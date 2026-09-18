@@ -1,0 +1,13 @@
+# 构建产物与本地运行时
+bin/
+*.log
+
+# 前端工程
+web/node_modules/
+web/dist/
+
+# 工作区数据（配置、数据库、截图、备份等，含敏感凭据）
+.workbuddy/
+
+# 根目录测试遗留二进制
+gateway.exe

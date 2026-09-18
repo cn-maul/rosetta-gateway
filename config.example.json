@@ -1,0 +1,33 @@
+{
+  "listen": "0.0.0.0:8080",
+  "db_path": "./data/gateway.db",
+  "log_level": "info",
+  "admin_token": "",
+  "master_key_env": "ROSETTA_GW_MASTER_KEY",
+  "defaults": {
+    "upstream_timeout_ms": 120000,
+    "stream_idle_timeout_ms": 60000,
+    "max_retries": 2,
+    "max_request_body_bytes": 33554432
+  },
+  "bootstrap": {
+    "providers": [
+      {
+        "slug": "deepseek",
+        "name": "DeepSeek",
+        "protocol": "auto",
+        "endpoint": "https://api.deepseek.com/v1",
+        "credentials": [
+          {
+            "label": "main",
+            "api_key_env": "DEEPSEEK_API_KEY"
+          }
+        ],
+        "models": ["deepseek-chat", "deepseek-reasoner"]
+      }
+    ],
+    "routes": [
+      { "public_name": "gpt-4o", "provider": "deepseek", "model": "deepseek-chat" }
+    ]
+  }
+}
