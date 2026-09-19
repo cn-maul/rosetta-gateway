@@ -1,0 +1,289 @@
+package admin
+
+import (
+	"context"
+	"crypto/rand"
+	"encoding/hex"
+	"fmt"
+	"net/http"
+	"strings"
+	"time"
+
+	"github.com/cn-maul/rosetta-gateway/internal/config"
+	"github.com/cn-maul/rosetta-gateway/internal/store"
+	"github.com/cn-maul/rosetta-gateway/internal/upstream"
+)
+
+type ProviderHandler struct {
+	store     *store.Store
+	masterKey []byte
+	cfg       *config.Config
+}
+
+func NewProviderHandler(st *store.Store, masterKey []byte, cfg *config.Config) *ProviderHandler {
+	return &ProviderHandler{store: st, masterKey: masterKey, cfg: cfg}
+}
+
+type providerRequest struct {
+	Slug       string `json:"slug"`
+	Name       string `json:"name"`
+	Protocol   string `json:"protocol"`
+	Endpoint   string `json:"endpoint"`
+	Enabled    *bool  `json:"enabled"`
+	TimeoutMs  int    `json:"timeout_ms"`
+	MaxRetries int    `json:"max_retries"`
+	QuirksJSON string `json:"quirks_json"`
+	APIKey     string `json:"api_key"`
+}
+
+type providerResponse struct {
+	ID         string `json:"id"`
+	Slug       string `json:"slug"`
+	Name       string `json:"name"`
+	Protocol   string `json:"protocol"`
+	Endpoint   string `json:"endpoint"`
+	Enabled    bool   `json:"enabled"`
+	TimeoutMs  int    `json:"timeout_ms"`
+	MaxRetries int    `json:"max_retries"`
+	QuirksJSON string `json:"quirks_json"`
+	CreatedAt  int64  `json:"created_at"`
+	UpdatedAt  int64  `json:"updated_at"`
+}
+
+func (h *ProviderHandler) List(w http.ResponseWriter, r *http.Request) {
+	providers, err := h.store.ListProviders(r.Context())
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	result := make([]providerResponse, 0, len(providers))
+	for _, p := range providers {
+		result = append(result, toProviderResponse(p))
+	}
+	writeJSON(w, http.StatusOK, result)
+}
+
+// Create 只需显示名称、协议、Endpoint（以及可选的 api_key）。
+// slug 由系统生成，启用固定为 true，超时与重试直接取设置里的默认值；
+// 若填写了 api_key，会顺带创建一条名为 default 的凭据。
+func (h *ProviderHandler) Create(w http.ResponseWriter, r *http.Request) {
+	var req providerRequest
+	if err := decodeJSON(r, &req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid JSON: "+err.Error())
+		return
+	}
+
+	if req.Endpoint == "" {
+		writeError(w, http.StatusBadRequest, "endpoint is required")
+		return
+	}
+
+	name := strings.TrimSpace(req.Name)
+	if name == "" {
+		name = req.Endpoint
+	}
+	if req.Protocol == "" {
+		req.Protocol = "openai-chat"
+	}
+
+	now := time.Now().UnixMilli()
+	p := &store.Provider{
+		ID:         generateID(),
+		Slug:       h.uniqueSlug(r.Context(), slugify(name)),
+		Name:       name,
+		Protocol:   req.Protocol,
+		Endpoint:   req.Endpoint,
+		Enabled:    true,
+		TimeoutMs:  h.cfg.Defaults.UpstreamTimeoutMs,
+		MaxRetries: h.cfg.Defaults.MaxRetries,
+		QuirksJSON: req.QuirksJSON,
+		CreatedAt:  now,
+		UpdatedAt:  now,
+	}
+
+	if err := h.store.CreateProvider(r.Context(), p); err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+
+	if strings.TrimSpace(req.APIKey) != "" {
+		enc, err := encryptSecret(req.APIKey, h.masterKey)
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, "failed to encrypt key: "+err.Error())
+			return
+		}
+		c := &store.Credential{
+			ID:         generateID(),
+			ProviderID: p.ID,
+			Label:      "default",
+			APIKeyEnc:  enc,
+			Enabled:    true,
+			Weight:     1,
+			Status:     "healthy",
+		}
+		if err := h.store.CreateCredential(r.Context(), c); err != nil {
+			writeError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+	}
+
+	writeJSON(w, http.StatusCreated, toProviderResponse(*p))
+}
+
+func (h *ProviderHandler) Get(w http.ResponseWriter, r *http.Request, id string) {
+	p, err := h.store.GetProvider(r.Context(), id)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	if p == nil {
+		writeError(w, http.StatusNotFound, "provider not found")
+		return
+	}
+	writeJSON(w, http.StatusOK, toProviderResponse(*p))
+}
+
+func (h *ProviderHandler) Update(w http.ResponseWriter, r *http.Request, id string) {
+	existing, err := h.store.GetProvider(r.Context(), id)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	if existing == nil {
+		writeError(w, http.StatusNotFound, "provider not found")
+		return
+	}
+
+	var req providerRequest
+	if err := decodeJSON(r, &req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid JSON: "+err.Error())
+		return
+	}
+
+	if req.Slug != "" {
+		existing.Slug = req.Slug
+	}
+	if req.Name != "" {
+		existing.Name = req.Name
+	}
+	if req.Protocol != "" {
+		existing.Protocol = req.Protocol
+	}
+	if req.Endpoint != "" {
+		existing.Endpoint = req.Endpoint
+	}
+	if req.Enabled != nil {
+		existing.Enabled = *req.Enabled
+	}
+	if req.TimeoutMs != 0 {
+		existing.TimeoutMs = req.TimeoutMs
+	}
+	if req.MaxRetries != 0 {
+		existing.MaxRetries = req.MaxRetries
+	}
+	if req.QuirksJSON != "" {
+		existing.QuirksJSON = req.QuirksJSON
+	}
+
+	if err := h.store.UpdateProvider(r.Context(), id, existing); err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+
+	writeJSON(w, http.StatusOK, toProviderResponse(*existing))
+}
+
+func (h *ProviderHandler) Delete(w http.ResponseWriter, r *http.Request, id string) {
+	if err := h.store.DeleteProvider(r.Context(), id); err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"status": "deleted"})
+}
+
+// Test 用即时构建的客户端拉取模型列表来验证连通性，不依赖内存池，
+// 因此刚添加、尚未 reload 的上游也能立即测通。
+func (h *ProviderHandler) Test(w http.ResponseWriter, r *http.Request, id string) {
+	p, err := h.store.GetProvider(r.Context(), id)
+	if err != nil || p == nil {
+		writeError(w, http.StatusNotFound, "provider not found")
+		return
+	}
+
+	client, err := upstream.NewProviderClient(r.Context(), h.store, id, h.masterKey, h.cfg)
+	if err != nil {
+		writeJSON(w, http.StatusOK, map[string]string{"status": "error", "message": err.Error()})
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(r.Context(), 15*time.Second)
+	defer cancel()
+
+	start := time.Now()
+	models, err := client.ListModels(ctx)
+	if err != nil {
+		writeJSON(w, http.StatusOK, map[string]string{"status": "error", "message": err.Error()})
+		return
+	}
+	latencyMs := time.Since(start).Milliseconds()
+
+	writeJSON(w, http.StatusOK, map[string]any{
+		"status":      "ok",
+		"message":     fmt.Sprintf("连接正常，%dms", latencyMs),
+		"latency_ms":  latencyMs,
+		"model_count": len(models),
+	})
+}
+
+func (h *ProviderHandler) uniqueSlug(ctx context.Context, base string) string {
+	slug := base
+	for i := 2; ; i++ {
+		p, err := h.store.GetProviderBySlug(ctx, slug)
+		if err != nil || p == nil {
+			return slug
+		}
+		slug = fmt.Sprintf("%s-%d", base, i)
+	}
+}
+
+func slugify(s string) string {
+	var b strings.Builder
+	prevDash := true
+	for _, r := range strings.ToLower(s) {
+		switch {
+		case (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9'):
+			b.WriteRune(r)
+			prevDash = false
+		case !prevDash:
+			b.WriteByte('-')
+			prevDash = true
+		}
+	}
+	slug := strings.Trim(b.String(), "-")
+	if slug == "" {
+		slug = "provider"
+	}
+	return slug
+}
+
+func toProviderResponse(p store.Provider) providerResponse {
+	return providerResponse{
+		ID:         p.ID,
+		Slug:       p.Slug,
+		Name:       p.Name,
+		Protocol:   p.Protocol,
+		Endpoint:   p.Endpoint,
+		Enabled:    p.Enabled,
+		TimeoutMs:  p.TimeoutMs,
+		MaxRetries: p.MaxRetries,
+		QuirksJSON: p.QuirksJSON,
+		CreatedAt:  p.CreatedAt,
+		UpdatedAt:  p.UpdatedAt,
+	}
+}
+
+func generateID() string {
+	b := make([]byte, 16)
+	rand.Read(b)
+	return hex.EncodeToString(b)
+}

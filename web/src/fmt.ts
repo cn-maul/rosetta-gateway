@@ -1,0 +1,75 @@
+// 展示格式化工具
+
+export function fmtNum(n: number): string {
+  if (!Number.isFinite(n)) return '0'
+  return new Intl.NumberFormat('zh-CN').format(n)
+}
+
+export function fmtTokens(n: number): string {
+  if (!Number.isFinite(n)) return '0'
+  if (n >= 1e9) return (n / 1e9).toFixed(2).replace(/\.?0+$/, '') + 'B'
+  if (n >= 1e6) return (n / 1e6).toFixed(2).replace(/\.?0+$/, '') + 'M'
+  if (n >= 1e3) return (n / 1e3).toFixed(1).replace(/\.0$/, '') + 'K'
+  return String(n)
+}
+
+// 输出速度（token/s）：整数级不带小数，个位数保留一位，过小则显式两位。
+export function fmtSpeed(n: number): string {
+  if (!Number.isFinite(n) || n <= 0) return '0'
+  if (n >= 100) return String(Math.round(n))
+  if (n >= 10) return n.toFixed(1).replace(/\.0$/, '')
+  return n.toFixed(2)
+}
+
+// 首字延迟：毫秒 → 秒，展示口径与速度一致（大数少位、小数多位）。
+export function fmtSec(ms: number): string {
+  if (!Number.isFinite(ms) || ms <= 0) return '0'
+  const s = ms / 1000
+  if (s >= 100) return String(Math.round(s))
+  if (s >= 10) return s.toFixed(1).replace(/\.0$/, '')
+  return s.toFixed(2)
+}
+
+// 毫秒时间戳 → 「MM-DD HH:MM:SS」（调用历史表格用）
+export function fmtTimeMs(tsMs: number): string {
+  if (!tsMs) return '—'
+  const d = new Date(tsMs)
+  const p = (x: number) => String(x).padStart(2, '0')
+  return `${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`
+}
+
+export function fmtDate(unixSec: number): string {
+  if (!unixSec) return '—'
+  const d = new Date(unixSec * 1000)
+  const p = (x: number) => String(x).padStart(2, '0')
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}`
+}
+
+export function fmtDateTime(unixSec: number): string {
+  if (!unixSec) return '—'
+  const d = new Date(unixSec * 1000)
+  const p = (x: number) => String(x).padStart(2, '0')
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`
+}
+
+export async function copyText(text: string): Promise<boolean> {
+  try {
+    await navigator.clipboard.writeText(text)
+    return true
+  } catch {
+    // 非安全上下文（http://）下 clipboard API 不可用，退回 execCommand
+    try {
+      const ta = document.createElement('textarea')
+      ta.value = text
+      ta.style.position = 'fixed'
+      ta.style.opacity = '0'
+      document.body.appendChild(ta)
+      ta.select()
+      const ok = document.execCommand('copy')
+      document.body.removeChild(ta)
+      return ok
+    } catch {
+      return false
+    }
+  }
+}
