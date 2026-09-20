@@ -31,6 +31,13 @@ func MapUpstreamError(err error) (int, string, string) {
 		return http.StatusBadRequest, "invalid_request_error", err.Error()
 	}
 	if errors.Is(err, rosetta.ErrStreamTruncated) {
+		// Partial content is already on the wire; there is no error body to
+		// add on top of it.
+		return http.StatusOK, "", ""
+	}
+	if errors.Is(err, rosetta.ErrStreamOverflow) {
+		// The SDK's accumulation guard tripped: same shape as truncation —
+		// whatever was produced is already delivered, nothing to append.
 		return http.StatusOK, "", ""
 	}
 

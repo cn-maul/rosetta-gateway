@@ -3,7 +3,7 @@ module github.com/cn-maul/rosetta-gateway
 go 1.27.0
 
 require (
-	github.com/cn-maul/rosetta v0.5.0
+	github.com/cn-maul/rosetta v0.5.1
 	modernc.org/sqlite v1.58.0
 )
 

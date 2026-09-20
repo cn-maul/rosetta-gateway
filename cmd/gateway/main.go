@@ -5,6 +5,7 @@ import (
 	crand "crypto/rand"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io/fs"
 	"log/slog"
@@ -413,14 +414,24 @@ func handleChatCompletions(pool *upstream.Pool, cfg *config.Config, db *store.St
 		rosettaReq.Model = res.UpstreamModel.ModelID
 
 		if req.Stream {
-			handleStreamRequest(w, r, client, rosettaReq, req.Model, res.Provider.ID, res.UpstreamModel.ModelID, authCtx.KeyID, cfg, db, logger, start)
+			handleStreamRequest(w, r, client, rosettaReq, req.Model, res.Provider.ID, res.UpstreamModel.ModelID, authCtx.KeyID, wantsStreamUsage(req), cfg, db, logger, start)
 		} else {
 			handleNonStreamRequest(w, client, rosettaReq, req.Model, res.Provider.ID, res.UpstreamModel.ModelID, authCtx.KeyID, cfg, db, logger, start)
 		}
 	}
 }
 
-func handleStreamRequest(w http.ResponseWriter, r *http.Request, client *rosetta.Client, req *rosetta.ChatRequest, publicModel, providerID, upstreamModelID, keyID string, cfg *config.Config, db *store.Store, logger *slog.Logger, start time.Time) {
+// wantsStreamUsage reports whether the caller asked for a trailing usage
+// chunk, i.e. OpenAI's {"stream_options":{"include_usage":true}}. The flag
+// only controls what the gateway forwards downstream: the SDK already asks
+// the upstream for usage on every stream.
+func wantsStreamUsage(req *inwire.OpenAIChatRequest) bool {
+	return req.StreamOptions != nil &&
+		req.StreamOptions.IncludeUsage != nil &&
+		*req.StreamOptions.IncludeUsage
+}
+
+func handleStreamRequest(w http.ResponseWriter, r *http.Request, client *rosetta.Client, req *rosetta.ChatRequest, publicModel, providerID, upstreamModelID, keyID string, sendUsage bool, cfg *config.Config, db *store.Store, logger *slog.Logger, start time.Time) {
 	ctx := r.Context()
 	var ttfbMs int64
 	firstByte := true
@@ -452,16 +463,9 @@ func handleStreamRequest(w http.ResponseWriter, r *http.Request, client *rosetta
 	heartbeatTicker := time.NewTicker(heartbeatInterval)
 	defer heartbeatTicker.Stop()
 
-	var sendUsage bool
-	if req.Extra != nil {
-		if so, ok := req.Extra["stream_options"]; ok {
-			if m, ok := so.(map[string]any); ok {
-				if v, ok := m["include_usage"].(bool); ok {
-					sendUsage = v
-				}
-			}
-		}
-	}
+	// sendUsage was resolved from the typed request by the caller; the
+	// gateway never populates rosetta.ChatRequest.Extra, so reading the flag
+	// back out of it would always yield false.
 
 	go func() {
 		for {
@@ -507,10 +511,21 @@ func handleStreamRequest(w http.ResponseWriter, r *http.Request, client *rosetta
 	}
 
 	if err := stream.Err(); err != nil {
-		if err == rosetta.ErrStreamTruncated {
+		switch {
+		case errors.Is(err, rosetta.ErrStreamTruncated):
+			// The upstream ended the stream before its terminal event. Partial
+			// content has already been forwarded. The SDK *wraps* this
+			// sentinel (fmt.Errorf with %w), so an == comparison never matches
+			// and every truncation would be misfiled as a generic error.
 			status = "truncated"
-			logger.Warn("stream truncated", "model", publicModel, "key_id", keyID)
-		} else {
+			logger.Warn("stream truncated", "model", publicModel, "key_id", keyID, "error", err)
+		case errors.Is(err, rosetta.ErrStreamOverflow):
+			// The SDK's accumulation guard tripped (64 MiB / 10k blocks) —
+			// the upstream is runaway or hostile. Client-visible outcome is
+			// the same as truncation: a partial answer and no finish event.
+			status = "overflow"
+			logger.Error("stream overflow", "model", publicModel, "key_id", keyID, "error", err)
+		default:
 			status = "error"
 			logger.Error("stream error", "error", err, "model", publicModel, "key_id", keyID)
 		}
