@@ -52,6 +52,30 @@ export function fmtDateTime(unixSec: number): string {
   return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`
 }
 
+/**
+ * 调用状态的展示标签。库内 status 是机器可读值（ok / truncated /
+ * overflow / error），界面统一中文化，未知值原样显示以便排查。
+ */
+export function statusLabel(status: string): string {
+  switch (status) {
+    case 'ok':
+      return '正常'
+    case 'truncated':
+      return '截断'
+    case 'overflow':
+      return '超限'
+    case 'error':
+      return '失败'
+    default:
+      return status || '—'
+  }
+}
+
+/** 非 ok 一律标记为异常（暖橙是设计系统里的专用错误色）。 */
+export function statusBadge(status: string): string {
+  return status === 'ok' ? 'badge-live' : 'badge-err'
+}
+
 export async function copyText(text: string): Promise<boolean> {
   try {
     await navigator.clipboard.writeText(text)

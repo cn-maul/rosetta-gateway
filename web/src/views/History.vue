@@ -2,7 +2,7 @@
 import { onMounted, ref } from 'vue'
 import { api } from '../api'
 import { toast } from '../ui'
-import { fmtTokens, fmtTimeMs } from '../fmt'
+import { fmtTokens, fmtTimeMs, statusLabel, statusBadge } from '../fmt'
 import type { UsageHistoryEntry } from '../types'
 
 const loading = ref(true)
@@ -71,8 +71,8 @@ defineExpose({ load })
               <td>{{ h.key_name || h.key_id || '—' }}</td>
               <td class="num-h">{{ fmtTokens(h.total_tokens) }}</td>
               <td class="c-st">
-                <span class="badge" :class="h.status === 'ok' ? 'badge-live' : 'badge-off'">
-                  {{ h.status === 'ok' ? '正常' : h.status }}
+                <span class="badge" :class="statusBadge(h.status)">
+                  {{ statusLabel(h.status) }}
                 </span>
               </td>
             </tr>

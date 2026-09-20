@@ -35,6 +35,11 @@ function submitToken() {
   // 重载页面，用新 token 重新拉取数据（hash 路由下停留当前页）
   window.location.reload()
 }
+
+// 版本号：构建时由 vite.config.ts 的 define 注入（单一来源：package.json / go.mod），
+// 这里先落到本地常量再交给模板，避免依赖模板内联替换。
+const appVersion = __APP_VERSION__
+const rosettaVersion = __ROSETTA_VERSION__
 </script>
 
 <template>
@@ -60,6 +65,13 @@ function submitToken() {
   </header>
 
   <RouterView />
+
+  <!-- 页脚版本号（构建时注入，非运行时接口） -->
+  <footer class="foot">
+    <span>rosetta-gateway v{{ appVersion }}</span>
+    <span class="foot-sep" aria-hidden="true">·</span>
+    <span>rosetta {{ rosettaVersion }}</span>
+  </footer>
 
   <!-- Toast -->
   <div
