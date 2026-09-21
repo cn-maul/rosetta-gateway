@@ -46,7 +46,10 @@ RUN chmod 0755 /app/gateway /usr/local/bin/docker-entrypoint.sh
 ENV ROSETTA_GW_HOME=/data
 VOLUME ["/data"]
 
-EXPOSE 6666
+# 端口用 8666，**不能用 6666** —— 6666 在 Chromium 的保留端口表
+# （net/base/port_util.cc 的 kRestrictedPorts，IRC 段）里，浏览器会在
+# 发起请求前就拒绝，报 ERR_UNSAFE_PORT，且服务端看不到任何连接日志。
+EXPOSE 8666
 
 WORKDIR /app
 ENTRYPOINT ["/usr/local/bin/docker-entrypoint.sh"]

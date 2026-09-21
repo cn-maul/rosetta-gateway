@@ -90,6 +90,19 @@ func main() {
 
 	logger.Info("config loaded", "listen", cfg.Listen, "db_path", cfg.DBPath, "log_level", cfg.LogLevel)
 
+	// 端口自检：落在浏览器保留端口（6666 / 6000 / 10080 …）上时，
+	// 浏览器根本不会发出请求，服务端**没有任何日志**，前端只显示 ERR_UNSAFE_PORT。
+	// 这种「完全静默」的失败模式排查成本极高，所以在启动这一步就喊出来。
+	if port, service, blocked := config.CheckListenPort(cfg.Listen); blocked {
+		logger.Warn("监听端口被浏览器保留，管理界面将无法在浏览器中打开",
+			"listen", cfg.Listen,
+			"port", port,
+			"reserved_for", service,
+			"browser_error", "ERR_UNSAFE_PORT",
+			"hint", "改用黑名单外的端口（如 8666）；容器里也可把宿主端口映射成 8666",
+		)
+	}
+
 	masterKey, generatedKey, err := crypto.LoadMasterKey(cfg.MasterKeyEnv, homeDir)
 	switch {
 	case err != nil:

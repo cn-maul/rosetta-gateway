@@ -25,6 +25,7 @@
 | 14 | `access_keys.quota_tokens` 既无写路径也无校验（假配额字段） | **P2** | 未修复（§4.4） |
 | 15 | 若干死代码与契约瑕疵 | **P2** | 部分修复（§4.5） |
 | 16 | 主密钥只认环境变量：**双击 exe 启动即无密钥，API Key 明文落库** | **P1** | 已修复（§3.9） |
+| 17 | 容器默认端口 6666 是**浏览器保留端口**，部署后管理界面永远打不开 | **P1** | 已修复（§3.10） |
 
 ---
 
@@ -248,6 +249,43 @@ provider_credentials.api_key_enc
 若先用双击（密钥落在 `<exeDir>/master.key`）、后来改成设环境变量启动，
 两把密钥不同 → 先前加密的凭据解不开。要么一直双击，要么一直用脚本。
 `gateway.ps1` 写的正是 `bin/master.key`，与 Go 侧路径一致，所以两条路天然对齐。
+
+### 3.10 容器默认端口 6666 换成 8666（P1，v1.1.1）
+
+**症状**：镜像部署到局域网后浏览器打不开，容器日志却完全正常
+（`listen 0.0.0.0:6666`、`server starting`）。
+
+**根因**：`6666` 在 Chromium 的保留端口表里（`net/base/port_util.cc` 的
+`kRestrictedPorts`，IRC 段 6665–6669 / 6697）。Chrome / Edge / Brave / Opera
+一律硬拦，Firefox 也拦。**拦截发生在浏览器内部，请求根本不会发出去**，
+所以服务端没有任何连接日志。
+
+这就解释了为什么分层自测会得到「很矛盾」的结果：
+
+| 测法 | 结果 |
+|---|---|
+| 容器内 `wget 127.0.0.1:6666` | 通 |
+| 宿主机 `curl.exe 127.0.0.1:6666` | 通 |
+| 浏览器 | `ERR_UNSAFE_PORT` |
+
+**`--explicitly-allowed-ports` / 组策略 `ExplicitlyAllowedNetworkPorts` 不是解药** ——
+只放开本机浏览器，其他访问者照样打不开。
+
+**修复**：
+
+- `Dockerfile` 的 `EXPOSE`、`docker/config.default.json` 的 `listen`、
+  入口脚本的提示语、`DOCKER.md` 全部改为 **8666**（在黑名单内最接近 6666 的取值）。
+- **新增 `internal/config/ports.go`**：内置一份完整的 Chromium 保留端口表 +
+  `CheckListenPort(listen)`。启动时在 `main.go` 里比对，命中就 `logger.Warn`
+  并打出 `reserved_for` / `browser_error` / 建议值。
+  放在 Go 里而不是入口脚本里，是为了**裸机部署（`bin\config.json`）也吃得到这个保护**。
+- `DOCKER.md` 新增「端口为什么是 8666」整节 + FAQ 条目；
+  并补上「`config.json` 生成后不随镜像更新」的提醒（换端口后老配置不会自动改）。
+
+**注意**：这是警告不是致命错误 —— 端口在非浏览器场景（纯 API 调用、反向代理前置）
+仍然可用，没必要拒绝启动。
+
+已验证（隔离环境 `.workbuddy/tmp/e2e-port`，见 §5.6）。
 
 ---
 
@@ -473,7 +511,34 @@ prov  : {'name': 'Renamed', 'slug': 'testup', 'timeout_ms': 0, 'max_retries': 0}
 
 ---
 
+### 5.6 端口自检（隔离环境 `.workbuddy/tmp/e2e-port`）
+
+同一个二进制，只改 `listen`，跑两次：
+
+```
+用例 1  listen=127.0.0.1:6666  (期望有警告)
+  结果: 命中警告 ✓
+{"level":"WARN","msg":"监听端口被浏览器保留，管理界面将无法在浏览器中打开",
+ "listen":"127.0.0.1:6666","port":6666,"reserved_for":"alternate IRC",
+ "browser_error":"ERR_UNSAFE_PORT","hint":"改用黑名单外的端口（如 8666）；容器里也可把宿主端口映射成 8666"}
+  (服务是否起来: 1)
+用例 2  listen=127.0.0.1:8666  (期望无警告)
+  结果: 无警告
+  (服务是否起来: 1)
+```
+
+要点：命中保留端口**只警告、不拒绝启动**（反向代理前置或纯 API 调用场景下端口仍然可用），
+两种情况服务都正常起来 —— 这正是期望行为。
+
+---
+
 ## 6. 排障手册
+
+**浏览器报 `ERR_UNSAFE_PORT`，但容器日志/服务端一切正常？**
+端口落在浏览器的保留端口表里（典型是 6666）。这是**客户端**拦截，请求根本没发出去，
+所以服务端看不到任何连接。换成黑名单外的端口，宿主和容器用同一个（例如 8666）。
+快速自证：容器内 `wget` 与宿主机 `curl` 都通、**只有浏览器不通** —— 就是这个。
+网关启动时会自动比对并在日志里警告，搜 `ERR_UNSAFE_PORT` 即可。
 
 **忘了管理密码怎么办？**
 删掉部署目录下的 `admin_auth.json` 并重启。系统退回使用 `config.json` 的 `admin_token` 登录。

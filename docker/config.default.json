@@ -1,5 +1,5 @@
 {
-  "listen": "0.0.0.0:6666",
+  "listen": "0.0.0.0:8666",
   "db_path": "./db/gateway.db",
   "log_level": "info",
   "admin_token": "",
