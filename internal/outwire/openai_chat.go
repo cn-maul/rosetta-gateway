@@ -30,6 +30,10 @@ type OpenAIMessage struct {
 	Role      string          `json:"role"`
 	Content   json.RawMessage `json:"content,omitempty"`
 	ToolCalls json.RawMessage `json:"tool_calls,omitempty"`
+	// ReasoningContent 承载思维链，与流式的 delta.reasoning_content 同名同义
+	// （DeepSeek / Qwen / vLLM 的约定）。为空时整体省略，标准 OpenAI 客户端
+	// 对未知字段是忽略语义，不受影响。
+	ReasoningContent string `json:"reasoning_content,omitempty"`
 }
 
 type OpenAIToolCall struct {
@@ -118,6 +122,23 @@ func (sw *SSEWriter) WriteTextDelta(delta string) error {
 	return sw.writeChunk(map[string]any{"content": delta}, nil)
 }
 
+// WriteThinkingDelta 把上游的推理（思维链）增量透传为 delta.reasoning_content。
+//
+// OpenAI 官方协议没有这个字段，但 DeepSeek / Qwen / vLLM / OpenRouter 一致用它承载
+// reasoning_content，rosetta 的 openai-chat 适配器也按这个键回读
+// （provider_openai_chat.go 的 ReasoningContent），所以键名对整个链路是自洽的。
+//
+// 不透传的代价不只是「少了一个字段」：只吐思考的流（思考型模型在 max_tokens
+// 耗尽于思考期时正是这种形态）到下游会变成**零内容**的流，且照样以
+// finish_reason:"stop" + [DONE] 收尾，下游只能报出「流式响应中没有内容」这种
+// 指向不了任何一层的错误。
+func (sw *SSEWriter) WriteThinkingDelta(delta string) error {
+	if err := sw.ensureRole(); err != nil {
+		return err
+	}
+	return sw.writeChunk(map[string]any{"reasoning_content": delta}, nil)
+}
+
 func (sw *SSEWriter) WriteToolCallDelta(index int, id, name, argsDelta string) error {
 	if err := sw.ensureRole(); err != nil {
 		return err
@@ -189,8 +210,9 @@ func WriteNonStreamResponse(w http.ResponseWriter, resp *rosetta.ChatResponse, m
 	finishReason := OpenAIFinishReason(resp.StopReason)
 
 	msg := &OpenAIMessage{
-		Role:    "assistant",
-		Content: json.RawMessage(`"` + escapeJSON(resp.Text()) + `"`),
+		Role:             "assistant",
+		Content:          json.RawMessage(`"` + escapeJSON(resp.Text()) + `"`),
+		ReasoningContent: resp.ThinkingText(),
 	}
 	if len(resp.ToolCalls()) > 0 {
 		tcs := make([]OpenAIToolCall, 0, len(resp.ToolCalls()))

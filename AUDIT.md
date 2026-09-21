@@ -3,6 +3,9 @@
 本轮针对「多阶段开发累积的不一致」做了一次全面审计。触发点是局长报的一个具体故障：
 **访问管理后台，输入密码 test123 后又要求输入，一直重复。**
 
+§3.11 是后半天追加的：局长另一个项目（leans）通过本网关调模型时报
+「AI 调用失败: 流式响应中没有内容」，定位下来根因在本网关，见该节。
+
 ---
 
 ## 0. 结论速览
@@ -26,6 +29,8 @@
 | 15 | 若干死代码与契约瑕疵 | **P2** | 部分修复（§4.5） |
 | 16 | 主密钥只认环境变量：**双击 exe 启动即无密钥，API Key 明文落库** | **P1** | 已修复（§3.9） |
 | 17 | 容器默认端口 6666 是**浏览器保留端口**，部署后管理界面永远打不开 | **P1** | 已修复（§3.10） |
+| 18 | 空闲看门狗超时被当成正常收尾：下游收到假的 `finish_reason:stop` + `[DONE]` | **P1** | 已修复（§3.11） |
+| 19 | `EventThinkingDelta` 被静默丢弃：只吐思考的上游在下游变成**零内容**的流 | **P1** | 已修复（§3.11） |
 
 ---
 
@@ -286,6 +291,110 @@ provider_credentials.api_key_enc
 仍然可用，没必要拒绝启动。
 
 已验证（隔离环境 `.workbuddy/tmp/e2e-port`，见 §5.6）。
+
+---
+
+### 3.11 流式空响应：看门狗超时被伪装成正常收尾 + 思考增量被丢弃（P1，v1.1.2）
+
+**症状**：局长另一个项目（leans）经本网关（部署在 `192.168.4.162:8666`，v1.1.1）调模型时
+报 **「AI 调用失败: 流式响应中没有内容」**，随机出现、无法复现。直连上游各模型
+（6+3+8+3 次）全部正常，所以最初怀疑是模型 API 提供商。
+
+**定位结论**：两处都在本网关，且都会让下游收到一个**看起来成功**的空流。
+
+#### (a) 空闲看门狗超时不留痕 → 状态仍是 `ok`
+
+```go
+idleTimer := time.AfterFunc(idleTimeout, func() {
+    logger.Warn("stream idle timeout", ...)
+    stream.Close()          // ← 只关流，没置任何状态
+})
+...
+if err := stream.Err(); err != nil { ... }   // ← Close() 不写 s.err，恒 nil
+if status == "ok" { sse.WriteFinish(...) }   // ← 于是照常写 finish_reason:"stop"
+if status == "ok" { sse.WriteDone() }        // ← 并且照常写 [DONE]
+```
+
+**根因是跨包契约误判**：`streamCore.Close()` 只置 `done` 并释放连接，
+**不写 `s.err`**（Rosetta 的设计是「干净结束必须 `Err()==nil`，哪怕关连接失败」）。
+所以看门狗掐断的流在 SDK 视角里跟正常结束**完全一样**，网关不自己记一笔就无从区分。
+
+这直接违反本项目自己的设计文档：
+`DESIGN.md` §8.1「超时视为 `status=truncated`」与 §16-P0 验收第 5 条
+「上游卡住不吐字节，60s 后看门狗关闭流，下游收到断流」—— 两条都没做到。
+
+**隐蔽伤害**：`usage_records.status` 也记成 `ok`，所以事后从网关后台的调用历史里
+**也查不出来**（实测记录是 `status=ok, latency_ms=3001, ttfb_ms=0, 0 tokens`）。
+
+#### (b) `EventThinkingDelta` 是空实现
+
+```go
+case rosetta.EventThinkingDelta:     // ← 直接丢掉
+```
+
+上游只发 `reasoning_content` 的流（思考型模型把 `max_tokens` 耗在思考期时正是这种形态）
+到下游就变成**完全空**的流，且照样以 `finish_reason:"stop"` + `[DONE]` 收尾。
+旁证：`qwen` 首字延迟 15.3s，`agens` 1.5s / `dsv41` 1.3s —— `qwen` 是思考型，
+思考阶段对下游完全不可见。
+
+#### 为什么两处都要修，而不是「下游少报点错就行」
+
+两类问题有一个共同的病理：**网关把一个异常包装成了正常收尾**。
+下游（leans 侧 `backend/service/ai.go` 只统计 `EventTextDelta`）拿到
+「HTTP 200 + 零文本增量 + `finish_reason:stop` + `[DONE]`」，
+在协议层面这是一次**成功的空回复**，它除了报「没有内容」无话可说。
+错误信息模糊是症状，网关撒谎才是病因。
+
+#### 修复
+
+`cmd/gateway/main.go`：
+
+- 看门狗回调加 `var idleTimedOut atomic.Bool`，开火时置位（`Close()` 释放的局部变量
+  不能直接写，必须走 atomic）。
+- 循环后补第二类终态：`else if idleTimedOut.Load() && !sawTerminal` → `status="truncated"`，
+  从而落进既有的「非 `ok` 不写 `finish_reason`、不写 `[DONE]`」分支。
+- `sawTerminal`（收到过 `EventMessageEnd`）是**防御性条件**：实测 Rosetta v0.5.1 在
+  `[DONE]`/EOF 之后就短路 `next()`，适配器不会在吐出 `message_end` 后继续阻塞，
+  所以这条判定当前**打不到**；留着守「适配器将来在终止事件之后仍等待更多数据」。
+- `EventThinkingDelta` 改为透传；同时记 `wroteContent`，在「上游给了终止事件却
+  一个增量都没写」时补一条 `WARN stream finished with no content`
+  —— 不替上游改协议语义（合法的空回复确实存在），但日志必须能区分
+  「上游真空」与「网关吃掉」。
+
+`internal/outwire/openai_chat.go`：新增 `WriteThinkingDelta` → `delta.reasoning_content`；
+非流式的 `message.reasoning_content` 同步补上（取自 `ChatResponse.ThinkingText()`）。
+键名不是自创的：DeepSeek / Qwen / vLLM / OpenRouter 一致用它，Rosetta 的 openai-chat
+适配器也按这个键回读（`provider_openai_chat.go`），所以**整链路自洽可往返**。
+
+#### 验证（隔离环境 `.workbuddy/tmp/e2e`，18099 + 19090 假上游，空闲超时调成 3000ms）
+
+`zzfake` 新增三种模式：`silent`（只发 role 块后挂住）、`no_done_hold`
+（发了 finish_reason + usage 但既不发 `[DONE]` 也不关连接）、`thinking`（只发 `reasoning_content`）。
+判定看**下游实收字节**（`raw_*.sse` 留档），不看代码推断：
+
+| 场景 | 下游收到的流 | `usage_records.status` |
+|---|---|---|
+| A 正常上游 | `content` + `finish_reason:"stop"` + usage + `[DONE]` | `ok` |
+| **B 上游静默** | 只有 `: keepalive`，**无 finish_reason、无 `[DONE]`** | **`truncated`**（`latency_ms=3001`） |
+| **C 有内容但缺 `[DONE]` 且挂住** | 内容已下发，**无 finish_reason、无 `[DONE]`** | **`truncated`**（`latency_ms=3001`） |
+| **D 上游只发思考（流式）** | `reasoning_content` ×3 + `finish_reason:"stop"` + usage + `[DONE]` | `ok` |
+| **E 上游只发思考（非流式）** | `message.content=""` + `message.reasoning_content="想完了，但没写正文"` | `ok` |
+
+修前 B/C 两条的 `status` 都是 `ok`、下游都带假 `finish_reason:"stop"` + `[DONE]`；
+D 的 `reasoning_content` 一行为空。日志侧同步可见两条新告警，
+且 `content_written` 字段能区分「掐断时有内容」（C=true）与「一个字都没吐」（B=false）：
+
+```
+WARN stream idle timeout                           idle_timeout_ms=3000
+WARN stream cut by idle watchdog without terminal event  content_written=false
+WARN stream cut by idle watchdog without terminal event  content_written=true
+```
+
+`go build ./... && go vet ./...` 空输出。
+
+**给下游（leans）的残余项**：网关现在最多只能做到「如实暴露」。`leans` 若要更精确的
+报错，得把 `finish_reason` / `usage` / 是否收到过 thinking 带进错误文案
+（该项目的 §5.2 已记录，不在本仓库范围）。
 
 ---
 

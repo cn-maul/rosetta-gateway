@@ -430,11 +430,13 @@ PATCH 结构体里刻意不含该字段，传了也会被忽略。
 | 项 | 做法 |
 |---|---|
 | 取消传播 | 上游 ctx 直接取 `r.Context()`。下游断开 → ctx 取消 → Rosetta 中止流 → 上游连接关闭。**这是最直接的止损点，必须做对** |
-| 空闲看门狗 | 独立 `time.AfterFunc`，默认 60s 无事件则 `stream.Close()`。每收到一个事件重置定时器。超时视为 `status=truncated` |
+| 空闲看门狗 | 独立 `time.AfterFunc`，默认 60s 无事件则 `stream.Close()`。每收到一个事件重置定时器。超时视为 `status=truncated`。**注意 `Stream.Close()` 不写 `stream.Err()`**（Rosetta 只在真的读失败时才置 err），所以看门狗必须自己用 `atomic.Bool` 留痕；否则 `Err()==nil` → 状态保持 `ok` → 下游收到 `finish_reason:"stop"` + `[DONE]`，卡死的上游被伪装成正常收尾（详见 §8.2） |
 | 心跳 | 空闲超过 `idle/2` 时下发 `: keepalive\n\n`，防中间代理超时断连 |
 | Flush | 用 `http.NewResponseController(w).Flush()`（Go 1.20+），不用 `http.Flusher` 类型断言 |
 | 首字节时机 | `ChatStream` 成功后才写 `200 + Content-Type: text/event-stream` + `Cache-Control: no-cache` + `X-Accel-Buffering: no` |
-| 结束事件 | OpenAI 系发 `data: [DONE]`；Anthropic 发 `event: message_stop` |
+| 结束事件 | OpenAI 系发 `data: [DONE]`；Anthropic 发 `event: message_stop`。**只有 `status=="ok"` 才发** |
+| 思考增量 | `EventThinkingDelta` 编码为 `delta.reasoning_content`（DeepSeek / Qwen / vLLM 的既成约定，Rosetta 的 openai-chat 适配器也按这个键回读）。**不能丢**：只吐思考的流丢了它就是个零内容的流 |
+| 空文本事件 | `EventThinkingDelta` 的 `Text==""` 是 Anthropic thinking signature 的载体，OpenAI 下游无对应字段，跳过即可 |
 | usage 合成 | OpenAI 下游要 usage 需客户端传 `stream_options.include_usage`；网关在 `EventMessageEnd` 处合成仅含 usage 的 chunk，且仅当客户端要求时下发 |
 | 断流处理 | 见 §8.2 |
 | 缓冲 | 逐事件 Flush，不做批量聚合（延迟优先） |
@@ -446,6 +448,23 @@ Rosetta 用 `ErrStreamTruncated` 区分「干净结束」与「连接被掐断�
 - **OpenAI / Responses 下游**：发完已收到的增量与结束事件，但**不下发 `[DONE]` / `response.completed`**，直接关闭连接。这是 OpenAI 自身中断时的表现，客户端会据此判定异常。
 - **Anthropic 下游**：发 `event: error`，载荷 `{"type":"error","error":{"type":"api_error","message":"upstream stream truncated"}}`，然后关闭。
 - 无论哪种，`usage_records.status` 记 `truncated`，已知的 usage 照常入账（Rosetta 在截断时会交付带 usage 的结束事件）。
+
+**`status=truncated` 有两个来源，都要覆盖**：
+
+1. `stream.Err()` 命中 `rosetta.ErrStreamTruncated`（上游断连、缺 `[DONE]`）。
+2. **空闲看门狗开火**。这类超时在 Rosetta 的流上不留痕迹（`Close()` 不置 `err`），
+   必须由网关自己判定；否则就是第 1 类漏网、且是以「正常收尾」的形态漏网。
+   终态判定：`idleTimedOut && !sawTerminal` → `truncated`。
+   其中 `sawTerminal`（收到过 `EventMessageEnd`）是防御性条件 —— 实测 Rosetta v0.5.1
+   在 `[DONE]`/EOF 之后会短路 `next()`，适配器不会在吐出 `message_end` 后继续阻塞，
+   所以当前打不到；留着守「适配器将来在终止事件之后仍等待更多数据」的情形。
+
+两者都无法回滚已下发的内容，下游看到的都是「有增量、无收尾」。
+另外补一条留痕规则：上游给了终止事件却一个内容增量都没写（`wroteContent==false`）时，
+协议行为保持不变（上游可能因内容过滤合法地返回空回复，网关不该替它改语义），
+但记一条 `WARN stream finished with no content` —— 日志是唯一能区分
+「上游确实回了空」与「网关把内容吃掉了」的地方。
+
 
 ### 8.3 非流式
 

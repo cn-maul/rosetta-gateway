@@ -14,6 +14,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -519,10 +520,22 @@ func handleStreamRequest(w http.ResponseWriter, r *http.Request, client *rosetta
 	flusher, _ := w.(http.Flusher)
 	sse := outwire.NewSSEWriter(w, flusher, "chatcmpl-"+generateID(), publicModel, time.Now().Unix())
 
+	// 看门狗：idleTimeout 内一个上游事件都没有就关流止损。
+	//
+	// 为什么必须自己记一笔：Stream.Close() 只置 done 并释放连接，
+	// **不会**写 stream.Err()（见 rosetta stream.go 的 streamCore.Close）。
+	// 于是超时在流上不留任何痕迹 —— Err() 返回 nil，status 保持 "ok"，
+	// 下游照常收到 finish_reason:"stop" + [DONE]，把一个「上游卡死」伪装成
+	// 正常收尾，本网关自己的 usage_records 也会记成 ok，事后无从追查。
+	// DESIGN.md §8.1 明确要求这种情况记 status=truncated。
+	var idleTimedOut atomic.Bool
 	idleTimeout := cfg.StreamIdleTimeout()
 	idleTimer := time.AfterFunc(idleTimeout, func() {
-		logger.Warn("stream idle timeout", "model", publicModel, "key_id", keyID)
-		stream.Close()
+		idleTimedOut.Store(true)
+		logger.Warn("stream idle timeout",
+			"model", publicModel, "key_id", keyID,
+			"idle_timeout_ms", idleTimeout.Milliseconds())
+		_ = stream.Close()
 	})
 	defer idleTimer.Stop()
 
@@ -552,6 +565,16 @@ func handleStreamRequest(w http.ResponseWriter, r *http.Request, client *rosetta
 	var stopReason rosetta.StopReason
 	status := "ok"
 	httpStatus := 200
+	// sawTerminal：上游给过 EventMessageEnd。看门狗开火只对「从未拿到终止事件」
+	// 的流降级 —— 已收到 message_end 的流是完整的，把它报成截断属于反向误判。
+	// 实测 rosetta v0.5.1 在 [DONE]/EOF 之后就短路了 next()，适配器不会在吐出
+	// message_end 后继续阻塞，所以这条判定当前**打不到**；留着守的是「适配器
+	// 将来在终止事件之后仍等待更多数据」这种情形（对照 zzfake 的 no_done_hold：
+	// 那条路径没有 message_end，仍然如实记 truncated）。
+	sawTerminal := false
+	// wroteContent：往下游写过至少一个内容增量（文本/思考/工具调用）。
+	// 全都没有时是可疑的空流，留痕但不改协议行为（见循环后的注释）。
+	wroteContent := false
 
 	for stream.Next() {
 		if firstByte {
@@ -565,11 +588,26 @@ func handleStreamRequest(w http.ResponseWriter, r *http.Request, client *rosetta
 		case rosetta.EventMessageStart:
 			sse.SetResponseID(ev.ID)
 		case rosetta.EventTextDelta:
+			if ev.Text != "" {
+				wroteContent = true
+			}
 			sse.WriteTextDelta(ev.Text)
 		case rosetta.EventThinkingDelta:
+			// 思考增量必须透传：只吐 reasoning_content 的流（思考型模型在
+			// max_tokens 耗尽于思考期时就是这种形态）若被丢掉，下游收到的是
+			// 一条「零内容 + finish_reason:stop + [DONE]」的正常流，
+			// 只能报出「流式响应中没有内容」这种无从排查的错误。
+			// Text 为空的事件是 Anthropic thinking signature 的载体，
+			// OpenAI 下游没有对应字段，跳过不算丢内容。
+			if ev.Text != "" {
+				wroteContent = true
+				sse.WriteThinkingDelta(ev.Text)
+			}
 		case rosetta.EventToolCall:
+			wroteContent = true
 			sse.WriteToolCallDelta(ev.ToolIndex, ev.ToolID, ev.ToolName, ev.ArgumentsDelta)
 		case rosetta.EventMessageEnd:
+			sawTerminal = true
 			if ev.Usage != nil {
 				lastUsage = *ev.Usage
 			}
@@ -596,6 +634,26 @@ func handleStreamRequest(w http.ResponseWriter, r *http.Request, client *rosetta
 			status = "error"
 			logger.Error("stream error", "error", err, "model", publicModel, "key_id", keyID)
 		}
+	} else if idleTimedOut.Load() && !sawTerminal {
+		// 看门狗掐断且上游从未给出终止事件 —— 与 ErrStreamTruncated 同类：
+		// 已转发的内容不回滚，但绝不能让下游收到「正常收尾」（不写
+		// finish_reason、不写 [DONE]，客户端据此判定断流）。
+		status = "truncated"
+		logger.Warn("stream cut by idle watchdog without terminal event",
+			"model", publicModel, "key_id", keyID,
+			"idle_timeout_ms", idleTimeout.Milliseconds(),
+			"content_written", wroteContent)
+	} else if !wroteContent {
+		// 上游给了终止事件却一个内容增量都没吐。协议上保持原样下发
+		// （上游可能因内容过滤合法地返回空回复，网关不该替它改语义），
+		// 但必须留痕：下游通常只会报「没有内容」，日志是唯一能区分
+		// 「上游确实回了空」与「网关把内容吃掉了」的地方。
+		logger.Warn("stream finished with no content",
+			"model", publicModel, "key_id", keyID,
+			"stop_reason", string(stopReason),
+			"input_tokens", lastUsage.InputTokens,
+			"output_tokens", lastUsage.OutputTokens,
+			"reasoning_tokens", lastUsage.ReasoningTokens)
 	}
 
 	if status == "ok" {
