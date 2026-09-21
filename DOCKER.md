@@ -155,6 +155,40 @@ services:
 若要挂在公网，建议先设 `-e ADMIN_TOKEN=<随机串>` 再启动，或者只绑回环
 （`-p 127.0.0.1:8666:8666`）。
 
+## 日志
+
+**没有日志文件 —— 应用日志就是容器的标准输出。**
+
+网关用 `slog` 的 JSON handler 直接写 stdout（`cmd/gateway/main.go`），配置里的 `log_level`
+只调级别、不改去向。所以 `docker logs` 就是全部日志，`/data` 里不会出现任何 `.log`。
+
+```bash
+docker logs -f --tail 200 rosetta-gateway        # 实时跟随
+docker logs rosetta-gateway > gateway.log        # 导出留档（推荐，见下）
+```
+
+Docker 默认的 `json-file` driver 会把它们落在
+`/var/lib/docker/containers/<容器ID>/<容器ID>-json.log`。**别去那儿找**：Docker Desktop 跑在
+WSL 的 docker VM 里，宿主机文件系统上翻不到；而且 `docker rm` 容器就带走了。
+
+每行是完整的 JSON（`time` / `level` / `msg` + 字段），要人读可转一下：
+
+```bash
+docker logs rosetta-gateway 2>&1 | jq -r '"\(.time) \(.level) \(.msg)"'
+```
+
+想让 Docker 自己控制大小与轮转（compose）：
+
+```yaml
+    logging:
+      driver: json-file        # 或 local
+      options:
+        max-size: "20m"
+        max-file: "5"
+```
+
+`TZ` 环境变量只影响时间戳的读法，不影响日志去向。
+
 ## 数据与升级
 
 ```bash
