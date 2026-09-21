@@ -11,3 +11,6 @@ web/dist/
 
 # 根目录测试遗留二进制
 gateway.exe
+
+# 管理后台密码（含盐哈希，不应入库）
+admin_auth.json

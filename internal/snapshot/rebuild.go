@@ -2,15 +2,16 @@ package snapshot
 
 import (
 	"context"
-	"log/slog"
 
-	"github.com/cn-maul/rosetta-gateway/internal/crypto"
 	"github.com/cn-maul/rosetta-gateway/internal/routing"
 	"github.com/cn-maul/rosetta-gateway/internal/store"
 	"github.com/cn-maul/rosetta-gateway/internal/upstream"
 )
 
-func RebuildFromDB(ctx context.Context, st *store.Store, pool *upstream.Pool, masterKey []byte, logger *slog.Logger) (*Snapshot, error) {
+// RebuildFromDB 只搬运「路由/上游/密钥」这三类解析元数据。
+// 凭据解密不在这里发生——上游池在 BuildFromStore 里自行解密建客户端，
+// 所以本函数不需要主密钥，也不需要 logger。
+func RebuildFromDB(ctx context.Context, st *store.Store, pool *upstream.Pool) (*Snapshot, error) {
 	snap := &Snapshot{
 		Routes:    routing.NewRouteIndex(),
 		Providers: make(map[string]*ProviderSnapshot),
@@ -34,6 +35,7 @@ func RebuildFromDB(ctx context.Context, st *store.Store, pool *upstream.Pool, ma
 			ID:       p.ID,
 			Slug:     p.Slug,
 			Endpoint: p.Endpoint,
+			Protocol: p.Protocol,
 			Enabled:  p.Enabled,
 		})
 	}
@@ -81,19 +83,5 @@ func RebuildFromDB(ctx context.Context, st *store.Store, pool *upstream.Pool, ma
 		}
 	}
 
-	_ = masterKey
-	_ = logger
-
 	return snap, nil
-}
-
-func decryptKey(enc []byte, masterKey []byte) (string, error) {
-	if masterKey == nil {
-		return "", crypto.ErrNoMasterKey
-	}
-	plain, err := crypto.Decrypt(enc, masterKey)
-	if err != nil {
-		return "", err
-	}
-	return string(plain), nil
 }

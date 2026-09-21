@@ -21,13 +21,18 @@ func NewModelHandler(st *store.Store, masterKey []byte, cfg *config.Config) *Mod
 	return &ModelHandler{store: st, masterKey: masterKey, cfg: cfg}
 }
 
+// modelRequest 是上游模型的创建 / PATCH 输入。
+//
+// PATCH 语义（2026-09-21 重构）：字段为指针，nil = 未提供（保持原值）。
+// ContextWindow / MaxOutputTokens 传 0 是合法值 —— 会落回 NULL，即「未设置」，
+// 旧实现下这两个字段一旦写入就再也无法清空。
 type modelRequest struct {
-	ModelID          string `json:"model_id"`
-	DisplayName      string `json:"display_name"`
-	Enabled          *bool  `json:"enabled"`
-	ContextWindow    int    `json:"context_window"`
-	MaxOutputTokens  int    `json:"max_output_tokens"`
-	DefaultExtraJSON string `json:"default_extra_json"`
+	ModelID          *string `json:"model_id"`
+	DisplayName      *string `json:"display_name"`
+	Enabled          *bool   `json:"enabled"`
+	ContextWindow    *int    `json:"context_window"`
+	MaxOutputTokens  *int    `json:"max_output_tokens"`
+	DefaultExtraJSON *string `json:"default_extra_json"`
 }
 
 type modelResponse struct {
@@ -74,8 +79,16 @@ func (h *ModelHandler) Create(w http.ResponseWriter, r *http.Request, providerID
 		return
 	}
 
-	if req.ModelID == "" {
+	modelID := strings.TrimSpace(derefStr(req.ModelID))
+	if modelID == "" {
 		writeError(w, http.StatusBadRequest, "model_id is required")
+		return
+	}
+
+	ctxWindow := derefInt(req.ContextWindow)
+	maxOut := derefInt(req.MaxOutputTokens)
+	if ctxWindow < 0 || maxOut < 0 {
+		writeError(w, http.StatusBadRequest, "context_window and max_output_tokens cannot be negative")
 		return
 	}
 
@@ -87,12 +100,12 @@ func (h *ModelHandler) Create(w http.ResponseWriter, r *http.Request, providerID
 	m := &store.UpstreamModel{
 		ID:               generateID(),
 		ProviderID:       providerID,
-		ModelID:          req.ModelID,
-		DisplayName:      req.DisplayName,
+		ModelID:          modelID,
+		DisplayName:      strings.TrimSpace(derefStr(req.DisplayName)),
 		Enabled:          enabled,
-		ContextWindow:    req.ContextWindow,
-		MaxOutputTokens:  req.MaxOutputTokens,
-		DefaultExtraJSON: req.DefaultExtraJSON,
+		ContextWindow:    ctxWindow,
+		MaxOutputTokens:  maxOut,
+		DefaultExtraJSON: derefStr(req.DefaultExtraJSON),
 	}
 
 	if err := h.store.CreateUpstreamModel(r.Context(), m); err != nil {
@@ -116,23 +129,38 @@ func (h *ModelHandler) Update(w http.ResponseWriter, r *http.Request, id string)
 		return
 	}
 
-	if req.ModelID != "" {
-		existing.ModelID = req.ModelID
+	if req.ModelID != nil {
+		v := strings.TrimSpace(*req.ModelID)
+		if v == "" {
+			writeError(w, http.StatusBadRequest, "model_id cannot be empty")
+			return
+		}
+		existing.ModelID = v
 	}
-	if req.DisplayName != "" {
-		existing.DisplayName = req.DisplayName
+	// 可清空字段：空串即清空
+	if req.DisplayName != nil {
+		existing.DisplayName = strings.TrimSpace(*req.DisplayName)
 	}
 	if req.Enabled != nil {
 		existing.Enabled = *req.Enabled
 	}
-	if req.ContextWindow != 0 {
-		existing.ContextWindow = req.ContextWindow
+	// 传 0 = 显式清空（落 NULL）；负数是非法输入
+	if req.ContextWindow != nil {
+		if *req.ContextWindow < 0 {
+			writeError(w, http.StatusBadRequest, "context_window cannot be negative")
+			return
+		}
+		existing.ContextWindow = *req.ContextWindow
 	}
-	if req.MaxOutputTokens != 0 {
-		existing.MaxOutputTokens = req.MaxOutputTokens
+	if req.MaxOutputTokens != nil {
+		if *req.MaxOutputTokens < 0 {
+			writeError(w, http.StatusBadRequest, "max_output_tokens cannot be negative")
+			return
+		}
+		existing.MaxOutputTokens = *req.MaxOutputTokens
 	}
-	if req.DefaultExtraJSON != "" {
-		existing.DefaultExtraJSON = req.DefaultExtraJSON
+	if req.DefaultExtraJSON != nil {
+		existing.DefaultExtraJSON = *req.DefaultExtraJSON
 	}
 
 	if err := h.store.UpdateUpstreamModel(r.Context(), id, existing); err != nil {

@@ -22,6 +22,8 @@ type statsResponse struct {
 	TotalTokens     int64   `json:"total_tokens"`
 	InputTokens     int64   `json:"input_tokens"`
 	OutputTokens    int64   `json:"output_tokens"`
+	CachedTokens    int64   `json:"cached_tokens"`
+	CacheHitRate    float64 `json:"cache_hit_rate"`
 	ErrorCount      int64   `json:"error_count"`
 	AvgTokensPerSec float64 `json:"avg_tokens_per_sec"`
 	AvgTtfbMs       float64 `json:"avg_ttfb_ms"`
@@ -35,11 +37,14 @@ func (h *StatsHandler) Get(w http.ResponseWriter, r *http.Request) {
 	}
 	tps, _ := h.store.GetRecentThroughput(r.Context(), 5)
 	ttfb, _ := h.store.GetRecentTtfbMs(r.Context(), 5)
+	hitRate, _ := h.store.CacheHitRate(r.Context())
 	writeJSON(w, http.StatusOK, statsResponse{
 		TotalRequests:   stats.TotalRequests,
 		TotalTokens:     stats.TotalTokens,
 		InputTokens:     stats.InputTokens,
 		OutputTokens:    stats.OutputTokens,
+		CachedTokens:    stats.CachedTokens,
+		CacheHitRate:    hitRate,
 		ErrorCount:      stats.ErrorCount,
 		AvgTokensPerSec: tps,
 		AvgTtfbMs:       ttfb,
@@ -64,7 +69,7 @@ func (h *ReloadHandler) Reload(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	snap, err := snapshot.RebuildFromDB(r.Context(), h.store, h.pool, h.masterKey, nil)
+	snap, err := snapshot.RebuildFromDB(r.Context(), h.store, h.pool)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "failed to rebuild snapshot: "+err.Error())
 		return

@@ -24,7 +24,13 @@ type OpenAIChatRequest struct {
 	PresencePenalty     *float64            `json:"presence_penalty,omitempty"`
 	FrequencyPenalty    *float64            `json:"frequency_penalty,omitempty"`
 	N                  *int                `json:"n,omitempty"`
-	Extra              map[string]any      `json:"-"`
+
+	// Extra is the raw passthrough slot mirroring rosetta.ChatRequest.Extra.
+	// The json:"-" tag stops the decoder from ever writing it and nothing
+	// else fills it yet, so it is always nil today. When unrecognized-field
+	// collection lands, feed it through ApplyProtocolPrivateExtra so the
+	// per-protocol gate still applies.
+	Extra map[string]any `json:"-"`
 }
 
 type StreamOptions struct {
@@ -110,11 +116,53 @@ func (r *OpenAIChatRequest) ToRosetta() *rosetta.ChatRequest {
 		req.Tools = tools
 	}
 
-	if r.Extra != nil {
-		req.Extra = r.Extra
+	return req
+}
+
+// ApplyProtocolPrivateExtra forwards the OpenAI-only request fields the SDK
+// does not model onto req.Extra, so they reach the upstream instead of being
+// silently dropped on the floor.
+//
+// Only an OpenAI-Chat upstream parses this shape. Anthropic spells tool_choice
+// as an object rather than a bare string and has no penalty knobs at all, so
+// forwarding OpenAI-shaped values there would turn today's silent drop into a
+// hard 400; the Responses API has no penalty fields either. Both are skipped
+// and the fields stay dropped, as before.
+//
+// "auto" and an empty protocol are let through on purpose: they resolve to an
+// OpenAI-compatible dialect in practice, and whitelisting only "openai-chat"
+// would disable the passthrough for the common bootstrap config.
+//
+// n is deliberately absent. rosetta models a single assistant turn -- the
+// unary decoder reads Choices[0] and the streaming decoder skips every
+// index != 0 -- so n > 1 would bill the caller for candidates the gateway
+// then discards. Dropping it is the safer outcome.
+func (r *OpenAIChatRequest) ApplyProtocolPrivateExtra(req *rosetta.ChatRequest, protocol string) {
+	if protocol == "anthropic" || protocol == "openai-responses" {
+		return
 	}
 
-	return req
+	extra := map[string]any{}
+	if r.ToolChoice != nil {
+		extra["tool_choice"] = r.ToolChoice
+	}
+	if r.PresencePenalty != nil {
+		extra["presence_penalty"] = *r.PresencePenalty
+	}
+	if r.FrequencyPenalty != nil {
+		extra["frequency_penalty"] = *r.FrequencyPenalty
+	}
+	if len(extra) == 0 {
+		return
+	}
+
+	if req.Extra == nil {
+		req.Extra = extra
+		return
+	}
+	for k, v := range extra {
+		req.Extra[k] = v
+	}
 }
 
 func maxTokens(r *OpenAIChatRequest) int {

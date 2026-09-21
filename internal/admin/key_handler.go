@@ -4,6 +4,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"net/http"
+	"strings"
 
 	"github.com/cn-maul/rosetta-gateway/internal/crypto"
 	"github.com/cn-maul/rosetta-gateway/internal/store"
@@ -17,17 +18,23 @@ func NewKeyHandler(st *store.Store) *KeyHandler {
 	return &KeyHandler{store: st}
 }
 
+// keyRequest 是访问密钥的创建 / PATCH 输入。
+// PATCH 语义：字段为指针，nil = 未提供（保持原值），非 nil = 显式赋新值。
+// 注：quota_tokens 目前只有读路径（列表/详情下发），没有任何写路径与配额校验，
+// 属于未接线的存量字段，此处不提供写入入口，避免造成「配额可用」的错觉。
 type keyRequest struct {
-	Name    string `json:"name"`
-	Enabled *bool  `json:"enabled"`
+	Name    *string `json:"name"`
+	Enabled *bool   `json:"enabled"`
 }
 
 type keyResponse struct {
-	ID        string `json:"id"`
-	KeyPrefix string `json:"key_prefix"`
-	Name      string `json:"name"`
-	Enabled   bool   `json:"enabled"`
-	CreatedAt int64  `json:"created_at"`
+	ID         string `json:"id"`
+	KeyPrefix  string `json:"key_prefix"`
+	Name       string `json:"name"`
+	Enabled    bool   `json:"enabled"`
+	QuotaTokens int64 `json:"quota_tokens"`
+	UsedTokens  int64 `json:"used_tokens"`
+	CreatedAt  int64  `json:"created_at"`
 }
 
 type keyCreateResponse struct {
@@ -55,7 +62,8 @@ func (h *KeyHandler) Create(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if req.Name == "" {
+	name := strings.TrimSpace(derefStr(req.Name))
+	if name == "" {
 		writeError(w, http.StatusBadRequest, "name is required")
 		return
 	}
@@ -74,7 +82,7 @@ func (h *KeyHandler) Create(w http.ResponseWriter, r *http.Request) {
 		ID:        generateID(),
 		KeyHash:   keyHash,
 		KeyPrefix: keyPrefix,
-		Name:      req.Name,
+		Name:      name,
 		Enabled:   enabled,
 	}
 
@@ -102,8 +110,13 @@ func (h *KeyHandler) Update(w http.ResponseWriter, r *http.Request, id string) {
 		return
 	}
 
-	if req.Name != "" {
-		existing.Name = req.Name
+	if req.Name != nil {
+		name := strings.TrimSpace(*req.Name)
+		if name == "" {
+			writeError(w, http.StatusBadRequest, "name cannot be empty")
+			return
+		}
+		existing.Name = name
 	}
 	if req.Enabled != nil {
 		existing.Enabled = *req.Enabled
@@ -127,10 +140,12 @@ func (h *KeyHandler) Delete(w http.ResponseWriter, r *http.Request, id string) {
 
 func toKeyResponse(k store.AccessKey) keyResponse {
 	return keyResponse{
-		ID:        k.ID,
-		KeyPrefix: k.KeyPrefix,
-		Name:      k.Name,
-		Enabled:   k.Enabled,
-		CreatedAt: k.CreatedAt,
+		ID:          k.ID,
+		KeyPrefix:   k.KeyPrefix,
+		Name:        k.Name,
+		Enabled:     k.Enabled,
+		QuotaTokens: k.QuotaTokens,
+		UsedTokens:  k.UsedTokens,
+		CreatedAt:   k.CreatedAt,
 	}
 }

@@ -64,7 +64,12 @@ func Load(path string) (*Config, error) {
 }
 
 // Default 返回一份可直接启动的最小配置：不含任何 provider/route，
-// 全部由管理后台在前端添加。admin_token 留空 = 后台免鉴权，首次启动即可进面板。
+// 全部由管理后台在前端添加。
+//
+// admin_token 留空**不等于**后台免鉴权：管理凭据独立存放在可执行文件同级的
+// admin_auth.json（见 internal/adminauth）。留空且凭据文件不存在时，后台处于
+// 「等待首次设置密码」状态 —— 除 password/check 与首次 password/set 外的接口一律 401。
+// 这也是默认 listen 只绑回环的原因。
 func Default() *Config {
 	c := &Config{
 		MasterKeyEnv: "ROSETTA_GW_MASTER_KEY",
@@ -114,7 +119,10 @@ func Parse(data []byte) (*Config, error) {
 
 func (c *Config) setDefaults() {
 	if c.Listen == "" {
-		c.Listen = "0.0.0.0:8080"
+		// 默认只监听回环。网关对外提供 /v1 是常态，但**首次启动时后台还没有任何凭据**，
+		// 此时绑 0.0.0.0 等于把「抢先设置管理员密码」的权利交给局域网里第一个访问者。
+		// 要对外服务就显式改成 0.0.0.0:<port>（启动日志会打印实际监听地址）。
+		c.Listen = "127.0.0.1:8080"
 	}
 	if c.DBPath == "" {
 		c.DBPath = "./data/gateway.db"

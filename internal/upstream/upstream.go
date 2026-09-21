@@ -59,6 +59,10 @@ func (p *Pool) BuildFromConfig(cfg *config.Config) error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
+	// 重建前先清空：否则从配置删掉的上游会一直留在池里，
+	// /v1 仍然能路由到它（快照已删、池里还在）。
+	p.providers = make(map[string]*ProviderEntry)
+
 	for _, bp := range cfg.Bootstrap.Providers {
 		prov := &ProviderEntry{
 			ID:         bp.Slug,
@@ -106,6 +110,10 @@ func (p *Pool) BuildFromConfig(cfg *config.Config) error {
 func (p *Pool) BuildFromStore(ctx context.Context, st *store.Store, masterKey []byte, cfg *config.Config) error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
+
+	// 重建前先清空：admin 的每个写操作都会触发 reload → 本函数，
+	// 不清空的话「删除上游」在池里永不生效，请求仍会被转发到已删除的 provider。
+	p.providers = make(map[string]*ProviderEntry)
 
 	providers, err := st.ListProviders(ctx)
 	if err != nil {
@@ -304,6 +312,12 @@ func (p *Pool) selectWeighted(creds []*CredentialEntry) *CredentialEntry {
 	totalWeight := 0
 	for _, c := range creds {
 		totalWeight += c.Weight
+	}
+
+	// 权重全为 0 时不能走加权逻辑：rand.Intn(0) 会 panic，直接把网关打挂。
+	// 这是可达状态 —— 后台把每条凭据的权重都改成 0 即可。退化为均匀随机。
+	if totalWeight <= 0 {
+		return creds[rand.Intn(len(creds))]
 	}
 
 	r := rand.Intn(totalWeight)
@@ -521,12 +535,5 @@ func resolveEnv(name string) string {
 }
 
 func decryptCredentialKey(enc []byte, masterKey []byte) (string, error) {
-	if masterKey == nil {
-		return string(enc), nil
-	}
-	plain, err := crypto.Decrypt(enc, masterKey)
-	if err != nil {
-		return "", err
-	}
-	return string(plain), nil
+	return crypto.DecryptWithFallback(enc, masterKey)
 }

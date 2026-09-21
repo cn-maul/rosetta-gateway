@@ -104,7 +104,13 @@ func (s *Store) migrate() error {
 			key_prefix    TEXT NOT NULL,
 			name          TEXT NOT NULL,
 			enabled       INTEGER NOT NULL DEFAULT 1,
-			created_at    INTEGER NOT NULL
+			expires_at    INTEGER NOT NULL DEFAULT 0,
+			quota_tokens  INTEGER NOT NULL DEFAULT 0,
+			used_tokens   INTEGER NOT NULL DEFAULT 0,
+			rpm_limit     INTEGER NOT NULL DEFAULT 0,
+			tpm_limit     INTEGER NOT NULL DEFAULT 0,
+			created_at    INTEGER NOT NULL,
+			last_used_at  INTEGER NOT NULL DEFAULT 0
 		)`,
 		`CREATE TABLE IF NOT EXISTS usage_records (
 			id                TEXT PRIMARY KEY,
@@ -137,6 +143,11 @@ func (s *Store) migrate() error {
 			value       TEXT NOT NULL,
 			updated_at  INTEGER NOT NULL
 		)`,
+		`CREATE TRIGGER IF NOT EXISTS trg_update_used_tokens
+		 AFTER INSERT ON usage_records
+		 BEGIN
+		   UPDATE access_keys SET used_tokens = used_tokens + NEW.total_tokens WHERE id = NEW.access_key_id;
+		 END`,
 	}
 
 	for i, m := range migrations {

@@ -21,6 +21,20 @@ export interface ProviderCreatePayload {
   api_key?: string
 }
 
+// PATCH /providers/{id} 的载荷：
+// 只发要改的字段，未出现的字段后端保持原值；传 0 / "" 是显式的「改回默认 / 清空」。
+// 刻意不含 slug —— 该字段创建后不可修改，后端即使收到也忽略。
+// 也不含 id / created_at —— 服务端管理的只读字段。
+export interface ProviderUpdatePayload {
+  name?: string
+  protocol?: string
+  endpoint?: string
+  enabled?: boolean
+  timeout_ms?: number
+  max_retries?: number
+  quirks_json?: string
+}
+
 // discover 端点返回的上游模型条目；后端已把探测不到的容量替换为设置里的默认值
 export interface DiscoveredModel {
   model_id: string
@@ -87,6 +101,8 @@ export interface AccessKey {
   key_prefix: string
   name: string
   enabled: boolean
+  quota_tokens: number
+  used_tokens: number
   created_at: number
 }
 
@@ -99,6 +115,8 @@ export interface Stats {
   total_tokens: number
   input_tokens: number
   output_tokens: number
+  cached_tokens: number // 缓存读取命中的输入 token 累计
+  cache_hit_rate: number // 0~1，= cached_tokens / input_tokens；无输入样本时为 0
   error_count: number
   avg_tokens_per_sec: number
   avg_ttfb_ms: number
@@ -120,6 +138,8 @@ export interface UsageHistoryEntry {
   key_name: string // 调用密钥名称（密钥删除后为空）
   key_id: string // 调用密钥 id（回退显示用）
   total_tokens: number
+  ttfb_ms: number // 首字节时间（毫秒）
+  latency_ms: number // 总耗时（毫秒）
   status: string // 'ok' 或错误码
 }
 

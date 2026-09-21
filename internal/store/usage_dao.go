@@ -45,18 +45,45 @@ type UsageStats struct {
 	TotalTokens   int64
 	InputTokens   int64
 	OutputTokens  int64
+	CachedTokens  int64
 	ErrorCount    int64
 }
 
 func (s *Store) GetUsageStats(ctx context.Context) (*UsageStats, error) {
 	var stats UsageStats
 	err := s.db.QueryRowContext(ctx,
-		`SELECT COUNT(*), COALESCE(SUM(total_tokens), 0), COALESCE(SUM(input_tokens), 0), COALESCE(SUM(output_tokens), 0), COUNT(CASE WHEN status != 'ok' THEN 1 END) FROM usage_records`).
-		Scan(&stats.TotalRequests, &stats.TotalTokens, &stats.InputTokens, &stats.OutputTokens, &stats.ErrorCount)
+		`SELECT COUNT(*), COALESCE(SUM(total_tokens), 0), COALESCE(SUM(input_tokens), 0), COALESCE(SUM(output_tokens), 0), COALESCE(SUM(cached_tokens), 0), COUNT(CASE WHEN status != 'ok' THEN 1 END) FROM usage_records`).
+		Scan(&stats.TotalRequests, &stats.TotalTokens, &stats.InputTokens, &stats.OutputTokens, &stats.CachedTokens, &stats.ErrorCount)
 	if err != nil {
 		return nil, err
 	}
 	return &stats, nil
+}
+
+// CacheHitRate 返回缓存命中率（0~1），口径为「缓存读取输入 token / 总输入 token」。
+//
+// 分母用 input_tokens 而非 total_tokens：缓存命中衡量的是「输入侧有多少走了缓存」，
+// 输出 token 与缓存无关，计入分母只会稀释指标。
+//
+// 两个上游协议的语义已由 rosetta SDK 统一（这正是该比值恒 ≤ 1 的前提）：
+//   - openai-chat：prompt_tokens_details.cached_tokens ⊆ prompt_tokens
+//   - anthropic：SDK 把 cache_read 与 cache_creation 一并折进 input_tokens
+//     （见 provider_anthropic.go 的 anthroUsage.toUsage），因此同样 ⊆
+//
+// 全部记录参与统计（与同组其它指标口径一致）：失败记录通常没有 usage、
+// input_tokens 为 0，对分子分母都没有贡献；截断记录（truncated）的输入是真实
+// 发生过的，应当计入。无输入样本（input_tokens == 0）时返回 0，由调用方决定
+// 展示为「—」还是 0%。
+func (s *Store) CacheHitRate(ctx context.Context) (float64, error) {
+	var v float64
+	err := s.db.QueryRowContext(ctx,
+		`SELECT COALESCE(SUM(cached_tokens) * 1.0 / NULLIF(SUM(input_tokens), 0), 0)
+		   FROM usage_records`).
+		Scan(&v)
+	if err != nil {
+		return 0, err
+	}
+	return v, nil
 }
 
 // GetRecentThroughput 返回最近若干次成功调用的平均输出速度（token/s）。

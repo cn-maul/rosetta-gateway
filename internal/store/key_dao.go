@@ -7,17 +7,19 @@ import (
 )
 
 type AccessKey struct {
-	ID        string
-	KeyHash   string
-	KeyPrefix string
-	Name      string
-	Enabled   bool
-	CreatedAt int64
+	ID          string
+	KeyHash     string
+	KeyPrefix   string
+	Name        string
+	Enabled     bool
+	QuotaTokens int64
+	UsedTokens  int64
+	CreatedAt   int64
 }
 
 func (s *Store) ListAccessKeys(ctx context.Context) ([]AccessKey, error) {
 	rows, err := s.db.QueryContext(ctx,
-		`SELECT id, key_hash, key_prefix, name, enabled, created_at FROM access_keys ORDER BY created_at`)
+		`SELECT id, key_hash, key_prefix, name, enabled, quota_tokens, used_tokens, created_at FROM access_keys ORDER BY created_at`)
 	if err != nil {
 		return nil, err
 	}
@@ -27,7 +29,7 @@ func (s *Store) ListAccessKeys(ctx context.Context) ([]AccessKey, error) {
 	for rows.Next() {
 		var k AccessKey
 		var enabled int
-		if err := rows.Scan(&k.ID, &k.KeyHash, &k.KeyPrefix, &k.Name, &enabled, &k.CreatedAt); err != nil {
+		if err := rows.Scan(&k.ID, &k.KeyHash, &k.KeyPrefix, &k.Name, &enabled, &k.QuotaTokens, &k.UsedTokens, &k.CreatedAt); err != nil {
 			return nil, err
 		}
 		k.Enabled = enabled == 1
@@ -40,8 +42,8 @@ func (s *Store) GetAccessKey(ctx context.Context, id string) (*AccessKey, error)
 	var k AccessKey
 	var enabled int
 	err := s.db.QueryRowContext(ctx,
-		`SELECT id, key_hash, key_prefix, name, enabled, created_at FROM access_keys WHERE id = ?`, id).
-		Scan(&k.ID, &k.KeyHash, &k.KeyPrefix, &k.Name, &enabled, &k.CreatedAt)
+		`SELECT id, key_hash, key_prefix, name, enabled, quota_tokens, used_tokens, created_at FROM access_keys WHERE id = ?`, id).
+		Scan(&k.ID, &k.KeyHash, &k.KeyPrefix, &k.Name, &enabled, &k.QuotaTokens, &k.UsedTokens, &k.CreatedAt)
 	if err == sql.ErrNoRows {
 		return nil, nil
 	}

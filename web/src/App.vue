@@ -2,7 +2,7 @@
 import { onMounted, onUnmounted, ref, watch } from 'vue'
 import { useRoute } from 'vue-router'
 import { toasts, confirmState, settleConfirm, authState } from './ui'
-import { auth, saveToken } from './api'
+import { saveToken } from './api'
 import AppModal from './components/AppModal.vue'
 
 const route = useRoute()
@@ -26,15 +26,109 @@ watch(
   },
 )
 
-// token 输入框
+// ---------- 管理员凭据 ----------
+//
+// 三条铁律：
+//   1. 绝不「存下来就刷新」。必须先把候选密码送去 /admin/api/auth/verify 验证，
+//      通过才落 localStorage。否则密码一错就会被 401 弹回同一个对话框，
+//      而该对话框 dismissable=false，用户会被永久困在里面 ——
+//      这正是「输入密码后又让输入，一直重复」的成因。
+//   2. 校验失败必须显示原因，不能静默刷新。
+//   3. 是否「首次设置」由后端 first_setup 决定，不靠前端猜。
+
 const tokenInput = ref('')
-function submitToken() {
-  saveToken(tokenInput.value.trim())
+const isFirstSetup = ref(false)
+const authError = ref('')
+const submitting = ref(false)
+
+async function checkStatus() {
+  try {
+    const res = await fetch('/admin/api/password/check')
+    if (!res.ok) return
+    const data = await res.json()
+    isFirstSetup.value = data.first_setup ?? !data.has_password
+  } catch (e) {
+    console.error('检查密码状态失败:', e)
+  }
+}
+
+async function submit() {
+  const pwd = tokenInput.value.trim()
+  if (!pwd || submitting.value) return
+
+  authError.value = ''
+  submitting.value = true
+  try {
+    if (isFirstSetup.value) await setupPassword(pwd)
+    else await login(pwd)
+  } finally {
+    submitting.value = false
+  }
+}
+
+// 已有密码：先验证，再保存。
+async function login(pwd: string) {
+  let res: Response
+  try {
+    res = await fetch('/admin/api/auth/verify', {
+      headers: { Authorization: 'Bearer ' + pwd },
+    })
+  } catch (e) {
+    authError.value = '无法连接网关：' + (e as Error).message
+    return
+  }
+
+  if (!res.ok) {
+    authError.value =
+      res.status === 401 ? '密码错误，请重新输入' : `校验失败（HTTP ${res.status}）`
+    return
+  }
+
+  saveToken(pwd)
   authState.needToken = false
   tokenInput.value = ''
-  // 重载页面，用新 token 重新拉取数据（hash 路由下停留当前页）
+  // 此前所有请求都因 401 失败，页面数据是空的，必须重载才能拿到真实数据。
   window.location.reload()
 }
+
+// 首次使用：设置密码。后端写完立即生效（凭据是运行时状态），无需重启。
+async function setupPassword(pwd: string) {
+  let res: Response
+  try {
+    res = await fetch('/admin/api/password/set', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ password: pwd }),
+    })
+  } catch (e) {
+    authError.value = '无法连接网关：' + (e as Error).message
+    return
+  }
+
+  const data = await res.json().catch(() => null)
+  if (!res.ok) {
+    authError.value = data?.error?.message || `设置密码失败（HTTP ${res.status}）`
+    return
+  }
+
+  saveToken(pwd)
+  isFirstSetup.value = false
+  authState.needToken = false
+  tokenInput.value = ''
+  window.location.reload()
+}
+
+// 对话框「刚打开」时才探测一次状态，避免 401 风暴里反复请求。
+let wasNeedToken = false
+watch(
+  () => authState.needToken,
+  (need) => {
+    if (need && !wasNeedToken) checkStatus()
+    wasNeedToken = need
+  },
+)
+
+onMounted(checkStatus)
 
 // 版本号：构建时由 vite.config.ts 的 define 注入（单一来源：package.json / go.mod），
 // 这里先落到本地常量再交给模板，避免依赖模板内联替换。
@@ -100,26 +194,37 @@ const rosettaVersion = __ROSETTA_VERSION__
     </div>
   </AppModal>
 
-  <!-- 管理员令牌输入 -->
-  <AppModal :open="authState.needToken" title="需要管理员令牌" max-width="440px" :dismissable="false">
+  <!-- 管理员密码：首次设置 / 输入 -->
+  <AppModal
+    :open="authState.needToken"
+    :title="isFirstSetup ? '设置管理密码' : '需要管理员密码'"
+    max-width="440px"
+    :dismissable="false"
+  >
     <div class="sheet-body">
-      请输入网关配置中的管理员令牌（<span class="mono">admin_token</span>），用于访问管理
-      API。令牌保存在本机浏览器中。
+      <template v-if="isFirstSetup">
+        首次使用，请设置管理密码（至少 6 位），用于保护管理后台。
+      </template>
+      <template v-else>请输入管理密码。密码仅保存在本机浏览器中。</template>
     </div>
-    <form style="margin-top: 14px" @submit.prevent="submitToken">
+    <p v-if="authError" class="auth-error" role="alert">{{ authError }}</p>
+    <form style="margin-top: 14px" @submit.prevent="submit">
       <div class="field">
-        <label>管理员令牌</label>
+        <label>管理密码</label>
         <input
           v-model="tokenInput"
           class="input mono"
           type="password"
-          placeholder="admin token"
+          :placeholder="isFirstSetup ? '至少 6 位' : '请输入密码'"
           autocomplete="off"
           autofocus
+          @input="authError = ''"
         />
       </div>
       <div class="form-actions">
-        <button class="btn btn-primary" type="submit" :disabled="!tokenInput.trim()">保存并继续</button>
+        <button class="btn btn-primary" type="submit" :disabled="!tokenInput.trim() || submitting">
+          {{ submitting ? '验证中…' : isFirstSetup ? '设置密码' : '保存并继续' }}
+        </button>
       </div>
     </form>
   </AppModal>

@@ -2,7 +2,7 @@
 import { onMounted, ref } from 'vue'
 import { api } from '../api'
 import { toast } from '../ui'
-import { fmtTokens, fmtTimeMs, statusLabel, statusBadge } from '../fmt'
+import { fmtTokens, fmtTimeMs, fmtSec, statusLabel, statusBadge } from '../fmt'
 import type { UsageHistoryEntry } from '../types'
 
 const loading = ref(true)
@@ -60,6 +60,8 @@ defineExpose({ load })
               <th>实际模型</th>
               <th>调用密钥</th>
               <th class="num-h">Tokens</th>
+              <th class="num-h">首字(s)</th>
+              <th class="num-h">总耗时(s)</th>
               <th class="c-st">状态</th>
             </tr>
           </thead>
@@ -70,6 +72,8 @@ defineExpose({ load })
               <td class="mono dim">{{ h.upstream_model || '—' }}</td>
               <td>{{ h.key_name || h.key_id || '—' }}</td>
               <td class="num-h">{{ fmtTokens(h.total_tokens) }}</td>
+              <td class="num-h">{{ h.ttfb_ms > 0 ? fmtSec(h.ttfb_ms) : '—' }}</td>
+              <td class="num-h">{{ h.latency_ms > 0 ? fmtSec(h.latency_ms) : '—' }}</td>
               <td class="c-st">
                 <span class="badge" :class="statusBadge(h.status)">
                   {{ statusLabel(h.status) }}

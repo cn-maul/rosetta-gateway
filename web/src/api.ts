@@ -1,8 +1,15 @@
 // 管理后台 API 客户端
 //
 // 关键约定（源自后端 handler 实现，改代码前必读）：
-// 1. 所有 PATCH 接口都是「非空才覆盖」的部分更新语义 ——
-//    编辑表单必须发送完整字段，否则空串字段不会清空后端旧值。
+//
+// 1. 所有 PATCH 接口都是「字段级部分更新」：
+//    - 请求体里**出现的**字段才会被写入，未出现的字段保持原值；
+//    - 空串 / 0 是**合法值**，会被真正落库（空串在库里落 NULL）。
+//      例如 priority: 0 能真的把优先级改回 0，fallback_route_id: "" 能真的清空兜底路由。
+//    - 必填字段（name / endpoint / model_id / public_name / provider_id /
+//      upstream_model_id / protocol / api_key）显式传空串会返回 400，而不是被静默忽略。
+//    所以：只发你要改的字段即可，不必回传完整对象。
+//
 // 2. 任何写操作（create/update/delete）成功后都必须 POST /admin/api/reload，
 //    否则内存快照不刷新，新资源对 /v1 不可见。用 mutate() 统一封装。
 // 3. 错误响应统一为 {"error":{"message":...,"type":...}}。
@@ -93,6 +100,7 @@ export async function mutate<T>(fn: () => Promise<T>): Promise<T> {
 import type {
   Provider,
   ProviderCreatePayload,
+  ProviderUpdatePayload,
   Credential,
   UpstreamModel,
   DiscoveredModel,
@@ -110,7 +118,7 @@ export const api = {
   // providers
   providers: () => get<Provider[]>('/providers'),
   createProvider: (b: ProviderCreatePayload) => mutate(() => post<Provider>('/providers', b)),
-  updateProvider: (id: string, b: Partial<Provider>) => mutate(() => patch<Provider>(`/providers/${id}`, b)),
+  updateProvider: (id: string, b: ProviderUpdatePayload) => mutate(() => patch<Provider>(`/providers/${id}`, b)),
   deleteProvider: (id: string) => mutate(() => del(`/providers/${id}`)),
   testProvider: (id: string) => post<{ status?: string; message?: string }>(`/providers/${id}/test`),
 

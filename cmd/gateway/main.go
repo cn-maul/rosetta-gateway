@@ -19,6 +19,7 @@ import (
 
 	"github.com/cn-maul/rosetta"
 	"github.com/cn-maul/rosetta-gateway/internal/admin"
+	"github.com/cn-maul/rosetta-gateway/internal/adminauth"
 	"github.com/cn-maul/rosetta-gateway/internal/auth"
 	"github.com/cn-maul/rosetta-gateway/internal/config"
 	"github.com/cn-maul/rosetta-gateway/internal/crypto"
@@ -32,21 +33,48 @@ import (
 	"github.com/cn-maul/rosetta-gateway/internal/webui"
 )
 
+// homeEnvVar 是状态根目录的环境变量名。
+//
+// 容器镜像靠它把 config.json、master.key、admin_auth.json 与数据库整体
+// 指到挂载卷上，让镜像层保持无状态（见 DOCKER.md）。
+const homeEnvVar = "ROSETTA_GW_HOME"
+
+// buildVersion 由构建期注入：-ldflags "-X main.buildVersion=x.y.z"。
+// 未注入时为 "dev"。取值与前端页脚的 __APP_VERSION__ 同源
+// —— 都来自 web/package.json 的 version，由 CI 打镜像时统一传入。
+var buildVersion = "dev"
+
+// resolveHome 返回状态根目录。
+//
+// 默认取可执行文件所在目录：这样无论当前工作目录是什么，都读同一份 config.json、
+// 命中同一个数据库 —— 状态跟着二进制走，而不是跟着 CWD 漂。
+// homeEnvVar 非空时改用它，用于把状态整体重定向到挂载卷。
+func resolveHome(exeDir string) string {
+	override := strings.TrimSpace(os.Getenv(homeEnvVar))
+	if override == "" {
+		return exeDir
+	}
+	if abs, err := filepath.Abs(override); err == nil {
+		return abs
+	}
+	return override
+}
+
 func main() {
 	logger := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{
 		Level: slog.LevelInfo,
 	}))
 
-	// 配置与数据都按可执行文件所在目录解析，与当前工作目录无关：
-	// 无论从哪个目录双击或命令行启动，都读同一个 config.json、命中同一个数据库。
 	exePath, err := os.Executable()
 	if err != nil {
 		logger.Error("failed to resolve executable path", "error", err)
 		os.Exit(1)
 	}
-	exeDir := filepath.Dir(exePath)
+	homeDir := resolveHome(filepath.Dir(exePath))
 
-	configPath := filepath.Join(exeDir, "config.json")
+	logger.Info("rosetta-gateway starting", "version", buildVersion, "home_dir", homeDir)
+
+	configPath := filepath.Join(homeDir, "config.json")
 	cfg, generated, err := config.LoadOrGenerate(configPath)
 	if err != nil {
 		logger.Error("failed to load config", "error", err)
@@ -57,15 +85,18 @@ func main() {
 	}
 
 	if !filepath.IsAbs(cfg.DBPath) {
-		cfg.DBPath = filepath.Join(exeDir, cfg.DBPath)
+		cfg.DBPath = filepath.Join(homeDir, cfg.DBPath)
 	}
 
 	logger.Info("config loaded", "listen", cfg.Listen, "db_path", cfg.DBPath, "log_level", cfg.LogLevel)
 
-	masterKey, err := crypto.GetMasterKey(cfg.MasterKeyEnv)
-	if err != nil {
-		logger.Warn("master key not set, credential encryption disabled", "error", err)
+	masterKey, generatedKey, err := crypto.LoadMasterKey(cfg.MasterKeyEnv, homeDir)
+	switch {
+	case err != nil:
+		logger.Warn("master key unavailable, credential encryption disabled", "error", err)
 		masterKey = nil
+	case generatedKey:
+		logger.Info("generated master key", "path", filepath.Join(homeDir, crypto.KeyFileName))
 	}
 
 	db, err := store.Open(cfg.DBPath, logger)
@@ -75,7 +106,7 @@ func main() {
 	}
 	defer db.Close()
 
-	bootstrapDB(db, cfg, logger)
+	bootstrapDB(db, cfg, logger, masterKey)
 
 	pool := upstream.NewPool(logger)
 	if err := pool.BuildFromStore(context.Background(), db, masterKey, cfg); err != nil {
@@ -85,7 +116,7 @@ func main() {
 		}
 	}
 
-	snap, err := snapshot.RebuildFromDB(context.Background(), db, pool, masterKey, logger)
+	snap, err := snapshot.RebuildFromDB(context.Background(), db, pool)
 	if err != nil {
 		logger.Error("failed to rebuild snapshot from DB", "error", err)
 		snap = buildSnapshotFromConfig(cfg)
@@ -96,9 +127,28 @@ func main() {
 	mux.HandleFunc("POST /v1/chat/completions", handleChatCompletions(pool, cfg, db, logger))
 	mux.HandleFunc("GET /v1/models", handleListModels())
 
+	// 管理端凭据。两个来源，优先级：用户在后台设置的密码（admin_auth.json）
+	// > config.json 的 admin_token（或 ADMIN_TOKEN 环境变量）作为兜底。
+	//
+	// 凭据放在可执行文件同级而不是数据库里，理由见 internal/adminauth 的包注释：
+	// gateway.db 是「可丢弃的运行时数据」（删库重建是常规操作），
+	// 而管理员密码是身份凭据 —— 放库里等于「删库 = 把自己锁在门外」。
 	adminToken := cfg.AdminToken
 	if adminToken == "" {
 		adminToken = os.Getenv("ADMIN_TOKEN")
+	}
+
+	authStore, err := adminauth.Open(adminauth.ResolvePath(homeDir), adminToken)
+	if err != nil {
+		logger.Error("failed to load admin credentials", "error", err)
+		os.Exit(1)
+	}
+	if authStore.HasUserPassword() {
+		logger.Info("admin password loaded", "path", authStore.Path())
+	} else if adminToken != "" {
+		logger.Info("using admin_token from config; set a password in the admin UI to override it")
+	} else {
+		logger.Warn("no admin credential configured; the admin UI will ask you to set a password on first visit")
 	}
 
 	providerHandler := admin.NewProviderHandler(db, masterKey, cfg)
@@ -110,6 +160,7 @@ func main() {
 	settingsHandler := admin.NewSettingsHandler(db)
 	reloadHandler := admin.NewReloadHandler(db, masterKey, pool, cfg)
 	usageHandler := admin.NewUsageHandler(db)
+	passwordHandler := admin.NewPasswordHandler(authStore)
 
 	adminMux := http.NewServeMux()
 	adminMux.HandleFunc("GET /admin/api/providers", providerHandler.List)
@@ -142,17 +193,20 @@ func main() {
 	adminMux.HandleFunc("DELETE /admin/api/keys/{id}", func(w http.ResponseWriter, r *http.Request) { keyHandler.Delete(w, r, r.PathValue("id")) })
 
 	adminMux.HandleFunc("GET /admin/api/stats", statsHandler.Get)
-	adminMux.HandleFunc("GET /admin/api/settings", settingsHandler.Get)
-	adminMux.HandleFunc("PUT /admin/api/settings", settingsHandler.Update)
 	adminMux.HandleFunc("POST /admin/api/reload", reloadHandler.Reload)
 	adminMux.HandleFunc("GET /admin/api/usage", usageHandler.Query)
 	adminMux.HandleFunc("GET /admin/api/usage/by-key", usageHandler.GroupByKey)
 	adminMux.HandleFunc("GET /admin/api/usage/by-model", usageHandler.GroupByModel)
 	adminMux.HandleFunc("GET /admin/api/usage/by-provider", usageHandler.GroupByProvider)
 	adminMux.HandleFunc("GET /admin/api/usage/by-day", usageHandler.GroupByDay)
+	adminMux.HandleFunc("GET /admin/api/settings", settingsHandler.Get)
+	adminMux.HandleFunc("PUT /admin/api/settings", settingsHandler.Update)
+	adminMux.HandleFunc("GET /admin/api/password/check", passwordHandler.Check)
+	adminMux.HandleFunc("POST /admin/api/password/set", passwordHandler.Set)
+	adminMux.HandleFunc("GET /admin/api/auth/verify", passwordHandler.Verify)
 	adminMux.HandleFunc("GET /admin/api/usage/history", usageHandler.History)
 
-	adminWrapped := server.AdminAuth(adminMux, adminToken)
+	adminWrapped := server.AdminAuth(adminMux, authStore)
 
 	// SPA 产物在 embed FS 的 dist/ 子目录下；剥掉 /admin 前缀后交给 FileServer。
 	// hash 路由下路径只有 /admin/（入口）与 /admin/assets/*（静态资源）两类。
@@ -211,7 +265,7 @@ func main() {
 	logger.Info("server stopped")
 }
 
-func bootstrapDB(db *store.Store, cfg *config.Config, logger *slog.Logger) {
+func bootstrapDB(db *store.Store, cfg *config.Config, logger *slog.Logger, masterKey []byte) {
 	ctx := context.Background()
 	existing, _ := db.ListProviders(ctx)
 	if len(existing) > 0 {
@@ -226,8 +280,6 @@ func bootstrapDB(db *store.Store, cfg *config.Config, logger *slog.Logger) {
 	}
 
 	logger.Info("bootstrapping database from config")
-
-	masterKey, _ := crypto.GetMasterKey(cfg.MasterKeyEnv)
 
 	// 记录 provider slug + 上游模型名 -> 实际写入 upstream_models.id 的映射。
 	// routes.upstream_model_id 是外键，必须引用真实主键，不能自行拼接。
@@ -337,6 +389,7 @@ func buildSnapshotFromConfig(cfg *config.Config) *snapshot.Snapshot {
 			ID:       bp.Slug,
 			Slug:     bp.Slug,
 			Endpoint: bp.Endpoint,
+			Protocol: bp.Protocol,
 			Enabled:  true,
 		})
 		for _, modelID := range bp.Models {
@@ -412,6 +465,7 @@ func handleChatCompletions(pool *upstream.Pool, cfg *config.Config, db *store.St
 
 		rosettaReq := req.ToRosetta()
 		rosettaReq.Model = res.UpstreamModel.ModelID
+		req.ApplyProtocolPrivateExtra(rosettaReq, res.Provider.Protocol)
 
 		if req.Stream {
 			handleStreamRequest(w, r, client, rosettaReq, req.Model, res.Provider.ID, res.UpstreamModel.ModelID, authCtx.KeyID, wantsStreamUsage(req), cfg, db, logger, start)

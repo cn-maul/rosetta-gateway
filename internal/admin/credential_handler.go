@@ -2,6 +2,7 @@ package admin
 
 import (
 	"net/http"
+	"strings"
 
 	"github.com/cn-maul/rosetta-gateway/internal/crypto"
 	"github.com/cn-maul/rosetta-gateway/internal/store"
@@ -16,11 +17,16 @@ func NewCredentialHandler(st *store.Store, masterKey []byte) *CredentialHandler 
 	return &CredentialHandler{store: st, masterKey: masterKey}
 }
 
+// credentialRequest 是上游凭据的创建 / PATCH 输入。
+//
+// PATCH 语义（2026-09-21 重构）：字段为指针，nil = 未提供（保持原值）。
+// APIKey 是「不提供即不更换」；显式传空串会被拒绝 —— 空密钥的凭据没有意义，
+// 要弃用请直接删除凭据或置 enabled=false，不该静默变成一条永远 401 的记录。
 type credentialRequest struct {
-	Label    string `json:"label"`
-	APIKey   string `json:"api_key"`
-	Weight   int    `json:"weight"`
-	Enabled  *bool  `json:"enabled"`
+	Label   *string `json:"label"`
+	APIKey  *string `json:"api_key"`
+	Weight  *int    `json:"weight"`
+	Enabled *bool   `json:"enabled"`
 }
 
 type credentialResponse struct {
@@ -54,12 +60,14 @@ func (h *CredentialHandler) Create(w http.ResponseWriter, r *http.Request, provi
 		return
 	}
 
-	if req.APIKey == "" {
+	// 密钥里的首尾空白在 HTTP 头里非法，粘贴时极易带上换行，统一裁掉
+	apiKey := strings.TrimSpace(derefStr(req.APIKey))
+	if apiKey == "" {
 		writeError(w, http.StatusBadRequest, "api_key is required")
 		return
 	}
 
-	enc, err := encryptSecret(req.APIKey, h.masterKey)
+	enc, err := encryptSecret(apiKey, h.masterKey)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "failed to encrypt key: "+err.Error())
 		return
@@ -69,15 +77,15 @@ func (h *CredentialHandler) Create(w http.ResponseWriter, r *http.Request, provi
 	if req.Enabled != nil {
 		enabled = *req.Enabled
 	}
-	weight := req.Weight
-	if weight == 0 {
+	weight := derefInt(req.Weight)
+	if weight <= 0 {
 		weight = 1
 	}
 
 	c := &store.Credential{
 		ID:         generateID(),
 		ProviderID: providerID,
-		Label:      req.Label,
+		Label:      strings.TrimSpace(derefStr(req.Label)),
 		APIKeyEnc:  enc,
 		Enabled:    enabled,
 		Weight:     weight,
@@ -105,11 +113,17 @@ func (h *CredentialHandler) Update(w http.ResponseWriter, r *http.Request, id st
 		return
 	}
 
-	if req.Label != "" {
-		existing.Label = req.Label
+	// label 可清空
+	if req.Label != nil {
+		existing.Label = strings.TrimSpace(*req.Label)
 	}
-	if req.APIKey != "" {
-		enc, err := encryptSecret(req.APIKey, h.masterKey)
+	if req.APIKey != nil {
+		apiKey := strings.TrimSpace(*req.APIKey)
+		if apiKey == "" {
+			writeError(w, http.StatusBadRequest, "api_key cannot be empty; delete the credential instead")
+			return
+		}
+		enc, err := encryptSecret(apiKey, h.masterKey)
 		if err != nil {
 			writeError(w, http.StatusInternalServerError, "failed to encrypt key")
 			return
@@ -119,8 +133,12 @@ func (h *CredentialHandler) Update(w http.ResponseWriter, r *http.Request, id st
 	if req.Enabled != nil {
 		existing.Enabled = *req.Enabled
 	}
-	if req.Weight != 0 {
-		existing.Weight = req.Weight
+	if req.Weight != nil {
+		if *req.Weight < 1 {
+			writeError(w, http.StatusBadRequest, "weight must be >= 1")
+			return
+		}
+		existing.Weight = *req.Weight
 	}
 
 	if err := h.store.UpdateCredential(r.Context(), id, existing); err != nil {

@@ -30,6 +30,19 @@ export function fmtSec(ms: number): string {
   return s.toFixed(2)
 }
 
+/**
+ * 比率（0~1）→ 百分比字符串。
+ * 保留一位下限保护：命中率极低但不为 0 时不显示成「0」，
+ * 否则「几乎没命中」和「完全没有缓存」在界面上无法区分。
+ */
+export function fmtPercent(rate: number): string {
+  if (!Number.isFinite(rate) || rate <= 0) return '0'
+  const p = rate * 100
+  if (p >= 10) return String(Math.round(p))
+  if (p >= 0.1) return p.toFixed(1)
+  return '<0.1'
+}
+
 // 毫秒时间戳 → 「MM-DD HH:MM:SS」（调用历史表格用）
 export function fmtTimeMs(tsMs: number): string {
   if (!tsMs) return '—'
@@ -38,16 +51,20 @@ export function fmtTimeMs(tsMs: number): string {
   return `${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`
 }
 
-export function fmtDate(unixSec: number): string {
-  if (!unixSec) return '—'
-  const d = new Date(unixSec * 1000)
+export function fmtDate(unixSecOrMs: number): string {
+  if (!unixSecOrMs) return '—'
+  // 判断是秒级还是毫秒级：如果值大于 1e12，则是毫秒级
+  const ts = unixSecOrMs > 1e12 ? unixSecOrMs : unixSecOrMs * 1000
+  const d = new Date(ts)
   const p = (x: number) => String(x).padStart(2, '0')
   return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}`
 }
 
-export function fmtDateTime(unixSec: number): string {
-  if (!unixSec) return '—'
-  const d = new Date(unixSec * 1000)
+export function fmtDateTime(unixSecOrMs: number): string {
+  if (!unixSecOrMs) return '—'
+  // 判断是秒级还是毫秒级：如果值大于 1e12，则是毫秒级
+  const ts = unixSecOrMs > 1e12 ? unixSecOrMs : unixSecOrMs * 1000
+  const d = new Date(ts)
   const p = (x: number) => String(x).padStart(2, '0')
   return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`
 }

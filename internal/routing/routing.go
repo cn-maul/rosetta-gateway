@@ -24,6 +24,11 @@ type ProviderRef struct {
 	ID       string
 	Slug     string
 	Endpoint string
+	// Protocol is the upstream wire protocol ("openai-chat",
+	// "openai-responses", "anthropic", or "auto"/"" to let the SDK probe).
+	// Request construction needs it: protocol-private fields are only valid
+	// on the dialect that defines them.
+	Protocol string
 	Enabled  bool
 }
 

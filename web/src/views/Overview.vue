@@ -2,7 +2,7 @@
 import { computed, onMounted, ref } from 'vue'
 import { api } from '../api'
 import { toast } from '../ui'
-import { fmtNum, fmtTokens, fmtSpeed, fmtSec } from '../fmt'
+import { fmtNum, fmtTokens, fmtSpeed, fmtSec, fmtPercent } from '../fmt'
 import type { Stats, UsageGroupEntry } from '../types'
 
 const loading = ref(true)
@@ -87,6 +87,15 @@ defineExpose({ load })
         <div class="stat-card">
           <div class="k">输出 Tokens</div>
           <div class="v num">{{ fmtTokens(stats.output_tokens) }}</div>
+        </div>
+        <div
+          class="stat-card"
+          :title="`缓存读取 ${fmtTokens(stats.cached_tokens)} / 输入 ${fmtTokens(stats.input_tokens)} tok`"
+        >
+          <div class="k">缓存命中率</div>
+          <div class="v num">
+            {{ fmtPercent(stats.cache_hit_rate) }}<span class="unit">%</span>
+          </div>
         </div>
         <div class="stat-card">
           <div class="k">平均速度</div>

@@ -24,16 +24,33 @@ func NewProviderHandler(st *store.Store, masterKey []byte, cfg *config.Config) *
 	return &ProviderHandler{store: st, masterKey: masterKey, cfg: cfg}
 }
 
-type providerRequest struct {
-	Slug       string `json:"slug"`
+// providerCreateRequest 是新建上游的输入。
+// slug 由系统生成、enabled 固定 true、超时与重试取「设置」里的全局默认，
+// 三者都不接受客户端指定 —— 所以不与 PATCH 共用结构体。
+type providerCreateRequest struct {
 	Name       string `json:"name"`
 	Protocol   string `json:"protocol"`
 	Endpoint   string `json:"endpoint"`
-	Enabled    *bool  `json:"enabled"`
-	TimeoutMs  int    `json:"timeout_ms"`
-	MaxRetries int    `json:"max_retries"`
 	QuirksJSON string `json:"quirks_json"`
 	APIKey     string `json:"api_key"`
+}
+
+// providerUpdateRequest 是上游的 PATCH 输入。
+//
+// PATCH 语义（2026-09-21 重构）：字段为指针，nil = 未提供（保持原值）；
+// 非 nil 即显式赋新值，TimeoutMs=0 / MaxRetries=0 是合法值
+// —— 表示「回到全局默认」，旧实现下这两个字段一旦改过就再也回不去。
+//
+// 这里**没有 slug 字段**：slug 是日志、路由与管理界面对外引用的稳定标识，
+// 创建后不可修改。客户端即使传了也会被忽略。
+type providerUpdateRequest struct {
+	Name       *string `json:"name"`
+	Protocol   *string `json:"protocol"`
+	Endpoint   *string `json:"endpoint"`
+	Enabled    *bool   `json:"enabled"`
+	TimeoutMs  *int    `json:"timeout_ms"`
+	MaxRetries *int    `json:"max_retries"`
+	QuirksJSON *string `json:"quirks_json"`
 }
 
 type providerResponse struct {
@@ -67,23 +84,25 @@ func (h *ProviderHandler) List(w http.ResponseWriter, r *http.Request) {
 // slug 由系统生成，启用固定为 true，超时与重试直接取设置里的默认值；
 // 若填写了 api_key，会顺带创建一条名为 default 的凭据。
 func (h *ProviderHandler) Create(w http.ResponseWriter, r *http.Request) {
-	var req providerRequest
+	var req providerCreateRequest
 	if err := decodeJSON(r, &req); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid JSON: "+err.Error())
 		return
 	}
 
-	if req.Endpoint == "" {
+	endpoint := strings.TrimSpace(req.Endpoint)
+	if endpoint == "" {
 		writeError(w, http.StatusBadRequest, "endpoint is required")
 		return
 	}
 
 	name := strings.TrimSpace(req.Name)
 	if name == "" {
-		name = req.Endpoint
+		name = endpoint
 	}
-	if req.Protocol == "" {
-		req.Protocol = "openai-chat"
+	protocol := strings.TrimSpace(req.Protocol)
+	if protocol == "" {
+		protocol = "openai-chat"
 	}
 
 	now := time.Now().UnixMilli()
@@ -91,8 +110,8 @@ func (h *ProviderHandler) Create(w http.ResponseWriter, r *http.Request) {
 		ID:         generateID(),
 		Slug:       h.uniqueSlug(r.Context(), slugify(name)),
 		Name:       name,
-		Protocol:   req.Protocol,
-		Endpoint:   req.Endpoint,
+		Protocol:   protocol,
+		Endpoint:   endpoint,
 		Enabled:    true,
 		TimeoutMs:  h.cfg.Defaults.UpstreamTimeoutMs,
 		MaxRetries: h.cfg.Defaults.MaxRetries,
@@ -107,7 +126,7 @@ func (h *ProviderHandler) Create(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if strings.TrimSpace(req.APIKey) != "" {
-		enc, err := encryptSecret(req.APIKey, h.masterKey)
+		enc, err := encryptSecret(strings.TrimSpace(req.APIKey), h.masterKey)
 		if err != nil {
 			writeError(w, http.StatusInternalServerError, "failed to encrypt key: "+err.Error())
 			return
@@ -154,35 +173,58 @@ func (h *ProviderHandler) Update(w http.ResponseWriter, r *http.Request, id stri
 		return
 	}
 
-	var req providerRequest
+	var req providerUpdateRequest
 	if err := decodeJSON(r, &req); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid JSON: "+err.Error())
 		return
 	}
 
-	if req.Slug != "" {
-		existing.Slug = req.Slug
+	// 必填字段：显式提供时不允许置空
+	if req.Name != nil {
+		name := strings.TrimSpace(*req.Name)
+		if name == "" {
+			writeError(w, http.StatusBadRequest, "name cannot be empty")
+			return
+		}
+		existing.Name = name
 	}
-	if req.Name != "" {
-		existing.Name = req.Name
+	if req.Protocol != nil {
+		protocol := strings.TrimSpace(*req.Protocol)
+		if protocol == "" {
+			writeError(w, http.StatusBadRequest, "protocol cannot be empty")
+			return
+		}
+		existing.Protocol = protocol
 	}
-	if req.Protocol != "" {
-		existing.Protocol = req.Protocol
-	}
-	if req.Endpoint != "" {
-		existing.Endpoint = req.Endpoint
+	if req.Endpoint != nil {
+		endpoint := strings.TrimSpace(*req.Endpoint)
+		if endpoint == "" {
+			writeError(w, http.StatusBadRequest, "endpoint cannot be empty")
+			return
+		}
+		existing.Endpoint = endpoint
 	}
 	if req.Enabled != nil {
 		existing.Enabled = *req.Enabled
 	}
-	if req.TimeoutMs != 0 {
-		existing.TimeoutMs = req.TimeoutMs
+	// 0 是合法值，语义为「回到全局默认」
+	if req.TimeoutMs != nil {
+		if *req.TimeoutMs < 0 {
+			writeError(w, http.StatusBadRequest, "timeout_ms cannot be negative")
+			return
+		}
+		existing.TimeoutMs = *req.TimeoutMs
 	}
-	if req.MaxRetries != 0 {
-		existing.MaxRetries = req.MaxRetries
+	if req.MaxRetries != nil {
+		if *req.MaxRetries < 0 {
+			writeError(w, http.StatusBadRequest, "max_retries cannot be negative")
+			return
+		}
+		existing.MaxRetries = *req.MaxRetries
 	}
-	if req.QuirksJSON != "" {
-		existing.QuirksJSON = req.QuirksJSON
+	// 可清空字段
+	if req.QuirksJSON != nil {
+		existing.QuirksJSON = *req.QuirksJSON
 	}
 
 	if err := h.store.UpdateProvider(r.Context(), id, existing); err != nil {

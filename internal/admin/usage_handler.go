@@ -153,6 +153,8 @@ type usageHistoryEntry struct {
 	KeyName       string `json:"key_name"`
 	KeyID         string `json:"key_id"`
 	TotalTokens   int64  `json:"total_tokens"`
+	TTFBMs        int64  `json:"ttfb_ms"`
+	LatencyMs     int64  `json:"latency_ms"`
 	Status        string `json:"status"`
 }
 
@@ -169,7 +171,7 @@ func (h *UsageHandler) History(w http.ResponseWriter, r *http.Request) {
 	}
 
 	rows, err := h.store.DB().Query(
-		`SELECT u.ts, u.public_model, u.upstream_model, COALESCE(a.name, ''), u.access_key_id, u.total_tokens, u.status
+		`SELECT u.ts, u.public_model, u.upstream_model, COALESCE(a.name, ''), u.access_key_id, u.total_tokens, u.ttfb_ms, u.latency_ms, u.status
 		   FROM usage_records u LEFT JOIN access_keys a ON a.id = u.access_key_id
 		  WHERE u.ts >= ? AND u.ts <= ?
 		  ORDER BY u.ts DESC LIMIT ?`, from, to, limit)
@@ -182,7 +184,7 @@ func (h *UsageHandler) History(w http.ResponseWriter, r *http.Request) {
 	entries := make([]usageHistoryEntry, 0)
 	for rows.Next() {
 		var e usageHistoryEntry
-		if err := rows.Scan(&e.Ts, &e.PublicModel, &e.UpstreamModel, &e.KeyName, &e.KeyID, &e.TotalTokens, &e.Status); err != nil {
+		if err := rows.Scan(&e.Ts, &e.PublicModel, &e.UpstreamModel, &e.KeyName, &e.KeyID, &e.TotalTokens, &e.TTFBMs, &e.LatencyMs, &e.Status); err != nil {
 			continue
 		}
 		entries = append(entries, e)

@@ -319,7 +319,16 @@ resolve(model):
 
 ### 6.3 管理接口
 
-统一挂在 `/admin/api/*`，管理鉴权独立于下游 Key（`ADMIN_TOKEN` 环境变量，未设置时首次启动生成并打印一次）。
+统一挂在 `/admin/api/*`。管理鉴权独立于下游 Key：凭据存放在**可执行文件同级的 `admin_auth.json`**
+（PBKDF2-HMAC-SHA256 + 随机盐，见 `internal/adminauth`），`config.json` 的 `admin_token`
+仅作为「尚未设置密码」时的兜底与应急恢复通道。**凭证是运行时状态，设置后立即生效、无需重启。**
+
+| 端点 | 放行规则 |
+|---|---|
+| `GET /admin/api/password/check` | 恒放行（只返回布尔值） |
+| `POST /admin/api/password/set` | 仅当系统尚无任何凭据时放行；已有凭据则必须带正确的旧凭据 |
+| `GET /admin/api/auth/verify` | 需鉴权（给前端「先验证再保存」用） |
+| 其余 | `Authorization: Bearer <密码或 admin_token>` |
 
 ```
 GET    /admin/api/providers                     列表
@@ -355,6 +364,33 @@ POST   /admin/api/reload                        从 DB 重建内存快照
 ```
 
 所有写操作的事务边界：**先写 DB，提交成功后再重建快照**。DB 写失败则快照不动。
+
+#### PATCH 语义：字段级部分更新
+
+PATCH 端点一律「只看请求体里出现了哪些字段」：
+
+| 请求体 | 行为 |
+|---|---|
+| 字段不出现（或 `null`） | 保持数据库原值 |
+| 字段出现 | 显式赋新值。**空串 / `0` 都是合法值**，会真正落库（空串落 `NULL`） |
+| 必填字段显式传空串 | `400`，而不是静默忽略 |
+
+必填字段指 `name` / `endpoint` / `protocol` / `model_id` / `public_name` / `provider_id` /
+`upstream_model_id` / `api_key`。**静默忽略是最坏的选项** —— 用户会以为改成功了。
+
+因此两个直接结论：
+
+- **编辑时只发你要改的字段即可**，不必回传完整对象。
+- `priority: 0`、`fallback_route_id: ""`、`timeout_ms: 0`（=用全局默认）、
+  `context_window: 0`（=未设置）都是可表达的意图，不再是「空值即忽略」。
+
+实现约束：结构体的标量字段必须是指针，合并处写 `if req.X != nil { ... }`。
+用 `if *req.X != ""` 或解引用后判断零值的写法会把「显式置空」重新变回「未提供」，
+等于回到旧行为 —— `internal/admin/helpers.go` 的 `derefStr` / `derefInt`
+**只准用于 Create 这类「缺省即零值」的场合**。
+
+例外：`providers` 的 `slug` 创建后不可修改（它是对外引用的稳定标识），
+PATCH 结构体里刻意不含该字段，传了也会被忽略。
 
 ---
 
@@ -528,16 +564,59 @@ UPDATE access_keys SET used_tokens = used_tokens + ?, last_used_at = ? WHERE id 
 | 配置类别 | 存放位置 | 可否运行时改 |
 |---|---|---|
 | Provider / 模型 / Route / Key | **数据库** | 是（管理 API / Web 界面） |
+| **管理后台密码** | **`<exeDir>/admin_auth.json`** | **是（「设置」页，改完立即生效）** |
 | 监听地址、DB 路径、日志级别、加密主密钥、全局默认超时与重试、body 大小上限 | **配置文件** | 否（改后重启） |
 | 首次 bootstrap 的 provider/route | 配置文件（仅当 DB 为空时生效） | 否 |
 
 **关键纪律**：DB 非空时，配置文件里的 `providers` / `routes` 段落被**忽略并打印 warning**。这防止出现「界面改完、重启被配置文件覆盖」这类经典事故。
 
+**为什么管理密码不进数据库**：`gateway.db` 在本项目里是「可丢弃的运行时数据」—— 加密主密钥丢失、库损坏、想重来一遍时，标准动作就是删库重建。管理员密码是**身份凭据**，放进一个会被随手删掉的文件里，等于「删库 = 把自己锁在门外」。这与 `master.key` 独立于库的理由完全一致：**身份状态必须独立于业务数据**。
+
+**为什么也不塞进 `config.json`**：`config.json` 是运维手写的引导配置，程序回写它会丢掉注释与字段顺序；而且 `admin_token` 的语义是「运维引导用的静态令牌」，与「用户在界面上设置的管理密码」是两回事。混用会让判定逻辑互相污染 —— 早期实现因此被迫用 `len(token) == 64` 去猜「这串到底是明文还是哈希」，一个恰好 64 字符的明文令牌就会被误判成哈希而**永久锁死**。
+
+两者关系：用户设置的密码**优先**；未设置时回退到 `config.json` 的 `admin_token`（或 `ADMIN_TOKEN` 环境变量）。后者是兜底与应急恢复通道 —— 忘了密码时删掉 `admin_auth.json` 重启，就退回用 `admin_token` 登录。
+
+### 12.1.1 数据目录布局
+
+所有相对路径都按**可执行文件所在目录**解析（与进程 CWD 无关），因此部署形态是「一个目录装下全部状态」：
+
+```
+<部署目录>/
+├── gateway.exe          # 单个二进制（前端已 embed）
+├── config.json          # 手写引导配置，程序不回写
+├── master.key           # 凭据加密主密钥（缺失时程序自动生成，见下）
+├── admin_auth.json      # 管理后台密码（PBKDF2-SHA256，加盐，无明文）
+└── data/
+    └── gateway.db       # SQLite：provider/模型/路由/key/用量记录
+```
+
+删掉 `data/` 等于重置全部业务数据；删掉 `admin_auth.json` 等于重置管理密码。两者互不影响。
+
+**主密钥的解析顺序**（`crypto.LoadMasterKey`）：
+
+1. 环境变量 `master_key_env`（缺省 `ROSETTA_GW_MASTER_KEY`）
+2. `<exeDir>/master.key` 文件
+3. 都没有 → **生成一个写入 `<exeDir>/master.key`** 并复用（启动日志给出路径）
+
+之所以必须有第 3 条：早期实现只认环境变量，而 `bin/master.key` 那套自动生成活在
+`gateway.ps1` 里 —— 结果**用脚本启动有密钥、双击 exe 启动没有**，后者会把上游 API Key
+**明文**写进 `data/gateway.db`。同一份库在两种启动方式下还会互相解不开。
+密钥落盘后两条路共用一把。
+
+⚠️ **选定启动方式后不要来回换。** 环境变量优先级高于文件：先双击（密钥落在 `master.key`）、
+后来改成设环境变量启动，两把密钥不同 → 先前加密的凭据解不开。
+`gateway.ps1` 写的正是 `bin/master.key`，与 Go 侧路径一致，所以脚本与双击天然对齐。
+
+**历史明文数据的兼容**：解密走 `crypto.DecryptWithFallback` —— 主密钥存在但解不开时，
+只有数据看起来是可打印文本才按明文返回，密文形态仍报错。
+这样老库（明文）升级后立刻可用，不会被新密钥打死；但明文依旧躺在库里，
+要彻底消除得把每条凭据**重新保存一次**。
+
 ### 12.2 配置文件示例
 
 ```json
 {
-  "listen": "0.0.0.0:8080",
+  "listen": "127.0.0.1:8080",
   "db_path": "./data/gateway.db",
   "log_level": "info",
   "admin_token": "",
@@ -568,15 +647,32 @@ UPDATE access_keys SET used_tokens = used_tokens + ?, last_used_at = ? WHERE id 
 
 `api_key_env` 支持从环境变量读，避免密钥落盘到配置文件。
 
+**关于 `listen`**：默认（含程序自动生成的配置）是 `127.0.0.1:8080`。
+网关对外提供 `/v1` 是常态，但**首次启动时后台还没有任何凭据**，
+此时绑 `0.0.0.0` 等于把「抢先设置管理员密码」的权利交给局域网里第一个访问 `/admin/` 的人。
+要对外服务就显式改成 `0.0.0.0:<port>` —— 启动日志会打印实际监听地址，改完记得回头核对。
+
+**关于 `admin_token`**：留空**不等于**免鉴权。真实凭据在 `<exeDir>/admin_auth.json`。
+留空且该文件不存在时，后台处于「等待首次设置密码」状态，
+此时除 `password/check` 与首次 `password/set` 外的接口一律 401。
+
 ---
 
 ## 13. Web 管理界面（D10）
 
 ### 13.1 形态
 
-`go:embed` 打包静态资源，原生 HTML + `fetch` 调 `/admin/api/*`。**不上前端框架**：内网管理页不超过 8 个，引入 Vite/React 会带来 Node 构建链、产物管理、CI 复杂度，收益不成比例。
+`go:embed` 打包静态资源（`internal/webui/dist`），`web/` 下是 **Vue 3 + Vite + TS** 工程，`fetch` 调 `/admin/api/*`。
 
-升级边界（明确）：一旦出现「多页 + 复杂表单联动 + 图表」，换成 Vite + React，产物 `dist/` embed 进二进制。现在不预付这个成本。
+> 历史沿革：早期是单个 `index.html` 内联全部逻辑，理由写的是「内网管理页不超过 8 个，引入框架收益不成比例」，并预设了升级边界「一旦出现多页 + 复杂表单联动 + 图表就换框架」。边界随后真的被触发了（六页 + 表单弹窗 + 图表），于是按当初的约定迁到 Vue 3。构建链：`cd web && npm run build && npm run sync`（`sync` 把产物同步进 `internal/webui/dist` 供 embed），`gateway.ps1` 已编排。
+
+**鉴权**：管理 API 由 `server.AdminAuth` 中间件保护，凭据逻辑在 `internal/adminauth`。三个端点例外/半例外：
+- `GET /admin/api/password/check` —— 恒免鉴权，前端靠它决定弹「设置密码」还是「输入密码」；
+- `POST /admin/api/password/set` —— **仅在系统尚无任何凭据时免鉴权**（一次性引导窗口），已有凭据后必须带上正确的旧凭据；
+- `GET /admin/api/auth/verify` —— 需鉴权，专门给前端做「先验证再保存」。
+
+前端有一条硬规则：**绝不「把输入存进 localStorage 就刷新」**。必须先用 `/admin/api/auth/verify` 验证通过再落盘，否则密码一错就会被 401 弹回同一个对话框，而该对话框是 `dismissable=false` 的 —— 用户会被永久困在「输入密码 → 又要求输入」的循环里。
+
 
 ### 13.2 页面清单
 

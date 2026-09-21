@@ -2,7 +2,7 @@
 import { onMounted, reactive, ref } from 'vue'
 import { api } from '../api'
 import { toast, confirmBox } from '../ui'
-import { fmtDateTime, copyText } from '../fmt'
+import { fmtDateTime, fmtTokens, copyText } from '../fmt'
 import type { AccessKey, KeyCreateResponse } from '../types'
 import AppModal from '../components/AppModal.vue'
 
@@ -144,6 +144,7 @@ onMounted(load)
             </div>
             <div class="row-sub mono">{{ k.key_prefix }}</div>
             <div class="row-sub num">建于 {{ fmtDateTime(k.created_at) }}</div>
+            <div class="row-sub num">用量：{{ fmtTokens(k.used_tokens) }}</div>
           </div>
           <div class="row-side">
             <button class="btn btn-sm btn-ghost" @click="openEdit(k)">编辑</button>

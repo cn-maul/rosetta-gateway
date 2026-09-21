@@ -78,12 +78,11 @@ async function submitProvider() {
   }
   try {
     if (pForm.editing) {
-      // PATCH 为非空覆盖语义：编辑时回传完整字段
+      // PATCH 为字段级部分更新：只发要改的字段；timeout_ms/max_retries 传 0 即「回到全局默认」
       await api.updateProvider(pForm.editing, {
         name: pForm.name.trim() || pForm.endpoint.trim(),
         protocol: pForm.protocol,
         endpoint: pForm.endpoint.trim(),
-        slug: pForm.slug.trim(),
         timeout_ms: Number(pForm.timeout_ms) || 0,
         max_retries: Number(pForm.max_retries) || 0,
       })
@@ -106,11 +105,8 @@ async function submitProvider() {
 
 async function toggleProvider(p: Provider) {
   try {
-    // PATCH 为部分更新语义，发送完整字段
-    await api.updateProvider(p.id, {
-      slug: p.slug, name: p.name, protocol: p.protocol, endpoint: p.endpoint,
-      timeout_ms: p.timeout_ms, max_retries: p.max_retries, enabled: !p.enabled,
-    })
+    // 只发改动字段：其余字段后端保持原值
+    await api.updateProvider(p.id, { enabled: !p.enabled })
     toast(!p.enabled ? '已启用' : '已停用')
     await load()
   } catch (e) {
