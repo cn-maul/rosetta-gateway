@@ -1,0 +1,87 @@
+name: docker
+
+# 只由版本 tag 触发（v1.2.3），外加手动补跑。
+# 镜像的版本号直接取自 web/package.json 的 version，与软件本体保持一致；
+# 若 tag 与 package.json 不一致，构建会直接失败，避免打出名不副实的镜像。
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  # 镜像名固定为 rosetta-gateway（GHCR 命名空间用仓库属主）
+  IMAGE: ghcr.io/${{ github.repository_owner }}/rosetta-gateway
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: 解析版本号（唯一来源：web/package.json）
+        id: ver
+        run: |
+          set -euo pipefail
+          VERSION="$(node -p "require('./web/package.json').version")"
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "软件版本: ${VERSION}"
+
+      - name: 校验 tag 与软件版本一致
+        if: github.ref_type == 'tag'
+        run: |
+          set -euo pipefail
+          TAG="${GITHUB_REF_NAME#v}"
+          VER="${{ steps.ver.outputs.version }}"
+          if [ "${TAG}" != "${VER}" ]; then
+            echo "::error::git tag v${TAG} 与 web/package.json 的 ${VER} 不一致"
+            exit 1
+          fi
+          echo "tag 与 package.json 一致: ${VER}"
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: 登录 GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: 生成镜像标签与 OCI 注解
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.IMAGE }}
+          tags: |
+            type=raw,value=${{ steps.ver.outputs.version }}
+            type=raw,value=latest,enable=${{ github.ref_type == 'tag' }}
+            type=raw,value=edge,enable=${{ github.ref_type != 'tag' }}
+          labels: |
+            org.opencontainers.image.title=rosetta-gateway
+            org.opencontainers.image.description=LLM API gateway: OpenAI Chat Completions in, multi-protocol upstreams out
+            org.opencontainers.image.version=${{ steps.ver.outputs.version }}
+            org.opencontainers.image.licenses=MIT
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+
+      - name: 构建并推送
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          build-args: |
+            VERSION=${{ steps.ver.outputs.version }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max

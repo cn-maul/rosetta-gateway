@@ -1,0 +1,21 @@
+# 构建上下文裁剪：不进镜像的东西一律排除，减小上下文并避免缓存失效。
+
+# 版本控制与工作区
+.git
+.github
+.workbuddy
+
+# 本机构建产物（镜像内自行编译）
+bin/
+gateway.exe
+*.log
+
+# 前端依赖。dist 已随仓库入库到 internal/webui/dist 并被 go:embed 打包，
+# 镜像内不需要再装一遍 node_modules。
+web/node_modules/
+web/dist/
+
+# 本地凭据与数据，绝不进镜像
+admin_auth.json
+master.key
+data/

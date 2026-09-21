@@ -1,0 +1,17 @@
+{
+  "listen": "0.0.0.0:6666",
+  "db_path": "./db/gateway.db",
+  "log_level": "info",
+  "admin_token": "",
+  "master_key_env": "ROSETTA_GW_MASTER_KEY",
+  "defaults": {
+    "upstream_timeout_ms": 120000,
+    "stream_idle_timeout_ms": 60000,
+    "max_retries": 2,
+    "max_request_body_bytes": 33554432
+  },
+  "bootstrap": {
+    "providers": [],
+    "routes": []
+  }
+}

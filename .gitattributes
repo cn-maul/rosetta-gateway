@@ -1,0 +1,13 @@
+# 容器相关文件强制 LF 行尾。
+#
+# 仓库在 Windows 上开了 core.autocrlf=true，若不锁定，docker/docker-entrypoint.sh
+# 会以 CRLF 签出；在 Linux 容器里执行时 shebang 变成 "#!/bin/sh\r"，
+# 直接报 "/bin/sh^M: bad interpreter"。仓库里存 LF 才能让本地构建也正常。
+# 本文件自身也必须 LF：带 CR 签出时，模式里的 "eol=lf" 会变成 "lf\r" 而失效。
+.gitattributes text eol=lf
+
+docker/** text eol=lf
+Dockerfile text eol=lf
+*.sh text eol=lf
+*.yml text eol=lf
+*.yaml text eol=lf
