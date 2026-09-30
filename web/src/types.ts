@@ -84,6 +84,12 @@ export interface UpstreamModel {
   enabled: boolean
   context_window: number
   max_output_tokens: number
+  // 单价（元 / 百万 tokens），0 = 未配置（费用按 0 计）。
+  // price_input 是缓存未命中的输入价，price_cache_hit 是缓存命中的输入价，
+  // price_output 是输出价。
+  price_input: number
+  price_cache_hit: number
+  price_output: number
   tokens_per_sec?: number // 近 5 次真实调用的平均输出速度；未调用过则不下发
   ttfb_ms?: number // 近 5 次流式调用的平均首字延迟（毫秒）；非流式/未测得则不下发
   success_rate?: number // 近 100 次调用成功率（0~1）
@@ -149,6 +155,7 @@ export interface Stats {
   error_count: number
   avg_tokens_per_sec: number
   avg_ttfb_ms: number
+  cost: number // 费用（元），按各模型当前单价对区间内用量实时估算
 }
 
 // usage 分组端点（by-day / by-model / by-key / by-provider）的统一返回行

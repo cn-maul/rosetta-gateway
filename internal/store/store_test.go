@@ -327,3 +327,99 @@ func TestSyncHeadTarget(t *testing.T) {
 		t.Fatalf("not idempotent: %+v", ts)
 	}
 }
+
+// 费用口径：单价存于 upstream_models（元/百万 tokens），GetUsageStats 在读取时
+// 联表实时算钱。三条不变量：
+//   - 未命中输入 / 命中输入 / 输出各按各价计；
+//   - 只配了输入价时，命中部分回退用输入价（不白送）；
+//   - 没配价的模型（含已被删除的模型）贡献 0，不让整体统计失败。
+func TestUsageStats_Cost(t *testing.T) {
+	ctx := context.Background()
+	st := testStore(t, t.TempDir()+"/gw.db")
+
+	must := func(err error) {
+		t.Helper()
+		if err != nil {
+			t.Fatalf("setup: %v", err)
+		}
+	}
+	must(st.CreateProvider(ctx, &Provider{ID: "p1", Slug: "p1", Name: "P1", Endpoint: "http://x", Protocol: "openai-chat", Enabled: true}))
+	must(st.CreateUpstreamModel(ctx, &UpstreamModel{
+		ID: "m1", ProviderID: "p1", ModelID: "priced", Enabled: true,
+		PriceInput: 0.2, PriceCacheHit: 0.02, PriceOutput: 0.8,
+	}))
+	must(st.CreateUpstreamModel(ctx, &UpstreamModel{
+		ID: "m2", ProviderID: "p1", ModelID: "input-only", Enabled: true,
+		PriceInput: 0.5,
+	}))
+	must(st.CreateUpstreamModel(ctx, &UpstreamModel{ID: "m3", ProviderID: "p1", ModelID: "free", Enabled: true}))
+
+	usage := func(id, model string, in, cached, out int64) {
+		t.Helper()
+		must(st.CreateUsageRecord(ctx, &UsageRecord{
+			ID: id, Ts: 1700000000000, AccessKeyID: "k1", PublicModel: model,
+			ProviderID: "p1", UpstreamModel: model, IngressProtocol: "openai-chat",
+			InputTokens: in, OutputTokens: out, TotalTokens: in + out, CachedTokens: cached,
+			UsageState: "reported", Status: "ok",
+		}))
+	}
+	usage("u1", "priced", 1_000_000, 400_000, 100_000) // 600k*0.2 + 400k*0.02 + 100k*0.8
+	usage("u2", "input-only", 1_000_000, 1_000_000, 0) // 1M*0.5（命中回退输入价）
+	usage("u3", "free", 5_000_000, 0, 5_000_000)       // 未配置价格 → 0
+	usage("u4", "deleted-model", 2_000_000, 0, 2_000_000)
+
+	stats, err := st.GetUsageStats(ctx, 0, 0)
+	if err != nil {
+		t.Fatalf("stats: %v", err)
+	}
+	// 0.208 + 0.5 = 0.708
+	if diff := stats.Cost - 0.708; diff > 1e-9 || diff < -1e-9 {
+		t.Fatalf("want cost=0.708, got %v", stats.Cost)
+	}
+	if stats.TotalRequests != 4 || stats.InputTokens != 9_000_000 {
+		t.Fatalf("token/request aggregate wrong: %+v", stats)
+	}
+
+	// 时间边界：区间外的记录不计费。
+	if _, err = st.GetUsageStats(ctx, 1700000000001, 0); err != nil {
+		t.Fatalf("stats after range: %v", err)
+	}
+	future, err := st.GetUsageStats(ctx, 1700000000001, 1700000000002)
+	if err != nil {
+		t.Fatalf("stats future: %v", err)
+	}
+	if future.Cost != 0 || future.TotalRequests != 0 {
+		t.Fatalf("out-of-range window should be empty, got %+v", future)
+	}
+}
+
+// 重新导入模型列表走 Upsert：价格是人工配置，不能被上游模型列表的
+// upsert 顺手清零。
+func TestUpsertUpstreamModel_KeepsPrices(t *testing.T) {
+	ctx := context.Background()
+	st := testStore(t, t.TempDir()+"/gw.db")
+
+	must := func(err error) {
+		t.Helper()
+		if err != nil {
+			t.Fatalf("setup: %v", err)
+		}
+	}
+	must(st.CreateProvider(ctx, &Provider{ID: "p1", Slug: "p1", Name: "P1", Endpoint: "http://x", Protocol: "openai-chat", Enabled: true}))
+	must(st.CreateUpstreamModel(ctx, &UpstreamModel{
+		ID: "m1", ProviderID: "p1", ModelID: "chat", Enabled: true,
+		DisplayName: "Chat", PriceInput: 1, PriceCacheHit: 0.1, PriceOutput: 2,
+	}))
+
+	must(st.UpsertUpstreamModel(ctx, &UpstreamModel{
+		ID: "other", ProviderID: "p1", ModelID: "chat", Enabled: true, DisplayName: "Chat",
+	}))
+
+	got, err := st.GetUpstreamModel(ctx, "m1")
+	if err != nil || got == nil {
+		t.Fatalf("get: %v %v", got, err)
+	}
+	if got.PriceInput != 1 || got.PriceCacheHit != 0.1 || got.PriceOutput != 2 {
+		t.Fatalf("prices wiped by upsert: %+v", got)
+	}
+}

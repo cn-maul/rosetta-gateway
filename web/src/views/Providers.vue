@@ -190,7 +190,17 @@ async function removeCred(c: Credential) {
 
 // ---------- 模型：编辑表单 ----------
 
-const mForm = reactive({ open: false, provider: '' as string, editing: '' as string, model_id: '', context_window: 0, max_output_tokens: 0, enabled: true })
+// 模型编辑表单。价格不在这里配 —— 单价属于「设置 → 模型价格」分类，
+// 按 供应商 × 模型 维度管理（同一 model_id 不同供应商可以不同价）。
+const mForm = reactive({
+  open: false,
+  provider: '' as string,
+  editing: '' as string,
+  model_id: '',
+  context_window: 0,
+  max_output_tokens: 0,
+  enabled: true,
+})
 
 function openModel(providerId: string, m?: UpstreamModel) {
   mForm.provider = providerId
@@ -532,6 +542,9 @@ onMounted(load)
           <div class="field">
             <label>最大输出</label>
             <input v-model.number="mForm.max_output_tokens" class="input num" type="number" min="0" step="1" placeholder="0 = 未设置" />
+          </div>
+          <div class="field span2">
+            <span class="tip">单价（元/1M tokens）在「设置 → 模型价格」里按供应商 × 模型配置</span>
           </div>
           <div class="field span2">
             <label class="check-line">

@@ -116,6 +116,14 @@ func derefInt(p *int) int {
 	return *p
 }
 
+// derefFloat 同 derefInt，用于价格这类浮点字段的 Create（缺省即 0 = 未配置）。
+func derefFloat(p *float64) float64 {
+	if p == nil {
+		return 0
+	}
+	return *p
+}
+
 // derefBool 用于 Create 这类「缺省即 false」的场合；
 // Update 里必须写 `if req.X != nil` 才能区分「未提供」与「显式置 false」。
 func derefBool(p *bool) bool {

@@ -88,6 +88,9 @@ func (s *Store) migrate() error {
 			context_window    INTEGER,
 			max_output_tokens INTEGER,
 			supports_thinking INTEGER,
+			price_input       REAL,
+			price_cache_hit   REAL,
+			price_output      REAL,
 			UNIQUE (provider_id, model_id)
 		)`,
 		`CREATE TABLE IF NOT EXISTS routes (
@@ -251,6 +254,12 @@ func (s *Store) ensureColumns() error {
 	}
 	additions := []col{
 		{"routes", "failover_enabled", "INTEGER NOT NULL DEFAULT 0"},
+		// 模型单价（元 / 百万 tokens），可空：NULL = 未配置价格，统计费用按 0 计。
+		// price_input 是「缓存未命中输入」单价；命中的输入另按 price_cache_hit 计
+		// （为 0 时回退到 price_input，见 usage_dao 的费用口径）。
+		{"upstream_models", "price_input", "REAL"},
+		{"upstream_models", "price_cache_hit", "REAL"},
+		{"upstream_models", "price_output", "REAL"},
 	}
 
 	for _, a := range additions {
@@ -278,12 +287,12 @@ func (s *Store) columnExists(table, column string) (bool, error) {
 	defer rows.Close()
 	for rows.Next() {
 		var (
-			cid     int
-			name    string
-			ctype   string
-			nn      int
-			dflt    sql.NullString
-			pk      int
+			cid   int
+			name  string
+			ctype string
+			nn    int
+			dflt  sql.NullString
+			pk    int
 		)
 		if err := rows.Scan(&cid, &name, &ctype, &nn, &dflt, &pk); err != nil {
 			return false, err

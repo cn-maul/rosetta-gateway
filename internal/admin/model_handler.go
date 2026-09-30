@@ -32,6 +32,13 @@ type modelRequest struct {
 	Enabled         *bool   `json:"enabled"`
 	ContextWindow   *int    `json:"context_window"`
 	MaxOutputTokens *int    `json:"max_output_tokens"`
+
+	// 单价（元 / 百万 tokens），0 = 不计费。PATCH 语义同样是 nil = 保持原值、
+	// 0 = 显式清空。price_input 是缓存未命中的输入价，price_cache_hit 是缓存
+	// 命中的输入价，price_output 是输出价。
+	PriceInput    *float64 `json:"price_input"`
+	PriceCacheHit *float64 `json:"price_cache_hit"`
+	PriceOutput   *float64 `json:"price_output"`
 }
 
 type modelResponse struct {
@@ -42,6 +49,9 @@ type modelResponse struct {
 	Enabled         bool    `json:"enabled"`
 	ContextWindow   int     `json:"context_window"`
 	MaxOutputTokens int     `json:"max_output_tokens"`
+	PriceInput      float64 `json:"price_input"`
+	PriceCacheHit   float64 `json:"price_cache_hit"`
+	PriceOutput     float64 `json:"price_output"`
 	TokensPerSec    float64 `json:"tokens_per_sec,omitempty"`
 	TtfbMs          float64 `json:"ttfb_ms,omitempty"`
 	SuccessRate     float64 `json:"success_rate"`
@@ -98,6 +108,14 @@ func (h *ModelHandler) Create(w http.ResponseWriter, r *http.Request, providerID
 		return
 	}
 
+	priceIn := derefFloat(req.PriceInput)
+	priceHit := derefFloat(req.PriceCacheHit)
+	priceOut := derefFloat(req.PriceOutput)
+	if priceIn < 0 || priceHit < 0 || priceOut < 0 {
+		writeError(w, http.StatusBadRequest, "price cannot be negative")
+		return
+	}
+
 	enabled := true
 	if req.Enabled != nil {
 		enabled = *req.Enabled
@@ -111,6 +129,9 @@ func (h *ModelHandler) Create(w http.ResponseWriter, r *http.Request, providerID
 		Enabled:         enabled,
 		ContextWindow:   ctxWindow,
 		MaxOutputTokens: maxOut,
+		PriceInput:      priceIn,
+		PriceCacheHit:   priceHit,
+		PriceOutput:     priceOut,
 	}
 
 	if err := h.store.CreateUpstreamModel(r.Context(), m); err != nil {
@@ -171,6 +192,25 @@ func (h *ModelHandler) Update(w http.ResponseWriter, r *http.Request, id string)
 			return
 		}
 		existing.MaxOutputTokens = *req.MaxOutputTokens
+	}
+	// 单价：nil = 不改，0 = 清空（不计费），负数非法。
+	for _, p := range []struct {
+		name string
+		req  *float64
+		dst  *float64
+	}{
+		{"price_input", req.PriceInput, &existing.PriceInput},
+		{"price_cache_hit", req.PriceCacheHit, &existing.PriceCacheHit},
+		{"price_output", req.PriceOutput, &existing.PriceOutput},
+	} {
+		if p.req == nil {
+			continue
+		}
+		if *p.req < 0 {
+			writeError(w, http.StatusBadRequest, p.name+" cannot be negative")
+			return
+		}
+		*p.dst = *p.req
 	}
 
 	if err := h.store.UpdateUpstreamModel(r.Context(), id, existing); err != nil {
@@ -315,5 +355,8 @@ func toModelResponse(m store.UpstreamModel) modelResponse {
 		Enabled:         m.Enabled,
 		ContextWindow:   m.ContextWindow,
 		MaxOutputTokens: m.MaxOutputTokens,
+		PriceInput:      m.PriceInput,
+		PriceCacheHit:   m.PriceCacheHit,
+		PriceOutput:     m.PriceOutput,
 	}
 }

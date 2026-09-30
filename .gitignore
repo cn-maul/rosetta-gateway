@@ -18,3 +18,6 @@ gateway.exe
 
 # 管理后台密码（含盐哈希，不应入库）
 admin_auth.json
+
+# 旧版运行目录（库 / 配置 / 主密钥，含敏感凭据，绝不入库）
+gateway/

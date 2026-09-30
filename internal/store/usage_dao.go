@@ -56,19 +56,39 @@ type UsageStats struct {
 	OutputTokens  int64
 	CachedTokens  int64
 	ErrorCount    int64
+	// Cost 是费用（元），按**当前** upstream_models 里的单价实时计算
+	// （改价后历史区间统计随之变化，usage_records 不固化金额）。
+	Cost float64
 }
 
 // GetUsageStats 返回累计统计。from/to 为毫秒时间戳，0 表示不设该边界
 // （from=0 即统计全部历史）。ErrorCount 排除 canceled：那是「客户端主动断开」，
 // 既不是上游故障也不是本网关的失败，算进错误率只会让成功率虚低。
+//
+// 费用口径（单价来自 upstream_models，均为「元 / 百万 tokens」）：
+//   - 缓存未命中的输入 = MAX(input - cached, 0) × price_input；
+//   - 缓存命中的输入   = cached × price_cache_hit，未单独配置时回退 price_input
+//     （只填了输入价的模型，缓存命中部分不会被错算成免费）；
+//   - 输出             = output × price_output；
+//   - 未配置价格的模型（三价皆空/0）贡献 0，不会污染总额。
+//
+// LEFT JOIN 按 (provider_id, upstream_model) 匹配：usage_records 里那对字段
+// 正是上游模型的自然键，记录的模型已从库里删掉时退化为 0 而不是让统计整体失败。
 func (s *Store) GetUsageStats(ctx context.Context, from, to int64) (*UsageStats, error) {
 	var stats UsageStats
-	where, args := timeRangeClause(from, to)
+	where, args := timeRangeClause(from, to, "u.")
 	err := s.db.QueryRowContext(ctx,
-		`SELECT COUNT(*), COALESCE(SUM(total_tokens), 0), COALESCE(SUM(input_tokens), 0), COALESCE(SUM(output_tokens), 0), COALESCE(SUM(cached_tokens), 0),
-		        COUNT(CASE WHEN status NOT IN ('ok', 'canceled') THEN 1 END)
-		   FROM usage_records`+where, args...).
-		Scan(&stats.TotalRequests, &stats.TotalTokens, &stats.InputTokens, &stats.OutputTokens, &stats.CachedTokens, &stats.ErrorCount)
+		`SELECT COUNT(*), COALESCE(SUM(u.total_tokens), 0), COALESCE(SUM(u.input_tokens), 0), COALESCE(SUM(u.output_tokens), 0), COALESCE(SUM(u.cached_tokens), 0),
+		        COUNT(CASE WHEN u.status NOT IN ('ok', 'canceled') THEN 1 END),
+		        COALESCE(SUM(
+		           MAX(u.input_tokens - u.cached_tokens, 0) * COALESCE(m.price_input, 0)
+		           + u.cached_tokens * (CASE WHEN COALESCE(m.price_cache_hit, 0) > 0 THEN m.price_cache_hit ELSE COALESCE(m.price_input, 0) END)
+		           + u.output_tokens * COALESCE(m.price_output, 0)
+		        ) / 1000000.0, 0)
+		   FROM usage_records u
+		   LEFT JOIN upstream_models m ON m.provider_id = u.provider_id AND m.model_id = u.upstream_model`+where,
+		args...).
+		Scan(&stats.TotalRequests, &stats.TotalTokens, &stats.InputTokens, &stats.OutputTokens, &stats.CachedTokens, &stats.ErrorCount, &stats.Cost)
 	if err != nil {
 		return nil, err
 	}
@@ -76,16 +96,17 @@ func (s *Store) GetUsageStats(ctx context.Context, from, to int64) (*UsageStats,
 }
 
 // timeRangeClause 构造 ts 时间过滤的 WHERE 子句。from/to 为毫秒时间戳，
-// 0 表示不设该边界。返回的 args 与 where 配套使用。
-func timeRangeClause(from, to int64) (string, []any) {
+// 0 表示不设该边界。prefix 是 ts 列的限定前缀（如 "u."，JOIN 时用来消歧），
+// 返回的 args 与 where 配套使用。
+func timeRangeClause(from, to int64, prefix string) (string, []any) {
 	var conds []string
 	var args []any
 	if from > 0 {
-		conds = append(conds, "ts >= ?")
+		conds = append(conds, prefix+"ts >= ?")
 		args = append(args, from)
 	}
 	if to > 0 {
-		conds = append(conds, "ts <= ?")
+		conds = append(conds, prefix+"ts <= ?")
 		args = append(args, to)
 	}
 	if len(conds) == 0 {
@@ -111,7 +132,7 @@ func timeRangeClause(from, to int64) (string, []any) {
 // 展示为「—」还是 0%。
 func (s *Store) CacheHitRate(ctx context.Context, from, to int64) (float64, error) {
 	var v float64
-	where, args := timeRangeClause(from, to)
+	where, args := timeRangeClause(from, to, "")
 	err := s.db.QueryRowContext(ctx,
 		`SELECT COALESCE(SUM(cached_tokens) * 1.0 / NULLIF(SUM(input_tokens), 0), 0)
 		   FROM usage_records`+where, args...).

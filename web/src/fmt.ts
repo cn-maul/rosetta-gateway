@@ -52,6 +52,22 @@ export function fmtPercent(rate: number): string {
   return '<0.1'
 }
 
+/**
+ * 金额（元）→ 展示字符串（不带符号，单位由调用方标注）。
+ *
+ * 大额（≥1 元）固定两位小数、带千分位；小额必须留住有效数字 ——
+ * 一次几十万 token 的请求往往只值几分钱，一刀切成两位小数会显示成「0.00」，
+ * 与同一屏「有流量」的指标自相矛盾，所以 <1 元时最多保留 4 位小数。
+ */
+export function fmtMoney(n: number): string {
+  if (!Number.isFinite(n) || n <= 0) return '0.00'
+  const opts: Intl.NumberFormatOptions =
+    n >= 1
+      ? { minimumFractionDigits: 2, maximumFractionDigits: 2 }
+      : { minimumFractionDigits: 2, maximumFractionDigits: 4 }
+  return new Intl.NumberFormat('zh-CN', opts).format(n)
+}
+
 // 毫秒时间戳 → 「MM-DD HH:MM:SS」（调用历史表格用）
 export function fmtTimeMs(tsMs: number): string {
   if (!tsMs) return '—'

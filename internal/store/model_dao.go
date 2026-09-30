@@ -14,15 +14,31 @@ type UpstreamModel struct {
 	ContextWindow    int
 	MaxOutputTokens  int
 	SupportsThinking *bool
+
+	// 价格：单位为「元 / 百万 tokens」，0 = 未配置（费用统计按 0 计）。
+	// PriceInput 对应缓存未命中的输入，PriceCacheHit 对应缓存命中的输入，
+	// PriceOutput 对应输出。
+	PriceInput    float64
+	PriceCacheHit float64
+	PriceOutput   float64
 }
 
 // modelColumns 是 upstream_models 三处读路径共用的列清单。
-const modelColumns = `id, provider_id, model_id, display_name, enabled, context_window, max_output_tokens, supports_thinking`
+const modelColumns = `id, provider_id, model_id, display_name, enabled, context_window, max_output_tokens, supports_thinking, price_input, price_cache_hit, price_output`
 
 // nullIfZeroInt 把 0 写回 NULL。
 // context_window / max_output_tokens 是可空列，0 与"未知"语义不同，
 // 且可空整数列在 SQLite 中若被写入 NULL 后仍需能被读回，故统一走 NULL。
 func nullIfZeroInt(v int) any {
+	if v == 0 {
+		return nil
+	}
+	return v
+}
+
+// nullIfZeroFloat 同上，用于价格列：0 与 NULL 同义（未配置价格），
+// 落 NULL 让「没设过价」和「设了 0 元」在库里可区分地表达为同一件事。
+func nullIfZeroFloat(v float64) any {
 	if v == 0 {
 		return nil
 	}
@@ -43,9 +59,10 @@ func scanModel(sc scanner) (UpstreamModel, error) {
 	var displayName sql.NullString
 	var ctxWindow, maxOut sql.NullInt64
 	var thinking sql.NullBool
+	var priceIn, priceHit, priceOut sql.NullFloat64
 
 	err := sc.Scan(&m.ID, &m.ProviderID, &m.ModelID, &displayName, &enabled,
-		&ctxWindow, &maxOut, &thinking)
+		&ctxWindow, &maxOut, &thinking, &priceIn, &priceHit, &priceOut)
 	if err != nil {
 		return m, err
 	}
@@ -54,6 +71,9 @@ func scanModel(sc scanner) (UpstreamModel, error) {
 	m.DisplayName = displayName.String
 	m.ContextWindow = int(ctxWindow.Int64)
 	m.MaxOutputTokens = int(maxOut.Int64)
+	m.PriceInput = priceIn.Float64
+	m.PriceCacheHit = priceHit.Float64
+	m.PriceOutput = priceOut.Float64
 	if thinking.Valid {
 		v := thinking.Bool
 		m.SupportsThinking = &v
@@ -117,9 +137,10 @@ func (s *Store) CreateUpstreamModel(ctx context.Context, m *UpstreamModel) error
 		enabled = 1
 	}
 	_, err := s.db.ExecContext(ctx,
-		`INSERT INTO upstream_models (id, provider_id, model_id, display_name, enabled, context_window, max_output_tokens, supports_thinking) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+		`INSERT INTO upstream_models (id, provider_id, model_id, display_name, enabled, context_window, max_output_tokens, supports_thinking, price_input, price_cache_hit, price_output) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		m.ID, m.ProviderID, m.ModelID, nullIfEmpty(m.DisplayName), enabled,
-		nullIfZeroInt(m.ContextWindow), nullIfZeroInt(m.MaxOutputTokens), m.SupportsThinking)
+		nullIfZeroInt(m.ContextWindow), nullIfZeroInt(m.MaxOutputTokens), m.SupportsThinking,
+		nullIfZeroFloat(m.PriceInput), nullIfZeroFloat(m.PriceCacheHit), nullIfZeroFloat(m.PriceOutput))
 	return err
 }
 
@@ -129,9 +150,10 @@ func (s *Store) UpdateUpstreamModel(ctx context.Context, id string, m *UpstreamM
 		enabled = 1
 	}
 	_, err := s.db.ExecContext(ctx,
-		`UPDATE upstream_models SET model_id = ?, display_name = ?, enabled = ?, context_window = ?, max_output_tokens = ?, supports_thinking = ? WHERE id = ?`,
+		`UPDATE upstream_models SET model_id = ?, display_name = ?, enabled = ?, context_window = ?, max_output_tokens = ?, supports_thinking = ?, price_input = ?, price_cache_hit = ?, price_output = ? WHERE id = ?`,
 		m.ModelID, nullIfEmpty(m.DisplayName), enabled,
-		nullIfZeroInt(m.ContextWindow), nullIfZeroInt(m.MaxOutputTokens), m.SupportsThinking, id)
+		nullIfZeroInt(m.ContextWindow), nullIfZeroInt(m.MaxOutputTokens), m.SupportsThinking,
+		nullIfZeroFloat(m.PriceInput), nullIfZeroFloat(m.PriceCacheHit), nullIfZeroFloat(m.PriceOutput), id)
 	return err
 }
 
@@ -140,16 +162,22 @@ func (s *Store) DeleteUpstreamModel(ctx context.Context, id string) error {
 	return deleteByID(ctx, s.db, "upstream_models", id)
 }
 
+// UpsertUpstreamModel 按 (provider_id, model_id) 幂等写入。
+//
+// 冲突时**不覆盖价格列**：价格是运维手工填的配置，而本方法的调用方是
+// 「探测 / 批量导入模型列表」—— 上游返回的模型列表永远不带价格，
+// 若把价格也写进 DO UPDATE SET，一次重新导入就会把配好的单价悄悄清零。
 func (s *Store) UpsertUpstreamModel(ctx context.Context, m *UpstreamModel) error {
 	enabled := 0
 	if m.Enabled {
 		enabled = 1
 	}
 	_, err := s.db.ExecContext(ctx,
-		`INSERT INTO upstream_models (id, provider_id, model_id, display_name, enabled, context_window, max_output_tokens, supports_thinking)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+		`INSERT INTO upstream_models (id, provider_id, model_id, display_name, enabled, context_window, max_output_tokens, supports_thinking, price_input, price_cache_hit, price_output)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		 ON CONFLICT(provider_id, model_id) DO UPDATE SET display_name = excluded.display_name, enabled = excluded.enabled, context_window = excluded.context_window, max_output_tokens = excluded.max_output_tokens, supports_thinking = excluded.supports_thinking`,
 		m.ID, m.ProviderID, m.ModelID, nullIfEmpty(m.DisplayName), enabled,
-		nullIfZeroInt(m.ContextWindow), nullIfZeroInt(m.MaxOutputTokens), m.SupportsThinking)
+		nullIfZeroInt(m.ContextWindow), nullIfZeroInt(m.MaxOutputTokens), m.SupportsThinking,
+		nullIfZeroFloat(m.PriceInput), nullIfZeroFloat(m.PriceCacheHit), nullIfZeroFloat(m.PriceOutput))
 	return err
 }

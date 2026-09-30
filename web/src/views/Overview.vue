@@ -2,7 +2,7 @@
 import { computed, onMounted, onUnmounted, ref } from 'vue'
 import { api } from '../api'
 import { toast } from '../ui'
-import { fmtNum, fmtTokens, fmtSpeed, fmtSec, fmtPercent } from '../fmt'
+import { fmtNum, fmtTokens, fmtSpeed, fmtSec, fmtPercent, fmtMoney } from '../fmt'
 import type { Stats, UsageGroupEntry } from '../types'
 
 const loading = ref(true)
@@ -218,6 +218,15 @@ onUnmounted(() => {
         <div class="stat-card">
           <div class="k">总 Tokens</div>
           <div class="v num">{{ fmtTokens(stats.total_tokens) }}</div>
+        </div>
+        <!-- 费用：后端按各模型【当前】单价实时估算（元），改价会改写历史区间的结果；
+             未配置价格的模型按 0 计，所以它不是账单，是「照这个价算大概花多少」。 -->
+        <div
+          class="stat-card"
+          title="按模型当前单价实时估算（元）；未配置价格的模型不计费"
+        >
+          <div class="k">费用</div>
+          <div class="v num">¥{{ fmtMoney(stats.cost) }}</div>
         </div>
         <div class="stat-card">
           <div class="k">输入 Tokens</div>

@@ -28,6 +28,9 @@ type statsResponse struct {
 	ErrorCount      int64   `json:"error_count"`
 	AvgTokensPerSec float64 `json:"avg_tokens_per_sec"`
 	AvgTtfbMs       float64 `json:"avg_ttfb_ms"`
+	// Cost 为费用（元）：按各模型当前单价对区间内用量实时估算，
+	// 未配置价格的模型按 0 计（见 store.GetUsageStats 的费用口径）。
+	Cost float64 `json:"cost"`
 }
 
 func (h *StatsHandler) Get(w http.ResponseWriter, r *http.Request) {
@@ -53,6 +56,7 @@ func (h *StatsHandler) Get(w http.ResponseWriter, r *http.Request) {
 		ErrorCount:      stats.ErrorCount,
 		AvgTokensPerSec: tps,
 		AvgTtfbMs:       ttfb,
+		Cost:            stats.Cost,
 	})
 }
 
