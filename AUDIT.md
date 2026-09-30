@@ -22,10 +22,10 @@
 | 8 | `config.go` 注释与 `server.go` 实现语义相反 | **P1** | 已修复 |
 | 9 | PATCH 一律「非空才覆盖」，`0` / 空串永远写不进库 | **P1** | 已修复（§3.7） |
 | 10 | 自动生成的默认配置绑 `0.0.0.0` + 无凭据 → 局域网可抢先设管理员密码 | **P1** | 已修复（§3.8） |
-| 11 | 凭据冷却机制未接线，失效凭据永不被摘除 | **P1** | 未修复（§4.1） |
-| 12 | 路由 `priority` 在解析时完全没被使用，同名路由互相覆盖 | **P1** | 未修复（§4.2） |
-| 13 | 两处 `extra_json` 与 `routes.fallback_route_id` 存了但从不使用 | **P2** | 未修复（§4.3） |
-| 14 | `access_keys.quota_tokens` 既无写路径也无校验（假配额字段） | **P2** | 未修复（§4.4） |
+| 11 | 凭据冷却机制未接线，失效凭据永不被摘除 | **P1** | 已修复（v1.2.0，§4.1） |
+| 12 | 路由 `priority` 在解析时完全没被使用，同名路由互相覆盖 | **P1** | 已修复（v1.2.0，§4.2）：**摘掉字段**（`public_name` 是 UNIQUE，「同名择优」在数据层不可能成立；多上游由 `route_targets` 链承担） |
+| 13 | 两处 `extra_json` 与 `routes.fallback_route_id` 存了但从不使用 | **P2** | 已修复（v1.2.0）：兜底改由 `route_targets` 有序链实现、UI 不再暴露假开关；两处 `extra_json` 连同列一并摘除（§4.3） |
+| 14 | `access_keys.quota_tokens` 既无写路径也无校验（假配额字段） | **P2** | 已修复（v1.2.0，§4.4）：写路径 + 请求前预检强制 |
 | 15 | 若干死代码与契约瑕疵 | **P2** | 部分修复（§4.5） |
 | 16 | 主密钥只认环境变量：**双击 exe 启动即无密钥，API Key 明文落库** | **P1** | 已修复（§3.9） |
 | 17 | 容器默认端口 6666 是**浏览器保留端口**，部署后管理界面永远打不开 | **P1** | 已修复（§3.10） |
@@ -403,16 +403,23 @@ WARN stream cut by idle watchdog without terminal event  content_written=true
 以下问题都已核实，但**改动面大或涉及产品语义**，一次全改会引入回归且难以验证，
 因此明确列出而不是偷偷绕过。
 
-### 4.1 凭据冷却未接线（P1）
+### 4.1 凭据冷却未接线（P1）—— 已修复（v1.2.0）
 
-`upstream.MarkCredentialCooldown` / `MarkCredentialError` 全仓库**无调用者**。
-也就是说：某条凭据被上游拒绝（401/429）后不会被摘除，也不会进入冷却，
-每次请求仍然可能选到它。`CredentialEntry.Status` / `CooldownUntil` 字段形同虚设。
+~~`upstream.MarkCredentialCooldown` / `MarkCredentialError` 全仓库无调用者。~~
+**已接线**：故障转移热路径（`handleChatCompletions`，见 DESIGN §10）在写回处直接依错误分类回写凭据健康态——
+`out.credCooldown>0` 时 `pool.MarkCredentialCooldown(credID, d)`（时长来自 `outwire.CredentialCooldown`：
+401/403→30min、402→1h、429/408/5xx/传输层→60s）；成功命中则 `pool.RecordCredentialSuccess(credID)` 清除冷却。
+`getHealthyCredentials` 会跳过 `CooldownUntil > now` 的凭据，故被冷却的失效 key 在窗口内不再被选中。
+> 注（v1.2.x 后续清理）：原封装 `pool.RecordCredentialFailure` 因热路径按 attempt 结果内联回写而成了死代码，已删除；行为不变。
 
-**建议**：在 `handleChatCompletions` 的错误分支接线 —— 上游返回鉴权/限流类错误时调用对应方法，
-并让 `selectWeighted` 跳过冷却期内的凭据。
+**修订（2026-09-24，详见 §2.5）**：原结论里「失效凭据永不摘除」只对了一半 ——
+`MarkCredentialError` **就算接上也是空操作**：它只改内存里的 `status`，既不回写库（管理 API 读的是库），
+也不参与健康过滤（`getHealthyCredentials` 只看 `cooling` 与 `disabled`）。而且它当时所在的那条 `else`
+分支**本来就不可达**（所有可转移状态都带非零冷却，`credCooldown>0` 恒成立）。
+已**删除该函数与那条死分支**：判废一把 key 的唯一真实手段是冷却；「不该罚凭据的失败」（当前只有 404/410）
+的正确记账位置是目标熔断，而不是凭据状态。
 
-### 4.2 `priority` 在路由解析时完全没被使用（P1）
+### 4.2 `priority` 在路由解析时完全没被使用（P1）—— 已修复（v1.2.0）
 
 **这是本轮新发现的**，性质比 §4.3 更严重。
 
@@ -440,31 +447,69 @@ func (ri *RouteIndex) AddRoute(r *Route) {
 `Resolve` 依次尝试，跳过 provider/模型被停用的候选。
 **没有直接做**：这会改变「谁在服务流量」的行为，属于功能变更而非纯 bug 修复，需要局长确认。
 
+**最终处置（2026-09-24，全修轮）—— 摘掉字段，而不是接上语义。**
+
+局长选择「全修」后重新评估了上面那条建议，结论是**不采纳**，理由：
+
+1. `routes.public_name` 带 **`UNIQUE` 约束**。也就是说「同一个 public_name 配多条路由」
+   这件事在**数据层根本不可能发生** —— 想让它发生，得先拆掉 UNIQUE。
+   而拆掉 UNIQUE 之后，`Resolve` 就必须处理「同名多路由」的全部歧义（哪条优先？
+   部分可用怎么办？`/v1/models` 列表怎么去重？），换来的能力却只是
+   「同一个名字背后有多个上游」—— 这件事已经由 `route_targets` 有序链做了，
+   而且做得更对：链是**有序、显式、可故障转移、可在界面上编排**的。
+2. 两个机制语义重叠，保留 `priority` 的净效果是**误导**：界面上有个可编辑、
+   写着「数字越小越优先」的输入框，而它什么也不控制。这正是本次审计要消灭的那类问题。
+
+因此：`routes.priority` 列由 `dropDeadColumns()` **真删**（不只是从建表语句里去掉，
+老库启动时也会 DROP），`routing.Route` 结构体、`routeRequest`/`routeResponse`、
+`web/src/types.ts` 的 `Route`、以及 `Routes.vue` 的优先级徽章与输入框一并移除。
+
+真正的「多上游」需求请用 `route_targets`：`POST /admin/api/routes` 建 route 时同事务
+种一条 position 0，之后 `PUT /admin/api/routes/{id}/targets` 整体替换链。
+
 ### 4.3 三处配置字段存了但从不使用（P2）
 
-- `routes.fallback_route_id`：库里存、后台能选、`snapshot/rebuild.go` 搬进快照，
-  但 `routing.Resolve()` 从不读取 —— **兜底路由是个假开关**。
-  （顺带说明：因为功能不存在，我**没有**给它加「不允许指向自己」的校验，
-  给一个不工作的功能加校验会让人误以为它能用。）
-- `routes.extra_json`：同上。
-- `upstream_models.default_extra_json`：同上。
+- ~~`routes.fallback_route_id`：兜底路由是个假开关。~~ **已修复（v1.2.0）——故障转移已落地，但换了一种形态**：
+  自动兜底不再走 `fallback_route_id` 单跳，而是由新表 `route_targets` 承载的**有序上游链**实现
+  （对外同一个 `public_name` 挂多个 `(provider, model)`，按 `position` 升序、满足 pre-commit 条件时自动转移，详见 DESIGN §10）。
+  `fallback_route_id` 就此退化为**历史兼容列**：`Routes.vue` 已移除「兜底路由」下拉，不再暴露给用户；
+  列本身保留在 schema 中（避免破坏性迁移），但无写路径、`Resolve()` 亦不读取。
+  即「假开关」的问题根因（给了用户一个不工作的入口）已消除——界面不再呈现它。
+- ~~`routes.extra_json`：仍未接线。~~ **已修（v1.2.0，全修轮）——摘掉。**
+- ~~`upstream_models.default_extra_json`：仍未接线。~~ **已修（v1.2.0，全修轮）——摘掉。**
 
-**现象**：后台那个「透传参数」输入框填了不生效，且没有任何提示。
-**建议**：要么接线（在 `ToRosetta()` 之后合并进 `Extra`），要么从界面和 schema 里摘掉 ——
-现在这样最糟：给了用户一个假的开关。
+**先更正本条审计的一处事实**：「后台那个『透传参数』输入框填了不生效」在当前版本**已不存在** ——
+逐字 `grep` 过 `web/src`，`extra_json` 只出现在 `types.ts` 的类型声明里，没有任何 view 渲染它。
+所以假开关的**可见**症状早在前几轮就被消掉了，剩下的纯粹是 API 层「接受写入、写入无效果」。
 
-### 4.4 `access_keys.quota_tokens` 是假配额（P2）
+**最终处置：摘掉，而不是接线。** 理由（与 §4.2 的 `priority` 同一逻辑）：
 
-`quota_tokens` 列在 schema 里（`NOT NULL DEFAULT 0`）、被 `ListAccessKeys` / `GetAccessKey` 读出、
-出现在 `keyResponse.quota_tokens` 和前端 `types.ts` 的 `AccessKey` 里 —— 但：
+1. 两个字段都没有消费者。要接线，必须先在 `ToRosetta()` 之后把值合并进 `ChatRequest.Extra`，
+   而这一步的前提是**语义先定清楚**，以下几件事目前都是未决的：
+   - **链可跨协议**：一条 route 的 `route_targets` 可以同时挂 `openai-chat` 与 `anthropic` 的上游，
+     所以「路由级 extra 的保留键校验」在**写入时没法一次做完** —— 而 SDK 对保留键的处理是
+     `ErrInvalidRequest`，校验漏一次就是让整条路由的**每个请求**都 400。
+   - **优先级未定**：路由级与模型级同时存在时谁覆盖谁？合并顺序写反了会静默改行为。
+   - **热路径成本**：每请求解一次 JSON，还是解析后缓进快照？缓存就要处理「改了配置但快照没 reload」。
+2. 在没有测试覆盖的前提下塞进一个「修复轮」，产出的是一个语义不明、只有作者知道怎么用的开关 ——
+   那不叫接线，叫把「静默不生效」换成「静默生效但没人说得清规则」。
 
-- **没有任何 INSERT / UPDATE 语句写它**（`UpdateAccessKey` 只更新 `name` 和 `enabled`）；
-- **没有任何地方校验它**（`auth` 包只校验 key 哈希与 enabled）。
+**留下的钩子**：真要这个能力（例如给某个 vLLM 模型固定加 `top_k`），它是个小而清楚的功能轮，
+加起来是一个 `ALTER TABLE ADD COLUMN` + 快照字段 + 合并点 + 保留键门控 + 用例，
+目录和命名已由 `ApplyProtocolPrivateExtra` 铺好。届时优先做**模型级**（协议唯一、可在写入时校验），
+路由级留到有跨协议方案之后。
 
-也就是说这是个「能读、不能写、不生效」的三无字段。
+### 4.4 `access_keys.quota_tokens` 是假配额（P2）—— 已修复（v1.2.0）
 
-**我刻意没有给它加写入口**：加上去会让它看起来像个能用的配额功能，
-而实际上没有任何强制逻辑。要么把校验也补上，要么把这个字段和前端类型一起摘掉。
+~~「能读、不能写、不生效」的三无字段。~~ 本轮按 §4.4 的建议**把写入口和强制逻辑一并补上**（而非摘掉字段）：
+
+- **写路径**：`CreateAccessKey` / `UpdateAccessKey` 均落 `quota_tokens`（PATCH 语义 `*int64`，可显式改回 0=不限；负数在 handler 层挡 400）；
+  前端 `Keys.vue` 新建/编辑表单加了「Token 配额」数字输入，列表行显示 `用量 used/quota`（超限打「配额已用尽」徽章）。
+- **强制**：`handleChatCompletions` 在鉴权后、解析前调 `store.GetKeyQuota` 读库预检，`quota>0 且 used>=quota` → `429 insufficient_quota`。
+  `used_tokens` 由 `usage_records` 触发器实时累加，故读库即权威值（不读滞后快照）。
+- **语义**：终身累计、不自动重置、0=不限；并发容忍至多一个在途请求超发（pre-check + post-deduct，DESIGN §11.2）；读库出错 fail-open。
+
+**测试**：`store` 写/读+触发器、`admin` 写路径+负数 400、`cmd/gateway` 超限 429 与 quota=0 放行——均已覆盖并通过。
 
 ### 4.5 死代码与契约瑕疵（P2）
 
@@ -689,3 +734,522 @@ prov  : {'name': 'Renamed', 'slug': 'testup', 'timeout_ms': 0, 'max_retries': 0}
 如果你先双击启动（密钥落在 `master.key`），后来又设置了 `ROSETTA_GW_MASTER_KEY`
 （或改用 `gateway.ps1`），两者内容不同 → 先前加密的凭据解不开。
 选定一种启动方式后不要来回换；必须换时，把旧密钥内容原样写进新来源。
+
+---
+
+# 审计与修复记录 — 2026-09-23（故障转移 + 配额复审）
+
+对象：v1.2.0 新落地的**自动故障转移**（`route_targets` 有序链）与**密钥 token 配额**。
+全量审阅后端热路径、DAO、快照、admin handler 与前端，构建链与 `go test ./...` 均绿。
+
+## 结论速览
+
+设计扎实：迁移幂等（`ensureColumns` + `backfillRouteTargets`）、零回归意识（未配链的老 route 回落单目标）、
+哨兵错误分级、pre-commit 才转移、`committed` 后绝不回退。测试覆盖 failover/quota/routing/store/admin。
+复审查出 6 项，**已全部处置**；另留 3 项低优先注记（未改，见文末）。
+
+## 已修复
+
+| # | 严重度 | 问题 | 处置 |
+|---|---|---|---|
+| 1 | 中 | **主目标列与链分叉**：运行时以 `route_targets` 为准，但 `PATCH /routes/{id}` 改 `provider_id/upstream_model_id` 只动 `routes` 行、不回写链首 → 裸 API 改主目标被静默忽略，响应还回显新值 | 新增 `store.SyncHeadTarget`（空链补 position-0 / 有链只改链首 / 幂等），`RouteHandler.Update` 成功后调用。UI 流程本就一致（随后 `PUT .../targets` 覆盖），此修复覆盖直连 API 的调用方。测试 `TestSyncHeadTarget` |
+| 2 | 中 | **客户端断开仍打完整条链**：非流式用 `context.Background()` 无视取消；流式取消可能被判为可转移 → 给跑掉的客户端逐目标重试，烧下游配额 | 转移循环每轮顶部检查 `r.Context().Err()`，非空即 return（不再打下个目标、不误记 error 用量）。测试 `TestFailover_ClientGoneAbortsBeforeAnyUpstream` |
+| A | 中 | **`pool.targets` 只增不删 → 慢性泄漏**：每次 `PUT .../targets` 重生成 `target_id`，旧熔断条目永久驻留；重建池只清 `providers` 不清 `targets` | `BuildFromStore` / `BuildFromConfig` 重建时一并清空 `p.targets`。测试 `TestPoolBuildResetsTargetHealth` |
+| B | 低 | **死代码**：`upstream.RecordCredentialFailure` 无调用者（热路径按 attempt 结果内联回写），且它使 `outwire` 成为该包唯一依赖 | 删除函数 + 去掉 `outwire` import；同步修正本文档 §4.1 对它的旧引用 |
+| C | 低 | **两层健康态语义相反**：重建池会重置凭据冷却，却保留目标熔断（A 的反面） | 随 A 一并解决：两者都在重建时清零，一致。代价（管理员改配置重置 ≤60s 冷却/熔断）已在 DESIGN §10 记为有意取舍 |
+| D | — | **单请求内不重试同 provider 的其他 key**：一次 attempt 只用一把 key，坏 key 交给跨请求冷却轮换 | 确认为有意设计，未改行为；在循环取凭据处 + DESIGN §10 补注说明，免后人误判为 bug |
+
+## 文档同步
+
+- DESIGN §6.3：补 `GET/PUT /admin/api/routes/{id}/targets` 端点、`keys` PATCH 的 `quota_tokens`。
+- DESIGN §10：补「主目标列与链的一致性」「每次 attempt 只取一把凭证」「客户端断开即收手」「健康态随池重建清零」四段。
+- DESIGN §12.2 + `config.example.json` + `docker/config.default.json`：补 `stream_first_token_timeout_ms` / `failover_max_targets` / `failover_failure_threshold` 三个默认及其说明。
+
+## 仍存（低优先注记，未改）
+
+1. **截断/溢出的流被记为目标「成功」**：`attemptStream` 对 `truncated`/`overflow` 也返回 `committed`，调用方随即 `RecordTargetSuccess` 清零熔断。回退不了这点没错，但「持续截断的目标永远开不了熔断」偏乐观——可考虑 truncated 不重置计数。
+2. **TTFT 定时器与首事件的窄竞态**：首个事件恰在 `ttftTimer` 关流的同一刻到达时，`gotFirst` 仍为 true，可能把半条流按 `ok` 收尾。概率极低。
+3. **配额预检是唯一同步落库的热路径读**：鉴权走内存快照，quota 每请求一次 `SELECT`（为拿权威 `used_tokens`，设计如此）。高并发下值得盯一眼。
+
+---
+
+# 全面审计 — 2026-09-23（全代码库）
+
+范围：`cmd/` + `internal/` 全部 41 个 Go 文件（7.9k 行）+ `web/src` 全部 17 个前端文件。
+基线：`go build ./...` / `go vet ./...` 空输出，`go test ./...` 全绿。
+方法：通读热路径 → 分模块深审（store / admin+鉴权 / 前端）→ **对可疑结论一律实测**，不靠读码推断。
+
+## 0. 结论速览
+
+**无 P0。** P1 三条（均已实测复现或代码确凿），P2 一批（分六组）。
+上一轮（本节之上 2026-09-23 故障转移/配额复审）的 6 项处置仍然有效，未发现回归。
+
+| # | 严重度 | 问题 | 状态 |
+|---|---|---|---|
+| 1 | **P1** | `defaults` 里负数超时 → `time.NewTicker` panic → 流式响应变成「200 + `text/event-stream` + 一坨 JSON 错误体」，且**漏记用量** | 实测复现 |
+| 2 | **P1** | 流式请求被**客户端断开**被记成 `status=error` + `ERROR stream error`，污染用量统计与成功率 | 实测复现 |
+| 3 | **P1** | route 的 `(provider_id, upstream_model_id)` **无配对校验** → 建出恒 404 的路由，接口却回 `201` | 代码确凿 |
+| 4 | P2 | 一批契约/死字段/并发/前端缺陷，见 §3（A–F 六组） | 已核实 |
+
+---
+
+## 1. P1 详述
+
+### 1.1 负数 `defaults` → `NewTicker` panic → 畸形响应 + 漏记用量（实测）
+
+`internal/config/config.go:141-161` 的 `setDefaults` **只在 `== 0` 时填默认值，负值原样通过**，
+`validate()`（164-193）也只检查 `Listen` 与 bootstrap 段，**从不检查 `defaults` 任何字段**。
+于是 `stream_idle_timeout_ms: -1` 一路到达 `cmd/gateway/main.go:742`：
+
+```go
+heartbeatTicker := time.NewTicker(idleTimeout / 2)   // idleTimeout = -1ms → panic
+```
+
+**实测**（隔离环境 `.workbuddy/tmp/e2e`，18099 + 假上游 19090，只改这一行）：
+
+```json
+{"level":"ERROR","msg":"panic recovered","error":"non-positive interval for NewTicker",
+ "path":"/v1/chat/completions","request_id":"125e757edd0a81ad"}
+```
+
+下游实收：
+
+```
+HTTP/1.1 200 OK
+Content-Type: text/event-stream
+X-Accel-Buffering: no
+Content-Length: 63
+
+{"error":{"message":"internal error","type":"internal_error"}}
+```
+
+三个后果，每个都独立成立：
+
+1. **协议层说谎**：状态码 200 + `Content-Type: text/event-stream`（SSE 头在 `main.go:723-726`
+   已写过，`WriteHeader` 不可撤），body 却是一个没有 `data:` 前缀的 JSON 对象。
+   任何 SSE 客户端都只会报「解析失败 / 流式响应中没有内容」—— 正是 2026-09-21 那次
+   流量事故的症状形态，排查成本极高。
+2. **用量漏记**：panic 发生在 `recordUsage` 之前，这次调用在 `usage_records` 里
+   **完全不存在**（实测 `usage/history` 里没有记录）。配额与统计同时漏账。
+3. **触发门槛极低**：运维用 `-1` 表达「禁用超时」是很自然的直觉。
+   同一路径上 `upstream_timeout_ms: -1` 会让 `context.WithTimeout` 立即超时、
+   `stream_first_token_timeout_ms: -1` 会让 `AfterFunc` 立即开火 —— 都是「全量请求失败」级。
+
+**建议**：`validate()` 补 `defaults` 区间校验（各超时 > 0、`max_*` >= 0），
+并在 `main.go` 里对 `idleTimeout/2` 做下界钳制（`NewTicker` 的入参必须 > 0）。
+
+### 1.2 客户端断开被记成上游错误（实测）
+
+`cmd/gateway/main.go:802-813` 的归类里，`stream.Err()` 只要不是 truncated/overflow 就
+`status = "error"`，**不区分 `context.Canceled`**：
+
+```go
+default:
+    status = "error"
+    logger.Error("stream error", "error", err, ...)
+```
+
+转移循环顶部那处 `r.Context().Err()` 前置检查（`main.go:534-539`）**只覆盖「尚未写头」**；
+一旦 committed（SSE 头已发），客户端断开必然落到这里。
+
+**实测**（同一环境，curl 在约 1.8s 后主动断开，三次）：
+
+```json
+{"level":"ERROR","msg":"stream error","error":"context canceled","model":"test-model",
+ "key_id":"5b4c1096f05cdc153d3c1566b56deac3"}
+```
+
+`GET /admin/api/usage/history` 对应三条：
+
+```
+{"total_tokens":0,"ttfb_ms":1,"latency_ms":1806,"status":"error"}
+{"total_tokens":0,"ttfb_ms":1,"latency_ms":2102,"status":"error"}
+{"total_tokens":0,"ttfb_ms":1,"latency_ms":2201,"status":"error"}
+```
+
+**这三条的真实原因是客户端主动断开**（用户点「停止生成」、客户端自带超时、网络切换），
+不是上游故障。代价：后台调用历史的错误率虚高、`stats` 的成功率虚低、
+日志里 `ERROR` 噪音掩盖真正的上游故障。
+
+**建议**：新增 `status="canceled"`（或复用 `truncated` 语义但单独打 INFO 日志），
+判定用 `errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)`。
+注意这会改 `usage_records.status` 的取值集合 —— **前端标签中文化**（`History.vue`）
+与 `DESIGN.md` §8 的四值定义需同步，故列为待决策而非直接改。
+
+### 1.3 route 的主目标列不校验「配对」，可造出恒 404 的路由
+
+两条写入路径对同一件事的严格程度**不一致**：
+
+| 端点 | 校验 |
+|---|---|
+| `PUT /admin/api/routes/{id}/targets` | `route_target_handler.go:122-143`：provider 存在、model 存在、**且 `m.ProviderID == in.ProviderID`**，并有测试守护 |
+| `POST /admin/api/routes`、`PATCH /admin/api/routes/{id}` | `route_handler.go:74-141` / `143-232`：**只校验非空串**，无配对校验 |
+
+而 `route_handler.Create` 会在 126-138 行**立刻种一条 position 0 的目标**（用同一对
+`route.ProviderID` / `route.UpstreamModelID`）。FK 只做单列存在性检查
+（`store.go:93-94`、`151-153`），不拦跨 provider 的配对。
+
+运行时后果：`routing.buildCandidates`（`routing.go:195-228`）用
+`findUpstreamModel(t.ProviderID, t.UpstreamModelID)` 查不到 → 候选为空；
+由于该 route 有目标行（`len(targets) > 0`），**不回落主目标列**，直接
+`return out`（空）→ `Resolve` 报 `ErrModelNotFound`。
+
+于是：**接口返回 `201 Created` 并回显这条路由，界面显示保存成功，`/v1` 上该公开模型名恒 404。**
+唯一的差异是 `route_targets` 那条链，而链是谁种的？正是 `Create` 自己 —— 与 targets 端点
+的严格校验自相矛盾。
+
+**建议**：把 `validateTarget` 的配对校验抽成 `store` 层可复用的函数，
+在 `route_handler.Create/Update` 落库前调用，不合法返 `400`。
+
+---
+
+## 2. 实测环境说明（复现路径）
+
+隔离环境 `.workbuddy/tmp/e2e`（18099 + 假上游 19090），沿用 `rosetta-gateway-verify` skill 的
+脚手架，本轮新增：
+
+- `zzfake` 增加 **`slow` 模式**：分 100 批 × 200 块慢速吐字（每批后停 50ms），
+  用来让长流跨越网关 keepalive 的触发周期。
+- `check_sse.py`：按 SSE 帧规范逐行校验下游实收字节（`data:` 载荷必须能 `json.loads`，
+  非空行只允许 `data:` / `event:` / `: ` 三种形态）。
+
+**踩到的坑（已回写 skill）**：`gateway-e2e.exe` 若用 `ROSETTA_GW_MASTER_KEY=<固定值>` 启动，
+而库里的凭据是用同目录 `master.key` 加密的，两者派生的密钥不同 → 凭据全部解不开 →
+`/v1` 恒 `no available upstream provider`（**不是**路由问题，也不是上游问题）。
+本轮改为**不设该环境变量**、并删库重新 bootstrap，才跑通。
+
+---
+
+## 3. P2 分组（已核实，未改）
+
+### A. 死字段 / 静默失效（「存了但不用」，与 §4.3 的 extra_json 同类）
+
+| 位置 | 问题 |
+|---|---|
+| `internal/config/config.go:16,138-140` + `main.go:65-67` | **`log_level` 是死配置**：被解析、被写进启动日志的 `log_level` 字段，但 logger 硬编码 `slog.LevelInfo` —— 改成 `debug`/`warn` 完全没有效果 |
+| `internal/snapshot/rebuild.go:14` | **`RebuildFromDB` 的 `pool *upstream.Pool` 参数从未被使用**（函数体 15-108 行无引用），该 import 仅为它存在。池的重建实际发生在 `ReloadHandler` 里（分工明确，但这个参数是纯噪音） |
+| `internal/routing/routing.go:18,96-99,157-164` | `Route.Priority` 被 `rebuild.go:67` 搬进快照，`Resolve` 却**只做一次 `byPublicName[model]` 查表**。§4.2 记的「同名路由互相覆盖」因 `store.go:92` 的 `public_name TEXT NOT NULL UNIQUE` 而**不可达**（DB 层挡住），但字段本身仍是假语义 —— 界面写着「按 priority 升序择优」，实际没有任何择优 |
+| `internal/upstream/upstream.go:227,244,251` | `GetClientForCredential` / `GetProvider` / `ListProviders` **仍无调用者**（§4.5 记录过，未清理）；其中 `GetProvider` 返回**锁内裸指针**，调用方读 `Credentials` 会与冷却写入并发竞争 |
+| `internal/upstream/upstream.go:148-151,460-463` | **`provider.max_retries = 0` 被静默替换为全局默认**（`if sp.MaxRetries > 0`）。用户显式设 0 表达「不重试」，实际走 `cfg.Defaults.MaxRetries`（默认 2）。与 §3.7 确立的「0 是合法显式值」契约直接冲突。（`timeout_ms: 0 = 用全局默认` 是文档明示的，`max_retries` 不是） |
+| `internal/upstream/upstream.go:601-610` | `buildClient` 的 `switch prov.Protocol` **无 `default`** → 拼错的 protocol（如 `openai`）不加任何 `WithProtocol`，静默退化为 SDK 自动探测。与 `admin/provider_handler.go` 不校验 protocol（§4.5 记录）组合成**静默错配** |
+| `internal/store/store.go:107-113` | `access_keys` 的 `expires_at` / `rpm_limit` / `tpm_limit` / `last_used_at` 是**死列**：建表有、全仓无读写路径。未实现的「密钥过期 / 限速」看起来像已支持 |
+
+### B. 管理 API 契约
+
+| 位置 | 问题 |
+|---|---|
+| `internal/admin/usage_handler.go:56-70,105-106` | `GET /admin/api/usage` 的 `limit` **无上限、负数不拒**。SQLite 里 `LIMIT -1` 语义是「不限制」（`strconv.ParseInt("-1")` 得到 -1，`if limit == 0` 不触发）→ `?limit=-1` 拉全表；`?limit=999999999` 全量物化。同文件 `History`（166-171）已有 `<=0→200 / >1000→1000` 的 clamp，此处是**同一不变量漏了一处**。另：`group_by` 分支（88-103）用 `args = []any{from, to}` **整体覆盖**前面已追加的 `key_id`/`model`/`provider_id` 过滤条件，且 SELECT 里含非聚合裸列（SQLite 取组内任一行）—— 当前前端不传 `group_by`，属潜伏 |
+| `internal/admin/route_handler.go:74-141` | 同名 `public_name` 的 Create 撞 `store.go:92` 的 `UNIQUE` → 返回 **500 + 裸 `UNIQUE constraint failed: routes.public_name`**，而非 409 + 可读文案。前端 `Routes.vue` 的两步创建（create → saveTargets）在这种失败下提示「保存失败」，用户重试必然是同一个 500 |
+| `model_handler.go:120-124`、`route_handler.go:144-148`、`key_handler.go:112-116`、`provider_handler.go:249-253` | **DB 错误被当成 404**（`if err != nil \|\| existing == nil { 404 }`）。DB 故障时前端看到「资源不存在」，会误导运维去删库/重建配置。credential_handler 的同款问题 §4.5 已记，这四处是**同模式扩散** |
+| `provider_handler.go:238-244`、`model_handler.go:174-180`、`route_handler.go:234-240`、`key_handler.go:151-157` | **Delete 不存在的 ID 返回 200 deleted**：DAO 层（`provider_dao.go:106-109` 等）是裸 `ExecContext` + `return err`，不看 `RowsAffected` |
+| `model_handler.go:75-117`、`credential_handler.go:56-101` | **子资源端点不校验父资源存在**：`POST /admin/api/providers/{乱填}/models\|credentials` 直接 INSERT → 撞 FK → **500 `FOREIGN KEY constraint failed`**（应 400/404）。`GET .../{不存在}/models` 则返回 200 + `[]`，无从区分「provider 不存在」与「没有模型」 |
+| `provider_handler.go:123-147`、`route_handler.go:121-138,218-229` | **复合写无事务**，第二步失败留下半成品却返 500：provider 已建但 credential 建失败；route 已建但 seed target 失败（作者在 136 行的文案里已自认这点）；route 已改但 `SyncHeadTarget` 失败 → **`routes` 主目标列与 `route_targets` 链永久分叉**。`route_target_dao.go:156-185` 的 `ReplaceRouteTargets` 已是正确范式（`BeginTx` + `defer Rollback`），照抄即可 |
+| `internal/store/route_target_dao.go:129-151` | `SyncHeadTarget` 是「读-改-写」跨两条语句、**无事务**；并发两个 PATCH 会丢更新。`MaxOpenConns(1)` 只保证单条语句串行，不覆盖这次组合 |
+| `provider_handler.go:124,131,144,231,240,257`、`model_handler.go:112,167,176`、`key_handler.go:101,144`、`usage_handler.go:110`、`password_handler.go:67` | **500 响应直接回显 `err.Error()`**：把 SQLite 约束名/语句片段、乃至 `密码_handler` 的凭据文件**绝对路径**吐给调用方。管理端点虽已鉴权，仍是内部信息泄露面 |
+| `usage_handler.go:203-247` | `/admin/api/usage/by-model\|by-key\|by-provider\|by-day` **静默忽略 `limit`**：`web/src/api.ts:174-175` 明确请求 `?limit=10`，`groupBy`/`groupByNamed` 全文不读该参数 → 全量返回 |
+| `usage_handler.go:119-139` | `summary` 是**从被 `LIMIT ?` 截断的页内行累加**的：字段名 `total_requests` 暗示总量，实际是「本页条数」；`avg_latency_ms` 同理是页内均值 |
+| `usage_handler.go:121-123,187-189,254-256,279-281` | 四处 `rows.Scan` 出错 `continue` **静默丢行**，循环后**均未检查 `rows.Err()`**。（`store` 包内已全部上抛，此处是包外漏网） |
+
+### C. 鉴权 / 安全
+
+| 位置 | 问题 |
+|---|---|
+| `cmd/gateway/main.go:142,910-938` | **`GET /v1/models` 完全不鉴权**：`handleListModels` 不调 `auth.Authenticate`，任何人可枚举全部公开模型名（等于暴露路由与供应商结构），也不受 key 的 enabled/配额约束。同一文件的 `/v1/chat/completions` 是鉴权的（450 行）。官方 OpenAI 的 `/v1/models` **需要**鉴权 —— 但「模型目录公开」也可能是产品决策，**需局长定** |
+| `internal/adminauth/store.go:94-101` + `main.go:155-159` | 凭据文件**格式损坏/内容非法 → `os.Exit(1)`，整个进程拒绝启动**。`/v1` 数据面根本不读管理凭据，却被一起拖死：一次磁盘写坏或手工编辑失误 = 全部转发服务中断。`store.go:96` 的注释只论证了「不该静默放行」，没论证「该拒绝启动」 |
+| `internal/adminauth/store.go:57,150` + `server.go:158` | 管理登录**无失败计数/限速/锁定**；口令下限仅 6 位。PBKDF2 21 万迭代把单次尝试压到几十毫秒（对交互无感），但并发下 6 位弱口令仍可爆破，且失败路径无任何痕迹 |
+| `internal/adminauth/store.go:244-253` | `verifyFallback` 保留 `len(expected)==64 && isHex(expected)` 的「猜明文还是摘要」启发式 —— 正是包注释 21-23 行声称已消除的失败模式。运维把 `admin_token` 设成 64 位 hex 明文字符串时，**同一串作 Bearer 会恒 401**（被当作 sha256 摘要比对） |
+| `internal/auth/auth.go:28,49` | `ks.KeyHash == hashHex` 非恒定时间比较；`extractKey` 仍支持 `?key=` 传参（§4.5 记录，未变）。补充证据：`server.Middleware` 只记 `r.URL.Path` **不记 query**，故本网关日志不落密钥；泄露面在 Referer / 上游代理日志 |
+
+### D. 流式与 HTTP 细节
+
+| 位置 | 问题 |
+|---|---|
+| `main.go:742,768` | keepalive 的 `time.NewTicker(idleTimeout/2)` **创建后从不 Reset**（只有 `idleTimer` 在 `handleEvent` 里 Reset）→ **上游持续吐字时心跳照发**，实测 1.8s 的流里发了 **18 次** `: keepalive`（raw_slow_*.sse 可见其与 `data:` 事件交错）。对标准 SSE 客户端无害（注释行），对朴素按行解析的下游（如 leans 的 `backend/service/ai.go`）是纯噪声 |
+| `main.go:745-757` | **heartbeat goroutine 与主 SSE 循环并发写同一个 `http.ResponseWriter`**（主循环经 `SSEWriter`，心跳直接 `fmt.Fprintf(w, ...)`）。Go 明确不支持并发使用 ResponseWriter；`statusResponseWriter.written`/`statusCode`（`server.go:57,62,70`）也是无锁写。**实测 3 轮、6814~8594 个事件、18~22 次并发写窗口，未观测到字节损坏**（`check_sse.py` 报 `corrupt_lines=0`）—— 定 P2：违反契约但触发窗口极小，随时间与并发累积。**注意本机 `go test -race` 不可用**（链接器故障：`cannot find default-manifest.o`），无法用 race detector 硬证。修法：`SSEWriter` 内加 mutex，心跳改走 `sse.WriteComment()` |
+| `server.go:188` | `Recovery` 用 `http.Error` 写 JSON **字符串** → `Content-Type: text/plain; charset=utf-8` 且内容多一个换行；若响应头已发出（如上面的 §1.1 场景），只能把这段文本追加进 SSE 流里 |
+| `main.go:902-908` | `recordUsage` 是 **fire-and-forget goroutine**，`srv.Shutdown` 只等 handler 返回、不等它 → 进程退出时**尾部若干条用量可能丢**。（顺带：§4.4 配额预检注释声称「并发下容忍至多一个在途请求超发」，实际是无上限的 fire-and-forget，突发 N 个并发请求会在第一条 usage 落库前**全部**通过预检） |
+| `inwire/openai_chat.go:71` | 硬编码 `io.LimitReader(r.Body, 32*1024*1024)`，与 `cfg.Defaults.MaxRequestBodyBytes`（可配，默认同为 32MB）**两处独立**：配大了内层仍截断（`json` 报「unexpected end of JSON input」）；配小了外层 `MaxBytesReader` 触发，但错误被包成 `read body: ...` → 返回 **400 而非 413** |
+| `outwire/openai_chat.go:173-188` | `WriteUsage` 只发 `prompt_tokens`/`completion_tokens`/`total_tokens`，**不含 `prompt_tokens_details.cached_tokens`** —— 网关内部明明记了 `cached_tokens`（§5.2 口径），下游却拿不到 |
+
+### E. 前端（`web/src`）
+
+| 位置 | 问题 |
+|---|---|
+| `views/Routes.vue:88-97,169` | **目标链加载失败被静默吞掉并伪造单行链**：`catch { form.targets = [{主目标}] }` 无 toast、无 return。用户下一次保存 → `PUT .../targets` 后端先 `DELETE` 再按数组 INSERT（`route_target_dao.go:163`）→ **position 1..N 的目标被静默删光**。这是本轮前端最严重的一条（静默数据丢失） |
+| `api.ts:84-96` | `mutate()` 的 reload 失败分支把 **401 抹成 `status: 0`**（`new ApiFail(0, ...)`）→ 绕过所有 view 的 `status !== 401` 守卫，令牌过期时在令牌弹窗之上再叠一条错误 toast，真实 401 语义丢失 |
+| `App.vue:183-195` | 确认弹窗 `<AppModal>` **缺 `@close`**（对比 `Keys.vue:168` 有）：`AppModal.vue:14` 的遮罩点击会 `emit('close')` 但无人监听 → 遮罩点击无效；且 `ui.ts:53` 的 `confirmState.resolve = resolve` 直接覆盖，**上一个 Promise 永久 pending** |
+| `styles.css:791` | `@media (prefers-transparency: reduced)` —— **特性名非法**（正确是 `prefers-reduced-transparency`），整块降级**永不生效**，与文件内注释「三个必须齐备」矛盾 |
+| `views/Settings.vue:28-34,85-101` | `password/check` 的失败被并入 `load()` 的同一个 `try` → settings 已成功加载也会报「加载设置失败」；改密码**无提交锁**（按钮无 `:disabled`、函数无守卫）→ 双击时第二次带已失效的旧密码 → 401 toast，而第一次其实已成功 |
+| `ui.ts:68`、`api.ts:24-27`、`Overview.vue:56`、`History.vue:30` | 死代码：`authState.callback`（§4.5 已记）、**`auth.ready` 从未被写入或读取**（新增）、两处 `defineExpose({ load })` 无人引用 |
+| `views/Routes.vue:181-192` | `toggleRoute` **仍回传完整字段集**（`public_name`/`provider_id`/`upstream_model_id`/…），构成读-改-写，与「只发要改的字段」的新契约不符（`Providers.vue:109`、`Keys.vue:95` 已是正确写法） |
+| `views/Providers.vue:406` | 成功率展示自相矛盾：`0.995` 被 `Math.round` 显示成 `100%`，同时因 `< 1` 而带 warn 橙 —— 99.5% 与 100% 在界面上完全等价 |
+
+### F. 小瑕疵
+
+| 位置 | 问题 |
+|---|---|
+| `usage_handler.go:302` | `var _ = sql.ErrNoRows`：为了让 `database/sql` 这个**实际只被这一行使用**的 import 不报错而写的死代码 |
+| `outwire/openai_chat.go:59,87` | `SSEWriter.flushed` 被写但**从未被读** |
+| `outwire/openai_chat.go:214,231` | `WriteNonStreamResponse` 手工拼 JSON（`"` + `escapeJSON` + `"`）；且有 tool_calls 时 `msg.Content = nil` + `omitempty` → **`content` 字段整体消失**（OpenAI 语义应为 `null`） |
+| `inwire/openai_chat.go:218` | `extractText` 解析失败时 `return string(raw)` —— **畸形 content 会被原样当正文发给上游**；数组里的 `image_url` 等非文本块仍被静默丢弃（§4.5 已记） |
+| `store/store.go:26` | DSN `?_journal_mode=WAL&_foreign_keys=ON` **未设 `_busy_timeout`**：多进程打开同一 db（备份/CLI/双实例）时写锁竞争直接返回 `SQLITE_BUSY`，配合 `main.go:468` 的 fail-open 会让配额预检静默失守。单实例进程内因 `SetMaxOpenConns(1)` 无此问题 |
+| `store/usage_dao.go:37-39` | `error_code` / `request_id` 是可空列却直接落空串，未走项目约定的 `nullIfEmpty`（同文件其他列与 `provider_dao`/`credential_dao` 都已走） |
+
+---
+
+## 4. 已核对、确认无问题（避免重复排查）
+
+- **SQL 注入**：全仓唯一的字符串拼 SQL 在 `store.ensureColumns`（`fmt.Sprintf("ALTER TABLE %s ADD COLUMN %s %s")`，三处全部取自**常量白名单**）与 `usage_handler.groupBy(column)`（column 只用字面量调用）。用户输入一律走 `?` 占位符，`ORDER BY`/`LIMIT` 无拼接。
+- **事务**：`route_target_dao.go:157` 的 `BeginTx` 写法正确（失败即 return、`defer Rollback`、`Commit` 错误上抛）。**除此之外全仓无事务** —— 已列进 §3.B。
+- **NULL / 外键**：`fallback_route_id`（唯一带 FK 的可空列）在 `route_dao.go:109,126` 走 `nullIfEmpty`，不会触发 FK 787；所有 `scan*` 的可空列都用 `sql.Null*` 承接；8 处 list 函数全部 `make([]T,0)`（空结果不会序列化成 `null`）。
+- **行扫描（store 包内）**：所有 `rows.Scan` 出错均 `return nil, err`，所有 `defer rows.Close()` 齐全，所有 `return result, rows.Err()` 都检查了。无 `*sql.Rows`/`*sql.Stmt` 跨 goroutine，无 Prepared Statement。
+- **SQLite 算术**：`usage_dao.go` 的 `cache_hit_rate` / tps / 成功率全部写成 `SUM(x) * 1.0 / NULLIF(SUM(y), 0)`，无整数除法截断、均有除零保护。
+- **触发器与冗余状态**：`usage_records` 只有 `AFTER INSERT` 触发器；全仓**无** `UPDATE/DELETE usage_records`；`UpdateAccessKey` 不碰 `used_tokens`；失败路径落的 error 记录 `TotalTokens=0`（加 0 不虚增）；usage 只有一处 INSERT → **无重复计数**。
+- **迁移幂等**：`CREATE TABLE/INDEX/TRIGGER` 全带 `IF NOT EXISTS`；`ensureColumns` 先 `columnExists` 再 `ALTER`；`backfillRouteTargets` 用 `WHERE NOT EXISTS`。`store_test.go` 已实测三次重开不重复。
+- **删除级联**：providers→credentials/upstream_models 为 CASCADE；routes/route_targets→providers 与 routes→upstream_models 为 RESTRICT；route_targets→routes 为 CASCADE → 无孤儿配置行。（代价是删除被拒不友好，见 §3.B）
+- **CORS / CSRF**：`Access-Control-Allow-Origin: *` 但鉴权走 `Authorization` 头（非 Cookie），浏览器不自动携带，跨源页面也读不到 `localStorage` 中的令牌 → 无 CSRF。
+- **路径穿越**：`AdminAuth` 对白名单用 `==` 精确匹配；ServeMux 先做 `cleanPath` 归一并对脏路径发 301。逐一核对 `main.go:181-224` 注册表，**未被白名单放行的敏感端点无一旁路**；`/admin/api/auth/verify` 确实需鉴权。
+- **恒定时间比较（管理端）**：`adminauth` 的 PBKDF2 结果与 fallback 两条分支全部 `subtle.ConstantTimeCompare`。例外只有 §3.C 的 `auth.KeyHash`。
+- **PATCH 指针语义**：逐个 handler 核对，**全部 `if req.X != nil`**，无一处 Update 残留 `deref*` 或 `!= ""` / `!= 0`；必填字段显式空串一律 400；`deref*` 只出现在 Create 分支 —— 与 `helpers.go:39-40` 的约定一致。
+- **reload 契约**：全仓无 view 绕过 `mutate()`；`ReloadHandler` 先重建 pool 再 `snapshot.Swap`，顺序正确。
+- **前端 XSS**：`v-html|innerHTML|dangerously|eval(|new Function` **零命中**，所有用户可控字符串经 `{{ }}` 转义。
+- **前端凭据流程**：`App.vue:70-92` 严格「先 `/auth/verify` 成功才 `saveToken`」，失败只写 `authError` 不落库；`Settings.vue` 改密码的 `saveToken` 在 `if (res.ok)` 内 —— **2026-09-21 修的死循环未回退**。
+- **API 契约对齐**：`api.ts` 全部 path/method 与 `main.go:181-224` 一致，字段名与 Go json tag 一致。
+- **ID 随机性**：`generateID()` = `crypto/rand` 16 字节（128-bit），不可枚举。
+- **前端 typecheck**：`npm run typecheck` 通过（`vite.config.ts` 不参与类型检查是已知的 tsconfig 限制，§6 已记）。
+
+---
+
+## 5. 建议处置顺序
+
+**建议立即修（低风险、无产品语义变更）**
+
+1. §1.1 `config.validate` 补 `defaults` 区间校验 + `main.go` 对 `NewTicker` 入参钳制下界。
+2. §1.3 `route_handler.Create/Update` 复用 `validateTarget` 的配对校验。
+3. §3.B `usage_handler` 的 `limit` clamp（照抄同文件 `History` 的写法）。
+4. §3.A `RebuildFromDB` 删掉死参数、`config.log_level` 要么接线要么删字段。
+5. §3.D `Recovery` 改用 `outwire.WriteOpenAIError` 风格的自定义 writer（别用 `http.Error`）。
+
+**需局长决策后再动**
+
+6. §1.2 客户端断开是否新增 `status="canceled"`（会改 `usage_records.status` 取值集合，
+   连带前端标签与 `DESIGN.md` §8）。
+7. §3.C `/v1/models` 是否加鉴权（产品决策）。
+8. §3.A `route.priority`：接上「按 priority 择优」（改 `byPublicName` 为多值 + 排序），
+   还是摘掉字段与界面提示（DB 层 `public_name` 已 UNIQUE，择优目前不可能生效）。
+9. §3.E `Routes.vue` 的链加载失败处理（是禁止保存并提示，还是二次确认）。
+
+---
+
+# 全修 — 2026-09-24（v1.2.0）
+
+局长指令：「全修」。即上面列出的**全部**问题 —— 含「建议立即修」5 项、4 项「需决策」、
+以及 §3 的六组 P2（A 死字段 / B 管理 API 契约 / C 鉴权安全 / D 流式与 HTTP / E 前端 / F 小瑕疵）。
+
+## 1. 四项待决策的落地
+
+| 项 | 决定 | 理由 |
+|---|---|---|
+| §1.2 客户端断开 | **新增 `status="canceled"`** | 客户端主动断开既不是网关的错也不是上游的错；记成 `error` 会污染错误率，让「用户关了个页面」看起来像线上故障。统计口径（`GetUsageStats` / `ListModelThroughput`）同步排除该值；前端用中性灰、与暖橙的 `失败/截断` 区分。 |
+| §3.C `/v1/models` | **加鉴权** | 它暴露的是完整的公开模型名清单。未鉴权时等于把「这台网关上配了哪些模型」免费送给任意扫描者，而 `/v1/chat/completions` 本身就要鉴权 —— 这是个不一致的缺口。 |
+| §3.A `route.priority` | **摘掉字段**（而非接上语义） | 「同名路由择优」在数据层不可能成立（`routes.public_name` 是 `UNIQUE`），而「一个公开名挂多个上游」已由 `route_targets` 链（有序 + 可故障转移）承担。两个机制重叠，保留 `priority` 只会让人以为它在起作用。 |
+| §3.E 链加载失败 | **禁止保存并提示** | 保存走 `PUT /routes/{id}/targets` 的**整体替换**。加载失败时伪造一条单目标链再提交，等于把 position 1..N 静默删光 —— 界面显示「保存成功」，故障转移链已经没了，且无撤销路径。宁可挡着不让存。 |
+
+## 2. 本轮实测新发现（原审计未列出，均已修）
+
+三条都是「编译通过、看代码像对的、只有实测才暴露」的类型。
+
+### 2.1 管理端登录限速**完全失效**（P1，功能性）
+
+`server.go` 的 `FailureThrottle.Fail` 原文：
+
+```go
+e, ok := t.fails[ip]
+if !ok || !time.Now().Before(e.until) {   // ← 对新条目恒为真
+    e = &failEntry{}
+    t.fails[ip] = e
+}
+e.count++
+```
+
+新条目的 `until` 是**零值**，而任意时刻都「不在零值之前」，所以这个条件对新条目恒为真：
+每失败一次就新建条目、`count` 被清回 1，`count >= limit` 永远不成立。
+
+实测：连打 26 次错误密码，**全是 401，一条 429 都没有**。管理密码下限只有 6 位，
+PBKDF2 21 万迭代把单次尝试压到几十毫秒 —— 这道唯一的在线防线此前形同虚设。
+
+修法：用 `e.until.IsZero()` 区分「从未冷却」与「冷却已过」，并在冷却重启时把 `until` 清回零值
+（不清就会在下一次 `Fail` 又命中重置分支，行为退化成同样的失效）。
+`internal/server/throttle_test.go` 六个用例钉死；**已用旧实现反证**：旧代码下 3 个用例 FAIL，
+其中一条报的正是实测看到的 `超过阈值应 429，得到 401`。
+
+### 2.2 所有 Create 响应的时间戳恒为 0（P2，契约）
+
+`createProvider` / `createCredential` / `createRoute` / `CreateAccessKey` 都把
+`time.Now().UnixMilli()` 存进**局部变量** `now` 落库，却从不回写到结构体 ——
+于是创建响应里的 `created_at`（provider 还有 `updated_at`）是 0，与随后 GET 到的同一条记录不一致。
+前端目前恰好只用创建响应里的 `plaintext_key`，所以没暴露出可见症状，但契约是错的。
+`route_target_dao.go` 一直是正确写法（`if t.CreatedAt == 0 { t.CreatedAt = now }`），本轮把其余四处对齐。
+
+### 2.3 `upstream_models` 根本没有 `created_at` 列，前端却在渲染它（P2，死字段）
+
+`types.ts` 的 `UpstreamModel` 声明了 `created_at: number`，`Providers.vue` 用
+`fmtDate(m.created_at)` 渲染 —— 该列在表里不存在、接口也不下发，于是模型列表里永远挂着一个
+只显示「—」的日期列。已从类型与模板删除。
+
+### 2.4 上游 404 不在可转移集合里 → 一条链首模型被上游退役的链会**永久硬失败**（P1，功能性）
+
+**怎么发现的**：验证「故障转移到底会不会发生」时，把链配成
+`[fakeanth/fake-claude , fake/fake-model]`（链首打的 anthropic 路径在本机假上游上必 404），
+开启 `failover_enabled` + `max_targets=2`，然后发一次请求：
+
+```
+HTTP 502  {"error":{"message":"not found","type":"api_error","code":"upstream_error"}}
+假上游 /__last 显示实收 model = "fake-claude"   ← 只打了链首，根本没有转移
+```
+
+**根因**：`outwire.FailoverEligible` 的判定集合是 5xx / 401 / 402 / 403 / 408 / 429 / 传输层，
+**404 不在其中**（还有一条 `errors_test.go` 用例显式断言 404 → false）。于是 `out.eligible=false`
+立刻 `break`，`max_targets=2` 形同虚设。
+
+**为什么这是真 bug 而不是设计取舍**：上游 404 的语义是「我这个提供商没有这个模型」，
+属于**目标级**配置问题 —— 而链正是为吸收目标级故障存在的。最现实的触发场景是
+**上游退役模型**（OpenAI / Anthropic 定期下架旧模型）：链首那个模型一旦被退役，
+整条链会永久硬失败，故障转移在最需要它的场景里恰好是失效的。运维加链的动机通常就是
+「主上游不稳/在换模型」，此时链首 404 若不能落到链尾，链等于白配。
+
+**附带**：`MapUpstreamError` 对 404 落到 `default` 分支，把上游那句裸 `"not found"`
+塞进 **502 `upstream_error`** 返回。这既掩盖了病因（调用方会去查自己的 model 名，
+而模型名在网关自己的 `/v1/models` 里是合法的），又泄漏上游原文。改为 404 `model_not_found`。
+
+**修法**：404 / 410 纳入可转移集合；`CredentialCooldown(404) = 0`（**不罚凭据** ——
+key 是好的，错的是目标的模型配置，罚它会把目标级故障放大成 provider 级故障），
+这类失败只累计目标熔断。
+
+**反证**：临时把 404 从两个判定里摘掉，`TestFailover_NonStreamSwitchesOnUpstream404` 与
+`TestFailover_SingleTarget404MapsToModelNotFound` 双双 FAIL，报的正是实测看到的那个形状：
+
+```
+want 200 after failover on 404, got 502 body={"error":{"message":"model not found","type":"api_error","code":"upstream_error"}}
+```
+
+### 2.5 `MarkCredentialError` 是个纯日志空操作（P2，死代码 / 假机制）
+
+原审计 §4.1 记的是「`MarkCredentialCooldown/Error` 无调用者，失效凭据永不摘除」。
+本轮把调用者接上之后才发现后半句不是「没接上」而是**接上也没用**：
+
+```go
+func (p *Pool) MarkCredentialError(credID string, err error) {
+	...
+			cred.Status = "error"        // ← 只改内存，不回写库
+			p.logger.Warn("credential error", ...)
+```
+
+而健康过滤 `getHealthyCredentials` 只跳过 `cooling`（且 `cooldown_until > now`）与 `disabled`，
+**从不看 `"error"`**；管理 API 读的又是库里的值（内存里这次改也没落库）。所以这个函数
+唯一的效果是打一行 warning。
+
+更彻底的是：它所在的 `else` 分支**本来就永远进不去**。热路径只在 `out.eligible` 时回写，
+而当时所有可转移状态（401/403/402/408/429/5xx/传输层）都带非零冷却，`credCooldown > 0`
+恒成立 —— 那个 `else` 是死分支，只是没人注意。
+
+**处置：删掉函数与那条死分支，而不是给它补行为。** 判废一把 key 的唯一真实手段是冷却；
+对「404 这类不该罚凭据的失败」，正确的记账位置是目标熔断而不是凭据状态。
+（把 `"error"` 接成「永久摘除」反而有害：一个健康 key 会陪着一个配错的模型一起下线。）
+
+## 3. 已修复清单
+
+- **P1**：配置 `defaults` 区间校验 + `NewTicker` 入参钳制（负数超时改为**启动期拒绝**，不再 panic）；
+  客户端断开 → `canceled`；route 主目标列**配对校验**（复用 `validateTarget` 的同一份判定）；
+  **上游 404/410 纳入可转移集合**（见 2.4）+ 404 对外映射改 `404 model_not_found`。
+- **P2.A 死字段**：`config.log_level` 接线（`slog.LevelVar` + `slog.SetDefault`）；
+  `RebuildFromDB` 删死参数；删 3 个无调用者的 pool 方法；`max_retries` 显式 0 不再回落默认；
+  `buildClient` 补 `default` 分支；**删 `Pool.MarkCredentialError` 及其永不可达的调用分支**（见 2.5，
+  原 §4.1 的「失效凭据永不摘除」实为「接上也无效」）；`access_keys` 删 4 死列（`expires_at`/`rpm_limit`/`tpm_limit`/`last_used_at`）+
+  `routes` 删 `priority`（`dropDeadColumns()` 真删，不只是建表语句里去掉）；
+  `access_keys.quota_tokens` 补上管理端写入口（运行时的配额预检本来就在，缺的只是写入路径）。
+- **P2.B 管理 API 契约**：`limit` clamp；DB 故障与 404 分离；Delete 未找到 → 404；
+  父资源校验；三处复合写改**单事务**（provider+credential、route+链首目标、route 更新+链首对齐）；
+  500 不回显底层错误；UNIQUE → 409；外键冲突 → 409；`usage` 明细与汇总共用同一份 WHERE
+  （修 `group_by` 覆盖 args）、`summary` 改**全量聚合**（不再页内累加）、`rows.Err()` 检查、
+  非聚合裸列给中性值；补 `routes/{id}/targets` 子资源端点。
+- **P2.C 鉴权安全**：`auth.KeyHash` 改**恒定时间比较**并遍历全部 key（原实现提前 return，
+  可按响应时序区分「键存在但停用」与「键不存在」）；删 `?key=` 查询参数支持（会进 access log / Referer）；
+  `admin_auth.json` 损坏不再 `os.Exit(1)`（改锁定态，转发服务不受影响）；登录失败限速（本节 2.1）；
+  删 `verifyFallback` 的 `len==64 && isHex` 启发式（应为明文比较）；`/v1/models` 加鉴权。
+- **P2.D 流式与 HTTP**：keepalive ticker 补 `Reset` + 入参钳制下界；`SSEWriter` 加锁 + 新增
+  `WriteComment`（并发写同一个 `http.ResponseWriter` 是数据竞争）；`Recovery` 换掉 `http.Error`
+  （SSE 头已发时不能再写 JSON 错误体，先查 `Committed()`）；`recordUsage` 改为可等待的
+  `usageRecorder` + 关停时 drain（原来进程退出会丢最后几条用量）；
+  `inwire` 请求体上限单源化 + `*http.MaxBytesError` → 413；`WriteUsage` 补
+  `prompt_tokens_details.cached_tokens`；`statusResponseWriter` 加锁。
+- **P2.E 前端**：`Routes.vue` 链加载失败禁止保存（§1 决策）+ `toggleRoute` 只发增量字段；
+  `api.ts` `mutate()` 的 401 原样上抛；`App.vue` 确认弹窗补 `@close` + 接住锁定态；
+  `ui.ts` 覆盖前结算旧 Promise；`styles.css` 的 `prefers-transparency` → `prefers-reduced-transparency`
+  （原特性名非法，整块降级样式从未生效）；删死代码 `auth.ready` / `authState.callback` / 两处 `defineExpose`；
+  `Settings.vue` 的 `password/check` 从 `load()` 的 try 拆出 + 改密码加提交锁；
+  `Providers.vue` 成功率改用 `fmtPercent`（`0.995` 不再被显示成 `100%` 却挂着 warn 橙）；
+  `fmt.ts` 补 `canceled` 标签与中性徽章、`fmtPercent` 不再向上进位到 100%。
+- **P2.F 小瑕疵**：`var _ = sql.ErrNoRows` 死代码；`SSEWriter.flushed` 死字段；
+  `WriteNonStreamResponse` 手工拼 JSON → `json.Marshal`，且有 tool_calls 时 `content` 下发 `null`
+  而非整体消失；`extractText` 畸形 JSON 不再原样当正文（改返回空串 → 由 SDK 校验拒绝为 400）；
+  DSN 补 `_busy_timeout=5000`；`error_code`/`request_id` 走 `nullIfEmpty`。
+
+### 附带完成：多模态输入透传（原「已知缺口」）
+
+`inwire.extractText` 把 `image_url` 静默丢弃：客户端发多模态请求，网关照单全收并回 200，
+上游只看到文字 —— 用户以为「模型看不懂图」，实际是网关半路把图删了且不留痕迹。
+
+rosetta v0.5.1 原生有 `BlockImage`/`ImageURL`，跨协议翻译（OpenAI `image_url` ↔
+Anthropic `image source` ↔ Responses `input_image`）正是这个网关存在的意义，没有理由丢。
+现 `user` 角色按块透传文本 + 图像；`system`/`assistant`/`tool` 保持纯文本（与 OpenAI 语义一致）。
+无图像时仍走 `rosetta.User(text)`，与旧实现逐字节一致，不做行为变更。
+
+**非法 URL 不需要网关再写白名单**：rosetta 的 `validate` 会拦下并返回 `ErrInvalidRequest`，
+网关已有的错误映射把它变成 400（实测 `file:///etc/passwd` → 400，未开 SSRF 口子）。
+
+## 4. 验证证据（全部在 `.workbuddy/tmp/e2e`，18099 网关 + 19090 假上游）
+
+- **迁移**：拿 **9-23 建的旧库**（`routes` 带 `priority`、`access_keys` 带 4 个死列）直接起新二进制。
+  实测 `PRAGMA table_info` 确认 5 个死列**真被 DROP**，`route_targets` 为两条已有路由各回填 position 0。
+- **多模态透传**：`zzfake` 的 `/__last` 回看上游实收 body ——
+  `{"content":[{"text":"描述这张图","type":"text"},{"image_url":{"url":"https://example.com/cat.png"},"type":"image_url"}],"role":"user"}`
+  图像块完整保留。回归：纯字符串 → `'hello'`；纯文本块数组 → `'ABCD'`（拼接无分隔符，与旧行为一致）；
+  畸形 `content: 123` → **400**（不再把 `123` 当正文发给上游）。
+- **客户端断开**：`slow` 模式 + `--max-time 1` 主动断开 → `usage_records.status = canceled`
+  （改为 `error` 之前的行为已不复现）。
+- **负数超时**：`stream_idle_timeout_ms: -1` → 启动**退出码 1**，
+  `failed to load config: defaults.stream_idle_timeout_ms: must be >= 1, got -1`（不再 panic）。
+- **配对校验**：provider 与模型不互属 → 400；provider 不存在 → 400；重名 → **409**（原先 500 + 裸 SQL 错误）。
+- **`/v1/models` 鉴权**：无头 401，带有效 key 200。
+- **登录限速**：前 10 次 401，第 11 次起 **429 + `Retry-After: 60`**；
+  冷却期内即使口令正确也 429，且耗时 1.1ms（未做 PBKDF2）。
+- **Create 时间戳**：`POST /keys` → `created_at = 1790206267000`；`POST /providers` → `created_at`/`updated_at` 均非 0。
+- **流式矩阵** `bash .workbuddy/tmp/e2e/run-matrix.sh` 四种模式全部符合预期：
+  `ok` → `[DONE]` + `finish_reason` + status `ok`；`silent` → 仅 `: keepalive`、status `truncated`（latency 3001ms）；
+  `no_done_hold` → 有内容但无收尾、status `truncated`；`thinking` → 流式 `delta.reasoning_content`
+  与非流式 `message.reasoning_content` 均有值。`check_sse.py` 对四个 raw 文件判定全部 `VERDICT=clean`
+  （`corrupt_lines=0`，含 keepalive 与数据帧交错的 `no_done_hold`）。
+  用量尾块已带 `prompt_tokens_details.cached_tokens: 4`。
+- **单元测试反证**：`internal/server/throttle_test.go` 在旧实现下 3 个用例 FAIL（见 2.1）；
+  `TestFailover_NonStreamSwitchesOnUpstream404` / `TestFailover_SingleTarget404MapsToModelNotFound`
+  在旧的 404 判定下双双 FAIL（见 2.4）。
+- **故障转移**（`python .workbuddy/tmp/e2e/failover-test.py`，13 项断言全过）：
+  链 `[fakeanth(必 404) , fake(ok)]`、`failover=on max_targets=2` → **200 且假上游 `/__last` =
+  `fake-model`**（证明真的转移了；修复前是 502 且 `/__last` = `fake-claude`）；
+  `failover=off` → 只打链首、对外 **404 `model_not_found`**；按模型给链首注入 `http500` → 同样转移；
+  **流式路径同样转移**（下游收到链尾的完整流并带 `[DONE]`）。单目标链下六种注入状态码映射
+  全部符合 DESIGN §9 表格：`http429`→429 `rate_limit_exceeded`、`http500`→502 `upstream_error`、
+  `http404`→404 `model_not_found`、`http402`→502 `upstream_quota_exhausted`、
+  `http401`→502 `upstream_auth_error`、`http400`→400 `invalid_request_error`。
+  每条用例前 reload（清掉上一条留下的凭据冷却/目标熔断）保证结论不被前置状态污染。
+- **目标熔断**（`bash .workbuddy/tmp/e2e/breaker-test.sh`）：`failure_threshold=2` 连打 4 次，
+  网关日志出现 `target circuit opened target=0b67e213… threshold=2 until=+60s`，
+  且 4 次请求对外都是 200 —— 熔断器不是死配置，404 确实走了 `RecordTargetFailure` 记账。
+- **假上游能力扩展**（`.workbuddy/tools/zstream/zzfake`）：新增 `httpNNN` 错误注入与
+  `?model=<上游模型名>` 按模型覆盖模式。后者是验证链式故障转移的**必要条件** ——
+  链上各目标发来的 model 名不同，只改全局模式会把整条链一起打掉，根本测不出转移。
+- **静态检查**：`go build ./...` / `go vet ./...` 均无输出；`go test ./... -count=1` 全过；
+  `npm run typecheck` 通过；管理界面四页截图核对（`overflowX: 0`，无窄屏溢出）。
+
+

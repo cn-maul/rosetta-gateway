@@ -136,7 +136,7 @@ SQLite，WAL 模式，`foreign_keys=ON`。
 -- 上游服务商
 CREATE TABLE providers (
   id            TEXT PRIMARY KEY,          -- uuid
-  slug          TEXT NOT NULL UNIQUE,      -- 前缀语法用，限定 [a-z0-9-]{2,32}
+  slug          TEXT NOT NULL UNIQUE,      -- 前缀语法用，限定 [a-z0-9]{2,32}（不允许连字符）
   name          TEXT NOT NULL,             -- 显示名
   protocol      TEXT NOT NULL DEFAULT 'auto',
                                            -- auto|openai-chat|openai-responses|anthropic
@@ -173,37 +173,61 @@ CREATE TABLE upstream_models (
   context_window    INTEGER,                -- 覆盖 rosetta 注册表
   max_output_tokens INTEGER,
   supports_thinking INTEGER,                -- NULL = 不覆盖
-  default_extra_json TEXT,                  -- 该模型固定附加的上游字段
   UNIQUE (provider_id, model_id)
+  -- 曾有一个 default_extra_json 列，但没有任何地方拿它构造请求，2026-09-24 摘除。
+  -- 要接线得先定清语义（链上各目标协议可能不同、路由级与模型级谁覆盖谁），
+  -- 理由与 routes.priority 同类：留着 = schema 在说谎。见 store.dropDeadColumns 注释。
 );
 
 -- 对外虚拟模型名（D2 的轨道一）
+-- 一条 route 背后是一条「有序上游链」（见 route_targets）。
+-- provider_id / upstream_model_id 是链首（position 0）的向后兼容列：
+-- 老代码、config bootstrap、以及「尚未建目标行」的场景仍以它们为准。
 CREATE TABLE routes (
   id                TEXT PRIMARY KEY,
   public_name       TEXT NOT NULL UNIQUE,   -- 对外 model 名
-  provider_id       TEXT NOT NULL REFERENCES providers(id) ON DELETE RESTRICT,
-  upstream_model_id TEXT NOT NULL REFERENCES upstream_models(id) ON DELETE RESTRICT,
+  provider_id       TEXT NOT NULL REFERENCES providers(id) ON DELETE RESTRICT,        -- 链首（兼容列）
+  upstream_model_id TEXT NOT NULL REFERENCES upstream_models(id) ON DELETE RESTRICT,  -- 链首（兼容列）
   enabled           INTEGER NOT NULL DEFAULT 1,
-  priority          INTEGER NOT NULL DEFAULT 0,   -- 预留：故障转移候选顺序
-  fallback_route_id TEXT REFERENCES routes(id) ON DELETE SET NULL,
-  extra_json        TEXT,
+  -- 没有 priority：曾规划为「同名多路由择优」，但 public_name 是 UNIQUE，
+  -- 该语义在数据层不可能成立，界面却写着「按 priority 升序择优」→ 2026-09-24 摘除。
+  -- 「一个公开名挂多个上游」由下面的 route_targets 链承担（有序、可故障转移）。
+  -- 没有 fallback_route_id：旧单跳兜底已被 route_targets 链取代（DESIGN §10），
+  -- 留着会与链形成两套并行机制 → 2026-09-29 摘除。
+  -- 没有 max_targets / failure_threshold / stream_first_token_timeout_ms /
+  -- nonstream_timeout_ms：故障转移与超时策略已统一收进「设置」页
+  -- （app_settings 的 runtime_defaults），不再按路由存 → 2026-09-29 摘除。
+  failover_enabled  INTEGER NOT NULL DEFAULT 0,  -- 1 = 这条路由启用自动故障转移
+  -- 曾有一个 extra_json 列（自 2026-09-21 起），但没有任何地方拿它构造请求，2026-09-24 摘除。
   created_at        INTEGER NOT NULL
 );
 
+-- route 的有序上游链：对外同一个 public_name 挂多个 (provider, model)，按 position 升序尝试。
+-- 迁移期幂等回填：为「尚无任何目标行」的老 route 补一条 position 0（取 route 的兼容列）。
+CREATE TABLE route_targets (
+  id                TEXT PRIMARY KEY,
+  route_id          TEXT NOT NULL REFERENCES routes(id) ON DELETE CASCADE,
+  provider_id       TEXT NOT NULL REFERENCES providers(id) ON DELETE RESTRICT,
+  upstream_model_id TEXT NOT NULL REFERENCES upstream_models(id) ON DELETE RESTRICT,
+  position          INTEGER NOT NULL DEFAULT 0,   -- 链顺序，越小越先尝试
+  enabled           INTEGER NOT NULL DEFAULT 1,
+  created_at        INTEGER NOT NULL
+);
+CREATE INDEX idx_route_targets_route ON route_targets(route_id, position);
+
 -- 下游访问凭证（D7 的配额载体）
+-- 只做「总量配额」这一维。expires_at / rpm_limit / tpm_limit / last_used_at 曾在表里
+-- 但没有任何读写路径（能读、无写、无人用），2026-09-24 随 dropDeadColumns() 一并删除——
+-- 留着它们只会让「支持过期/RPM/TPM」看起来像是已实现的功能。
 CREATE TABLE access_keys (
   id            TEXT PRIMARY KEY,
   key_hash      TEXT NOT NULL UNIQUE,      -- SHA-256(明文)，不存明文
   key_prefix    TEXT NOT NULL,             -- 形如 "sk-gw-a1b2"，用于界面展示
   name          TEXT NOT NULL,
   enabled       INTEGER NOT NULL DEFAULT 1,
-  expires_at    INTEGER NOT NULL DEFAULT 0,     -- 0 = 不过期
-  quota_tokens  INTEGER NOT NULL DEFAULT 0,     -- 0 = 不限
-  used_tokens   INTEGER NOT NULL DEFAULT 0,     -- 累计，只增
-  rpm_limit     INTEGER NOT NULL DEFAULT 0,     -- 0 = 不限
-  tpm_limit     INTEGER NOT NULL DEFAULT 0,     -- 0 = 不限
-  created_at    INTEGER NOT NULL,
-  last_used_at  INTEGER NOT NULL DEFAULT 0
+  quota_tokens  INTEGER NOT NULL DEFAULT 0,     -- 0 = 不限；累计 input+output token 上限
+  used_tokens   INTEGER NOT NULL DEFAULT 0,     -- 累计，只增（由 usage_records 触发器维护）
+  created_at    INTEGER NOT NULL
 );
 
 -- 逐请求用量
@@ -222,7 +246,7 @@ CREATE TABLE usage_records (
   reasoning_tokens  INTEGER NOT NULL DEFAULT 0,
   cached_tokens     INTEGER NOT NULL DEFAULT 0,
   usage_state       TEXT NOT NULL,         -- reported|estimated|missing
-  status            TEXT NOT NULL,         -- ok|error|truncated|canceled
+  status            TEXT NOT NULL,         -- ok|truncated|overflow|canceled|error（见 §8.2）
   http_status       INTEGER NOT NULL,
   error_code        TEXT,
   latency_ms        INTEGER NOT NULL,
@@ -266,6 +290,22 @@ resolve(model):
 - **轨道二零配置。** 只要 provider 和模型在库里 enabled，就能直接用 `slug/model` 调用，不需要建 route。
 - **撞名校验。** 管理界面在创建 `public_name` 时，若其与任一 provider 的 `slug` 相同则给出警告（不阻断，但明确提示该名字的无斜杠请求会走轨道一）。
 - 解析结果进快照，O(1) 查表。
+
+**命中之后：怎么选上游。** `Resolve` 返回的是 `(Route, []Candidate)`，候选链来自 `route_targets`：
+
+- 按 `position` 升序逐个尝试，过滤掉 provider/model 缺失或禁用的成员。
+- **只要这条 route 有目标行，就以链为准**，绝不回落到 `routes` 的主目标列 —— 否则等于
+  无视运维对链的显式禁用、把死目标复活。仅当一条目标行都没有（从未配置过链的老 route）
+  才用主目标列合成单元素链兜底（零回归）。
+- 尝试预算：关掉 `failover_enabled` 时**只打链首**（等价于改造前的单目标行为）；
+  开启时按 `failover_max_targets`（**全局设置**，见 §10「参数落点」）裁剪。
+- 开启故障转移时跳过正被熔断的目标（`Pool.TargetAvailable`）；**若全被熔断则退回整条链** ——
+  宁可打一个刚失败的目标，也不要因为链整体静默就给调用方一个「模型不存在」（模型名明明在
+  网关自己的 `/v1/models` 里）。
+- 链首与 `routes.provider_id`/`upstream_model_id` 的一致性由写入路径维护：
+  `POST /routes` 建 route 时同事务种一条 position 0；`PATCH /routes/{id}` 在**所有字段赋值之后**
+  做配对校验并同事务把链首对齐到新的主目标。少了这一步就会留下
+  「响应回显新值、界面显示成功、实际流量还打旧目标」的永久分叉。
 
 ### 5.2 对外模型列表
 
@@ -323,9 +363,28 @@ resolve(model):
 （PBKDF2-HMAC-SHA256 + 随机盐，见 `internal/adminauth`），`config.json` 的 `admin_token`
 仅作为「尚未设置密码」时的兜底与应急恢复通道。**凭证是运行时状态，设置后立即生效、无需重启。**
 
+**凭据优先级（唯一事实来源）** —— 两者是**覆盖**关系，不是并存：
+
+| 状态 | 实际生效的凭据 | 判定依据 |
+|---|---|---|
+| ① `admin_auth.json` 存在且可解析 | **只认其中的用户密码**；`admin_token` **完全失效** | `Store.cred != nil` → 走 `cred.matches()` |
+| ② `admin_auth.json` 不存在 | `config.json` 的 `admin_token`；若它为空则用 `ADMIN_TOKEN` 环境变量 | `Store.cred == nil` → 走 `verifyFallback()` |
+| ③ 两者都没有 | 无凭据：除 `password/check` 与首次 `password/set` 外一律 401 | `HasCredential() == false` |
+| ④ `admin_auth.json` 存在但损坏 | 一律拒绝（锁定态）；`HasCredential()` 仍为真 | `Store.locked != nil` |
+
+要点：
+- **一旦在「设置」页设过密码，`admin_token` 就再也不认了**（不是「都能用」）。这是最常见的困惑来源。
+- 忘了密码的恢复通道：删掉 `admin_auth.json` 重启 → 回到状态 ②/③（用 `admin_token` 登录，或重新设置密码）。
+- 状态 ④ 的 `HasCredential()` 必须为真，否则一个损坏的文件就等于把 `password/set` 引导窗口向所有人敞开。
+- 上述四条由 `internal/adminauth/store_test.go` 钉住（`TestVerify_PasswordBeatsConfigToken` 等）。
+
+前端 `GET /admin/api/password/check` 返回 `source` 字段（`none` / `config_token` / `password_file` / `locked`）
+与 `first_setup`，登录弹窗据此渲染成三种**明显不同**的形态（首次初始化需二次确认 / 令牌登录 / 密码登录），
+避免「创建凭据」与「使用凭据」长得一样。
+
 | 端点 | 放行规则 |
 |---|---|
-| `GET /admin/api/password/check` | 恒放行（只返回布尔值） |
+| `GET /admin/api/password/check` | 恒放行（只返回布尔值与来源标签，不含任何可用于登录的信息） |
 | `POST /admin/api/password/set` | 仅当系统尚无任何凭据时放行；已有凭据则必须带正确的旧凭据 |
 | `GET /admin/api/auth/verify` | 需鉴权（给前端「先验证再保存」用） |
 | 其余 | `Authorization: Bearer <密码或 admin_token>` |
@@ -352,10 +411,12 @@ GET    /admin/api/routes
 POST   /admin/api/routes
 PATCH  /admin/api/routes/{id}
 DELETE /admin/api/routes/{id}
+GET    /admin/api/routes/{id}/targets             读有序上游链（含 provider/model 展示名）
+PUT    /admin/api/routes/{id}/targets             原子整体替换链；链首回写 routes 主目标列
 
 GET    /admin/api/keys
 POST   /admin/api/keys                          返回明文一次
-PATCH  /admin/api/keys/{id}
+PATCH  /admin/api/keys/{id}                      可改 name / enabled / quota_tokens
 DELETE /admin/api/keys/{id}
 
 GET    /admin/api/usage?from=&to=&group_by=key|model|provider|day
@@ -380,9 +441,14 @@ PATCH 端点一律「只看请求体里出现了哪些字段」：
 
 因此两个直接结论：
 
-- **编辑时只发你要改的字段即可**，不必回传完整对象。
-- `priority: 0`、`fallback_route_id: ""`、`timeout_ms: 0`（=用全局默认）、
+- **编辑时只发你要改的字段即可**，不必回传完整对象。前端里唯一的正确写法是
+  「只发要改的字段」（如启停开关只发 `{ enabled: ... }`）；回传整个对象等于做读-改-写，
+  会把列表快照里的陈旧值一起写回去，静默回滚别的标签页刚做的改动。
+- `timeout_ms: 0`（=用全局默认）、`quirks_json: ""`（=清空）、
   `context_window: 0`（=未设置）都是可表达的意图，不再是「空值即忽略」。
+  （注意：故障转移与超时策略**不是**路由的 PATCH 字段，它们在「设置」页，见 §10。）
+
+管理端登录限速（§11.4）与配额预检（§11.2）都不走 PATCH 语义，别混。
 
 实现约束：结构体的标量字段必须是指针，合并处写 `if req.X != nil { ... }`。
 用 `if *req.X != ""` 或解引用后判断零值的写法会把「显式置空」重新变回「未提供」，
@@ -429,7 +495,7 @@ PATCH 结构体里刻意不含该字段，传了也会被忽略。
 
 | 项 | 做法 |
 |---|---|
-| 取消传播 | 上游 ctx 直接取 `r.Context()`。下游断开 → ctx 取消 → Rosetta 中止流 → 上游连接关闭。**这是最直接的止损点，必须做对** |
+| 取消传播 | 上游 ctx 直接取 `r.Context()`。下游断开 → ctx 取消 → Rosetta 中止流 → 上游连接关闭。**这是最直接的止损点，必须做对**。下游断开**不算错误**：`usage_records.status` 记 `canceled`（见 §8.2），不计入错误率 |
 | 空闲看门狗 | 独立 `time.AfterFunc`，默认 60s 无事件则 `stream.Close()`。每收到一个事件重置定时器。超时视为 `status=truncated`。**注意 `Stream.Close()` 不写 `stream.Err()`**（Rosetta 只在真的读失败时才置 err），所以看门狗必须自己用 `atomic.Bool` 留痕；否则 `Err()==nil` → 状态保持 `ok` → 下游收到 `finish_reason:"stop"` + `[DONE]`，卡死的上游被伪装成正常收尾（详见 §8.2） |
 | 心跳 | 空闲超过 `idle/2` 时下发 `: keepalive\n\n`，防中间代理超时断连 |
 | Flush | 用 `http.NewResponseController(w).Flush()`（Go 1.20+），不用 `http.Flusher` 类型断言 |
@@ -465,6 +531,26 @@ Rosetta 用 `ErrStreamTruncated` 区分「干净结束」与「连接被掐断�
 但记一条 `WARN stream finished with no content` —— 日志是唯一能区分
 「上游确实回了空」与「网关把内容吃掉了」的地方。
 
+#### status 取值（五值）
+
+| status | 含义 | 算不算错误 |
+|---|---|---|
+| `ok` | 拿到终止事件的干净结束 | 否 |
+| `truncated` | 内容已下发，但缺收尾事件（上游断连，或我们的看门狗开火） | 否（内容确实上线了） |
+| `overflow` | Rosetta 侧内容超限（64 MiB）而截断 | 否（同上） |
+| `canceled` | **客户端主动断开**，网关随之取消上游 | **否** |
+| `error` | 上游报错、鉴权失败、路由不存在等 | 是 |
+
+`canceled` 单列的理由：客户端断开既不是网关的错，也不是上游的错。记成 `error` 会让
+「用户关掉了一个页面」在错误率里和「上游 500」等价 —— 看板上会出现无法解释的错误尖峰，
+而真正需要关注的故障被淹没在里面。判定用 `context.Canceled` / `context.DeadlineExceeded`
+（`errors.Is`），并在写响应前先检查 `r.Context().Err() != nil`：客户端已经走了，
+再往里写只能是徒劳（而且会掩盖真实原因）。
+
+统计口径同步排除它：`GetUsageStats` 的错误计数是 `status NOT IN ('ok','canceled')`，
+模型吞吐（`ListModelThroughput`）过滤 `status <> 'canceled'`。前端用**中性灰**标签，
+与暖橙的 `truncated`/`overflow`/`error` 区分（见 §13）。
+
 
 ### 8.3 非流式
 
@@ -484,11 +570,12 @@ Rosetta 用 `ErrStreamTruncated` 区分「干净结束」与「连接被掐断�
 | 上游 5xx | 502 | `upstream_error` | |
 | 上游超时 / 连接失败 | 504 / 502 | `upstream_timeout` | 出站侧 |
 | 上游 400（请求非法） | 400 | 透传上游 code | 这类是调用方的问题，原样透传并保留 message |
-| 上游 404（模型不存在） | 502 | `upstream_model_not_found` | 是网关路由配置错了，不是调用方写错模型名 |
+| 上游 404 / 410（该目标没有这个模型） | **404** | `model_not_found` | 目标级配置问题（上游退役了那个模型、或链上模型名配错）。**不透传上游原文、也不报 502** —— 调用方给的模型名在网关这边是合法的，报 502 会让人去查错地方；是否可转移见 §10 |
 | 未知模型名 | 404 | `model_not_found` | 网关自己产生 |
 | 下游 Key 无效 | 401 | `invalid_api_key` | |
 | 下游 Key 停用 / 过期 | 403 / 401 | | |
-| 配额耗尽 / 限速 | 429 | `rate_limit_exceeded` | |
+| 配额耗尽（Key 总量） | 429 | `insufficient_quota` | 已实现，见 §11.2；预检读库，OpenAI 计费语义同款 code |
+| 限速（RPM/TPM） | 429 | `rate_limit_exceeded` | 尚未实现，§11.4 |
 | 上下文超长（`ErrContextTooLong`） | 400 | `context_length_exceeded` | Rosetta strict 模式产生 |
 | 请求体非法（`ErrInvalidRequest`） | 400 | `invalid_request_error` | 含 Rosetta 的结构校验失败 |
 
@@ -520,16 +607,66 @@ Client 是 goroutine 安全的，进程内单例复用（内含连接池）。
 1. N 个 `http.Client` ⇒ N 个连接池。key 数量在几十把以内可忽略；上百把需要合并 `WithHTTPClient` 共享传输层。
 2. 改 key 后要重建对应 Client（管理接口里封装，热更新时替换快照中的指针）。
 
-**选择策略**（P2）：
+**选择策略**（已实现）：
 
 - `weight` 加权的随机选择（默认）、或轮询
-- 跳过 `status != healthy` 或 `cooldown_until > now` 的凭证
-- 冷却规则：429 按 `Retry-After`（上限 60s，Rosetta 已有硬上限）；401/403 冷却 30 分钟；402 冷却 1 小时；5xx 冷却 60s
-- 单请求重试：用另一把凭证重发，最多 2 次（**仅在未向下游写出任何字节时可以重试**，即非流式请求、或流式的 `ChatStream` 建立阶段失败）
+- 跳过 `disabled` 或处于冷却（`cooldown_until > now`）的凭证
+- 冷却回写（已启用，`outwire.CredentialCooldown`）：401/403 冷却 30 分钟；402 冷却 1 小时；429 / 408 / 5xx / 传输层错误冷却 60s。
+  注：Rosetta v0.5.1 未在 `APIError` 上暴露 `Retry-After`，故 429 统一按 60s 上限处理（不读上游响应头）。
+- 冷却回写只影响「同一 provider 内换哪把 key」，不决定跨 provider 转移。
+- **凭据只有两种失效方式**：`cooling`（冷却到期自动恢复）与 `disabled`（运营显式停用）——
+  二者都在 `getHealthyCredentials` 里被真正过滤。旧实现另有一个 `MarkCredentialError`，
+  它把内存里的 `status` 置成 `"error"`，但那个值既不参与健康过滤、也不回写库，调用它只是
+  打一行 warning：**纯空操作**，2026-09-24 已删（连带删掉热路径里那条调用它的死分支 ——
+  因为所有可转移状态都带非零冷却，那条 `else` 分支本来就永远进不去）。
+  判废一把 key 的唯一真实手段是冷却。
 
-**故障转移**：`routes.fallback_route_id` 指向备用 route。仅当当前 provider 的所有凭证都不可用时触发。P2 实现。
+**自动故障转移**（已实现，取代旧的 `fallback_route_id` 单跳兜底）：
 
-**P0 阶段**：单凭证、无池、无冷却、无故障转移。够跑通链路。
+一条 route 背后是 `route_targets` 承载的**有序上游链**——对外同一个 `public_name` 可挂多个 `(provider, model)`，按 `position` 升序尝试。`routes.provider_id / upstream_model_id` 退化为链首兼容列。
+
+请求热路径（`handleChatCompletions` 的转移循环）语义：
+
+- 仅当 `failover_enabled=1` 才进入多目标循环；否则只打链首，上游错误原样透出。
+- 单次请求最多尝试 `failover_max_targets` 个候选（**全局设置**，见下方「参数落点」），按链顺序推进。
+- **转移只发生在「尚未向下游写出任何字节」时**（pre-commit）：
+  - 非流式：整段响应成功即提交；写出前任何可用错误都可换下一目标。
+  - 流式：**SSE 头延迟到收到上游首个事件才写**。首字（TTFT）前的建立/超时失败仍可转移；一旦写出 SSE 头即视为已提交，此后断流按 `truncated` 语义处理，**不再转移**（避免把半截回答重复计费/重复输出）。
+- 可转移的错误（`outwire.FailoverEligible`）：5xx / 401 / 402 / 403 / **404 / 410** / 408 / 429 / 传输层错误（超时）。不可转移：400 / 422 / 流截断。
+  - **为什么 404/410 要转移**（2026-09-24 由 e2e 实测暴露）：上游 404 的语义是「我这个提供商没有这个模型」，属于**目标级**故障，而链正是为吸收目标级故障存在的。最现实的场景是上游退役了链首在用的那个模型 —— 它若不算可转移，整条链会永久硬失败，故障转移在最需要它的场景里恰好失效。反证：`cmd/gateway/failover_test.go` 的 `TestFailover_NonStreamSwitchesOnUpstream404` 与 `TestFailover_SingleTarget404MapsToModelNotFound` 在旧判定下必失败。
+  - 404/410 可转移但**不冷却凭据**（`outwire.CredentialCooldown` 返回 0）：key 是好的，错的是目标的模型配置。惩罚凭据会把「目标级故障」放大成「provider 级故障」—— 一个健康 key 陪着一个配错的模型下线。这类失败只累计目标熔断。
+- **目标级熔断**：某 `target` 连续失败达 `failover_failure_threshold`（全局设置，>= 1）后，进入 60s 冷却，期间该目标在链上被跳过；若整条链都在冷却，则回退为按序尝试全链（不让运营配出的链因瞬时抖动整体不可用）。
+- **每次 attempt 只取该 provider 的一把凭证**：单请求内不会就地换同 provider 的下一把 key，失败即让位链上下一个目标；坏 key 的轮换交给跨请求冷却（下个请求自会选到好 key）。有意如此，避免「一个请求把某 provider 所有 key 各打一遍」放大延迟与配额消耗。
+- **客户端断开即收手**：转移循环每轮顶部检查 `r.Context().Err()`，非空则直接返回——不再往链上后续目标打（半路跑掉的客户端不该消耗下游配额），也不记 error 用量（断流是客户端行为，非上游故障）。
+  - 同理，**客户端在调用进行中断开时不做任何健康态记账**（`out.eligible && r.Context().Err() == nil`）。SDK 会把 context 取消包成 `TransportError` 落进可转移集合，若照记就会把一把健康凭据冷却 60s 并累计目标熔断 —— 对单 key provider 等于「几次用户点停止 = 该上游 60 秒整体不可用」（冷却期内凭据不再被选中，也就没有任何请求能成功以触发复苏）。判据用 `r.Context()`：它只在客户端断开/服务关停时取消，上游超时用的是派生 ctx，两者不会混淆。
+- 命中成功目标：回写清除该凭证冷却 + 复位该目标熔断计数。
+- 全链耗尽：透出最后一个上游错误（映射到对应 5xx/4xx），并记一条 error 用量。
+
+**主目标列与链的一致性**：`routes.provider_id / upstream_model_id` 是链首（position 0）的兼容视图，但运行时解析以 `route_targets` 为准（一旦有目标行就不再回看主目标列）。因此 `PATCH /admin/api/routes/{id}` 改这两列时，`SyncHeadTarget` 会把改动落到链首，避免「DB 列变了、响应回显新值、实际流量仍打旧目标」的静默分叉；链为空则补一条 position 0。整体换链走 `PUT .../targets`，其内部再用链首反向同步主目标列。
+
+**健康态与池重建**：`upstream.Pool` 的目标熔断表与凭据冷却在每次重建池（`BuildFromStore` / `BuildFromConfig`，即每个管理写操作触发的 reload）时一并清零——两层语义一致，配置变更本就是重新探测的正当理由（代价：管理员改配置会重置 ≤60s 的冷却/熔断）。这也堵住「每次保存链重生成 `target_id` → 旧熔断条目在表里单调堆积」的泄漏。
+
+**健康态是纯运行时的，不落库、重启即清零**：冷却与熔断只活在 `upstream.Pool` 的内存里。`provider_credentials.cooldown_until / status` 与 `routes` 上的旧策略列**不是**事实来源（后者的策略列已整体删除，见 `store.dropDeadColumns`）。理由：这些状态生命周期极短（熔断 60s、冷却 ≤30min），冷启动一律「全健康」再由真实失败快速收敛，比持久化更简单也更快收敛；反之一旦落库，就要处理「重启后读到一批早已过期的冷却」这种伪状态。运维影响：**重启网关会清空全部健康态**（表现为故障目标立刻又被试一次），这是预期行为，不是故障。
+
+**参数落点**：故障转移与超时策略**统一是全局的**，由「设置」页写入 `app_settings` 的 `runtime_defaults`，经快照（`snapshot.Snapshot.Runtime`）在转发热路径读取；DB 未配置的字段回落 `config.json` 的 `defaults`（这样老部署升级后原配置继续生效，直到在后台显式保存）。
+
+| 设置项 | 含义 | config 兜底键 |
+|---|---|---|
+| `failover_max_targets` | 一次请求最多尝试链上几个目标 | `defaults.failover_max_targets` |
+| `failover_failure_threshold` | 某目标连续失败几次即熔断 | `defaults.failover_failure_threshold` |
+| `stream_first_token_timeout_ms` | 流式首字（TTFT）看门狗 | `defaults.stream_first_token_timeout_ms` |
+| `stream_idle_timeout_ms` | 流式空闲看门狗 | `defaults.stream_idle_timeout_ms` |
+| `upstream_timeout_ms` | 非流式整体超时 | `defaults.upstream_timeout_ms` |
+
+保存设置后前端触发一次 `POST /admin/api/reload` 重建快照，**无需重启即生效**。
+
+> 历史沿革：这些参数曾按 route 存在（`routes.max_targets / failure_threshold /
+> stream_first_token_timeout_ms / nonstream_timeout_ms`），界面上每条路由各配一遍。
+> 已整体移除：同一份策略散在多条路由上必然漂移，且会出现「改了全局默认、某条路由
+> 却被旧覆盖值悄悄盖住」的排查地狱。现在每条路由只需要一个 `failover_enabled` 开关
+> 加一条有序链。同理移除的还有 `routes.fallback_route_id`（单跳兜底，已被本链取代）。
+
+管理面用 `PUT /admin/api/routes/{id}/targets` 原子替换整条链，`PATCH /admin/api/routes/{id}` 改 `failover_enabled` 等路由自身字段。
 
 ---
 
@@ -541,27 +678,35 @@ Client 是 goroutine 安全的，进程内单例复用（内含连接池）。
 - 来源：`ChatResponse.Usage` / `EventMessageEnd.Usage`
 - **usage 缺失时**：Rosetta 会标记 `IsZero()` 并计入 `usage_missing`。网关的处置是**按估算值扣减**（`rosetta.EstimateTokens` 输入 + 输出按字符数估），并记 `usage_state='estimated'`。理由：记 0 等于放行白嫖。界面里把 `estimated` 单独统计，便于发现是哪个上游不吐 usage。
 
-### 11.2 为什么不可能精确
+### 11.2 为什么不可能精确（Key 总量配额 · 已实现）
 
-流式请求的 output token 只有流结束才知道。所以**不存在请求前精确拒绝**。设计成：
+流式请求的 output token 只有流结束才知道。所以**不存在请求前精确拒绝**。落地实现（`handleChatCompletions` 预检 + 请求后落库）：
 
 ```
-请求前：读 used_tokens（快照缓存），若 >= quota_tokens → 429
+请求前：GetKeyQuota 从库里读 (quota_tokens, used_tokens)；若 quota>0 且 used>=quota → 429 insufficient_quota
 请求中：放行
-请求后：used_tokens += 真实用量（原子 UPDATE）
+请求后：usage_records 触发器 trg_update_used_tokens 令 used_tokens += total_tokens
 ```
 
-并发下必然短暂超发（N 个并发请求可同时通过检查）。**这是设计上接受的**，界面与文档都要明说，不要把它当 bug。
+- **读库而非读快照**：`used_tokens` 每次请求都在变，而内存快照只在管理写操作后重建，拿它做配额判断会严重滞后——所以预检直查 SQLite（主键单行读，局域网量级可忽略）。
+- **超发容忍**：并发下多个在途请求可同时通过预检，最多多放行「一个请求」的量。**这是设计上接受的**（§11.2 前提），界面与文档都明说，不当 bug。
+- **查询抖动 fail-open**：预检读库出错时记 error 日志并放行，不因一次读失败拒绝正常流量。
+- **语义**：终身累计、不自动重置；`quota_tokens=0` = 不限（默认，向后兼容存量 key）。
 
 ### 11.3 并发安全
 
 ```sql
-UPDATE access_keys SET used_tokens = used_tokens + ?, last_used_at = ? WHERE id = ?;
+-- trg_update_used_tokens：AFTER INSERT ON usage_records
+UPDATE access_keys SET used_tokens = used_tokens + NEW.total_tokens WHERE id = NEW.access_key_id;
 ```
 
-单条 UPDATE 天然原子，无需显式事务。写放大：每条请求一次 UPDATE + 一条 INSERT，SQLite WAL 下局域网量级无压力。`usage_records` 可以异步批量写（缓冲 ≤1s 或 ≤64 条 flush），但 `used_tokens` 扣减**同步写**，否则崩溃会丢额度。
+扣减不再由请求路径手写 UPDATE，而是挂在 `usage_records` 插入上的 SQLite 触发器，与 INSERT 同语句原子完成。落库本身走 `recordUsage`（goroutine 异步），故扣减在响应返回后就近实时生效——配合上面的超发容忍，无需同步阻塞。写放大：每条请求一次 INSERT（触发器顺带一次 UPDATE），WAL 下无压力。
 
-### 11.4 限速（P2）
+### 11.4 限速（P2 · 未实现）
+
+> 注：本节的**下游** RPM/TPM 限速未实现，与 11.2 已实现的**总量配额**是两回事。
+> `access_keys` 里原先的 `rpm_limit` / `tpm_limit` 占位列已于 2026-09-24 删除
+> （能读、无写、无人用）；要做这一维时再加列 + 加写入口 + 加执行点，三件一起做。
 
 | 维度 | 实现 |
 |---|---|
@@ -570,9 +715,21 @@ UPDATE access_keys SET used_tokens = used_tokens + ?, last_used_at = ? WHERE id 
 | 实现 | 标准库 `sync.Map` + 每秒清扫；不用 `golang.org/x/time/rate`（避免依赖） |
 | 重启 | 计数归零，接受 |
 
+**另有一个已实现、不要与本节混淆的限速**：**管理后台登录失败限速**（`internal/server`）。
+按来源 IP 记连续鉴权失败，10 次即进 60 秒冷却，冷却期内连 PBKDF2 都不做（省 CPU）。
+存在的理由：管理密码下限只有 6 位，PBKDF2 21 万迭代把单次尝试压到几十毫秒（交互无感），
+但**并发下 6 位弱口令依然可爆破** —— 这是唯一的在线防线。
+
+- 来源 IP 取 `r.RemoteAddr`，**刻意不采信 `X-Forwarded-For`**（可伪造，采信等于把限速开关交给攻击者）。
+- 判定「是否处于冷却期」必须用 `until.IsZero()`，**不能写 `!time.Now().Before(e.until)`** ——
+  未冷却过的条目 `until` 是零值，而任意时刻都「不在零值之前」，那个条件对新条目恒为真，
+  于是每次失败都重建条目、计数被清回 1，限速静默失效
+  （2026-09-24 实测发现并修复：连打 26 次错误密码全是 401）。
+  回归测试见 `internal/server/throttle_test.go`。
+
 ### 11.5 配额维度
 
-只做 **Key 总量**。per-model 配额、per-provider 配额记入后续路线，不进 P2。
+只做 **Key 总量**（已实现，见 11.2）。per-model 配额、per-provider 配额记入后续路线，不进 P2。
 
 ---
 
@@ -643,8 +800,11 @@ UPDATE access_keys SET used_tokens = used_tokens + ?, last_used_at = ? WHERE id 
   "defaults": {
     "upstream_timeout_ms": 120000,
     "stream_idle_timeout_ms": 60000,
+    "stream_first_token_timeout_ms": 30000,
     "max_retries": 2,
-    "max_request_body_bytes": 33554432
+    "max_request_body_bytes": 33554432,
+    "failover_max_targets": 3,
+    "failover_failure_threshold": 3
   },
   "bootstrap": {
     "providers": [
@@ -665,6 +825,13 @@ UPDATE access_keys SET used_tokens = used_tokens + ?, last_used_at = ? WHERE id 
 ```
 
 `api_key_env` 支持从环境变量读，避免密钥落盘到配置文件。
+
+**故障转移相关默认**（`defaults` 下，全部可省略、缺省由 `setDefaults` 兜底）：
+`stream_first_token_timeout_ms` 是流式首字（TTFT）看门狗——区别于 `stream_idle_timeout_ms`（已出字后的空闲超时），掐的是「一个事件都没等到」的慢上游，触发即在写出 SSE 头前转移下一目标。
+`failover_max_targets` 是一次请求最多尝试链上几个目标；`failover_failure_threshold` 是某目标连续失败几次即熔断进 60s 冷却。
+
+这些值同时也是「设置」页可热改项（写入 `app_settings.runtime_defaults`）。**优先级：设置页 > 本文件**：
+设置页里显式保存过的值覆盖 config，未配置的字段回落到这里的 `defaults`，见 §10「参数落点」。
 
 **关于 `listen`**：默认（含程序自动生成的配置）是 `127.0.0.1:8080`。
 网关对外提供 `/v1` 是常态，但**首次启动时后台还没有任何凭据**，
@@ -794,13 +961,13 @@ rosetta-gateway/
 
 ### P2 — 管住量
 
-**做**：`usage_records` 落库；配额检查与同步扣减；RPM/TPM 限速；用量看板；凭证池（多 key、加权、冷却）；`fallback_route_id` 故障转移。
+**做**：`usage_records` 落库；配额检查与同步扣减；RPM/TPM 限速；用量看板；凭证池（多 key、加权、冷却）；**自动故障转移**——最终落地形态是 `route_targets` 有序上游链（取代原设想的 `fallback_route_id` 单跳兜底），每条路由只有一个 `failover_enabled` 开关，策略参数是全局的（「设置」页 → `app_settings.runtime_defaults`），详见 §10。
 
 **验收**：
 1. 给 Key 设 10k token 配额，跑超后返回 429
 2. 同一 provider 配 2 把 key，其中一把返回 401 后自动切另一把，且该 key 进入冷却
 3. 并发 50 个请求，`SUM(usage_records.total_tokens)` 与 `used_tokens` 一致，不漏记
-4. 主 route 的 provider 全部凭证失效时，自动走 fallback route
+4. 一条 route 挂 2 个上游目标、链首返回 5xx 时，自动在写出任何字节前转移到链上次个目标 ✅（`cmd/gateway/failover_test.go` 覆盖）
 
 ### P3 — 补协议
 
@@ -837,7 +1004,7 @@ rosetta-gateway/
 | 三协议上游调用 | ✅ | `Client.Chat` / `ChatStream` |
 | Embed / Rerank 上游 | ✅ | `Client.Embed` / `Rerank` |
 | 统一 usage | ✅ | `Usage` + `UsageTracker` 接口（网关实现它落库） |
-| 上游重试 / 退避 | ✅ | `WithMaxRetries`，含 `Retry-After`（60s 硬上限） |
+| 上游重试 / 退避 | ⚠️ | `WithMaxRetries` 只对**幂等**方法生效（GET/HEAD/OPTIONS/PUT/DELETE）。对话是 POST，SDK **不重试**，故 `max_retries` 对 chat 无效——聊天路径的重试由本网关的故障转移链承担（`route_targets`）。含 `Retry-After`（60s 硬上限）。 |
 | 上游凭证 | ✅ | 每 Client 一套，网关按 provider × credential 建实例 |
 | 流式拉取 | ✅ | `Stream.Next()`，逐事件转下游 SSE 很顺 |
 | 流截断识别 | ✅ | `ErrStreamTruncated` |
@@ -848,7 +1015,7 @@ rosetta-gateway/
 | 流空闲超时 | ❌ | 网关实现看门狗 |
 | 下游协议解码 | ❌ | 网关实现 |
 | 下游协议编码 | ❌ | 网关实现 |
-| 凭证池 / 冷却 / 故障转移 | ❌ | 网关实现 |
+| 凭证池 / 冷却 / 故障转移 | ❌ | 网关实现（已落地：加权选凭证 + 冷却回写 + `route_targets` 有序链自动转移，见 §10） |
 | per-request endpoint/key 覆盖 | ❌ | 网关用多 Client 实例绕过 |
 
 ## 附录 B：需要 Rosetta 后续补的能力（不在本期）

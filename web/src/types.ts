@@ -51,10 +51,18 @@ export interface ModelImportItem {
   max_output_tokens?: number
 }
 
-// 全局设置（与 internal/admin/settings_handler.go 对应）
+// 全局设置（与 internal/admin/settings_handler.go 对应）。
+// Get 返回的是**生效值**：DB 未配置时回显 config.json 的值。
 export interface Settings {
   default_context_window: number
   default_max_output_tokens: number
+
+  // 运行时全局默认（超时 + 故障转移策略）。原先散落在每条路由上，现统一在此配置。
+  upstream_timeout_ms: number
+  stream_idle_timeout_ms: number
+  stream_first_token_timeout_ms: number
+  failover_max_targets: number
+  failover_failure_threshold: number
 }
 
 export interface Credential {
@@ -76,24 +84,45 @@ export interface UpstreamModel {
   enabled: boolean
   context_window: number
   max_output_tokens: number
-  default_extra_json: string
   tokens_per_sec?: number // 近 5 次真实调用的平均输出速度；未调用过则不下发
   ttfb_ms?: number // 近 5 次流式调用的平均首字延迟（毫秒）；非流式/未测得则不下发
   success_rate?: number // 近 100 次调用成功率（0~1）
   call_count?: number // 成功率样本量（≤100）；缺失/0 表示未调用过
-  created_at: number
+  // 没有 created_at：upstream_models 表压根没有这一列，接口也不下发。
+  // 曾在这里声明过一次，导致列表里永远渲染出一个「—」日期列。
+  // 也没有 default_extra_json：存了但没有任何地方拿它构造请求，已随列一并摘除。
 }
 
 export interface Route {
   id: string
   public_name: string
   provider_id: string
-  upstream_model_id: string // 外键 → upstream_models.id（短哈希）
+  upstream_model_id: string // 外键 → upstream_models.id（短哈希）；= 链首主目标
   enabled: boolean
-  priority: number
-  fallback_route_id: string
-  extra_json: string
   created_at: number
+
+  // 是否启用自动故障转移。链成员与顺序见 route_targets。
+  // 策略参数（尝试预算/熔断阈值/超时）是全局的，在「设置」页配置。
+  failover_enabled: boolean
+}
+
+// 一条 route 的有序上游目标（position 越小越先尝试）
+export interface RouteTarget {
+  id: string
+  route_id: string
+  provider_id: string
+  provider_name: string
+  upstream_model_id: string
+  model_id: string
+  position: number
+  enabled: boolean
+}
+
+// 整体替换链时提交的元素：position 由数组顺序决定，enabled 省略即 true
+export interface RouteTargetInput {
+  provider_id: string
+  upstream_model_id: string
+  enabled?: boolean
 }
 
 export interface AccessKey {
@@ -141,6 +170,12 @@ export interface UsageHistoryEntry {
   ttfb_ms: number // 首字节时间（毫秒）
   latency_ms: number // 总耗时（毫秒）
   status: string // 'ok' 或错误码
+}
+
+// 调用历史的分页结果：当页明细 + 过滤后的总条数（用于计算总页数）
+export interface UsageHistoryPage {
+  records: UsageHistoryEntry[]
+  total: number
 }
 
 // 通用错误响应：{"error":{"message":"...","type":"invalid_request_error"}}

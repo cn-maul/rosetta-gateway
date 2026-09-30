@@ -7,8 +7,11 @@
   "defaults": {
     "upstream_timeout_ms": 120000,
     "stream_idle_timeout_ms": 60000,
+    "stream_first_token_timeout_ms": 30000,
     "max_retries": 2,
-    "max_request_body_bytes": 33554432
+    "max_request_body_bytes": 33554432,
+    "failover_max_targets": 3,
+    "failover_failure_threshold": 3
   },
   "bootstrap": {
     "providers": [],

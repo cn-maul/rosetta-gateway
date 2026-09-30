@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"net/http"
+	"time"
 
 	"github.com/cn-maul/rosetta"
 )
@@ -54,6 +55,12 @@ func MapUpstreamError(err error) (int, string, string) {
 			return http.StatusBadGateway, "upstream_error", "upstream provider error"
 		case apiErr.StatusCode == 400:
 			return http.StatusBadRequest, "invalid_request_error", apiErr.Message
+		case apiErr.StatusCode == http.StatusNotFound, apiErr.StatusCode == http.StatusGone:
+			// 上游说「没有这个模型 / 没有这个端点」。这是目标级的配置问题，
+			// 不是网关内部故障 —— 旧实现落到 default 分支，把上游那句
+			// "not found" 原样塞进 502 upstream_error 里，客户端看不出该去查
+			// 自己的 model 名还是该去查网关的 provider 配置。
+			return http.StatusNotFound, "model_not_found", "upstream provider does not serve this model"
 		default:
 			return http.StatusBadGateway, "upstream_error", apiErr.Message
 		}
@@ -94,4 +101,71 @@ func errorTypeFromCode(code string) string {
 	default:
 		return "api_error"
 	}
+}
+
+// FailoverEligible 报告一次上游失败是否「值得换一个链上目标再试」。
+//
+// 判定集合（2026-09 与需求确认，2026-09-24 纳入 404/410）：
+// 5xx、401/403（鉴权）、402（额度）、429（限流）、404/410（目标没有这个模型）、
+// 408/传输层超时。400 一类（非法请求、上下文超限）不在列 —— 换上游既救不回来，
+// 还会把同一份坏请求往链上每个目标各打一次，白白烧配额并放大延迟。
+// 流式截断/溢出的错误体（ErrStreamTruncated/Overflow）也不转移：内容已经写给下游，
+// 回退不了，只能如实按 truncated 收尾。
+//
+// 为什么 404/410 要转移（2026-09-24 e2e 实测暴露的缺口）：上游 404 的语义是
+// 「我这个提供商没有这个模型」，属于**目标级**配置问题，而链正是为吸收目标级
+// 故障存在的。最现实的场景是上游退役模型 —— 链首那个模型被下架后若不算可转移，
+// 整条链会永久硬失败，故障转移在最需要它的场景里恰好是失效的。
+// 注意「这次失败不该罚凭据」：404 说明 key 是好的，只是目标配错了，所以
+// CredentialCooldown(404) 必须是 0，让目标级熔断（RecordTargetFailure）去记账。
+func FailoverEligible(err error) bool {
+	if err == nil {
+		return false
+	}
+	var transportErr *rosetta.TransportError
+	if errors.As(err, &transportErr) {
+		return true
+	}
+	var apiErr *rosetta.APIError
+	if errors.As(err, &apiErr) {
+		switch {
+		case apiErr.StatusCode == http.StatusUnauthorized,
+			apiErr.StatusCode == http.StatusForbidden,
+			apiErr.StatusCode == http.StatusNotFound,
+			apiErr.StatusCode == http.StatusGone,
+			apiErr.StatusCode == http.StatusPaymentRequired,
+			apiErr.StatusCode == http.StatusRequestTimeout,
+			apiErr.StatusCode == http.StatusTooManyRequests:
+			return true
+		case apiErr.StatusCode >= 500:
+			return true
+		}
+	}
+	return false
+}
+
+// CredentialCooldown 返回产出该错误的凭据应被踢出轮换多久；0 表示「不冷却」。
+//
+// 规则见 DESIGN §10：401/403→30min、402→1h、429→60s、408/5xx→60s、传输错误→60s。
+// 429 本应按 Retry-After，但 rosetta v0.5.1 未把该 header 暴露到 APIError 上
+// （重试退避在 SDK 内部完成），故取 DESIGN 的 60s 上限作为保守值。
+func CredentialCooldown(err error) time.Duration {
+	var transportErr *rosetta.TransportError
+	if errors.As(err, &transportErr) {
+		return 60 * time.Second
+	}
+	var apiErr *rosetta.APIError
+	if errors.As(err, &apiErr) {
+		switch {
+		case apiErr.StatusCode == http.StatusUnauthorized, apiErr.StatusCode == http.StatusForbidden:
+			return 30 * time.Minute
+		case apiErr.StatusCode == http.StatusPaymentRequired:
+			return time.Hour
+		case apiErr.StatusCode == http.StatusTooManyRequests,
+			apiErr.StatusCode == http.StatusRequestTimeout,
+			apiErr.StatusCode >= 500:
+			return 60 * time.Second
+		}
+	}
+	return 0
 }

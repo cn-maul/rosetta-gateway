@@ -61,8 +61,13 @@ func (s *Store) CreateAccessKey(ctx context.Context, k *AccessKey) error {
 		enabled = 1
 	}
 	_, err := s.db.ExecContext(ctx,
-		`INSERT INTO access_keys (id, key_hash, key_prefix, name, enabled, created_at) VALUES (?, ?, ?, ?, ?, ?)`,
-		k.ID, k.KeyHash, k.KeyPrefix, k.Name, enabled, now)
+		`INSERT INTO access_keys (id, key_hash, key_prefix, name, enabled, quota_tokens, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)`,
+		k.ID, k.KeyHash, k.KeyPrefix, k.Name, enabled, k.QuotaTokens, now)
+	// 回写时间戳：落库用的是局部变量 now，结构体仍是零值 → 创建响应里的
+	// created_at 会是 0，与随后 GET 到的同一条记录不一致（前端会显示「建于 1970」）。
+	if err == nil {
+		k.CreatedAt = now
+	}
 	return err
 }
 
@@ -72,12 +77,28 @@ func (s *Store) UpdateAccessKey(ctx context.Context, id string, k *AccessKey) er
 		enabled = 1
 	}
 	_, err := s.db.ExecContext(ctx,
-		`UPDATE access_keys SET name = ?, enabled = ? WHERE id = ?`,
-		k.Name, enabled, id)
+		`UPDATE access_keys SET name = ?, enabled = ?, quota_tokens = ? WHERE id = ?`,
+		k.Name, enabled, k.QuotaTokens, id)
 	return err
 }
 
+// GetKeyQuota 读单个密钥的配额与已用量，供热路径预检。
+// ok=false 表示密钥不存在（已删除）。used_tokens 由 usage_records 触发器实时累加，
+// 故这里是权威值；配额预检直接查库而非读快照——快照只在管理写操作后重建，会严重滞后。
+func (s *Store) GetKeyQuota(ctx context.Context, id string) (quota, used int64, ok bool, err error) {
+	err = s.db.QueryRowContext(ctx,
+		`SELECT quota_tokens, used_tokens FROM access_keys WHERE id = ?`, id).
+		Scan(&quota, &used)
+	if err == sql.ErrNoRows {
+		return 0, 0, false, nil
+	}
+	if err != nil {
+		return 0, 0, false, err
+	}
+	return quota, used, true, nil
+}
+
+// DeleteAccessKey 删除一把访问密钥；id 不存在时返回 ErrNotFound。
 func (s *Store) DeleteAccessKey(ctx context.Context, id string) error {
-	_, err := s.db.ExecContext(ctx, `DELETE FROM access_keys WHERE id = ?`, id)
-	return err
+	return deleteByID(ctx, s.db, "access_keys", id)
 }

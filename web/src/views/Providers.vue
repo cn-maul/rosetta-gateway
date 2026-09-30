@@ -2,7 +2,7 @@
 import { computed, onMounted, reactive, ref } from 'vue'
 import { api } from '../api'
 import { toast, confirmBox } from '../ui'
-import { fmtDate, fmtSpeed, fmtSec } from '../fmt'
+import { fmtDate, fmtSpeed, fmtSec, fmtPercent } from '../fmt'
 import type { Provider, Credential, UpstreamModel, DiscoveredModel } from '../types'
 import AppModal from '../components/AppModal.vue'
 
@@ -354,7 +354,7 @@ onMounted(load)
                 <span class="badge" :class="p.enabled ? 'badge-live' : 'badge-off'">{{ p.enabled ? '启用' : '停用' }}</span>
                 <span class="badge">{{ p.protocol }}</span>
               </div>
-              <div class="sub-row mono">{{ p.slug }} · {{ p.endpoint }}</div>
+              <div class="row-sub mono">{{ p.slug }} · {{ p.endpoint }}</div>
             </div>
             <div class="row-side">
               <button class="btn btn-sm btn-ghost" :disabled="testing === p.id" @click="testProvider(p)">
@@ -403,8 +403,7 @@ onMounted(load)
                   <span class="mini-main mono">{{ m.model_id }}</span>
                   <span class="col-spd">{{ m.tokens_per_sec ? fmtSpeed(m.tokens_per_sec) + ' tok/s' : '' }}</span>
                   <span class="col-ttfb">{{ m.ttfb_ms ? fmtSec(m.ttfb_ms) + ' s' : '' }}</span>
-                  <span class="col-sr"><span v-if="m.call_count" class="sr" :class="{ warn: (m.success_rate ?? 1) < 1 }">{{ Math.round((m.success_rate ?? 0) * 100) }}%</span></span>
-                  <span class="mono" style="color: var(--text-4)">{{ fmtDate(m.created_at) }}</span>
+                  <span class="col-sr"><span v-if="m.call_count" class="sr" :class="{ warn: (m.success_rate ?? 1) < 1 }">{{ fmtPercent(m.success_rate ?? 1) }}%</span></span>
                   <button class="btn btn-sm btn-ghost" @click="openModel(p.id, m)">编辑</button>
                   <button class="btn btn-sm btn-danger" @click="removeModel(m)">删</button>
                 </div>
@@ -459,13 +458,16 @@ onMounted(load)
               </div>
               <div class="field">
                 <label>超时（毫秒）</label>
-                <input v-model.number="pForm.timeout_ms" class="input num" type="number" min="0" step="1000" />
+                <input v-model.number="pForm.timeout_ms" class="input num" type="number" min="0" step="1" />
                 <span class="tip">0 = 使用全局默认</span>
               </div>
               <div class="field">
                 <label>最大重试</label>
-                <input v-model.number="pForm.max_retries" class="input num" type="number" min="0" max="10" />
-                <span class="tip">0 = 使用全局默认</span>
+                <input v-model.number="pForm.max_retries" class="input num" type="number" min="0" max="10" step="1" />
+                <span class="tip">
+                  仅作用于<strong>幂等</strong>请求（如连通性测试时的 GET /models）。
+                  对话是 POST，SDK 不会重试 —— 重试由「故障转移链换目标」承担。
+                </span>
               </div>
             </template>
           </template>
@@ -525,11 +527,11 @@ onMounted(load)
           </div>
           <div class="field">
             <label>上下文窗口</label>
-            <input v-model.number="mForm.context_window" class="input num" type="number" min="0" step="1024" placeholder="0 = 未设置" />
+            <input v-model.number="mForm.context_window" class="input num" type="number" min="0" step="1" placeholder="0 = 未设置" />
           </div>
           <div class="field">
             <label>最大输出</label>
-            <input v-model.number="mForm.max_output_tokens" class="input num" type="number" min="0" step="256" placeholder="0 = 未设置" />
+            <input v-model.number="mForm.max_output_tokens" class="input num" type="number" min="0" step="1" placeholder="0 = 未设置" />
           </div>
           <div class="field span2">
             <label class="check-line">
@@ -638,14 +640,14 @@ onMounted(load)
 }
 .sr {
   font-size: 11px;
-  padding: 1px 6px;
-  border-radius: 999px;
-  background: var(--bg-2, rgba(46, 160, 67, 0.16));
-  color: var(--ok, #3fb950);
+  padding: 1px 7px;
+  border-radius: var(--r-chip, 6px);
+  background: var(--success-soft);
+  color: var(--success-soft-foreground);
 }
 .sr.warn {
-  background: var(--bg-2, rgba(218, 149, 29, 0.18));
-  color: var(--warn, #d9942a);
+  background: var(--warning-soft);
+  color: var(--warning-soft-foreground);
 }
 .add-model {
   display: flex;
@@ -668,10 +670,10 @@ onMounted(load)
   gap: 6px;
   padding: 4px 6px 4px 10px;
   font-size: 12px;
-  border-radius: 999px;
-  background: var(--bg-2, rgba(79, 124, 255, 0.14));
-  border: 1px solid var(--accent, #4f7cff);
-  color: var(--text-1, inherit);
+  border-radius: var(--r-pill, 999px);
+  background: var(--accent-soft);
+  border: 1px solid color-mix(in oklab, var(--accent) 30%, transparent);
+  color: var(--accent-soft-foreground);
 }
 .pill-x {
   border: none;
@@ -693,8 +695,8 @@ onMounted(load)
   display: flex;
   flex-direction: column;
   gap: 4px;
-  border: 1px solid var(--border, #2a2a2a);
-  border-radius: 8px;
+  border: 1px solid var(--border);
+  border-radius: var(--r-thumb, 12px);
   padding: 6px;
 }
 .discover-item {
@@ -705,27 +707,27 @@ onMounted(load)
   text-align: left;
   background: transparent;
   border: 1px solid transparent;
-  border-radius: 6px;
+  border-radius: var(--r-chip, 6px);
   padding: 6px 8px;
   font-size: 12px;
   cursor: pointer;
   color: var(--text-2, inherit);
 }
 .discover-item:hover {
-  background: var(--bg-2, rgba(255, 255, 255, 0.04));
+  background: var(--default);
 }
 .discover-item.active {
-  border-color: var(--accent, #4f7cff);
-  color: var(--text-1, inherit);
+  border-color: var(--accent);
+  color: var(--text);
 }
 .di-check {
   width: 16px;
   text-align: center;
-  color: var(--accent, #4f7cff);
+  color: var(--accent);
 }
 .di-cap {
   margin-left: auto;
-  color: var(--text-4, #888);
+  color: var(--text-4);
   white-space: nowrap;
 }
 </style>

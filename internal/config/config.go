@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"strings"
 	"time"
 )
 
@@ -25,6 +26,14 @@ type Defaults struct {
 	StreamIdleTimeoutMs  int `json:"stream_idle_timeout_ms"`
 	MaxRetries           int `json:"max_retries"`
 	MaxRequestBodyBytes  int `json:"max_request_body_bytes"`
+
+	// 故障转移链级默认参数：route 上对应列为 0 时回落到这里。
+	// StreamFirstTokenTimeoutMs 是流式「首字（TTFT）」看门狗，区别于 StreamIdleTimeoutMs
+	// （已出字后的空闲超时）。FailoverMaxTargets 是一次请求最多尝试链上几个目标，
+	// FailoverFailureThreshold 是某目标连续失败几次即熔断进冷却。
+	StreamFirstTokenTimeoutMs int `json:"stream_first_token_timeout_ms"`
+	FailoverMaxTargets        int `json:"failover_max_targets"`
+	FailoverFailureThreshold  int `json:"failover_failure_threshold"`
 }
 
 type Bootstrap struct {
@@ -142,12 +151,60 @@ func (c *Config) setDefaults() {
 	if c.Defaults.MaxRequestBodyBytes == 0 {
 		c.Defaults.MaxRequestBodyBytes = 32 * 1024 * 1024
 	}
+	if c.Defaults.StreamFirstTokenTimeoutMs == 0 {
+		c.Defaults.StreamFirstTokenTimeoutMs = 30000
+	}
+	if c.Defaults.FailoverMaxTargets == 0 {
+		c.Defaults.FailoverMaxTargets = 3
+	}
+	if c.Defaults.FailoverFailureThreshold == 0 {
+		c.Defaults.FailoverFailureThreshold = 3
+	}
 }
 
 func (c *Config) validate() error {
 	if c.Listen == "" {
 		return errors.New("listen address is required")
 	}
+
+	// defaults 的区间校验。这些值会直接喂给 time.NewTicker / time.AfterFunc /
+	// context.WithTimeout / http.MaxBytesReader —— 负值不只是「配置没生效」，
+	// 而是启动即 panic 或全量请求失败：
+	//
+	//	stream_idle_timeout_ms: -1         → time.NewTicker(-500µs) → panic
+	//	upstream_timeout_ms: -1            → context.WithTimeout 立即超时
+	//	stream_first_token_timeout_ms: -1  → time.AfterFunc 立即开火
+	//
+	// 尤其致命的是第一条：SSE 响应头在 NewTicker 之前就已写出（不可撤），
+	// panic 恢复后下游收到的是「200 + text/event-stream + 一段 JSON 错误体」，
+	// 且这次调用的 usage 完全没落库。运维用 -1 表达「禁用超时」是很自然的直觉，
+	// 所以这里必须是硬校验而不是「填个默认值蒙混过去」。
+	for _, f := range []struct {
+		name string
+		val  int
+		min  int
+	}{
+		{"upstream_timeout_ms", c.Defaults.UpstreamTimeoutMs, 1},
+		{"stream_idle_timeout_ms", c.Defaults.StreamIdleTimeoutMs, 1},
+		{"stream_first_token_timeout_ms", c.Defaults.StreamFirstTokenTimeoutMs, 1},
+		{"max_retries", c.Defaults.MaxRetries, 0},
+		{"max_request_body_bytes", c.Defaults.MaxRequestBodyBytes, 1},
+		{"failover_max_targets", c.Defaults.FailoverMaxTargets, 1},
+		{"failover_failure_threshold", c.Defaults.FailoverFailureThreshold, 1},
+	} {
+		if f.val < f.min {
+			return fmt.Errorf("defaults.%s: must be >= %d, got %d", f.name, f.min, f.val)
+		}
+	}
+
+	// log_level 是启动日志的可见性开关。非法值会让 logger 静默退回 info
+	// （改错了却看不出效果），所以在这里挡掉。
+	switch strings.ToLower(strings.TrimSpace(c.LogLevel)) {
+	case "debug", "info", "warn", "error":
+	default:
+		return fmt.Errorf("log_level: must be one of debug|info|warn|error, got %q", c.LogLevel)
+	}
+
 	for i, p := range c.Bootstrap.Providers {
 		if !slugRe.MatchString(p.Slug) {
 			return fmt.Errorf("bootstrap.providers[%d].slug: must match [a-z0-9]{2,32}, got %q", i, p.Slug)
@@ -181,4 +238,25 @@ func (c *Config) UpstreamTimeout() time.Duration {
 
 func (c *Config) StreamIdleTimeout() time.Duration {
 	return time.Duration(c.Defaults.StreamIdleTimeoutMs) * time.Millisecond
+}
+
+// StreamFirstTokenTimeout 是流式首字（TTFT）看门狗的全局默认值。
+func (c *Config) StreamFirstTokenTimeout() time.Duration {
+	return time.Duration(c.Defaults.StreamFirstTokenTimeoutMs) * time.Millisecond
+}
+
+// FailoverMaxTargets 是一条故障转移链默认最多尝试的目标数（>=1）。
+func (c *Config) FailoverMaxTargets() int {
+	if c.Defaults.FailoverMaxTargets > 0 {
+		return c.Defaults.FailoverMaxTargets
+	}
+	return 3
+}
+
+// FailoverFailureThreshold 是某目标连续失败后被熔断的默认阈值（>=1）。
+func (c *Config) FailoverFailureThreshold() int {
+	if c.Defaults.FailoverFailureThreshold > 0 {
+		return c.Defaults.FailoverFailureThreshold
+	}
+	return 3
 }

@@ -14,6 +14,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"syscall"
 	"time"
@@ -61,10 +62,32 @@ func resolveHome(exeDir string) string {
 	return override
 }
 
+// slogLevel 把 config.log_level 映射成 slog 级别。
+// 非法值在 config.validate 里已被挡掉，这里的 default 只是兜底。
+func slogLevel(name string) slog.Level {
+	switch strings.ToLower(strings.TrimSpace(name)) {
+	case "debug":
+		return slog.LevelDebug
+	case "warn":
+		return slog.LevelWarn
+	case "error":
+		return slog.LevelError
+	default:
+		return slog.LevelInfo
+	}
+}
+
 func main() {
+	// 日志级别要等 config 读出来才知道，但「读 config 失败」这件事本身也得有日志 ——
+	// 用 LevelVar 先占位、拿到配置后再调，比造两个 logger 干净。
+	logLevel := new(slog.LevelVar)
+	logLevel.Set(slog.LevelInfo)
 	logger := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{
-		Level: slog.LevelInfo,
+		Level: logLevel,
 	}))
+	// 让 internal/admin 这类不方便注入 logger 的包直接 slog.Error 也能落在
+	// 同一个 handler 上（writeServerError 就是这么写的）。
+	slog.SetDefault(logger)
 
 	exePath, err := os.Executable()
 	if err != nil {
@@ -89,6 +112,7 @@ func main() {
 		cfg.DBPath = filepath.Join(homeDir, cfg.DBPath)
 	}
 
+	logLevel.Set(slogLevel(cfg.LogLevel))
 	logger.Info("config loaded", "listen", cfg.Listen, "db_path", cfg.DBPath, "log_level", cfg.LogLevel)
 
 	// 端口自检：落在浏览器保留端口（6666 / 6000 / 10080 …）上时，
@@ -130,15 +154,16 @@ func main() {
 		}
 	}
 
-	snap, err := snapshot.RebuildFromDB(context.Background(), db, pool)
+	snap, err := snapshot.RebuildFromDB(context.Background(), db)
 	if err != nil {
 		logger.Error("failed to rebuild snapshot from DB", "error", err)
 		snap = buildSnapshotFromConfig(cfg)
 	}
 	snapshot.Init(snap)
 
+	usage := newUsageRecorder(db, logger)
 	mux := http.NewServeMux()
-	mux.HandleFunc("POST /v1/chat/completions", handleChatCompletions(pool, cfg, db, logger))
+	mux.HandleFunc("POST /v1/chat/completions", handleChatCompletions(pool, cfg, usage))
 	mux.HandleFunc("GET /v1/models", handleListModels())
 
 	// 管理端凭据。两个来源，优先级：用户在后台设置的密码（admin_auth.json）
@@ -152,16 +177,23 @@ func main() {
 		adminToken = os.Getenv("ADMIN_TOKEN")
 	}
 
-	authStore, err := adminauth.Open(adminauth.ResolvePath(homeDir), adminToken)
-	if err != nil {
-		logger.Error("failed to load admin credentials", "error", err)
-		os.Exit(1)
-	}
-	if authStore.HasUserPassword() {
+	authPath := adminauth.ResolvePath(homeDir)
+	authStore, err := adminauth.Open(authPath, adminToken)
+	switch {
+	case err != nil:
+		// 凭据文件坏了**不能**让进程起不来：/v1 数据面根本不读管理凭据，
+		// 为一份坏掉的管理凭据把全部转发拖死完全不成比例（一次磁盘写坏、
+		// 一次手工编辑失误 = 全部转发服务中断）。降级成锁定态：
+		// 后台进不去、也绝不放行设置新密码，但转发照常。
+		logger.Error("admin credential file unusable, admin API locked",
+			"path", authPath, "error", err,
+			"recovery", "删除该文件后重启：改用 config.json 的 admin_token，或重新设置密码")
+		authStore = adminauth.NewLocked(authPath, err)
+	case authStore.HasUserPassword():
 		logger.Info("admin password loaded", "path", authStore.Path())
-	} else if adminToken != "" {
+	case adminToken != "":
 		logger.Info("using admin_token from config; set a password in the admin UI to override it")
-	} else {
+	default:
 		logger.Warn("no admin credential configured; the admin UI will ask you to set a password on first visit")
 	}
 
@@ -169,9 +201,10 @@ func main() {
 	credentialHandler := admin.NewCredentialHandler(db, masterKey)
 	modelHandler := admin.NewModelHandler(db, masterKey, cfg)
 	routeHandler := admin.NewRouteHandler(db)
+	routeTargetHandler := admin.NewRouteTargetHandler(db)
 	keyHandler := admin.NewKeyHandler(db)
 	statsHandler := admin.NewStatsHandler(db)
-	settingsHandler := admin.NewSettingsHandler(db)
+	settingsHandler := admin.NewSettingsHandler(db, cfg)
 	reloadHandler := admin.NewReloadHandler(db, masterKey, pool, cfg)
 	usageHandler := admin.NewUsageHandler(db)
 	passwordHandler := admin.NewPasswordHandler(authStore)
@@ -200,6 +233,8 @@ func main() {
 	adminMux.HandleFunc("POST /admin/api/routes", routeHandler.Create)
 	adminMux.HandleFunc("PATCH /admin/api/routes/{id}", func(w http.ResponseWriter, r *http.Request) { routeHandler.Update(w, r, r.PathValue("id")) })
 	adminMux.HandleFunc("DELETE /admin/api/routes/{id}", func(w http.ResponseWriter, r *http.Request) { routeHandler.Delete(w, r, r.PathValue("id")) })
+	adminMux.HandleFunc("GET /admin/api/routes/{id}/targets", func(w http.ResponseWriter, r *http.Request) { routeTargetHandler.List(w, r, r.PathValue("id")) })
+	adminMux.HandleFunc("PUT /admin/api/routes/{id}/targets", func(w http.ResponseWriter, r *http.Request) { routeTargetHandler.Replace(w, r, r.PathValue("id")) })
 
 	adminMux.HandleFunc("GET /admin/api/keys", keyHandler.List)
 	adminMux.HandleFunc("POST /admin/api/keys", keyHandler.Create)
@@ -227,12 +262,31 @@ func main() {
 	webuiFS, _ := fs.Sub(webui.StaticFS, "dist")
 	fileServer := http.FileServer(http.FS(webuiFS))
 	webHandler := func(w http.ResponseWriter, r *http.Request) {
+		// 只服务已知的两类路径，其余一律 404。虽然 http.FileServer + embed FS
+		// 本身已防路径穿越，显式白名单能避免把未知路径静默回退成 index.html
+		// 或暴露 dist 下意外多出的文件。
 		p := strings.TrimPrefix(r.URL.Path, "/admin")
-		if p == "" {
-			p = "/index.html"
+		switch {
+		case p == "" || p == "/":
+			// 入口页：直接读 index.html 内容并写出，**不能**把路径改写成
+			// "/index.html" 再交给 http.FileServer —— 后者对任何以
+			// "/index.html" 结尾的路径都会 301 重定向到 "./"（浏览器解析成
+			// /admin/），于是 /admin/ → /index.html → ./ → /admin/ 无限循环，
+			// 表现为「127.0.0.1 将您重定向的次数过多」。
+			data, err := fs.ReadFile(webuiFS, "index.html")
+			if err != nil {
+				http.NotFound(w, r)
+				return
+			}
+			w.Header().Set("Content-Type", "text/html; charset=utf-8")
+			w.Write(data)
+		case strings.HasPrefix(p, "/assets/"):
+			// 静态资源，原样交给 FileServer。
+			r.URL.Path = p
+			fileServer.ServeHTTP(w, r)
+		default:
+			http.NotFound(w, r)
 		}
-		r.URL.Path = p
-		fileServer.ServeHTTP(w, r)
 	}
 
 	// 注意：Go 1.22+ 的 ServeMux 会拒绝 "GET /admin/"（路径更泛、方法更窄）
@@ -248,6 +302,7 @@ func main() {
 
 	handler := server.Recovery(mux, logger)
 	handler = server.Middleware(handler, logger)
+	handler = server.SecurityHeaders(handler)
 	handler = server.CORS(handler)
 	handler = server.RequestSizeLimit(int64(cfg.Defaults.MaxRequestBodyBytes))(handler)
 
@@ -276,6 +331,12 @@ func main() {
 	if err := srv.Shutdown(ctx); err != nil {
 		logger.Error("shutdown error", "error", err)
 	}
+
+	// handler 都返回了，但在途的用量记录还在异步落库。不等它们，
+	// 进程一退这批记录就没了 —— 表现为「最后几次调用的用量查不到」。
+	drainCtx, drainCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer drainCancel()
+	usage.wait(drainCtx)
 	logger.Info("server stopped")
 }
 
@@ -440,53 +501,289 @@ func buildSnapshotFromConfig(cfg *config.Config) *snapshot.Snapshot {
 // 而不是 provider/model 拼接串，否则按公开名解析会找不到模型。
 func cfgModelID(providerSlug, modelID string) string { return providerSlug + "/" + modelID }
 
-func handleChatCompletions(pool *upstream.Pool, cfg *config.Config, db *store.Store, logger *slog.Logger) http.HandlerFunc {
+// writeAuthError 把鉴权失败映射成 OpenAI 兼容的错误响应。
+// /v1 下的每个端点都走这一处，免得口径漂移（例如某个端点把「密钥被禁用」
+// 也当成 401 而非 403）。
+func writeAuthError(w http.ResponseWriter, err error) {
+	switch {
+	case errors.Is(err, auth.ErrNoKey):
+		outwire.WriteOpenAIError(w, http.StatusUnauthorized, "invalid_api_key", "missing API key")
+	case errors.Is(err, auth.ErrKeyDisabled):
+		outwire.WriteOpenAIError(w, http.StatusForbidden, "invalid_api_key", "API key disabled")
+	case errors.Is(err, auth.ErrInvalidKey):
+		outwire.WriteOpenAIError(w, http.StatusUnauthorized, "invalid_api_key", "invalid API key")
+	default:
+		outwire.WriteOpenAIError(w, http.StatusUnauthorized, "invalid_api_key", "authentication failed")
+	}
+}
+
+func handleChatCompletions(pool *upstream.Pool, cfg *config.Config, usage *usageRecorder) http.HandlerFunc {
+	db, logger := usage.db, usage.logger
 	return func(w http.ResponseWriter, r *http.Request) {
 		start := time.Now()
 
 		authCtx, err := auth.Authenticate(r)
 		if err != nil {
-			switch err {
-			case auth.ErrNoKey:
-				outwire.WriteOpenAIError(w, http.StatusUnauthorized, "invalid_api_key", "missing API key")
-			case auth.ErrInvalidKey:
-				outwire.WriteOpenAIError(w, http.StatusUnauthorized, "invalid_api_key", "invalid API key")
-			case auth.ErrKeyDisabled:
-				outwire.WriteOpenAIError(w, http.StatusForbidden, "invalid_api_key", "API key disabled")
-			default:
-				outwire.WriteOpenAIError(w, http.StatusUnauthorized, "invalid_api_key", "authentication failed")
-			}
+			writeAuthError(w, err)
 			return
 		}
 
-		req, err := inwire.DecodeOpenAIChatRequest(r)
+		// 终身 token 配额预检（DESIGN §11.2）：quota>0 且 used>=quota 直接 429。
+		// 读的是库里的权威 used_tokens（触发器实时累加）；查询抖动时 fail-open，
+		// 不因一次读失败拒绝正常流量。并发下容忍至多一个在途请求超发（post-deduct 语义）。
+		if quota, used, ok, qerr := db.GetKeyQuota(r.Context(), authCtx.KeyID); qerr != nil {
+			logger.Error("quota lookup failed", "error", qerr, "key_id", authCtx.KeyID)
+		} else if ok && quota > 0 && used >= quota {
+			logger.Warn("quota exceeded", "key_id", authCtx.KeyID, "used", used, "quota", quota,
+				"request_id", server.RequestIDFromContext(r.Context()))
+			outwire.WriteOpenAIError(w, http.StatusTooManyRequests, "insufficient_quota",
+				"this API key has exhausted its token quota")
+			return
+		}
+
+		req, err := inwire.DecodeOpenAIChatRequest(r, int64(cfg.Defaults.MaxRequestBodyBytes))
 		if err != nil {
+			// 超限时中间件的 MaxBytesReader 会返回 *http.MaxBytesError。
+			// 旧实现把它包成 "read body: ..." 一并当 400 回，客户端看不出
+			// 「是body太大」还是「body格式错」——两者要采取的行动完全不同。
+			var tooLarge *http.MaxBytesError
+			if errors.As(err, &tooLarge) {
+				outwire.WriteOpenAIError(w, http.StatusRequestEntityTooLarge, "invalid_request_error",
+					fmt.Sprintf("request body exceeds %d bytes", tooLarge.Limit))
+				return
+			}
 			outwire.WriteOpenAIError(w, http.StatusBadRequest, "invalid_request_error", err.Error())
 			return
 		}
 
-		res, err := snapshot.Get().Routes.Resolve(req.Model)
+		snap := snapshot.Get()
+		res, err := snap.Routes.Resolve(req.Model)
 		if err != nil {
 			outwire.WriteOpenAIError(w, http.StatusNotFound, "model_not_found", fmt.Sprintf("model %q not found", req.Model))
 			return
 		}
+		route := res.Route
 
-		client, _, err := pool.GetAnyClient(res.Provider.Slug)
-		if err != nil {
-			outwire.WriteOpenAIError(w, http.StatusBadGateway, "upstream_error", "no available upstream provider")
-			return
+		// 尝试预算：链上按 position 升序最多打 maxTargets 个目标。
+		// 未开启故障转移 → 只打主目标（等价于改造前的单目标行为，零回归）。
+		// 策略值统一来自「设置」页写入的全局默认（快照），config 只作兜底。
+		cands := res.Candidates
+		limit := len(cands)
+		if !route.FailoverEnabled {
+			limit = 1
+		} else if budget := failoverMaxTargets(snap, cfg); budget < limit {
+			limit = budget
 		}
 
-		rosettaReq := req.ToRosetta()
-		rosettaReq.Model = res.UpstreamModel.ModelID
-		req.ApplyProtocolPrivateExtra(rosettaReq, res.Provider.Protocol)
-
-		if req.Stream {
-			handleStreamRequest(w, r, client, rosettaReq, req.Model, res.Provider.ID, res.UpstreamModel.ModelID, authCtx.KeyID, wantsStreamUsage(req), cfg, db, logger, start)
-		} else {
-			handleNonStreamRequest(w, client, rosettaReq, req.Model, res.Provider.ID, res.UpstreamModel.ModelID, authCtx.KeyID, cfg, db, logger, start)
+		// 开故障转移时，跳过正被熔断的目标（若全被熔断则退回整条链，宁可打也不 404）。
+		active := cands
+		if route.FailoverEnabled {
+			var avail []routing.Candidate
+			for _, c := range cands {
+				if pool.TargetAvailable(c.TargetID) {
+					avail = append(avail, c)
+				}
+			}
+			if len(avail) > 0 {
+				active = avail
+			}
 		}
+		if len(active) > limit {
+			active = active[:limit]
+		}
+
+		threshold := failoverFailureThreshold(snap, cfg)
+		sendUsage := wantsStreamUsage(req)
+		keyID := authCtx.KeyID
+
+		var out attemptOutcome
+		for i, cand := range active {
+			isLast := i == len(active)-1
+
+			// 客户端已断开就收手：半路跑掉的人不该消耗整条链的下游配额，
+			// 也不该把一次在途取消误记成目标的失败。此刻尚未写出任何字节，
+			// 直接返回、不记 error usage（断流是客户端行为，不是上游故障）。
+			if cerr := r.Context().Err(); cerr != nil {
+				logger.Info("client disconnected, aborting failover",
+					"model", req.Model, "attempt", i+1, "error", cerr,
+					"request_id", server.RequestIDFromContext(r.Context()))
+				return
+			}
+
+			rosettaReq := req.ToRosetta()
+			rosettaReq.Model = cand.UpstreamModel.ModelID
+			req.ApplyProtocolPrivateExtra(rosettaReq, cand.Provider.Protocol)
+
+			// 一次 attempt 只取该 provider 的一把凭据：某把 key 失败时本请求不就地换
+			// 同 provider 的下一把，而是让位给链上下一个目标。跨请求的 key 轮换交给
+			// 冷却 —— 坏 key 被踢出 healthy 后，下个请求自会选到好 key。这是有意取舍，
+			// 免得「一个请求把某 provider 所有 key 各打一遍」放大延迟与配额消耗。
+			client, credID, cerr := pool.GetAnyClient(cand.Provider.Slug)
+			if cerr != nil {
+				// 该目标当前无健康凭据：累计目标失败，换链上下一个。
+				pool.RecordTargetFailure(cand.TargetID, threshold)
+				out = attemptOutcome{eligible: true, statusCode: http.StatusBadGateway,
+					code: "upstream_error", message: "no available upstream provider"}
+				if !isLast {
+					logger.Warn("failover: no healthy credential, switching target",
+						"model", req.Model, "provider", cand.Provider.Slug, "request_id", server.RequestIDFromContext(r.Context()))
+					continue
+				}
+				break
+			}
+
+			if req.Stream {
+				out = attemptStream(w, r, client, rosettaReq, req.Model, cand, keyID, sendUsage, cfg, snap, usage, start)
+			} else {
+				out = attemptNonStream(w, r, client, rosettaReq, req.Model, cand, keyID, cfg, snap, usage, start)
+			}
+
+			if out.committed {
+				pool.RecordCredentialSuccess(credID)
+				pool.RecordTargetSuccess(cand.TargetID)
+				return
+			}
+
+			// 未写出任何下游字节才可能转移；此处按分类回写凭据冷却与目标熔断计数。
+			//
+			// credCooldown==0 表示这次失败不该罚凭据（当前只有 404/410：目标服务不了
+			// 这个模型，key 本身是好的）—— 只累计目标熔断。旧实现在这个分支调
+			// MarkCredentialError，既不改库也不参与健康过滤，是个纯日志空操作，已删。
+			//
+			// 客户端在调用进行中断开时必须跳过全部记账：SDK 会把 context 取消包成
+			// TransportError，落进可转移集合，若照记就会把一把健康凭据冷却 60s、并
+			// 累计目标熔断 —— 单 key provider 会被几次用户中断搞成整体不可用
+			// （凭据冷却期内不再被选中，也就没有任何请求能成功以触发复苏）。
+			// r.Context() 只在客户端断开/服务关停时取消（上游超时用的是派生 ctx），
+			// 因此这个判据能精确区分「客户端跑了」与「上游真的坏了」。
+			if out.eligible && r.Context().Err() == nil {
+				pool.RecordTargetFailure(cand.TargetID, threshold)
+				if out.credCooldown > 0 {
+					pool.MarkCredentialCooldown(credID, out.credCooldown)
+				}
+			}
+
+			if !out.eligible || isLast {
+				break
+			}
+			logger.Warn("failover: switching to next target",
+				"model", req.Model, "from_provider", cand.Provider.Slug,
+				"error_code", out.code, "attempt", i+1,
+				"request_id", server.RequestIDFromContext(r.Context()))
+		}
+
+		// 走到这里 = 最后一次尝试未提交（要么不可转移错误、要么链已耗尽）。
+		// 写出最终错误并记一条 usage —— 若 active 为空（理论不该发生）兜底成 502。
+		// 客户端已经断开时它根本收不到这个响应（写了只会撞 broken pipe），
+		// 且这次失败与上游无关，按 canceled 记账，与流式路径同一口径。
+		clientGone := r.Context().Err() != nil
+
+		statusCode, code, message := out.statusCode, out.code, out.message
+		if statusCode == 0 {
+			statusCode, code, message = http.StatusBadGateway, "upstream_error", "no available upstream provider"
+		}
+		if !clientGone {
+			outwire.WriteOpenAIError(w, statusCode, code, message)
+		}
+		provID, upstreamModel := "", ""
+		if len(active) > 0 {
+			last := active[len(active)-1]
+			provID, upstreamModel = last.Provider.ID, last.UpstreamModel.ModelID
+		}
+		status := "error"
+		if clientGone {
+			status = "canceled"
+			logger.Info("client disconnected before any response was written",
+				"model", req.Model, "request_id", server.RequestIDFromContext(r.Context()))
+		}
+		errorCode := code
+		if clientGone {
+			errorCode = ""
+		}
+		usage.record(&store.UsageRecord{
+			ID:              generateID(),
+			AccessKeyID:     keyID,
+			PublicModel:     req.Model,
+			ProviderID:      provID,
+			UpstreamModel:   upstreamModel,
+			IngressProtocol: "openai-chat",
+			Stream:          req.Stream,
+			UsageState:      "none",
+			Status:          status,
+			HTTPStatus:      statusCode,
+			ErrorCode:       errorCode,
+			LatencyMs:       time.Since(start).Milliseconds(),
+		})
 	}
+}
+
+// attemptOutcome 是一次「对某个链目标发起上游调用」的结果。
+//
+// committed=true 表示已向下游写出内容（非流式的完整响应、或流式已发首字并写完整个流），
+// 此时 usage 已由该次 attempt 落库，请求终结，绝不能回退去换目标（半条流收不回）。
+// committed=false 时 attempt 未碰过 ResponseWriter，由外层循环决定「换下一个目标」还是
+// 「把这次错误写回客户端」。eligible 告诉外层这次失败值不值得转移。
+type attemptOutcome struct {
+	committed    bool
+	eligible     bool
+	credCooldown time.Duration
+	statusCode   int
+	code         string
+	message      string
+}
+
+// outcomeFromErr 把一次上游 err 归类成「未提交」的结果。
+func outcomeFromErr(err error) attemptOutcome {
+	eligible := outwire.FailoverEligible(err)
+	statusCode, code, message := outwire.MapUpstreamError(err)
+	return attemptOutcome{
+		eligible:     eligible,
+		credCooldown: outwire.CredentialCooldown(err),
+		statusCode:   statusCode,
+		code:         code,
+		message:      message,
+	}
+}
+
+// failoverMaxTargets 解析「一次请求最多尝试链上几个目标」：
+// 设置页写入的全局默认优先，未配置（0）回落 config。
+func failoverMaxTargets(snap *snapshot.Snapshot, cfg *config.Config) int {
+	if snap != nil && snap.Runtime.FailoverMaxTargets > 0 {
+		return snap.Runtime.FailoverMaxTargets
+	}
+	return cfg.FailoverMaxTargets()
+}
+
+// failoverFailureThreshold 解析「某目标连续失败几次即熔断」：设置页优先，回落 config。
+func failoverFailureThreshold(snap *snapshot.Snapshot, cfg *config.Config) int {
+	if snap != nil && snap.Runtime.FailoverFailureThreshold > 0 {
+		return snap.Runtime.FailoverFailureThreshold
+	}
+	return cfg.FailoverFailureThreshold()
+}
+
+// nonStreamTimeout：设置页的全局默认优先，其次 config 的上游超时。
+func nonStreamTimeout(snap *snapshot.Snapshot, cfg *config.Config) time.Duration {
+	if snap != nil && snap.Runtime.UpstreamTimeoutMs > 0 {
+		return time.Duration(snap.Runtime.UpstreamTimeoutMs) * time.Millisecond
+	}
+	return cfg.UpstreamTimeout()
+}
+
+// firstTokenTimeout：设置页的全局默认优先，其次 config 的首字超时。
+func firstTokenTimeout(snap *snapshot.Snapshot, cfg *config.Config) time.Duration {
+	if snap != nil && snap.Runtime.StreamFirstTokenTimeoutMs > 0 {
+		return time.Duration(snap.Runtime.StreamFirstTokenTimeoutMs) * time.Millisecond
+	}
+	return cfg.StreamFirstTokenTimeout()
+}
+
+// streamIdleTimeout：设置页的全局默认优先，其次 config 的流式空闲超时。
+func streamIdleTimeout(snap *snapshot.Snapshot, cfg *config.Config) time.Duration {
+	if snap != nil && snap.Runtime.StreamIdleTimeoutMs > 0 {
+		return time.Duration(snap.Runtime.StreamIdleTimeoutMs) * time.Millisecond
+	}
+	return cfg.StreamIdleTimeout()
 }
 
 // wantsStreamUsage reports whether the caller asked for a trailing usage
@@ -499,18 +796,51 @@ func wantsStreamUsage(req *inwire.OpenAIChatRequest) bool {
 		*req.StreamOptions.IncludeUsage
 }
 
-func handleStreamRequest(w http.ResponseWriter, r *http.Request, client *rosetta.Client, req *rosetta.ChatRequest, publicModel, providerID, upstreamModelID, keyID string, sendUsage bool, cfg *config.Config, db *store.Store, logger *slog.Logger, start time.Time) {
+// attemptStream 尝试在当前目标上完成一次流式响应。
+//
+// 关键：SSE 头与状态码**推迟到拿到第一个上游事件之后才写**。这样「建立失败」
+// 和「首字迟迟不来」都发生在向下游写出任何字节之前，可安全地让外层循环换目标；
+// 一旦写了头并提交首个事件，就再无回退余地（DESIGN §414 的约束）。
+func attemptStream(w http.ResponseWriter, r *http.Request, client *rosetta.Client, req *rosetta.ChatRequest, publicModel string, cand routing.Candidate, keyID string, sendUsage bool, cfg *config.Config, snap *snapshot.Snapshot, usage *usageRecorder, start time.Time) attemptOutcome {
 	ctx := r.Context()
-	var ttfbMs int64
-	firstByte := true
+	logger := usage.logger
 
 	stream, err := client.ChatStream(ctx, req)
 	if err != nil {
-		statusCode, code, message := outwire.MapUpstreamError(err)
-		outwire.WriteOpenAIError(w, statusCode, code, message)
-		return
+		return outcomeFromErr(err)
 	}
 	defer stream.Close()
+
+	// 首字（TTFT）看门狗：只掐「一个事件都没等到」的慢上游，触发即关流，
+	// 尚未写头 → 未提交 → 外层可转移。与下面的 idle 看门狗是两回事。
+	ttftTimeout := firstTokenTimeout(snap, cfg)
+	var ttftTimedOut atomic.Bool
+	ttftTimer := time.AfterFunc(ttftTimeout, func() {
+		ttftTimedOut.Store(true)
+		_ = stream.Close()
+	})
+	gotFirst := stream.Next()
+	ttftTimer.Stop()
+
+	if !gotFirst {
+		if cerr := stream.Err(); cerr != nil {
+			return outcomeFromErr(cerr)
+		}
+		if ttftTimedOut.Load() {
+			logger.Warn("stream first-token timeout", "model", publicModel,
+				"provider", cand.Provider.Slug, "ttft_timeout_ms", ttftTimeout.Milliseconds())
+			return attemptOutcome{eligible: true, credCooldown: 60 * time.Second,
+				statusCode: http.StatusGatewayTimeout, code: "upstream_timeout",
+				message: "upstream first-token timeout"}
+		}
+		// 干净 EOF 却在首个事件之前（上游返回 200 后立刻空流）—— 按可转移的空响应处理。
+		return attemptOutcome{eligible: true, statusCode: http.StatusBadGateway,
+			code: "upstream_error", message: "upstream returned empty response"}
+	}
+
+	// —— 首个事件已到，自此提交：写 SSE 头，之后任何中断都只能如实 truncated 收尾 ——
+	var ttfbMs int64
+	ttfbMs = time.Since(start).Milliseconds()
 
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
@@ -520,16 +850,8 @@ func handleStreamRequest(w http.ResponseWriter, r *http.Request, client *rosetta
 	flusher, _ := w.(http.Flusher)
 	sse := outwire.NewSSEWriter(w, flusher, "chatcmpl-"+generateID(), publicModel, time.Now().Unix())
 
-	// 看门狗：idleTimeout 内一个上游事件都没有就关流止损。
-	//
-	// 为什么必须自己记一笔：Stream.Close() 只置 done 并释放连接，
-	// **不会**写 stream.Err()（见 rosetta stream.go 的 streamCore.Close）。
-	// 于是超时在流上不留任何痕迹 —— Err() 返回 nil，status 保持 "ok"，
-	// 下游照常收到 finish_reason:"stop" + [DONE]，把一个「上游卡死」伪装成
-	// 正常收尾，本网关自己的 usage_records 也会记成 ok，事后无从追查。
-	// DESIGN.md §8.1 明确要求这种情况记 status=truncated。
+	idleTimeout := streamIdleTimeout(snap, cfg)
 	var idleTimedOut atomic.Bool
-	idleTimeout := cfg.StreamIdleTimeout()
 	idleTimer := time.AfterFunc(idleTimeout, func() {
 		idleTimedOut.Store(true)
 		logger.Warn("stream idle timeout",
@@ -539,22 +861,26 @@ func handleStreamRequest(w http.ResponseWriter, r *http.Request, client *rosetta
 	})
 	defer idleTimer.Stop()
 
+	// 心跳间隔必须严格为正：idleTimeout 为 1ms 时 idleTimeout/2 == 0，
+	// time.NewTicker 会当场 panic —— 而此刻 SSE 响应头已经写出，收不回来。
+	// config.validate 已挡掉负的超时配置，这里是最后一道防线。
 	heartbeatInterval := idleTimeout / 2
+	if heartbeatInterval <= 0 {
+		heartbeatInterval = time.Second
+	}
 	heartbeatTicker := time.NewTicker(heartbeatInterval)
 	defer heartbeatTicker.Stop()
 
-	// sendUsage was resolved from the typed request by the caller; the
-	// gateway never populates rosetta.ChatRequest.Extra, so reading the flag
-	// back out of it would always yield false.
-
+	// 心跳只在**真的空闲**时才发。上游持续吐字时由 handleEvent 把 ticker 推后，
+	// 否则一条两秒的流会连发十几条 `: keepalive` —— 对标准 SSE 客户端无害，
+	// 对按行解析的下游是纯噪声。
+	// 心跳 goroutine 与主循环会并发写同一个 ResponseWriter，所以统一经由 sse
+	// （outwire.SSEWriter 内部有锁），不再自己 fmt.Fprintf(w, ...)。
 	go func() {
 		for {
 			select {
 			case <-heartbeatTicker.C:
-				fmt.Fprintf(w, ": keepalive\n\n")
-				if flusher != nil {
-					flusher.Flush()
-				}
+				sse.WriteComment("keepalive")
 			case <-ctx.Done():
 				return
 			}
@@ -564,26 +890,15 @@ func handleStreamRequest(w http.ResponseWriter, r *http.Request, client *rosetta
 	var lastUsage rosetta.Usage
 	var stopReason rosetta.StopReason
 	status := "ok"
+	errorCode := ""
 	httpStatus := 200
-	// sawTerminal：上游给过 EventMessageEnd。看门狗开火只对「从未拿到终止事件」
-	// 的流降级 —— 已收到 message_end 的流是完整的，把它报成截断属于反向误判。
-	// 实测 rosetta v0.5.1 在 [DONE]/EOF 之后就短路了 next()，适配器不会在吐出
-	// message_end 后继续阻塞，所以这条判定当前**打不到**；留着守的是「适配器
-	// 将来在终止事件之后仍等待更多数据」这种情形（对照 zzfake 的 no_done_hold：
-	// 那条路径没有 message_end，仍然如实记 truncated）。
 	sawTerminal := false
-	// wroteContent：往下游写过至少一个内容增量（文本/思考/工具调用）。
-	// 全都没有时是可疑的空流，留痕但不改协议行为（见循环后的注释）。
 	wroteContent := false
 
-	for stream.Next() {
-		if firstByte {
-			ttfbMs = time.Since(start).Milliseconds()
-			firstByte = false
-		}
+	// handleEvent 消费一个上游事件（首个 + 后续走同一套逻辑）。
+	handleEvent := func(ev *rosetta.Event) {
 		idleTimer.Reset(idleTimeout)
-
-		ev := stream.Event()
+		heartbeatTicker.Reset(heartbeatInterval)
 		switch ev.Type {
 		case rosetta.EventMessageStart:
 			sse.SetResponseID(ev.ID)
@@ -593,12 +908,9 @@ func handleStreamRequest(w http.ResponseWriter, r *http.Request, client *rosetta
 			}
 			sse.WriteTextDelta(ev.Text)
 		case rosetta.EventThinkingDelta:
-			// 思考增量必须透传：只吐 reasoning_content 的流（思考型模型在
-			// max_tokens 耗尽于思考期时就是这种形态）若被丢掉，下游收到的是
-			// 一条「零内容 + finish_reason:stop + [DONE]」的正常流，
-			// 只能报出「流式响应中没有内容」这种无从排查的错误。
-			// Text 为空的事件是 Anthropic thinking signature 的载体，
-			// OpenAI 下游没有对应字段，跳过不算丢内容。
+			// 思考增量必须透传：只吐 reasoning_content 的流若被丢掉，下游会收到
+			// 一条「零内容 + finish_reason:stop + [DONE]」的假正常流。空 Text 是
+			// Anthropic thinking signature 载体，OpenAI 下游无对应字段，跳过不算丢内容。
 			if ev.Text != "" {
 				wroteContent = true
 				sse.WriteThinkingDelta(ev.Text)
@@ -615,39 +927,39 @@ func handleStreamRequest(w http.ResponseWriter, r *http.Request, client *rosetta
 		}
 	}
 
+	handleEvent(stream.Event())
+	for stream.Next() {
+		handleEvent(stream.Event())
+	}
+
 	if err := stream.Err(); err != nil {
 		switch {
 		case errors.Is(err, rosetta.ErrStreamTruncated):
-			// The upstream ended the stream before its terminal event. Partial
-			// content has already been forwarded. The SDK *wraps* this
-			// sentinel (fmt.Errorf with %w), so an == comparison never matches
-			// and every truncation would be misfiled as a generic error.
 			status = "truncated"
+			errorCode = "stream_truncated"
 			logger.Warn("stream truncated", "model", publicModel, "key_id", keyID, "error", err)
 		case errors.Is(err, rosetta.ErrStreamOverflow):
-			// The SDK's accumulation guard tripped (64 MiB / 10k blocks) —
-			// the upstream is runaway or hostile. Client-visible outcome is
-			// the same as truncation: a partial answer and no finish event.
 			status = "overflow"
+			errorCode = "stream_overflow"
 			logger.Error("stream overflow", "model", publicModel, "key_id", keyID, "error", err)
+		case isClientGone(ctx, err):
+			// 客户端主动断开不是上游故障。此前一律记 error，后果是：后台错误率虚高、
+			// 成功率虚低，且真故障被 ERROR 噪音淹没。单独一个取值才能把两者分开。
+			status = "canceled"
+			logger.Info("client disconnected mid-stream", "model", publicModel, "key_id", keyID, "error", err)
 		default:
 			status = "error"
+			errorCode = "upstream_error"
 			logger.Error("stream error", "error", err, "model", publicModel, "key_id", keyID)
 		}
 	} else if idleTimedOut.Load() && !sawTerminal {
-		// 看门狗掐断且上游从未给出终止事件 —— 与 ErrStreamTruncated 同类：
-		// 已转发的内容不回滚，但绝不能让下游收到「正常收尾」（不写
-		// finish_reason、不写 [DONE]，客户端据此判定断流）。
 		status = "truncated"
+		errorCode = "stream_idle_timeout"
 		logger.Warn("stream cut by idle watchdog without terminal event",
 			"model", publicModel, "key_id", keyID,
 			"idle_timeout_ms", idleTimeout.Milliseconds(),
 			"content_written", wroteContent)
 	} else if !wroteContent {
-		// 上游给了终止事件却一个内容增量都没吐。协议上保持原样下发
-		// （上游可能因内容过滤合法地返回空回复，网关不该替它改语义），
-		// 但必须留痕：下游通常只会报「没有内容」，日志是唯一能区分
-		// 「上游确实回了空」与「网关把内容吃掉了」的地方。
 		logger.Warn("stream finished with no content",
 			"model", publicModel, "key_id", keyID,
 			"stop_reason", string(stopReason),
@@ -668,12 +980,12 @@ func handleStreamRequest(w http.ResponseWriter, r *http.Request, client *rosetta
 
 	latency := time.Since(start).Milliseconds()
 
-	recordUsage(db, logger, &store.UsageRecord{
+	usage.record(&store.UsageRecord{
 		ID:              generateID(),
 		AccessKeyID:     keyID,
 		PublicModel:     publicModel,
-		ProviderID:      providerID,
-		UpstreamModel:   upstreamModelID,
+		ProviderID:      cand.Provider.ID,
+		UpstreamModel:   cand.UpstreamModel.ModelID,
 		IngressProtocol: "openai-chat",
 		Stream:          true,
 		InputTokens:     lastUsage.InputTokens,
@@ -684,20 +996,22 @@ func handleStreamRequest(w http.ResponseWriter, r *http.Request, client *rosetta
 		UsageState:      "reported",
 		Status:          status,
 		HTTPStatus:      httpStatus,
+		ErrorCode:       errorCode,
 		LatencyMs:       latency,
 		TTFBMs:          ttfbMs,
 	})
+	return attemptOutcome{committed: true}
 }
 
-func handleNonStreamRequest(w http.ResponseWriter, client *rosetta.Client, req *rosetta.ChatRequest, publicModel, providerID, upstreamModelID, keyID string, cfg *config.Config, db *store.Store, logger *slog.Logger, start time.Time) {
-	ctx, cancel := context.WithTimeout(context.Background(), cfg.UpstreamTimeout())
+func attemptNonStream(w http.ResponseWriter, r *http.Request, client *rosetta.Client, req *rosetta.ChatRequest, publicModel string, cand routing.Candidate, keyID string, cfg *config.Config, snap *snapshot.Snapshot, usage *usageRecorder, start time.Time) attemptOutcome {
+	// 绑定 r.Context() 而非 context.Background()：客户端断开时上游调用应随之取消，
+	// 否则断连请求会一直占用上游连接与配额直到超时（默认 120s）。
+	ctx, cancel := context.WithTimeout(r.Context(), nonStreamTimeout(snap, cfg))
 	defer cancel()
 
 	resp, err := client.Chat(ctx, req)
 	if err != nil {
-		statusCode, code, message := outwire.MapUpstreamError(err)
-		outwire.WriteOpenAIError(w, statusCode, code, message)
-		return
+		return outcomeFromErr(err)
 	}
 
 	// 非流式响应一次性返回，拿不到"首字"这一独立时刻，用响应到达时刻近似（≈总耗时）。
@@ -706,12 +1020,12 @@ func handleNonStreamRequest(w http.ResponseWriter, client *rosetta.Client, req *
 
 	outwire.WriteNonStreamResponse(w, resp, publicModel)
 
-	recordUsage(db, logger, &store.UsageRecord{
+	usage.record(&store.UsageRecord{
 		ID:              generateID(),
 		AccessKeyID:     keyID,
 		PublicModel:     publicModel,
-		ProviderID:      providerID,
-		UpstreamModel:   upstreamModelID,
+		ProviderID:      cand.Provider.ID,
+		UpstreamModel:   cand.UpstreamModel.ModelID,
 		IngressProtocol: "openai-chat",
 		Stream:          false,
 		InputTokens:     resp.Usage.InputTokens,
@@ -725,19 +1039,110 @@ func handleNonStreamRequest(w http.ResponseWriter, client *rosetta.Client, req *
 		LatencyMs:       latency,
 		TTFBMs:          ttfbMs,
 	})
+	return attemptOutcome{committed: true}
 }
 
-// recordUsage 异步落库一条使用记录，避免阻塞响应返回。
-func recordUsage(db *store.Store, logger *slog.Logger, rec *store.UsageRecord) {
-	go func() {
-		if err := db.CreateUsageRecord(context.Background(), rec); err != nil {
-			logger.Error("failed to record usage", "error", err, "key_id", rec.AccessKeyID)
+
+// isClientGone 判断一次流式中断是否源于**客户端**断开，而不是上游故障。
+//
+// 请求 context 被取消（用户点「停止生成」、客户端进程退出、网络切换）时，
+// SDK 会把 context 错误从流里透出来。这类中断既不该算进上游的成功率，
+// 也不该打成 ERROR —— 它跟路由、凭据、上游的健康状况无关。
+func isClientGone(ctx context.Context, err error) bool {
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return true
+	}
+	return ctx.Err() != nil
+}
+
+// usageRecorder 负责把用量记录异步落库，并在关停时等它们写完。
+//
+// 异步是必须的 —— 不能让客户端为了等一次 SQLite 写多耗一个来回；但纯粹的
+// fire-and-forget 有真实代价：srv.Shutdown 只等 handler 返回、不等这些 goroutine，
+// 进程退出时尾部若干条 usage 会凭空消失（表现是配额与统计对不上账）。
+//
+// 用固定数量的 worker + 有界队列取代「每条记录一个 goroutine」：
+//   - 高并发下不再无限堆积 goroutine（配合 SetMaxOpenConns(1)，无界 goroutine
+//     只会全部阻塞在 DB 锁上排队，白白吃内存）；
+//   - 队列满时 record 退化为同步写，提供背压而不是静默丢记录。
+type usageRecorder struct {
+	db     *store.Store
+	logger *slog.Logger
+	queue  chan *store.UsageRecord
+	wg     sync.WaitGroup
+}
+
+const (
+	// usageQueueSize 是有界队列容量。超过该值即触发同步写背压。
+	usageQueueSize = 1024
+	// usageWorkers 是并发落库的 worker 数。SQLite 单写锁下并发写没有收益，
+	// 1 个 worker 足够，队列本身负责吸收突发。
+	usageWorkers = 1
+)
+
+func newUsageRecorder(db *store.Store, logger *slog.Logger) *usageRecorder {
+	u := &usageRecorder{
+		db:     db,
+		logger: logger,
+		queue:  make(chan *store.UsageRecord, usageQueueSize),
+	}
+	for i := 0; i < usageWorkers; i++ {
+		u.wg.Add(1)
+		go u.worker()
+	}
+	return u
+}
+
+// worker 消费队列并落库，直到队列关闭。
+func (u *usageRecorder) worker() {
+	defer u.wg.Done()
+	for rec := range u.queue {
+		if err := u.db.CreateUsageRecord(context.Background(), rec); err != nil {
+			u.logger.Error("failed to record usage", "error", err, "key_id", rec.AccessKeyID)
 		}
+	}
+}
+
+// record 排队一条异步落库，立即返回。
+//
+// 队列满时退化为同步写：宁可让当前请求多等一次 SQLite 写，也不丢用量记录。
+// 同步写失败同样记日志，与异步路径口径一致。
+func (u *usageRecorder) record(rec *store.UsageRecord) {
+	select {
+	case u.queue <- rec:
+	default:
+		// 队列已满 —— 背压：同步写。
+		if err := u.db.CreateUsageRecord(context.Background(), rec); err != nil {
+			u.logger.Error("failed to record usage (sync fallback)", "error", err, "key_id", rec.AccessKeyID)
+		}
+	}
+}
+
+// wait 关闭队列、等 worker 把在途写入全部完成，或 ctx 到期（到期即放弃，
+// 不让一个卡住的 SQLite 写把进程关停拖成无限期）。
+func (u *usageRecorder) wait(ctx context.Context) {
+	close(u.queue)
+	done := make(chan struct{})
+	go func() {
+		u.wg.Wait()
+		close(done)
 	}()
+	select {
+	case <-done:
+	case <-ctx.Done():
+	}
 }
 
 func handleListModels() http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
+		// 与 /v1/chat/completions 同一鉴权口径（官方 OpenAI 的 /v1/models 同样要求
+		// Authorization）。这里不查配额 —— 列个目录不消耗 token —— 但必须校验密钥：
+		// 否则任何人都能枚举出全部公开模型名，等于白送一份路由与供应商结构图。
+		if _, err := auth.Authenticate(r); err != nil {
+			writeAuthError(w, err)
+			return
+		}
+
 		type openaiModelEntry struct {
 			ID      string `json:"id"`
 			Object  string `json:"object"`

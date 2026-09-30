@@ -28,10 +28,12 @@ async function load() {
 const form = reactive({
   open: false,
   name: '',
+  quota: 0,
 })
 
 function openCreate() {
   form.name = ''
+  form.quota = 0
   form.open = true
 }
 
@@ -41,7 +43,7 @@ async function submitCreate() {
     return
   }
   try {
-    const created = await api.createKey({ name: form.name.trim() })
+    const created = await api.createKey({ name: form.name.trim(), quota_tokens: Number(form.quota) || 0 })
     form.open = false
     plainKeyBox.key = (created as KeyCreateResponse).plaintext_key
     plainKeyBox.name = created.name
@@ -63,11 +65,13 @@ const eForm = reactive({
   open: false,
   id: '',
   name: '',
+  quota: 0,
 })
 
 function openEdit(k: AccessKey) {
   eForm.id = k.id
   eForm.name = k.name
+  eForm.quota = k.quota_tokens ?? 0
   eForm.open = true
 }
 
@@ -77,7 +81,7 @@ async function submitEdit() {
     return
   }
   try {
-    await api.updateKey(eForm.id, { name: eForm.name.trim() })
+    await api.updateKey(eForm.id, { name: eForm.name.trim(), quota_tokens: Number(eForm.quota) || 0 })
     eForm.open = false
     toast('密钥已更新')
     await load()
@@ -141,10 +145,15 @@ onMounted(load)
             <div class="row-title">
               {{ k.name }}
               <span class="badge" :class="k.enabled ? 'badge-live' : 'badge-off'">{{ k.enabled ? '启用' : '停用' }}</span>
+              <span v-if="k.quota_tokens > 0 && k.used_tokens >= k.quota_tokens" class="badge badge-off">配额已用尽</span>
             </div>
             <div class="row-sub mono">{{ k.key_prefix }}</div>
             <div class="row-sub num">建于 {{ fmtDateTime(k.created_at) }}</div>
-            <div class="row-sub num">用量：{{ fmtTokens(k.used_tokens) }}</div>
+            <div class="row-sub num">
+              用量：{{ fmtTokens(k.used_tokens) }}
+              <template v-if="k.quota_tokens > 0">/ {{ fmtTokens(k.quota_tokens) }}</template>
+              <template v-else>· 不限</template>
+            </div>
           </div>
           <div class="row-side">
             <button class="btn btn-sm btn-ghost" @click="openEdit(k)">编辑</button>
@@ -162,6 +171,11 @@ onMounted(load)
           <div class="field span2">
             <label>名称 *</label>
             <input v-model="form.name" class="input" placeholder="cursor-主力 / 内部测试" />
+          </div>
+          <div class="field span2">
+            <label>Token 配额</label>
+            <input v-model.number="form.quota" class="input num" type="number" min="0" step="1" placeholder="0" />
+            <span class="tip">累计 input+output token 上限，用尽后 /v1 返回 429；0 = 不限</span>
           </div>
         </div>
         <div class="form-actions">
@@ -193,6 +207,11 @@ onMounted(load)
           <div class="field span2">
             <label>名称 *</label>
             <input v-model="eForm.name" class="input" />
+          </div>
+          <div class="field span2">
+            <label>Token 配额</label>
+            <input v-model.number="eForm.quota" class="input num" type="number" min="0" step="1" placeholder="0" />
+            <span class="tip">累计 input+output token 上限，用尽后 /v1 返回 429；0 = 不限</span>
           </div>
         </div>
         <div class="form-actions">

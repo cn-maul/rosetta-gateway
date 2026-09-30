@@ -4,11 +4,13 @@
 //
 // 1. 所有 PATCH 接口都是「字段级部分更新」：
 //    - 请求体里**出现的**字段才会被写入，未出现的字段保持原值；
-//    - 空串 / 0 是**合法值**，会被真正落库（空串在库里落 NULL）。
-//      例如 priority: 0 能真的把优先级改回 0，fallback_route_id: "" 能真的清空兜底路由。
+//    - 空串 / 0 是**合法值**，会被真正落库。
 //    - 必填字段（name / endpoint / model_id / public_name / provider_id /
 //      upstream_model_id / protocol / api_key）显式传空串会返回 400，而不是被静默忽略。
 //    所以：只发你要改的字段即可，不必回传完整对象。
+//
+//    注意：故障转移的策略参数（尝试预算 / 熔断阈值 / 各类超时）**不是**按路由的
+//    部分更新字段，它们在「设置」页统一配置（见 saveSettings）。
 //
 // 2. 任何写操作（create/update/delete）成功后都必须 POST /admin/api/reload，
 //    否则内存快照不刷新，新资源对 /v1 不可见。用 mutate() 统一封装。
@@ -23,7 +25,6 @@ const TOKEN_KEY = 'rosetta_gw_admin_token'
 
 export const auth = reactive({
   token: localStorage.getItem(TOKEN_KEY) ?? '',
-  ready: false,
 })
 
 export function saveToken(t: string) {
@@ -86,6 +87,10 @@ export async function mutate<T>(fn: () => Promise<T>): Promise<T> {
   try {
     await post('/reload')
   } catch (e) {
+    // 401 必须原样上抛。旧实现把它包成 status 0，于是所有 view 的
+    // `status !== 401` 守卫全部失效 —— 令牌过期时会在「请重新登录」的弹窗之上
+    // 再叠一条错误 toast，真正的原因（令牌失效）被淹没在噪音里。
+    if (e instanceof ApiFail && e.status === 401) throw e
     throw new ApiFail(
       0,
       '资源已保存，但刷新内存快照失败：' + (e instanceof Error ? e.message : String(e)) +
@@ -106,12 +111,14 @@ import type {
   DiscoveredModel,
   ModelImportItem,
   Route,
+  RouteTarget,
+  RouteTargetInput,
   AccessKey,
   KeyCreateResponse,
   Settings,
   Stats,
   UsageGroupEntry,
-  UsageHistoryEntry,
+  UsageHistoryPage,
 } from './types'
 
 export const api = {
@@ -147,27 +154,33 @@ export const api = {
   updateRoute: (id: string, b: Partial<Route>) => mutate(() => patch<Route>(`/routes/${id}`, b)),
   deleteRoute: (id: string) => mutate(() => del(`/routes/${id}`)),
 
+  // 故障转移目标链（有序）。整体替换后由 mutate 统一 reload 快照。
+  routeTargets: (routeId: string) => get<RouteTarget[]>(`/routes/${routeId}/targets`),
+  saveRouteTargets: (routeId: string, targets: RouteTargetInput[]) =>
+    mutate(() => put<RouteTarget[]>(`/routes/${routeId}/targets`, { targets })),
+
   // access keys
   keys: () => get<AccessKey[]>('/keys'),
-  createKey: (b: { name: string }) =>
+  createKey: (b: { name: string; quota_tokens?: number }) =>
     mutate(() => post<KeyCreateResponse>('/keys', b)),
-  updateKey: (id: string, b: { name?: string; enabled?: boolean }) => mutate(() => patch<AccessKey>(`/keys/${id}`, b)),
+  updateKey: (id: string, b: { name?: string; enabled?: boolean; quota_tokens?: number }) =>
+    mutate(() => patch<AccessKey>(`/keys/${id}`, b)),
   deleteKey: (id: string) => mutate(() => del(`/keys/${id}`)),
 
-  // stats & usage（注意：usage 端点的 from/to 是【毫秒】时间戳）
-  stats: () => get<Stats>('/stats'),
+  // stats & usage（注意：usage 端点的 from/to 是【毫秒】时间戳；from=0 表示全部历史）
+  stats: (from = 0, to = Date.now()) => get<Stats>(`/stats?from=${from}&to=${to}`),
   settings: () => get<Settings>('/settings'),
-  saveSettings: (b: Settings) => put<Settings>('/settings', b),
-  usageByDay: (days = 14) => {
+  // 设置里含运行时全局默认（超时 + 故障转移策略），这些值由快照驱动转发路径，
+  // 所以必须走 mutate() 触发 reload 才能即时生效（模型容量默认也一并保存）。
+  saveSettings: (b: Settings) => mutate(() => put<Settings>('/settings', b)),
+  usageByDay: (from: number, to: number) => get<UsageGroupEntry[]>(`/usage/by-day?from=${from}&to=${to}`),
+  usageByModel: (from = 0, to = Date.now()) => get<UsageGroupEntry[]>(`/usage/by-model?from=${from}&to=${to}&limit=10`),
+  usageByKey: (from = 0, to = Date.now()) => get<UsageGroupEntry[]>(`/usage/by-key?from=${from}&to=${to}&limit=10`),
+  // 调用历史：分页查询（limit = 每页条数，offset = 偏移）。
+  // 返回 { records, total }，total 是**过滤后的总条数**（不受分页影响）。
+  usageHistory: (days = 7, limit = 20, offset = 0) => {
     const to = Date.now()
     const from = to - days * 86400_000
-    return get<UsageGroupEntry[]>(`/usage/by-day?from=${from}&to=${to}`)
-  },
-  usageByModel: () => get<UsageGroupEntry[]>('/usage/by-model?limit=10'),
-  usageByKey: () => get<UsageGroupEntry[]>('/usage/by-key?limit=10'),
-  usageHistory: (days = 7, limit = 200) => {
-    const to = Date.now()
-    const from = to - days * 86400_000
-    return get<UsageHistoryEntry[]>(`/usage/history?from=${from}&to=${to}&limit=${limit}`)
+    return get<UsageHistoryPage>(`/usage/history?from=${from}&to=${to}&limit=${limit}&offset=${offset}`)
   },
 }

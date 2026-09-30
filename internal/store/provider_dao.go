@@ -81,14 +81,23 @@ func (s *Store) GetProviderBySlug(ctx context.Context, slug string) (*Provider, 
 }
 
 func (s *Store) CreateProvider(ctx context.Context, p *Provider) error {
+	return createProvider(ctx, s.db, p)
+}
+
+// createProvider 接受 execer，供事务内复用（见 CreateProviderWithCredential）。
+func createProvider(ctx context.Context, ex execer, p *Provider) error {
 	now := time.Now().UnixMilli()
 	enabled := 0
 	if p.Enabled {
 		enabled = 1
 	}
-	_, err := s.db.ExecContext(ctx,
+	_, err := ex.ExecContext(ctx,
 		`INSERT INTO providers (id, slug, name, protocol, endpoint, enabled, timeout_ms, max_retries, quirks_json, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		p.ID, p.Slug, p.Name, p.Protocol, p.Endpoint, enabled, p.TimeoutMs, p.MaxRetries, nullIfEmpty(p.QuirksJSON), now, now)
+	// 回写时间戳，否则创建响应里的 created_at/updated_at 是 0，与库里不一致。
+	if err == nil {
+		p.CreatedAt, p.UpdatedAt = now, now
+	}
 	return err
 }
 
@@ -103,7 +112,7 @@ func (s *Store) UpdateProvider(ctx context.Context, id string, p *Provider) erro
 	return err
 }
 
+// DeleteProvider 删除一个上游；id 不存在时返回 ErrNotFound。
 func (s *Store) DeleteProvider(ctx context.Context, id string) error {
-	_, err := s.db.ExecContext(ctx, `DELETE FROM providers WHERE id = ?`, id)
-	return err
+	return deleteByID(ctx, s.db, "providers", id)
 }

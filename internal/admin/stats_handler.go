@@ -2,6 +2,7 @@ package admin
 
 import (
 	"net/http"
+	"strconv"
 
 	"github.com/cn-maul/rosetta-gateway/internal/config"
 	"github.com/cn-maul/rosetta-gateway/internal/snapshot"
@@ -30,14 +31,18 @@ type statsResponse struct {
 }
 
 func (h *StatsHandler) Get(w http.ResponseWriter, r *http.Request) {
-	stats, err := h.store.GetUsageStats(r.Context())
+	// from/to 为毫秒时间戳；from=0 表示统计全部历史（总览「全部」档）。
+	from, _ := strconv.ParseInt(r.URL.Query().Get("from"), 10, 64)
+	to, _ := strconv.ParseInt(r.URL.Query().Get("to"), 10, 64)
+
+	stats, err := h.store.GetUsageStats(r.Context(), from, to)
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, err.Error())
+		writeServerError(w, "usage stats", err)
 		return
 	}
 	tps, _ := h.store.GetRecentThroughput(r.Context(), 5)
 	ttfb, _ := h.store.GetRecentTtfbMs(r.Context(), 5)
-	hitRate, _ := h.store.CacheHitRate(r.Context())
+	hitRate, _ := h.store.CacheHitRate(r.Context(), from, to)
 	writeJSON(w, http.StatusOK, statsResponse{
 		TotalRequests:   stats.TotalRequests,
 		TotalTokens:     stats.TotalTokens,
@@ -65,13 +70,13 @@ func NewReloadHandler(st *store.Store, masterKey []byte, pool *upstream.Pool, cf
 func (h *ReloadHandler) Reload(w http.ResponseWriter, r *http.Request) {
 	if h.pool != nil {
 		if err := h.pool.BuildFromStore(r.Context(), h.store, h.masterKey, h.cfg); err != nil {
-			writeError(w, http.StatusInternalServerError, "failed to rebuild upstream pool: "+err.Error())
+			writeServerError(w, "rebuild upstream pool", err)
 			return
 		}
 	}
-	snap, err := snapshot.RebuildFromDB(r.Context(), h.store, h.pool)
+	snap, err := snapshot.RebuildFromDB(r.Context(), h.store)
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, "failed to rebuild snapshot: "+err.Error())
+		writeServerError(w, "rebuild snapshot", err)
 		return
 	}
 	snapshot.Swap(snap)

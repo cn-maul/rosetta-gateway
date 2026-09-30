@@ -5,13 +5,13 @@ import (
 
 	"github.com/cn-maul/rosetta-gateway/internal/routing"
 	"github.com/cn-maul/rosetta-gateway/internal/store"
-	"github.com/cn-maul/rosetta-gateway/internal/upstream"
 )
 
 // RebuildFromDB 只搬运「路由/上游/密钥」这三类解析元数据。
 // 凭据解密不在这里发生——上游池在 BuildFromStore 里自行解密建客户端，
-// 所以本函数不需要主密钥，也不需要 logger。
-func RebuildFromDB(ctx context.Context, st *store.Store, pool *upstream.Pool) (*Snapshot, error) {
+// 所以本函数不需要主密钥，也不需要 logger，同样不需要池
+// （池的重建由 ReloadHandler 显式先做，分工是「先池后快照」）。
+func RebuildFromDB(ctx context.Context, st *store.Store) (*Snapshot, error) {
 	snap := &Snapshot{
 		Routes:    routing.NewRouteIndex(),
 		Providers: make(map[string]*ProviderSnapshot),
@@ -64,9 +64,23 @@ func RebuildFromDB(ctx context.Context, st *store.Store, pool *upstream.Pool) (*
 			ProviderID:      r.ProviderID,
 			UpstreamModelID: r.UpstreamModelID,
 			Enabled:         r.Enabled,
-			Priority:        r.Priority,
-			FallbackRouteID: r.FallbackRouteID,
-			ExtraJSON:       r.ExtraJSON,
+			FailoverEnabled: r.FailoverEnabled,
+		})
+	}
+
+	// route_targets 已按 route_id, position 升序返回，逐条 append 即为有序链。
+	targets, err := st.ListAllRouteTargets(ctx)
+	if err != nil {
+		return nil, err
+	}
+	for _, t := range targets {
+		snap.Routes.AddRouteTarget(&routing.Target{
+			ID:              t.ID,
+			RouteID:         t.RouteID,
+			ProviderID:      t.ProviderID,
+			UpstreamModelID: t.UpstreamModelID,
+			Position:        t.Position,
+			Enabled:         t.Enabled,
 		})
 	}
 
@@ -81,6 +95,19 @@ func RebuildFromDB(ctx context.Context, st *store.Store, pool *upstream.Pool) (*
 			Name:    k.Name,
 			Enabled: k.Enabled,
 		}
+	}
+
+	// 运行时全局默认（超时与故障转移策略）。读失败不致命：留 0 即全部回落 config。
+	if rd, err := st.GetRuntimeDefaults(ctx); err == nil {
+		snap.Runtime = RuntimeDefaults{
+			UpstreamTimeoutMs:         rd.UpstreamTimeoutMs,
+			StreamIdleTimeoutMs:       rd.StreamIdleTimeoutMs,
+			StreamFirstTokenTimeoutMs: rd.StreamFirstTokenTimeoutMs,
+			FailoverMaxTargets:        rd.FailoverMaxTargets,
+			FailoverFailureThreshold:  rd.FailoverFailureThreshold,
+		}
+	} else {
+		return nil, err
 	}
 
 	return snap, nil

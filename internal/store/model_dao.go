@@ -14,11 +14,10 @@ type UpstreamModel struct {
 	ContextWindow    int
 	MaxOutputTokens  int
 	SupportsThinking *bool
-	DefaultExtraJSON string
 }
 
 // modelColumns 是 upstream_models 三处读路径共用的列清单。
-const modelColumns = `id, provider_id, model_id, display_name, enabled, context_window, max_output_tokens, supports_thinking, default_extra_json`
+const modelColumns = `id, provider_id, model_id, display_name, enabled, context_window, max_output_tokens, supports_thinking`
 
 // nullIfZeroInt 把 0 写回 NULL。
 // context_window / max_output_tokens 是可空列，0 与"未知"语义不同，
@@ -41,19 +40,18 @@ type scanner interface {
 func scanModel(sc scanner) (UpstreamModel, error) {
 	var m UpstreamModel
 	var enabled int
-	var displayName, extraJSON sql.NullString
+	var displayName sql.NullString
 	var ctxWindow, maxOut sql.NullInt64
 	var thinking sql.NullBool
 
 	err := sc.Scan(&m.ID, &m.ProviderID, &m.ModelID, &displayName, &enabled,
-		&ctxWindow, &maxOut, &thinking, &extraJSON)
+		&ctxWindow, &maxOut, &thinking)
 	if err != nil {
 		return m, err
 	}
 
 	m.Enabled = enabled == 1
 	m.DisplayName = displayName.String
-	m.DefaultExtraJSON = extraJSON.String
 	m.ContextWindow = int(ctxWindow.Int64)
 	m.MaxOutputTokens = int(maxOut.Int64)
 	if thinking.Valid {
@@ -119,9 +117,9 @@ func (s *Store) CreateUpstreamModel(ctx context.Context, m *UpstreamModel) error
 		enabled = 1
 	}
 	_, err := s.db.ExecContext(ctx,
-		`INSERT INTO upstream_models (id, provider_id, model_id, display_name, enabled, context_window, max_output_tokens, supports_thinking, default_extra_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		`INSERT INTO upstream_models (id, provider_id, model_id, display_name, enabled, context_window, max_output_tokens, supports_thinking) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
 		m.ID, m.ProviderID, m.ModelID, nullIfEmpty(m.DisplayName), enabled,
-		nullIfZeroInt(m.ContextWindow), nullIfZeroInt(m.MaxOutputTokens), m.SupportsThinking, nullIfEmpty(m.DefaultExtraJSON))
+		nullIfZeroInt(m.ContextWindow), nullIfZeroInt(m.MaxOutputTokens), m.SupportsThinking)
 	return err
 }
 
@@ -131,15 +129,15 @@ func (s *Store) UpdateUpstreamModel(ctx context.Context, id string, m *UpstreamM
 		enabled = 1
 	}
 	_, err := s.db.ExecContext(ctx,
-		`UPDATE upstream_models SET model_id = ?, display_name = ?, enabled = ?, context_window = ?, max_output_tokens = ?, supports_thinking = ?, default_extra_json = ? WHERE id = ?`,
+		`UPDATE upstream_models SET model_id = ?, display_name = ?, enabled = ?, context_window = ?, max_output_tokens = ?, supports_thinking = ? WHERE id = ?`,
 		m.ModelID, nullIfEmpty(m.DisplayName), enabled,
-		nullIfZeroInt(m.ContextWindow), nullIfZeroInt(m.MaxOutputTokens), m.SupportsThinking, nullIfEmpty(m.DefaultExtraJSON), id)
+		nullIfZeroInt(m.ContextWindow), nullIfZeroInt(m.MaxOutputTokens), m.SupportsThinking, id)
 	return err
 }
 
+// DeleteUpstreamModel 删除一个上游模型；id 不存在时返回 ErrNotFound。
 func (s *Store) DeleteUpstreamModel(ctx context.Context, id string) error {
-	_, err := s.db.ExecContext(ctx, `DELETE FROM upstream_models WHERE id = ?`, id)
-	return err
+	return deleteByID(ctx, s.db, "upstream_models", id)
 }
 
 func (s *Store) UpsertUpstreamModel(ctx context.Context, m *UpstreamModel) error {
@@ -148,10 +146,10 @@ func (s *Store) UpsertUpstreamModel(ctx context.Context, m *UpstreamModel) error
 		enabled = 1
 	}
 	_, err := s.db.ExecContext(ctx,
-		`INSERT INTO upstream_models (id, provider_id, model_id, display_name, enabled, context_window, max_output_tokens, supports_thinking, default_extra_json)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-		 ON CONFLICT(provider_id, model_id) DO UPDATE SET display_name = excluded.display_name, enabled = excluded.enabled, context_window = excluded.context_window, max_output_tokens = excluded.max_output_tokens, supports_thinking = excluded.supports_thinking, default_extra_json = excluded.default_extra_json`,
+		`INSERT INTO upstream_models (id, provider_id, model_id, display_name, enabled, context_window, max_output_tokens, supports_thinking)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+		 ON CONFLICT(provider_id, model_id) DO UPDATE SET display_name = excluded.display_name, enabled = excluded.enabled, context_window = excluded.context_window, max_output_tokens = excluded.max_output_tokens, supports_thinking = excluded.supports_thinking`,
 		m.ID, m.ProviderID, m.ModelID, nullIfEmpty(m.DisplayName), enabled,
-		nullIfZeroInt(m.ContextWindow), nullIfZeroInt(m.MaxOutputTokens), m.SupportsThinking, nullIfEmpty(m.DefaultExtraJSON))
+		nullIfZeroInt(m.ContextWindow), nullIfZeroInt(m.MaxOutputTokens), m.SupportsThinking)
 	return err
 }

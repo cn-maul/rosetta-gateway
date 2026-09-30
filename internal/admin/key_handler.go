@@ -20,11 +20,12 @@ func NewKeyHandler(st *store.Store) *KeyHandler {
 
 // keyRequest 是访问密钥的创建 / PATCH 输入。
 // PATCH 语义：字段为指针，nil = 未提供（保持原值），非 nil = 显式赋新值。
-// 注：quota_tokens 目前只有读路径（列表/详情下发），没有任何写路径与配额校验，
-// 属于未接线的存量字段，此处不提供写入入口，避免造成「配额可用」的错觉。
+// quota_tokens 是终身 token 配额（input+output 累计）：0 = 不限，>0 时请求前预检，
+// 达到即 429 拒绝（used_tokens 由 usage 触发器实时累加，见 DESIGN §11）。
 type keyRequest struct {
-	Name    *string `json:"name"`
-	Enabled *bool   `json:"enabled"`
+	Name        *string `json:"name"`
+	Enabled     *bool   `json:"enabled"`
+	QuotaTokens *int64  `json:"quota_tokens"`
 }
 
 type keyResponse struct {
@@ -45,7 +46,7 @@ type keyCreateResponse struct {
 func (h *KeyHandler) List(w http.ResponseWriter, r *http.Request) {
 	keys, err := h.store.ListAccessKeys(r.Context())
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, err.Error())
+		writeServerError(w, "list keys", err)
 		return
 	}
 	result := make([]keyResponse, 0, len(keys))
@@ -78,16 +79,26 @@ func (h *KeyHandler) Create(w http.ResponseWriter, r *http.Request) {
 		enabled = *req.Enabled
 	}
 
+	var quota int64
+	if req.QuotaTokens != nil {
+		if *req.QuotaTokens < 0 {
+			writeError(w, http.StatusBadRequest, "quota_tokens cannot be negative")
+			return
+		}
+		quota = *req.QuotaTokens
+	}
+
 	k := &store.AccessKey{
-		ID:        generateID(),
-		KeyHash:   keyHash,
-		KeyPrefix: keyPrefix,
-		Name:      name,
-		Enabled:   enabled,
+		ID:          generateID(),
+		KeyHash:     keyHash,
+		KeyPrefix:   keyPrefix,
+		Name:        name,
+		Enabled:     enabled,
+		QuotaTokens: quota,
 	}
 
 	if err := h.store.CreateAccessKey(r.Context(), k); err != nil {
-		writeError(w, http.StatusInternalServerError, err.Error())
+		writeServerError(w, "create key", err)
 		return
 	}
 
@@ -99,7 +110,11 @@ func (h *KeyHandler) Create(w http.ResponseWriter, r *http.Request) {
 
 func (h *KeyHandler) Update(w http.ResponseWriter, r *http.Request, id string) {
 	existing, err := h.store.GetAccessKey(r.Context(), id)
-	if err != nil || existing == nil {
+	if err != nil {
+		writeServerError(w, "get key", err)
+		return
+	}
+	if existing == nil {
 		writeError(w, http.StatusNotFound, "key not found")
 		return
 	}
@@ -121,9 +136,16 @@ func (h *KeyHandler) Update(w http.ResponseWriter, r *http.Request, id string) {
 	if req.Enabled != nil {
 		existing.Enabled = *req.Enabled
 	}
+	if req.QuotaTokens != nil {
+		if *req.QuotaTokens < 0 {
+			writeError(w, http.StatusBadRequest, "quota_tokens cannot be negative")
+			return
+		}
+		existing.QuotaTokens = *req.QuotaTokens
+	}
 
 	if err := h.store.UpdateAccessKey(r.Context(), id, existing); err != nil {
-		writeError(w, http.StatusInternalServerError, err.Error())
+		writeServerError(w, "update key", err)
 		return
 	}
 
@@ -132,7 +154,7 @@ func (h *KeyHandler) Update(w http.ResponseWriter, r *http.Request, id string) {
 
 func (h *KeyHandler) Delete(w http.ResponseWriter, r *http.Request, id string) {
 	if err := h.store.DeleteAccessKey(r.Context(), id); err != nil {
-		writeError(w, http.StatusInternalServerError, err.Error())
+		writeDeleteError(w, "delete key", err)
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]string{"status": "deleted"})

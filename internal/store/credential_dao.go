@@ -72,14 +72,23 @@ func (s *Store) GetCredential(ctx context.Context, id string) (*Credential, erro
 }
 
 func (s *Store) CreateCredential(ctx context.Context, c *Credential) error {
+	return createCredential(ctx, s.db, c)
+}
+
+// createCredential 接受 execer，供事务内复用（见 CreateProviderWithCredential）。
+func createCredential(ctx context.Context, ex execer, c *Credential) error {
 	now := time.Now().UnixMilli()
 	enabled := 0
 	if c.Enabled {
 		enabled = 1
 	}
-	_, err := s.db.ExecContext(ctx,
+	_, err := ex.ExecContext(ctx,
 		`INSERT INTO provider_credentials (id, provider_id, label, api_key_enc, enabled, weight, status, cooldown_until, last_error, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		c.ID, c.ProviderID, nullIfEmpty(c.Label), c.APIKeyEnc, enabled, c.Weight, c.Status, c.CooldownUntil, nullIfEmpty(c.LastError), now)
+	// 回写时间戳，否则创建响应里的 created_at 是 0，与库里不一致。
+	if err == nil {
+		c.CreatedAt = now
+	}
 	return err
 }
 
@@ -94,7 +103,7 @@ func (s *Store) UpdateCredential(ctx context.Context, id string, c *Credential) 
 	return err
 }
 
+// DeleteCredential 删除一把凭据；id 不存在时返回 ErrNotFound。
 func (s *Store) DeleteCredential(ctx context.Context, id string) error {
-	_, err := s.db.ExecContext(ctx, `DELETE FROM provider_credentials WHERE id = ?`, id)
-	return err
+	return deleteByID(ctx, s.db, "provider_credentials", id)
 }

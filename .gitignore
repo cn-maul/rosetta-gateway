@@ -2,6 +2,10 @@
 bin/
 *.log
 
+# Go 本地缓存（GOMODCACHE / GOCACHE，本轮开发产生的巨型目录）
+.gobuild/
+.gocache/
+
 # 前端工程
 web/node_modules/
 web/dist/

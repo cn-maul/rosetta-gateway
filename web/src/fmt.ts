@@ -32,13 +32,22 @@ export function fmtSec(ms: number): string {
 
 /**
  * 比率（0~1）→ 百分比字符串。
- * 保留一位下限保护：命中率极低但不为 0 时不显示成「0」，
- * 否则「几乎没命中」和「完全没有缓存」在界面上无法区分。
+ *
+ * 两条下限保护：
+ *   - 命中率极低但不为 0 时不显示成「0」，否则「几乎没命中」和「完全没有」无法区分；
+ *   - 99.5% 不许进位成「100%」。四舍五入到 100 会把「有失败」说成「全成功」，
+ *     而调用方往往同时按 `rate < 1` 打了警告色 —— 于是界面出现「100%」配橙色告警
+ *     这种自相矛盾的显示。小于 1 时一律向下取到一位小数。
  */
 export function fmtPercent(rate: number): string {
   if (!Number.isFinite(rate) || rate <= 0) return '0'
+  if (rate >= 1) return '100'
   const p = rate * 100
-  if (p >= 10) return String(Math.round(p))
+  if (p >= 10) {
+    const r = Math.round(p)
+    if (r >= 100) return (Math.floor(p * 10) / 10).toFixed(1)
+    return String(r)
+  }
   if (p >= 0.1) return p.toFixed(1)
   return '<0.1'
 }
@@ -71,7 +80,7 @@ export function fmtDateTime(unixSecOrMs: number): string {
 
 /**
  * 调用状态的展示标签。库内 status 是机器可读值（ok / truncated /
- * overflow / error），界面统一中文化，未知值原样显示以便排查。
+ * overflow / canceled / error），界面统一中文化，未知值原样显示以便排查。
  */
 export function statusLabel(status: string): string {
   switch (status) {
@@ -81,6 +90,8 @@ export function statusLabel(status: string): string {
       return '截断'
     case 'overflow':
       return '超限'
+    case 'canceled':
+      return '已取消'
     case 'error':
       return '失败'
     default:
@@ -88,9 +99,20 @@ export function statusLabel(status: string): string {
   }
 }
 
-/** 非 ok 一律标记为异常（暖橙是设计系统里的专用错误色）。 */
+/**
+ * 状态徽章样式。
+ *
+ * 三类语义，别再退回「非 ok 即异常」的二元判断：
+ *   - ok        → 绿色（正常）
+ *   - canceled  → 中性灰。客户端主动断开既不是网关的错，也不是上游的错，
+ *                 统计口径里同样不计入错误率；标成暖橙会让「用户关了个页面」
+ *                 看起来像线上故障。
+ *   - 其余      → 暖橙（截断 / 超限 / 失败，都是需要关注的异常）
+ */
 export function statusBadge(status: string): string {
-  return status === 'ok' ? 'badge-live' : 'badge-err'
+  if (status === 'ok') return 'badge-live'
+  if (status === 'canceled') return 'badge-off'
+  return 'badge-err'
 }
 
 export async function copyText(text: string): Promise<boolean> {

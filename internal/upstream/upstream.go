@@ -6,7 +6,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
-	"math/rand"
+	"math/rand/v2"
 	"net/http"
 	"os"
 	"strings"
@@ -33,8 +33,20 @@ type CredentialEntry struct {
 type Pool struct {
 	mu        sync.RWMutex
 	providers map[string]*ProviderEntry
+	targets   map[string]*targetHealth
 	logger    *slog.Logger
 }
+
+// targetHealth 是某个链目标（provider+model，按 route_targets.id 归键）的熔断状态。
+// consecutiveFails 达到阈值即把 until 推到未来某点，其间该目标被跳过并让位给链上下一个。
+type targetHealth struct {
+	consecutiveFails int
+	until            time.Time
+}
+
+// targetBreakerCooldown 是目标达阈值后的熔断时长。与 5xx 凭据冷却同量级：
+// 短到能较快自愈，长到不会让一个坏目标在每个请求上都被重新试一遍。
+const targetBreakerCooldown = 60 * time.Second
 
 type ProviderEntry struct {
 	ID          string
@@ -51,6 +63,7 @@ type ProviderEntry struct {
 func NewPool(logger *slog.Logger) *Pool {
 	return &Pool{
 		providers: make(map[string]*ProviderEntry),
+		targets:   make(map[string]*targetHealth),
 		logger:    logger,
 	}
 }
@@ -62,6 +75,10 @@ func (p *Pool) BuildFromConfig(cfg *config.Config) error {
 	// 重建前先清空：否则从配置删掉的上游会一直留在池里，
 	// /v1 仍然能路由到它（快照已删、池里还在）。
 	p.providers = make(map[string]*ProviderEntry)
+	// 健康态随池一起清零：凭据冷却在上面的 providers 重建里已隐含重置，
+	// 目标熔断这张表若不清就会随「每次保存链都重新生成 targetID」单调堆积成泄漏。
+	// 两层一起在重建时归零 —— 语义一致，配置变更本就是重新探测的正当理由。
+	p.targets = make(map[string]*targetHealth)
 
 	for _, bp := range cfg.Bootstrap.Providers {
 		prov := &ProviderEntry{
@@ -114,6 +131,9 @@ func (p *Pool) BuildFromStore(ctx context.Context, st *store.Store, masterKey []
 	// 重建前先清空：admin 的每个写操作都会触发 reload → 本函数，
 	// 不清空的话「删除上游」在池里永不生效，请求仍会被转发到已删除的 provider。
 	p.providers = make(map[string]*ProviderEntry)
+	// 目标级健康/熔断态与凭据冷却一起清零 —— 重建即重新探测。既避免旧 targetID
+	// （每次保存链都重新生成主键）在本表里累积成泄漏，也让两层健康态语义一致。
+	p.targets = make(map[string]*targetHealth)
 
 	providers, err := st.ListProviders(ctx)
 	if err != nil {
@@ -125,10 +145,11 @@ func (p *Pool) BuildFromStore(ctx context.Context, st *store.Store, masterKey []
 		if sp.TimeoutMs > 0 {
 			timeout = time.Duration(sp.TimeoutMs) * time.Millisecond
 		}
-		maxRetries := cfg.Defaults.MaxRetries
-		if sp.MaxRetries > 0 {
-			maxRetries = sp.MaxRetries
-		}
+		// max_retries 是权威值，直接用。此前写成 `if sp.MaxRetries > 0`，
+		// 把用户显式设置的 0（= 不重试）静默换成了全局默认 —— 与项目里
+		// 「0 是合法显式值」的 PATCH 契约（见 admin/helpers.go）直接冲突。
+		// timeout_ms 的 0 有文档明示的「回落全局默认」语义，max_retries 没有。
+		maxRetries := sp.MaxRetries
 		prov := &ProviderEntry{
 			ID:         sp.ID,
 			Slug:       sp.Slug,
@@ -204,40 +225,7 @@ func (p *Pool) GetAnyClient(providerSlug string) (*rosetta.Client, string, error
 	return cred.Client, cred.ID, nil
 }
 
-func (p *Pool) GetClientForCredential(providerSlug, credID string) (*rosetta.Client, error) {
-	p.mu.RLock()
-	defer p.mu.RUnlock()
-
-	prov, ok := p.providers[providerSlug]
-	if !ok || !prov.Enabled {
-		return nil, fmt.Errorf("provider %q not found or disabled", providerSlug)
-	}
-
-	for _, cred := range prov.Credentials {
-		if cred.ID == credID && cred.Enabled {
-			return cred.Client, nil
-		}
-	}
-	return nil, fmt.Errorf("credential %q not found", credID)
-}
-
-func (p *Pool) GetProvider(slug string) (*ProviderEntry, bool) {
-	p.mu.RLock()
-	defer p.mu.RUnlock()
-	prov, ok := p.providers[slug]
-	return prov, ok
-}
-
-func (p *Pool) ListProviders() []*ProviderEntry {
-	p.mu.RLock()
-	defer p.mu.RUnlock()
-	result := make([]*ProviderEntry, 0, len(p.providers))
-	for _, prov := range p.providers {
-		result = append(result, prov)
-	}
-	return result
-}
-
+// MarkCredentialCooldown 把一把凭据踢出健康轮换一段时间（冷却）。
 func (p *Pool) MarkCredentialCooldown(credID string, duration time.Duration) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -257,20 +245,68 @@ func (p *Pool) MarkCredentialCooldown(credID string, duration time.Duration) {
 	}
 }
 
-func (p *Pool) MarkCredentialError(credID string, err error) {
+// RecordCredentialSuccess 在一把凭据成功响应后清除其冷却，恢复 healthy。
+// 不这样做的话：一次偶发 5xx 把 key 打进 60s cooling，即便它马上又好了，
+// 这一分钟内仍被 getHealthyCredentials 跳过 —— 对单 key provider 等于凭空造 outage。
+func (p *Pool) RecordCredentialSuccess(credID string) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
 	for _, prov := range p.providers {
 		for _, cred := range prov.Credentials {
 			if cred.ID == credID {
-				cred.Status = "error"
-				p.logger.Warn("credential error",
-					"credential", credID,
-					"error", err)
+				if cred.Status != "healthy" || !cred.CooldownUntil.IsZero() {
+					cred.Status = "healthy"
+					cred.CooldownUntil = time.Time{}
+					p.logger.Info("credential recovered", "credential", credID)
+				}
 				return
 			}
 		}
+	}
+}
+
+// TargetAvailable 报告链上某目标当前是否可打（未处于熔断冷却期）。
+func (p *Pool) TargetAvailable(targetID string) bool {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	h, ok := p.targets[targetID]
+	if !ok {
+		return true
+	}
+	return !time.Now().Before(h.until)
+}
+
+// RecordTargetFailure 给目标累计一次失败；达到 threshold 则熔断 targetBreakerCooldown。
+// threshold<=0 表示不启用目标级熔断（仅凭据级冷却生效）。
+func (p *Pool) RecordTargetFailure(targetID string, threshold int) {
+	if threshold <= 0 {
+		return
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	h := p.targets[targetID]
+	if h == nil {
+		h = &targetHealth{}
+		p.targets[targetID] = h
+	}
+	h.consecutiveFails++
+	if h.consecutiveFails >= threshold {
+		h.until = time.Now().Add(targetBreakerCooldown)
+		h.consecutiveFails = 0
+		p.logger.Warn("target circuit opened",
+			"target", targetID, "threshold", threshold, "until", h.until)
+	}
+}
+
+// RecordTargetSuccess 清零目标的连续失败计数（成功即认为健康）。
+func (p *Pool) RecordTargetSuccess(targetID string) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if h, ok := p.targets[targetID]; ok {
+		h.consecutiveFails = 0
+		h.until = time.Time{}
 	}
 }
 
@@ -314,13 +350,13 @@ func (p *Pool) selectWeighted(creds []*CredentialEntry) *CredentialEntry {
 		totalWeight += c.Weight
 	}
 
-	// 权重全为 0 时不能走加权逻辑：rand.Intn(0) 会 panic，直接把网关打挂。
+	// 权重全为 0 时不能走加权逻辑：rand.IntN(0) 会 panic，直接把网关打挂。
 	// 这是可达状态 —— 后台把每条凭据的权重都改成 0 即可。退化为均匀随机。
 	if totalWeight <= 0 {
-		return creds[rand.Intn(len(creds))]
+		return creds[rand.IntN(len(creds))]
 	}
 
-	r := rand.Intn(totalWeight)
+	r := rand.IntN(totalWeight)
 	for _, c := range creds {
 		r -= c.Weight
 		if r < 0 {
@@ -372,16 +408,12 @@ func NewProviderClient(ctx context.Context, st *store.Store, providerID string, 
 	if p.TimeoutMs > 0 {
 		timeout = time.Duration(p.TimeoutMs) * time.Millisecond
 	}
-	maxRetries := cfg.Defaults.MaxRetries
-	if p.MaxRetries > 0 {
-		maxRetries = p.MaxRetries
-	}
-
+	// 同理：0 表示不重试，是显式配置，不回落全局默认。
 	entry := &ProviderEntry{
 		Protocol:   p.Protocol,
 		Endpoint:   p.Endpoint,
 		Timeout:    timeout,
-		MaxRetries: maxRetries,
+		MaxRetries: p.MaxRetries,
 	}
 	return buildClient(entry, apiKey, cfg)
 }
@@ -521,6 +553,12 @@ func buildClient(prov *ProviderEntry, apiKey string, cfg *config.Config) (*roset
 			opts = append(opts, rosetta.WithProtocol(rosetta.ProtoOpenAIResponses))
 		case "anthropic":
 			opts = append(opts, rosetta.WithProtocol(rosetta.ProtoAnthropic))
+		default:
+			// 拼错的协议名此前被静默忽略 —— 不加 WithProtocol，退化成 SDK 的
+			// 自动探测，请求打到错误的端点形态上，报出来的错误指向下游而非配置。
+			// 配置错了就说配置错了。管理 API 在写入时已用同一份白名单校验过，
+			// 这里是运行时（含 bootstrap 配置）的最后一道。
+			return nil, fmt.Errorf("provider %s: 未知的 protocol %q（合法值：auto / openai-chat / openai-responses / anthropic）", prov.Slug, prov.Protocol)
 		}
 	}
 	if prov.Timeout > 0 {

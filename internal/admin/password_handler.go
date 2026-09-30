@@ -30,13 +30,32 @@ type passwordStatusResponse struct {
 	// 而不是「请输入管理员密码」—— 后者会让用户去猜一个根本不存在的密码。
 	FirstSetup bool `json:"first_setup"`
 	// Source 说明当前凭据来自哪里，纯粹用于排障展示：
-	// "password_file"（后台设置过）/"config_token"（仍在使用配置文件里的初始令牌）。
+	// "password_file"（后台设置过）/"config_token"（仍在使用配置文件里的初始令牌）
+	// /"locked"（凭据文件损坏，见 Locked）。
 	Source string `json:"source"`
+	// Locked 为真表示凭据文件存在但不可用，后台进入锁定态。
+	//
+	// 这时 HasPassword 也为真（否则 password/set 的引导窗口会对所有人敞开，
+	// 一个损坏的文件就变成「后台任人接管」），前端必须优先看 Locked，
+	// 提示用户删文件重启，而不是反复让他猜密码。
+	Locked  bool   `json:"locked,omitempty"`
+	Message string `json:"message,omitempty"`
 }
 
 // Check 报告凭据状态。该端点经中间件豁免，无需鉴权：
 // 响应里只有一个布尔值和来源标签，不含任何可用于登录的信息。
 func (h *PasswordHandler) Check(w http.ResponseWriter, r *http.Request) {
+	if err := h.auth.LockedError(); err != nil {
+		writeJSON(w, http.StatusOK, passwordStatusResponse{
+			HasPassword: true,
+			Source:      "locked",
+			Locked:      true,
+			Message: "管理凭据文件已损坏或不可读，管理后台暂时锁定（转发服务不受影响）。" +
+				"删除 " + h.auth.Path() + " 后重启网关即可重新设置密码。",
+		})
+		return
+	}
+
 	resp := passwordStatusResponse{HasPassword: h.auth.HasCredential()}
 	if !resp.HasPassword {
 		resp.Source = "none"
@@ -64,7 +83,8 @@ func (h *PasswordHandler) Set(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusBadRequest, err.Error())
 			return
 		}
-		writeError(w, http.StatusInternalServerError, err.Error())
+		// 写盘失败的原文含凭据文件的绝对路径，进日志不回显。
+		writeServerError(w, "set admin password", err)
 		return
 	}
 

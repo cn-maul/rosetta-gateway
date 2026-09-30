@@ -67,10 +67,37 @@ type providerResponse struct {
 	UpdatedAt  int64  `json:"updated_at"`
 }
 
+// validProtocols 是管理 API 接受的 protocol 取值，与 upstream.buildClient
+// 里的 switch 一一对应（那里现在对未知值直接返回错误）。
+//
+// 在配置入口就挡住，是为了避免「保存成功、调用时才报错」：protocol 拼错
+// （比如写成 "openai"）此前会被静默忽略、退化成 SDK 自动探测，请求打到错误的
+// 端点形态上，报出来的错误指向下游，排查方向从一开始就是错的。
+var validProtocols = []string{"auto", "openai-chat", "openai-responses", "anthropic"}
+
+func validateProtocol(protocol string) error {
+	for _, p := range validProtocols {
+		if protocol == p {
+			return nil
+		}
+	}
+	return fmt.Errorf("protocol 必须是 %s 之一，收到 %q",
+		strings.Join(validProtocols, " / "), protocol)
+}
+
+// writeProviderWriteError 把 providers 写操作的失败映射成合适的状态码。
+func writeProviderWriteError(w http.ResponseWriter, action string, err error) {
+	if store.IsUniqueViolation(err) {
+		writeError(w, http.StatusConflict, "该上游标识（slug）已存在，请换个名称后重试")
+		return
+	}
+	writeServerError(w, action, err)
+}
+
 func (h *ProviderHandler) List(w http.ResponseWriter, r *http.Request) {
 	providers, err := h.store.ListProviders(r.Context())
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, err.Error())
+		writeServerError(w, "list providers", err)
 		return
 	}
 	result := make([]providerResponse, 0, len(providers))
@@ -104,6 +131,10 @@ func (h *ProviderHandler) Create(w http.ResponseWriter, r *http.Request) {
 	if protocol == "" {
 		protocol = "openai-chat"
 	}
+	if err := validateProtocol(protocol); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
 
 	now := time.Now().UnixMilli()
 	p := &store.Provider{
@@ -120,18 +151,17 @@ func (h *ProviderHandler) Create(w http.ResponseWriter, r *http.Request) {
 		UpdatedAt:  now,
 	}
 
-	if err := h.store.CreateProvider(r.Context(), p); err != nil {
-		writeError(w, http.StatusInternalServerError, err.Error())
-		return
-	}
-
-	if strings.TrimSpace(req.APIKey) != "" {
-		enc, err := encryptSecret(strings.TrimSpace(req.APIKey), h.masterKey)
+	// 表单填了 api_key 就一并创建首条凭据。两半必须原子落库：
+	// 先建 provider 再建凭据、第二步失败，会留下一个没有任何凭据的上游 ——
+	// 界面报错、用户以为没建成功，它却已经在列表里，且永远不可用。
+	var cred *store.Credential
+	if apiKey := strings.TrimSpace(req.APIKey); apiKey != "" {
+		enc, err := encryptSecret(apiKey, h.masterKey)
 		if err != nil {
-			writeError(w, http.StatusInternalServerError, "failed to encrypt key: "+err.Error())
+			writeServerError(w, "encrypt api key", err)
 			return
 		}
-		c := &store.Credential{
+		cred = &store.Credential{
 			ID:         generateID(),
 			ProviderID: p.ID,
 			Label:      "default",
@@ -140,10 +170,11 @@ func (h *ProviderHandler) Create(w http.ResponseWriter, r *http.Request) {
 			Weight:     1,
 			Status:     "healthy",
 		}
-		if err := h.store.CreateCredential(r.Context(), c); err != nil {
-			writeError(w, http.StatusInternalServerError, err.Error())
-			return
-		}
+	}
+
+	if err := h.store.CreateProviderWithCredential(r.Context(), p, cred); err != nil {
+		writeProviderWriteError(w, "create provider", err)
+		return
 	}
 
 	writeJSON(w, http.StatusCreated, toProviderResponse(*p))
@@ -152,7 +183,7 @@ func (h *ProviderHandler) Create(w http.ResponseWriter, r *http.Request) {
 func (h *ProviderHandler) Get(w http.ResponseWriter, r *http.Request, id string) {
 	p, err := h.store.GetProvider(r.Context(), id)
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, err.Error())
+		writeServerError(w, "get provider", err)
 		return
 	}
 	if p == nil {
@@ -165,7 +196,7 @@ func (h *ProviderHandler) Get(w http.ResponseWriter, r *http.Request, id string)
 func (h *ProviderHandler) Update(w http.ResponseWriter, r *http.Request, id string) {
 	existing, err := h.store.GetProvider(r.Context(), id)
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, err.Error())
+		writeServerError(w, "get provider", err)
 		return
 	}
 	if existing == nil {
@@ -190,8 +221,8 @@ func (h *ProviderHandler) Update(w http.ResponseWriter, r *http.Request, id stri
 	}
 	if req.Protocol != nil {
 		protocol := strings.TrimSpace(*req.Protocol)
-		if protocol == "" {
-			writeError(w, http.StatusBadRequest, "protocol cannot be empty")
+		if err := validateProtocol(protocol); err != nil {
+			writeError(w, http.StatusBadRequest, err.Error())
 			return
 		}
 		existing.Protocol = protocol
@@ -228,7 +259,7 @@ func (h *ProviderHandler) Update(w http.ResponseWriter, r *http.Request, id stri
 	}
 
 	if err := h.store.UpdateProvider(r.Context(), id, existing); err != nil {
-		writeError(w, http.StatusInternalServerError, err.Error())
+		writeProviderWriteError(w, "update provider", err)
 		return
 	}
 
@@ -237,7 +268,7 @@ func (h *ProviderHandler) Update(w http.ResponseWriter, r *http.Request, id stri
 
 func (h *ProviderHandler) Delete(w http.ResponseWriter, r *http.Request, id string) {
 	if err := h.store.DeleteProvider(r.Context(), id); err != nil {
-		writeError(w, http.StatusInternalServerError, err.Error())
+		writeDeleteError(w, "delete provider", err)
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]string{"status": "deleted"})
@@ -247,7 +278,11 @@ func (h *ProviderHandler) Delete(w http.ResponseWriter, r *http.Request, id stri
 // 因此刚添加、尚未 reload 的上游也能立即测通。
 func (h *ProviderHandler) Test(w http.ResponseWriter, r *http.Request, id string) {
 	p, err := h.store.GetProvider(r.Context(), id)
-	if err != nil || p == nil {
+	if err != nil {
+		writeServerError(w, "get provider", err)
+		return
+	}
+	if p == nil {
 		writeError(w, http.StatusNotFound, "provider not found")
 		return
 	}

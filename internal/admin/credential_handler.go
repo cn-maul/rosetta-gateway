@@ -41,9 +41,13 @@ type credentialResponse struct {
 }
 
 func (h *CredentialHandler) List(w http.ResponseWriter, r *http.Request, providerID string) {
+	if !requireProvider(w, r, h.store, providerID) {
+		return
+	}
+
 	creds, err := h.store.ListCredentials(r.Context(), providerID)
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, err.Error())
+		writeServerError(w, "list credentials", err)
 		return
 	}
 	result := make([]credentialResponse, 0, len(creds))
@@ -54,6 +58,10 @@ func (h *CredentialHandler) List(w http.ResponseWriter, r *http.Request, provide
 }
 
 func (h *CredentialHandler) Create(w http.ResponseWriter, r *http.Request, providerID string) {
+	if !requireProvider(w, r, h.store, providerID) {
+		return
+	}
+
 	var req credentialRequest
 	if err := decodeJSON(r, &req); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid JSON: "+err.Error())
@@ -69,7 +77,7 @@ func (h *CredentialHandler) Create(w http.ResponseWriter, r *http.Request, provi
 
 	enc, err := encryptSecret(apiKey, h.masterKey)
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, "failed to encrypt key: "+err.Error())
+		writeServerError(w, "encrypt api key", err)
 		return
 	}
 
@@ -93,7 +101,7 @@ func (h *CredentialHandler) Create(w http.ResponseWriter, r *http.Request, provi
 	}
 
 	if err := h.store.CreateCredential(r.Context(), c); err != nil {
-		writeError(w, http.StatusInternalServerError, err.Error())
+		writeServerError(w, "create credential", err)
 		return
 	}
 
@@ -102,7 +110,12 @@ func (h *CredentialHandler) Create(w http.ResponseWriter, r *http.Request, provi
 
 func (h *CredentialHandler) Update(w http.ResponseWriter, r *http.Request, id string) {
 	existing, err := h.store.GetCredential(r.Context(), id)
-	if err != nil || existing == nil {
+	if err != nil {
+		// DB 故障不是「资源不存在」。混在一起报 404 会让运维去删库重建配置。
+		writeServerError(w, "get credential", err)
+		return
+	}
+	if existing == nil {
 		writeError(w, http.StatusNotFound, "credential not found")
 		return
 	}
@@ -125,7 +138,7 @@ func (h *CredentialHandler) Update(w http.ResponseWriter, r *http.Request, id st
 		}
 		enc, err := encryptSecret(apiKey, h.masterKey)
 		if err != nil {
-			writeError(w, http.StatusInternalServerError, "failed to encrypt key")
+			writeServerError(w, "encrypt api key", err)
 			return
 		}
 		existing.APIKeyEnc = enc
@@ -142,7 +155,7 @@ func (h *CredentialHandler) Update(w http.ResponseWriter, r *http.Request, id st
 	}
 
 	if err := h.store.UpdateCredential(r.Context(), id, existing); err != nil {
-		writeError(w, http.StatusInternalServerError, err.Error())
+		writeServerError(w, "update credential", err)
 		return
 	}
 
@@ -151,7 +164,7 @@ func (h *CredentialHandler) Update(w http.ResponseWriter, r *http.Request, id st
 
 func (h *CredentialHandler) Delete(w http.ResponseWriter, r *http.Request, id string) {
 	if err := h.store.DeleteCredential(r.Context(), id); err != nil {
-		writeError(w, http.StatusInternalServerError, err.Error())
+		writeDeleteError(w, "delete credential", err)
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]string{"status": "deleted"})

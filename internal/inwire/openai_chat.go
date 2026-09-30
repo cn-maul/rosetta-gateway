@@ -67,8 +67,20 @@ type OpenAIFuncDef struct {
 	Parameters  json.RawMessage `json:"parameters,omitempty"`
 }
 
-func DecodeOpenAIChatRequest(r *http.Request) (*OpenAIChatRequest, error) {
-	body, err := io.ReadAll(io.LimitReader(r.Body, 32*1024*1024))
+// defaultMaxBodyBytes 是未显式指定上限时的兜底（32 MiB，与 config.Defaults 的默认值一致）。
+const defaultMaxBodyBytes = 32 * 1024 * 1024
+
+// DecodeOpenAIChatRequest 读取并解析请求体。
+//
+// maxBytes <= 0 时用内置兜底。调用方应当传入 cfg.Defaults.MaxRequestBodyBytes ——
+// 这个上限此前在两层各写一份（这里硬编码 32MiB，中间件读配置），配大了内层先截断、
+// json 报出「unexpected end of JSON input」这种看不出原因的错误；配小了外层先拦、
+// 但错误被包成 400 而非 413。同一份值只有一个来源，才不会自相矛盾。
+func DecodeOpenAIChatRequest(r *http.Request, maxBytes int64) (*OpenAIChatRequest, error) {
+	if maxBytes <= 0 {
+		maxBytes = defaultMaxBodyBytes
+	}
+	body, err := io.ReadAll(io.LimitReader(r.Body, maxBytes))
 	if err != nil {
 		return nil, fmt.Errorf("read body: %w", err)
 	}
@@ -180,7 +192,8 @@ func convertMessage(m OpenAIMessage) rosetta.Message {
 	case "system":
 		return rosetta.System(extractText(m.Content))
 	case "user":
-		return rosetta.User(extractText(m.Content))
+		// 唯一保留多模态的角色：文本 + image_url 一起透传给上游。
+		return userMessage(m.Content)
 	case "assistant":
 		if len(m.ToolCalls) > 0 {
 			blocks := make([]rosetta.Block, 0, len(m.ToolCalls)+1)
@@ -196,33 +209,100 @@ func convertMessage(m OpenAIMessage) rosetta.Message {
 	case "tool":
 		return rosetta.ToolResult(m.ToolCallID, "", extractText(m.Content))
 	default:
-		return rosetta.User(extractText(m.Content))
+		// 角色未知时按 user 处理（rosetta 的 validate 随后会拒绝非法角色）。
+		return userMessage(m.Content)
 	}
 }
 
-func extractText(raw json.RawMessage) string {
+// openAIContentPart 是 OpenAI「内容块数组」里的一块。
+//
+// 只声明我们真的会透传的字段：多出来的（image_url.detail / input_audio / file…）
+// 由 encoding/json 忽略，不会被误当成正文。
+type openAIContentPart struct {
+	Type     string `json:"type"`
+	Text     string `json:"text"`
+	ImageURL *struct {
+		URL string `json:"url"`
+	} `json:"image_url"`
+}
+
+// extractUserContent 拆开一条消息的 content：文本拼成一段，图像 URL 原样收集。
+//
+// 旧实现只抽文本，把 image_url **静默丢掉**：客户端发多模态请求，网关照单全收
+// 并回 200，而上游只看到文字 —— 用户以为模型「看不懂图」，实际是网关半路把图删了，
+// 链路上不留任何痕迹。rosetta 原生有 BlockImage，跨协议翻译（OpenAI image_url
+// ↔ Anthropic image source ↔ Responses input_image）正是这个网关存在的意义。
+//
+// 非法 URL（file:// 之类）不在这里白名单：rosetta 的 validate 会拦下并返回
+// ErrInvalidRequest，网关已有的错误映射把它变成 400。
+//
+// 都认不出来时返回空串。旧实现 `return string(raw)` 会把畸形 JSON **原样当正文**
+// 发给上游：客户端传个数字或嵌套对象，上游收到一段 JSON 字面量文本，
+// 而链路上看不出任何异常（它确实是一段"合法的"文本），排查时只能靠肉眼比对话。
+func extractUserContent(raw json.RawMessage) (string, []string) {
 	if len(raw) == 0 {
-		return ""
+		return "", nil
 	}
 
 	var s string
 	if err := json.Unmarshal(raw, &s); err == nil {
-		return s
+		return s, nil
 	}
 
-	var parts []struct {
-		Type string `json:"type"`
-		Text string `json:"text"`
-	}
+	var parts []openAIContentPart
 	if err := json.Unmarshal(raw, &parts); err != nil {
-		return string(raw)
+		// 单块的「对象形态」：非标准，但手写请求里很常见，尽力提取。
+		var single openAIContentPart
+		if err := json.Unmarshal(raw, &single); err != nil {
+			return "", nil
+		}
+		if single.Type == "image_url" && single.ImageURL != nil && single.ImageURL.URL != "" {
+			return "", []string{single.ImageURL.URL}
+		}
+		if single.Text != "" {
+			return single.Text, nil
+		}
+		return "", nil
 	}
 
 	result := ""
+	var images []string
 	for _, p := range parts {
-		if p.Type == "text" {
+		switch p.Type {
+		case "text":
 			result += p.Text
+		case "image_url":
+			if p.ImageURL != nil && p.ImageURL.URL != "" {
+				images = append(images, p.ImageURL.URL)
+			}
 		}
 	}
-	return result
+	return result, images
+}
+
+// extractText 只要文本，丢弃图像。用于 system / assistant / tool —— 这三个角色的
+// 内容在 OpenAI 协议里本就是纯文本，图像只对 user 有意义。
+func extractText(raw json.RawMessage) string {
+	text, _ := extractUserContent(raw)
+	return text
+}
+
+// userMessage 组装 user 消息。
+//
+// 无图像时直接走 rosetta.User，与旧实现逐字节一致（不改变既有行为）；
+// 带图像时才构造多块消息。只有在 rosetta 的 validate 允许的角色-块组合内
+// （RoleUser 支持 text / image / audio / file）才可能通过。
+func userMessage(raw json.RawMessage) rosetta.Message {
+	text, images := extractUserContent(raw)
+	if len(images) == 0 {
+		return rosetta.User(text)
+	}
+	blocks := make([]rosetta.Block, 0, len(images)+1)
+	if text != "" {
+		blocks = append(blocks, rosetta.Block{Type: rosetta.BlockText, Text: text})
+	}
+	for _, u := range images {
+		blocks = append(blocks, rosetta.Block{Type: rosetta.BlockImage, ImageURL: u})
+	}
+	return rosetta.Message{Role: rosetta.RoleUser, Blocks: blocks}
 }

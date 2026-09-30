@@ -27,33 +27,35 @@ func NewModelHandler(st *store.Store, masterKey []byte, cfg *config.Config) *Mod
 // ContextWindow / MaxOutputTokens 传 0 是合法值 —— 会落回 NULL，即「未设置」，
 // 旧实现下这两个字段一旦写入就再也无法清空。
 type modelRequest struct {
-	ModelID          *string `json:"model_id"`
-	DisplayName      *string `json:"display_name"`
-	Enabled          *bool   `json:"enabled"`
-	ContextWindow    *int    `json:"context_window"`
-	MaxOutputTokens  *int    `json:"max_output_tokens"`
-	DefaultExtraJSON *string `json:"default_extra_json"`
+	ModelID         *string `json:"model_id"`
+	DisplayName     *string `json:"display_name"`
+	Enabled         *bool   `json:"enabled"`
+	ContextWindow   *int    `json:"context_window"`
+	MaxOutputTokens *int    `json:"max_output_tokens"`
 }
 
 type modelResponse struct {
-	ID               string  `json:"id"`
-	ProviderID       string  `json:"provider_id"`
-	ModelID          string  `json:"model_id"`
-	DisplayName      string  `json:"display_name"`
-	Enabled          bool    `json:"enabled"`
-	ContextWindow    int     `json:"context_window"`
-	MaxOutputTokens  int     `json:"max_output_tokens"`
-	DefaultExtraJSON string  `json:"default_extra_json"`
-	TokensPerSec     float64 `json:"tokens_per_sec,omitempty"`
-	TtfbMs           float64 `json:"ttfb_ms,omitempty"`
-	SuccessRate      float64 `json:"success_rate"`
-	CallCount        int     `json:"call_count,omitempty"`
+	ID              string  `json:"id"`
+	ProviderID      string  `json:"provider_id"`
+	ModelID         string  `json:"model_id"`
+	DisplayName     string  `json:"display_name"`
+	Enabled         bool    `json:"enabled"`
+	ContextWindow   int     `json:"context_window"`
+	MaxOutputTokens int     `json:"max_output_tokens"`
+	TokensPerSec    float64 `json:"tokens_per_sec,omitempty"`
+	TtfbMs          float64 `json:"ttfb_ms,omitempty"`
+	SuccessRate     float64 `json:"success_rate"`
+	CallCount       int     `json:"call_count,omitempty"`
 }
 
 func (h *ModelHandler) List(w http.ResponseWriter, r *http.Request, providerID string) {
+	if !requireProvider(w, r, h.store, providerID) {
+		return
+	}
+
 	models, err := h.store.ListUpstreamModels(r.Context(), providerID)
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, err.Error())
+		writeServerError(w, "list upstream models", err)
 		return
 	}
 	// 统计只来自历史真实调用，不做探测；未调用过的模型不在 map 中，速度/成功率留空。
@@ -73,6 +75,10 @@ func (h *ModelHandler) List(w http.ResponseWriter, r *http.Request, providerID s
 }
 
 func (h *ModelHandler) Create(w http.ResponseWriter, r *http.Request, providerID string) {
+	if !requireProvider(w, r, h.store, providerID) {
+		return
+	}
+
 	var req modelRequest
 	if err := decodeJSON(r, &req); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid JSON: "+err.Error())
@@ -98,18 +104,21 @@ func (h *ModelHandler) Create(w http.ResponseWriter, r *http.Request, providerID
 	}
 
 	m := &store.UpstreamModel{
-		ID:               generateID(),
-		ProviderID:       providerID,
-		ModelID:          modelID,
-		DisplayName:      strings.TrimSpace(derefStr(req.DisplayName)),
-		Enabled:          enabled,
-		ContextWindow:    ctxWindow,
-		MaxOutputTokens:  maxOut,
-		DefaultExtraJSON: derefStr(req.DefaultExtraJSON),
+		ID:              generateID(),
+		ProviderID:      providerID,
+		ModelID:         modelID,
+		DisplayName:     strings.TrimSpace(derefStr(req.DisplayName)),
+		Enabled:         enabled,
+		ContextWindow:   ctxWindow,
+		MaxOutputTokens: maxOut,
 	}
 
 	if err := h.store.CreateUpstreamModel(r.Context(), m); err != nil {
-		writeError(w, http.StatusInternalServerError, err.Error())
+		if store.IsUniqueViolation(err) {
+			writeError(w, http.StatusConflict, "该上游下已存在同名模型")
+			return
+		}
+		writeServerError(w, "create upstream model", err)
 		return
 	}
 
@@ -118,7 +127,11 @@ func (h *ModelHandler) Create(w http.ResponseWriter, r *http.Request, providerID
 
 func (h *ModelHandler) Update(w http.ResponseWriter, r *http.Request, id string) {
 	existing, err := h.store.GetUpstreamModel(r.Context(), id)
-	if err != nil || existing == nil {
+	if err != nil {
+		writeServerError(w, "get upstream model", err)
+		return
+	}
+	if existing == nil {
 		writeError(w, http.StatusNotFound, "model not found")
 		return
 	}
@@ -159,12 +172,13 @@ func (h *ModelHandler) Update(w http.ResponseWriter, r *http.Request, id string)
 		}
 		existing.MaxOutputTokens = *req.MaxOutputTokens
 	}
-	if req.DefaultExtraJSON != nil {
-		existing.DefaultExtraJSON = *req.DefaultExtraJSON
-	}
 
 	if err := h.store.UpdateUpstreamModel(r.Context(), id, existing); err != nil {
-		writeError(w, http.StatusInternalServerError, err.Error())
+		if store.IsUniqueViolation(err) {
+			writeError(w, http.StatusConflict, "该上游下已存在同名模型")
+			return
+		}
+		writeServerError(w, "update upstream model", err)
 		return
 	}
 
@@ -173,7 +187,7 @@ func (h *ModelHandler) Update(w http.ResponseWriter, r *http.Request, id string)
 
 func (h *ModelHandler) Delete(w http.ResponseWriter, r *http.Request, id string) {
 	if err := h.store.DeleteUpstreamModel(r.Context(), id); err != nil {
-		writeError(w, http.StatusInternalServerError, err.Error())
+		writeDeleteError(w, "delete upstream model", err)
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]string{"status": "deleted"})
@@ -189,6 +203,10 @@ type discoveredModel struct {
 // Discover 直接拉取上游原始 /models，带出各家扩展的上下文/最大输出容量；
 // 探测不到的条目用「设置」里的默认容量兜底，一并返回给前端。
 func (h *ModelHandler) Discover(w http.ResponseWriter, r *http.Request, providerID string) {
+	if !requireProvider(w, r, h.store, providerID) {
+		return
+	}
+
 	ctx, cancel := context.WithTimeout(r.Context(), 20*time.Second)
 	defer cancel()
 
@@ -238,6 +256,10 @@ type modelImportItem struct {
 
 // ImportModels 批量 upsert 模型（按 provider_id+model_id 幂等），一次写入避免逐条 reload。
 func (h *ModelHandler) ImportModels(w http.ResponseWriter, r *http.Request, providerID string) {
+	if !requireProvider(w, r, h.store, providerID) {
+		return
+	}
+
 	var body struct {
 		Models []modelImportItem `json:"models"`
 	}
@@ -248,7 +270,7 @@ func (h *ModelHandler) ImportModels(w http.ResponseWriter, r *http.Request, prov
 
 	def, err := h.store.GetModelDefaults(r.Context())
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, err.Error())
+		writeServerError(w, "get model defaults", err)
 		return
 	}
 
@@ -275,7 +297,7 @@ func (h *ModelHandler) ImportModels(w http.ResponseWriter, r *http.Request, prov
 			MaxOutputTokens: maxOut,
 		}
 		if err := h.store.UpsertUpstreamModel(r.Context(), m); err != nil {
-			writeError(w, http.StatusInternalServerError, err.Error())
+			writeServerError(w, "import upstream model", err)
 			return
 		}
 		imported++
@@ -286,13 +308,12 @@ func (h *ModelHandler) ImportModels(w http.ResponseWriter, r *http.Request, prov
 
 func toModelResponse(m store.UpstreamModel) modelResponse {
 	return modelResponse{
-		ID:               m.ID,
-		ProviderID:       m.ProviderID,
-		ModelID:          m.ModelID,
-		DisplayName:      m.DisplayName,
-		Enabled:          m.Enabled,
-		ContextWindow:    m.ContextWindow,
-		MaxOutputTokens:  m.MaxOutputTokens,
-		DefaultExtraJSON: m.DefaultExtraJSON,
+		ID:              m.ID,
+		ProviderID:      m.ProviderID,
+		ModelID:         m.ModelID,
+		DisplayName:     m.DisplayName,
+		Enabled:         m.Enabled,
+		ContextWindow:   m.ContextWindow,
+		MaxOutputTokens: m.MaxOutputTokens,
 	}
 }

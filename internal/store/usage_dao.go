@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"strings"
 	"time"
 )
 
@@ -28,15 +29,23 @@ type UsageRecord struct {
 	RequestID       string
 }
 
+// CreateUsageRecord 落一条用量记录。
+//
+// Ts 为 0 时取当前时刻；非 0 则用它。此前该字段被**整个忽略**、恒写 time.Now()，
+// 于是任何显式带 Ts 的插入都静默落在「现在」—— 回填历史数据时整条时间线错位，
+// 而且因为字段名和列名都叫 ts，看不出哪里错了。
 func (s *Store) CreateUsageRecord(ctx context.Context, r *UsageRecord) error {
-	now := time.Now().UnixMilli()
+	ts := r.Ts
+	if ts == 0 {
+		ts = time.Now().UnixMilli()
+	}
 	stream := 0
 	if r.Stream {
 		stream = 1
 	}
 	_, err := s.db.ExecContext(ctx,
 		`INSERT INTO usage_records (id, ts, access_key_id, public_model, provider_id, upstream_model, ingress_protocol, stream, input_tokens, output_tokens, total_tokens, reasoning_tokens, cached_tokens, usage_state, status, http_status, error_code, latency_ms, ttfb_ms, request_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		r.ID, now, r.AccessKeyID, r.PublicModel, r.ProviderID, r.UpstreamModel, r.IngressProtocol, stream, r.InputTokens, r.OutputTokens, r.TotalTokens, r.ReasoningTokens, r.CachedTokens, r.UsageState, r.Status, r.HTTPStatus, r.ErrorCode, r.LatencyMs, r.TTFBMs, r.RequestID)
+		r.ID, ts, r.AccessKeyID, r.PublicModel, r.ProviderID, r.UpstreamModel, r.IngressProtocol, stream, r.InputTokens, r.OutputTokens, r.TotalTokens, r.ReasoningTokens, r.CachedTokens, r.UsageState, r.Status, r.HTTPStatus, nullIfEmpty(r.ErrorCode), r.LatencyMs, r.TTFBMs, nullIfEmpty(r.RequestID))
 	return err
 }
 
@@ -49,10 +58,16 @@ type UsageStats struct {
 	ErrorCount    int64
 }
 
-func (s *Store) GetUsageStats(ctx context.Context) (*UsageStats, error) {
+// GetUsageStats 返回累计统计。from/to 为毫秒时间戳，0 表示不设该边界
+// （from=0 即统计全部历史）。ErrorCount 排除 canceled：那是「客户端主动断开」，
+// 既不是上游故障也不是本网关的失败，算进错误率只会让成功率虚低。
+func (s *Store) GetUsageStats(ctx context.Context, from, to int64) (*UsageStats, error) {
 	var stats UsageStats
+	where, args := timeRangeClause(from, to)
 	err := s.db.QueryRowContext(ctx,
-		`SELECT COUNT(*), COALESCE(SUM(total_tokens), 0), COALESCE(SUM(input_tokens), 0), COALESCE(SUM(output_tokens), 0), COALESCE(SUM(cached_tokens), 0), COUNT(CASE WHEN status != 'ok' THEN 1 END) FROM usage_records`).
+		`SELECT COUNT(*), COALESCE(SUM(total_tokens), 0), COALESCE(SUM(input_tokens), 0), COALESCE(SUM(output_tokens), 0), COALESCE(SUM(cached_tokens), 0),
+		        COUNT(CASE WHEN status NOT IN ('ok', 'canceled') THEN 1 END)
+		   FROM usage_records`+where, args...).
 		Scan(&stats.TotalRequests, &stats.TotalTokens, &stats.InputTokens, &stats.OutputTokens, &stats.CachedTokens, &stats.ErrorCount)
 	if err != nil {
 		return nil, err
@@ -60,7 +75,27 @@ func (s *Store) GetUsageStats(ctx context.Context) (*UsageStats, error) {
 	return &stats, nil
 }
 
+// timeRangeClause 构造 ts 时间过滤的 WHERE 子句。from/to 为毫秒时间戳，
+// 0 表示不设该边界。返回的 args 与 where 配套使用。
+func timeRangeClause(from, to int64) (string, []any) {
+	var conds []string
+	var args []any
+	if from > 0 {
+		conds = append(conds, "ts >= ?")
+		args = append(args, from)
+	}
+	if to > 0 {
+		conds = append(conds, "ts <= ?")
+		args = append(args, to)
+	}
+	if len(conds) == 0 {
+		return "", nil
+	}
+	return " WHERE " + strings.Join(conds, " AND "), args
+}
+
 // CacheHitRate 返回缓存命中率（0~1），口径为「缓存读取输入 token / 总输入 token」。
+// from/to 为毫秒时间戳，0 表示不设该边界（from=0 即统计全部历史）。
 //
 // 分母用 input_tokens 而非 total_tokens：缓存命中衡量的是「输入侧有多少走了缓存」，
 // 输出 token 与缓存无关，计入分母只会稀释指标。
@@ -74,11 +109,12 @@ func (s *Store) GetUsageStats(ctx context.Context) (*UsageStats, error) {
 // input_tokens 为 0，对分子分母都没有贡献；截断记录（truncated）的输入是真实
 // 发生过的，应当计入。无输入样本（input_tokens == 0）时返回 0，由调用方决定
 // 展示为「—」还是 0%。
-func (s *Store) CacheHitRate(ctx context.Context) (float64, error) {
+func (s *Store) CacheHitRate(ctx context.Context, from, to int64) (float64, error) {
 	var v float64
+	where, args := timeRangeClause(from, to)
 	err := s.db.QueryRowContext(ctx,
 		`SELECT COALESCE(SUM(cached_tokens) * 1.0 / NULLIF(SUM(input_tokens), 0), 0)
-		   FROM usage_records`).
+		   FROM usage_records`+where, args...).
 		Scan(&v)
 	if err != nil {
 		return 0, err
@@ -145,7 +181,7 @@ func (s *Store) ListModelThroughput(ctx context.Context, providerID string) (map
 		          CASE WHEN status = 'ok' AND output_tokens > 0 AND latency_ms > 0 THEN 1 ELSE 0 END AS is_meas,
 		          CASE WHEN status = 'ok' AND ttfb_ms > 0 THEN 1 ELSE 0 END AS is_ttfb
 		     FROM usage_records
-		    WHERE provider_id = ?
+		    WHERE provider_id = ? AND status <> 'canceled'
 		 ),
 		 ranked AS (
 		   SELECT upstream_model, output_tokens, latency_ms, ttfb_ms, is_ok, is_meas, is_ttfb,
@@ -173,7 +209,7 @@ func (s *Store) ListModelThroughput(ctx context.Context, providerID string) (map
 		var model string
 		var st ModelStat
 		if err := rows.Scan(&model, &st.Tps, &st.SuccessRate, &st.SuccessSample, &st.TtfbMs); err != nil {
-			continue
+			return nil, err
 		}
 		out[model] = st
 	}

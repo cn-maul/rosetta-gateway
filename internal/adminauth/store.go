@@ -31,7 +31,6 @@ import (
 	"crypto/sha256"
 	"crypto/subtle"
 	"encoding/base64"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -71,15 +70,21 @@ type Store struct {
 	mu   sync.RWMutex
 	path string
 	cred *Credential
-	// fallback 来自 config.json 的 admin_token（明文或历史实现写入的裸 sha256 hex）。
+	// fallback 来自 config.json 的 admin_token（明文）或 ADMIN_TOKEN 环境变量。
 	// 仅在用户从未设置过密码时生效，用于平滑迁移与应急恢复。
 	fallback string
+	// locked 非 nil 表示凭据文件存在但不可用（读不了 / 格式错）。见 NewLocked。
+	locked error
 }
 
 // Open 加载（或惰性创建）凭据存储。
 //
 // path 为凭据文件路径；fallback 为 config.json 的 admin_token，可为空。
 // 文件不存在不是错误：此时视为「尚未设置密码」，由 fallback 决定是否放行。
+//
+// 返回的错误表示「文件在，但不可用」（读不了或格式错）。调用方**不应该**因此拒绝启动：
+// /v1 数据面根本不读管理凭据，为一份坏掉的管理凭据把全部转发服务拖死不成比例。
+// 正确的降级是 NewLocked —— 后台进不去，但转发照跑。
 func Open(path, fallback string) (*Store, error) {
 	s := &Store{path: path, fallback: fallback}
 
@@ -103,6 +108,25 @@ func Open(path, fallback string) (*Store, error) {
 	return s, nil
 }
 
+// NewLocked 返回一个「拒绝一切」的 Store，用于凭据文件损坏时的降级。
+//
+// 三种状态的边界必须分清楚：
+//   - 文件**不存在** → 正常状态（还没设过密码），由 fallback 决定放行 → Open。
+//   - 文件**存在且可用** → 正常校验 → Open。
+//   - 文件**存在但坏了** → 既不能当「没密码」放行（一个字节的损坏 = 后台失守），
+//     也不该拒绝启动（/v1 数据面不读它，却会跟着一起死）。所以锁定：
+//     所有管理请求一律拒绝，理由通过 LockedError 透给前端，并指明恢复方法。
+func NewLocked(path string, cause error) *Store {
+	return &Store{path: path, locked: cause}
+}
+
+// LockedError 报告 Store 是否处于锁定态，以及原因（nil 表示正常）。
+func (s *Store) LockedError() error {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.locked
+}
+
 // Path 返回凭据文件的落盘路径。
 func (s *Store) Path() string { return s.path }
 
@@ -111,6 +135,11 @@ func (s *Store) Path() string { return s.path }
 func (s *Store) HasCredential() bool {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
+	// 锁定态一律视为「已有凭据」。否则 password/set 的引导窗口会向所有人敞开 ——
+	// 一个损坏的凭据文件就变成了「后台任人接管」，比拒绝服务严重得多。
+	if s.locked != nil {
+		return true
+	}
 	return s.cred != nil || s.fallback != ""
 }
 
@@ -134,8 +163,12 @@ func (s *Store) Verify(token string) bool {
 	s.mu.RLock()
 	cred := s.cred
 	fallback := s.fallback
+	locked := s.locked
 	s.mu.RUnlock()
 
+	if locked != nil {
+		return false
+	}
 	if cred != nil {
 		return cred.matches(token)
 	}
@@ -186,6 +219,7 @@ func (s *Store) Clear() error {
 	}
 	s.mu.Lock()
 	s.cred = nil
+	s.locked = nil
 	s.mu.Unlock()
 	return nil
 }
@@ -239,26 +273,18 @@ func (c *Credential) matches(password string) bool {
 	return subtle.ConstantTimeCompare(got, want) == 1
 }
 
-// verifyFallback 校验 config.json 的 admin_token。
-// 兼容两种历史形态：64 位 hex 视为裸 sha256 摘要，其余按明文比较。
+// verifyFallback 校验 config.json 的 admin_token，一律按**明文**比较。
+//
+// 历史实现要猜「这串到底是明文还是 sha256 摘要」（`len==64 && isHex` 启发式），
+// 代价是运维把一个恰好 64 位 hex 的明文令牌写进 config 时，拿它当 Bearer 会恒 401
+// —— 正是本包注释第 21-23 行声称已消除的那个失败模式。
+// 现在唯一的「摘要形态」是 admin_auth.json 里的 PBKDF2，且有 algo 字段显式标明，
+// 不需要猜。admin_token 就是明文，说清楚比猜对更重要。
 func verifyFallback(token, expected string) bool {
 	if expected == "" {
 		return false
 	}
-	if len(expected) == 64 && isHex(expected) {
-		sum := sha256.Sum256([]byte(token))
-		return subtle.ConstantTimeCompare([]byte(hex.EncodeToString(sum[:])), []byte(expected)) == 1
-	}
 	return subtle.ConstantTimeCompare([]byte(token), []byte(expected)) == 1
-}
-
-func isHex(s string) bool {
-	for _, r := range s {
-		if !(r >= '0' && r <= '9' || r >= 'a' && r <= 'f' || r >= 'A' && r <= 'F') {
-			return false
-		}
-	}
-	return len(s) > 0
 }
 
 // ResolvePath 返回可执行文件同级目录下的凭据文件路径。

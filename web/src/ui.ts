@@ -46,6 +46,10 @@ export function confirmBox(opts: {
   confirmLabel?: string
 }): Promise<boolean> {
   return new Promise((resolve) => {
+    // 上一个确认框若还没结算，先按「取消」了结它。
+    // 直接覆盖 resolve 会把那个 Promise 永远挂起 —— await 它的地方从此不再往下走
+    // （表现为「点了删除，界面卡住，什么也没发生」）。
+    confirmState.resolve?.(false)
     confirmState.title = opts.title
     confirmState.body = opts.body ?? ''
     confirmState.danger = opts.danger ?? false
@@ -65,5 +69,4 @@ export function settleConfirm(v: boolean) {
 
 export const authState = reactive({
   needToken: false, // 401 后弹出输入框
-  callback: null as ((ok: boolean) => void) | null,
 })

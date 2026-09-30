@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"sync"
 	"time"
 
 	"github.com/cn-maul/rosetta"
@@ -54,12 +55,18 @@ type OpenAIUsage struct {
 }
 
 type SSEWriter struct {
-	w        io.Writer
-	flusher  http.Flusher
-	flushed  bool
-	id       string
-	model    string
-	created  int64
+	w       io.Writer
+	flusher http.Flusher
+	id      string
+	model   string
+	created int64
+
+	// mu 串行化对底层 writer 的写入。网关的心跳 goroutine 与主事件循环会并发
+	// 写同一个 http.ResponseWriter，而 Go 明确不支持并发使用 ResponseWriter
+	// （server.statusResponseWriter 的 written/statusCode 也是无锁写）。
+	// 实测高频窗口下未观测到字节损坏，但那是运气，不是契约 —— 一旦交错出一个
+	// 半个 `data:` 行，下游只会报「流式响应中没有内容」。
+	mu       sync.Mutex
 	roleSent bool
 }
 
@@ -70,6 +77,8 @@ func NewSSEWriter(w io.Writer, flusher http.Flusher, id, model string, created i
 // SetResponseID 在上游 message_start 带回真实响应 id 后覆盖预先生成的兜底 id；
 // 必须在首个分片写出前调用，否则分片已带旧 id 无法追溯。
 func (sw *SSEWriter) SetResponseID(id string) {
+	sw.mu.Lock()
+	defer sw.mu.Unlock()
 	if sw.roleSent || id == "" {
 		return
 	}
@@ -77,6 +86,8 @@ func (sw *SSEWriter) SetResponseID(id string) {
 }
 
 func (sw *SSEWriter) WriteEvent(event, data string) error {
+	sw.mu.Lock()
+	defer sw.mu.Unlock()
 	if event != "" {
 		fmt.Fprintf(sw.w, "event: %s\n", event)
 	}
@@ -84,7 +95,18 @@ func (sw *SSEWriter) WriteEvent(event, data string) error {
 	if sw.flusher != nil {
 		sw.flusher.Flush()
 	}
-	sw.flushed = true
+	return nil
+}
+
+// WriteComment 写一行 SSE 注释（`: keepalive`）。注释被所有标准 SSE 客户端忽略，
+// 唯一作用是让连接与中间代理不因长时间零字节而误判空闲并断开。
+func (sw *SSEWriter) WriteComment(text string) error {
+	sw.mu.Lock()
+	defer sw.mu.Unlock()
+	fmt.Fprintf(sw.w, ": %s\n\n", text)
+	if sw.flusher != nil {
+		sw.flusher.Flush()
+	}
 	return nil
 }
 
@@ -171,17 +193,24 @@ func (sw *SSEWriter) WriteFinish(reason string) error {
 }
 
 func (sw *SSEWriter) WriteUsage(u rosetta.Usage) error {
+	usage := map[string]any{
+		"prompt_tokens":     u.InputTokens,
+		"completion_tokens": u.OutputTokens,
+		"total_tokens":      u.TotalTokens,
+	}
+	// 缓存命中的 token 按 OpenAI 官方口径放在 prompt_tokens_details.cached_tokens。
+	// 网关自己明明把 CachedInputTokens 记进了 usage_records，却不下发给下游 ——
+	// 下游据此算出的成本会系统性偏高（缓存命中部分通常便宜一个数量级）。
+	if u.CachedInputTokens > 0 {
+		usage["prompt_tokens_details"] = map[string]any{"cached_tokens": u.CachedInputTokens}
+	}
 	chunk := map[string]any{
 		"id":      sw.id,
 		"object":  "chat.completion.chunk",
 		"created": sw.created,
 		"model":   sw.model,
 		"choices": []any{},
-		"usage": map[string]any{
-			"prompt_tokens":     u.InputTokens,
-			"completion_tokens": u.OutputTokens,
-			"total_tokens":      u.TotalTokens,
-		},
+		"usage":   usage,
 	}
 	data, _ := json.Marshal(chunk)
 	return sw.WriteEvent("", string(data))
@@ -211,7 +240,7 @@ func WriteNonStreamResponse(w http.ResponseWriter, resp *rosetta.ChatResponse, m
 
 	msg := &OpenAIMessage{
 		Role:             "assistant",
-		Content:          json.RawMessage(`"` + escapeJSON(resp.Text()) + `"`),
+		Content:          jsonString(resp.Text()),
 		ReasoningContent: resp.ThinkingText(),
 	}
 	if len(resp.ToolCalls()) > 0 {
@@ -228,7 +257,10 @@ func WriteNonStreamResponse(w http.ResponseWriter, resp *rosetta.ChatResponse, m
 		}
 		raw, _ := json.Marshal(tcs)
 		msg.ToolCalls = raw
-		msg.Content = nil
+		// OpenAI 的语义是「带 tool_calls 时 content 为 null」，而不是整个字段消失。
+		// 置 nil 会被 omitempty 连字段一起抹掉，客户端拿不到 content 键 ——
+		// 部分 SDK 会把它判成响应结构不合法。
+		msg.Content = json.RawMessage("null")
 	}
 
 	choices = append(choices, OpenAIChatChoice{
@@ -256,7 +288,13 @@ func WriteNonStreamResponse(w http.ResponseWriter, resp *rosetta.ChatResponse, m
 	json.NewEncoder(w).Encode(out)
 }
 
-func escapeJSON(s string) string {
-	b, _ := json.Marshal(s)
-	return string(b[1 : len(b)-1])
+// jsonString 把字符串编码成一个完整的 JSON 字面量（含引号与转义）。
+// 此前是「手工拼引号 + 剥掉首尾引号的 json.Marshal 产物」，结果等价但脆弱：
+// 任一处引号写漏就产出非法 JSON，而这是下游解析的第一个字段。
+func jsonString(s string) json.RawMessage {
+	b, err := json.Marshal(s)
+	if err != nil {
+		return json.RawMessage(`""`)
+	}
+	return json.RawMessage(b)
 }
