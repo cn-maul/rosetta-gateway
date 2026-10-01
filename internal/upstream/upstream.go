@@ -539,11 +539,29 @@ func firstPositive(vals ...int) int {
 	return 0
 }
 
+// upstreamHTTPClient 是所有 rosetta 客户端共享的 HTTP 客户端（共用一个连接池）。
+// 不用 SDK 自建 transport 的两个原因：它的 Proxy 为 nil，不读 HTTP_PROXY/
+// HTTPS_PROXY；ResponseHeaderTimeout 固定 30s，而非流式上游要等完整生成才发
+// 响应头，慢生成会在 30s 被掐断（网关非流式超时默认 120s）。这里恢复环境
+// 代理、头超时放宽到 60s，连接池参数与 SDK 默认保持一致。CheckRedirect 留空，
+// 由 SDK 补跨主机重定向防护；client.Timeout 也不设，超时一律走 ctx。
+var upstreamHTTPClient = &http.Client{
+	Transport: &http.Transport{
+		Proxy:                 http.ProxyFromEnvironment,
+		MaxIdleConns:          128,
+		MaxIdleConnsPerHost:   64,
+		IdleConnTimeout:       90 * time.Second,
+		ForceAttemptHTTP2:     true,
+		ResponseHeaderTimeout: 60 * time.Second,
+	},
+}
+
 func buildClient(prov *ProviderEntry, apiKey string, cfg *config.Config) (*rosetta.Client, error) {
 	opts := []rosetta.Option{
 		rosetta.WithEndpoint(prov.Endpoint),
 		rosetta.WithAPIKey(apiKey),
 		rosetta.WithMaxRetries(prov.MaxRetries),
+		rosetta.WithHTTPClient(upstreamHTTPClient),
 	}
 	if prov.Protocol != "" && prov.Protocol != "auto" {
 		switch prov.Protocol {
