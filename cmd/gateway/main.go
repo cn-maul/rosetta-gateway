@@ -147,19 +147,14 @@ func main() {
 	bootstrapDB(db, cfg, logger, masterKey)
 
 	pool := upstream.NewPool(logger)
-	if err := pool.BuildFromStore(context.Background(), db, masterKey, cfg); err != nil {
-		logger.Warn("failed to build pool from DB, falling back to config", "error", err)
+	reloader := &runtimeReloader{db: db, masterKey: masterKey, pool: pool, cfg: cfg}
+	if err := reloader.Reload(context.Background()); err != nil {
+		logger.Warn("failed to build runtime from DB, falling back to config", "error", err)
 		if err := pool.BuildFromConfig(cfg); err != nil {
 			logger.Error("failed to build upstream pool from config", "error", err)
 		}
+		snapshot.Init(buildSnapshotFromConfig(cfg))
 	}
-
-	snap, err := snapshot.RebuildFromDB(context.Background(), db)
-	if err != nil {
-		logger.Error("failed to rebuild snapshot from DB", "error", err)
-		snap = buildSnapshotFromConfig(cfg)
-	}
-	snapshot.Init(snap)
 
 	usage := newUsageRecorder(db, logger)
 	mux := http.NewServeMux()
@@ -205,7 +200,7 @@ func main() {
 	keyHandler := admin.NewKeyHandler(db)
 	statsHandler := admin.NewStatsHandler(db)
 	settingsHandler := admin.NewSettingsHandler(db, cfg)
-	reloadHandler := admin.NewReloadHandler(db, masterKey, pool, cfg)
+	reloadHandler := admin.NewReloadHandler(reloader.Reload)
 	usageHandler := admin.NewUsageHandler(db)
 	passwordHandler := admin.NewPasswordHandler(authStore)
 
@@ -257,6 +252,19 @@ func main() {
 
 	adminWrapped := server.AdminAuth(adminMux, authStore)
 
+	// 管理写操作成功后自动重建运行时（池 + 快照）：配置生效不再依赖前端自觉调
+	// POST /admin/api/reload，任何带凭据的调用方（curl/脚本）写完立即生效 ——
+	// 包括禁用下游 Key 这类安全敏感操作（auth 读快照，不重建就照常放行）。
+	// AutoReload 在 AdminAuth 外侧：401/429 的失败响应不会触发重建。
+	// 前端 mutate() 里的 reload 调用保留为兜底（服务端重建失败时再给一次机会）。
+	adminAuto := server.AutoReload(adminWrapped, reloader.Reload, logger)
+
+	mux.Handle("GET /admin/api/", adminAuto)
+	mux.Handle("POST /admin/api/", adminAuto)
+	mux.Handle("PATCH /admin/api/", adminAuto)
+	mux.Handle("DELETE /admin/api/", adminAuto)
+	mux.Handle("PUT /admin/api/", adminAuto)
+
 	// SPA 产物在 embed FS 的 dist/ 子目录下；剥掉 /admin 前缀后交给 FileServer。
 	// hash 路由下路径只有 /admin/（入口）与 /admin/assets/*（静态资源）两类。
 	webuiFS, _ := fs.Sub(webui.StaticFS, "dist")
@@ -293,11 +301,6 @@ func main() {
 	// 与 "/admin/api/"（路径更窄、方法不限）并存——两者互不更具特异性，注册期直接 panic。
 	// 因此两侧都显式声明方法：API 按方法逐个注册，静态资源只挂 GET 子树。
 	// 于是 "GET /admin/api/" 在路径上严格更具体、方法相同，冲突消除。
-	mux.Handle("GET /admin/api/", adminWrapped)
-	mux.Handle("POST /admin/api/", adminWrapped)
-	mux.Handle("PATCH /admin/api/", adminWrapped)
-	mux.Handle("DELETE /admin/api/", adminWrapped)
-	mux.Handle("PUT /admin/api/", adminWrapped)
 	mux.HandleFunc("GET /admin/", webHandler)
 
 	handler := server.Recovery(mux, logger)
@@ -310,7 +313,17 @@ func main() {
 		Addr:         cfg.Listen,
 		Handler:      handler,
 		ReadTimeout:  30 * time.Second,
-		WriteTimeout: 5 * time.Minute,
+		// WriteTimeout 必须为 0：net/http 的写超时从「开始写响应」起算，覆盖整个
+		// 响应时长 —— 5 分钟一到会把仍在正常吐字的流式响应硬切（大输出的慢推理
+		// 模型恰好会撞上），下游看到的是来历不明的 truncated。流的生命周期已由
+		// TTFT/空闲看门狗约束（attemptStream），非流式由 upstream_timeout 限定
+		// handler 时长，全局写超时在这里只会误伤长流，不会多保护任何东西。
+		WriteTimeout: 0,
+		// 慢连接防护：30s 读不完请求头、空闲 2 分钟的 keep-alive 连接即回收。
+		// IdleTimeout 不设的话回落 ReadTimeout(30s)，聊天客户端「想一会儿再发
+		// 下一条」的间隔内连接被反复重建，复用率反而更低。
+		ReadHeaderTimeout: 30 * time.Second,
+		IdleTimeout:       2 * time.Minute,
 	}
 
 	go func() {
@@ -338,6 +351,44 @@ func main() {
 	defer drainCancel()
 	usage.wait(drainCtx)
 	logger.Info("server stopped")
+}
+
+// runtimeReloader 把「上游池重建 + 快照重建」收口成一个可串行、可复用的原子操作。
+//
+// 为什么要收口（而不是各 handler 自行重建、或只依赖前端调 reload）：
+//   - 池与快照是运行时的唯一事实视图，管理写操作落库后必须重建才生效；
+//     生效路径若只靠前端，任何绕过前端的调用方（curl/脚本）都会造成静默分叉，
+//     最敏感的是禁用下游 Key —— auth 校验读快照，不重建就照常放行。
+//   - 池与快照是两个独立的原子域，「先换一个、再建另一个」时第二步失败会两边
+//     分叉。这里先各自完整构建（PrepareFromStore / RebuildFromDB 都不触碰
+//     运行状态），两边都成功才依次替换；任一步失败则运行时保持旧状态继续服务。
+//
+// mu 串行化并发触发（管理写操作的自动 reload + 手动 POST /admin/api/reload），
+// 避免两轮重建交错执行。
+type runtimeReloader struct {
+	mu        sync.Mutex
+	db        *store.Store
+	masterKey []byte
+	pool      *upstream.Pool
+	cfg       *config.Config
+}
+
+// Reload 串行执行一次「池 + 快照」重建；任何一步失败都不改变运行状态。
+func (rr *runtimeReloader) Reload(ctx context.Context) error {
+	rr.mu.Lock()
+	defer rr.mu.Unlock()
+
+	providers, err := rr.pool.PrepareFromStore(ctx, rr.db, rr.masterKey, rr.cfg)
+	if err != nil {
+		return fmt.Errorf("prepare upstream pool: %w", err)
+	}
+	snap, err := snapshot.RebuildFromDB(ctx, rr.db)
+	if err != nil {
+		return fmt.Errorf("rebuild snapshot: %w", err)
+	}
+	rr.pool.Install(providers)
+	snapshot.Swap(snap)
+	return nil
 }
 
 func bootstrapDB(db *store.Store, cfg *config.Config, logger *slog.Logger, masterKey []byte) {

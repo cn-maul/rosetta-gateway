@@ -69,17 +69,9 @@ func NewPool(logger *slog.Logger) *Pool {
 }
 
 func (p *Pool) BuildFromConfig(cfg *config.Config) error {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-
-	// 重建前先清空：否则从配置删掉的上游会一直留在池里，
-	// /v1 仍然能路由到它（快照已删、池里还在）。
-	p.providers = make(map[string]*ProviderEntry)
-	// 健康态随池一起清零：凭据冷却在上面的 providers 重建里已隐含重置，
-	// 目标熔断这张表若不清就会随「每次保存链都重新生成 targetID」单调堆积成泄漏。
-	// 两层一起在重建时归零 —— 语义一致，配置变更本就是重新探测的正当理由。
-	p.targets = make(map[string]*targetHealth)
-
+	// 先在局部表里完整构建，全部成功才 Install 替换 —— 与 BuildFromStore 同一纪律：
+	// 构建中途失败（buildClient 出错）绝不能把旧池清掉，否则 /v1 全站断粮。
+	newProviders := make(map[string]*ProviderEntry)
 	for _, bp := range cfg.Bootstrap.Providers {
 		prov := &ProviderEntry{
 			ID:         bp.Slug,
@@ -119,27 +111,33 @@ func (p *Pool) BuildFromConfig(cfg *config.Config) error {
 			prov.Credentials = append(prov.Credentials, cred)
 		}
 
-		p.providers[bp.Slug] = prov
+		newProviders[bp.Slug] = prov
 	}
+	p.Install(newProviders)
 	return nil
 }
 
 func (p *Pool) BuildFromStore(ctx context.Context, st *store.Store, masterKey []byte, cfg *config.Config) error {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-
-	// 重建前先清空：admin 的每个写操作都会触发 reload → 本函数，
-	// 不清空的话「删除上游」在池里永不生效，请求仍会被转发到已删除的 provider。
-	p.providers = make(map[string]*ProviderEntry)
-	// 目标级健康/熔断态与凭据冷却一起清零 —— 重建即重新探测。既避免旧 targetID
-	// （每次保存链都重新生成主键）在本表里累积成泄漏，也让两层健康态语义一致。
-	p.targets = make(map[string]*targetHealth)
-
-	providers, err := st.ListProviders(ctx)
+	providers, err := p.PrepareFromStore(ctx, st, masterKey, cfg)
 	if err != nil {
 		return err
 	}
+	p.Install(providers)
+	return nil
+}
 
+// PrepareFromStore 从数据库构建一份完整的 provider 表（含解密、建 client），
+// **不触碰池的现有状态**。任何失败都以 error 返回，调用方手里的池保持原样 ——
+// 旧实现「先清空 p.providers 再查库」在 ListProviders 失败时会留下一个空池，
+// 之后所有 /v1 请求都选不到上游，直到下一次成功的 reload。
+// 单 provider 级的失败（凭据解密失败、client 构建失败）仍只跳过该 provider 并记日志。
+func (p *Pool) PrepareFromStore(ctx context.Context, st *store.Store, masterKey []byte, cfg *config.Config) (map[string]*ProviderEntry, error) {
+	providers, err := st.ListProviders(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	newProviders := make(map[string]*ProviderEntry, len(providers))
 	for _, sp := range providers {
 		timeout := cfg.UpstreamTimeout()
 		if sp.TimeoutMs > 0 {
@@ -202,9 +200,20 @@ func (p *Pool) BuildFromStore(ctx context.Context, st *store.Store, masterKey []
 			prov.Credentials = append(prov.Credentials, cred)
 		}
 
-		p.providers[sp.Slug] = prov
+		newProviders[sp.Slug] = prov
 	}
-	return nil
+	return newProviders, nil
+}
+
+// Install 以构建好的新表原子替换运行状态，并把目标熔断表一并清零。
+// 语义：重建即重新探测 —— 配置变更本就是重新探测的正当理由；不清的话
+// 已删除 target 的旧条目会随「每次保存链都重新生成 targetID」单调堆积成泄漏。
+// 在途请求持有的旧 *CredentialEntry/Client 指针不受影响，由 GC 收尾。
+func (p *Pool) Install(providers map[string]*ProviderEntry) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.providers = providers
+	p.targets = make(map[string]*targetHealth)
 }
 
 func (p *Pool) GetAnyClient(providerSlug string) (*rosetta.Client, string, error) {

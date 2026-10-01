@@ -1,13 +1,11 @@
 package admin
 
 import (
+	"context"
 	"net/http"
 	"strconv"
 
-	"github.com/cn-maul/rosetta-gateway/internal/config"
-	"github.com/cn-maul/rosetta-gateway/internal/snapshot"
 	"github.com/cn-maul/rosetta-gateway/internal/store"
-	"github.com/cn-maul/rosetta-gateway/internal/upstream"
 )
 
 type StatsHandler struct {
@@ -43,16 +41,17 @@ func (h *StatsHandler) Get(w http.ResponseWriter, r *http.Request) {
 		writeServerError(w, "usage stats", err)
 		return
 	}
+	// 缓存命中率已并入 GetUsageStats 同一条 SELECT（见 usage_dao.go）：
+	// 此前它是对同一区间 usage_records 的第二次独立全扫，纯属重复。
 	tps, _ := h.store.GetRecentThroughput(r.Context(), 5)
 	ttfb, _ := h.store.GetRecentTtfbMs(r.Context(), 5)
-	hitRate, _ := h.store.CacheHitRate(r.Context(), from, to)
 	writeJSON(w, http.StatusOK, statsResponse{
 		TotalRequests:   stats.TotalRequests,
 		TotalTokens:     stats.TotalTokens,
 		InputTokens:     stats.InputTokens,
 		OutputTokens:    stats.OutputTokens,
 		CachedTokens:    stats.CachedTokens,
-		CacheHitRate:    hitRate,
+		CacheHitRate:    stats.CacheHitRate,
 		ErrorCount:      stats.ErrorCount,
 		AvgTokensPerSec: tps,
 		AvgTtfbMs:       ttfb,
@@ -60,29 +59,21 @@ func (h *StatsHandler) Get(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// ReloadHandler 处理手动触发的 POST /admin/api/reload。
+// 实际重建逻辑由注入的 reload 函数提供（cmd/gateway 的 runtimeReloader），
+// 与管理写操作后的自动 reload（server.AutoReload）共用同一把串行锁。
 type ReloadHandler struct {
-	store     *store.Store
-	masterKey []byte
-	pool      *upstream.Pool
-	cfg       *config.Config
+	reload func(ctx context.Context) error
 }
 
-func NewReloadHandler(st *store.Store, masterKey []byte, pool *upstream.Pool, cfg *config.Config) *ReloadHandler {
-	return &ReloadHandler{store: st, masterKey: masterKey, pool: pool, cfg: cfg}
+func NewReloadHandler(reload func(ctx context.Context) error) *ReloadHandler {
+	return &ReloadHandler{reload: reload}
 }
 
 func (h *ReloadHandler) Reload(w http.ResponseWriter, r *http.Request) {
-	if h.pool != nil {
-		if err := h.pool.BuildFromStore(r.Context(), h.store, h.masterKey, h.cfg); err != nil {
-			writeServerError(w, "rebuild upstream pool", err)
-			return
-		}
-	}
-	snap, err := snapshot.RebuildFromDB(r.Context(), h.store)
-	if err != nil {
-		writeServerError(w, "rebuild snapshot", err)
+	if err := h.reload(r.Context()); err != nil {
+		writeServerError(w, "reload runtime", err)
 		return
 	}
-	snapshot.Swap(snap)
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 }

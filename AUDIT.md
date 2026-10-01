@@ -1253,3 +1253,80 @@ Anthropic `image source` ↔ Responses `input_image`）正是这个网关存在�
   `npm run typecheck` 通过；管理界面四页截图核对（`overflowX: 0`，无窄屏溢出）。
 
 
+
+---
+
+# 全局复审 + 高优先级修复 — 2026-10-01
+
+触发点：对全项目做一次整体全局审计（性能 / 功能 / 正确性），随后修复其中高优先级的 5 项。
+审计范围覆盖 Go 全部 50 个源文件 + Vue 前端 + 构建链路；此处只记录本轮修掉的高优先级项，
+性能优化与功能增强建议（synchronous=NORMAL、鉴权 O(N)、Anthropic 入口、response_format 透传、
+RPM/TPM 限速、审计日志、CI 校验 dist 同步等）待后续排期。
+
+## 0. 结论速览
+
+| # | 问题 | 严重度 | 状态 |
+|---|---|---|---|
+| 1 | /v1 请求体超限被内层 LimitReader 静默截断，413 永远变 400 | **P1** | 已修复 |
+| 2 | 池重建「先清空再查库」，ListProviders 失败留下空池 → 全站 /v1 选不到上游；并发 reload 交错 | **P1** | 已修复 |
+| 3 | 配置生效完全依赖前端调 reload：绕过前端的调用方写完不生效，禁用 Key 后 auth 读旧快照照常放行（安全窗口） | **P1** | 已修复 |
+| 4 | `ListModelThroughput` 全历史窗口函数挂在 GET models 上，重查询阻塞唯一 DB 连接；缓存命中率对同一区间重复全扫 | **P1** | 已修复 |
+| 5 | `http.Server.WriteTimeout=5min` 从响应起算，会硬切超过 5 分钟的正常流式（来历不明的 truncated）；无 ReadHeaderTimeout/IdleTimeout | **P1** | 已修复 |
+
+## 1. 修复详述
+
+### 1.1 请求体超限报 413（inwire）
+
+`DecodeOpenAIChatRequest` 原来读 `LimitReader(r.Body, maxBytes)`——LimitReader 到点即停不报错，
+外层 MaxBytesReader 永远等不到越界读，超限 body 被截断后 json 报 `unexpected end of JSON input`（400），
+`handleChatCompletions` 里 `errors.As(*http.MaxBytesError)` 的 413 分支是死代码。
+现改为读 `maxBytes+1` 后显式判长度，超限直接返回 `&http.MaxBytesError{Limit: maxBytes}`；
+外层中间件先行报错的路也汇到同一个 413。回归测试：`internal/inwire/openai_chat_test.go`
+（超限报 MaxBytesError / 恰好满额正常解码）。
+
+### 1.2 池重建原子化（upstream）
+
+`BuildFromStore` / `BuildFromConfig` 原来第一步就 `p.providers = make(...)` 清空，之后任何失败
+都留下空池。现拆为 `PrepareFromStore`（构建完整局部表，不触碰运行状态；单 provider 级失败仍只跳过并记日志）
++ `Install`（锁内一次性换入新表并清零目标熔断表）。构建失败 → 旧池原样保留，照常服务。
+回归测试：`internal/upstream/pool_test.go` 的 `TestBuildFromStore_ErrorKeepsOldPool`
+（用已关闭的 store 制造失败，断言旧池仍可用、熔断表未被误清）。
+
+### 1.3 配置生效服务端化：AutoReload + runtimeReloader（server / cmd/gateway）
+
+新增 `server.AutoReload` 中间件：管理写方法（POST/PATCH/PUT/DELETE）响应 2xx 后就地触发重建；
+GET、4xx/5xx、`/admin/api/reload`（自身会重建）、`password/set`（不涉运行时）、
+`/test` 与 `/discover`（只读探测）均跳过。重建与请求生命周期解耦
+（`context.Background()` + 30s 超时），失败只 ERROR 留痕（响应已发出无法改写），
+运行时与库的分叉由下一次写操作或手动 reload 收敛。
+
+新增 `runtimeReloader`（cmd/gateway）：`sync.Mutex` 串行化「池重建 + 快照重建」，
+先 `PrepareFromStore` 与 `RebuildFromDB` 各自完整构建，两边都成功才依次原子替换——
+任一步失败运行时保持旧状态，消除「池新快照旧」的分叉。启动流程、`POST /admin/api/reload`、
+AutoReload 三者共用同一把锁。前端 `mutate()` 的 reload 调用保留为兜底。
+回归测试：`internal/server/autoreload_test.go`（触发矩阵 + reload 失败不影响响应）。
+
+### 1.4 用量重查询加界（store）
+
+- `ListModelThroughput` 统计范围限定近 30 天（`throughputWindow`）：窗口函数要对全历史排序，
+  调用量大的 provider 积累几十万行后，每次打开模型页都是一次重查询，且持着唯一的
+  DB 连接（`SetMaxOpenConns(1)`）阻塞配额预检与用量写入。`idx_usage_prov_ts` 可直接服务该范围。
+- 缓存命中率并入 `GetUsageStats` 同一条 SELECT（JOIN 至多 1:1，不会因行复制失真），
+  独立的 `CacheHitRate` 方法（唯一调用方是 stats 页）随之删除；语义注释迁入 `UsageStats.CacheHitRate`。
+- 设计口径不变：`usage_records` 仍不做保留/归档策略（DESIGN §4），本轮只约束查询侧。
+
+### 1.5 HTTP 超时（cmd/gateway）
+
+`WriteTimeout: 5min` → `0`：net/http 的写超时从「开始写响应」起算、覆盖整个响应时长，
+长输出的慢推理流（>5 分钟）会被硬切成来历不明的 truncated。流已有 TTFT/空闲看门狗兜底，
+非流式由 `upstream_timeout` 限定。补上 `ReadHeaderTimeout: 30s` 与 `IdleTimeout: 2min`
+（不设 IdleTimeout 会回落 ReadTimeout 的 30s，聊天客户端思考间隙的 keep-alive 连接被反复重建）。
+
+## 2. 验证证据
+
+- `go build ./...` / `go vet ./...` 无输出；`go test ./... -count=1` 全过
+  （含本轮新增的 inwire 2 例、upstream 1 例、server 2 例）。
+- 既有回归全部保持绿：`failover_test.go` / `quota_test.go` / `throttle_test.go` /
+  admin 各 handler 测试未改动、原样通过。
+- 文档同步：DESIGN §4（查询侧防线）、§6.3（服务端自动 reload）、§8.1（WriteTimeout=0）、
+  §10（池重建原子化）已更新。

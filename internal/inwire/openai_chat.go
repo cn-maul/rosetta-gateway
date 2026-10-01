@@ -72,17 +72,24 @@ const defaultMaxBodyBytes = 32 * 1024 * 1024
 
 // DecodeOpenAIChatRequest 读取并解析请求体。
 //
-// maxBytes <= 0 时用内置兜底。调用方应当传入 cfg.Defaults.MaxRequestBodyBytes ——
-// 这个上限此前在两层各写一份（这里硬编码 32MiB，中间件读配置），配大了内层先截断、
-// json 报出「unexpected end of JSON input」这种看不出原因的错误；配小了外层先拦、
-// 但错误被包成 400 而非 413。同一份值只有一个来源，才不会自相矛盾。
+// maxBytes <= 0 时用内置兜底。调用方应当传入 cfg.Defaults.MaxRequestBodyBytes，
+// 与外层 RequestSizeLimit 中间件保持同一来源。
+//
+// 超限必须以 *http.MaxBytesError 报出（调用方据此映射 413），因此这里读
+// maxBytes+1 再显式判长度：LimitReader 到点即停、不报错，只读 maxBytes 会让
+// 超限 body 被静默截断、json 报出「unexpected end of JSON input」（400），
+// 调用方的 413 分支永远走不到。外层 MaxBytesReader 在读越限时也会先行报出
+// 同类错误，两条路汇到同一个 413。
 func DecodeOpenAIChatRequest(r *http.Request, maxBytes int64) (*OpenAIChatRequest, error) {
 	if maxBytes <= 0 {
 		maxBytes = defaultMaxBodyBytes
 	}
-	body, err := io.ReadAll(io.LimitReader(r.Body, maxBytes))
+	body, err := io.ReadAll(io.LimitReader(r.Body, maxBytes+1))
 	if err != nil {
 		return nil, fmt.Errorf("read body: %w", err)
+	}
+	if int64(len(body)) > maxBytes {
+		return nil, &http.MaxBytesError{Limit: maxBytes}
 	}
 
 	var req OpenAIChatRequest

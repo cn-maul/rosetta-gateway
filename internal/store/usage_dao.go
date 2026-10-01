@@ -56,6 +56,14 @@ type UsageStats struct {
 	OutputTokens  int64
 	CachedTokens  int64
 	ErrorCount    int64
+	// CacheHitRate 是缓存命中率（0~1）：cached_tokens / input_tokens。
+	// 分母用 input_tokens 而非 total_tokens —— 缓存命中衡量的是输入侧，
+	// 输出 token 与缓存无关，计入分母只会稀释指标。分子分母的语义前提：
+	// 两个上游协议的 cached 都 ⊆ input（openai-chat 的
+	// prompt_tokens_details.cached_tokens、anthropic 被 SDK 折进 input 的
+	// cache_read/cache_creation），故比值恒 ≤ 1。并入本查询是为了省掉对
+	// 同一区间的第二次全扫（此前的 stats 页要为它单独再扫一遍 usage_records）。
+	CacheHitRate float64
 	// Cost 是费用（元），按**当前** upstream_models 里的单价实时计算
 	// （改价后历史区间统计随之变化，usage_records 不固化金额）。
 	Cost float64
@@ -74,12 +82,15 @@ type UsageStats struct {
 //
 // LEFT JOIN 按 (provider_id, upstream_model) 匹配：usage_records 里那对字段
 // 正是上游模型的自然键，记录的模型已从库里删掉时退化为 0 而不是让统计整体失败。
+// JOIN 至多 1:1（provider_id+model_id 在 upstream_models 上 UNIQUE），
+// 因此缓存命中率可在同一条 SELECT 里一并聚合，不会因行复制而失真。
 func (s *Store) GetUsageStats(ctx context.Context, from, to int64) (*UsageStats, error) {
 	var stats UsageStats
 	where, args := timeRangeClause(from, to, "u.")
 	err := s.db.QueryRowContext(ctx,
 		`SELECT COUNT(*), COALESCE(SUM(u.total_tokens), 0), COALESCE(SUM(u.input_tokens), 0), COALESCE(SUM(u.output_tokens), 0), COALESCE(SUM(u.cached_tokens), 0),
 		        COUNT(CASE WHEN u.status NOT IN ('ok', 'canceled') THEN 1 END),
+		        COALESCE(SUM(u.cached_tokens) * 1.0 / NULLIF(SUM(u.input_tokens), 0), 0),
 		        COALESCE(SUM(
 		           MAX(u.input_tokens - u.cached_tokens, 0) * COALESCE(m.price_input, 0)
 		           + u.cached_tokens * (CASE WHEN COALESCE(m.price_cache_hit, 0) > 0 THEN m.price_cache_hit ELSE COALESCE(m.price_input, 0) END)
@@ -88,7 +99,7 @@ func (s *Store) GetUsageStats(ctx context.Context, from, to int64) (*UsageStats,
 		   FROM usage_records u
 		   LEFT JOIN upstream_models m ON m.provider_id = u.provider_id AND m.model_id = u.upstream_model`+where,
 		args...).
-		Scan(&stats.TotalRequests, &stats.TotalTokens, &stats.InputTokens, &stats.OutputTokens, &stats.CachedTokens, &stats.ErrorCount, &stats.Cost)
+		Scan(&stats.TotalRequests, &stats.TotalTokens, &stats.InputTokens, &stats.OutputTokens, &stats.CachedTokens, &stats.ErrorCount, &stats.CacheHitRate, &stats.Cost)
 	if err != nil {
 		return nil, err
 	}
@@ -113,34 +124,6 @@ func timeRangeClause(from, to int64, prefix string) (string, []any) {
 		return "", nil
 	}
 	return " WHERE " + strings.Join(conds, " AND "), args
-}
-
-// CacheHitRate 返回缓存命中率（0~1），口径为「缓存读取输入 token / 总输入 token」。
-// from/to 为毫秒时间戳，0 表示不设该边界（from=0 即统计全部历史）。
-//
-// 分母用 input_tokens 而非 total_tokens：缓存命中衡量的是「输入侧有多少走了缓存」，
-// 输出 token 与缓存无关，计入分母只会稀释指标。
-//
-// 两个上游协议的语义已由 rosetta SDK 统一（这正是该比值恒 ≤ 1 的前提）：
-//   - openai-chat：prompt_tokens_details.cached_tokens ⊆ prompt_tokens
-//   - anthropic：SDK 把 cache_read 与 cache_creation 一并折进 input_tokens
-//     （见 provider_anthropic.go 的 anthroUsage.toUsage），因此同样 ⊆
-//
-// 全部记录参与统计（与同组其它指标口径一致）：失败记录通常没有 usage、
-// input_tokens 为 0，对分子分母都没有贡献；截断记录（truncated）的输入是真实
-// 发生过的，应当计入。无输入样本（input_tokens == 0）时返回 0，由调用方决定
-// 展示为「—」还是 0%。
-func (s *Store) CacheHitRate(ctx context.Context, from, to int64) (float64, error) {
-	var v float64
-	where, args := timeRangeClause(from, to, "")
-	err := s.db.QueryRowContext(ctx,
-		`SELECT COALESCE(SUM(cached_tokens) * 1.0 / NULLIF(SUM(input_tokens), 0), 0)
-		   FROM usage_records`+where, args...).
-		Scan(&v)
-	if err != nil {
-		return 0, err
-	}
-	return v, nil
 }
 
 // GetRecentThroughput 返回最近若干次成功调用的平均输出速度（token/s）。
@@ -191,10 +174,20 @@ type ModelStat struct {
 	SuccessSample int     // 成功率样本量（≤100）；>0 说明该模型被调用过
 }
 
+// throughputWindow 界定「近期表现」类统计（模型速度/成功率/TTFB）的回看窗口。
+const throughputWindow = 30 * 24 * time.Hour
+
 // ListModelThroughput 返回某上游下每个 model_id 的近期速度（近 5 次）与成功率（近 100 次）。
 // 用窗口函数按模型分区取最近 N 条：速度只统计成功且有输出/耗时的记录，
 // 成功率 = 最近 100 次里 status='ok' 的占比。未调用过的模型不出现在结果里。
+//
+// 统计范围限定近 throughputWindow：窗口函数要对该 provider 的全部历史排序，
+// 调用量大的 provider 积累几十万行后，挂在本查询上的
+// GET /providers/{id}/models 每次打开模型页都会全表扫一遍 —— 而它持着唯一的
+// DB 连接（SetMaxOpenConns(1)），会直接阻塞配额预检与用量写入。
+// 「近期表现」本来就只关心最近的数据，超窗的老记录没有统计价值。
 func (s *Store) ListModelThroughput(ctx context.Context, providerID string) (map[string]ModelStat, error) {
+	cutoff := time.Now().Add(-throughputWindow).UnixMilli()
 	rows, err := s.db.QueryContext(ctx,
 		`WITH base AS (
 		   SELECT upstream_model, ts, output_tokens, latency_ms, ttfb_ms,
@@ -202,7 +195,7 @@ func (s *Store) ListModelThroughput(ctx context.Context, providerID string) (map
 		          CASE WHEN status = 'ok' AND output_tokens > 0 AND latency_ms > 0 THEN 1 ELSE 0 END AS is_meas,
 		          CASE WHEN status = 'ok' AND ttfb_ms > 0 THEN 1 ELSE 0 END AS is_ttfb
 		     FROM usage_records
-		    WHERE provider_id = ? AND status <> 'canceled'
+		    WHERE provider_id = ? AND status <> 'canceled' AND ts >= ?
 		 ),
 		 ranked AS (
 		   SELECT upstream_model, output_tokens, latency_ms, ttfb_ms, is_ok, is_meas, is_ttfb,
@@ -219,7 +212,7 @@ func (s *Store) ListModelThroughput(ctx context.Context, providerID string) (map
 		        SUM(CASE WHEN rn_all <= 100 THEN 1 ELSE 0 END) AS sample_n,
 		        COALESCE(AVG(CASE WHEN is_ttfb = 1 AND rn_ttfb <= 5 THEN ttfb_ms END), 0) AS ttfb_ms
 		   FROM ranked
-		  GROUP BY upstream_model`, providerID)
+		  GROUP BY upstream_model`, providerID, cutoff)
 	if err != nil {
 		return nil, err
 	}

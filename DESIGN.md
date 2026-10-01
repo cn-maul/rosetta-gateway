@@ -262,6 +262,8 @@ CREATE INDEX idx_usage_prov_ts   ON usage_records(provider_id, ts);
 
 **不做的事**：`usage_records` 不做分区与归档策略（单机局域网量级，一年也到不了千万行）；`used_tokens` 不做对账重算（如果真要，可以用 `SUM(usage_records)` 定期校正——记入 P2 可选）。
 
+**查询侧的防线**（保留策略不做，但重查询必须加界）：「近期表现」类统计（模型速度/成功率/TTFB，`ListModelThroughput`）固定只回看近 30 天（`throughputWindow`）——窗口函数要对全历史排序，调用量大的 provider 积累几十万行后，挂它的 `GET /providers/{id}/models` 会变成重查询并阻塞唯一的 DB 连接。总览页「全部」档的全区间聚合保留（只在打开总览页时触发），缓存命中率与总统计合并在同一条 SELECT 里完成。
+
 ---
 
 ## 5. 路由解析（D2）
@@ -426,6 +428,8 @@ POST   /admin/api/reload                        从 DB 重建内存快照
 
 所有写操作的事务边界：**先写 DB，提交成功后再重建快照**。DB 写失败则快照不动。
 
+**重建由服务端自动执行**（2026-10-01 起）：管理写请求成功（2xx）后，`server.AutoReload` 中间件就地调用 `runtimeReloader.Reload`（池重建 + 快照重建，`sync.Mutex` 串行化，两边都构建成功才原子替换，任一步失败运行时保持旧状态）。此前生效路径完全依赖前端写完自觉调 `POST /admin/api/reload`——任何绕过前端的调用方（curl/脚本）写完不调 reload 就是静默分叉，最敏感的是**禁用下游 Key 后 auth 读旧快照照常放行**。前端 `mutate()` 里的 reload 调用保留为兜底。
+
 #### PATCH 语义：字段级部分更新
 
 PATCH 端点一律「只看请求体里出现了哪些字段」：
@@ -506,6 +510,7 @@ PATCH 结构体里刻意不含该字段，传了也会被忽略。
 | usage 合成 | OpenAI 下游要 usage 需客户端传 `stream_options.include_usage`；网关在 `EventMessageEnd` 处合成仅含 usage 的 chunk，且仅当客户端要求时下发 |
 | 断流处理 | 见 §8.2 |
 | 缓冲 | 逐事件 Flush，不做批量聚合（延迟优先） |
+| 全局 WriteTimeout | **必须为 0**：net/http 的写超时从「开始写响应」起算、覆盖整个响应时长，定时值一到会把仍在正常吐字的长流硬切（大输出的慢推理模型恰好会撞上），下游只看到来历不明的 truncated。流的生命周期由 TTFT/空闲看门狗约束，非流式由 `upstream_timeout` 限定 handler 时长；全局写超时在这里只会误伤，不多保护任何东西（2026-10-01 修正，此前 5 分钟） |
 
 ### 8.2 断流语义
 
@@ -644,7 +649,7 @@ Client 是 goroutine 安全的，进程内单例复用（内含连接池）。
 
 **主目标列与链的一致性**：`routes.provider_id / upstream_model_id` 是链首（position 0）的兼容视图，但运行时解析以 `route_targets` 为准（一旦有目标行就不再回看主目标列）。因此 `PATCH /admin/api/routes/{id}` 改这两列时，`SyncHeadTarget` 会把改动落到链首，避免「DB 列变了、响应回显新值、实际流量仍打旧目标」的静默分叉；链为空则补一条 position 0。整体换链走 `PUT .../targets`，其内部再用链首反向同步主目标列。
 
-**健康态与池重建**：`upstream.Pool` 的目标熔断表与凭据冷却在每次重建池（`BuildFromStore` / `BuildFromConfig`，即每个管理写操作触发的 reload）时一并清零——两层语义一致，配置变更本就是重新探测的正当理由（代价：管理员改配置会重置 ≤60s 的冷却/熔断）。这也堵住「每次保存链重生成 `target_id` → 旧熔断条目在表里单调堆积」的泄漏。
+**健康态与池重建**：`upstream.Pool` 的目标熔断表与凭据冷却在每次重建池（`BuildFromStore` / `BuildFromConfig`，即每个管理写操作触发的 reload）时一并清零——两层语义一致，配置变更本就是重新探测的正当理由（代价：管理员改配置会重置 ≤60s 的冷却/熔断）。这也堵住「每次保存链重生成 `target_id` → 旧熔断条目在表里单调堆积」的泄漏。重建是**先完整构建、后原子替换**（`PrepareFromStore` 构建局部表 → `Install` 锁内换入）：构建失败时旧池/旧快照原样保留，绝不出现「清空后查库失败」留下的空池——那会让全站 /v1 选不到上游，直到下一次成功的 reload。
 
 **健康态是纯运行时的，不落库、重启即清零**：冷却与熔断只活在 `upstream.Pool` 的内存里。`provider_credentials.cooldown_until / status` 与 `routes` 上的旧策略列**不是**事实来源（后者的策略列已整体删除，见 `store.dropDeadColumns`）。理由：这些状态生命周期极短（熔断 60s、冷却 ≤30min），冷启动一律「全健康」再由真实失败快速收敛，比持久化更简单也更快收敛；反之一旦落库，就要处理「重启后读到一批早已过期的冷却」这种伪状态。运维影响：**重启网关会清空全部健康态**（表现为故障目标立刻又被试一次），这是预期行为，不是故障。
 
@@ -658,7 +663,7 @@ Client 是 goroutine 安全的，进程内单例复用（内含连接池）。
 | `stream_idle_timeout_ms` | 流式空闲看门狗 | `defaults.stream_idle_timeout_ms` |
 | `upstream_timeout_ms` | 非流式整体超时 | `defaults.upstream_timeout_ms` |
 
-保存设置后前端触发一次 `POST /admin/api/reload` 重建快照，**无需重启即生效**。
+保存设置后由服务端自动重建快照（`server.AutoReload`，见 §6.3），**无需重启即生效**，也不依赖前端调 reload。
 
 > 历史沿革：这些参数曾按 route 存在（`routes.max_targets / failure_threshold /
 > stream_first_token_timeout_ms / nonstream_timeout_ms`），界面上每条路由各配一遍。
