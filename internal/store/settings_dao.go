@@ -34,11 +34,44 @@ func (s *Store) getSetting(ctx context.Context, key string) (string, bool, error
 }
 
 func (s *Store) setSetting(ctx context.Context, key, value string) error {
-	_, err := s.db.ExecContext(ctx,
+	return setSettingExec(ctx, s.db, key, value)
+}
+
+func setSettingExec(ctx context.Context, ex execer, key, value string) error {
+	_, err := ex.ExecContext(ctx,
 		`INSERT INTO app_settings (key, value, updated_at) VALUES (?, ?, ?)
 		 ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at`,
 		key, value, time.Now().UnixMilli())
 	return err
+}
+
+// SaveSettings 在一个事务里同时写入模型容量默认与运行时默认。
+//
+// 设置页的「保存」是一个动作的两半；分两条自动提交语句写（旧实现）会在第二条
+// 失败时留下「容量已改、超时未改」的半套配置，界面回 500 但库里已部分生效，
+// 用户重试前系统状态与界面显示不一致。
+func (s *Store) SaveSettings(ctx context.Context, d ModelDefaults, rt RuntimeDefaults) error {
+	db, err := json.Marshal(d)
+	if err != nil {
+		return err
+	}
+	rb, err := json.Marshal(rt)
+	if err != nil {
+		return err
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	if err := setSettingExec(ctx, tx, settingModelDefaultsKey, string(db)); err != nil {
+		return err
+	}
+	if err := setSettingExec(ctx, tx, settingRuntimeDefaultsKey, string(rb)); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 // GetModelDefaults 返回默认模型容量；未配置时给出常量兜底（不回写）。

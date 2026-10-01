@@ -270,11 +270,11 @@ async function loadPrices() {
   pricesLoading.value = true
   try {
     providers.value = await api.providers()
-    await Promise.all(
-      providers.value.map(async (p) => {
-        modelsMap[p.id] = await api.models(p.id)
-      }),
-    )
+    // 一次取回全部模型再本地按 provider_id 分组，替代逐 provider 取模型的 1+N 请求
+    const all = await api.allModels()
+    const grouped: Record<string, UpstreamModel[]> = {}
+    for (const m of all) (grouped[m.provider_id] ??= []).push(m)
+    for (const p of providers.value) modelsMap[p.id] = grouped[p.id] ?? []
     pricesLoaded.value = true
   } catch (e) {
     if ((e as { status?: number }).status !== 401)

@@ -22,24 +22,29 @@ const pageSizes = [20, 50, 100]
 
 const totalPages = computed(() => Math.max(1, Math.ceil(total.value / pageSize.value)))
 
+// 请求序号守卫：快速翻页 / 切时间范围会并发多个 fetch，晚到的旧响应若直接
+// 写回 rows/page/total，会把新结果覆盖成过期数据（表内容与页码自相矛盾）。
+// 每次请求 ++reqSeq，await 全部结束后只有「仍是最新序号」的请求才提交状态。
+let reqSeq = 0
+
 // fetchPage 取第 p 页（1 基）。
 //
 // 越界保护：数据变少（或切到更窄的时间范围）时当前页可能已不存在，
 // 此时退到最后一页重取，而不是让用户停在一张空白表上 —— 空白表看起来
 // 和「这个范围内没有记录」一模一样，会误导人。
 async function fetchPage(p: number) {
-  const res = await api.usageHistory(days.value, pageSize.value, (p - 1) * pageSize.value)
-  total.value = res.total
+  const seq = ++reqSeq
+  let res = await api.usageHistory(days.value, pageSize.value, (p - 1) * pageSize.value)
+  let target = p
   const last = Math.max(1, Math.ceil(res.total / pageSize.value))
   if (p > last) {
-    const again = await api.usageHistory(days.value, pageSize.value, (last - 1) * pageSize.value)
-    rows.value = again.records
-    total.value = again.total
-    page.value = last
-    return
+    res = await api.usageHistory(days.value, pageSize.value, (last - 1) * pageSize.value)
+    target = last
   }
-  page.value = p
+  if (seq !== reqSeq) return // 期间又发起了新请求，本响应的数据已过时，丢弃
+  page.value = target
   rows.value = res.records
+  total.value = res.total
 }
 
 async function load() {

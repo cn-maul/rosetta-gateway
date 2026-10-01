@@ -35,10 +35,10 @@ async function load() {
     const [r, p] = await Promise.all([api.routes(), api.providers()])
     routes.value = r
     providers.value = p
-    // 模型端点按 provider 分片：并行拉取所有 provider 的模型建索引
-    const all = await Promise.all(p.map((x) => api.models(x.id).catch(() => [])))
+    // 一次取回全部上游模型建索引（此前对每个 provider 各发一次请求 = 1+N）
+    const all = await api.allModels()
     const map: Record<string, UpstreamModel> = {}
-    for (const list of all) for (const m of list) map[m.id] = m
+    for (const m of all) map[m.id] = m
     mmap.value = map
   } catch (e) {
     if ((e as { status?: number }).status !== 401) toast('加载失败：' + (e as Error).message, 'err')

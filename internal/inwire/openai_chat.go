@@ -24,6 +24,10 @@ type OpenAIChatRequest struct {
 	PresencePenalty     *float64            `json:"presence_penalty,omitempty"`
 	FrequencyPenalty    *float64            `json:"frequency_penalty,omitempty"`
 	N                  *int                `json:"n,omitempty"`
+	ResponseFormat     json.RawMessage     `json:"response_format,omitempty"`
+	Seed               *int                `json:"seed,omitempty"`
+	User               string              `json:"user,omitempty"`
+	ParallelToolCalls  *bool               `json:"parallel_tool_calls,omitempty"`
 
 	// Extra is the raw passthrough slot mirroring rosetta.ChatRequest.Extra.
 	// The json:"-" tag stops the decoder from ever writing it and nothing
@@ -170,6 +174,21 @@ func (r *OpenAIChatRequest) ApplyProtocolPrivateExtra(req *rosetta.ChatRequest, 
 	}
 	if r.FrequencyPenalty != nil {
 		extra["frequency_penalty"] = *r.FrequencyPenalty
+	}
+	// response_format 保留客户端原始 JSON（{"type":"json_object"} 或含 json_schema
+	// 的对象）：这里用 json.RawMessage 直传、不做结构往返，schema 里我们没建模的
+	// 字段（strict、schema 名等）才不会被解码环节吃掉。显式 null 也照原样透传。
+	if len(r.ResponseFormat) > 0 {
+		extra["response_format"] = r.ResponseFormat
+	}
+	if r.Seed != nil {
+		extra["seed"] = *r.Seed
+	}
+	if r.User != "" {
+		extra["user"] = r.User
+	}
+	if r.ParallelToolCalls != nil {
+		extra["parallel_tool_calls"] = *r.ParallelToolCalls
 	}
 	if len(extra) == 0 {
 		return

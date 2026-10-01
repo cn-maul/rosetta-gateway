@@ -46,11 +46,24 @@ async function request<T>(method: string, path: string, body?: unknown): Promise
   if (auth.token) headers['Authorization'] = 'Bearer ' + auth.token
   if (body !== undefined) headers['Content-Type'] = 'application/json'
 
-  const res = await fetch('/admin/api' + path, {
-    method,
-    headers,
-    body: body === undefined ? undefined : JSON.stringify(body),
-  })
+  // 超时：网关若挂起（连接不响应），没有 signal 的 fetch 会一直 pending，
+  // 页面永远停在「加载中」。AbortSignal.timeout 到点主动中断，让 finally 收场。
+  // 30s 对管理端足够：这些接口不代理 /v1 长对话，最慢的 test/discover 也只是一次上游 /models。
+  let res: Response
+  try {
+    res = await fetch('/admin/api' + path, {
+      method,
+      headers,
+      body: body === undefined ? undefined : JSON.stringify(body),
+      signal: AbortSignal.timeout(30_000),
+    })
+  } catch (e) {
+    const name = e instanceof DOMException ? e.name : ''
+    if (name === 'TimeoutError' || name === 'AbortError') {
+      throw new ApiFail(0, '请求超时，请稍后重试')
+    }
+    throw new ApiFail(0, '网络错误：' + (e instanceof Error ? e.message : String(e)))
+  }
 
   if (res.status === 401) {
     authState.needToken = true
@@ -139,6 +152,9 @@ export const api = {
 
   // upstream models（挂在 provider 下；discover 实时拉取上游 /models 列表）
   models: (providerId: string) => get<UpstreamModel[]>(`/providers/${providerId}/models`),
+  // 全部上游模型的扁平列表（跨 provider）。Routes/Settings 用它一次取全，
+  // 避免「先取 providers 再逐 provider 取 models」的 1+N 请求。不含吞吐统计。
+  allModels: () => get<UpstreamModel[]>('/upstream-models'),
   createModel: (providerId: string, b: Partial<UpstreamModel>) =>
     mutate(() => post<UpstreamModel>(`/providers/${providerId}/models`, b)),
   updateModel: (id: string, b: Partial<UpstreamModel>) => mutate(() => patch<UpstreamModel>(`/models/${id}`, b)),

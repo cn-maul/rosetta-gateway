@@ -122,7 +122,13 @@ const maxTokens = computed(() => Math.max(1, ...daySeries.value.map((d) => d.tok
 const topModelMax = computed(() => Math.max(1, ...byModel.value.map((e) => e.tokens)))
 const topKeyMax = computed(() => Math.max(1, ...byKey.value.map((e) => e.tokens)))
 
+// 请求序号守卫：快速切换时间范围会并发多个 load()，晚到的旧响应若写回状态，
+// 会把新范围的数据覆盖成旧范围的（下拉显示「近 1 天」、表里却是「近 1 年」）。
+// 只有「仍是最新序号」的请求才提交状态与收场 loading。
+let reqSeq = 0
+
 async function load() {
+  const seq = ++reqSeq
   loading.value = true
   try {
     const { from, to } = rangeBounds(range.value)
@@ -132,14 +138,16 @@ async function load() {
       api.usageByModel(from, to),
       api.usageByKey(from, to),
     ])
+    if (seq !== reqSeq) return // 期间切换了新范围，本响应已过时
     stats.value = s
     byDay.value = d
     byModel.value = m
     byKey.value = k
   } catch (e) {
+    if (seq !== reqSeq) return
     if ((e as { status?: number }).status !== 401) toast('加载总览失败：' + (e as Error).message, 'err')
   } finally {
-    loading.value = false
+    if (seq === reqSeq) loading.value = false
   }
 }
 

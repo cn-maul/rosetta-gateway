@@ -1,0 +1,56 @@
+name: ci
+
+# 校验「前端产物已同步入库」。
+#
+# Docker 镜像只是 `COPY . .` + `go build`，用 go:embed 打包仓库里的
+# internal/webui/dist —— 它**从不**重新构建前端。于是改完 web/src 却忘了
+# `npm run build && node sync-embed.mjs` 就打 tag，旧 UI 会被静默发出去，
+# 而整条流水线没有任何一步会发现（docker.yml 只在 tag 时跑，且也不碰前端）。
+#
+# 这里在 push/PR 时重新构建一遍，若与入库产物不一致即失败 —— 把「忘 sync」
+# 从一次线上事故变成一次红灯。
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  webui-sync:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: web
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      - name: 安装依赖
+        run: npm ci
+
+      - name: 构建前端并同步到 go:embed 目录
+        run: |
+          set -euo pipefail
+          npm run build
+          node sync-embed.mjs
+
+      - name: 校验入库产物与构建结果一致
+        working-directory: .
+        run: |
+          set -euo pipefail
+          if ! git diff --exit-code -- internal/webui/dist; then
+            echo "::error::internal/webui/dist 与 web/src 的最新构建不一致。"
+            echo "请在本地执行：cd web && npm run build && node sync-embed.mjs，再把同步后的产物一并提交。"
+            exit 1
+          fi
+          echo "入库的前端产物与源码一致。"

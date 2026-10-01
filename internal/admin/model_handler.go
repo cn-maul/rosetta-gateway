@@ -84,6 +84,25 @@ func (h *ModelHandler) List(w http.ResponseWriter, r *http.Request, providerID s
 	writeJSON(w, http.StatusOK, result)
 }
 
+// ListAll 扁平返回全部上游模型（跨所有 provider），供前端一次取全、本地按
+// provider_id 分组。此前 Routes/Settings 页先取 providers、再对每个 provider
+// 各发一次 models 请求（1+N）；模型总量不大，一次取回即可。
+//
+// 刻意不带 per-provider 的吞吐/成功率：那是窗口函数重查询（见 ListModelThroughput），
+// 且这两个页面只用到 id/provider_id/model_id/display_name/价格，用不到统计。
+func (h *ModelHandler) ListAll(w http.ResponseWriter, r *http.Request) {
+	models, err := h.store.ListAllUpstreamModels(r.Context())
+	if err != nil {
+		writeServerError(w, "list all upstream models", err)
+		return
+	}
+	result := make([]modelResponse, 0, len(models))
+	for _, m := range models {
+		result = append(result, toModelResponse(m))
+	}
+	writeJSON(w, http.StatusOK, result)
+}
+
 func (h *ModelHandler) Create(w http.ResponseWriter, r *http.Request, providerID string) {
 	if !requireProvider(w, r, h.store, providerID) {
 		return
@@ -314,7 +333,7 @@ func (h *ModelHandler) ImportModels(w http.ResponseWriter, r *http.Request, prov
 		return
 	}
 
-	imported := 0
+	models := make([]*store.UpstreamModel, 0, len(body.Models))
 	for _, it := range body.Models {
 		if strings.TrimSpace(it.ModelID) == "" {
 			continue
@@ -327,7 +346,7 @@ func (h *ModelHandler) ImportModels(w http.ResponseWriter, r *http.Request, prov
 		if maxOut <= 0 {
 			maxOut = def.MaxOutputTokens
 		}
-		m := &store.UpstreamModel{
+		models = append(models, &store.UpstreamModel{
 			ID:              generateID(),
 			ProviderID:      providerID,
 			ModelID:         strings.TrimSpace(it.ModelID),
@@ -335,15 +354,15 @@ func (h *ModelHandler) ImportModels(w http.ResponseWriter, r *http.Request, prov
 			Enabled:         true,
 			ContextWindow:   ctxWindow,
 			MaxOutputTokens: maxOut,
-		}
-		if err := h.store.UpsertUpstreamModel(r.Context(), m); err != nil {
-			writeServerError(w, "import upstream model", err)
-			return
-		}
-		imported++
+		})
 	}
 
-	writeJSON(w, http.StatusOK, map[string]any{"status": "ok", "imported": imported})
+	if err := h.store.ImportUpstreamModels(r.Context(), models); err != nil {
+		writeServerError(w, "import upstream models", err)
+		return
+	}
+
+	writeJSON(w, http.StatusOK, map[string]any{"status": "ok", "imported": len(models)})
 }
 
 func toModelResponse(m store.UpstreamModel) modelResponse {

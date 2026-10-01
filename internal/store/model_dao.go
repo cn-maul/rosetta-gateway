@@ -168,11 +168,15 @@ func (s *Store) DeleteUpstreamModel(ctx context.Context, id string) error {
 // 「探测 / 批量导入模型列表」—— 上游返回的模型列表永远不带价格，
 // 若把价格也写进 DO UPDATE SET，一次重新导入就会把配好的单价悄悄清零。
 func (s *Store) UpsertUpstreamModel(ctx context.Context, m *UpstreamModel) error {
+	return upsertUpstreamModel(ctx, s.db, m)
+}
+
+func upsertUpstreamModel(ctx context.Context, ex execer, m *UpstreamModel) error {
 	enabled := 0
 	if m.Enabled {
 		enabled = 1
 	}
-	_, err := s.db.ExecContext(ctx,
+	_, err := ex.ExecContext(ctx,
 		`INSERT INTO upstream_models (id, provider_id, model_id, display_name, enabled, context_window, max_output_tokens, supports_thinking, price_input, price_cache_hit, price_output)
 		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		 ON CONFLICT(provider_id, model_id) DO UPDATE SET display_name = excluded.display_name, enabled = excluded.enabled, context_window = excluded.context_window, max_output_tokens = excluded.max_output_tokens, supports_thinking = excluded.supports_thinking`,
@@ -180,4 +184,27 @@ func (s *Store) UpsertUpstreamModel(ctx context.Context, m *UpstreamModel) error
 		nullIfZeroInt(m.ContextWindow), nullIfZeroInt(m.MaxOutputTokens), m.SupportsThinking,
 		nullIfZeroFloat(m.PriceInput), nullIfZeroFloat(m.PriceCacheHit), nullIfZeroFloat(m.PriceOutput))
 	return err
+}
+
+// ImportUpstreamModels 在单个事务里批量 upsert 一组模型。
+//
+// 逐条自动提交（旧实现）会在第 N 条失败时把前 N-1 条永久落下：批量导入是「要么
+// 全进、要么全不进」的语义，部分导入让运维以为清单已同步、实则残缺，且重试前
+// 库里已经多了半套模型。空切片直接返回 nil，不空开一个事务。
+func (s *Store) ImportUpstreamModels(ctx context.Context, models []*UpstreamModel) error {
+	if len(models) == 0 {
+		return nil
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	for _, m := range models {
+		if err := upsertUpstreamModel(ctx, tx, m); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
 }

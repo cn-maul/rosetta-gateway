@@ -111,11 +111,6 @@ func (h *SettingsHandler) Update(w http.ResponseWriter, r *http.Request) {
 		ContextWindow:   req.DefaultContextWindow,
 		MaxOutputTokens: req.DefaultMaxOutputTokens,
 	}
-	if err := h.store.SetModelDefaults(r.Context(), d); err != nil {
-		writeServerError(w, "set model defaults", err)
-		return
-	}
-
 	rt := store.RuntimeDefaults{
 		UpstreamTimeoutMs:         req.UpstreamTimeoutMs,
 		StreamIdleTimeoutMs:       req.StreamIdleTimeoutMs,
@@ -123,8 +118,8 @@ func (h *SettingsHandler) Update(w http.ResponseWriter, r *http.Request) {
 		FailoverMaxTargets:        req.FailoverMaxTargets,
 		FailoverFailureThreshold:  req.FailoverFailureThreshold,
 	}
-	if err := h.store.SetRuntimeDefaults(r.Context(), rt); err != nil {
-		writeServerError(w, "set runtime defaults", err)
+	if err := h.store.SaveSettings(r.Context(), d, rt); err != nil {
+		writeServerError(w, "save settings", err)
 		return
 	}
 

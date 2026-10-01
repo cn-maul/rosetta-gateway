@@ -223,6 +223,7 @@ func main() {
 	adminMux.HandleFunc("POST /admin/api/providers/{id}/models/import", func(w http.ResponseWriter, r *http.Request) { modelHandler.ImportModels(w, r, r.PathValue("id")) })
 	adminMux.HandleFunc("PATCH /admin/api/models/{id}", func(w http.ResponseWriter, r *http.Request) { modelHandler.Update(w, r, r.PathValue("id")) })
 	adminMux.HandleFunc("DELETE /admin/api/models/{id}", func(w http.ResponseWriter, r *http.Request) { modelHandler.Delete(w, r, r.PathValue("id")) })
+	adminMux.HandleFunc("GET /admin/api/upstream-models", modelHandler.ListAll)
 
 	adminMux.HandleFunc("GET /admin/api/routes", routeHandler.List)
 	adminMux.HandleFunc("POST /admin/api/routes", routeHandler.Create)
