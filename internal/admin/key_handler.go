@@ -145,7 +145,7 @@ func (h *KeyHandler) Update(w http.ResponseWriter, r *http.Request, id string) {
 	}
 
 	if err := h.store.UpdateAccessKey(r.Context(), id, existing); err != nil {
-		writeServerError(w, "update key", err)
+		writeNotFoundOrError(w, "update key", "密钥不存在（可能已被并发删除）", err)
 		return
 	}
 

@@ -212,18 +212,6 @@ func (s *Store) Set(password string) error {
 	return nil
 }
 
-// Clear 删除用户密码，退回使用 config 的 admin_token（应急恢复通道）。
-func (s *Store) Clear() error {
-	if err := os.Remove(s.path); err != nil && !errors.Is(err, os.ErrNotExist) {
-		return fmt.Errorf("删除凭据文件: %w", err)
-	}
-	s.mu.Lock()
-	s.cred = nil
-	s.locked = nil
-	s.mu.Unlock()
-	return nil
-}
-
 // persist 原子写入凭据文件：先写临时文件再重命名，
 // 避免写入中途断电/崩溃留下半截 JSON（下次启动直接拒绝服务）。
 func (s *Store) persist(c *Credential) error {

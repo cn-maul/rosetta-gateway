@@ -120,10 +120,10 @@ func updateRoute(ctx context.Context, ex execer, id string, r *Route) error {
 	if r.FailoverEnabled {
 		failover = 1
 	}
-	_, err := ex.ExecContext(ctx,
+	res, err := ex.ExecContext(ctx,
 		`UPDATE routes SET public_name = ?, provider_id = ?, upstream_model_id = ?, enabled = ?, failover_enabled = ? WHERE id = ?`,
 		r.PublicName, r.ProviderID, r.UpstreamModelID, enabled, failover, id)
-	return err
+	return checkAffected(res, err)
 }
 
 // DeleteRoute 删除一条 route；id 不存在时返回 ErrNotFound。

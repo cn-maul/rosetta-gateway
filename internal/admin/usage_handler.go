@@ -92,20 +92,29 @@ func groupRangeClause(from, to int64, explicit bool, prefix string) (string, []a
 // 只构造一次、两处复用。分开拼两份迟早会漂移 —— 旧实现的 group_by 分支就直接
 // `args = []any{from, to}` 把 key_id / model / provider_id 三个过滤条件整体丢了，
 // 于是「按密钥筛选 + 按天分组」会静默返回全量数据。
-func usageFilter(from, to int64, q url.Values) (where string, args []any) {
-	where = ` WHERE ts >= ? AND ts <= ?`
-	args = []any{from, to}
+//
+// explicit && from==0 → 「全部历史」（不设下界），与 by-* 端点同口径。此前 /usage
+// 明细把 from=0 当「最近 window」，而 by-* 把 from=0 当「全部」——同名参数语义相反，
+// curl/API 调用方极易踩坑，这里统一。
+func usageFilter(from, to int64, explicit bool, q url.Values) (where string, args []any) {
+	var conds []string
+	if !(explicit && from == 0) {
+		conds = append(conds, `ts >= ?`)
+		args = append(args, from)
+	}
+	conds = append(conds, `ts <= ?`)
+	args = append(args, to)
 	for _, f := range []struct{ param, col string }{
 		{"key_id", "access_key_id"},
 		{"model", "public_model"},
 		{"provider_id", "provider_id"},
 	} {
 		if v := q.Get(f.param); v != "" {
-			where += ` AND ` + f.col + ` = ?`
+			conds = append(conds, f.col+` = ?`)
 			args = append(args, v)
 		}
 	}
-	return where, args
+	return " WHERE " + strings.Join(conds, " AND "), args
 }
 
 // usageRecordColumns 是 usageRecordEntry 对应的列顺序，明细查询与分组查询共用。
@@ -168,10 +177,10 @@ type usageSummary struct {
 
 func (h *UsageHandler) Query(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query()
-	from, to := queryRange(q, 24*time.Hour)
+	from, to, explicit := queryRangeExplicit(q, 24*time.Hour)
 	limit := clampLimit(q.Get("limit"), defaultUsageLimit, maxUsageLimit)
 
-	where, args := usageFilter(from, to, q)
+	where, args := usageFilter(from, to, explicit, q)
 
 	summary, err := h.summarize(where, args)
 	if err != nil {

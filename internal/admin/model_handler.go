@@ -237,7 +237,7 @@ func (h *ModelHandler) Update(w http.ResponseWriter, r *http.Request, id string)
 			writeError(w, http.StatusConflict, "该上游下已存在同名模型")
 			return
 		}
-		writeServerError(w, "update upstream model", err)
+		writeNotFoundOrError(w, "update upstream model", "上游模型不存在（可能已被并发删除）", err)
 		return
 	}
 

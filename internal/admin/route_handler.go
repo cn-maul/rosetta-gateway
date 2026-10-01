@@ -70,6 +70,10 @@ func (h *RouteHandler) List(w http.ResponseWriter, r *http.Request) {
 // "UNIQUE constraint failed: routes.public_name" —— 一个 4xx 级别的问题
 // 披着 500 的皮，前端只能提示「保存失败」，用户重试必然还是同一个 500。
 func writeRouteWriteError(w http.ResponseWriter, action string, err error) {
+	if errors.Is(err, store.ErrNotFound) {
+		writeError(w, http.StatusNotFound, "路由不存在（可能已被并发删除）")
+		return
+	}
 	if store.IsUniqueViolation(err) {
 		writeError(w, http.StatusConflict, "该公开模型名已被另一条路由占用，请换一个")
 		return

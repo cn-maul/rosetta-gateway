@@ -46,12 +46,22 @@ function Die([string]$msg) { Write-Host "[X] $msg" -ForegroundColor Red; exit 1 
 # 这里只为端口探测 / 停止旧进程读取该配置，缺失时按默认 8080 处理即可。
 $ConfigPath = Join-Path (Split-Path $Bin) 'config.json'
 
-# 从 listen 字段提取端口（"127.0.0.1:8080" -> 8080），解析失败按默认 8080
+# 从 listen 字段提取端口。取最后一个冒号之后的部分——IPv6 地址自带多个冒号
+# （如 "[::1]:8080"、"[fe80::1]:8080"），按最后一个冒号切才拿到端口而非半截地址。
+# 解析失败/越界按默认 8080 处理。
 $Port = 8080
 if (Test-Path $ConfigPath) {
   try {
     $cfg = Get-Content $ConfigPath -Raw -Encoding UTF8 | ConvertFrom-Json
-    if ($cfg.listen) { $Port = [int]($cfg.listen -replace '^.*:', '') }
+    if ($cfg.listen) {
+      $listen = ([string]$cfg.listen).Trim()
+      $idx = $listen.LastIndexOf(':')
+      $portStr = if ($idx -ge 0) { $listen.Substring($idx + 1) } else { $listen }
+      $parsed = 0
+      if ([int]::TryParse($portStr, [ref]$parsed) -and $parsed -gt 0 -and $parsed -le 65535) {
+        $Port = $parsed
+      }
+    }
   } catch { Write-Host "[i] 配置解析失败，端口按默认 $Port 处理" -ForegroundColor Yellow }
 }
 

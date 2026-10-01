@@ -149,12 +149,12 @@ func (s *Store) UpdateUpstreamModel(ctx context.Context, id string, m *UpstreamM
 	if m.Enabled {
 		enabled = 1
 	}
-	_, err := s.db.ExecContext(ctx,
+	res, err := s.db.ExecContext(ctx,
 		`UPDATE upstream_models SET model_id = ?, display_name = ?, enabled = ?, context_window = ?, max_output_tokens = ?, supports_thinking = ?, price_input = ?, price_cache_hit = ?, price_output = ? WHERE id = ?`,
 		m.ModelID, nullIfEmpty(m.DisplayName), enabled,
 		nullIfZeroInt(m.ContextWindow), nullIfZeroInt(m.MaxOutputTokens), m.SupportsThinking,
 		nullIfZeroFloat(m.PriceInput), nullIfZeroFloat(m.PriceCacheHit), nullIfZeroFloat(m.PriceOutput), id)
-	return err
+	return checkAffected(res, err)
 }
 
 // DeleteUpstreamModel 删除一个上游模型；id 不存在时返回 ErrNotFound。

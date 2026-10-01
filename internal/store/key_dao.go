@@ -76,10 +76,10 @@ func (s *Store) UpdateAccessKey(ctx context.Context, id string, k *AccessKey) er
 	if k.Enabled {
 		enabled = 1
 	}
-	_, err := s.db.ExecContext(ctx,
+	res, err := s.db.ExecContext(ctx,
 		`UPDATE access_keys SET name = ?, enabled = ?, quota_tokens = ? WHERE id = ?`,
 		k.Name, enabled, k.QuotaTokens, id)
-	return err
+	return checkAffected(res, err)
 }
 
 // GetKeyQuota 读单个密钥的配额与已用量，供热路径预检。

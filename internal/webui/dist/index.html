@@ -5,8 +5,24 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <meta name="color-scheme" content="light" />
     <title>Rosetta Gateway · 管理后台</title>
-    <script type="module" crossorigin src="./assets/index-CbgR81z8.js"></script>
-    <link rel="stylesheet" crossorigin href="./assets/index-ghss5oa2.css">
+    <script>
+      // 暗色主题防闪：Vue 的 initTheme() 在 onMounted 才跑，首帧永远是浅色，
+      // 老暗色用户会看到「白一下」。这里在 <head> 同步、解析 CSS 之前先把
+      // data-theme 打上，让首帧即正确。逻辑与 App.vue 的 THEME_KEY/回退保持一致。
+      (function () {
+        try {
+          var saved = localStorage.getItem('rosetta_gw_theme');
+          var dark = saved === 'dark' || (!saved && matchMedia('(prefers-color-scheme: dark)').matches);
+          if (dark) {
+            document.documentElement.setAttribute('data-theme', 'dark');
+            var m = document.querySelector('meta[name=color-scheme]');
+            if (m) m.setAttribute('content', 'dark');
+          }
+        } catch (e) {}
+      })();
+    </script>
+    <script type="module" crossorigin src="./assets/index-CzDjRp3x.js"></script>
+    <link rel="stylesheet" crossorigin href="./assets/index-Bvj--AY6.css">
   </head>
   <body>
     <div id="app"></div>

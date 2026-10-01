@@ -90,15 +90,24 @@ if (-not (Get-Command go -ErrorAction SilentlyContinue)) {
 
 New-Item -ItemType Directory -Force -Path (Split-Path $Bin) | Out-Null
 
+# 版本号与 Dockerfile / 前端页脚同源：web\package.json 的 version。
+# 未注入时网关启动日志会是 "version dev"，本地构建也应带上真实版本。
+$pkgPath = Join-Path $WebDir 'package.json'
+$version = if (Test-Path $pkgPath) {
+  try { ((Get-Content $pkgPath -Raw -Encoding UTF8 | ConvertFrom-Json).version) } catch { $null }
+} else { $null }
+if (-not $version) { $version = 'dev' }
+$ldflags = "-s -w -X main.buildVersion=$version"
+
 if ($Vet) {
   Write-Host "-> 静态检查（go vet ./...）..."
   Invoke-Native { go vet ./... } "go vet 失败"
 }
 
-Write-Host "-> 编译中（go build ./cmd/gateway）..."
+Write-Host "-> 编译中（go build ./cmd/gateway，version=$version）..."
 Push-Location $Root
 try {
-  Invoke-Native { go build -trimpath -o $Bin './cmd/gateway' } "编译失败"
+  Invoke-Native { go build -trimpath -ldflags $ldflags -o $Bin './cmd/gateway' } "编译失败"
 } finally {
   Pop-Location
 }

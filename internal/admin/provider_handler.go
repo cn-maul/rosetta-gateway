@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"net/http"
 	"strings"
@@ -87,6 +88,10 @@ func validateProtocol(protocol string) error {
 
 // writeProviderWriteError 把 providers 写操作的失败映射成合适的状态码。
 func writeProviderWriteError(w http.ResponseWriter, action string, err error) {
+	if errors.Is(err, store.ErrNotFound) {
+		writeError(w, http.StatusNotFound, "上游不存在（可能已被并发删除）")
+		return
+	}
 	if store.IsUniqueViolation(err) {
 		writeError(w, http.StatusConflict, "该上游标识（slug）已存在，请换个名称后重试")
 		return
@@ -137,9 +142,14 @@ func (h *ProviderHandler) Create(w http.ResponseWriter, r *http.Request) {
 	}
 
 	now := time.Now().UnixMilli()
+	slug, err := h.uniqueSlug(r.Context(), slugify(name))
+	if err != nil {
+		writeServerError(w, "resolve unique slug", err)
+		return
+	}
 	p := &store.Provider{
 		ID:         generateID(),
-		Slug:       h.uniqueSlug(r.Context(), slugify(name)),
+		Slug:       slug,
 		Name:       name,
 		Protocol:   protocol,
 		Endpoint:   endpoint,
@@ -312,12 +322,19 @@ func (h *ProviderHandler) Test(w http.ResponseWriter, r *http.Request, id string
 	})
 }
 
-func (h *ProviderHandler) uniqueSlug(ctx context.Context, base string) string {
+// uniqueSlug 基于 base 生成一个未被占用的 slug：命中已有 slug 就追加 -2/-3…。
+// GetProviderBySlug 对「不存在」返回 (nil, nil)，对真实 DB 故障返回 (nil, err)。
+// 旧实现 `if err != nil || p == nil { return slug }` 把 err 当「可用」——查询挂了
+// 会返回一个可能其实已被占用的 slug，最终撞上 UNIQUE 约束报成 500，掩盖真实原因。
+func (h *ProviderHandler) uniqueSlug(ctx context.Context, base string) (string, error) {
 	slug := base
 	for i := 2; ; i++ {
 		p, err := h.store.GetProviderBySlug(ctx, slug)
-		if err != nil || p == nil {
-			return slug
+		if err != nil {
+			return "", err
+		}
+		if p == nil {
+			return slug, nil
 		}
 		slug = fmt.Sprintf("%s-%d", base, i)
 	}

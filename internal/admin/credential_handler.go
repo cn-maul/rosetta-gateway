@@ -155,7 +155,7 @@ func (h *CredentialHandler) Update(w http.ResponseWriter, r *http.Request, id st
 	}
 
 	if err := h.store.UpdateCredential(r.Context(), id, existing); err != nil {
-		writeServerError(w, "update credential", err)
+		writeNotFoundOrError(w, "update credential", "凭据不存在（可能已被并发删除）", err)
 		return
 	}
 

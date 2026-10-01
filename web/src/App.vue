@@ -2,7 +2,7 @@
 import { computed, onMounted, onUnmounted, ref, watch } from 'vue'
 import { useRoute } from 'vue-router'
 import { toasts, confirmState, settleConfirm, authState } from './ui'
-import { saveToken } from './api'
+import { saveToken, auth } from './api'
 import AppModal from './components/AppModal.vue'
 
 const route = useRoute()
@@ -243,6 +243,14 @@ function toggleTheme() {
   applyTheme(!isDark.value)
 }
 
+// 退出登录：清掉本地令牌后重载（与登录成功后的 reload 对称）。
+// 令牌只存 localStorage、每次请求以 Bearer 携带，网关侧无会话状态，清掉即登出；
+// 重载后首个受限请求会 401，自动弹回凭据框。
+function logout() {
+  saveToken('')
+  window.location.reload()
+}
+
 onMounted(() => {
   initTheme()
   checkStatus()
@@ -281,6 +289,21 @@ onMounted(() => {
           </svg>
           <svg v-else viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
             <path d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8z" />
+          </svg>
+        </button>
+        <!-- 退出登录：清掉本机保存的管理凭据并重载。密码只存在浏览器 localStorage，
+             网关侧无会话，所以清空 token 即登出；重载后首个受保护请求 401 会弹回登录框。 -->
+        <button
+          v-if="auth.token"
+          class="theme-toggle"
+          title="退出登录"
+          aria-label="退出登录"
+          @click="logout"
+        >
+          <svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4" />
+            <path d="M16 17l5-5-5-5" />
+            <path d="M21 12H9" />
           </svg>
         </button>
       </div>

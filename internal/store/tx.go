@@ -41,6 +41,27 @@ func deleteByID(ctx context.Context, ex execer, table, id string) error {
 	return nil
 }
 
+// checkAffected 承接 `UPDATE ... WHERE id = ?` 的结果：影响 0 行（主键已不存在）
+// 返回 ErrNotFound，而不是静默 nil。
+//
+// 各 Update handler 都先 Get 再 Update，TOCTOU 窗口极小，但并非为零：Get 与 Update
+// 之间那行被删（并发删除 / 另一实例）时，旧实现 UPDATE 命中 0 行仍返回 nil，接口回
+// 200「更新成功」，用户以为写进去了，实际目标早已消失。SQLite 对匹配 WHERE 的行一律计入
+// changes（即便新旧值相同），所以「存在但值没变」不会被误判为 0 行。
+func checkAffected(res sql.Result, err error) error {
+	if err != nil {
+		return err
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if n == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
 // IsUniqueViolation 报告错误是否为唯一约束冲突（如 routes.public_name 重名）。
 //
 // modernc 的驱动会把 constraint failed 报成 *sqlite.Error，但没有导出可供

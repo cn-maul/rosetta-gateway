@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strings"
 
 	"github.com/cn-maul/rosetta"
 )
@@ -28,13 +29,6 @@ type OpenAIChatRequest struct {
 	Seed               *int                `json:"seed,omitempty"`
 	User               string              `json:"user,omitempty"`
 	ParallelToolCalls  *bool               `json:"parallel_tool_calls,omitempty"`
-
-	// Extra is the raw passthrough slot mirroring rosetta.ChatRequest.Extra.
-	// The json:"-" tag stops the decoder from ever writing it and nothing
-	// else fills it yet, so it is always nil today. When unrecognized-field
-	// collection lands, feed it through ApplyProtocolPrivateExtra so the
-	// per-protocol gate still applies.
-	Extra map[string]any `json:"-"`
 }
 
 type StreamOptions struct {
@@ -291,19 +285,19 @@ func extractUserContent(raw json.RawMessage) (string, []string) {
 		return "", nil
 	}
 
-	result := ""
+	var text strings.Builder
 	var images []string
 	for _, p := range parts {
 		switch p.Type {
 		case "text":
-			result += p.Text
+			text.WriteString(p.Text)
 		case "image_url":
 			if p.ImageURL != nil && p.ImageURL.URL != "" {
 				images = append(images, p.ImageURL.URL)
 			}
 		}
 	}
-	return result, images
+	return text.String(), images
 }
 
 // extractText 只要文本，丢弃图像。用于 system / assistant / tool —— 这三个角色的

@@ -97,10 +97,10 @@ func (s *Store) UpdateCredential(ctx context.Context, id string, c *Credential) 
 	if c.Enabled {
 		enabled = 1
 	}
-	_, err := s.db.ExecContext(ctx,
+	res, err := s.db.ExecContext(ctx,
 		`UPDATE provider_credentials SET label = ?, api_key_enc = ?, enabled = ?, weight = ?, status = ?, cooldown_until = ?, last_error = ? WHERE id = ?`,
 		nullIfEmpty(c.Label), c.APIKeyEnc, enabled, c.Weight, c.Status, c.CooldownUntil, nullIfEmpty(c.LastError), id)
-	return err
+	return checkAffected(res, err)
 }
 
 // DeleteCredential 删除一把凭据；id 不存在时返回 ErrNotFound。

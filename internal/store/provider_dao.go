@@ -106,10 +106,10 @@ func (s *Store) UpdateProvider(ctx context.Context, id string, p *Provider) erro
 	if p.Enabled {
 		enabled = 1
 	}
-	_, err := s.db.ExecContext(ctx,
+	res, err := s.db.ExecContext(ctx,
 		`UPDATE providers SET slug = ?, name = ?, protocol = ?, endpoint = ?, enabled = ?, timeout_ms = ?, max_retries = ?, quirks_json = ?, updated_at = ? WHERE id = ?`,
 		p.Slug, p.Name, p.Protocol, p.Endpoint, enabled, p.TimeoutMs, p.MaxRetries, nullIfEmpty(p.QuirksJSON), time.Now().UnixMilli(), id)
-	return err
+	return checkAffected(res, err)
 }
 
 // DeleteProvider 删除一个上游；id 不存在时返回 ErrNotFound。
