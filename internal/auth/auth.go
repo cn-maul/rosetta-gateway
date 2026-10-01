@@ -2,7 +2,6 @@ package auth
 
 import (
 	"crypto/sha256"
-	"crypto/subtle"
 	"encoding/hex"
 	"net/http"
 	"strings"
@@ -24,19 +23,13 @@ func Authenticate(r *http.Request) (*Context, error) {
 	hash := sha256.Sum256([]byte(key))
 	hashHex := hex.EncodeToString(hash[:])
 
-	// 遍历**全部** key、把结果累积起来再判定，而不是命中即 return：
-	//   - `==` 字符串比较是逐字节短路，响应时间会泄露「前缀对了几个字节」；
-	//   - 命中即返回还会让耗时随「匹配项在 map 遍历顺序中的位置」浮动。
-	// 两者叠加就是一条可用的计时侧信道（本机、无网络抖动时尤其好利用）。
-	// 遍历的总项数固定，用 ConstantTimeCompare 逐项比较，时间与「匹配到哪一项」无关。
-	snap := snapshot.Get()
-	var matched *snapshot.KeySnapshot
-	for _, ks := range snap.Keys {
-		if subtle.ConstantTimeCompare([]byte(ks.KeyHash), []byte(hashHex)) == 1 {
-			matched = ks
-		}
-	}
-
+	// 按哈希索引 O(1) 查表，而不是逐 key 常量时间比较（旧实现全量遍历，
+	// 与 DESIGN「SHA-256 索引」的口径也不符）。map 查找的耗时确实会泄露
+	// 「与存储哈希前缀的匹配程度」，但存储的是高熵 key 的 SHA-256 ——
+	// 前缀匹配信息无法反推哈希原像，更无法还原 key 本身，不构成可用的
+	// 侧信道。慢哈希（bcrypt 类）同样不必要：key 是网关生成的高熵随机串
+	// （DESIGN §6.2），不是用户口令。
+	matched := snapshot.Get().KeysByHash[hashHex]
 	if matched == nil {
 		return nil, ErrInvalidKey
 	}

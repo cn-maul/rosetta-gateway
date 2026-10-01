@@ -13,9 +13,9 @@ import (
 // （池的重建由 ReloadHandler 显式先做，分工是「先池后快照」）。
 func RebuildFromDB(ctx context.Context, st *store.Store) (*Snapshot, error) {
 	snap := &Snapshot{
-		Routes:    routing.NewRouteIndex(),
-		Providers: make(map[string]*ProviderSnapshot),
-		Keys:      make(map[string]*KeySnapshot),
+		Routes:     routing.NewRouteIndex(),
+		Providers:  make(map[string]*ProviderSnapshot),
+		KeysByHash: make(map[string]*KeySnapshot),
 	}
 
 	providers, err := st.ListProviders(ctx)
@@ -88,14 +88,16 @@ func RebuildFromDB(ctx context.Context, st *store.Store) (*Snapshot, error) {
 	if err != nil {
 		return nil, err
 	}
+	keysByHash := make(map[string]*KeySnapshot, len(keys))
 	for _, k := range keys {
-		snap.Keys[k.ID] = &KeySnapshot{
+		keysByHash[k.KeyHash] = &KeySnapshot{
 			ID:      k.ID,
 			KeyHash: k.KeyHash,
 			Name:    k.Name,
 			Enabled: k.Enabled,
 		}
 	}
+	snap.KeysByHash = keysByHash
 
 	// 运行时全局默认（超时与故障转移策略）。读失败不致命：留 0 即全部回落 config。
 	if rd, err := st.GetRuntimeDefaults(ctx); err == nil {

@@ -497,9 +497,9 @@ func bootstrapDB(db *store.Store, cfg *config.Config, logger *slog.Logger, maste
 
 func buildSnapshotFromConfig(cfg *config.Config) *snapshot.Snapshot {
 	snap := &snapshot.Snapshot{
-		Routes:    routing.NewRouteIndex(),
-		Providers: make(map[string]*snapshot.ProviderSnapshot),
-		Keys:      make(map[string]*snapshot.KeySnapshot),
+		Routes:     routing.NewRouteIndex(),
+		Providers:  make(map[string]*snapshot.ProviderSnapshot),
+		KeysByHash: make(map[string]*snapshot.KeySnapshot),
 	}
 	modelIDs := make(map[string]string)
 

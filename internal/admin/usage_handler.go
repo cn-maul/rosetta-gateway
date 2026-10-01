@@ -185,8 +185,15 @@ func (h *UsageHandler) Query(w http.ResponseWriter, r *http.Request) {
 		selectCols, groupClause = cols, group
 	}
 
+	// 明细行必须带唯一列兜底：毫秒时间戳在并发写入下会重复，纯 `ts DESC` 让同
+	// 毫秒记录随机重排，翻页时同一条可能跳变或漏现 —— 与 History 端点
+	// (u.ts DESC, u.id DESC) 同一口径。分组行没有单一 id（ts 也常是 0/日桶），不套用。
+	orderBy := ` ORDER BY ts DESC`
+	if groupClause == "" {
+		orderBy += `, id DESC`
+	}
 	query := `SELECT ` + selectCols + ` FROM usage_records` + where + groupClause +
-		` ORDER BY ts DESC LIMIT ?`
+		orderBy + ` LIMIT ?`
 	rowArgs := append(append([]any{}, args...), limit)
 
 	rows, err := h.store.DB().Query(query, rowArgs...)

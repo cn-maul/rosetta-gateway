@@ -22,7 +22,10 @@ import (
 type Snapshot struct {
 	Routes    *routing.RouteIndex
 	Providers map[string]*ProviderSnapshot
-	Keys      map[string]*KeySnapshot
+	// KeysByHash 以 SHA-256(明文key) 的 hex 为键建索引，供热路径 O(1) 鉴权
+	// （internal/auth）。此前的 ID 键 map 没有任何读者，鉴权靠全量遍历 ——
+	// key 数量上百 + 高 QPS 时每次请求都是 O(N) 字符串比较。
+	KeysByHash map[string]*KeySnapshot
 	// Runtime 是超时与故障转移策略的全局默认（来自 app_settings，0 = 回落 config）。
 	Runtime RuntimeDefaults
 }
@@ -64,9 +67,9 @@ func Get() *Snapshot {
 	s := current.Load()
 	if s == nil {
 		return &Snapshot{
-			Routes:    routing.NewRouteIndex(),
-			Providers: make(map[string]*ProviderSnapshot),
-			Keys:      make(map[string]*KeySnapshot),
+			Routes:     routing.NewRouteIndex(),
+			Providers:  make(map[string]*ProviderSnapshot),
+			KeysByHash: make(map[string]*KeySnapshot),
 		}
 	}
 	return s

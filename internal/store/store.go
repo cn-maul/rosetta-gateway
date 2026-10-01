@@ -27,7 +27,10 @@ func Open(dbPath string, logger *slog.Logger) (*Store, error) {
 	// 单进程内 SetMaxOpenConns(1) 已经避免了自争抢，但备份脚本、CLI 工具、
 	// 误起的第二个实例都会以独立连接打开同一个文件 —— 那种情况下没有它，
 	// 一次写撞锁就直接失败，而配额预检是 fail-open 的，会静默放行超额请求。
-	db, err := sql.Open("sqlite", dbPath+"?_journal_mode=WAL&_foreign_keys=ON&_busy_timeout=5000")
+	// _synchronous=NORMAL 是 WAL 模式的官方推荐搭配：WAL 下 FULL 只多保护
+	// 「掉电丢最近几个已提交事务」这一种情形（不损坏），代价是每次 commit 都
+	// fsync —— 本表的用量 INSERT 每请求一条，NORMAL 省掉这笔开销且无完整性风险。
+	db, err := sql.Open("sqlite", dbPath+"?_journal_mode=WAL&_synchronous=NORMAL&_foreign_keys=ON&_busy_timeout=5000")
 	if err != nil {
 		return nil, fmt.Errorf("open db: %w", err)
 	}

@@ -164,10 +164,11 @@ func buildHarnessFull(t *testing.T, chain []struct {
 	}
 
 	sum := sha256.Sum256([]byte(testAccessKey))
+	sumHex := hex.EncodeToString(sum[:])
 	snap := &snapshot.Snapshot{
-		Routes:    ri,
-		Providers: map[string]*snapshot.ProviderSnapshot{},
-		Keys:      map[string]*snapshot.KeySnapshot{testAccessKey: {ID: "k1", KeyHash: hex.EncodeToString(sum[:]), Name: "t", Enabled: true}},
+		Routes:     ri,
+		Providers:  map[string]*snapshot.ProviderSnapshot{},
+		KeysByHash: map[string]*snapshot.KeySnapshot{sumHex: {ID: "k1", KeyHash: sumHex, Name: "t", Enabled: true}},
 		// 故障转移策略是全局的（设置页写入），测试里用快照的 Runtime 默认驱动。
 		Runtime: snapshot.RuntimeDefaults{
 			FailoverMaxTargets:        len(chain),

@@ -2,6 +2,7 @@ package admin
 
 import (
 	"context"
+	"log/slog"
 	"net/http"
 	"strconv"
 
@@ -43,8 +44,17 @@ func (h *StatsHandler) Get(w http.ResponseWriter, r *http.Request) {
 	}
 	// 缓存命中率已并入 GetUsageStats 同一条 SELECT（见 usage_dao.go）：
 	// 此前它是对同一区间 usage_records 的第二次独立全扫，纯属重复。
-	tps, _ := h.store.GetRecentThroughput(r.Context(), 5)
-	ttfb, _ := h.store.GetRecentTtfbMs(r.Context(), 5)
+	// tps/ttfb 是补充指标，查询失败不应让整份 stats 报 500（主统计已成功）；
+	// 但旧实现把错误丢进 _ 后指标静默显示 0，运维无从分辨「真的是 0」还是「查挂了」。
+	// 补 WARN：值仍回 0，但日志说明原因。
+	tps, tpsErr := h.store.GetRecentThroughput(r.Context(), 5)
+	if tpsErr != nil {
+		slog.Warn("admin stats: recent throughput query failed", "error", tpsErr)
+	}
+	ttfb, ttfbErr := h.store.GetRecentTtfbMs(r.Context(), 5)
+	if ttfbErr != nil {
+		slog.Warn("admin stats: recent ttfb query failed", "error", ttfbErr)
+	}
 	writeJSON(w, http.StatusOK, statsResponse{
 		TotalRequests:   stats.TotalRequests,
 		TotalTokens:     stats.TotalTokens,

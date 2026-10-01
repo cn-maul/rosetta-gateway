@@ -12,20 +12,20 @@ import (
 )
 
 type Config struct {
-	Listen      string         `json:"listen"`
-	DBPath      string         `json:"db_path"`
-	LogLevel    string         `json:"log_level"`
-	AdminToken  string         `json:"admin_token"`
-	MasterKeyEnv string        `json:"master_key_env"`
-	Defaults    Defaults       `json:"defaults"`
-	Bootstrap   Bootstrap      `json:"bootstrap"`
+	Listen       string    `json:"listen"`
+	DBPath       string    `json:"db_path"`
+	LogLevel     string    `json:"log_level"`
+	AdminToken   string    `json:"admin_token"`
+	MasterKeyEnv string    `json:"master_key_env"`
+	Defaults     Defaults  `json:"defaults"`
+	Bootstrap    Bootstrap `json:"bootstrap"`
 }
 
 type Defaults struct {
-	UpstreamTimeoutMs    int `json:"upstream_timeout_ms"`
-	StreamIdleTimeoutMs  int `json:"stream_idle_timeout_ms"`
-	MaxRetries           int `json:"max_retries"`
-	MaxRequestBodyBytes  int `json:"max_request_body_bytes"`
+	UpstreamTimeoutMs   int `json:"upstream_timeout_ms"`
+	StreamIdleTimeoutMs int `json:"stream_idle_timeout_ms"`
+	MaxRetries          int `json:"max_retries"`
+	MaxRequestBodyBytes int `json:"max_request_body_bytes"`
 
 	// 故障转移链级默认参数：route 上对应列为 0 时回落到这里。
 	// StreamFirstTokenTimeoutMs 是流式「首字（TTFT）」看门狗，区别于 StreamIdleTimeoutMs
@@ -51,9 +51,9 @@ type BootstrapProvider struct {
 }
 
 type BootstrapCredential struct {
-	Label      string `json:"label"`
-	APIKeyEnv  string `json:"api_key_env"`
-	APIKey     string `json:"api_key"`
+	Label     string `json:"label"`
+	APIKeyEnv string `json:"api_key_env"`
+	APIKey    string `json:"api_key"`
 }
 
 type BootstrapRoute struct {
@@ -63,6 +63,14 @@ type BootstrapRoute struct {
 }
 
 var slugRe = regexp.MustCompile(`^[a-z0-9]{2,32}$`)
+
+// validBootstrapProtocols 与 admin 写入校验、upstream.buildClient 使用同一组取值。
+var validBootstrapProtocols = map[string]bool{
+	"auto":             true,
+	"openai-chat":      true,
+	"openai-responses": true,
+	"anthropic":        true,
+}
 
 func Load(path string) (*Config, error) {
 	data, err := os.ReadFile(path)
@@ -211,6 +219,12 @@ func (c *Config) validate() error {
 		}
 		if p.Endpoint == "" {
 			return fmt.Errorf("bootstrap.providers[%d].endpoint: required", i)
+		}
+		// 与 admin/provider_handler.go 的 validProtocols 同一份白名单：配置入口
+		// 就挡住拼写错误，而不是等到运行时 buildClient 才失败（那时错误会伪装成
+		// 上游连接问题，指向下游而非配置）。空串合法，表示走默认/自动探测。
+		if p.Protocol != "" && !validBootstrapProtocols[p.Protocol] {
+			return fmt.Errorf("bootstrap.providers[%d].protocol: must be one of auto / openai-chat / openai-responses / anthropic, got %q", i, p.Protocol)
 		}
 		for j, cred := range p.Credentials {
 			if cred.APIKeyEnv == "" && cred.APIKey == "" {
