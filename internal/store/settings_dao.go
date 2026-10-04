@@ -23,7 +23,7 @@ type ModelDefaults struct {
 
 func (s *Store) getSetting(ctx context.Context, key string) (string, bool, error) {
 	var v string
-	err := s.db.QueryRowContext(ctx, `SELECT value FROM app_settings WHERE key = ?`, key).Scan(&v)
+	err := s.read.QueryRowContext(ctx, `SELECT value FROM app_settings WHERE key = ?`, key).Scan(&v)
 	if err == sql.ErrNoRows {
 		return "", false, nil
 	}

@@ -127,6 +127,7 @@ import type {
   RouteTarget,
   RouteTargetInput,
   AccessKey,
+  AuditEntry,
   KeyCreateResponse,
   Settings,
   Stats,
@@ -177,11 +178,13 @@ export const api = {
 
   // access keys
   keys: () => get<AccessKey[]>('/keys'),
-  createKey: (b: { name: string; quota_tokens?: number }) =>
+  createKey: (b: { name: string; quota_tokens?: number; rpm_limit?: number; tpm_limit?: number }) =>
     mutate(() => post<KeyCreateResponse>('/keys', b)),
-  updateKey: (id: string, b: { name?: string; enabled?: boolean; quota_tokens?: number }) =>
+  updateKey: (id: string, b: { name?: string; enabled?: boolean; quota_tokens?: number; rpm_limit?: number; tpm_limit?: number }) =>
     mutate(() => patch<AccessKey>(`/keys/${id}`, b)),
   deleteKey: (id: string) => mutate(() => del(`/keys/${id}`)),
+  // 审计日志：管理后台写操作留痕（只记字段名，不记值）
+  audit: (limit = 50) => get<{ entries: AuditEntry[]; server_ts: number }>(`/audit?limit=${limit}`),
 
   // stats & usage（注意：usage 端点的 from/to 是【毫秒】时间戳；from=0 表示全部历史）
   stats: (from = 0, to = Date.now()) => get<Stats>(`/stats?from=${from}&to=${to}`),

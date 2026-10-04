@@ -29,11 +29,15 @@ const form = reactive({
   open: false,
   name: '',
   quota: 0,
+  rpm: 0,
+  tpm: 0,
 })
 
 function openCreate() {
   form.name = ''
   form.quota = 0
+  form.rpm = 0
+  form.tpm = 0
   form.open = true
 }
 
@@ -43,7 +47,12 @@ async function submitCreate() {
     return
   }
   try {
-    const created = await api.createKey({ name: form.name.trim(), quota_tokens: Number(form.quota) || 0 })
+    const created = await api.createKey({
+      name: form.name.trim(),
+      quota_tokens: Number(form.quota) || 0,
+      rpm_limit: Number(form.rpm) || 0,
+      tpm_limit: Number(form.tpm) || 0,
+    })
     form.open = false
     plainKeyBox.key = (created as KeyCreateResponse).plaintext_key
     plainKeyBox.name = created.name
@@ -66,12 +75,16 @@ const eForm = reactive({
   id: '',
   name: '',
   quota: 0,
+  rpm: 0,
+  tpm: 0,
 })
 
 function openEdit(k: AccessKey) {
   eForm.id = k.id
   eForm.name = k.name
   eForm.quota = k.quota_tokens ?? 0
+  eForm.rpm = k.rpm_limit ?? 0
+  eForm.tpm = k.tpm_limit ?? 0
   eForm.open = true
 }
 
@@ -81,7 +94,12 @@ async function submitEdit() {
     return
   }
   try {
-    await api.updateKey(eForm.id, { name: eForm.name.trim(), quota_tokens: Number(eForm.quota) || 0 })
+    await api.updateKey(eForm.id, {
+      name: eForm.name.trim(),
+      quota_tokens: Number(eForm.quota) || 0,
+      rpm_limit: Number(eForm.rpm) || 0,
+      tpm_limit: Number(eForm.tpm) || 0,
+    })
     eForm.open = false
     toast('密钥已更新')
     await load()
@@ -153,6 +171,11 @@ onMounted(load)
               用量：{{ fmtTokens(k.used_tokens) }}
               <template v-if="k.quota_tokens > 0">/ {{ fmtTokens(k.quota_tokens) }}</template>
               <template v-else>· 不限</template>
+              <template v-if="(k.rpm_limit ?? 0) > 0 || (k.tpm_limit ?? 0) > 0">
+                · 限速：<template v-if="(k.rpm_limit ?? 0) > 0">{{ k.rpm_limit }} req/min</template>
+                <template v-if="(k.rpm_limit ?? 0) > 0 && (k.tpm_limit ?? 0) > 0"> & </template>
+                <template v-if="(k.tpm_limit ?? 0) > 0">{{ fmtTokens(k.tpm_limit) }} tok/min</template>
+              </template>
             </div>
           </div>
           <div class="row-side">
@@ -176,6 +199,16 @@ onMounted(load)
             <label>Token 配额</label>
             <input v-model.number="form.quota" class="input num" type="number" min="0" step="1" placeholder="0" />
             <span class="tip">累计 input+output token 上限，用尽后 /v1 返回 429；0 = 不限</span>
+          </div>
+          <div class="field">
+            <label>RPM 限速</label>
+            <input v-model.number="form.rpm" class="input num" type="number" min="0" step="1" placeholder="0" />
+            <span class="tip">每分钟请求数上限；0 = 不限</span>
+          </div>
+          <div class="field">
+            <label>TPM 限速</label>
+            <input v-model.number="form.tpm" class="input num" type="number" min="0" step="1" placeholder="0" />
+            <span class="tip">每分钟 token 上限（估算预占+事后校正）；0 = 不限</span>
           </div>
         </div>
         <div class="form-actions">
@@ -212,6 +245,16 @@ onMounted(load)
             <label>Token 配额</label>
             <input v-model.number="eForm.quota" class="input num" type="number" min="0" step="1" placeholder="0" />
             <span class="tip">累计 input+output token 上限，用尽后 /v1 返回 429；0 = 不限</span>
+          </div>
+          <div class="field">
+            <label>RPM 限速</label>
+            <input v-model.number="eForm.rpm" class="input num" type="number" min="0" step="1" placeholder="0" />
+            <span class="tip">每分钟请求数上限；0 = 不限</span>
+          </div>
+          <div class="field">
+            <label>TPM 限速</label>
+            <input v-model.number="eForm.tpm" class="input num" type="number" min="0" step="1" placeholder="0" />
+            <span class="tip">每分钟 token 上限（估算预占+事后校正）；0 = 不限</span>
           </div>
         </div>
         <div class="form-actions">

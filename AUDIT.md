@@ -1468,3 +1468,68 @@ A 目标的 Extra 泄漏给 B 目标（这正是旧代码在循环内反复 ToRo
 - 既有回归全绿：failover 9 例、quota、throttle、admin 全部未动并通过。
 - DESIGN 同步：§6.1（入口现状）、§7（编解码分工）、§8.1（Anthropic 下游）、
   §17 R4（已解决）。
+
+---
+
+# 剩余大件批次 — 2026-10-04（限速 / 审计 / 读写分池 / 安全硬化）
+
+全局审计 backlog 的最后一批（History 过滤/导出与 /v1/responses 入口除外，见文末）。
+
+## 1. RPM/TPM 限速（DESIGN §11.4 落地）
+
+- 新增 `internal/ratelimit`：内存固定窗口（每 key 每分钟一桶），单锁守护；
+  RPM 记请求数（**被拒同样计数**），TPM 记 token（请求前 `estimateRequestTokens`
+  预占 = 输入字符估算 + max_tokens 全额，请求终结时 `CommitTPM` 以真实
+  usage 校正；被拒不预占；跨窗校正差值落新窗口，误差单请求级）。
+- 三件套齐活：`access_keys.rpm_limit/tpm_limit` 列（从死列清单摘出、ensureColumns
+  加回）+ 管理写入口（`PATCH /admin/api/keys/{id}`，PATCH 语义、非负校验、
+  Keys 页编辑）+ 热路径执行点（`handleIngress`：鉴权后 RPM、解码后 TPM，
+  两个入口共享；额度经 `KeySnapshot` 下发，热路径不查库）。
+- 429 带 `Retry-After`（窗口剩余秒数），OpenAI/Anthropic 各按自己的错误形状输出。
+- TPM 校正只在请求终结处发生一次：committed 路径按真实 usage，错误/断开路径
+  全额退还预占（`rateCommit`，nil 安全）。
+
+## 2. 管理写操作审计日志（DESIGN §13.3 落地）
+
+- `audit_log` 表（自增 id + ts/actor/remote/method/path/status/fields），
+  `server.AutoReload` 在每个管理写操作上同步落库（含 password/set —— 它不触发
+  重建但必须审计）；失败只 WARN，不阻塞管理操作。
+- **只记字段名不记值**：AutoReload 缓存请求体（64KB 上限）提取顶层字段名，
+  body 里的上游 api_key 与密码明文永不落审计。
+- 查询：`GET /admin/api/audit?limit=`（新→旧，上限 500）+ 设置页新增
+  「审计日志」页签（首次切入懒加载）。
+
+## 3. SQLite 读写分池
+
+- `store.Store` 持双 `*sql.DB`：写池单连接（管理写 + 用量落库 + 审计写），
+  读池 4 连接承载全部只读查询（所有 DAO 的 Query 切到 `s.read`，
+  `usage_handler` 的裸查询切 `Reader()`）。
+- WAL 下读者与单写者并行 —— 用量看板的重查询不再阻塞配额预检与 INSERT。
+- 回归测试 `TestStore_ReadPoolServesReads`：分池对象 + 读后可见性 + 限速字段
+  随 Create→Get 全程不丢。
+
+## 4. 安全硬化
+
+- 管理密码下限 6 → **8 字符 + 至少两类字符**（只约束新设密码，存量凭据校验
+  路径不变）；`adminauth` 测试同步。
+- 弱密钥告警：`crypto.LoadMasterKey` 新增 weak 标记（材料 < 32 字符，
+  大概率是手填口令），启动时 WARN 提示改用自动生成的 master.key 并重存凭据。
+  **刻意不改推导**（如上 PBKDF2/KDF）：改推导会让存量密文全部解不开，
+  锁死代价高于收益 —— 已在 crypto 注释与本节留痕。
+- `admin_token` < 16 字符时启动 WARN（在线爆破在登录限速下仍可磨，建议设密码）。
+
+## 验证证据
+
+- `go build ./...` / `go vet ./...` 无输出；`go test ./... -count=1` 全绿
+  （10 个包，新增 ratelimit 4 例、cmd 限速端到端 1 例、审计中间件字段名断言
+  1 例、审计 DAO 与读池可见性 store 测试 2 例）。
+- `npm run typecheck` 通过；`npm run build && node sync-embed.mjs` 后 dist 已同步。
+- DESIGN 同步：§4（分池、限速列）、§6.3（audit 端点、keys 限速字段）、
+  §11.4（已实现）、§13.3（审计已实现 + 密码下限）。
+
+## 仍未做（backlog 清零前仅剩）
+
+| 项 | 说明 |
+|---|---|
+| `POST /v1/responses`（OpenAI Responses 入口） | 唯一剩余的下游协议缺口 |
+| History 过滤 / CSV 导出 | 按状态/模型/Key 过滤调用明细并导出 |

@@ -11,7 +11,8 @@ import (
 )
 
 type Store struct {
-	db     *sql.DB
+	db     *sql.DB // 写池（单连接）
+	read   *sql.DB // 读池（WAL 并发读者）
 	logger *slog.Logger
 }
 
@@ -30,17 +31,33 @@ func Open(dbPath string, logger *slog.Logger) (*Store, error) {
 	// _synchronous=NORMAL 是 WAL 模式的官方推荐搭配：WAL 下 FULL 只多保护
 	// 「掉电丢最近几个已提交事务」这一种情形（不损坏），代价是每次 commit 都
 	// fsync —— 本表的用量 INSERT 每请求一条，NORMAL 省掉这笔开销且无完整性风险。
-	db, err := sql.Open("sqlite", dbPath+"?_journal_mode=WAL&_synchronous=NORMAL&_foreign_keys=ON&_busy_timeout=5000")
+	dsn := dbPath + "?_journal_mode=WAL&_synchronous=NORMAL&_foreign_keys=ON&_busy_timeout=5000"
+	db, err := sql.Open("sqlite", dsn)
 	if err != nil {
 		return nil, fmt.Errorf("open db: %w", err)
 	}
 
+	// 写池：单连接。SQLite 同一时刻只有一个写者，多连接写只会互相撞锁；
+	// 用量落库（异步 worker）+ 管理写 + 审计写都在这里排队。
 	db.SetMaxOpenConns(1)
 	db.SetMaxIdleConns(1)
 
-	s := &Store{db: db, logger: logger}
+	// 读池：WAL 允许任意多读者与单写者并行。用量看板的重查询（全区间聚合、
+	// 窗口函数）走读池，不再阻塞写池上的配额预检与用量 INSERT —— 这是读写
+	// 分池的全部意义。读多写少的局域网网关给 4 条已绰绰有余。
+	read, err := sql.Open("sqlite", dsn)
+	if err != nil {
+		db.Close()
+		return nil, fmt.Errorf("open db (read pool): %w", err)
+	}
+	read.SetMaxOpenConns(4)
+	read.SetMaxIdleConns(4)
+	read.SetConnMaxLifetime(0)
+
+	s := &Store{db: db, read: read, logger: logger}
 	if err := s.migrate(); err != nil {
 		db.Close()
+		read.Close()
 		return nil, fmt.Errorf("migrate: %w", err)
 	}
 
@@ -48,11 +65,22 @@ func Open(dbPath string, logger *slog.Logger) (*Store, error) {
 }
 
 func (s *Store) Close() error {
-	return s.db.Close()
+	errDb := s.db.Close()
+	errRead := s.read.Close()
+	if errDb != nil {
+		return errDb
+	}
+	return errRead
 }
 
+// DB 返回写池（管理面个别查询路径在用）。新代码请用 Reader。
 func (s *Store) DB() *sql.DB {
 	return s.db
+}
+
+// Reader 返回读池：一切只读查询都应走这里，与写池上的写入互不阻塞。
+func (s *Store) Reader() *sql.DB {
+	return s.read
 }
 
 func (s *Store) migrate() error {
@@ -115,6 +143,10 @@ func (s *Store) migrate() error {
 			used_tokens   INTEGER NOT NULL DEFAULT 0,
 			created_at    INTEGER NOT NULL
 		)`,
+		// rpm_limit / tpm_limit：Key 维度的每分钟限速（DESIGN §11.4），
+		// 0 = 不限。曾作为占位列在 2026-09-24 摘除（当时无执行点），
+		// 2026-10-04 随限速功能三件套（列 + 管理写入口 + 热路径执行点）加回。
+		// expires_at / last_used_at 仍无读写路径，继续由 dropDeadColumns 摘除。
 		`CREATE TABLE IF NOT EXISTS usage_records (
 			id                TEXT PRIMARY KEY,
 			ts                INTEGER NOT NULL,
@@ -164,6 +196,19 @@ func (s *Store) migrate() error {
 		 BEGIN
 		   UPDATE access_keys SET used_tokens = used_tokens + NEW.total_tokens WHERE id = NEW.access_key_id;
 		 END`,
+		// audit_log：管理后台写操作审计（DESIGN §13.3）。只记「谁/何时/动了哪类
+		// 资源/动了哪些字段名」，不记请求体值 —— body 里可能有 api_key、密码明文。
+		`CREATE TABLE IF NOT EXISTS audit_log (
+			id      INTEGER PRIMARY KEY AUTOINCREMENT,
+			ts      INTEGER NOT NULL,
+			actor   TEXT NOT NULL,
+			remote  TEXT NOT NULL,
+			method  TEXT NOT NULL,
+			path    TEXT NOT NULL,
+			status  INTEGER NOT NULL,
+			fields  TEXT
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_audit_ts ON audit_log(ts)`,
 	}
 
 	for i, m := range migrations {
@@ -215,9 +260,8 @@ func (s *Store) migrate() error {
 func (s *Store) dropDeadColumns() error {
 	for _, d := range []struct{ table, column string }{
 		{"access_keys", "expires_at"},
-		{"access_keys", "rpm_limit"},
-		{"access_keys", "tpm_limit"},
 		{"access_keys", "last_used_at"},
+		// rpm_limit / tpm_limit 已随限速功能加回（见 ensureColumns），不再摘除。
 		{"routes", "priority"},
 		{"routes", "extra_json"},
 		{"routes", "fallback_route_id"},
@@ -257,6 +301,9 @@ func (s *Store) ensureColumns() error {
 	}
 	additions := []col{
 		{"routes", "failover_enabled", "INTEGER NOT NULL DEFAULT 0"},
+		// Key 维度每分钟限速（DESIGN §11.4，2026-10-04 落地）：0 = 不限。
+		{"access_keys", "rpm_limit", "INTEGER NOT NULL DEFAULT 0"},
+		{"access_keys", "tpm_limit", "INTEGER NOT NULL DEFAULT 0"},
 		// 模型单价（元 / 百万 tokens），可空：NULL = 未配置价格，统计费用按 0 计。
 		// price_input 是「缓存未命中输入」单价；命中的输入另按 price_cache_hit 计
 		// （为 0 时回退到 price_input，见 usage_dao 的费用口径）。

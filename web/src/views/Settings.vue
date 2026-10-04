@@ -2,22 +2,46 @@
 import { computed, onMounted, reactive, ref, watch } from 'vue'
 import { api, saveToken } from '../api'
 import { toast, confirmBox } from '../ui'
-import { fmtMoney } from '../fmt'
+import { fmtMoney, fmtDateTime } from '../fmt'
 import AppModal from '../components/AppModal.vue'
-import type { Provider, UpstreamModel } from '../types'
+import type { Provider, UpstreamModel, AuditEntry } from '../types'
 
 // ---------- 分类页：设置项按分类分页展示，一次只看一类 ----------
-type TabKey = 'model' | 'runtime' | 'security' | 'price'
+type TabKey = 'model' | 'runtime' | 'security' | 'price' | 'audit'
 
 const TABS: { key: TabKey; label: string; sub: string }[] = [
   { key: 'model', label: '模型默认', sub: '全局默认值；模型容量探测不到时回落到这里' },
   { key: 'runtime', label: '运行时', sub: '各类超时与自动故障转移的全局默认' },
   { key: 'security', label: '安全', sub: '管理后台的登录凭据' },
   { key: 'price', label: '模型价格', sub: '按供应商 × 模型配置单价，总览「费用」按此实时估算' },
+  { key: 'audit', label: '审计日志', sub: '管理后台的写操作留痕（谁/何时/动了哪些字段）' },
 ]
 const tab = ref<TabKey>('model')
 
 const tabSub = computed(() => TABS.find((t) => t.key === tab.value)?.sub ?? '')
+
+// ---------- 审计日志 ----------
+// 只在第一次切到该页签时拉取（后续手动刷新），避免每次进设置页都打一次库。
+const auditLoading = ref(false)
+const auditLoadedOnce = ref(false)
+const auditEntries = ref<AuditEntry[]>([])
+
+async function loadAudit() {
+  auditLoading.value = true
+  try {
+    const res = await api.audit(100)
+    auditEntries.value = res.entries
+    auditLoadedOnce.value = true
+  } catch (e) {
+    if ((e as { status?: number }).status !== 401) toast('审计日志加载失败：' + (e as Error).message, 'err')
+  } finally {
+    auditLoading.value = false
+  }
+}
+
+watch(tab, (t) => {
+  if (t === 'audit' && !auditLoadedOnce.value && !auditLoading.value) loadAudit()
+})
 
 const loading = ref(true)
 const saving = ref(false)
@@ -534,6 +558,37 @@ onMounted(() => {
         <button class="btn" @click="openPasswordModal">
           {{ hasPassword ? '修改密码' : '设置密码' }}
         </button>
+      </div>
+    </div>
+
+    <!-- 分类 5：审计日志 -->
+    <div v-else-if="tab === 'audit'" class="panel">
+      <div style="display: flex; align-items: center; justify-content: space-between; margin-bottom: 12px">
+        <div class="tip">
+          管理后台所有写操作（含来自脚本/API 的调用）在此留痕：来源、动作、涉及的资源与字段名。
+          字段值不入审计 —— 请求体里可能有上游密钥与密码明文。
+        </div>
+        <button class="btn" :disabled="auditLoading" @click="loadAudit">刷新</button>
+      </div>
+      <div v-if="auditLoading && auditEntries.length === 0" class="loading">加载中…</div>
+      <div v-else-if="auditEntries.length === 0" class="empty">
+        <div class="big">◇</div>
+        还没有审计记录（执行一次任意后台写操作后出现）
+      </div>
+      <div v-else class="row-list">
+        <div v-for="e in auditEntries" :key="e.id" class="row">
+          <div class="row-main">
+            <div class="row-title mono">
+              <span class="badge" :class="e.status < 400 ? 'badge-live' : 'badge-off'">{{ e.method }} {{ e.status }}</span>
+              {{ e.path }}
+            </div>
+            <div class="row-sub">
+              {{ e.remote }} · {{ e.actor }}
+              <template v-if="e.fields"> · 字段：{{ e.fields }}</template>
+            </div>
+          </div>
+          <div class="row-side num">{{ fmtDateTime(e.ts) }}</div>
+        </div>
       </div>
     </div>
 

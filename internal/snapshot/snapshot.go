@@ -53,6 +53,10 @@ type KeySnapshot struct {
 	KeyHash string
 	Name    string
 	Enabled bool
+	// RPMLimit / TPMLimit 是 Key 维度每分钟限速（DESIGN §11.4），0 = 不限。
+	// 随快照下发：热路径取额度不查库，管理改动经 reload 生效。
+	RPMLimit int
+	TPMLimit int
 }
 
 var current atomic.Pointer[Snapshot]

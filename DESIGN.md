@@ -130,7 +130,10 @@
 
 ## 4. 数据模型
 
-SQLite，WAL 模式，`foreign_keys=ON`。
+SQLite，WAL 模式，`foreign_keys=ON`，`synchronous=NORMAL`。
+**读写分池**（2026-10-04 起）：写池单连接（管理写 + 用量落库 + 审计写），
+读池 4 连接承载一切只读查询 —— WAL 下读者与单写者并行，用量看板的重查询
+不再阻塞热路径上的配额预检。
 
 ```sql
 -- 上游服务商
@@ -227,6 +230,8 @@ CREATE TABLE access_keys (
   enabled       INTEGER NOT NULL DEFAULT 1,
   quota_tokens  INTEGER NOT NULL DEFAULT 0,     -- 0 = 不限；累计 input+output token 上限
   used_tokens   INTEGER NOT NULL DEFAULT 0,     -- 累计，只增（由 usage_records 触发器维护）
+  rpm_limit     INTEGER NOT NULL DEFAULT 0,     -- 每分钟请求数上限，0 = 不限（§11.4）
+  tpm_limit     INTEGER NOT NULL DEFAULT 0,     -- 每分钟 token 上限，0 = 不限（§11.4）
   created_at    INTEGER NOT NULL
 );
 
@@ -422,9 +427,11 @@ PUT    /admin/api/routes/{id}/targets             原子整体替换链；链首
 
 GET    /admin/api/keys
 POST   /admin/api/keys                          返回明文一次
-PATCH  /admin/api/keys/{id}                      可改 name / enabled / quota_tokens
+PATCH  /admin/api/keys/{id}                      可改 name / enabled / quota_tokens /
+                                                 rpm_limit / tpm_limit（每分钟限速，0=不限）
 DELETE /admin/api/keys/{id}
 
+GET    /admin/api/audit?limit=                   管理写操作审计（新→旧，只记字段名不记值）
 GET    /admin/api/usage?from=&to=&group_by=key|model|provider|day
                                                   from/to 为毫秒时间戳；**from=0 一律表示
                                                   「全部历史」**（本端点与 by-* 系列语义统一，
@@ -718,23 +725,27 @@ UPDATE access_keys SET used_tokens = used_tokens + NEW.total_tokens WHERE id = N
 
 扣减不再由请求路径手写 UPDATE，而是挂在 `usage_records` 插入上的 SQLite 触发器，与 INSERT 同语句原子完成。落库本身走 `recordUsage`（goroutine 异步），故扣减在响应返回后就近实时生效——配合上面的超发容忍，无需同步阻塞。写放大：每条请求一次 INSERT（触发器顺带一次 UPDATE），WAL 下无压力。
 
-### 11.4 限速（P2 · 未实现）
+### 11.4 限速（已实现，2026-10-04）
 
-> 注：本节的**下游** RPM/TPM 限速未实现，与 11.2 已实现的**总量配额**是两回事。
-> `access_keys` 里原先的 `rpm_limit` / `tpm_limit` 占位列已于 2026-09-24 删除
-> （能读、无写、无人用）；要做这一维时再加列 + 加写入口 + 加执行点，三件一起做。
+> 本节的**下游** RPM/TPM 限速与 11.2 已实现的**总量配额**是两回事。
+> `access_keys` 的 `rpm_limit` / `tpm_limit` 列曾作为占位在 2026-09-24 摘除
+> （当时无执行点），现按当初承诺的「加列 + 加写入口 + 加执行点」三件一起落地。
 
 | 维度 | 实现 |
 |---|---|
-| RPM | 内存固定窗口计数器（每分钟一个桶），Key 维度 |
-| TPM | 同上，按请求前估算 + 请求后校正 |
-| 实现 | 标准库 `sync.Map` + 每秒清扫；不用 `golang.org/x/time/rate`（避免依赖） |
-| 重启 | 计数归零，接受 |
+| RPM | 内存固定窗口计数器（每分钟一个桶，`internal/ratelimit`），Key 维度；**被拒的请求同样计数** |
+| TPM | 同桶按 token 计数：请求前按 `estimateRequestTokens` 预占（输入估算 + max_tokens 全额），请求终结时按真实 usage 校正（`CommitTPM`）；被拒的请求不预占 |
+| 执行点 | `handleIngress` 骨架层（鉴权后 RPM、解码后 TPM），两个入口共享；额度随 `KeySnapshot` 从快照下发（0 = 不限），热路径不查库 |
+| 拒绝响应 | 429 `rate_limit_exceeded` + `Retry-After`（窗口剩余秒数，两个协议同语义、各按自己的错误形状） |
+| 窗口实现 | 单锁守护的 map（key 数量由管理员管理、有界，不需清扫）；不用 `golang.org/x/time/rate`（避免依赖） |
+| 重启 | 计数归零，接受（DESIGN 既定取舍） |
+| 校正跨窗 | 请求跨窗口边界时，TPM 校正差值落进新窗口 —— 误差为单个请求量级，接受 |
 
 **另有一个已实现、不要与本节混淆的限速**：**管理后台登录失败限速**（`internal/server`）。
 按来源 IP 记连续鉴权失败，10 次即进 60 秒冷却，冷却期内连 PBKDF2 都不做（省 CPU）。
-存在的理由：管理密码下限只有 6 位，PBKDF2 21 万迭代把单次尝试压到几十毫秒（交互无感），
-但**并发下 6 位弱口令依然可爆破** —— 这是唯一的在线防线。
+存在的理由：管理密码下限为 8 字符 + 两类字符（2026-10-04 从 6 位上调，只约束新设
+密码），PBKDF2 21 万迭代把单次尝试压到几十毫秒（交互无感），
+但**并发下的弱口令依然可爆破** —— 这是唯一的在线防线。
 
 - 来源 IP 取 `r.RemoteAddr`，**刻意不采信 `X-Forwarded-For`**（可伪造，采信等于把限速开关交给攻击者）。
 - 判定「是否处于冷却期」必须用 `until.IsZero()`，**不能写 `!time.Now().Before(e.until)`** ——
@@ -898,7 +909,10 @@ UPDATE access_keys SET used_tokens = used_tokens + NEW.total_tokens WHERE id = N
 
 - 管理界面仅监听内网，但**默认要求 `ADMIN_TOKEN`**，不做「内网免鉴权」的假设
 - 上游 key 在界面只显示掩码（`sk-...abcd`），明文不可回读
-- 所有写操作记审计日志（谁、什么时候、改了什么）
+- 所有写操作记审计日志（**已实现，2026-10-04**）：`server.AutoReload` 在每个管理写
+  操作上落 `audit_log`（谁=admin+来源 IP、何时、哪个资源、**哪些字段名**）。
+  字段名刻意不记值 —— 请求体里有上游 api_key 与管理密码明文。查询走
+  `GET /admin/api/audit`，「设置 → 审计日志」页签展示
 
 ---
 

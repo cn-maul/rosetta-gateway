@@ -14,12 +14,15 @@ type AccessKey struct {
 	Enabled     bool
 	QuotaTokens int64
 	UsedTokens  int64
-	CreatedAt   int64
+	// RPMLimit / TPMLimit 是 Key 维度的每分钟限速（DESIGN §11.4），0 = 不限。
+	RPMLimit  int
+	TPMLimit  int
+	CreatedAt int64
 }
 
 func (s *Store) ListAccessKeys(ctx context.Context) ([]AccessKey, error) {
-	rows, err := s.db.QueryContext(ctx,
-		`SELECT id, key_hash, key_prefix, name, enabled, quota_tokens, used_tokens, created_at FROM access_keys ORDER BY created_at`)
+	rows, err := s.read.QueryContext(ctx,
+		`SELECT id, key_hash, key_prefix, name, enabled, quota_tokens, used_tokens, rpm_limit, tpm_limit, created_at FROM access_keys ORDER BY created_at`)
 	if err != nil {
 		return nil, err
 	}
@@ -29,7 +32,7 @@ func (s *Store) ListAccessKeys(ctx context.Context) ([]AccessKey, error) {
 	for rows.Next() {
 		var k AccessKey
 		var enabled int
-		if err := rows.Scan(&k.ID, &k.KeyHash, &k.KeyPrefix, &k.Name, &enabled, &k.QuotaTokens, &k.UsedTokens, &k.CreatedAt); err != nil {
+		if err := rows.Scan(&k.ID, &k.KeyHash, &k.KeyPrefix, &k.Name, &enabled, &k.QuotaTokens, &k.UsedTokens, &k.RPMLimit, &k.TPMLimit, &k.CreatedAt); err != nil {
 			return nil, err
 		}
 		k.Enabled = enabled == 1
@@ -41,9 +44,9 @@ func (s *Store) ListAccessKeys(ctx context.Context) ([]AccessKey, error) {
 func (s *Store) GetAccessKey(ctx context.Context, id string) (*AccessKey, error) {
 	var k AccessKey
 	var enabled int
-	err := s.db.QueryRowContext(ctx,
-		`SELECT id, key_hash, key_prefix, name, enabled, quota_tokens, used_tokens, created_at FROM access_keys WHERE id = ?`, id).
-		Scan(&k.ID, &k.KeyHash, &k.KeyPrefix, &k.Name, &enabled, &k.QuotaTokens, &k.UsedTokens, &k.CreatedAt)
+	err := s.read.QueryRowContext(ctx,
+		`SELECT id, key_hash, key_prefix, name, enabled, quota_tokens, used_tokens, rpm_limit, tpm_limit, created_at FROM access_keys WHERE id = ?`, id).
+		Scan(&k.ID, &k.KeyHash, &k.KeyPrefix, &k.Name, &enabled, &k.QuotaTokens, &k.UsedTokens, &k.RPMLimit, &k.TPMLimit, &k.CreatedAt)
 	if err == sql.ErrNoRows {
 		return nil, nil
 	}
@@ -61,8 +64,8 @@ func (s *Store) CreateAccessKey(ctx context.Context, k *AccessKey) error {
 		enabled = 1
 	}
 	_, err := s.db.ExecContext(ctx,
-		`INSERT INTO access_keys (id, key_hash, key_prefix, name, enabled, quota_tokens, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)`,
-		k.ID, k.KeyHash, k.KeyPrefix, k.Name, enabled, k.QuotaTokens, now)
+		`INSERT INTO access_keys (id, key_hash, key_prefix, name, enabled, quota_tokens, rpm_limit, tpm_limit, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		k.ID, k.KeyHash, k.KeyPrefix, k.Name, enabled, k.QuotaTokens, k.RPMLimit, k.TPMLimit, now)
 	// 回写时间戳：落库用的是局部变量 now，结构体仍是零值 → 创建响应里的
 	// created_at 会是 0，与随后 GET 到的同一条记录不一致（前端会显示「建于 1970」）。
 	if err == nil {
@@ -77,8 +80,8 @@ func (s *Store) UpdateAccessKey(ctx context.Context, id string, k *AccessKey) er
 		enabled = 1
 	}
 	res, err := s.db.ExecContext(ctx,
-		`UPDATE access_keys SET name = ?, enabled = ?, quota_tokens = ? WHERE id = ?`,
-		k.Name, enabled, k.QuotaTokens, id)
+		`UPDATE access_keys SET name = ?, enabled = ?, quota_tokens = ?, rpm_limit = ?, tpm_limit = ? WHERE id = ?`,
+		k.Name, enabled, k.QuotaTokens, k.RPMLimit, k.TPMLimit, id)
 	return checkAffected(res, err)
 }
 
@@ -86,7 +89,7 @@ func (s *Store) UpdateAccessKey(ctx context.Context, id string, k *AccessKey) er
 // ok=false 表示密钥不存在（已删除）。used_tokens 由 usage_records 触发器实时累加，
 // 故这里是权威值；配额预检直接查库而非读快照——快照只在管理写操作后重建，会严重滞后。
 func (s *Store) GetKeyQuota(ctx context.Context, id string) (quota, used int64, ok bool, err error) {
-	err = s.db.QueryRowContext(ctx,
+	err = s.read.QueryRowContext(ctx,
 		`SELECT quota_tokens, used_tokens FROM access_keys WHERE id = ?`, id).
 		Scan(&quota, &used)
 	if err == sql.ErrNoRows {

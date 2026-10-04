@@ -41,7 +41,7 @@ func scanCredential(sc scanner) (Credential, error) {
 }
 
 func (s *Store) ListCredentials(ctx context.Context, providerID string) ([]Credential, error) {
-	rows, err := s.db.QueryContext(ctx,
+	rows, err := s.read.QueryContext(ctx,
 		`SELECT `+credentialColumns+` FROM provider_credentials WHERE provider_id = ? ORDER BY created_at`, providerID)
 	if err != nil {
 		return nil, err
@@ -60,7 +60,7 @@ func (s *Store) ListCredentials(ctx context.Context, providerID string) ([]Crede
 }
 
 func (s *Store) GetCredential(ctx context.Context, id string) (*Credential, error) {
-	c, err := scanCredential(s.db.QueryRowContext(ctx,
+	c, err := scanCredential(s.read.QueryRowContext(ctx,
 		`SELECT `+credentialColumns+` FROM provider_credentials WHERE id = ?`, id))
 	if err == sql.ErrNoRows {
 		return nil, nil

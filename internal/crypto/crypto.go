@@ -37,32 +37,36 @@ var (
 // 走两条路——前者无密钥、凭据明文落库，后者有密钥，同一份库在两种启动方式下
 // 互相解不开。密钥落盘后两种方式共用同一把。
 // generated 表示本次是否新生成密钥（调用方可据此打日志）。
-func LoadMasterKey(envName, dir string) (key []byte, generated bool, err error) {
+// weak 表示密钥材料熵偏低（< 32 字符）——大概率是用户手填的口令而非随机密钥。
+// 推导仍是 SHA-256（改推导会锁死存量凭据，见 AUDIT 2026-10-04 的评估），
+// 调用方应当 WARN 提醒改用自动生成的 master.key。
+func LoadMasterKey(envName, dir string) (key []byte, generated bool, weak bool, err error) {
 	if envName == "" {
 		envName = DefaultEnvName
 	}
 	if raw := strings.TrimSpace(os.Getenv(envName)); raw != "" {
 		sum := sha256.Sum256([]byte(raw))
-		return sum[:], false, nil
+		return sum[:], false, WeakMaterial(raw), nil
 	}
 	if strings.TrimSpace(dir) == "" {
-		return nil, false, ErrNoMasterKey
+		return nil, false, false, ErrNoMasterKey
 	}
 
 	path := filepath.Join(dir, KeyFileName)
 	if content, readErr := os.ReadFile(path); readErr == nil {
 		if raw := strings.TrimSpace(string(content)); raw != "" {
 			sum := sha256.Sum256([]byte(raw))
-			return sum[:], false, nil
+			return sum[:], false, WeakMaterial(raw), nil
 		}
 	}
 
+	// 自动生成的密钥是 64 hex（256 bit 熵），永远不会 weak。
 	raw := GenerateKey()
 	if err := os.WriteFile(path, []byte(raw+"\n"), 0o600); err != nil {
-		return nil, false, fmt.Errorf("write %s: %w", path, err)
+		return nil, false, false, fmt.Errorf("write %s: %w", path, err)
 	}
 	sum := sha256.Sum256([]byte(raw))
-	return sum[:], true, nil
+	return sum[:], true, false, nil
 }
 
 // DecryptWithFallback 用 masterKey 解密。masterKey 为空时直接按明文返回；
@@ -146,4 +150,13 @@ func GenerateKey() string {
 	b := make([]byte, 32)
 	rand.Read(b)
 	return base64.URLEncoding.EncodeToString(b)
+}
+
+// WeakMaterial 报告一段密钥材料的熵是否低到值得告警。
+// 阈值 32 字符：自动生成的 master.key 是 64 hex；手填的短口令（"123456"、
+// 公司名拼音）落库加密的是上游付费 API Key，值得被离线字典爆破。
+// 只作告警依据，不改变推导 —— 见 AUDIT 2026-10-04：改推导（KDF）会让
+// 存量密文全部解不开，锁死代价高于收益。
+func WeakMaterial(raw string) bool {
+	return len(strings.TrimSpace(raw)) < 32
 }

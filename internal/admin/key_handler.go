@@ -26,16 +26,21 @@ type keyRequest struct {
 	Name        *string `json:"name"`
 	Enabled     *bool   `json:"enabled"`
 	QuotaTokens *int64  `json:"quota_tokens"`
+	// RPMLimit / TPMLimit：Key 维度每分钟限速（DESIGN §11.4），0 = 不限。
+	RPMLimit *int `json:"rpm_limit"`
+	TPMLimit *int `json:"tpm_limit"`
 }
 
 type keyResponse struct {
-	ID         string `json:"id"`
-	KeyPrefix  string `json:"key_prefix"`
-	Name       string `json:"name"`
-	Enabled    bool   `json:"enabled"`
-	QuotaTokens int64 `json:"quota_tokens"`
-	UsedTokens  int64 `json:"used_tokens"`
-	CreatedAt  int64  `json:"created_at"`
+	ID          string `json:"id"`
+	KeyPrefix   string `json:"key_prefix"`
+	Name        string `json:"name"`
+	Enabled     bool   `json:"enabled"`
+	QuotaTokens int64  `json:"quota_tokens"`
+	UsedTokens  int64  `json:"used_tokens"`
+	RPMLimit    int    `json:"rpm_limit"`
+	TPMLimit    int    `json:"tpm_limit"`
+	CreatedAt   int64  `json:"created_at"`
 }
 
 type keyCreateResponse struct {
@@ -88,6 +93,16 @@ func (h *KeyHandler) Create(w http.ResponseWriter, r *http.Request) {
 		quota = *req.QuotaTokens
 	}
 
+	rpm, tpm, bad, err := limitPair(req)
+	if bad != "" {
+		writeError(w, http.StatusBadRequest, bad)
+		return
+	}
+	if err != nil {
+		writeServerError(w, "parse limits", err)
+		return
+	}
+
 	k := &store.AccessKey{
 		ID:          generateID(),
 		KeyHash:     keyHash,
@@ -95,6 +110,8 @@ func (h *KeyHandler) Create(w http.ResponseWriter, r *http.Request) {
 		Name:        name,
 		Enabled:     enabled,
 		QuotaTokens: quota,
+		RPMLimit:    rpm,
+		TPMLimit:    tpm,
 	}
 
 	if err := h.store.CreateAccessKey(r.Context(), k); err != nil {
@@ -143,6 +160,21 @@ func (h *KeyHandler) Update(w http.ResponseWriter, r *http.Request, id string) {
 		}
 		existing.QuotaTokens = *req.QuotaTokens
 	}
+	// 限速字段沿用 PATCH 语义：nil = 保持原值，显式数字（含 0 = 取消限制）才覆盖。
+	if req.RPMLimit != nil {
+		if *req.RPMLimit < 0 {
+			writeError(w, http.StatusBadRequest, "rpm_limit cannot be negative")
+			return
+		}
+		existing.RPMLimit = *req.RPMLimit
+	}
+	if req.TPMLimit != nil {
+		if *req.TPMLimit < 0 {
+			writeError(w, http.StatusBadRequest, "tpm_limit cannot be negative")
+			return
+		}
+		existing.TPMLimit = *req.TPMLimit
+	}
 
 	if err := h.store.UpdateAccessKey(r.Context(), id, existing); err != nil {
 		writeNotFoundOrError(w, "update key", "密钥不存在（可能已被并发删除）", err)
@@ -168,6 +200,26 @@ func toKeyResponse(k store.AccessKey) keyResponse {
 		Enabled:     k.Enabled,
 		QuotaTokens: k.QuotaTokens,
 		UsedTokens:  k.UsedTokens,
+		RPMLimit:    k.RPMLimit,
+		TPMLimit:    k.TPMLimit,
 		CreatedAt:   k.CreatedAt,
 	}
+}
+
+// limitPair 解析 rpm_limit / tpm_limit（PATCH 语义 + 非负校验）。
+// 返回值约定：bad 非空 = 校验失败（直接 400）；否则 err 上抛为 500。
+func limitPair(req keyRequest) (rpm, tpm int, bad string, err error) {
+	if req.RPMLimit != nil {
+		if *req.RPMLimit < 0 {
+			return 0, 0, "rpm_limit cannot be negative", nil
+		}
+		rpm = *req.RPMLimit
+	}
+	if req.TPMLimit != nil {
+		if *req.TPMLimit < 0 {
+			return 0, 0, "tpm_limit cannot be negative", nil
+		}
+		tpm = *req.TPMLimit
+	}
+	return rpm, tpm, "", nil
 }

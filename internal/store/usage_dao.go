@@ -87,7 +87,7 @@ type UsageStats struct {
 func (s *Store) GetUsageStats(ctx context.Context, from, to int64) (*UsageStats, error) {
 	var stats UsageStats
 	where, args := timeRangeClause(from, to, "u.")
-	err := s.db.QueryRowContext(ctx,
+	err := s.read.QueryRowContext(ctx,
 		`SELECT COUNT(*), COALESCE(SUM(u.total_tokens), 0), COALESCE(SUM(u.input_tokens), 0), COALESCE(SUM(u.output_tokens), 0), COALESCE(SUM(u.cached_tokens), 0),
 		        COUNT(CASE WHEN u.status NOT IN ('ok', 'canceled') THEN 1 END),
 		        COALESCE(SUM(u.cached_tokens) * 1.0 / NULLIF(SUM(u.input_tokens), 0), 0),
@@ -134,7 +134,7 @@ func (s *Store) GetRecentThroughput(ctx context.Context, limit int) (float64, er
 		limit = 50
 	}
 	var v float64
-	err := s.db.QueryRowContext(ctx,
+	err := s.read.QueryRowContext(ctx,
 		`SELECT COALESCE(SUM(output_tokens) * 1000.0 / NULLIF(SUM(latency_ms), 0), 0)
 		   FROM (SELECT output_tokens, latency_ms FROM usage_records
 		          WHERE status = 'ok' AND output_tokens > 0 AND latency_ms > 0
@@ -154,7 +154,7 @@ func (s *Store) GetRecentTtfbMs(ctx context.Context, limit int) (float64, error)
 		limit = 5
 	}
 	var v float64
-	err := s.db.QueryRowContext(ctx,
+	err := s.read.QueryRowContext(ctx,
 		`SELECT COALESCE(AVG(ttfb_ms), 0)
 		   FROM (SELECT ttfb_ms FROM usage_records
 		          WHERE status = 'ok' AND ttfb_ms > 0
@@ -188,7 +188,7 @@ const throughputWindow = 30 * 24 * time.Hour
 // 「近期表现」本来就只关心最近的数据，超窗的老记录没有统计价值。
 func (s *Store) ListModelThroughput(ctx context.Context, providerID string) (map[string]ModelStat, error) {
 	cutoff := time.Now().Add(-throughputWindow).UnixMilli()
-	rows, err := s.db.QueryContext(ctx,
+	rows, err := s.read.QueryContext(ctx,
 		`WITH base AS (
 		   SELECT upstream_model, ts, output_tokens, latency_ms, ttfb_ms,
 		          CASE WHEN status = 'ok' THEN 1 ELSE 0 END AS is_ok,

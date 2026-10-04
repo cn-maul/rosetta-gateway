@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"io"
 	"log/slog"
+	"strconv"
 	"testing"
 )
 
@@ -453,5 +454,61 @@ func TestStore_Pragmas(t *testing.T) {
 	}
 	if foreignKeys != 1 {
 		t.Fatalf("foreign_keys = %d, want 1 (ON)", foreignKeys)
+	}
+}
+
+// 审计 DAO：写入 → 读回（新→旧），字段名提取排序。
+func TestAuditDAO(t *testing.T) {
+	st := testStore(t, t.TempDir()+"/a.db")
+	ctx := context.Background()
+
+	if got := AuditFieldNames([]byte(`{"name":"x","enabled":true}`)); got != "enabled,name" {
+		t.Fatalf("field names = %q", got)
+	}
+	if got := AuditFieldNames([]byte(`not json`)); got != "" {
+		t.Fatalf("invalid json should yield empty fields, got %q", got)
+	}
+
+	for i, path := range []string{"/admin/api/keys", "/admin/api/routes", "/admin/api/keys"} {
+		if err := st.CreateAuditEntry(ctx, &AuditEntry{
+			Ts: int64(1000 + i), Actor: "admin", Remote: "10.0.0." + strconv.Itoa(i+1),
+			Method: "POST", Path: path, Status: 200, Fields: "name",
+		}); err != nil {
+			t.Fatalf("create audit %d: %v", i, err)
+		}
+	}
+	entries, err := st.ListAuditEntries(ctx, 2)
+	if err != nil {
+		t.Fatalf("list audit: %v", err)
+	}
+	if len(entries) != 2 || entries[0].Path != "/admin/api/keys" || entries[0].ID < entries[1].ID {
+		t.Fatalf("list order/limit wrong: %+v", entries)
+	}
+}
+
+// 读写分池：所有 DAO 读走读池（Reader），写走写池（单连接）。
+// 读后可见性是分池正确性的底线 —— WAL 下读者总能看到已提交的最新写入。
+func TestStore_ReadPoolServesReads(t *testing.T) {
+	st := testStore(t, t.TempDir()+"/rw.db")
+	ctx := context.Background()
+
+	if st.Reader() == st.DB() {
+		t.Fatalf("read pool must be a separate *sql.DB")
+	}
+	if err := st.CreateAccessKey(ctx, &AccessKey{
+		ID: "k1", KeyHash: "h1", KeyPrefix: "sk-gw-x", Name: "n",
+		Enabled: true, RPMLimit: 30, TPMLimit: 100000,
+	}); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	got, err := st.GetAccessKey(ctx, "k1")
+	if err != nil || got == nil {
+		t.Fatalf("get: %v %v", got, err)
+	}
+	if got.RPMLimit != 30 || got.TPMLimit != 100000 {
+		t.Fatalf("rate limits lost: %+v", got)
+	}
+	if quota, used, ok, err := st.GetKeyQuota(ctx, "k1"); err != nil || !ok || quota != 0 || used != 0 {
+		t.Fatalf("quota read via read pool: %v %v %d %d", ok, err, quota, used)
 	}
 }

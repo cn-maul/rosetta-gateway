@@ -13,6 +13,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -26,6 +27,7 @@ import (
 	"github.com/cn-maul/rosetta-gateway/internal/config"
 	"github.com/cn-maul/rosetta-gateway/internal/crypto"
 	"github.com/cn-maul/rosetta-gateway/internal/inwire"
+	"github.com/cn-maul/rosetta-gateway/internal/ratelimit"
 	"github.com/cn-maul/rosetta-gateway/internal/outwire"
 	"github.com/cn-maul/rosetta-gateway/internal/routing"
 	"github.com/cn-maul/rosetta-gateway/internal/server"
@@ -128,13 +130,17 @@ func main() {
 		)
 	}
 
-	masterKey, generatedKey, err := crypto.LoadMasterKey(cfg.MasterKeyEnv, homeDir)
+	masterKey, generatedKey, weakKey, err := crypto.LoadMasterKey(cfg.MasterKeyEnv, homeDir)
 	switch {
 	case err != nil:
 		logger.Warn("master key unavailable, credential encryption disabled", "error", err)
 		masterKey = nil
 	case generatedKey:
 		logger.Info("generated master key", "path", filepath.Join(homeDir, crypto.KeyFileName))
+	case weakKey:
+		logger.Warn("master key material is short (<32 chars) and looks like a passphrase; " +
+			"upstream API keys encrypted with it are brute-forceable offline. " +
+			"Recommended: delete the weak key, restart to auto-generate a random master.key, then re-save every credential")
 	}
 
 	db, err := store.Open(cfg.DBPath, logger)
@@ -158,8 +164,9 @@ func main() {
 
 	usage := newUsageRecorder(db, logger)
 	mux := http.NewServeMux()
-	mux.HandleFunc("POST /v1/chat/completions", handleIngress(pool, cfg, usage, openaiChatCodec{}))
-	mux.HandleFunc("POST /v1/messages", handleIngress(pool, cfg, usage, anthropicMessagesCodec{}))
+	rateLimiter := ratelimit.New()
+	mux.HandleFunc("POST /v1/chat/completions", handleIngress(pool, cfg, usage, rateLimiter, openaiChatCodec{}))
+	mux.HandleFunc("POST /v1/messages", handleIngress(pool, cfg, usage, rateLimiter, anthropicMessagesCodec{}))
 	// D9：/v1/models 在两种协议下路径相同、响应形状不同 —— 按认证头分流，
 	// 显式别名路径永远优先。
 	mux.HandleFunc("GET /v1/models", handleListModels(""))
@@ -193,6 +200,10 @@ func main() {
 		logger.Info("admin password loaded", "path", authStore.Path())
 	case adminToken != "":
 		logger.Info("using admin_token from config; set a password in the admin UI to override it")
+		if len(adminToken) < 16 {
+			logger.Warn("admin_token is shorter than 16 chars; a weak token can be brute-forced online " +
+				"(login throttling only slows it down). Set a strong admin password in the UI to override it")
+		}
 	default:
 		logger.Warn("no admin credential configured; the admin UI will ask you to set a password on first visit")
 	}
@@ -206,6 +217,7 @@ func main() {
 	statsHandler := admin.NewStatsHandler(db)
 	settingsHandler := admin.NewSettingsHandler(db, cfg)
 	reloadHandler := admin.NewReloadHandler(reloader.Reload)
+	auditHandler := admin.NewAuditHandler(db)
 	usageHandler := admin.NewUsageHandler(db)
 	passwordHandler := admin.NewPasswordHandler(authStore)
 
@@ -244,6 +256,7 @@ func main() {
 
 	adminMux.HandleFunc("GET /admin/api/stats", statsHandler.Get)
 	adminMux.HandleFunc("POST /admin/api/reload", reloadHandler.Reload)
+	adminMux.HandleFunc("GET /admin/api/audit", auditHandler.List)
 	adminMux.HandleFunc("GET /admin/api/usage", usageHandler.Query)
 	adminMux.HandleFunc("GET /admin/api/usage/by-key", usageHandler.GroupByKey)
 	adminMux.HandleFunc("GET /admin/api/usage/by-model", usageHandler.GroupByModel)
@@ -258,12 +271,30 @@ func main() {
 
 	adminWrapped := server.AdminAuth(adminMux, authStore)
 
+	// 管理写操作审计（DESIGN §13.3）：谁（单密码模型下记 admin + 来源 IP）、
+	// 何时、动了哪个资源、动了哪些字段（只记字段名不记值 —— body 里有
+	// api_key 与密码明文）。审计在重建之前同步落库，失败只 WARN 不阻塞。
+	audit := func(method, path string, status int, remote, fields string) {
+		entry := &store.AuditEntry{
+			Ts:     time.Now().UnixMilli(),
+			Actor:  "admin",
+			Remote: remote,
+			Method: method,
+			Path:   path,
+			Status: status,
+			Fields: fields,
+		}
+		if err := db.CreateAuditEntry(context.Background(), entry); err != nil {
+			logger.Warn("audit entry write failed", "error", err, "path", path)
+		}
+	}
+
 	// 管理写操作成功后自动重建运行时（池 + 快照）：配置生效不再依赖前端自觉调
 	// POST /admin/api/reload，任何带凭据的调用方（curl/脚本）写完立即生效 ——
 	// 包括禁用下游 Key 这类安全敏感操作（auth 读快照，不重建就照常放行）。
 	// AutoReload 在 AdminAuth 外侧：401/429 的失败响应不会触发重建。
 	// 前端 mutate() 里的 reload 调用保留为兜底（服务端重建失败时再给一次机会）。
-	adminAuto := server.AutoReload(adminWrapped, reloader.Reload, logger)
+	adminAuto := server.AutoReload(adminWrapped, reloader.Reload, audit, logger)
 
 	mux.Handle("GET /admin/api/", adminAuto)
 	mux.Handle("POST /admin/api/", adminAuto)
@@ -608,6 +639,54 @@ type ingressRequest struct {
 	applyUpstreamExtras func(req *rosetta.ChatRequest, upstreamProtocol string)
 }
 
+// rateCommit 把一次请求的 TPM 预占在请求终结时校正为真实用量。
+// nil 接收者安全：TPM 未启用（额度 0）时调用方可以放一个 nil。
+type rateCommit struct {
+	limiter  *ratelimit.Limiter
+	keyID    string
+	reserved int64
+}
+
+func (rc *rateCommit) commit(actual int64) {
+	if rc == nil {
+		return
+	}
+	rc.limiter.CommitTPM(rc.keyID, rc.reserved, actual)
+}
+
+// setRetryAfter 写 Retry-After 响应头（向上取整秒，至少 1）。
+func setRetryAfter(w http.ResponseWriter, d time.Duration) {
+	seconds := int(d.Seconds())
+	if seconds < 1 {
+		seconds = 1
+	}
+	w.Header().Set("Retry-After", strconv.Itoa(seconds))
+}
+
+// estimateRequestTokens 粗估一次请求的输入 token —— TPM 限速的预占依据。
+// 不追求精确（精确值在请求终结时经 CommitTPM 以真实 usage 校正），
+// 只需落在同一数量级，避免预占远小于真实值令 TPM 形同虚设、或反之误拒。
+// 口径：文本/思考/工具参数/工具定义的字符估算 + max_tokens（输出侧按上限全额
+// 预占，宁可先多占后退还，也不先少占再超发）。
+func estimateRequestTokens(req *rosetta.ChatRequest) int64 {
+	var b strings.Builder
+	b.WriteString(req.System)
+	for _, m := range req.Messages {
+		for _, blk := range m.Blocks {
+			b.WriteString(blk.Text)
+			b.WriteString(blk.Thinking)
+			b.WriteString(blk.Content)
+			b.WriteString(blk.Arguments)
+		}
+	}
+	for _, t := range req.Tools {
+		b.WriteString(t.Name)
+		b.WriteString(t.Description)
+		b.WriteString(string(t.Parameters))
+	}
+	return int64(rosetta.EstimateTokens(b.String())) + int64(req.MaxOutputTokens)
+}
+
 // openaiChatCodec 服务 POST /v1/chat/completions。
 type openaiChatCodec struct{}
 
@@ -674,7 +753,7 @@ func (anthropicMessagesCodec) NewSink(w http.ResponseWriter, model string) outwi
 	return outwire.NewAnthropicSSE(w, flusher, "msg_"+generateID(), model)
 }
 
-func handleIngress(pool *upstream.Pool, cfg *config.Config, usage *usageRecorder, codec ingressCodec) http.HandlerFunc {
+func handleIngress(pool *upstream.Pool, cfg *config.Config, usage *usageRecorder, limiter *ratelimit.Limiter, codec ingressCodec) http.HandlerFunc {
 	db, logger := usage.db, usage.logger
 	return func(w http.ResponseWriter, r *http.Request) {
 		start := time.Now()
@@ -682,6 +761,18 @@ func handleIngress(pool *upstream.Pool, cfg *config.Config, usage *usageRecorder
 		authCtx, err := auth.Authenticate(r)
 		if err != nil {
 			writeAuthError(w, err, codec.WriteError)
+			return
+		}
+
+		// RPM 限速（DESIGN §11.4）：额度随鉴权从快照带出（0 = 不限）。
+		// 被拒的请求同样计数 —— 固定窗口语义下请求就是发生了。
+		if ok, retry := limiter.AllowRPM(authCtx.KeyID, authCtx.RPMLimit); !ok {
+			logger.Warn("rate limited (rpm)", "key_id", authCtx.KeyID,
+				"retry_after", retry.String(),
+				"request_id", server.RequestIDFromContext(r.Context()))
+			setRetryAfter(w, retry)
+			codec.WriteError(w, http.StatusTooManyRequests, "rate_limit_exceeded",
+				"request rate limit exceeded for this API key")
 			return
 		}
 
@@ -713,9 +804,25 @@ func handleIngress(pool *upstream.Pool, cfg *config.Config, usage *usageRecorder
 			return
 		}
 
+		// TPM 限速（DESIGN §11.4）：流式下真实 token 只有流结束才知道，
+		// 所以按「请求前估算预占 + 请求后按真实 usage 校正」两段执行。
+		// 被拒的请求不预占（没放行就不该消耗窗口额度），也不预扣任何东西。
+		est := estimateRequestTokens(ing.buildRosetta())
+		if ok, retry := limiter.ReserveTPM(authCtx.KeyID, authCtx.TPMLimit, est); !ok {
+			logger.Warn("rate limited (tpm)", "key_id", authCtx.KeyID,
+				"estimated_tokens", est, "retry_after", retry.String(),
+				"request_id", server.RequestIDFromContext(r.Context()))
+			setRetryAfter(w, retry)
+			codec.WriteError(w, http.StatusTooManyRequests, "rate_limit_exceeded",
+				"token rate limit exceeded for this API key")
+			return
+		}
+		rate := &rateCommit{limiter: limiter, keyID: authCtx.KeyID, reserved: est}
+
 		snap := snapshot.Get()
 		res, err := snap.Routes.Resolve(ing.model)
 		if err != nil {
+			rate.commit(0)
 			codec.WriteError(w, http.StatusNotFound, "model_not_found", fmt.Sprintf("model %q not found", ing.model))
 			return
 		}
@@ -763,6 +870,7 @@ func handleIngress(pool *upstream.Pool, cfg *config.Config, usage *usageRecorder
 				logger.Info("client disconnected, aborting failover",
 					"model", ing.model, "attempt", i+1, "error", cerr,
 					"request_id", server.RequestIDFromContext(r.Context()))
+				rate.commit(0)
 				return
 			}
 
@@ -789,9 +897,9 @@ func handleIngress(pool *upstream.Pool, cfg *config.Config, usage *usageRecorder
 			}
 
 			if ing.stream {
-				out = attemptStream(w, r, client, ing, cand, keyID, codec, cfg, snap, usage, start)
+				out = attemptStream(w, r, client, ing, cand, keyID, codec, rate, cfg, snap, usage, start)
 			} else {
-				out = attemptNonStream(w, r, client, ing, cand, keyID, codec, cfg, snap, usage, start)
+				out = attemptNonStream(w, r, client, ing, cand, keyID, codec, rate, cfg, snap, usage, start)
 			}
 
 			if out.committed {
@@ -841,6 +949,7 @@ func handleIngress(pool *upstream.Pool, cfg *config.Config, usage *usageRecorder
 		if !clientGone {
 			codec.WriteError(w, statusCode, code, message)
 		}
+		rate.commit(0)
 		provID, upstreamModel := "", ""
 		if len(active) > 0 {
 			last := active[len(active)-1]
@@ -960,7 +1069,7 @@ func wantsStreamUsage(req *inwire.OpenAIChatRequest) bool {
 //
 // 本函数只做与协议无关的事：看门狗、心跳、事件循环、断流状态归类、落库；
 // 「统一事件 → 下游协议分片」全部经由 codec.NewSink 的 StreamSink 完成。
-func attemptStream(w http.ResponseWriter, r *http.Request, client *rosetta.Client, ing *ingressRequest, cand routing.Candidate, keyID string, codec ingressCodec, cfg *config.Config, snap *snapshot.Snapshot, usage *usageRecorder, start time.Time) attemptOutcome {
+func attemptStream(w http.ResponseWriter, r *http.Request, client *rosetta.Client, ing *ingressRequest, cand routing.Candidate, keyID string, codec ingressCodec, rate *rateCommit, cfg *config.Config, snap *snapshot.Snapshot, usage *usageRecorder, start time.Time) attemptOutcome {
 	ctx := r.Context()
 	logger := usage.logger
 	publicModel := ing.model
@@ -1135,10 +1244,12 @@ func attemptStream(w http.ResponseWriter, r *http.Request, client *rosetta.Clien
 		LatencyMs:       latency,
 		TTFBMs:          ttfbMs,
 	})
+	// TPM 校正：预占的估算值以真实 usage（输入+输出）替换。
+	rate.commit(lastUsage.TotalTokens)
 	return attemptOutcome{committed: true}
 }
 
-func attemptNonStream(w http.ResponseWriter, r *http.Request, client *rosetta.Client, ing *ingressRequest, cand routing.Candidate, keyID string, codec ingressCodec, cfg *config.Config, snap *snapshot.Snapshot, usage *usageRecorder, start time.Time) attemptOutcome {
+func attemptNonStream(w http.ResponseWriter, r *http.Request, client *rosetta.Client, ing *ingressRequest, cand routing.Candidate, keyID string, codec ingressCodec, rate *rateCommit, cfg *config.Config, snap *snapshot.Snapshot, usage *usageRecorder, start time.Time) attemptOutcome {
 	publicModel := ing.model
 	// 绑定 r.Context() 而非 context.Background()：客户端断开时上游调用应随之取消，
 	// 否则断连请求会一直占用上游连接与配额直到超时（默认 120s）。
@@ -1175,6 +1286,7 @@ func attemptNonStream(w http.ResponseWriter, r *http.Request, client *rosetta.Cl
 		LatencyMs:       latency,
 		TTFBMs:          ttfbMs,
 	})
+	rate.commit(resp.Usage.TotalTokens)
 	return attemptOutcome{committed: true}
 }
 

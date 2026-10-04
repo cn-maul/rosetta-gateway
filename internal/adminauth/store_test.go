@@ -31,13 +31,13 @@ func TestVerify_PasswordBeatsConfigToken(t *testing.T) {
 	}
 
 	// 设置用户密码后：密码生效，config 令牌**立即失效**。
-	if err := s.Set("hunter2"); err != nil {
+	if err := s.Set("hunter2x2"); err != nil {
 		t.Fatalf("set: %v", err)
 	}
 	if !s.HasUserPassword() {
 		t.Fatal("应报告已有用户密码")
 	}
-	if !s.Verify("hunter2") {
+	if !s.Verify("hunter2x2") {
 		t.Fatal("用户密码应可用")
 	}
 	if s.Verify("cfg-token") {

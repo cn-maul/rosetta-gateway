@@ -12,6 +12,10 @@ import (
 type Context struct {
 	KeyID string
 	Name  string
+	// RPMLimit / TPMLimit 是该 key 的每分钟限速额度（0 = 不限），
+	// 从快照随鉴权一并带出，供转发热路径执行限速（DESIGN §11.4）。
+	RPMLimit int
+	TPMLimit int
 }
 
 func Authenticate(r *http.Request) (*Context, error) {
@@ -36,7 +40,12 @@ func Authenticate(r *http.Request) (*Context, error) {
 	if !matched.Enabled {
 		return nil, ErrKeyDisabled
 	}
-	return &Context{KeyID: matched.ID, Name: matched.Name}, nil
+	return &Context{
+		KeyID:    matched.ID,
+		Name:     matched.Name,
+		RPMLimit: matched.RPMLimit,
+		TPMLimit: matched.TPMLimit,
+	}, nil
 }
 
 // extractKey 只从请求头取密钥。

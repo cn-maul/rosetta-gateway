@@ -50,7 +50,7 @@ func scanRoute(sc scanner) (Route, error) {
 }
 
 func (s *Store) ListRoutes(ctx context.Context) ([]Route, error) {
-	rows, err := s.db.QueryContext(ctx,
+	rows, err := s.read.QueryContext(ctx,
 		`SELECT `+routeColumns+` FROM routes ORDER BY created_at`)
 	if err != nil {
 		return nil, err
@@ -69,7 +69,7 @@ func (s *Store) ListRoutes(ctx context.Context) ([]Route, error) {
 }
 
 func (s *Store) GetRoute(ctx context.Context, id string) (*Route, error) {
-	r, err := scanRoute(s.db.QueryRowContext(ctx,
+	r, err := scanRoute(s.read.QueryRowContext(ctx,
 		`SELECT `+routeColumns+` FROM routes WHERE id = ?`, id))
 	if err == sql.ErrNoRows {
 		return nil, nil

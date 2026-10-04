@@ -82,7 +82,7 @@ func scanModel(sc scanner) (UpstreamModel, error) {
 }
 
 func (s *Store) ListUpstreamModels(ctx context.Context, providerID string) ([]UpstreamModel, error) {
-	rows, err := s.db.QueryContext(ctx,
+	rows, err := s.read.QueryContext(ctx,
 		`SELECT `+modelColumns+` FROM upstream_models WHERE provider_id = ? ORDER BY model_id`, providerID)
 	if err != nil {
 		return nil, err
@@ -101,7 +101,7 @@ func (s *Store) ListUpstreamModels(ctx context.Context, providerID string) ([]Up
 }
 
 func (s *Store) ListAllUpstreamModels(ctx context.Context) ([]UpstreamModel, error) {
-	rows, err := s.db.QueryContext(ctx,
+	rows, err := s.read.QueryContext(ctx,
 		`SELECT `+modelColumns+` FROM upstream_models ORDER BY provider_id, model_id`)
 	if err != nil {
 		return nil, err
@@ -120,7 +120,7 @@ func (s *Store) ListAllUpstreamModels(ctx context.Context) ([]UpstreamModel, err
 }
 
 func (s *Store) GetUpstreamModel(ctx context.Context, id string) (*UpstreamModel, error) {
-	m, err := scanModel(s.db.QueryRowContext(ctx,
+	m, err := scanModel(s.read.QueryRowContext(ctx,
 		`SELECT `+modelColumns+` FROM upstream_models WHERE id = ?`, id))
 	if err == sql.ErrNoRows {
 		return nil, nil

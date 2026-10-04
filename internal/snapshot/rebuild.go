@@ -91,10 +91,12 @@ func RebuildFromDB(ctx context.Context, st *store.Store) (*Snapshot, error) {
 	keysByHash := make(map[string]*KeySnapshot, len(keys))
 	for _, k := range keys {
 		keysByHash[k.KeyHash] = &KeySnapshot{
-			ID:      k.ID,
-			KeyHash: k.KeyHash,
-			Name:    k.Name,
-			Enabled: k.Enabled,
+			ID:       k.ID,
+			KeyHash:  k.KeyHash,
+			Name:     k.Name,
+			Enabled:  k.Enabled,
+			RPMLimit: k.RPMLimit,
+			TPMLimit: k.TPMLimit,
 		}
 	}
 	snap.KeysByHash = keysByHash

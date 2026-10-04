@@ -205,7 +205,7 @@ func (h *UsageHandler) Query(w http.ResponseWriter, r *http.Request) {
 		orderBy + ` LIMIT ?`
 	rowArgs := append(append([]any{}, args...), limit)
 
-	rows, err := h.store.DB().Query(query, rowArgs...)
+	rows, err := h.store.Reader().Query(query, rowArgs...)
 	if err != nil {
 		writeServerError(w, "usage query", err)
 		return
@@ -241,7 +241,7 @@ func (h *UsageHandler) Query(w http.ResponseWriter, r *http.Request) {
 func (h *UsageHandler) summarize(where string, args []any) (usageSummary, error) {
 	var s usageSummary
 	var avg sql.NullFloat64
-	err := h.store.DB().QueryRow(
+	err := h.store.Reader().QueryRow(
 		`SELECT COUNT(*),
 		        COALESCE(SUM(total_tokens), 0),
 		        COALESCE(SUM(input_tokens), 0),
@@ -310,13 +310,13 @@ func (h *UsageHandler) History(w http.ResponseWriter, r *http.Request) {
 
 	// 总条数单独统计（计数不需要 JOIN access_keys，WHERE 只引用 u.ts）。
 	var total int64
-	if err := h.store.DB().QueryRow(
+	if err := h.store.Reader().QueryRow(
 		`SELECT COUNT(*) FROM usage_records u`+usageHistoryWhere, from, to).Scan(&total); err != nil {
 		writeServerError(w, "usage history count", err)
 		return
 	}
 
-	rows, err := h.store.DB().Query(
+	rows, err := h.store.Reader().Query(
 		`SELECT u.ts, u.public_model, u.upstream_model, COALESCE(a.name, ''), u.access_key_id, u.total_tokens, u.ttfb_ms, u.latency_ms, u.status
 		   FROM usage_records u LEFT JOIN access_keys a ON a.id = u.access_key_id`+usageHistoryWhere+
 			` ORDER BY u.ts DESC, u.id DESC LIMIT ? OFFSET ?`, from, to, limit, offset)
@@ -398,7 +398,7 @@ func (h *UsageHandler) groupBy(w http.ResponseWriter, r *http.Request, column st
 	query := `SELECT ` + column + ` as key, COUNT(*), SUM(total_tokens) FROM usage_records` + where + ` GROUP BY ` + column + ` ` + order + ` LIMIT ?`
 	args = append(args, limit)
 
-	rows, err := h.store.DB().Query(query, args...)
+	rows, err := h.store.Reader().Query(query, args...)
 	if err != nil {
 		writeServerError(w, "usage group by "+column, err)
 		return
@@ -422,7 +422,7 @@ func (h *UsageHandler) groupByNamed(w http.ResponseWriter, r *http.Request, head
 	// 本分支的查询都 JOIN 了 usage_records u，ts 用 u. 前缀限定。
 	where, args := groupRangeClause(from, to, explicit, "u.")
 	args = append(args, limit)
-	rows, err := h.store.DB().Query(head+where+tail+" LIMIT ?", args...)
+	rows, err := h.store.Reader().Query(head+where+tail+" LIMIT ?", args...)
 	if err != nil {
 		writeServerError(w, "usage group by named", err)
 		return

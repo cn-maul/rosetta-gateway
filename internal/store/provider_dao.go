@@ -41,7 +41,7 @@ func scanProvider(sc scanner) (Provider, error) {
 }
 
 func (s *Store) ListProviders(ctx context.Context) ([]Provider, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT `+providerColumns+` FROM providers ORDER BY created_at`)
+	rows, err := s.read.QueryContext(ctx, `SELECT `+providerColumns+` FROM providers ORDER BY created_at`)
 	if err != nil {
 		return nil, err
 	}
@@ -59,7 +59,7 @@ func (s *Store) ListProviders(ctx context.Context) ([]Provider, error) {
 }
 
 func (s *Store) GetProvider(ctx context.Context, id string) (*Provider, error) {
-	p, err := scanProvider(s.db.QueryRowContext(ctx, `SELECT `+providerColumns+` FROM providers WHERE id = ?`, id))
+	p, err := scanProvider(s.read.QueryRowContext(ctx, `SELECT `+providerColumns+` FROM providers WHERE id = ?`, id))
 	if err == sql.ErrNoRows {
 		return nil, nil
 	}
@@ -70,7 +70,7 @@ func (s *Store) GetProvider(ctx context.Context, id string) (*Provider, error) {
 }
 
 func (s *Store) GetProviderBySlug(ctx context.Context, slug string) (*Provider, error) {
-	p, err := scanProvider(s.db.QueryRowContext(ctx, `SELECT `+providerColumns+` FROM providers WHERE slug = ?`, slug))
+	p, err := scanProvider(s.read.QueryRowContext(ctx, `SELECT `+providerColumns+` FROM providers WHERE slug = ?`, slug))
 	if err == sql.ErrNoRows {
 		return nil, nil
 	}

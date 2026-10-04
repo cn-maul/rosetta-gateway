@@ -138,7 +138,20 @@ export interface AccessKey {
   enabled: boolean
   quota_tokens: number
   used_tokens: number
+  rpm_limit: number // 每分钟请求数上限，0 = 不限
+  tpm_limit: number // 每分钟 token 上限，0 = 不限
   created_at: number
+}
+
+export interface AuditEntry {
+  id: number
+  ts: number
+  actor: string
+  remote: string
+  method: string
+  path: string
+  status: number
+  fields: string
 }
 
 export interface KeyCreateResponse extends AccessKey {

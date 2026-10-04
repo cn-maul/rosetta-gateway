@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 )
 
@@ -20,6 +21,7 @@ func TestAutoReload_TriggersOnSuccessfulWrite(t *testing.T) {
 	var reloads int
 	reload := func(context.Context) error { reloads++; return nil }
 	logger := newTestLogger()
+	audit := func(string, string, int, string, string) {}
 
 	base := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
@@ -29,7 +31,7 @@ func TestAutoReload_TriggersOnSuccessfulWrite(t *testing.T) {
 			w.WriteHeader(http.StatusOK)
 		}
 	})
-	h := AutoReload(base, reload, logger)
+	h := AutoReload(base, reload, audit, logger)
 
 	call := func(method, path string) {
 		t.Helper()
@@ -75,6 +77,38 @@ func TestAutoReload_TriggersOnSuccessfulWrite(t *testing.T) {
 	}
 }
 
+// 审计回调在成功写操作上被调用，且只带字段名、不带请求体值。
+func TestAutoReload_AuditCapturesFieldNames(t *testing.T) {
+	var audited []string
+	audit := func(method, path string, status int, remote, fields string) {
+		audited = append(audited, method+"|"+path+"|"+fields)
+	}
+	reload := func(context.Context) error { return nil }
+	base := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {})
+	h := AutoReload(base, reload, audit, newTestLogger())
+
+	rec := httptest.NewRecorder()
+	sw := &statusResponseWriter{ResponseWriter: rec, statusCode: http.StatusOK}
+	req := httptest.NewRequest(http.MethodPost, "/admin/api/keys", strings.NewReader(`{"name":"a","quota_tokens":100}`))
+	h.ServeHTTP(sw, req)
+
+	if len(audited) != 1 {
+		t.Fatalf("audit should fire exactly once, got %v", audited)
+	}
+	// 字段名排序后拼接；值（"a"/100）绝不出现。
+	if audited[0] != "POST|/admin/api/keys|name,quota_tokens" {
+		t.Fatalf("audit entry = %q", audited[0])
+	}
+
+	// GET 不审计。
+	rec = httptest.NewRecorder()
+	sw = &statusResponseWriter{ResponseWriter: rec, statusCode: http.StatusOK}
+	h.ServeHTTP(sw, httptest.NewRequest(http.MethodGet, "/admin/api/keys", nil))
+	if len(audited) != 1 {
+		t.Fatalf("GET must not be audited, got %v", audited)
+	}
+}
+
 // reload 失败只留日志、不向上传播 —— 此时响应已发出，无法改写；
 // 调用方（runtimeReloader）保证失败不改变运行状态。
 func TestAutoReload_ReloadFailureIsLoggedNotPanicked(t *testing.T) {
@@ -82,7 +116,7 @@ func TestAutoReload_ReloadFailureIsLoggedNotPanicked(t *testing.T) {
 	base := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 	})
-	h := AutoReload(base, reload, newTestLogger())
+	h := AutoReload(base, reload, nil, newTestLogger())
 
 	rec := httptest.NewRecorder()
 	sw := &statusResponseWriter{ResponseWriter: rec, statusCode: http.StatusOK}

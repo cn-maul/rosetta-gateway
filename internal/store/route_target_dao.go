@@ -34,7 +34,7 @@ func scanRouteTarget(sc scanner) (RouteTarget, error) {
 // ListAllRouteTargets 一次性拉出全部目标，供快照重建按 route_id 分组建链，
 // 避免对每条 route 各发一次查询。
 func (s *Store) ListAllRouteTargets(ctx context.Context) ([]RouteTarget, error) {
-	rows, err := s.db.QueryContext(ctx,
+	rows, err := s.read.QueryContext(ctx,
 		`SELECT `+routeTargetColumns+` FROM route_targets ORDER BY route_id, position`)
 	if err != nil {
 		return nil, err
@@ -53,7 +53,7 @@ func (s *Store) ListAllRouteTargets(ctx context.Context) ([]RouteTarget, error) 
 }
 
 func (s *Store) ListRouteTargets(ctx context.Context, routeID string) ([]RouteTarget, error) {
-	rows, err := s.db.QueryContext(ctx,
+	rows, err := s.read.QueryContext(ctx,
 		`SELECT `+routeTargetColumns+` FROM route_targets WHERE route_id = ? ORDER BY position`, routeID)
 	if err != nil {
 		return nil, err
@@ -72,7 +72,7 @@ func (s *Store) ListRouteTargets(ctx context.Context, routeID string) ([]RouteTa
 }
 
 func (s *Store) GetRouteTarget(ctx context.Context, id string) (*RouteTarget, error) {
-	t, err := scanRouteTarget(s.db.QueryRowContext(ctx,
+	t, err := scanRouteTarget(s.read.QueryRowContext(ctx,
 		`SELECT `+routeTargetColumns+` FROM route_targets WHERE id = ?`, id))
 	if err == sql.ErrNoRows {
 		return nil, nil

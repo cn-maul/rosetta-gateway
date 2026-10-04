@@ -37,6 +37,7 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+	"unicode"
 )
 
 const (
@@ -53,7 +54,45 @@ const (
 )
 
 // ErrWeakPassword 表示新密码未通过最低强度校验。
-var ErrWeakPassword = errors.New("密码长度至少为 6 位")
+//
+// 强度门槛（2026-10-04 从 6 位上调）：至少 8 字符 + 至少两类字符
+// （小写/大写/数字/符号）。理由：管理密码是在线爆破的目标（登录限速只是
+// 减速带），PBKDF2 只防离线；内网部署不等于低价值目标 —— 网关背后是
+// 所有上游的付费凭据。已在用的弱密码不受影响（校验只在 Set 时做），
+// 换密码时自然收紧。
+var ErrWeakPassword = errors.New("密码长度至少为 8 位，且需包含字母/数字/符号中的至少两类")
+
+// validatePassword 是新密码的最低强度门槛。只约束新设置的密码，
+// 不影响既有凭据的校验路径。
+func validatePassword(p string) error {
+	runes := []rune(p)
+	if len(runes) < 8 {
+		return ErrWeakPassword
+	}
+	var hasLower, hasUpper, hasDigit, hasOther bool
+	for _, r := range runes {
+		switch {
+		case unicode.IsLower(r):
+			hasLower = true
+		case unicode.IsUpper(r):
+			hasUpper = true
+		case unicode.IsDigit(r):
+			hasDigit = true
+		default:
+			hasOther = true
+		}
+	}
+	classes := 0
+	for _, h := range []bool{hasLower, hasUpper, hasDigit, hasOther} {
+		if h {
+			classes++
+		}
+	}
+	if classes < 2 {
+		return ErrWeakPassword
+	}
+	return nil
+}
 
 // Credential 是用户设置的管理密码经 KDF 派生后的持久化形态。
 // 明文密码不落盘、不进内存缓存，只在校验的瞬间存在。
@@ -180,8 +219,8 @@ func (s *Store) Verify(token string) bool {
 // 顺序很关键：先写盘再更新内存。反过来会在写盘失败时留下
 // 「内存已换、磁盘未换」的状态 —— 进程重启后密码悄悄回退，且没有任何提示。
 func (s *Store) Set(password string) error {
-	if len([]rune(password)) < 6 {
-		return ErrWeakPassword
+	if err := validatePassword(password); err != nil {
+		return err
 	}
 
 	salt := make([]byte, saltLen)

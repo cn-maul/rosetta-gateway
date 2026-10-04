@@ -14,6 +14,7 @@ import (
 	"testing"
 
 	"github.com/cn-maul/rosetta-gateway/internal/config"
+	"github.com/cn-maul/rosetta-gateway/internal/ratelimit"
 	"github.com/cn-maul/rosetta-gateway/internal/routing"
 	"github.com/cn-maul/rosetta-gateway/internal/snapshot"
 	"github.com/cn-maul/rosetta-gateway/internal/store"
@@ -177,7 +178,8 @@ func buildHarnessFull(t *testing.T, chain []struct {
 	}
 	snapshot.Init(snap)
 
-	return handleIngress(pool, cfg, newUsageRecorder(db, logger), codec), db, pool
+	rl := ratelimit.New()
+	return handleIngress(pool, cfg, newUsageRecorder(db, logger), rl, codec), db, pool
 }
 
 func postChat(h http.HandlerFunc, model string) *httptest.ResponseRecorder {
