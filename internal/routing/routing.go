@@ -214,6 +214,38 @@ func (ri *RouteIndex) ListRoutes() []*Route {
 	return routes
 }
 
+// UpstreamModelRef 是轨道二（slug/model 直连）的枚举项。
+type UpstreamModelRef struct {
+	ProviderID   string
+	ProviderSlug string
+	ModelID      string
+	Enabled      bool
+}
+
+// ListUpstreamModels 枚举全部 (provider, upstream model) 对，供
+// /v1/models?include=upstream 展开。providers 索引按 ID 与 slug 各存一份，
+// 这里按 ID 去重；model 本身禁用或 provider 禁用时 Enabled=false，
+// 由调用方决定是否列出。
+func (ri *RouteIndex) ListUpstreamModels() []UpstreamModelRef {
+	seen := make(map[string]bool, len(ri.providers))
+	out := make([]UpstreamModelRef, 0)
+	for _, p := range ri.providers {
+		if seen[p.ID] {
+			continue
+		}
+		seen[p.ID] = true
+		for _, m := range ri.providerModels[p.ID] {
+			out = append(out, UpstreamModelRef{
+				ProviderID:   p.ID,
+				ProviderSlug: p.Slug,
+				ModelID:      m.ModelID,
+				Enabled:      m.Enabled && p.Enabled,
+			})
+		}
+	}
+	return out
+}
+
 func (ri *RouteIndex) findProviderByID(id string) *ProviderRef {
 	return ri.providers[id]
 }

@@ -158,8 +158,13 @@ func main() {
 
 	usage := newUsageRecorder(db, logger)
 	mux := http.NewServeMux()
-	mux.HandleFunc("POST /v1/chat/completions", handleChatCompletions(pool, cfg, usage))
-	mux.HandleFunc("GET /v1/models", handleListModels())
+	mux.HandleFunc("POST /v1/chat/completions", handleIngress(pool, cfg, usage, openaiChatCodec{}))
+	mux.HandleFunc("POST /v1/messages", handleIngress(pool, cfg, usage, anthropicMessagesCodec{}))
+	// D9：/v1/models 在两种协议下路径相同、响应形状不同 —— 按认证头分流，
+	// 显式别名路径永远优先。
+	mux.HandleFunc("GET /v1/models", handleListModels(""))
+	mux.HandleFunc("GET /openai/v1/models", handleListModels("openai"))
+	mux.HandleFunc("GET /anthropic/v1/models", handleListModels("anthropic"))
 
 	// 管理端凭据。两个来源，优先级：用户在后台设置的密码（admin_auth.json）
 	// > config.json 的 admin_token（或 ADMIN_TOKEN 环境变量）作为兜底。
@@ -553,30 +558,130 @@ func buildSnapshotFromConfig(cfg *config.Config) *snapshot.Snapshot {
 // 而不是 provider/model 拼接串，否则按公开名解析会找不到模型。
 func cfgModelID(providerSlug, modelID string) string { return providerSlug + "/" + modelID }
 
-// writeAuthError 把鉴权失败映射成 OpenAI 兼容的错误响应。
+// errorWriter 是「按下游协议写出错误响应」的统一签名。
+type errorWriter func(w http.ResponseWriter, status int, code, message string)
+
+// writeAuthError 把鉴权失败映射成下游协议对应的错误响应。
 // /v1 下的每个端点都走这一处，免得口径漂移（例如某个端点把「密钥被禁用」
-// 也当成 401 而非 403）。
-func writeAuthError(w http.ResponseWriter, err error) {
+// 也当成 401 而非 403）。状态码与 code 是协议无关的语义，形状由各协议渲染。
+func writeAuthError(w http.ResponseWriter, err error, writeErr errorWriter) {
 	switch {
 	case errors.Is(err, auth.ErrNoKey):
-		outwire.WriteOpenAIError(w, http.StatusUnauthorized, "invalid_api_key", "missing API key")
+		writeErr(w, http.StatusUnauthorized, "invalid_api_key", "missing API key")
 	case errors.Is(err, auth.ErrKeyDisabled):
-		outwire.WriteOpenAIError(w, http.StatusForbidden, "invalid_api_key", "API key disabled")
+		writeErr(w, http.StatusForbidden, "invalid_api_key", "API key disabled")
 	case errors.Is(err, auth.ErrInvalidKey):
-		outwire.WriteOpenAIError(w, http.StatusUnauthorized, "invalid_api_key", "invalid API key")
+		writeErr(w, http.StatusUnauthorized, "invalid_api_key", "invalid API key")
 	default:
-		outwire.WriteOpenAIError(w, http.StatusUnauthorized, "invalid_api_key", "authentication failed")
+		writeErr(w, http.StatusUnauthorized, "invalid_api_key", "authentication failed")
 	}
 }
 
-func handleChatCompletions(pool *upstream.Pool, cfg *config.Config, usage *usageRecorder) http.HandlerFunc {
+// ---- 下游协议编解码（DESIGN §6.1 / §7）----
+//
+// ingressCodec 抽象「下游协议」的差异：解码请求、写错误、编码非流式响应、
+// 构造流式 sink。转发的骨架（鉴权、配额、路由、故障转移、看门狗、落库）
+// 是协议无关的，只有 handleIngress 一个实现 —— 新增下游协议不再复制循环。
+type ingressCodec interface {
+	// Name 是 usage_records.ingress_protocol 的取值。
+	Name() string
+	// Decode 读取并解析请求体；错误由调用方映射成 400/413。
+	Decode(r *http.Request, maxBytes int64) (*ingressRequest, error)
+	// WriteError 把网关内部 code 渲染成协议的错误形状。
+	WriteError(w http.ResponseWriter, status int, code, message string)
+	// WriteNonStream 编码非流式成功响应。
+	WriteNonStream(w http.ResponseWriter, resp *rosetta.ChatResponse, model string)
+	// NewSink 构造流式编码器；调用前 SSE 响应头已写出。
+	NewSink(w http.ResponseWriter, model string) outwire.StreamSink
+}
+
+// ingressRequest 是解码后的协议无关请求视图。
+//
+// buildRosetta 是**每次 attempt 调一次**的工厂而不是建好的请求：链上各目标的
+// 上游协议可能不同，applyUpstreamExtras 会往 req.Extra 挂不同形状的协议私有
+// 字段，跨 attempt 复用同一个实例会把 A 目标的 Extra 泄漏给 B 目标。
+type ingressRequest struct {
+	buildRosetta      func() *rosetta.ChatRequest
+	stream            bool
+	model             string // 对外的公开模型名（解析前原样）
+	wantsStreamUsage  bool
+	applyUpstreamExtras func(req *rosetta.ChatRequest, upstreamProtocol string)
+}
+
+// openaiChatCodec 服务 POST /v1/chat/completions。
+type openaiChatCodec struct{}
+
+func (openaiChatCodec) Name() string { return "openai-chat" }
+
+func (openaiChatCodec) Decode(r *http.Request, maxBytes int64) (*ingressRequest, error) {
+	req, err := inwire.DecodeOpenAIChatRequest(r, maxBytes)
+	if err != nil {
+		return nil, err
+	}
+	return &ingressRequest{
+		buildRosetta:        req.ToRosetta,
+		stream:              req.Stream,
+		model:               req.Model,
+		wantsStreamUsage:    wantsStreamUsage(req),
+		applyUpstreamExtras: req.ApplyProtocolPrivateExtra,
+	}, nil
+}
+
+func (openaiChatCodec) WriteError(w http.ResponseWriter, status int, code, message string) {
+	outwire.WriteOpenAIError(w, status, code, message)
+}
+
+func (openaiChatCodec) WriteNonStream(w http.ResponseWriter, resp *rosetta.ChatResponse, model string) {
+	outwire.WriteNonStreamResponse(w, resp, model)
+}
+
+func (openaiChatCodec) NewSink(w http.ResponseWriter, model string) outwire.StreamSink {
+	flusher, _ := w.(http.Flusher)
+	return outwire.NewOpenAISink(outwire.NewSSEWriter(w, flusher, "chatcmpl-"+generateID(), model, time.Now().Unix()))
+}
+
+// anthropicMessagesCodec 服务 POST /v1/messages（Anthropic Messages 协议，
+// Claude Code 等客户端的接入点）。
+type anthropicMessagesCodec struct{}
+
+func (anthropicMessagesCodec) Name() string { return "anthropic" }
+
+func (anthropicMessagesCodec) Decode(r *http.Request, maxBytes int64) (*ingressRequest, error) {
+	req, err := inwire.DecodeAnthropicMessagesRequest(r, maxBytes)
+	if err != nil {
+		return nil, err
+	}
+	return &ingressRequest{
+		buildRosetta:        req.ToRosetta,
+		stream:              req.Stream,
+		model:               req.Model,
+		// Anthropic 的 message_delta 恒带 usage，没有 include_usage 开关。
+		wantsStreamUsage:    false,
+		applyUpstreamExtras: req.ApplyUpstreamExtras,
+	}, nil
+}
+
+func (anthropicMessagesCodec) WriteError(w http.ResponseWriter, status int, code, message string) {
+	outwire.WriteAnthropicError(w, status, code, message)
+}
+
+func (anthropicMessagesCodec) WriteNonStream(w http.ResponseWriter, resp *rosetta.ChatResponse, model string) {
+	outwire.WriteAnthropicResponse(w, resp, model)
+}
+
+func (anthropicMessagesCodec) NewSink(w http.ResponseWriter, model string) outwire.StreamSink {
+	flusher, _ := w.(http.Flusher)
+	return outwire.NewAnthropicSSE(w, flusher, "msg_"+generateID(), model)
+}
+
+func handleIngress(pool *upstream.Pool, cfg *config.Config, usage *usageRecorder, codec ingressCodec) http.HandlerFunc {
 	db, logger := usage.db, usage.logger
 	return func(w http.ResponseWriter, r *http.Request) {
 		start := time.Now()
 
 		authCtx, err := auth.Authenticate(r)
 		if err != nil {
-			writeAuthError(w, err)
+			writeAuthError(w, err, codec.WriteError)
 			return
 		}
 
@@ -588,30 +693,30 @@ func handleChatCompletions(pool *upstream.Pool, cfg *config.Config, usage *usage
 		} else if ok && quota > 0 && used >= quota {
 			logger.Warn("quota exceeded", "key_id", authCtx.KeyID, "used", used, "quota", quota,
 				"request_id", server.RequestIDFromContext(r.Context()))
-			outwire.WriteOpenAIError(w, http.StatusTooManyRequests, "insufficient_quota",
+			codec.WriteError(w, http.StatusTooManyRequests, "insufficient_quota",
 				"this API key has exhausted its token quota")
 			return
 		}
 
-		req, err := inwire.DecodeOpenAIChatRequest(r, int64(cfg.Defaults.MaxRequestBodyBytes))
+		ing, err := codec.Decode(r, int64(cfg.Defaults.MaxRequestBodyBytes))
 		if err != nil {
 			// 超限时中间件的 MaxBytesReader 会返回 *http.MaxBytesError。
 			// 旧实现把它包成 "read body: ..." 一并当 400 回，客户端看不出
 			// 「是body太大」还是「body格式错」——两者要采取的行动完全不同。
 			var tooLarge *http.MaxBytesError
 			if errors.As(err, &tooLarge) {
-				outwire.WriteOpenAIError(w, http.StatusRequestEntityTooLarge, "invalid_request_error",
+				codec.WriteError(w, http.StatusRequestEntityTooLarge, "request_too_large",
 					fmt.Sprintf("request body exceeds %d bytes", tooLarge.Limit))
 				return
 			}
-			outwire.WriteOpenAIError(w, http.StatusBadRequest, "invalid_request_error", err.Error())
+			codec.WriteError(w, http.StatusBadRequest, "invalid_request_error", err.Error())
 			return
 		}
 
 		snap := snapshot.Get()
-		res, err := snap.Routes.Resolve(req.Model)
+		res, err := snap.Routes.Resolve(ing.model)
 		if err != nil {
-			outwire.WriteOpenAIError(w, http.StatusNotFound, "model_not_found", fmt.Sprintf("model %q not found", req.Model))
+			codec.WriteError(w, http.StatusNotFound, "model_not_found", fmt.Sprintf("model %q not found", ing.model))
 			return
 		}
 		route := res.Route
@@ -645,7 +750,6 @@ func handleChatCompletions(pool *upstream.Pool, cfg *config.Config, usage *usage
 		}
 
 		threshold := failoverFailureThreshold(snap, cfg)
-		sendUsage := wantsStreamUsage(req)
 		keyID := authCtx.KeyID
 
 		var out attemptOutcome
@@ -657,14 +761,14 @@ func handleChatCompletions(pool *upstream.Pool, cfg *config.Config, usage *usage
 			// 直接返回、不记 error usage（断流是客户端行为，不是上游故障）。
 			if cerr := r.Context().Err(); cerr != nil {
 				logger.Info("client disconnected, aborting failover",
-					"model", req.Model, "attempt", i+1, "error", cerr,
+					"model", ing.model, "attempt", i+1, "error", cerr,
 					"request_id", server.RequestIDFromContext(r.Context()))
 				return
 			}
 
-			rosettaReq := req.ToRosetta()
+			rosettaReq := ing.buildRosetta()
 			rosettaReq.Model = cand.UpstreamModel.ModelID
-			req.ApplyProtocolPrivateExtra(rosettaReq, cand.Provider.Protocol)
+			ing.applyUpstreamExtras(rosettaReq, cand.Provider.Protocol)
 
 			// 一次 attempt 只取该 provider 的一把凭据：某把 key 失败时本请求不就地换
 			// 同 provider 的下一把，而是让位给链上下一个目标。跨请求的 key 轮换交给
@@ -678,16 +782,16 @@ func handleChatCompletions(pool *upstream.Pool, cfg *config.Config, usage *usage
 					code: "upstream_error", message: "no available upstream provider"}
 				if !isLast {
 					logger.Warn("failover: no healthy credential, switching target",
-						"model", req.Model, "provider", cand.Provider.Slug, "request_id", server.RequestIDFromContext(r.Context()))
+						"model", ing.model, "provider", cand.Provider.Slug, "request_id", server.RequestIDFromContext(r.Context()))
 					continue
 				}
 				break
 			}
 
-			if req.Stream {
-				out = attemptStream(w, r, client, rosettaReq, req.Model, cand, keyID, sendUsage, cfg, snap, usage, start)
+			if ing.stream {
+				out = attemptStream(w, r, client, ing, cand, keyID, codec, cfg, snap, usage, start)
 			} else {
-				out = attemptNonStream(w, r, client, rosettaReq, req.Model, cand, keyID, cfg, snap, usage, start)
+				out = attemptNonStream(w, r, client, ing, cand, keyID, codec, cfg, snap, usage, start)
 			}
 
 			if out.committed {
@@ -719,7 +823,7 @@ func handleChatCompletions(pool *upstream.Pool, cfg *config.Config, usage *usage
 				break
 			}
 			logger.Warn("failover: switching to next target",
-				"model", req.Model, "from_provider", cand.Provider.Slug,
+				"model", ing.model, "from_provider", cand.Provider.Slug,
 				"error_code", out.code, "attempt", i+1,
 				"request_id", server.RequestIDFromContext(r.Context()))
 		}
@@ -735,7 +839,7 @@ func handleChatCompletions(pool *upstream.Pool, cfg *config.Config, usage *usage
 			statusCode, code, message = http.StatusBadGateway, "upstream_error", "no available upstream provider"
 		}
 		if !clientGone {
-			outwire.WriteOpenAIError(w, statusCode, code, message)
+			codec.WriteError(w, statusCode, code, message)
 		}
 		provID, upstreamModel := "", ""
 		if len(active) > 0 {
@@ -746,7 +850,7 @@ func handleChatCompletions(pool *upstream.Pool, cfg *config.Config, usage *usage
 		if clientGone {
 			status = "canceled"
 			logger.Info("client disconnected before any response was written",
-				"model", req.Model, "request_id", server.RequestIDFromContext(r.Context()))
+				"model", ing.model, "request_id", server.RequestIDFromContext(r.Context()))
 		}
 		errorCode := code
 		if clientGone {
@@ -755,11 +859,11 @@ func handleChatCompletions(pool *upstream.Pool, cfg *config.Config, usage *usage
 		usage.record(&store.UsageRecord{
 			ID:              generateID(),
 			AccessKeyID:     keyID,
-			PublicModel:     req.Model,
+			PublicModel:     ing.model,
 			ProviderID:      provID,
 			UpstreamModel:   upstreamModel,
-			IngressProtocol: "openai-chat",
-			Stream:          req.Stream,
+			IngressProtocol: codec.Name(),
+			Stream:          ing.stream,
 			UsageState:      "none",
 			Status:          status,
 			HTTPStatus:      statusCode,
@@ -853,11 +957,15 @@ func wantsStreamUsage(req *inwire.OpenAIChatRequest) bool {
 // 关键：SSE 头与状态码**推迟到拿到第一个上游事件之后才写**。这样「建立失败」
 // 和「首字迟迟不来」都发生在向下游写出任何字节之前，可安全地让外层循环换目标；
 // 一旦写了头并提交首个事件，就再无回退余地（DESIGN §414 的约束）。
-func attemptStream(w http.ResponseWriter, r *http.Request, client *rosetta.Client, req *rosetta.ChatRequest, publicModel string, cand routing.Candidate, keyID string, sendUsage bool, cfg *config.Config, snap *snapshot.Snapshot, usage *usageRecorder, start time.Time) attemptOutcome {
+//
+// 本函数只做与协议无关的事：看门狗、心跳、事件循环、断流状态归类、落库；
+// 「统一事件 → 下游协议分片」全部经由 codec.NewSink 的 StreamSink 完成。
+func attemptStream(w http.ResponseWriter, r *http.Request, client *rosetta.Client, ing *ingressRequest, cand routing.Candidate, keyID string, codec ingressCodec, cfg *config.Config, snap *snapshot.Snapshot, usage *usageRecorder, start time.Time) attemptOutcome {
 	ctx := r.Context()
 	logger := usage.logger
+	publicModel := ing.model
 
-	stream, err := client.ChatStream(ctx, req)
+	stream, err := client.ChatStream(ctx, ing.buildRosetta())
 	if err != nil {
 		return outcomeFromErr(err)
 	}
@@ -899,8 +1007,8 @@ func attemptStream(w http.ResponseWriter, r *http.Request, client *rosetta.Clien
 	w.Header().Set("X-Accel-Buffering", "no")
 	w.WriteHeader(http.StatusOK)
 
-	flusher, _ := w.(http.Flusher)
-	sse := outwire.NewSSEWriter(w, flusher, "chatcmpl-"+generateID(), publicModel, time.Now().Unix())
+	// 流式编码器由 codec 构造：OpenAI 走 SSEWriter，Anthropic 走块状态机。
+	sink := codec.NewSink(w, publicModel)
 
 	idleTimeout := streamIdleTimeout(snap, cfg)
 	var idleTimedOut atomic.Bool
@@ -926,13 +1034,13 @@ func attemptStream(w http.ResponseWriter, r *http.Request, client *rosetta.Clien
 	// 心跳只在**真的空闲**时才发。上游持续吐字时由 handleEvent 把 ticker 推后，
 	// 否则一条两秒的流会连发十几条 `: keepalive` —— 对标准 SSE 客户端无害，
 	// 对按行解析的下游是纯噪声。
-	// 心跳 goroutine 与主循环会并发写同一个 ResponseWriter，所以统一经由 sse
-	// （outwire.SSEWriter 内部有锁），不再自己 fmt.Fprintf(w, ...)。
+	// 心跳 goroutine 与主循环会并发写同一个 ResponseWriter，所以统一经由 sink
+	// （各实现内部有锁），不再自己 fmt.Fprintf(w, ...)。
 	go func() {
 		for {
 			select {
 			case <-heartbeatTicker.C:
-				sse.WriteComment("keepalive")
+				sink.Keepalive()
 			case <-ctx.Done():
 				return
 			}
@@ -944,44 +1052,24 @@ func attemptStream(w http.ResponseWriter, r *http.Request, client *rosetta.Clien
 	status := "ok"
 	errorCode := ""
 	httpStatus := 200
-	sawTerminal := false
-	wroteContent := false
 
-	// handleEvent 消费一个上游事件（首个 + 后续走同一套逻辑）。
-	handleEvent := func(ev *rosetta.Event) {
+	// consume 消费一个上游事件（首个 + 后续走同一套逻辑）：看门狗续期与
+	// usage/stopReason 留档是循环的职责，协议编码全部交给 sink。
+	consume := func(ev *rosetta.Event) {
 		idleTimer.Reset(idleTimeout)
 		heartbeatTicker.Reset(heartbeatInterval)
-		switch ev.Type {
-		case rosetta.EventMessageStart:
-			sse.SetResponseID(ev.ID)
-		case rosetta.EventTextDelta:
-			if ev.Text != "" {
-				wroteContent = true
-			}
-			sse.WriteTextDelta(ev.Text)
-		case rosetta.EventThinkingDelta:
-			// 思考增量必须透传：只吐 reasoning_content 的流若被丢掉，下游会收到
-			// 一条「零内容 + finish_reason:stop + [DONE]」的假正常流。空 Text 是
-			// Anthropic thinking signature 载体，OpenAI 下游无对应字段，跳过不算丢内容。
-			if ev.Text != "" {
-				wroteContent = true
-				sse.WriteThinkingDelta(ev.Text)
-			}
-		case rosetta.EventToolCall:
-			wroteContent = true
-			sse.WriteToolCallDelta(ev.ToolIndex, ev.ToolID, ev.ToolName, ev.ArgumentsDelta)
-		case rosetta.EventMessageEnd:
-			sawTerminal = true
+		if ev.Type == rosetta.EventMessageEnd {
 			if ev.Usage != nil {
 				lastUsage = *ev.Usage
 			}
 			stopReason = ev.StopReason
 		}
+		sink.Event(ev)
 	}
 
-	handleEvent(stream.Event())
+	consume(stream.Event())
 	for stream.Next() {
-		handleEvent(stream.Event())
+		consume(stream.Event())
 	}
 
 	if err := stream.Err(); err != nil {
@@ -1004,14 +1092,14 @@ func attemptStream(w http.ResponseWriter, r *http.Request, client *rosetta.Clien
 			errorCode = "upstream_error"
 			logger.Error("stream error", "error", err, "model", publicModel, "key_id", keyID)
 		}
-	} else if idleTimedOut.Load() && !sawTerminal {
+	} else if idleTimedOut.Load() && !sink.SawTerminal() {
 		status = "truncated"
 		errorCode = "stream_idle_timeout"
 		logger.Warn("stream cut by idle watchdog without terminal event",
 			"model", publicModel, "key_id", keyID,
 			"idle_timeout_ms", idleTimeout.Milliseconds(),
-			"content_written", wroteContent)
-	} else if !wroteContent {
+			"content_written", sink.WroteContent())
+	} else if !sink.WroteContent() {
 		logger.Warn("stream finished with no content",
 			"model", publicModel, "key_id", keyID,
 			"stop_reason", string(stopReason),
@@ -1020,15 +1108,10 @@ func attemptStream(w http.ResponseWriter, r *http.Request, client *rosetta.Clien
 			"reasoning_tokens", lastUsage.ReasoningTokens)
 	}
 
-	if status == "ok" {
-		sse.WriteFinish(outwire.OpenAIFinishReason(stopReason))
-	}
-	if sendUsage && (lastUsage.InputTokens > 0 || lastUsage.OutputTokens > 0) {
-		sse.WriteUsage(lastUsage)
-	}
-	if status == "ok" {
-		sse.WriteDone()
-	}
+	// 终止序列由 sink 按协议收尾：ok 时发终止事件（finish_reason+[DONE] 或
+	// message_delta+message_stop），断流按 DESIGN §8.2 不发终止（OpenAI）/
+	// 发 error 事件（Anthropic），canceled 不写任何东西。
+	sink.Finish(status, stopReason, lastUsage, ing.wantsStreamUsage)
 
 	latency := time.Since(start).Milliseconds()
 
@@ -1038,7 +1121,7 @@ func attemptStream(w http.ResponseWriter, r *http.Request, client *rosetta.Clien
 		PublicModel:     publicModel,
 		ProviderID:      cand.Provider.ID,
 		UpstreamModel:   cand.UpstreamModel.ModelID,
-		IngressProtocol: "openai-chat",
+		IngressProtocol: codec.Name(),
 		Stream:          true,
 		InputTokens:     lastUsage.InputTokens,
 		OutputTokens:    lastUsage.OutputTokens,
@@ -1055,13 +1138,14 @@ func attemptStream(w http.ResponseWriter, r *http.Request, client *rosetta.Clien
 	return attemptOutcome{committed: true}
 }
 
-func attemptNonStream(w http.ResponseWriter, r *http.Request, client *rosetta.Client, req *rosetta.ChatRequest, publicModel string, cand routing.Candidate, keyID string, cfg *config.Config, snap *snapshot.Snapshot, usage *usageRecorder, start time.Time) attemptOutcome {
+func attemptNonStream(w http.ResponseWriter, r *http.Request, client *rosetta.Client, ing *ingressRequest, cand routing.Candidate, keyID string, codec ingressCodec, cfg *config.Config, snap *snapshot.Snapshot, usage *usageRecorder, start time.Time) attemptOutcome {
+	publicModel := ing.model
 	// 绑定 r.Context() 而非 context.Background()：客户端断开时上游调用应随之取消，
 	// 否则断连请求会一直占用上游连接与配额直到超时（默认 120s）。
 	ctx, cancel := context.WithTimeout(r.Context(), nonStreamTimeout(snap, cfg))
 	defer cancel()
 
-	resp, err := client.Chat(ctx, req)
+	resp, err := client.Chat(ctx, ing.buildRosetta())
 	if err != nil {
 		return outcomeFromErr(err)
 	}
@@ -1070,7 +1154,7 @@ func attemptNonStream(w http.ResponseWriter, r *http.Request, client *rosetta.Cl
 	latency := time.Since(start).Milliseconds()
 	ttfbMs := latency
 
-	outwire.WriteNonStreamResponse(w, resp, publicModel)
+	codec.WriteNonStream(w, resp, publicModel)
 
 	usage.record(&store.UsageRecord{
 		ID:              generateID(),
@@ -1078,7 +1162,7 @@ func attemptNonStream(w http.ResponseWriter, r *http.Request, client *rosetta.Cl
 		PublicModel:     publicModel,
 		ProviderID:      cand.Provider.ID,
 		UpstreamModel:   cand.UpstreamModel.ModelID,
-		IngressProtocol: "openai-chat",
+		IngressProtocol: codec.Name(),
 		Stream:          false,
 		InputTokens:     resp.Usage.InputTokens,
 		OutputTokens:    resp.Usage.OutputTokens,
@@ -1185,42 +1269,92 @@ func (u *usageRecorder) wait(ctx context.Context) {
 	}
 }
 
-func handleListModels() http.HandlerFunc {
+func handleListModels(forceShape string) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		// 与 /v1/chat/completions 同一鉴权口径（官方 OpenAI 的 /v1/models 同样要求
-		// Authorization）。这里不查配额 —— 列个目录不消耗 token —— 但必须校验密钥：
+		// D9 分流（DESIGN §6.1）：显式别名路径永远优先；/v1/models 按认证头
+		// 分流 —— 带 x-api-key 且不带 Authorization: Bearer 的请求按 Anthropic
+		// 形状返回，其余按 OpenAI 形状。
+		shape := forceShape
+		if shape == "" {
+			if r.Header.Get("X-Api-Key") != "" && !hasBearer(r) {
+				shape = "anthropic"
+			} else {
+				shape = "openai"
+			}
+		}
+		writeErr := errorWriter(outwire.WriteOpenAIError)
+		if shape == "anthropic" {
+			writeErr = outwire.WriteAnthropicError
+		}
+
+		// 与转发入口同一鉴权口径（官方 OpenAI / Anthropic 的 /v1/models 同样要求
+		// 认证）。这里不查配额 —— 列个目录不消耗 token —— 但必须校验密钥：
 		// 否则任何人都能枚举出全部公开模型名，等于白送一份路由与供应商结构图。
 		if _, err := auth.Authenticate(r); err != nil {
-			writeAuthError(w, err)
+			writeAuthError(w, err, writeErr)
 			return
 		}
 
-		type openaiModelEntry struct {
-			ID      string `json:"id"`
-			Object  string `json:"object"`
-			Created int64  `json:"created"`
-			OwnedBy string `json:"owned_by"`
+		snap := snapshot.Get()
+		// 轨道一：虚拟名。?include=upstream 时追加轨道二的 slug/model 形式
+		// （可能非常长且随 provider 增长，默认不列 —— DESIGN §5.2）。
+		ids := make([]string, 0, 16)
+		seen := make(map[string]bool)
+		for _, route := range snap.Routes.ListRoutes() {
+			if route.Enabled && !seen[route.PublicName] {
+				seen[route.PublicName] = true
+				ids = append(ids, route.PublicName)
+			}
 		}
-
-		routes := snapshot.Get().Routes.ListRoutes()
-		data := make([]openaiModelEntry, 0, len(routes))
-		for _, route := range routes {
-			if route.Enabled {
-				data = append(data, openaiModelEntry{
-					ID:      route.PublicName,
-					Object:  "model",
-					Created: 0,
-					OwnedBy: "gateway",
-				})
+		if r.URL.Query().Get("include") == "upstream" {
+			for _, m := range snap.Routes.ListUpstreamModels() {
+				id := m.ProviderSlug + "/" + m.ModelID
+				if m.Enabled && !seen[id] {
+					seen[id] = true
+					ids = append(ids, id)
+				}
 			}
 		}
 
 		w.Header().Set("Content-Type", "application/json")
+		if shape == "anthropic" {
+			entries := make([]map[string]any, 0, len(ids))
+			for _, id := range ids {
+				// created_at：网关不为模型持久化创建时间，用固定纪元占位
+				//（客户端不消费该字段，保持确定性比编一个值诚实）。
+				entries = append(entries, map[string]any{
+					"type": "model", "id": id, "display_name": id,
+					"created_at": "1970-01-01T00:00:00Z",
+				})
+			}
+			var first, last any
+			if len(entries) > 0 {
+				first, last = entries[0]["id"], entries[len(entries)-1]["id"]
+			}
+			json.NewEncoder(w).Encode(map[string]any{
+				"data": entries, "has_more": false, "first_id": first, "last_id": last,
+			})
+			return
+		}
+
+		entries := make([]map[string]any, 0, len(ids))
+		for _, id := range ids {
+			entries = append(entries, map[string]any{
+				"id": id, "object": "model", "created": 0, "owned_by": "gateway",
+			})
+		}
 		json.NewEncoder(w).Encode(map[string]any{
 			"object": "list",
-			"data":   data,
+			"data":   entries,
 		})
 	}
+}
+
+// hasBearer 报告请求是否带 Authorization: Bearer 头（D9 分流用，大小写不敏感）。
+func hasBearer(r *http.Request) bool {
+	const prefix = "Bearer "
+	auth := r.Header.Get("Authorization")
+	return len(auth) > len(prefix) && strings.EqualFold(auth[:len(prefix)], prefix)
 }
 
 func generateID() string {

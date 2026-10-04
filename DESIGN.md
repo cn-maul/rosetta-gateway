@@ -321,10 +321,10 @@ resolve(model):
 
 | 路径 | 协议 | 备注 |
 |---|---|---|
-| `POST /v1/chat/completions` | OpenAI Chat | P0 |
-| `POST /v1/responses` | OpenAI Responses | P3 |
-| `POST /v1/messages` | Anthropic Messages | P3 |
-| `GET /v1/models` | 形状按认证头分流（D9） | P0 只出 OpenAI 形状 |
+| `POST /v1/chat/completions` | OpenAI Chat | P0，已实现 |
+| `POST /v1/messages` | Anthropic Messages | **已实现（2026-10-02）**——Claude Code 把 `ANTHROPIC_BASE_URL` 指向网关即可用；thinking 回放（含签名）见 §17 R4 |
+| `POST /v1/responses` | OpenAI Responses | **未实现**（唯一的下游协议缺口；需要它的客户端可暂走 `/v1/chat/completions`） |
+| `GET /v1/models` | 形状按认证头分流（D9） | 已实现，支持 `?include=upstream` 展开轨道二 |
 | `GET /openai/v1/models` | 强制 OpenAI 形状 | 别名 |
 | `GET /anthropic/v1/models` | 强制 Anthropic 形状 | 别名 |
 
@@ -493,6 +493,9 @@ PATCH 结构体里刻意不含该字段，传了也会被忽略。
 - **Rosetta 没有流空闲超时**（全仓检索 `idle` 仅命中一句注释），看门狗是网关职责。
 
 **P0 只需实现 OpenAI Chat 那一套**，是 9 件里的 3 件。其余 6 件留到 P3。
+> 落地更新（2026-10-02）：OpenAI Chat 与 Anthropic Messages 两套入口已实现，
+> 转发骨架（鉴权/配额/路由/故障转移/看门狗/落库）通过 `ingressCodec` 接口复用，
+> 各协议只实现「解码请求 + 渲染错误/响应/SSE」。OpenAI Responses 入口仍未实现。
 
 ---
 
@@ -517,6 +520,7 @@ PATCH 结构体里刻意不含该字段，传了也会被忽略。
 | usage 合成 | OpenAI 下游要 usage 需客户端传 `stream_options.include_usage`；网关在 `EventMessageEnd` 处合成仅含 usage 的 chunk，且仅当客户端要求时下发 |
 | 断流处理 | 见 §8.2 |
 | 缓冲 | 逐事件 Flush，不做批量聚合（延迟优先） |
+| Anthropic 下游 | 事件序列 `message_start → (content_block_start → delta* → stop)* → message_delta(stop_reason, usage) → message_stop`，块 index 严格递增（文本/思考/工具各一块，`outwire.AnthropicSSE` 状态机）。message_start 的 `input_tokens` 发 0 —— 上游在结束时才报 usage，权威值随 message_delta 的累计 usage 补齐；断流发 `event: error` 且不发 message_stop（§8.2）。协议骨架与 OpenAI 共用一个 `StreamSink` 接口（`ingressCodec`），看门狗/心跳/断流归类只写一份 |
 | 全局 WriteTimeout | **必须为 0**：net/http 的写超时从「开始写响应」起算、覆盖整个响应时长，定时值一到会把仍在正常吐字的长流硬切（大输出的慢推理模型恰好会撞上），下游只看到来历不明的 truncated。流的生命周期由 TTFT/空闲看门狗约束，非流式由 `upstream_timeout` 限定 handler 时长；全局写超时在这里只会误伤，不多保护任何东西（2026-10-01 修正，此前 5 分钟） |
 
 ### 8.2 断流语义
@@ -1005,7 +1009,7 @@ rosetta-gateway/
 | R1 | Rosetta 不导出协议映射层，下游侧 9 件转换全靠网关自己写 | 工作量集中在 P0 与 P3 | 已确认 P0 只需 3 件；P3 再评估是否向 Rosetta 提导出需求 |
 | R2 | 一维模型名承载二维命名空间 | 可能歧义 | 解析优先级封死（§5），管理界面做撞名提示 |
 | R3 | `/v1/models` 在两种协议下路径相同、形状不同 | 客户端拿错格式 | 按认证头分流 + 显式别名路径（§6.1） |
-| R4 | **Anthropic thinking block 带 `signature`，跨协议转换会失效** | 下游 Anthropic + 上游非 Anthropic 时，多轮回传 thinking 会 400 | 该组合下默认剥掉历史 thinking 块（可配开关）。P3 处理 |
+| R4 | **Anthropic thinking block 带 `signature`，跨协议转换会失效** | 下游 Anthropic + 上游非 Anthropic 时，多轮回传 thinking 会 400 | **已解决（2026-10-02）**：thinking（含签名）在统一模型里原生表达（`Block.Thinking/Signature`），Anthropic 上游完整回放；OpenAI 系上游由 SDK 适配器剥除历史 thinking 块。无需开关 |
 | R5 | 流式断流无法回滚 | 下游可能收到半截回答 | 约定：不发终止事件，直接断连（§8.2） |
 | R6 | 流式配额必然可能超发 | 需接受 | 设计明示，界面明示（§11.2） |
 | R7 | 多模态 base64 让请求体很大 | 内存与 body 限制 | `max_request_body_bytes` 默认 32 MiB；注意 Rosetta chat 的 1 MiB 限制是**响应**侧，不冲突 |

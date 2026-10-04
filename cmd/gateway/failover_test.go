@@ -91,7 +91,7 @@ func buildHarness(t *testing.T, chain []struct {
 	fail      bool
 }, failover bool, ttftMs ...int) (http.HandlerFunc, *store.Store) {
 	t.Helper()
-	h, db, _ := buildHarnessFull(t, chain, failover, ttftMs...)
+	h, db, _ := buildHarnessFull(t, chain, failover, openaiChatCodec{}, ttftMs...)
 	return h, db
 }
 
@@ -100,7 +100,7 @@ func buildHarness(t *testing.T, chain []struct {
 func buildHarnessFull(t *testing.T, chain []struct {
 	slug, url string
 	fail      bool
-}, failover bool, ttftMs ...int) (http.HandlerFunc, *store.Store, *upstream.Pool) {
+}, failover bool, codec ingressCodec, ttftMs ...int) (http.HandlerFunc, *store.Store, *upstream.Pool) {
 	t.Helper()
 
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
@@ -177,7 +177,7 @@ func buildHarnessFull(t *testing.T, chain []struct {
 	}
 	snapshot.Init(snap)
 
-	return handleChatCompletions(pool, cfg, newUsageRecorder(db, logger)), db, pool
+	return handleIngress(pool, cfg, newUsageRecorder(db, logger), codec), db, pool
 }
 
 func postChat(h http.HandlerFunc, model string) *httptest.ResponseRecorder {
@@ -374,7 +374,7 @@ func TestFailover_ClientDisconnectMidFlightDoesNotPoisonCredential(t *testing.T)
 		fail      bool
 	}{
 		{"slow", srv.URL, false},
-	}, true)
+	}, true, openaiChatCodec{})
 
 	ctx, cancel := context.WithCancel(context.Background())
 	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions",

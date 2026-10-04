@@ -1401,3 +1401,70 @@ AutoReload 三者共用同一把锁。前端 `mutate()` 的 reload 调用保留�
 | SQLite 读写连接分离 | 消统计重查询与热路径互斥；查询加界后紧迫性下降 |
 | 安全硬化 | 管理密码仅 6 位下限；主密钥 env 口令场景无 KDF（自动生成的 master.key 不受影响） |
 | History 过滤/导出 | 按状态/模型/Key 过滤 + CSV 导出 |
+
+---
+
+# Anthropic 入口落地 — 2026-10-02（P3 大件之一）
+
+内容：`POST /v1/messages`（Anthropic Messages 协议）端到端实现 + `/v1/models` 双形状
+分流（D9）落地。**Claude Code 现在可以把 `ANTHROPIC_BASE_URL` 指向网关**，
+用网关的 `sk-gw-*` key 即可（x-api-key 与 Authorization: Bearer 都认）。
+
+## 架构：ingressCodec + StreamSink
+
+转发的骨架（鉴权、配额预检、路由、故障转移循环、TTFT/空闲看门狗、心跳、断流
+归类、用量落库）此前与 OpenAI 的 SSE 编码耦合在 `handleChatCompletions` 里。
+本次抽成两个接口，骨架只剩一份：
+
+- `ingressCodec`（cmd/gateway）：`Decode` / `WriteError` / `WriteNonStream` /
+  `NewSink` / `Name`（落库的 ingress_protocol）。openai-chat 与 anthropic 各一份。
+- `outwire.StreamSink`：统一事件 → 协议分片。OpenAI 实现包装既有 `SSEWriter`
+  （行为逐字节不变）；Anthropic 实现（`AnthropicSSE`）是块状态机 ——
+  message_start → content_block_*(index 严格递增) → message_delta → message_stop。
+
+注意 `ingressRequest.buildRosetta` 是**每次 attempt 调一次**的工厂：链上各目标
+上游协议不同，applyUpstreamExtras 会挂不同形状的 Extra，复用同一实例会把
+A 目标的 Extra 泄漏给 B 目标（这正是旧代码在循环内反复 ToRosetta 的原因，
+重构必须保留）。
+
+## /v1/messages 覆盖面
+
+- 解码（inwire/anthropic.go）：system（字符串/块数组，块级 cache_control 透传）、
+  content 字符串/块数组、tool_use/tool_result（user 轮里的 tool_result 拆成
+  rosetta 的 RoleTool 消息）、thinking + 签名回放、redacted_thinking、
+  image（base64→data: URI / url）、document（PDF）、tools(input_schema + 缓存断点)、
+  thinking{type,budget_tokens}、stop_sequences。max_tokens 按协议要求强制必填。
+- 协议私有字段按**上游**协议挂载（ApplyUpstreamExtras）：anthropic 上游拿
+  top_k + 原形状 tool_choice；openai-chat 上游拿翻译后的 tool_choice
+  （any→required、tool→function 形状）、top_k 丢弃；responses 上游跳过。
+- 非流式：content 块按序输出（thinking/text/tool_use），stop_reason 映射
+  （length→max_tokens、tool_use→tool_use、content_filter/refusal→refusal、
+  其余→end_turn），usage 带 cache_read/cache_creation。
+- 流式：块状态机 + 签名透传（signature_delta）；message_start 的 input_tokens
+  发 0（上游结束时才报），权威 usage 随 message_delta 补齐；断流发
+  `event: error` 且不发 message_stop（DESIGN §8.2 原文）；canceled 零写入。
+- 错误形状：`{"type":"error","error":{"type","message"}}`，网关内部 code 映射为
+  Anthropic 类型（401→authentication_error、403→permission_error、
+  model_not_found→not_found_error、配额/限流→rate_limit_error、413→request_too_large、
+  upstream_*→api_error）。
+- D9：`GET /v1/models` 按认证头分流（x-api-key 且无 Bearer → Anthropic 形状），
+  `/openai/v1/models`、`/anthropic/v1/models` 别名强制形状，
+  `?include=upstream` 展开轨道二（新增 `RouteIndex.ListUpstreamModels`）。
+
+## 已知取舍
+
+- message_start 阶段 input_tokens 未知（上游 usage 只在结束时交付），发 0，
+  客户端成本统计以 message_delta 的累计值为准 —— 实测 Claude Code 兼容。
+- `POST /v1/responses`（OpenAI Responses 入口）仍未实现，是唯一的下游协议缺口。
+- 未知 content 块类型交给 rosetta validate 报 400，不静默丢弃。
+
+## 验证证据
+
+- `go build ./...` / `go vet ./...` 无输出；`go test ./... -count=1` 全绿。
+- 新增测试：outwire 7 例（文本/思考+签名/双工具块/断流 error 事件/canceled
+  零写入/非流式编码/错误映射表）、inwire 5 例（全特性解码/max_tokens 必填/
+  tool_choice 翻译与校验/thinking 校验/413）、cmd 5 例
+  （messages 非流式/流式事件序列/鉴权与 404 的 Anthropic 形状/models 分流矩阵）。
+- 既有回归全绿：failover 9 例、quota、throttle、admin 全部未动并通过。
+- DESIGN 同步：§6.1（入口现状）、§7（编解码分工）、§8.1（Anthropic 下游）、
+  §17 R4（已解决）。
