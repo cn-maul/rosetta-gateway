@@ -26,3 +26,10 @@ web/** text eol=lf
 
 # go:embed 的数据源同理：入库产物也锁 LF，避免签出后与构建结果不一致。
 internal/webui/dist/** text eol=lf
+
+# Go 源码锁 LF：gofmt 以 LF 为准，CRLF 文件会被 gofmt -l 判为待格式化
+#（实测 `printf 'package x\r\n' > x.go; gofmt -l x.go` 必定输出该文件），
+# 也会让 go vet / golangci-lint 与 CI 的格式校验口径不一致。
+*.go text eol=lf
+go.mod text eol=lf
+go.sum text eol=lf
