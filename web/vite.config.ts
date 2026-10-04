@@ -1,5 +1,4 @@
 import { readFileSync } from 'node:fs'
-import { fileURLToPath } from 'node:url'
 import { defineConfig } from 'vite'
 import vue from '@vitejs/plugin-vue'
 
@@ -35,18 +34,6 @@ function gatewayTarget(): string {
 export default defineConfig({
   base: './',
   plugins: [vue()],
-  // root 固定为工程目录的**相对**解析基准，作用域ID(scopeId)才能跨平台一致。
-  //
-  // @vitejs/plugin-vue 默认用 .vue 文件的**绝对路径**计算 scoped CSS 的
-  // data-v-xxx 哈希。CI 在 ubuntu 上是 /home/runner/work/...，本地是
-  // C:\Users\<user>\...，路径不同 → 哈希不同：
-  //   旧产物 data-v-54140f4c，CI 上变成 data-v-1fb04c12
-  // → CSS/JS 内容变 → content hash 文件名变（C8ncBb6Z → Bhfa2-TX）
-  // → CI 的 `git diff --exit-code -- internal/webui/dist` 必然报红，
-  // 而 diff 里看到的只是文件名变了，肉眼完全看不出真正原因。
-  //
-  // 用相对 root 固定哈希输入，使产物逐字节可复现。
-  root: fileURLToPath(new URL('.', import.meta.url)),
   define: {
     __APP_VERSION__: JSON.stringify(pkgVersion),
     __ROSETTA_VERSION__: JSON.stringify(rosettaVersion),
