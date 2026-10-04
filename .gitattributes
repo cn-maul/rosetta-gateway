@@ -11,3 +11,18 @@ Dockerfile text eol=lf
 *.sh text eol=lf
 *.yml text eol=lf
 *.yaml text eol=lf
+
+# 前端源码锁定 LF：跨平台构建产物必须逐字节一致。
+#
+# CI（ubuntu）会 `npm run build && node sync-embed.mjs` 后用
+# `git diff --exit-code -- internal/webui/dist` 校验产物同步。
+# 本仓库开了 core.autocrlf=true，Windows 上签出时 LF 源文件被**转成 CRLF**，
+# 而 vite 对 public/ 下的文件是原样拷贝、对 index.html 也保留行尾符：
+#   Windows 构建 → 源含 CR → 产物含 CR
+#   ubuntu  构建 → 源纯 LF → 产物纯 LF
+# 两者内容不同 → content hash 不同 → CI 的 git diff 必然报红，
+# 且差异只有行尾符，肉眼与常规 diff 完全看不出。
+web/** text eol=lf
+
+# go:embed 的数据源同理：入库产物也锁 LF，避免签出后与构建结果不一致。
+internal/webui/dist/** text eol=lf
