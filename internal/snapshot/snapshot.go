@@ -38,6 +38,11 @@ type RuntimeDefaults struct {
 	StreamFirstTokenTimeoutMs int
 	FailoverMaxTargets        int
 	FailoverFailureThreshold  int
+	// DefaultContextWindow / DefaultMaxOutputTokens 是模型容量默认值
+	//（设置页「模型默认」）。/v1/models 的 context_length / max_output_tokens
+	// 在上游模型未单独覆盖时回落到这里，供外部工具读取正确容量。
+	DefaultContextWindow   int
+	DefaultMaxOutputTokens int
 }
 
 type ProviderSnapshot struct {

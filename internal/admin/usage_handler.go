@@ -2,6 +2,7 @@ package admin
 
 import (
 	"database/sql"
+	"encoding/csv"
 	"net/http"
 	"net/url"
 	"strconv"
@@ -280,9 +281,26 @@ type usageHistoryResponse struct {
 	Total   int64               `json:"total"`
 }
 
-// usageHistoryWhere 是明细查询与计数查询**共用**的过滤子句（口径必须一致，
-// 否则总页数与实际能翻到的页数会对不上）。
-const usageHistoryWhere = ` WHERE u.ts >= ? AND u.ts <= ?`
+// usageHistoryFilters 组装 History/CSV 共用的过滤子句：时间范围之外支持
+// status（精确）、public_model（精确）、access_key_id（精确）。
+// 列名是字面量、值全参数化，无注入面。返回 WHERE 子句与配套参数。
+func usageHistoryFilters(from, to int64, status, model, keyID string) (string, []any) {
+	conds := []string{"u.ts >= ?", "u.ts <= ?"}
+	args := []any{from, to}
+	if status != "" {
+		conds = append(conds, "u.status = ?")
+		args = append(args, status)
+	}
+	if model != "" {
+		conds = append(conds, "u.public_model = ?")
+		args = append(args, model)
+	}
+	if keyID != "" {
+		conds = append(conds, "u.access_key_id = ?")
+		args = append(args, keyID)
+	}
+	return " WHERE " + strings.Join(conds, " AND "), args
+}
 
 // clampOffset 解析分页偏移，钳制为非负；非法输入按 0（首页）。
 // 与 clampLimit 同理：负 offset 在 SQLite 里虽是合法语法，但语义诡异，
@@ -295,8 +313,47 @@ func clampOffset(raw string) int64 {
 	return n
 }
 
+// ExportCSV 以 CSV 流式导出调用明细（与 History 同一套过滤参数，无分页上限 ——
+// 上限由 maxUsageLimit 拉满）。排障取证用：把一段时间的明细拉进表格工具。
+// Content-Disposition 带 filename，浏览器直接触发下载。
+func (h *UsageHandler) ExportCSV(w http.ResponseWriter, r *http.Request) {
+	q := r.URL.Query()
+	from, to := queryRange(q, 7*24*time.Hour)
+	limit := clampLimit(q.Get("limit"), maxUsageLimit, maxUsageLimit)
+	where, args := usageHistoryFilters(from, to, q.Get("status"), q.Get("model"), q.Get("key_id"))
+
+	rows, err := h.store.Reader().Query(
+		`SELECT u.ts, u.public_model, u.upstream_model, COALESCE(a.name, ''), u.access_key_id, u.total_tokens, u.ttfb_ms, u.latency_ms, u.status
+		   FROM usage_records u LEFT JOIN access_keys a ON a.id = u.access_key_id`+where+
+			` ORDER BY u.ts DESC, u.id DESC LIMIT ?`, append(args, limit)...)
+	if err != nil {
+		writeServerError(w, "usage export", err)
+		return
+	}
+	defer rows.Close()
+
+	w.Header().Set("Content-Type", "text/csv; charset=utf-8")
+	w.Header().Set("Content-Disposition", `attachment; filename="usage-history.csv"`)
+	cw := csv.NewWriter(w)
+	_ = cw.Write([]string{"ts", "public_model", "upstream_model", "key_name", "key_id", "total_tokens", "ttfb_ms", "latency_ms", "status"})
+	for rows.Next() {
+		var e usageHistoryEntry
+		if err := rows.Scan(&e.Ts, &e.PublicModel, &e.UpstreamModel, &e.KeyName, &e.KeyID, &e.TotalTokens, &e.TTFBMs, &e.LatencyMs, &e.Status); err != nil {
+			return
+		}
+		_ = cw.Write([]string{
+			time.UnixMilli(e.Ts).Format(time.RFC3339), e.PublicModel, e.UpstreamModel,
+			e.KeyName, e.KeyID,
+			strconv.FormatInt(e.TotalTokens, 10), strconv.FormatInt(e.TTFBMs, 10),
+			strconv.FormatInt(e.LatencyMs, 10), e.Status,
+		})
+	}
+	cw.Flush()
+}
+
 // History 返回调用明细（时间倒序，分页），供「调用历史」页展示。
-// 参数：from/to（毫秒时间戳，默认近 7 天）、limit（默认 200，上限 1000）、offset（默认 0）。
+// 参数：from/to（毫秒时间戳，默认近 7 天）、limit（默认 200，上限 1000）、offset（默认 0）、
+// status / model / key_id（可选精确过滤，与 CSV 导出共用同一套过滤，口径一致）。
 //
 // 排序必须带唯一列兜底（`u.ts DESC, u.id DESC`）：毫秒时间戳在并发下会重复，
 // 只按 ts 排序时同值行的相对顺序不确定 —— 配上 OFFSET 分页就会出现
@@ -307,19 +364,20 @@ func (h *UsageHandler) History(w http.ResponseWriter, r *http.Request) {
 	from, to := queryRange(q, 7*24*time.Hour)
 	limit := clampLimit(q.Get("limit"), 200, maxUsageLimit)
 	offset := clampOffset(q.Get("offset"))
+	where, args := usageHistoryFilters(from, to, q.Get("status"), q.Get("model"), q.Get("key_id"))
 
-	// 总条数单独统计（计数不需要 JOIN access_keys，WHERE 只引用 u.ts）。
+	// 总条数单独统计（计数不需要 JOIN access_keys，WHERE 只引用 u 列）。
 	var total int64
 	if err := h.store.Reader().QueryRow(
-		`SELECT COUNT(*) FROM usage_records u`+usageHistoryWhere, from, to).Scan(&total); err != nil {
+		`SELECT COUNT(*) FROM usage_records u`+where, args...).Scan(&total); err != nil {
 		writeServerError(w, "usage history count", err)
 		return
 	}
 
 	rows, err := h.store.Reader().Query(
 		`SELECT u.ts, u.public_model, u.upstream_model, COALESCE(a.name, ''), u.access_key_id, u.total_tokens, u.ttfb_ms, u.latency_ms, u.status
-		   FROM usage_records u LEFT JOIN access_keys a ON a.id = u.access_key_id`+usageHistoryWhere+
-			` ORDER BY u.ts DESC, u.id DESC LIMIT ? OFFSET ?`, from, to, limit, offset)
+		   FROM usage_records u LEFT JOIN access_keys a ON a.id = u.access_key_id`+where+
+			` ORDER BY u.ts DESC, u.id DESC LIMIT ? OFFSET ?`, append(args, limit, offset)...)
 	if err != nil {
 		writeServerError(w, "usage history", err)
 		return

@@ -318,6 +318,14 @@ resolve(model):
 
 `GET /v1/models` 默认**只返回轨道一的虚拟名**。轨道二的形式不列出（可能非常长，且上游模型数会随 provider 增长）。可用 `?include=upstream` 展开。
 
+### 5.3 模型容量元数据（2026-10-04）
+
+外部工具（Cherry Studio / LobeChat / 各类网关面板）需要按模型读取上下文与输出上限，
+约定字段：`context_length`（OpenRouter 约定）、`max_input_tokens` / `max_output_tokens`
+（LiteLLM 约定）。取值链：链首上游模型的 `context_window` / `max_output_tokens`
+→ 设置页「模型默认」→ 两级都为 0 则**不加字段**（不编造数字）。
+单模型详情走 `GET /v1/models/{model}`（轨道一虚拟名与轨道二 slug/model 皆可查）。
+
 ---
 
 ## 6. 对外接口
@@ -328,10 +336,10 @@ resolve(model):
 |---|---|---|
 | `POST /v1/chat/completions` | OpenAI Chat | P0，已实现 |
 | `POST /v1/messages` | Anthropic Messages | **已实现（2026-10-02）**——Claude Code 把 `ANTHROPIC_BASE_URL` 指向网关即可用；thinking 回放（含签名）见 §17 R4 |
-| `POST /v1/responses` | OpenAI Responses | **未实现**（唯一的下游协议缺口；需要它的客户端可暂走 `/v1/chat/completions`） |
-| `GET /v1/models` | 形状按认证头分流（D9） | 已实现，支持 `?include=upstream` 展开轨道二 |
-| `GET /openai/v1/models` | 强制 OpenAI 形状 | 别名 |
-| `GET /anthropic/v1/models` | 强制 Anthropic 形状 | 别名 |
+| `POST /v1/responses` | OpenAI Responses | **已实现（2026-10-04）**——Codex CLI 等客户端接入点；`previous_response_id`/`store` 被忽略（网关不托管会话状态，store:false 的全量历史客户端天然兼容）；`text.format` 跨协议映射为 openai-chat 的 response_format |
+| `GET /v1/models` | 形状按认证头分流（D9） | 已实现，`?include=upstream` 展开轨道二；**条目带容量元数据**（见 §5.3） |
+| `GET /v1/models/{model}` | 单模型详情 | 已实现（OpenAI/Anthropic 形状 + 容量元数据；`/openai/v1/models/{m}`、`/anthropic/v1/models/{m}` 别名） |
+| `GET /dashboard/billing/*`、`GET /v1/organization/usage|costs` | 额度/费用查询 | 已实现（2026-10-04），见 §6.4 |
 
 **D9 冲突说明**：OpenAI 与 Anthropic 的模型列表**路径完全相同**（都是 `GET /v1/models`），但响应结构不同：
 
@@ -432,6 +440,8 @@ PATCH  /admin/api/keys/{id}                      可改 name / enabled / quota_t
 DELETE /admin/api/keys/{id}
 
 GET    /admin/api/audit?limit=                   管理写操作审计（新→旧，只记字段名不记值）
+GET    /admin/api/usage/history.csv              调用明细 CSV 导出（与 history 同一套
+                                                 status/model/key_id 过滤，无分页）
 GET    /admin/api/usage?from=&to=&group_by=key|model|provider|day
                                                   from/to 为毫秒时间戳；**from=0 一律表示
                                                   「全部历史」**（本端点与 by-* 系列语义统一，
@@ -443,6 +453,22 @@ POST   /admin/api/reload                        从 DB 重建内存快照
 所有写操作的事务边界：**先写 DB，提交成功后再重建快照**。DB 写失败则快照不动。
 
 **重建由服务端自动执行**（2026-10-01 起）：管理写请求成功（2xx）后，`server.AutoReload` 中间件就地调用 `runtimeReloader.Reload`（池重建 + 快照重建，`sync.Mutex` 串行化，两边都构建成功才原子替换，任一步失败运行时保持旧状态）。此前生效路径完全依赖前端写完自觉调 `POST /admin/api/reload`——任何绕过前端的调用方（curl/脚本）写完不调 reload 就是静默分叉，最敏感的是**禁用下游 Key 后 auth 读旧快照照常放行**。前端 `mutate()` 里的 reload 调用保留为兜底。
+
+### 6.4 额度/费用查询（2026-10-04）
+
+两套形状（实现见 `cmd/gateway/billing.go`），均需有效 sk-gw key：
+
+| 端点 | 形状来源 | 数据口径 |
+|---|---|---|
+| `GET /v1/organization/costs` | OpenAI 官方 Usage/Costs API（page + bucket + `organization.costs.result`） | 全组织；费用按 upstream_models 单价实时估算（口径同 §11.1 统计），`amount.currency` 诚实标 `cny` |
+| `GET /v1/organization/usage/completions` | 同上 | 全组织；input/cached/output/请求数按 1h/1d 桶聚合 |
+| `GET /dashboard/billing/subscription`（含 `/v1/` 前缀别名） | one-api/new-api 时代起客户端通用 | **per-key**：`hard_limit_usd` 等承载 key 的 token 配额 |
+| `GET /dashboard/billing/usage`（含别名） | 同上 | **per-key**：区间内已用 token 折算 `total_usage`（美分） |
+
+**单位映射（重要）**：dashboard billing 系把 **百万 tokens 记作 1 美元等价单位（PTM）**
+—— 客户端 UI 只消费两个数的比值（余额/进度条），同量纲保证比例正确；绝对值是
+token 量纲而非美元。key 未设配额时 `hard_limit_usd` 返回 1e9（避免 UI 把 0 显示成
+「零余额」），响应带 `total_tokens` 扩展字段供按 token 展示的工具使用。
 
 #### PATCH 语义：字段级部分更新
 

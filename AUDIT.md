@@ -1533,3 +1533,66 @@ A 目标的 Extra 泄漏给 B 目标（这正是旧代码在循环内反复 ToRo
 |---|---|
 | `POST /v1/responses`（OpenAI Responses 入口） | 唯一剩余的下游协议缺口 |
 | History 过滤 / CSV 导出 | 按状态/模型/Key 过滤调用明细并导出 |
+
+---
+
+# 收官批次 — 2026-10-04（Responses 入口 / 额度查询 / 模型元数据 / History 导出）
+
+## 1. POST /v1/responses（OpenAI Responses 入口，最后的协议缺口）
+
+- 解码（inwire/openai_responses.go）：input 字符串/item 数组、instructions→System、
+  developer/system 角色映射、function_call/function_call_output→工具调用与结果、
+  reasoning item 剥除、input_image、tools（仅 function，内建工具显式 400）、
+  tool_choice、reasoning.effort→ThinkingConfig（SDK 跨协议翻译）、
+  text.format→openai-chat 的 response_format（json_object 直映、json_schema 译外壳）。
+  `previous_response_id`/`store` 忽略（网关不托管会话状态，DESIGN §1）。
+- 编码（outwire/openai_responses.go）：response 对象（output: message/function_call
+  项，StopLength→status:"incomplete"+max_output_tokens）+ SSE 事件骨架
+  （response.created → output_item/content_part → output_text.delta →
+  function_call_arguments.* → response.completed 含完整对象与 usage；
+  断流发 response.failed；canceled 零写入）。
+- codec：openaiResponsesCodec（错误形状与 openai-chat 同信封）。
+- e2e 冒烟：非流式形状 + 流式事件序列（fake OpenAI 上游）。
+
+## 2. 额度/费用查询（对照 OpenAI 官方 Usage/Costs API 实现）
+
+- 官方形状：`GET /v1/organization/costs`、`GET /v1/organization/usage/completions`
+  （page + bucket，costs 的 result 带 line_item + amount{value,currency}），
+  全组织口径、费用按模型单价实时估算、currency 诚实标 cny。
+  DAO：`SumUsageBuckets` / `SumCostBuckets`（计费口径与 GetUsageStats 一致）。
+- 生态兼容：`GET /dashboard/billing/subscription|usage`（+/v1 别名），per-key 口径。
+  **单位映射：百万 tokens = 1 美元等价单位（PTM）** —— 客户端 UI 只消费比值，
+  同量纲保证比例正确；未设配额返回 1e9 避免显示成零余额；响应带 total_tokens
+  原值。踩坑记录：默认窗口上界若按秒截断会切掉同秒记录（costs 恒空页），
+  已改用 UnixMilli 并留注释。
+
+## 3. 模型容量元数据（DESIGN §5.3）
+
+- `/v1/models` 条目与新增 `GET /v1/models/{model}` 单模型详情（双形状 +
+  /openai|/anthropic 别名）携带 `context_length` / `max_input_tokens` /
+  `max_output_tokens`（OpenRouter / LiteLLM 约定字段）。
+- 取值链：链首上游模型覆盖值 → 设置页「模型默认」（随快照下发，Runtime 新增
+  DefaultContextWindow/DefaultMaxOutputTokens）→ 两级皆 0 不输出字段。
+  快照重建现在把 upstream_models 的容量列一并带入。
+
+## 4. History 过滤 + CSV 导出
+
+- `GET /admin/api/usage/history` 新增 `status` / `model` / `key_id` 精确过滤
+  （与分页计数同一 WHERE，口径一致）。
+- 新增 `GET /admin/api/usage/history.csv`：同一套过滤、无分页（上限拉满）、
+  Content-Disposition 触发下载。UI 过滤控件未同步（后端先行，见「仍未做」）。
+
+## 验证证据
+
+- `go build ./...` / `go vet ./...` 无输出；`go test ./... -count=1` 全绿（10 包）。
+- 新增测试：inwire responses 4 例、outwire responses 3 例、cmd 集成 5 例
+  （模型元数据含「两级皆 0 不编造」、billing 三端点形状与 PTM 映射、
+  history 过滤 + CSV、responses 非流式/流式冒烟）。
+- DESIGN 同步：§5.3（新增）、§6.1（入口现状）、§6.4（新增）、§6.3（CSV）。
+
+## 仍未做
+
+| 项 | 说明 |
+|---|---|
+| History 过滤的 UI 控件 | 后端（history 过滤 + CSV）已就绪，History 页加下拉与导出按钮即可 |
+| `/v1/responses` 的 reasoning 输出项 | thinking 增量在本协议下不出事件（provider 托管语义，跨协议无意义），已注释留痕 |

@@ -229,3 +229,111 @@ func (s *Store) ListModelThroughput(ctx context.Context, providerID string) (map
 	}
 	return out, rows.Err()
 }
+
+// ---- 额度/费用查询接口（OpenAI usage/costs 与 dashboard billing 的数据源）----
+
+// BucketUsage 是一个时间桶内的聚合用量（官方 /v1/organization/usage 形状的数据源）。
+type BucketUsage struct {
+	BucketStart  int64 // Unix 秒，桶起点
+	InputTokens  int64
+	CachedTokens int64
+	OutputTokens int64
+	Requests     int64
+}
+
+// SumUsageBuckets 把 [from,to]（毫秒）内的用量按 bucketSec 秒宽分桶聚合（全组织口径）。
+func (s *Store) SumUsageBuckets(ctx context.Context, from, to, bucketSec int64) ([]BucketUsage, error) {
+	rows, err := s.read.QueryContext(ctx,
+		`SELECT (ts / ?) * ? AS bucket, COALESCE(SUM(input_tokens),0), COALESCE(SUM(cached_tokens),0),
+		        COALESCE(SUM(output_tokens),0), COUNT(*)
+		   FROM usage_records WHERE ts >= ? AND ts <= ?
+		  GROUP BY bucket ORDER BY bucket`,
+		bucketSec*1000, bucketSec*1000, from, to)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := make([]BucketUsage, 0)
+	for rows.Next() {
+		var b BucketUsage
+		if err := rows.Scan(&b.BucketStart, &b.InputTokens, &b.CachedTokens, &b.OutputTokens, &b.Requests); err != nil {
+			return nil, err
+		}
+		out = append(out, b)
+	}
+	return out, rows.Err()
+}
+
+// BucketCost 是一个时间桶内单个模型的估算费用（官方 /v1/organization/costs 的数据源）。
+type BucketCost struct {
+	BucketStart int64
+	Model       string
+	Cost        float64 // 元（单价来自 upstream_models，口径同 GetUsageStats）
+}
+
+// SumCostBuckets 把 [from,to]（毫秒）内的估算费用按 bucketSec 秒宽、按模型分桶。
+// 计费口径与 GetUsageStats 完全一致（缓存命中/未命中分开计价）。
+func (s *Store) SumCostBuckets(ctx context.Context, from, to, bucketSec int64) ([]BucketCost, error) {
+	rows, err := s.read.QueryContext(ctx,
+		`SELECT (ts / ?) * ? AS bucket, u.upstream_model,
+		        COALESCE(SUM(
+		           MAX(u.input_tokens - u.cached_tokens, 0) * COALESCE(m.price_input, 0)
+		           + u.cached_tokens * (CASE WHEN COALESCE(m.price_cache_hit, 0) > 0 THEN m.price_cache_hit ELSE COALESCE(m.price_input, 0) END)
+		           + u.output_tokens * COALESCE(m.price_output, 0)
+		        ) / 1000000.0, 0)
+		   FROM usage_records u
+		   LEFT JOIN upstream_models m ON m.provider_id = u.provider_id AND m.model_id = u.upstream_model
+		  WHERE u.ts >= ? AND u.ts <= ?
+		  GROUP BY bucket, u.upstream_model ORDER BY bucket`,
+		bucketSec*1000, bucketSec*1000, from, to)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := make([]BucketCost, 0)
+	for rows.Next() {
+		var b BucketCost
+		if err := rows.Scan(&b.BucketStart, &b.Model, &b.Cost); err != nil {
+			return nil, err
+		}
+		out = append(out, b)
+	}
+	return out, rows.Err()
+}
+
+// DayTokens 是某把 key 在一天内的 token 总量（legacy dashboard/billing/usage 的 daily_costs）。
+type DayTokens struct {
+	Day   string // YYYY-MM-DD（UTC）
+	Total int64
+}
+
+// SumTokensForKey 统计某把 key 在 [from,to]（毫秒）内的 token 总量。
+func (s *Store) SumTokensForKey(ctx context.Context, keyID string, from, to int64) (int64, error) {
+	var v int64
+	err := s.read.QueryRowContext(ctx,
+		`SELECT COALESCE(SUM(total_tokens),0) FROM usage_records
+		  WHERE access_key_id = ? AND ts >= ? AND ts <= ?`, keyID, from, to).Scan(&v)
+	return v, err
+}
+
+// SumTokensByDayForKey 按天统计某把 key 的 token 总量。
+func (s *Store) SumTokensByDayForKey(ctx context.Context, keyID string, from, to int64) ([]DayTokens, error) {
+	rows, err := s.read.QueryContext(ctx,
+		`SELECT date(ts / 1000, 'unixepoch') AS day, COALESCE(SUM(total_tokens),0)
+		   FROM usage_records
+		  WHERE access_key_id = ? AND ts >= ? AND ts <= ?
+		  GROUP BY day ORDER BY day`, keyID, from, to)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := make([]DayTokens, 0)
+	for rows.Next() {
+		var d DayTokens
+		if err := rows.Scan(&d.Day, &d.Total); err != nil {
+			return nil, err
+		}
+		out = append(out, d)
+	}
+	return out, rows.Err()
+}

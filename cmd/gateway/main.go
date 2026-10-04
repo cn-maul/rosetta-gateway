@@ -27,8 +27,8 @@ import (
 	"github.com/cn-maul/rosetta-gateway/internal/config"
 	"github.com/cn-maul/rosetta-gateway/internal/crypto"
 	"github.com/cn-maul/rosetta-gateway/internal/inwire"
-	"github.com/cn-maul/rosetta-gateway/internal/ratelimit"
 	"github.com/cn-maul/rosetta-gateway/internal/outwire"
+	"github.com/cn-maul/rosetta-gateway/internal/ratelimit"
 	"github.com/cn-maul/rosetta-gateway/internal/routing"
 	"github.com/cn-maul/rosetta-gateway/internal/server"
 	"github.com/cn-maul/rosetta-gateway/internal/snapshot"
@@ -167,11 +167,25 @@ func main() {
 	rateLimiter := ratelimit.New()
 	mux.HandleFunc("POST /v1/chat/completions", handleIngress(pool, cfg, usage, rateLimiter, openaiChatCodec{}))
 	mux.HandleFunc("POST /v1/messages", handleIngress(pool, cfg, usage, rateLimiter, anthropicMessagesCodec{}))
+	mux.HandleFunc("POST /v1/responses", handleIngress(pool, cfg, usage, rateLimiter, openaiResponsesCodec{}))
 	// D9：/v1/models 在两种协议下路径相同、响应形状不同 —— 按认证头分流，
 	// 显式别名路径永远优先。
 	mux.HandleFunc("GET /v1/models", handleListModels(""))
 	mux.HandleFunc("GET /openai/v1/models", handleListModels("openai"))
 	mux.HandleFunc("GET /anthropic/v1/models", handleListModels("anthropic"))
+	// 单模型详情：外部工具（Cherry Studio / LobeChat / 各类网关面板）按
+	// OpenRouter/LiteLLM 约定读 context_length / max_output_tokens。
+	// 额度/费用查询（官方 usage/costs + 生态兼容 dashboard billing，见 billing.go）
+	mux.HandleFunc("GET /dashboard/billing/subscription", billingSubscription(db))
+	mux.HandleFunc("GET /v1/dashboard/billing/subscription", billingSubscription(db))
+	mux.HandleFunc("GET /dashboard/billing/usage", billingUsage(db))
+	mux.HandleFunc("GET /v1/dashboard/billing/usage", billingUsage(db))
+	mux.HandleFunc("GET /v1/organization/costs", orgCosts(db))
+	mux.HandleFunc("GET /v1/organization/usage/completions", orgUsageCompletions(db))
+
+	mux.HandleFunc("GET /v1/models/{model}", handleGetModel(""))
+	mux.HandleFunc("GET /openai/v1/models/{model}", handleGetModel("openai"))
+	mux.HandleFunc("GET /anthropic/v1/models/{model}", handleGetModel("anthropic"))
 
 	// 管理端凭据。两个来源，优先级：用户在后台设置的密码（admin_auth.json）
 	// > config.json 的 admin_token（或 ADMIN_TOKEN 环境变量）作为兜底。
@@ -268,6 +282,7 @@ func main() {
 	adminMux.HandleFunc("POST /admin/api/password/set", passwordHandler.Set)
 	adminMux.HandleFunc("GET /admin/api/auth/verify", passwordHandler.Verify)
 	adminMux.HandleFunc("GET /admin/api/usage/history", usageHandler.History)
+	adminMux.HandleFunc("GET /admin/api/usage/history.csv", usageHandler.ExportCSV)
 
 	adminWrapped := server.AdminAuth(adminMux, authStore)
 
@@ -347,9 +362,9 @@ func main() {
 	handler = server.RequestSizeLimit(int64(cfg.Defaults.MaxRequestBodyBytes))(handler)
 
 	srv := &http.Server{
-		Addr:         cfg.Listen,
-		Handler:      handler,
-		ReadTimeout:  30 * time.Second,
+		Addr:        cfg.Listen,
+		Handler:     handler,
+		ReadTimeout: 30 * time.Second,
 		// WriteTimeout 必须为 0：net/http 的写超时从「开始写响应」起算，覆盖整个
 		// 响应时长 —— 5 分钟一到会把仍在正常吐字的流式响应硬切（大输出的慢推理
 		// 模型恰好会撞上），下游看到的是来历不明的 truncated。流的生命周期已由
@@ -632,10 +647,10 @@ type ingressCodec interface {
 // 上游协议可能不同，applyUpstreamExtras 会往 req.Extra 挂不同形状的协议私有
 // 字段，跨 attempt 复用同一个实例会把 A 目标的 Extra 泄漏给 B 目标。
 type ingressRequest struct {
-	buildRosetta      func() *rosetta.ChatRequest
-	stream            bool
-	model             string // 对外的公开模型名（解析前原样）
-	wantsStreamUsage  bool
+	buildRosetta        func() *rosetta.ChatRequest
+	stream              bool
+	model               string // 对外的公开模型名（解析前原样）
+	wantsStreamUsage    bool
 	applyUpstreamExtras func(req *rosetta.ChatRequest, upstreamProtocol string)
 }
 
@@ -731,9 +746,9 @@ func (anthropicMessagesCodec) Decode(r *http.Request, maxBytes int64) (*ingressR
 		return nil, err
 	}
 	return &ingressRequest{
-		buildRosetta:        req.ToRosetta,
-		stream:              req.Stream,
-		model:               req.Model,
+		buildRosetta: req.ToRosetta,
+		stream:       req.Stream,
+		model:        req.Model,
 		// Anthropic 的 message_delta 恒带 usage，没有 include_usage 开关。
 		wantsStreamUsage:    false,
 		applyUpstreamExtras: req.ApplyUpstreamExtras,
@@ -751,6 +766,40 @@ func (anthropicMessagesCodec) WriteNonStream(w http.ResponseWriter, resp *rosett
 func (anthropicMessagesCodec) NewSink(w http.ResponseWriter, model string) outwire.StreamSink {
 	flusher, _ := w.(http.Flusher)
 	return outwire.NewAnthropicSSE(w, flusher, "msg_"+generateID(), model)
+}
+
+// openaiResponsesCodec 服务 POST /v1/responses（OpenAI Responses 协议，
+// Codex CLI 等客户端的接入点）。错误形状与 openai-chat 同一套信封。
+type openaiResponsesCodec struct{}
+
+func (openaiResponsesCodec) Name() string { return "openai-responses" }
+
+func (openaiResponsesCodec) Decode(r *http.Request, maxBytes int64) (*ingressRequest, error) {
+	req, err := inwire.DecodeResponsesRequest(r, maxBytes)
+	if err != nil {
+		return nil, err
+	}
+	return &ingressRequest{
+		buildRosetta: req.ToRosetta,
+		stream:       req.Stream,
+		model:        req.Model,
+		// Responses 的 response.completed 恒带 usage，没有 include_usage 开关。
+		wantsStreamUsage:    false,
+		applyUpstreamExtras: req.ApplyUpstreamExtras,
+	}, nil
+}
+
+func (openaiResponsesCodec) WriteError(w http.ResponseWriter, status int, code, message string) {
+	outwire.WriteOpenAIError(w, status, code, message)
+}
+
+func (openaiResponsesCodec) WriteNonStream(w http.ResponseWriter, resp *rosetta.ChatResponse, model string) {
+	outwire.WriteResponsesResponse(w, resp, model)
+}
+
+func (openaiResponsesCodec) NewSink(w http.ResponseWriter, model string) outwire.StreamSink {
+	flusher, _ := w.(http.Flusher)
+	return outwire.NewResponsesSSE(w, flusher, "resp_"+generateID(), model)
 }
 
 func handleIngress(pool *upstream.Pool, cfg *config.Config, usage *usageRecorder, limiter *ratelimit.Limiter, codec ingressCodec) http.HandlerFunc {
@@ -1290,7 +1339,6 @@ func attemptNonStream(w http.ResponseWriter, r *http.Request, client *rosetta.Cl
 	return attemptOutcome{committed: true}
 }
 
-
 // isClientGone 判断一次流式中断是否源于**客户端**断开，而不是上游故障。
 //
 // 请求 context 被取消（用户点「停止生成」、客户端进程退出、网络切换）时，
@@ -1434,10 +1482,12 @@ func handleListModels(forceShape string) http.HandlerFunc {
 			for _, id := range ids {
 				// created_at：网关不为模型持久化创建时间，用固定纪元占位
 				//（客户端不消费该字段，保持确定性比编一个值诚实）。
-				entries = append(entries, map[string]any{
+				entry := map[string]any{
 					"type": "model", "id": id, "display_name": id,
 					"created_at": "1970-01-01T00:00:00Z",
-				})
+				}
+				appendModelMetadata(entry, snap, id)
+				entries = append(entries, entry)
 			}
 			var first, last any
 			if len(entries) > 0 {
@@ -1451,14 +1501,97 @@ func handleListModels(forceShape string) http.HandlerFunc {
 
 		entries := make([]map[string]any, 0, len(ids))
 		for _, id := range ids {
-			entries = append(entries, map[string]any{
+			entry := map[string]any{
 				"id": id, "object": "model", "created": 0, "owned_by": "gateway",
-			})
+			}
+			appendModelMetadata(entry, snap, id)
+			entries = append(entries, entry)
 		}
 		json.NewEncoder(w).Encode(map[string]any{
 			"object": "list",
 			"data":   entries,
 		})
+	}
+}
+
+// appendModelMetadata 把「解析后的链首上游模型」的容量写进模型条目：
+// context_length（OpenRouter 约定）、max_input_tokens / max_output_tokens
+// （LiteLLM 约定）。上游模型未单独覆盖时回落设置页的模型容量默认；
+// 两级都为 0 则不加字段（不编造数字）。
+func appendModelMetadata(entry map[string]any, snap *snapshot.Snapshot, modelID string) {
+	cw, mo := modelCapacity(snap, modelID)
+	if cw > 0 {
+		entry["context_length"] = cw
+		entry["max_input_tokens"] = cw
+	}
+	if mo > 0 {
+		entry["max_output_tokens"] = mo
+	}
+}
+
+// modelCapacity 解析一个对外模型名到链首上游模型的容量。
+func modelCapacity(snap *snapshot.Snapshot, modelID string) (contextWindow, maxOutput int) {
+	res, err := snap.Routes.Resolve(modelID)
+	if err != nil || len(res.Candidates) == 0 {
+		return 0, 0
+	}
+	m := res.Candidates[0].UpstreamModel
+	if m == nil {
+		return 0, 0
+	}
+	cw, mo := m.ContextWindow, m.MaxOutputTokens
+	if cw <= 0 {
+		cw = snap.Runtime.DefaultContextWindow
+	}
+	if mo <= 0 {
+		mo = snap.Runtime.DefaultMaxOutputTokens
+	}
+	return cw, mo
+}
+
+// handleGetModel 返回单个对外模型的详情（OpenAI /v1/models/{id} 形状 + 容量
+// 元数据）。轨道一的虚拟名与轨道二的 slug/model 都可查。
+func handleGetModel(forceShape string) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		shape := forceShape
+		if shape == "" {
+			if r.Header.Get("X-Api-Key") != "" && !hasBearer(r) {
+				shape = "anthropic"
+			} else {
+				shape = "openai"
+			}
+		}
+		writeErr := errorWriter(outwire.WriteOpenAIError)
+		if shape == "anthropic" {
+			writeErr = outwire.WriteAnthropicError
+		}
+		if _, err := auth.Authenticate(r); err != nil {
+			writeAuthError(w, err, writeErr)
+			return
+		}
+
+		modelID := r.PathValue("model")
+		snap := snapshot.Get()
+		if _, err := snap.Routes.Resolve(modelID); err != nil {
+			writeErr(w, http.StatusNotFound, "model_not_found", fmt.Sprintf("model %q not found", modelID))
+			return
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		if shape == "anthropic" {
+			entry := map[string]any{
+				"type": "model", "id": modelID, "display_name": modelID,
+				"created_at": "1970-01-01T00:00:00Z",
+			}
+			appendModelMetadata(entry, snap, modelID)
+			json.NewEncoder(w).Encode(entry)
+			return
+		}
+		entry := map[string]any{
+			"id": modelID, "object": "model", "created": 0, "owned_by": "gateway",
+		}
+		appendModelMetadata(entry, snap, modelID)
+		json.NewEncoder(w).Encode(entry)
 	}
 }
 

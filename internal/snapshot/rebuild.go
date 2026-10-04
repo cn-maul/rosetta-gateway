@@ -46,10 +46,12 @@ func RebuildFromDB(ctx context.Context, st *store.Store) (*Snapshot, error) {
 	}
 	for _, m := range models {
 		snap.Routes.AddUpstreamModel(&routing.UpstreamModel{
-			ID:         m.ID,
-			ProviderID: m.ProviderID,
-			ModelID:    m.ModelID,
-			Enabled:    m.Enabled,
+			ID:              m.ID,
+			ProviderID:      m.ProviderID,
+			ModelID:         m.ModelID,
+			Enabled:         m.Enabled,
+			ContextWindow:   m.ContextWindow,
+			MaxOutputTokens: m.MaxOutputTokens,
 		})
 	}
 
@@ -101,7 +103,7 @@ func RebuildFromDB(ctx context.Context, st *store.Store) (*Snapshot, error) {
 	}
 	snap.KeysByHash = keysByHash
 
-	// 运行时全局默认（超时与故障转移策略）。读失败不致命：留 0 即全部回落 config。
+	// 运行时全局默认（超时与故障转移策略 + 模型容量默认）。读失败不致命：留 0 即全部回落 config。
 	if rd, err := st.GetRuntimeDefaults(ctx); err == nil {
 		snap.Runtime = RuntimeDefaults{
 			UpstreamTimeoutMs:         rd.UpstreamTimeoutMs,
@@ -112,6 +114,10 @@ func RebuildFromDB(ctx context.Context, st *store.Store) (*Snapshot, error) {
 		}
 	} else {
 		return nil, err
+	}
+	if md, err := st.GetModelDefaults(ctx); err == nil {
+		snap.Runtime.DefaultContextWindow = md.ContextWindow
+		snap.Runtime.DefaultMaxOutputTokens = md.MaxOutputTokens
 	}
 
 	return snap, nil
