@@ -1330,3 +1330,74 @@ AutoReload 三者共用同一把锁。前端 `mutate()` 的 reload 调用保留�
   admin 各 handler 测试未改动、原样通过。
 - 文档同步：DESIGN §4（查询侧防线）、§6.3（服务端自动 reload）、§8.1（WriteTimeout=0）、
   §10（池重建原子化）已更新。
+
+---
+
+# 审计跟进 — 2026-10-02（v1.4 三批：快赢 / 中等 / 收尾）
+
+背景：2026-10-01 全局复审修掉 5 个高优先级后，剩余优化项按投入分三批落地
+（`5899834` 快赢批 / `086cc5e` 中等批 / `bb79480` 收尾批）。本节补记三批的文档同步。
+
+## 快赢批（5899834）
+
+- SQLite DSN 增 `_synchronous=NORMAL`：WAL 模式的官方推荐搭配，用量 INSERT
+  不再逐条 fsync（FULL 在 WAL 下只多保护「掉电丢最近几个已提交事务」，不涉及损坏）。
+  钉住参数生效的回归测试：`TestStore_Pragmas`（驱动对 DSN 参数静默解析，写错不报错）。
+- 鉴权 O(1)：`snapshot.Keys`（ID 键、无读者）改为 `KeysByHash` 哈希索引，
+  `auth.Authenticate` 从全量遍历常量时间比较改为 O(1) 查表。map 查找的计时差异
+  只泄露「与存储哈希的前缀匹配度」，而存储的是高熵 key 的 SHA-256 —— 前缀信息
+  无法反推原像，不构成可用侧信道；DESIGN §6.2「SHA-256 索引」口径回归一致。
+- config bootstrap `protocol` 白名单校验（与 admin 端 / upstream.buildClient 同一份
+  名单，空串 = auto 放行）：拼错在启动时即报错，不再静默退化成 SDK 自动探测。
+- usage 明细 `ORDER BY ts DESC` 补 `, id DESC` 兜底（同毫秒并发写入不再随机重排；
+  分组行无单一 id，不套用）；`/admin/api/usage` 与 by-* 系列的 `from=0` 语义统一为
+  「全部历史」（此前一个当「未传」一个当「全部」）。
+- StatsHandler 对 tps/ttfb 查询失败补 WARN 留痕（此前 `_` 丢弃、指标静默显示 0）。
+
+## 中等批（086cc5e）
+
+- inwire 透传 `response_format`（json.RawMessage 原样直传，不结构往返，schema 里
+  未建模字段不被吃掉）/ `seed` / `user` / `parallel_tool_calls`，经
+  `ApplyProtocolPrivateExtra` 走 openai-chat 的 Extra 通道；anthropic / responses
+  上游维持既有门控跳过。
+- `ImportModels` 改单事务批量 upsert（`ImportUpstreamModels`）——逐条自动提交会在
+  第 N 条失败时永久落下前 N-1 条；Settings 的 model_defaults + runtime_defaults
+  合并为 `SaveSettings` 单事务。
+- 新增 `GET /admin/api/upstream-models` 扁平聚合端点（含 provider_id，不挂吞吐
+  重查询），Routes / Settings 从「1+N 个请求」降为「1 请求 + 本地分组」。
+- web：`api.ts` 请求加 `AbortSignal.timeout(30s)`（网关挂起不再永久「加载中」）；
+  History / Overview 加请求序号守卫（快速翻页/切范围旧响应不再覆盖新响应）。
+- CI：新增 `.github/workflows/ci.yml` —— push/PR 时重建前端 + sync，与入库的
+  `internal/webui/dist` 做 `git diff --exit-code`，「忘 sync 就打 tag 发旧 UI」从
+  线上事故变成一次红灯。
+
+## 收尾批（bb79480）
+
+- Update 类 DAO 命中 0 行返回 ErrNotFound（新增 `tx.checkAffected`），各写 handler
+  映射 404 —— 堵住 Get→Update 之间被并发删除仍回 200 的 TOCTOU 假成功。
+- `uniqueSlug` 不再把 `GetProviderBySlug` 的 DB 错误当「slug 可用」，上抛 500。
+- 删死代码：`adminauth.Clear()`（全仓无调用点）、入站 `OpenAIChatRequest.Extra`
+  （自述 always nil 的死字段；透传走的是 rosetta.ChatRequest.Extra，不受影响）。
+- `extractUserContent` 改 `strings.Builder`，去掉循环内拼接的 O(n²)。
+- `build.ps1` 从 web/package.json 读版本并 `-ldflags` 注入 `main.buildVersion`
+  （本地二进制不再恒为 "dev"）；`gateway.ps1` 端口解析兼容 IPv6 监听地址。
+- 前端：index.html 内联脚本首帧前打 `data-theme`（消暗色闪屏）；顶栏退出登录；
+  同步内嵌产物。
+
+## 验证证据
+
+- `go build ./...` / `go vet ./...` 无输出；`go test ./... -count=1` 全绿
+  （含 `TestStore_Pragmas`）。
+- 文档同步：DESIGN §6.3（upstream-models 端点、from=0 口径）、§13.1（CI 产物校验、
+  build.ps1 版本注入）。
+
+## 仍未做（大件，待排期）
+
+| 项 | 说明 |
+|---|---|
+| Anthropic `/v1/messages` + `/v1/responses` 入口 | 最大的功能缺口：Claude Code 尚无法直连；`/v1/models` 形状分流与别名路径、`?include=upstream` 同属此批 |
+| RPM/TPM 限速 | DESIGN §11.4 方案已写好（内存固定窗口 + Key 维度），纯实现活 |
+| 写操作审计日志 | DESIGN §13.3 承诺（谁/何时/改了什么），未实现 |
+| SQLite 读写连接分离 | 消统计重查询与热路径互斥；查询加界后紧迫性下降 |
+| 安全硬化 | 管理密码仅 6 位下限；主密钥 env 口令场景无 KDF（自动生成的 master.key 不受影响） |
+| History 过滤/导出 | 按状态/模型/Key 过滤 + CSV 导出 |

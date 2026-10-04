@@ -423,3 +423,35 @@ func TestUpsertUpstreamModel_KeepsPrices(t *testing.T) {
 		t.Fatalf("prices wiped by upsert: %+v", got)
 	}
 }
+
+// DSN 参数必须真实生效：驱动对 _journal_mode / _synchronous / _foreign_keys
+// 是解析式支持，写错参数名会被**静默忽略**（不报错）——journal_mode 退化成
+// delete 会失去读写并发，synchronous 退化成 FULL 会让每条用量 INSERT 都 fsync。
+// 本测试把三个参数钉在期望值上，DSN 改动一旦失效当场红灯。
+func TestStore_Pragmas(t *testing.T) {
+	st := testStore(t, t.TempDir()+"/p.db")
+
+	var journal string
+	if err := st.DB().QueryRow(`PRAGMA journal_mode`).Scan(&journal); err != nil {
+		t.Fatalf("query journal_mode: %v", err)
+	}
+	if journal != "wal" {
+		t.Fatalf("journal_mode = %q, want wal", journal)
+	}
+
+	var synchronous int
+	if err := st.DB().QueryRow(`PRAGMA synchronous`).Scan(&synchronous); err != nil {
+		t.Fatalf("query synchronous: %v", err)
+	}
+	if synchronous != 1 { // 1 = NORMAL
+		t.Fatalf("synchronous = %d, want 1 (NORMAL)", synchronous)
+	}
+
+	var foreignKeys int
+	if err := st.DB().QueryRow(`PRAGMA foreign_keys`).Scan(&foreignKeys); err != nil {
+		t.Fatalf("query foreign_keys: %v", err)
+	}
+	if foreignKeys != 1 {
+		t.Fatalf("foreign_keys = %d, want 1 (ON)", foreignKeys)
+	}
+}

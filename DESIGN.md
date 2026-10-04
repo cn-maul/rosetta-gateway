@@ -406,8 +406,12 @@ DELETE /admin/api/credentials/{id}
 GET    /admin/api/providers/{id}/models
 POST   /admin/api/providers/{id}/models
 POST   /admin/api/providers/{id}/models/discover  从上游 /models 拉取并批量导入
+POST   /admin/api/providers/{id}/models/import    批量导入（单事务，要么全进要么全不进）
 PATCH  /admin/api/models/{id}
 DELETE /admin/api/models/{id}
+GET    /admin/api/upstream-models                 全部上游模型扁平列表（含 provider_id，
+                                                  供 Routes/Settings 一次拉全，替代逐 provider 的 N+1；
+                                                  不挂吞吐重查询）
 
 GET    /admin/api/routes
 POST   /admin/api/routes
@@ -422,6 +426,9 @@ PATCH  /admin/api/keys/{id}                      可改 name / enabled / quota_t
 DELETE /admin/api/keys/{id}
 
 GET    /admin/api/usage?from=&to=&group_by=key|model|provider|day
+                                                  from/to 为毫秒时间戳；**from=0 一律表示
+                                                  「全部历史」**（本端点与 by-* 系列语义统一，
+                                                  未传 from 时 Query 默认近 24h）
 GET    /admin/api/stats                         当前快照：总请求/总 token/错误率/各 provider 健康
 POST   /admin/api/reload                        从 DB 重建内存快照
 ```
@@ -856,6 +863,12 @@ UPDATE access_keys SET used_tokens = used_tokens + NEW.total_tokens WHERE id = N
 `go:embed` 打包静态资源（`internal/webui/dist`），`web/` 下是 **Vue 3 + Vite + TS** 工程，`fetch` 调 `/admin/api/*`。
 
 > 历史沿革：早期是单个 `index.html` 内联全部逻辑，理由写的是「内网管理页不超过 8 个，引入框架收益不成比例」，并预设了升级边界「一旦出现多页 + 复杂表单联动 + 图表就换框架」。边界随后真的被触发了（六页 + 表单弹窗 + 图表），于是按当初的约定迁到 Vue 3。构建链：`cd web && npm run build && npm run sync`（`sync` 把产物同步进 `internal/webui/dist` 供 embed），`gateway.ps1` 已编排。
+>
+> **CI 会校验产物同步**（`.github/workflows/ci.yml`，2026-10-02 起）：push/PR 时重新
+> `npm build + sync` 一遍，与入库的 `internal/webui/dist` 做 `git diff --exit-code`，
+> 不一致即红灯 —— 把「改了 web/src 忘 sync 就打 tag、旧 UI 被静默发出去」从线上事故
+> 变成一次 CI 失败。本地二进制版本号由 `build.ps1` 从 `web/package.json` 读取并经
+> `-ldflags` 注入 `main.buildVersion`，与 CI/前端页脚同源。
 
 **鉴权**：管理 API 由 `server.AdminAuth` 中间件保护，凭据逻辑在 `internal/adminauth`。三个端点例外/半例外：
 - `GET /admin/api/password/check` —— 恒免鉴权，前端靠它决定弹「设置密码」还是「输入密码」；
