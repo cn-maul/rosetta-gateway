@@ -105,3 +105,45 @@ func (s *Store) GetKeyQuota(ctx context.Context, id string) (quota, used int64, 
 func (s *Store) DeleteAccessKey(ctx context.Context, id string) error {
 	return deleteByID(ctx, s.db, "access_keys", id)
 }
+
+// RecomputeUsedTokens 从 usage_records 重新计算某把密钥的已用量并写回
+// access_keys.used_tokens，返回修正后的值。
+//
+// 为什么需要它：used_tokens 由 INSERT 触发器单调累加（store.go 的
+// trg_update_used_tokens），**没有任何回退或重算路径**。一次误写、一次手工
+// 插记录、或一次 bug，都会让它永久偏高 —— 而配额预检（GetKeyQuota 的
+// used >= quota）会从此对这把 key 恒返回 429，且管理 API 里没有修正入口，
+// 唯一的办法是直接改库。这是「触发器维护的派生值」的固有代价，
+// 补一个显式重算把恢复能力还给运维。
+func (s *Store) RecomputeUsedTokens(ctx context.Context, keyID string) (int64, error) {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return 0, err
+	}
+	defer tx.Rollback()
+
+	var used int64
+	// 只有计入配额的记录才应计入 used_tokens。当前 total_tokens 即计费口径，
+	// 故直接求和；status 不筛 —— canceled 的请求同样消耗了上游配额。
+	if err := tx.QueryRowContext(ctx,
+		`SELECT COALESCE(SUM(total_tokens), 0) FROM usage_records WHERE access_key_id = ?`,
+		keyID).Scan(&used); err != nil {
+		return 0, err
+	}
+	res, err := tx.ExecContext(ctx,
+		`UPDATE access_keys SET used_tokens = ? WHERE id = ?`, used, keyID)
+	if err != nil {
+		return 0, err
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		// 老版本 SQLite 驱动可能不支持；不因此把成功变成失败。
+		s.logger.Debug("recompute used_tokens: RowsAffected unavailable", "error", err)
+	} else if n == 0 {
+		return 0, ErrNotFound
+	}
+	if err := tx.Commit(); err != nil {
+		return 0, err
+	}
+	return used, nil
+}

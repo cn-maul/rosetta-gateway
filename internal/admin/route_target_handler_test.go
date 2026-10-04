@@ -37,7 +37,7 @@ func TestRouteTargetReplaceAndList(t *testing.T) {
 	ctx := context.Background()
 
 	body := `{"targets":[{"provider_id":"p2","upstream_model_id":"m2"},{"provider_id":"p1","upstream_model_id":"m1","enabled":false}]}`
-	req := httptest.NewRequest(http.MethodPut, "/admin/api/routes/r1/targets", bytes.NewBufferString(body))
+	req := jsonRequest(http.MethodPut, "/admin/api/routes/r1/targets", bytes.NewBufferString(body))
 	rec := httptest.NewRecorder()
 	h.Replace(rec, req, "r1")
 	if rec.Code != http.StatusOK {
@@ -83,7 +83,7 @@ func TestRouteTargetReplaceValidation(t *testing.T) {
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			req := httptest.NewRequest(http.MethodPut, "/admin/api/routes/r1/targets", bytes.NewBufferString(c.body))
+			req := jsonRequest(http.MethodPut, "/admin/api/routes/r1/targets", bytes.NewBufferString(c.body))
 			rec := httptest.NewRecorder()
 			h.Replace(rec, req, "r1")
 			if rec.Code != http.StatusBadRequest {
@@ -93,7 +93,7 @@ func TestRouteTargetReplaceValidation(t *testing.T) {
 	}
 
 	// 未知 route → 404
-	req := httptest.NewRequest(http.MethodPut, "/admin/api/routes/zzz/targets", bytes.NewBufferString(`{"targets":[{"provider_id":"p1","upstream_model_id":"m1"}]}`))
+	req := jsonRequest(http.MethodPut, "/admin/api/routes/zzz/targets", bytes.NewBufferString(`{"targets":[{"provider_id":"p1","upstream_model_id":"m1"}]}`))
 	rec := httptest.NewRecorder()
 	h.Replace(rec, req, "zzz")
 	if rec.Code != http.StatusNotFound {

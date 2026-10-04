@@ -210,37 +210,55 @@ const appVersion = __APP_VERSION__
 const rosettaVersion = __ROSETTA_VERSION__
 
 // ---------- 亮/暗主题 ----------
-// 偏好存 localStorage，首访跟随系统 prefers-color-scheme。
+// 偏好存 localStorage，值为 'dark' / 'light' / 'system'。
+// 用'system' 而不是把当前系统的解析结果固化进去：固化后首次访问就把
+// 「跟随系统」变成一个具体值，此后 OS 切主题本网关再也不跟随（实测 bug）。
 const THEME_KEY = 'rosetta_gw_theme'
 const isDark = ref(false)
+let mediaQuery: MediaQueryList | null = null
 
 function applyTheme(dark: boolean) {
   isDark.value = dark
   document.documentElement.setAttribute('data-theme', dark ? 'dark' : 'light')
+  // color-scheme 必须与 data-theme 同步：它决定表单控件、滚动条等
+  // 浏览器原生 UI 的配色，不同步就会出现「深色页面 + 浅色下拉框」。
+  const meta = document.querySelector('meta[name=color-scheme]')
+  if (meta) meta.setAttribute('content', dark ? 'dark' : 'light')
+}
+
+function persistTheme(v: 'dark' | 'light' | 'system') {
   try {
-    localStorage.setItem(THEME_KEY, dark ? 'dark' : 'light')
+    localStorage.setItem(THEME_KEY, v)
   } catch {
     /* 隐私模式下可能写不了，忽略 */
   }
 }
 
-function initTheme() {
-  let saved: string | null = null
+function readStoredTheme(): 'dark' | 'light' | 'system' {
   try {
-    saved = localStorage.getItem(THEME_KEY)
+    const saved = localStorage.getItem(THEME_KEY)
+    if (saved === 'dark' || saved === 'light') return saved
   } catch {
     /* 忽略 */
   }
-  if (saved === 'dark' || saved === 'light') {
-    applyTheme(saved === 'dark')
-  } else {
-    // 未显式选择：跟随系统。
-    applyTheme(window.matchMedia('(prefers-color-scheme: dark)').matches)
-  }
+  return 'system'
 }
 
+function initTheme() {
+  mediaQuery = window.matchMedia('(prefers-color-scheme: dark)')
+  // 运行期跟随 OS：只有当前处于「跟随系统」时才响应系统主题变化。
+  mediaQuery.addEventListener('change', (e) => {
+    if (readStoredTheme() === 'system') applyTheme(e.matches)
+  })
+  applyTheme(mediaQuery.matches)
+}
+
+// toggleTheme 是**显式**选择：用户点一下就固化，不再跟随系统。
+// 想回到「跟随系统」需要清掉 localStorage 里的键（或后续加一个三态切换）。
 function toggleTheme() {
-  applyTheme(!isDark.value)
+  const next = !isDark.value
+  applyTheme(next)
+  persistTheme(next ? 'dark' : 'light')
 }
 
 // 退出登录：清掉本地令牌后重载（与登录成功后的 reload 对称）。

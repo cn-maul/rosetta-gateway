@@ -2,6 +2,7 @@ package admin
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"strings"
 	"time"
@@ -109,7 +110,10 @@ func (h *ModelHandler) Create(w http.ResponseWriter, r *http.Request, providerID
 	}
 
 	var req modelRequest
-	if err := decodeJSON(r, &req); err != nil {
+	if err := decodeJSON(w, r, &req); err != nil {
+		if errors.Is(err, errUnsupportedMediaType) {
+			return
+		}
 		writeError(w, http.StatusBadRequest, "invalid JSON: "+err.Error())
 		return
 	}
@@ -177,7 +181,10 @@ func (h *ModelHandler) Update(w http.ResponseWriter, r *http.Request, id string)
 	}
 
 	var req modelRequest
-	if err := decodeJSON(r, &req); err != nil {
+	if err := decodeJSON(w, r, &req); err != nil {
+		if errors.Is(err, errUnsupportedMediaType) {
+			return
+		}
 		writeError(w, http.StatusBadRequest, "invalid JSON: "+err.Error())
 		return
 	}
@@ -322,7 +329,10 @@ func (h *ModelHandler) ImportModels(w http.ResponseWriter, r *http.Request, prov
 	var body struct {
 		Models []modelImportItem `json:"models"`
 	}
-	if err := decodeJSON(r, &body); err != nil {
+	if err := decodeJSON(w, r, &body); err != nil {
+		if errors.Is(err, errUnsupportedMediaType) {
+			return
+		}
 		writeError(w, http.StatusBadRequest, "invalid JSON: "+err.Error())
 		return
 	}

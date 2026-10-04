@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io/fs"
 	"log/slog"
+	"math"
 	"net/http"
 	"os"
 	"os/signal"
@@ -133,8 +134,13 @@ func main() {
 	masterKey, generatedKey, weakKey, err := crypto.LoadMasterKey(cfg.MasterKeyEnv, homeDir)
 	switch {
 	case err != nil:
-		logger.Warn("master key unavailable, credential encryption disabled", "error", err)
-		masterKey = nil
+		// 这里绝不能降级成「无主密钥继续跑」：encryptSecret 在没有密钥时会把
+		// 上游 API key **明文**写进数据库，而 DecryptWithFallback 之后又一直按
+		// 明文接受 —— 一次瞬态失败（目录不存在/不可写/权限异常）就换来一批
+		// 不可逆的明文凭据，且没有任何补救路径。宁可拒绝启动。
+		logger.Error("master key unavailable, refusing to start", "error", err,
+			"hint", "确认状态目录可写，或设置 "+cfg.MasterKeyEnv)
+		os.Exit(1)
 	case generatedKey:
 		logger.Info("generated master key", "path", filepath.Join(homeDir, crypto.KeyFileName))
 	case weakKey:
@@ -153,6 +159,9 @@ func main() {
 	bootstrapDB(db, cfg, logger, masterKey)
 
 	pool := upstream.NewPool(logger)
+	// 冷却状态必须落库，否则任何 admin 写操作触发的池重建都会把刚被判坏的
+	// 凭据立刻放回轮换。
+	pool.SetCooldownStore(db)
 	reloader := &runtimeReloader{db: db, masterKey: masterKey, pool: pool, cfg: cfg}
 	if err := reloader.Reload(context.Background()); err != nil {
 		logger.Warn("failed to build runtime from DB, falling back to config", "error", err)
@@ -219,7 +228,21 @@ func main() {
 				"(login throttling only slows it down). Set a strong admin password in the UI to override it")
 		}
 	default:
-		logger.Warn("no admin credential configured; the admin UI will ask you to set a password on first visit")
+		// 「无凭据」本身只是一条引导提示 —— 但它和「监听非回环」叠加就
+		// 变成一个可被任意人抢占的窗口：password/set 在无凭据时被豁免鉴权
+		// （见 server.AdminAuth），默认 listen 是回环所以只有本机能碰，
+		// 可运维为对外服务把 listen 改成 0.0.0.0 是很常见的做法，那时
+		// 整个局域网都能 curl -X POST 抢走管理员。
+		if !isLoopbackListen(cfg.Listen) {
+			logger.Error("SECURITY: no admin credential AND listening on a non-loopback address — "+
+				"anyone who can reach this port can set the admin password and take over the gateway",
+				"listen", cfg.Listen,
+				"immediate_action", "设置 config.json 的 admin_token（或环境变量 ADMIN_TOKEN）后重启；"+
+					"或把 listen 改回 127.0.0.1")
+		} else {
+			logger.Warn("no admin credential configured; the admin UI will ask you to set a password on first visit",
+				"note", "监听地址是回环，仅本机可访问；一旦改为 0.0.0.0 暴露到网络，请务必先设置 admin_token")
+		}
 	}
 
 	providerHandler := admin.NewProviderHandler(db, masterKey, cfg)
@@ -267,6 +290,8 @@ func main() {
 	adminMux.HandleFunc("POST /admin/api/keys", keyHandler.Create)
 	adminMux.HandleFunc("PATCH /admin/api/keys/{id}", func(w http.ResponseWriter, r *http.Request) { keyHandler.Update(w, r, r.PathValue("id")) })
 	adminMux.HandleFunc("DELETE /admin/api/keys/{id}", func(w http.ResponseWriter, r *http.Request) { keyHandler.Delete(w, r, r.PathValue("id")) })
+	// 重算 used_tokens：触发器维护的派生值没有自愈路径，偏高后 key 会变成死 key。
+	adminMux.HandleFunc("POST /admin/api/keys/{id}/recompute-usage", func(w http.ResponseWriter, r *http.Request) { keyHandler.RecomputeUsage(w, r, r.PathValue("id")) })
 
 	adminMux.HandleFunc("GET /admin/api/stats", statsHandler.Get)
 	adminMux.HandleFunc("POST /admin/api/reload", reloadHandler.Reload)
@@ -322,7 +347,7 @@ func main() {
 	webuiFS, _ := fs.Sub(webui.StaticFS, "dist")
 	fileServer := http.FileServer(http.FS(webuiFS))
 	webHandler := func(w http.ResponseWriter, r *http.Request) {
-		// 只服务已知的两类路径，其余一律 404。虽然 http.FileServer + embed FS
+		// 只服务已知的几类路径，其余一律 404。虽然 http.FileServer + embed FS
 		// 本身已防路径穿越，显式白名单能避免把未知路径静默回退成 index.html
 		// 或暴露 dist 下意外多出的文件。
 		p := strings.TrimPrefix(r.URL.Path, "/admin")
@@ -339,10 +364,29 @@ func main() {
 				return
 			}
 			w.Header().Set("Content-Type", "text/html; charset=utf-8")
+			// index.html 不缓存：它引用的是带 hash 的资源文件名，网关升级后
+			// 浏览器若启发式缓存了旧 index.html，会去请求已不存在的旧 hash 资源，
+			// 表现为「打开管理后台白屏」。no-cache 允许缓存但强制回源校验。
+			w.Header().Set("Cache-Control", "no-cache")
 			w.Write(data)
-		case strings.HasPrefix(p, "/assets/"):
-			// 静态资源，原样交给 FileServer。
+		case p == "/theme-init.js":
+			// 主题防闪脚本。不走 FileServer 是为了拿到明确的缓存策略 ——
+			// 文件名不带 hash，内容变了必须让浏览器立刻看到。
+			data, err := fs.ReadFile(webuiFS, "theme-init.js")
+			if err != nil {
+				http.NotFound(w, r)
+				return
+			}
+			w.Header().Set("Content-Type", "text/javascript; charset=utf-8")
+			w.Header().Set("Cache-Control", "no-cache")
+			w.Write(data)
+		case strings.HasPrefix(p, "/assets/") && p != "/assets/" && !strings.HasSuffix(p, "/"):
+			// 静态资源。**排除 "/assets/" 本身**：http.FileServer 对以 / 结尾
+			// 且解析为目录的路径会生成 HTML 目录列表，把构建产物文件名全部
+			// 列出来。embed FS 下无敏感文件，但白名单既然存在就把这条堵上。
+			// 文件名带内容 hash，可以放心 immutable 长缓存。
 			r.URL.Path = p
+			w.Header().Set("Cache-Control", "public, max-age=31536000, immutable")
 			fileServer.ServeHTTP(w, r)
 		default:
 			http.NotFound(w, r)
@@ -438,9 +482,24 @@ func (rr *runtimeReloader) Reload(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("rebuild snapshot: %w", err)
 	}
-	rr.pool.Install(providers)
+	rr.pool.Install(providers, liveTargetIDs(ctx, rr.db))
 	snapshot.Swap(snap)
 	return nil
+}
+
+// liveTargetIDs 返回当前库里全部 route target 的 ID 集合，交给 Pool.Install
+// 决定哪些熔断状态该跨重建保留。读不到时返回空集（与 upstream 侧的兜底一致：
+// 清掉全部熔断只是让坏上游短暂复活，保留已删目标的状态则会单调堆积）。
+func liveTargetIDs(ctx context.Context, db *store.Store) map[string]bool {
+	targets, err := db.ListAllRouteTargets(ctx)
+	if err != nil {
+		return map[string]bool{}
+	}
+	ids := make(map[string]bool, len(targets))
+	for _, t := range targets {
+		ids[t.ID] = true
+	}
+	return ids
 }
 
 func bootstrapDB(db *store.Store, cfg *config.Config, logger *slog.Logger, masterKey []byte) {
@@ -655,10 +714,12 @@ type ingressRequest struct {
 }
 
 // rateCommit 把一次请求的 TPM 预占在请求终结时校正为真实用量。
-// nil 接收者安全：TPM 未启用（额度 0）时调用方可以放一个 nil。
+// nil 接收者安全：TPM 未启用（额度 0）时调用方可以放一个 nil ——
+// 现在主路径在 TPMLimit==0 时干脆不建这个结构，commit 就是纯 no-op。
 type rateCommit struct {
 	limiter  *ratelimit.Limiter
 	keyID    string
+	limit    int // 预占时的 tpmLimit；0 = 未启用，CommitTPM 据此直接返回
 	reserved int64
 }
 
@@ -666,12 +727,16 @@ func (rc *rateCommit) commit(actual int64) {
 	if rc == nil {
 		return
 	}
-	rc.limiter.CommitTPM(rc.keyID, rc.reserved, actual)
+	rc.limiter.CommitTPM(rc.keyID, rc.limit, rc.reserved, actual)
 }
 
 // setRetryAfter 写 Retry-After 响应头（向上取整秒，至少 1）。
+//
+// 必须向上取整而不是截断：windowRemaining 已经带了 +1s 余量，若这里再用
+// int(d.Seconds()) 截断，余量会被吃掉大半（剩 0.9s 时算成 1s，客户端 1s 后
+// 重试仍在原窗口内，立刻又被拒 —— 正是这个函数要避免的抖动）。
 func setRetryAfter(w http.ResponseWriter, d time.Duration) {
-	seconds := int(d.Seconds())
+	seconds := int(math.Ceil(d.Seconds()))
 	if seconds < 1 {
 		seconds = 1
 	}
@@ -856,17 +921,25 @@ func handleIngress(pool *upstream.Pool, cfg *config.Config, usage *usageRecorder
 		// TPM 限速（DESIGN §11.4）：流式下真实 token 只有流结束才知道，
 		// 所以按「请求前估算预占 + 请求后按真实 usage 校正」两段执行。
 		// 被拒的请求不预占（没放行就不该消耗窗口额度），也不预扣任何东西。
-		est := estimateRequestTokens(ing.buildRosetta())
-		if ok, retry := limiter.ReserveTPM(authCtx.KeyID, authCtx.TPMLimit, est); !ok {
-			logger.Warn("rate limited (tpm)", "key_id", authCtx.KeyID,
-				"estimated_tokens", est, "retry_after", retry.String(),
-				"request_id", server.RequestIDFromContext(r.Context()))
-			setRetryAfter(w, retry)
-			codec.WriteError(w, http.StatusTooManyRequests, "rate_limit_exceeded",
-				"token rate limit exceeded for this API key")
-			return
+		//
+		// TPMLimit==0（未启用，也是主流配置）时**整段跳过**：estimateRequestTokens
+		// 会遍历全部消息与工具定义拼出一个与请求体同量级的字符串再估算，
+		// 是一次纯浪费的全量分配；而它算出的 est 随后必然被丢弃。
+		// 同一个请求在 attempt* 里还会再 buildRosetta 一次，估算那次是多余的第 N 次。
+		var rate *rateCommit
+		if authCtx.TPMLimit > 0 {
+			est := estimateRequestTokens(ing.buildRosetta())
+			if ok, retry := limiter.ReserveTPM(authCtx.KeyID, authCtx.TPMLimit, est); !ok {
+				logger.Warn("rate limited (tpm)", "key_id", authCtx.KeyID,
+					"estimated_tokens", est, "retry_after", retry.String(),
+					"request_id", server.RequestIDFromContext(r.Context()))
+				setRetryAfter(w, retry)
+				codec.WriteError(w, http.StatusTooManyRequests, "rate_limit_exceeded",
+					"token rate limit exceeded for this API key")
+				return
+			}
+			rate = &rateCommit{limiter: limiter, keyID: authCtx.KeyID, limit: authCtx.TPMLimit, reserved: est}
 		}
-		rate := &rateCommit{limiter: limiter, keyID: authCtx.KeyID, reserved: est}
 
 		snap := snapshot.Get()
 		res, err := snap.Routes.Resolve(ing.model)
@@ -923,10 +996,6 @@ func handleIngress(pool *upstream.Pool, cfg *config.Config, usage *usageRecorder
 				return
 			}
 
-			rosettaReq := ing.buildRosetta()
-			rosettaReq.Model = cand.UpstreamModel.ModelID
-			ing.applyUpstreamExtras(rosettaReq, cand.Provider.Protocol)
-
 			// 一次 attempt 只取该 provider 的一把凭据：某把 key 失败时本请求不就地换
 			// 同 provider 的下一把，而是让位给链上下一个目标。跨请求的 key 轮换交给
 			// 冷却 —— 坏 key 被踢出 healthy 后，下个请求自会选到好 key。这是有意取舍，
@@ -952,8 +1021,14 @@ func handleIngress(pool *upstream.Pool, cfg *config.Config, usage *usageRecorder
 			}
 
 			if out.committed {
-				pool.RecordCredentialSuccess(credID)
-				pool.RecordTargetSuccess(cand.TargetID)
+				// 只有真成功才记成功 —— 断流/溢出/上游错误虽已提交，却是失败，
+				// 必须让目标熔断计数与凭据健康照常累计，否则故障永不转移。
+				if out.success {
+					pool.RecordCredentialSuccess(credID)
+					pool.RecordTargetSuccess(cand.TargetID)
+				} else {
+					pool.RecordTargetFailure(cand.TargetID, threshold)
+				}
 				return
 			}
 
@@ -1038,7 +1113,11 @@ func handleIngress(pool *upstream.Pool, cfg *config.Config, usage *usageRecorder
 // committed=false 时 attempt 未碰过 ResponseWriter，由外层循环决定「换下一个目标」还是
 // 「把这次错误写回客户端」。eligible 告诉外层这次失败值不值得转移。
 type attemptOutcome struct {
-	committed    bool
+	committed bool
+	// success 表示本次 attempt 真的成功抵达上游（流式仅 status=="ok" 为真）。
+	// committed 只说明「字节已写出、不能回退」，断流/溢出同样是 committed
+	// 却是失败 —— 熔断与凭据健康必须看success，不能看 committed。
+	success      bool
 	eligible     bool
 	credCooldown time.Duration
 	statusCode   int
@@ -1076,10 +1155,35 @@ func failoverFailureThreshold(snap *snapshot.Snapshot, cfg *config.Config) int {
 	return cfg.FailoverFailureThreshold()
 }
 
+// safeMillis 把毫秒数转成 time.Duration，并钳制在不会整数回绕的范围内。
+//
+// 为什么要钳制而不只是校验：校验（config.validate + settings_handler）挡住的是
+// **新写入**的脏值，挡不住数据库里已经存在的、或在别的部署路径下写进去的。
+// 而回绕的后果是灾难性的 —— time.Duration 是 int64 纳秒，
+// `time.Duration(ms) * time.Millisecond` 在 ms > 9.223e12 时得到**负数**：
+//
+//	context.WithTimeout(ctx, 负值)  → deadline 立即过期 → 非流式请求全挂
+//	time.AfterFunc(负值, ...)      → 立即开火 → 流刚发头就被自己关掉
+//
+// 而 UI 上显示的是一个「巨大但合法」的超时值，没有任何异常信号。
+// 24 小时足够任何网关用，且离溢出点有 380 倍余量。
+func safeMillis(ms int) time.Duration {
+	const maxMillis = 86_400_000 // 24h
+	if ms <= 0 {
+		return 0
+	}
+	if ms > maxMillis {
+		slog.Warn("runtime millisecond setting exceeds safe range, clamping",
+			"ms", ms, "clamped_to_ms", maxMillis)
+		return time.Duration(maxMillis) * time.Millisecond
+	}
+	return time.Duration(ms) * time.Millisecond
+}
+
 // nonStreamTimeout：设置页的全局默认优先，其次 config 的上游超时。
 func nonStreamTimeout(snap *snapshot.Snapshot, cfg *config.Config) time.Duration {
 	if snap != nil && snap.Runtime.UpstreamTimeoutMs > 0 {
-		return time.Duration(snap.Runtime.UpstreamTimeoutMs) * time.Millisecond
+		return safeMillis(snap.Runtime.UpstreamTimeoutMs)
 	}
 	return cfg.UpstreamTimeout()
 }
@@ -1087,7 +1191,7 @@ func nonStreamTimeout(snap *snapshot.Snapshot, cfg *config.Config) time.Duration
 // firstTokenTimeout：设置页的全局默认优先，其次 config 的首字超时。
 func firstTokenTimeout(snap *snapshot.Snapshot, cfg *config.Config) time.Duration {
 	if snap != nil && snap.Runtime.StreamFirstTokenTimeoutMs > 0 {
-		return time.Duration(snap.Runtime.StreamFirstTokenTimeoutMs) * time.Millisecond
+		return safeMillis(snap.Runtime.StreamFirstTokenTimeoutMs)
 	}
 	return cfg.StreamFirstTokenTimeout()
 }
@@ -1095,7 +1199,7 @@ func firstTokenTimeout(snap *snapshot.Snapshot, cfg *config.Config) time.Duratio
 // streamIdleTimeout：设置页的全局默认优先，其次 config 的流式空闲超时。
 func streamIdleTimeout(snap *snapshot.Snapshot, cfg *config.Config) time.Duration {
 	if snap != nil && snap.Runtime.StreamIdleTimeoutMs > 0 {
-		return time.Duration(snap.Runtime.StreamIdleTimeoutMs) * time.Millisecond
+		return safeMillis(snap.Runtime.StreamIdleTimeoutMs)
 	}
 	return cfg.StreamIdleTimeout()
 }
@@ -1123,7 +1227,15 @@ func attemptStream(w http.ResponseWriter, r *http.Request, client *rosetta.Clien
 	logger := usage.logger
 	publicModel := ing.model
 
-	stream, err := client.ChatStream(ctx, ing.buildRosetta())
+	// 每个 attempt 现造一份请求，并把公共别名换成该目标的上游 model_id、
+	// 挂上该上游协议的私有透传字段。必须在 attempt 内部做（而不是在调用点
+	// 造好传进来）：链上各目标的协议不同，Extra 形状也不同，复用同一实例
+	// 会把 A 目标的字段泄漏给 B 目标。
+	upstreamReq := ing.buildRosetta()
+	upstreamReq.Model = cand.UpstreamModel.ModelID
+	ing.applyUpstreamExtras(upstreamReq, cand.Provider.Protocol)
+
+	stream, err := client.ChatStream(ctx, upstreamReq)
 	if err != nil {
 		return outcomeFromErr(err)
 	}
@@ -1194,15 +1306,30 @@ func attemptStream(w http.ResponseWriter, r *http.Request, client *rosetta.Clien
 	// 对按行解析的下游是纯噪声。
 	// 心跳 goroutine 与主循环会并发写同一个 ResponseWriter，所以统一经由 sink
 	// （各实现内部有锁），不再自己 fmt.Fprintf(w, ...)。
+	// 心跳 goroutine 必须**保证在 handler 返回前退出**：它与主循环并发写同一个
+	// ResponseWriter，若handler 先返回、goroutine 还在 ticker 周期里，就会写一个
+	// 已结束的响应（连接复用时甚至串到下一个请求）。原来的 ctx.Done() 只在
+	// 客户端断开时才触发，正常完成路径上 goroutine 会一直活着。
+	// quit + WaitGroup 是必须的：ticker 最多要等一个周期才退出，不能靠 defer。
+	quit := make(chan struct{})
+	var hbWG sync.WaitGroup
+	hbWG.Add(1)
 	go func() {
+		defer hbWG.Done()
 		for {
 			select {
 			case <-heartbeatTicker.C:
 				sink.Keepalive()
+			case <-quit:
+				return
 			case <-ctx.Done():
 				return
 			}
 		}
+	}()
+	defer func() {
+		close(quit)
+		hbWG.Wait()
 	}()
 
 	var lastUsage rosetta.Usage
@@ -1295,17 +1422,27 @@ func attemptStream(w http.ResponseWriter, r *http.Request, client *rosetta.Clien
 	})
 	// TPM 校正：预占的估算值以真实 usage（输入+输出）替换。
 	rate.commit(lastUsage.TotalTokens)
-	return attemptOutcome{committed: true}
+	// committed=true（字节已写出、无法回退换目标）与「这一次算成功」是两件事：
+	// truncated / overflow / error / canceled 都已提交，但对上游而言是失败。
+	// 只有 status=="ok" 才允许外层记成功，否则「先200 再断流」这类最常见的
+	// 上游故障永远不累计失败、目标永不熔断。
+	return attemptOutcome{committed: true, success: status == "ok"}
 }
 
 func attemptNonStream(w http.ResponseWriter, r *http.Request, client *rosetta.Client, ing *ingressRequest, cand routing.Candidate, keyID string, codec ingressCodec, rate *rateCommit, cfg *config.Config, snap *snapshot.Snapshot, usage *usageRecorder, start time.Time) attemptOutcome {
 	publicModel := ing.model
+	// 同attemptStream：别名 → 上游 model_id 的映射与协议私有字段的透传
+	// 必须在本次 attempt 内完成，不能由调用方造好传入。
+	upstreamReq := ing.buildRosetta()
+	upstreamReq.Model = cand.UpstreamModel.ModelID
+	ing.applyUpstreamExtras(upstreamReq, cand.Provider.Protocol)
+
 	// 绑定 r.Context() 而非 context.Background()：客户端断开时上游调用应随之取消，
 	// 否则断连请求会一直占用上游连接与配额直到超时（默认 120s）。
 	ctx, cancel := context.WithTimeout(r.Context(), nonStreamTimeout(snap, cfg))
 	defer cancel()
 
-	resp, err := client.Chat(ctx, ing.buildRosetta())
+	resp, err := client.Chat(ctx, upstreamReq)
 	if err != nil {
 		return outcomeFromErr(err)
 	}
@@ -1336,7 +1473,10 @@ func attemptNonStream(w http.ResponseWriter, r *http.Request, client *rosetta.Cl
 		TTFBMs:          ttfbMs,
 	})
 	rate.commit(resp.Usage.TotalTokens)
-	return attemptOutcome{committed: true}
+	// 非流式能走到这里就意味着上游完整返回了响应 —— 一定是成功。
+	// 漏写success 会让每次非流式成功都被外层记成「目标失败」，
+	// 健康的链首目标 3 个请求后就被误熔断（详见 attemptOutcome.success）。
+	return attemptOutcome{committed: true, success: true}
 }
 
 // isClientGone 判断一次流式中断是否源于**客户端**断开，而不是上游故障。

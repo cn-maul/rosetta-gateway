@@ -21,7 +21,7 @@ func TestModelHandler_PriceRoundTrip(t *testing.T) {
 
 	patch := func(body string) (*httptest.ResponseRecorder, modelResponse) {
 		t.Helper()
-		req := httptest.NewRequest(http.MethodPatch, "/admin/api/models/m1", bytes.NewBufferString(body))
+		req := jsonRequest(http.MethodPatch, "/admin/api/models/m1", bytes.NewBufferString(body))
 		rec := httptest.NewRecorder()
 		h.Update(rec, req, "m1")
 		var resp modelResponse
@@ -90,7 +90,7 @@ func TestModelHandler_ListIncludesPrices(t *testing.T) {
 	st := newTestStore(t)
 	h := NewModelHandler(st, nil, nil)
 
-	req := httptest.NewRequest(http.MethodPost, "/admin/api/providers/p1/models",
+	req := jsonRequest(http.MethodPost, "/admin/api/providers/p1/models",
 		bytes.NewBufferString(`{"model_id":"priced","price_input":1,"price_output":3}`))
 	rec := httptest.NewRecorder()
 	h.Create(rec, req, "p1")

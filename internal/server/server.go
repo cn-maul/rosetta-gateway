@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"net/url"
 	"strconv"
 	"strings"
 	"sync"
@@ -182,6 +183,18 @@ func AdminAuthThrottled(next http.Handler, creds AdminCredentials, throttle *Fai
 			return
 		}
 		if path == "/admin/api/password/set" && !creds.HasCredential() {
+			// 引导窗口的 CSRF 防线。decodeJSON 的 Content-Type 断言是第一道
+			// （text/plain 是 CORS safelisted 类型，不预检也能发到服务端）；
+			// 这里是第二道，且不依赖请求体形状 —— 任何「跨源页面发起的
+			// 免鉴权写请求」都被挡下，与 Content-Type 无关。
+			//
+			// 判据用 Sec-Fetch-Site（现代浏览器强制发送、不可被 JS 伪造），
+			// 回退到 Origin 比对 Host。非浏览器客户端（curl / SDK）两个头
+			// 都不带 —— 那不是浏览器 CSRF 的攻击面，放行。
+			if !sameOrigin(r) {
+				writeForbidden(w)
+				return
+			}
 			next.ServeHTTP(w, r)
 			return
 		}
@@ -191,6 +204,10 @@ func AdminAuthThrottled(next http.Handler, creds AdminCredentials, throttle *Fai
 			writeTooManyAttempts(w, throttle.RetryAfter(ip))
 			return
 		}
+		// Allow 占用了一个并发额度，此后每条出口路径都必须归还：
+		// Success/Fail 内部各还一次，这里用 defer 兜住 Verify panic 之外的
+		// 中途返回，并把额度交给下一次调用。
+		defer throttle.Release(ip)
 
 		if creds.Verify(bearerToken(r)) {
 			throttle.Success(ip)
@@ -201,6 +218,37 @@ func AdminAuthThrottled(next http.Handler, creds AdminCredentials, throttle *Fai
 		throttle.Fail(ip)
 		writeAuthError(w)
 	})
+}
+
+// sameOrigin 报告请求是否来自同源。
+//
+// 判据优先级：
+//  1. Sec-Fetch-Site —— 浏览器强制发送，页面 JS **无法**伪造（属于
+//     forbidden header name）。跨站导航/表单/fetch 一律是 cross-site。
+//  2. Origin —— 浏览器对 CORS 相关请求必发。同样不可伪造。取其 scheme+host
+//     与请求的 Host 比对；反向代理后两者可能不等，此时保守判为跨源。
+//  3. 都没有 —— 非浏览器客户端（curl、SDK、服务间调用）。它不受浏览器
+//     同源策略约束，因此不是 CSRF 的攻击面，放行。
+func sameOrigin(r *http.Request) bool {
+	if site := r.Header.Get("Sec-Fetch-Site"); site != "" {
+		return site == "same-origin" || site == "none"
+	}
+	origin := r.Header.Get("Origin")
+	if origin == "" {
+		return true
+	}
+	u, err := url.Parse(origin)
+	if err != nil || u.Host == "" {
+		return false
+	}
+	return strings.EqualFold(u.Host, r.Host)
+}
+
+func writeForbidden(w http.ResponseWriter) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusForbidden)
+	//nolint:errcheck // 响应写入失败已无补救手段
+	w.Write([]byte(`{"error":{"message":"拒绝跨站请求","type":"invalid_request_error"}}`))
 }
 
 // clientIP 取请求来源地址。
@@ -240,6 +288,10 @@ type FailureThrottle struct {
 type failEntry struct {
 	count int
 	until time.Time
+	// inflight 是当前正在跑 KDF 的并发请求数。Allow 必须**先占用再放行**：
+	// 只读计数的话，同 IP 的 N 个并发请求会在第一次 Fail 落地前全部通过，
+	// 既击穿限速，又把 PBKDF2 的 CPU 消耗放大 N 倍。
+	inflight int
 }
 
 func NewFailureThrottle(limit int, cooldown time.Duration) *FailureThrottle {
@@ -252,15 +304,40 @@ func NewFailureThrottle(limit int, cooldown time.Duration) *FailureThrottle {
 	return &FailureThrottle{limit: limit, cooldown: cooldown, fails: make(map[string]*failEntry)}
 }
 
-// Allow 报告该 IP 当前是否允许尝试。
+// Allow 报告该 IP 当前是否允许尝试。返回 true 时同时**占用一个并发额度**，
+// 调用方必须在验证结束后调用 Release 归还（Success/Fail 内部已各自归还，
+// 只有中途 return 的分支需要手动调）。
 func (t *FailureThrottle) Allow(ip string) bool {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	e, ok := t.fails[ip]
 	if !ok {
+		t.fails[ip] = &failEntry{inflight: 1}
 		return true
 	}
-	return !time.Now().Before(e.until)
+	if !e.until.IsZero() && time.Now().Before(e.until) {
+		return false
+	}
+	// 并发上限：同一个 IP 最多同时有 maxConcurrent 个请求在跑 KDF。
+	if e.inflight >= maxConcurrentAttempts {
+		return false
+	}
+	e.inflight++
+	return true
+}
+
+// maxConcurrentAttempts 是单个来源 IP 允许同时进行的鉴权尝试数。
+// 超出的请求直接按限速处理（429），不给「并发抢先」留窗口。
+const maxConcurrentAttempts = 4
+
+// Release 归还 Allow 占用的并发额度。ip 没有条目时是 no-op
+// （Success 删条目后迟到的 Release 不该凭空造出一个新条目）。
+func (t *FailureThrottle) Release(ip string) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if e, ok := t.fails[ip]; ok && e.inflight > 0 {
+		e.inflight--
+	}
 }
 
 // RetryAfter 返回冷却剩余时长；未处于冷却期为 0。
@@ -299,6 +376,10 @@ func (t *FailureThrottle) Fail(ip string) {
 		e.count = 0
 		e.until = time.Time{}
 	}
+	// 归还 Allow 占用的并发额度（Fail 是一次尝试的终点）。
+	if e.inflight > 0 {
+		e.inflight--
+	}
 
 	e.count++
 	if e.count >= t.limit {
@@ -311,7 +392,18 @@ func (t *FailureThrottle) Fail(ip string) {
 func (t *FailureThrottle) Success(ip string) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	delete(t.fails, ip)
+	e, ok := t.fails[ip]
+	if !ok {
+		return
+	}
+	// 仍有并发尝试在跑时不能直接删条目 —— 那些请求结束时会调用 Fail，
+	// 删掉条目会让它们凭空造出一个 count=0 的新条目，把失败计数清零。
+	// 正确做法是清零失败状态、保留并发计数，等最后一个请求离开时再删。
+	e.count = 0
+	e.until = time.Time{}
+	if e.inflight <= 0 {
+		delete(t.fails, ip)
+	}
 }
 
 // sweepLocked 防止 map 被海量一次性 IP 撑爆：条目数超阈值时清掉所有不在冷却期的记录。
@@ -364,8 +456,16 @@ func SecurityHeaders(next http.Handler) http.Handler {
 		if strings.HasPrefix(r.URL.Path, "/admin") {
 			h := w.Header()
 			// 管理面板是自包含 SPA，无第三方脚本/样式，CSP 收紧到 self。
+			//
+			// 注意 script-src **不含** 'unsafe-inline'：主题防闪脚本曾经以
+			// 内联 IIFE 写在 index.html 的 <head> 里，被这条 CSP 静默拦掉 ——
+			// 功能直接坏掉（暗色用户首帧白闪回归），而浏览器只在控制台报一条
+			// 违规，测试与构建全绿，看不出任何异常。该脚本已外置为
+			// /admin/assets/theme-init.js（见 web/index.html）。
 			h.Set("Content-Security-Policy",
-				"default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; base-uri 'self'; form-action 'self'; frame-ancestors 'none'")
+				"default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; "+
+					"img-src 'self' data:; connect-src 'self'; base-uri 'self'; "+
+					"form-action 'self'; frame-ancestors 'none'")
 			// 禁止被嵌入 iframe（点击劫持防护）。
 			h.Set("X-Frame-Options", "DENY")
 			// 禁止 MIME 嗅探。
@@ -374,6 +474,10 @@ func SecurityHeaders(next http.Handler) http.Handler {
 			h.Set("X-XSS-Protection", "1; mode=block")
 			// 引用策略：不向任何跨源请求泄露 Referer。
 			h.Set("Referrer-Policy", "no-referrer")
+			// 管理面响应一律不缓存：凭据状态、路由配置、用量数据都是敏感且
+			// 强时效的，浏览器 back-forward cache 或中间代理命中一次旧响应
+			// 就会让「刚被禁用的 key 仍显示可用」这类误判持续存在。
+			h.Set("Cache-Control", "no-store")
 		}
 		next.ServeHTTP(w, r)
 	})

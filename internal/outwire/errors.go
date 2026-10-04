@@ -3,6 +3,7 @@ package outwire
 import (
 	"encoding/json"
 	"errors"
+	"log/slog"
 	"net/http"
 	"time"
 
@@ -51,27 +52,47 @@ func MapUpstreamError(err error) (int, string, string) {
 			return http.StatusBadGateway, "upstream_quota_exhausted", "upstream provider quota exhausted"
 		case apiErr.StatusCode == 429:
 			return http.StatusTooManyRequests, "rate_limit_exceeded", "rate limit exceeded"
+		case apiErr.StatusCode == statusOverloaded:
+			// 上游过载：Anthropic 的 529 有专门语义（overloaded_error），
+			// 官方 SDK 对它做指数退避重试。压成 502 会让客户端退化成
+			// 「未知错误」而不重试 —— 而过载恰恰是最该重试的场景。
+			// 503 同理（Service Unavailable，也是可重试的过载信号）。
+			logAPIError(apiErr)
+			return apiErr.StatusCode, "upstream_error", "upstream provider overloaded"
 		case apiErr.StatusCode >= 500:
 			return http.StatusBadGateway, "upstream_error", "upstream provider error"
 		case apiErr.StatusCode == 400:
-			return http.StatusBadRequest, "invalid_request_error", apiErr.Message
+			// 不回显上游原文：上游错误 message 里常带内部 URL、账号标识，
+			// 有时还有对方的 prompt片段。且这些文本对下游定位自己的问题无用
+			// —— 该做的是对照网关的路由配置。把原文放进日志而不是响应体。
+			logAPIError(apiErr)
+			return http.StatusBadRequest, "invalid_request_error", "upstream rejected the request"
 		case apiErr.StatusCode == http.StatusNotFound, apiErr.StatusCode == http.StatusGone:
 			// 上游说「没有这个模型 / 没有这个端点」。这是目标级的配置问题，
 			// 不是网关内部故障 —— 旧实现落到 default 分支，把上游那句
 			// "not found" 原样塞进 502 upstream_error 里，客户端看不出该去查
 			// 自己的 model 名还是该去查网关的 provider 配置。
+			logAPIError(apiErr)
 			return http.StatusNotFound, "model_not_found", "upstream provider does not serve this model"
 		default:
-			return http.StatusBadGateway, "upstream_error", apiErr.Message
+			logAPIError(apiErr)
+			return http.StatusBadGateway, "upstream_error", "upstream provider error"
 		}
 	}
 
 	var transportErr *rosetta.TransportError
 	if errors.As(err, &transportErr) {
+		// 同理：transport error 的原文含上游 endpoint 地址，不外泄。
 		return http.StatusGatewayTimeout, "upstream_timeout", "upstream connection failed"
 	}
 
 	return http.StatusInternalServerError, "internal_error", "internal gateway error"
+}
+
+// logAPIError 把上游错误原文留在服务端日志里（响应体只给分类后的固定文案）。
+func logAPIError(e *rosetta.APIError) {
+	slog.Warn("upstream returned an error",
+		"status", e.StatusCode, "type", e.Type, "message", e.Message)
 }
 
 func WriteOpenAIError(w http.ResponseWriter, statusCode int, code, message string) {
@@ -86,6 +107,16 @@ func WriteOpenAIError(w http.ResponseWriter, statusCode int, code, message strin
 	})
 }
 
+// errorTypeFromCode 把网关内部语义 code 翻译成 OpenAI 的 error.type。
+//
+// 关键诉求是**让客户端能按类型决策重试/退避**。旧实现只有 5 个分支，
+// 其余（含 upstream_* 一族）全塌成 api_error —— 而塌掉的恰恰是客户端
+// 最需要区分的四类：鉴权失败（换 key）、额度耗尽（充值/换账号）、
+// 超时（可重试）、上游过载（应退避重试）。收到 api_error 的 SDK 通常
+// 直接放弃重试。
+//
+// 注意 HTTP 状态码与 code 字段始终保留，按这两者判断的客户端不受影响；
+// 受影响的只是按 type 判断的那部分。
 func errorTypeFromCode(code string) string {
 	switch code {
 	case "model_not_found":
@@ -98,6 +129,25 @@ func errorTypeFromCode(code string) string {
 		return "invalid_request_error"
 	case "invalid_request_error":
 		return "invalid_request_error"
+	case "request_too_large":
+		// 413 属于请求本身过大，重试无用但也不该报成 api_error ——
+		// 客户端据此可以主动裁剪输入再试。
+		return "invalid_request_error"
+	case "insufficient_quota":
+		// 与 rate_limit 区分：额度耗尽要充值/换账号，退避没有意义。
+		return "insufficient_quota"
+	case "upstream_auth_error":
+		// 上游 401/403 —— 目标级凭据问题，故障转移链有机会换一把 key。
+		// 报成 api_error 会让客户端以为是自己请求的问题。
+		return "authentication_error"
+	case "upstream_quota_exhausted":
+		return "insufficient_quota"
+	case "upstream_timeout":
+		// 上游超时是可重试的瞬时故障，客户端应该退避后重发。
+		return "timeout_error"
+	case "upstream_error":
+		// 上游 5xx。多为过载/暂时不可用，可重试。
+		return "api_error"
 	default:
 		return "api_error"
 	}

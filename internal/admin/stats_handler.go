@@ -2,6 +2,7 @@ package admin
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"strconv"
@@ -33,9 +34,27 @@ type statsResponse struct {
 }
 
 func (h *StatsHandler) Get(w http.ResponseWriter, r *http.Request) {
-	// from/to 为毫秒时间戳；from=0 表示统计全部历史（总览「全部」档）。
-	from, _ := strconv.ParseInt(r.URL.Query().Get("from"), 10, 64)
-	to, _ := strconv.ParseInt(r.URL.Query().Get("to"), 10, 64)
+	// from/to 为毫秒时间戳；两者都不传（from=0）表示统计全部历史（总览「全部」档）。
+	//
+	// 解析失败必须显式拒绝，不能像旧实现那样把错误丢进 _ 后置 0 ——
+	// 那等于让 `?from=abc`、`?from=xyz` 静默退化成「查全表」。而全表聚合
+	// 带 LEFT JOIN、无 WHERE 无 LIMIT，是本项目最重的一条查询；
+	// usage_records 又没有保留策略，行数无上界。一个手滑的参数就能打出
+	// 一记全表扫描。
+	from, err := parseOptionalUnixMilli(r.URL.Query().Get("from"), "from")
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	to, err := parseOptionalUnixMilli(r.URL.Query().Get("to"), "to")
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if from > 0 && to > 0 && from > to {
+		writeError(w, http.StatusBadRequest, "from must not be greater than to")
+		return
+	}
 
 	stats, err := h.store.GetUsageStats(r.Context(), from, to)
 	if err != nil {
@@ -86,4 +105,20 @@ func (h *ReloadHandler) Reload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+}
+
+// parseOptionalUnixMilli 解析一个可选的毫秒时间戳查询参数。
+// 空串 → 0（表示「不限定」）；非数字 → 报错而非静默置 0。
+func parseOptionalUnixMilli(v, name string) (int64, error) {
+	if v == "" {
+		return 0, nil
+	}
+	n, err := strconv.ParseInt(v, 10, 64)
+	if err != nil {
+		return 0, fmt.Errorf("%s must be a unix millisecond timestamp", name)
+	}
+	if n < 0 {
+		return 0, fmt.Errorf("%s must not be negative", name)
+	}
+	return n, nil
 }

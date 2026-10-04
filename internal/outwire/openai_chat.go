@@ -52,6 +52,18 @@ type OpenAIUsage struct {
 	PromptTokens     int64 `json:"prompt_tokens"`
 	CompletionTokens int64 `json:"completion_tokens"`
 	TotalTokens      int64 `json:"total_tokens"`
+	// PromptTokensDetails 承载缓存命中的 token 数。
+	//
+	// 不能省：流式路径一直有输出（openai_chat.go 的 SSE usage chunk 里
+	// 带 prompt_tokens_details.cached_tokens），非流式路径却没有 ——
+	// 同一个网关、同一次缓存命中，**非流式客户端算出的成本会系统性偏高
+	// 一个数量级**（把全部 prompt token 按全价计费）。这种不一致尤其刺眼：
+	// 用户切到非流式模式后账单突然变高，而响应里没有任何线索说明为什么。
+	PromptTokensDetails *PromptTokensDetails `json:"prompt_tokens_details,omitempty"`
+}
+
+type PromptTokensDetails struct {
+	CachedTokens int64 `json:"cached_tokens"`
 }
 
 type SSEWriter struct {
@@ -273,6 +285,13 @@ func WriteNonStreamResponse(w http.ResponseWriter, resp *rosetta.ChatResponse, m
 		PromptTokens:     resp.Usage.InputTokens,
 		CompletionTokens: resp.Usage.OutputTokens,
 		TotalTokens:      resp.Usage.TotalTokens,
+	}
+	// 与流式路径对齐：缓存命中的 prompt token 必须报出来，否则非流式客户端
+	// 按全价计算成本，账单会明显高于同一请求的流式版本。
+	if resp.Usage.CachedInputTokens > 0 {
+		usage.PromptTokensDetails = &PromptTokensDetails{
+			CachedTokens: resp.Usage.CachedInputTokens,
+		}
 	}
 
 	out := OpenAIChatResponse{

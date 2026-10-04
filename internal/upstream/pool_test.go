@@ -30,9 +30,15 @@ func newTestConfig() *config.Config {
 	return cfg
 }
 
-// 目标熔断态必须在重建池时清零：既堵住「每次保存链重生成 targetID → 本表单调堆积」
-// 的泄漏，也让目标级与凭据级健康态语义一致（重建即重新探测）。
-func TestPoolBuildResetsTargetHealth(t *testing.T) {
+// 已从配置中删除的 target，其熔断态必须在重建时被丢弃。
+//
+// 这条测试原先断言的是相反的行为（重建清空全部熔断态），理由是
+// 「重建即重新探测」。但熔断状态与配置变更是正交的：任何 admin 写操作都会
+// 触发一次重建（server.AutoReload），若重建清空熔断，运维改一个模型的
+// context_width 就会让正在熔断中的坏上游立刻复活并被打满 —— 这不是
+// 「重新探测」，是让熔断形同虚设。正确语义：仍在配置中的目标保留状态，
+// 已删除的丢弃（targetID 每次保存链都重新生成，留着会单调堆积）。
+func TestPoolBuildDropsHealthOfDeletedTargets(t *testing.T) {
 	p := newTestPool()
 
 	// threshold=1：一次失败即熔断，TargetAvailable 转 false。
@@ -41,15 +47,34 @@ func TestPoolBuildResetsTargetHealth(t *testing.T) {
 		t.Fatalf("expected target circuit-open after threshold reached")
 	}
 
-	// 重建后该目标态应被整表丢弃 —— 旧 targetID 不再驻留，也不会误伤同名新目标。
+	// bootstrap 配置里没有 route_targets，liveTargetIDs 为空集 → 该条目应被丢弃。
 	if err := p.BuildFromConfig(newTestConfig()); err != nil {
 		t.Fatalf("build from config: %v", err)
 	}
 	if !p.TargetAvailable("ghost#t0") {
-		t.Fatalf("target health not reset on rebuild: still unavailable")
+		t.Errorf("已删除 target 的熔断态应随重建丢弃，仍不可用")
 	}
 	if len(p.targets) != 0 {
-		t.Fatalf("targets map not cleared on rebuild, len=%d", len(p.targets))
+		t.Errorf("targets map 应只剩存活target，len=%d", len(p.targets))
+	}
+}
+
+// 仍在配置中的目标，其熔断态必须跨重建保留 —— 重建不等于恢复。
+func TestInstall_PreservesHealthOfLiveTargets(t *testing.T) {
+	p := newTestPool()
+	if err := p.BuildFromConfig(newTestConfig()); err != nil {
+		t.Fatalf("build: %v", err)
+	}
+	p.RecordTargetFailure("live#t0", 1)
+	if p.TargetAvailable("live#t0") {
+		t.Fatalf("前置条件不成立：目标未熔断")
+	}
+
+	// 模拟 admin 写操作后的重建，且该 target 仍在库中。
+	p.Install(p.ProvidersSnapshot(), map[string]bool{"live#t0": true})
+
+	if p.TargetAvailable("live#t0") {
+		t.Errorf("重建把仍在配置中的目标的熔断态清掉了：改一个无关设置就能让坏上游复活")
 	}
 }
 

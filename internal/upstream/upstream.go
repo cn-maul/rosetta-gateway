@@ -30,11 +30,25 @@ type CredentialEntry struct {
 	Client        *rosetta.Client
 }
 
+// Pool 是上游 provider/凭据/熔断状态的运行时容器。
+//
+// credIndex（credID → *CredentialEntry）不是可选优化：MarkCredentialCooldown 与
+// RecordCredentialSuccess 在每次流式成功与每次失败时都会被调用，二者都持**写锁**。
+// 没有索引时它们要在锁内遍历所有 provider 的所有凭据（O(N×M)），而 GetAnyClient
+// 持读锁 —— 于是整个数据面被这两把写锁串行化。加索引把两者降到 O(1)。
 type Pool struct {
-	mu        sync.RWMutex
-	providers map[string]*ProviderEntry
-	targets   map[string]*targetHealth
-	logger    *slog.Logger
+	mu          sync.RWMutex
+	providers   map[string]*ProviderEntry
+	credIndex   map[string]*CredentialEntry
+	targets     map[string]*targetHealth
+	cooldownSto CooldownStore
+	logger      *slog.Logger
+}
+
+// CooldownStore 是凭据冷却状态的持久化出口。由 store.Store 实现；
+// 为 nil 时 Pool 只改内存（测试与 bootstrap 路径）。
+type CooldownStore interface {
+	SetCredentialCooldown(ctx context.Context, id, status string, until time.Time) error
 }
 
 // targetHealth 是某个链目标（provider+model，按 route_targets.id 归键）的熔断状态。
@@ -42,6 +56,10 @@ type Pool struct {
 type targetHealth struct {
 	consecutiveFails int
 	until            time.Time
+	// halfOpen 标记「冷却刚到期、已放一个探测请求进去」。
+	// 没有它，冷却到期瞬间所有在途请求会同时打向刚恢复（或仍坏）的目标，
+	// 形成惊群 —— 要么瞬时并发尖峰，要么全体真实失败各自计一次。
+	halfOpen bool
 }
 
 // targetBreakerCooldown 是目标达阈值后的熔断时长。与 5xx 凭据冷却同量级：
@@ -63,9 +81,29 @@ type ProviderEntry struct {
 func NewPool(logger *slog.Logger) *Pool {
 	return &Pool{
 		providers: make(map[string]*ProviderEntry),
+		credIndex: make(map[string]*CredentialEntry),
 		targets:   make(map[string]*targetHealth),
 		logger:    logger,
 	}
+}
+
+// SetCooldownStore 注入冷却持久化出口。必须在任何数据面请求之前调用
+// （main 在建池后立即设置）；之后调用不影响已在途的请求。
+func (p *Pool) SetCooldownStore(s CooldownStore) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.cooldownSto = s
+}
+
+// reindexLocked 重建 credID 索引。调用方必须已持写锁。
+func (p *Pool) reindexLocked() {
+	idx := make(map[string]*CredentialEntry)
+	for _, prov := range p.providers {
+		for _, cred := range prov.Credentials {
+			idx[cred.ID] = cred
+		}
+	}
+	p.credIndex = idx
 }
 
 func (p *Pool) BuildFromConfig(cfg *config.Config) error {
@@ -113,7 +151,10 @@ func (p *Pool) BuildFromConfig(cfg *config.Config) error {
 
 		newProviders[bp.Slug] = prov
 	}
-	p.Install(newProviders)
+	// config bootstrap 路径不存在 route_targets（路由只能来自 DB），
+	// 所以存活 target 集合是**空集**（不是 nil）：先前留下的任何熔断条目
+	// 都对应一个不存在的目标，应当丢弃。
+	p.Install(newProviders, map[string]bool{})
 	return nil
 }
 
@@ -122,8 +163,25 @@ func (p *Pool) BuildFromStore(ctx context.Context, st *store.Store, masterKey []
 	if err != nil {
 		return err
 	}
-	p.Install(providers)
+	p.Install(providers, liveTargetIDsFromStore(ctx, st))
 	return nil
+}
+
+// liveTargetIDsFromStore 读出全部 route target 的 ID 集合。
+// 失败时返回**空集**而非 nil：Install 的语义是「集合外的条目一律丢弃」，
+// 而调用方能走到这里说明 PrepareFromStore 已经成功查过库了，此处再失败
+// 只可能是目标表本身为空。此时把熔断全清的后果（坏上游短暂复活），
+// 远小于把已删目标的状态永远留在内存里的后果（单调堆积）。
+func liveTargetIDsFromStore(ctx context.Context, st *store.Store) map[string]bool {
+	targets, err := st.ListAllRouteTargets(ctx)
+	if err != nil {
+		return map[string]bool{}
+	}
+	ids := make(map[string]bool, len(targets))
+	for _, t := range targets {
+		ids[t.ID] = true
+	}
+	return ids
 }
 
 // PrepareFromStore 从数据库构建一份完整的 provider 表（含解密、建 client），
@@ -205,15 +263,41 @@ func (p *Pool) PrepareFromStore(ctx context.Context, st *store.Store, masterKey 
 	return newProviders, nil
 }
 
-// Install 以构建好的新表原子替换运行状态，并把目标熔断表一并清零。
-// 语义：重建即重新探测 —— 配置变更本就是重新探测的正当理由；不清的话
-// 已删除 target 的旧条目会随「每次保存链都重新生成 targetID」单调堆积成泄漏。
-// 在途请求持有的旧 *CredentialEntry/Client 指针不受影响，由 GC 收尾。
-func (p *Pool) Install(providers map[string]*ProviderEntry) {
+// Install 以构建好的新表原子替换运行状态。
+//
+// **熔断状态跨重建保留**：任何 admin 写操作都会触发一次重建，而熔断状态与
+// 配置变更是正交的 —— 运维改一个模型的 context_width，不该让正在熔断中的
+// 坏上游立刻复活并被打满。旧实现在这里 `make(map[string]*targetHealth)`
+// 把全部计数与 until 清零，等于每次保存设置都重置全站熔断。
+//
+// liveTargetIDs 是重建后仍然存在的 target ID 全集（来自 route_targets）。
+// 不在其中的旧条目被丢弃：targetID 每次保存链都重新生成，留着会单调堆积。
+func (p *Pool) Install(providers map[string]*ProviderEntry, liveTargetIDs map[string]bool) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	p.providers = providers
-	p.targets = make(map[string]*targetHealth)
+	p.reindexLocked()
+
+	kept := make(map[string]*targetHealth, len(liveTargetIDs))
+	for tid := range liveTargetIDs {
+		if h, ok := p.targets[tid]; ok {
+			kept[tid] = h // 沿用旧的健康状态（含未到期的 until）
+		} else {
+			kept[tid] = &targetHealth{}
+		}
+	}
+	p.targets = kept
+}
+
+// ProvidersSnapshot 返回当前 provider 表的浅拷贝，仅供测试与诊断使用。
+func (p *Pool) ProvidersSnapshot() map[string]*ProviderEntry {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	out := make(map[string]*ProviderEntry, len(p.providers))
+	for k, v := range p.providers {
+		out[k] = v
+	}
+	return out
 }
 
 func (p *Pool) GetAnyClient(providerSlug string) (*rosetta.Client, string, error) {
@@ -237,19 +321,25 @@ func (p *Pool) GetAnyClient(providerSlug string) (*rosetta.Client, string, error
 // MarkCredentialCooldown 把一把凭据踢出健康轮换一段时间（冷却）。
 func (p *Pool) MarkCredentialCooldown(credID string, duration time.Duration) {
 	p.mu.Lock()
-	defer p.mu.Unlock()
+	cred, ok := p.credIndex[credID]
+	if ok {
+		cred.CooldownUntil = time.Now().Add(duration)
+		cred.Status = "cooling"
+	}
+	store := p.cooldownSto
+	p.mu.Unlock()
 
-	for _, prov := range p.providers {
-		for _, cred := range prov.Credentials {
-			if cred.ID == credID {
-				cred.CooldownUntil = time.Now().Add(duration)
-				cred.Status = "cooling"
-				p.logger.Info("credential cooling down",
-					"credential", credID,
-					"until", cred.CooldownUntil,
-					"duration", duration)
-				return
-			}
+	if !ok {
+		return
+	}
+	p.logger.Info("credential cooling down",
+		"credential", credID, "until", cred.CooldownUntil, "duration", duration)
+	// 必须落库：冷却是运行时状态，而池会被任何 admin 写操作重建。
+	// 只改内存的话，重建时 PrepareFromStore 从库读到 cooldown_until=0，
+	// 刚被判 401 无效的 key 立刻回到轮换里。
+	if store != nil {
+		if err := store.SetCredentialCooldown(context.Background(), credID, "cooling", cred.CooldownUntil); err != nil {
+			p.logger.Warn("persist credential cooldown failed", "credential", credID, "error", err)
 		}
 	}
 }
@@ -259,31 +349,50 @@ func (p *Pool) MarkCredentialCooldown(credID string, duration time.Duration) {
 // 这一分钟内仍被 getHealthyCredentials 跳过 —— 对单 key provider 等于凭空造 outage。
 func (p *Pool) RecordCredentialSuccess(credID string) {
 	p.mu.Lock()
-	defer p.mu.Unlock()
+	cred, ok := p.credIndex[credID]
+	changed := false
+	if ok && (cred.Status != "healthy" || !cred.CooldownUntil.IsZero()) {
+		cred.Status = "healthy"
+		cred.CooldownUntil = time.Time{}
+		changed = true
+	}
+	store := p.cooldownSto
+	p.mu.Unlock()
 
-	for _, prov := range p.providers {
-		for _, cred := range prov.Credentials {
-			if cred.ID == credID {
-				if cred.Status != "healthy" || !cred.CooldownUntil.IsZero() {
-					cred.Status = "healthy"
-					cred.CooldownUntil = time.Time{}
-					p.logger.Info("credential recovered", "credential", credID)
-				}
-				return
-			}
+	if !changed {
+		return
+	}
+	p.logger.Info("credential recovered", "credential", credID)
+	if store != nil {
+		if err := store.SetCredentialCooldown(context.Background(), credID, "healthy", time.Time{}); err != nil {
+			p.logger.Warn("persist credential recovery failed", "credential", credID, "error", err)
 		}
 	}
 }
 
 // TargetAvailable 报告链上某目标当前是否可打（未处于熔断冷却期）。
+//
+// 冷却刚到期时实行 **half-open**：只放行一个探测请求，其余仍视为不可用。
+// 该副作用（占用探测名额）是刻意的 —— 不这样做，冷却到期瞬间所有请求会同时
+// 打向这个目标：若已自愈则是并发尖峰，若仍坏则全体真实失败并各自计一次，
+// 熔断-惊群会按「冷却时长 + 攒满阈值的时长」周期性循环。
+// 探测请求的成败由 RecordTargetSuccess / RecordTargetFailure 收敛：
+// 成功清零计数并释放名额，失败立刻重新熔断。
 func (p *Pool) TargetAvailable(targetID string) bool {
-	p.mu.RLock()
-	defer p.mu.RUnlock()
+	p.mu.Lock()
+	defer p.mu.Unlock()
 	h, ok := p.targets[targetID]
 	if !ok {
 		return true
 	}
-	return !time.Now().Before(h.until)
+	if time.Now().Before(h.until) {
+		return false
+	}
+	if h.halfOpen {
+		return false // 探测请求已在途，不放第二个
+	}
+	h.halfOpen = true
+	return true
 }
 
 // RecordTargetFailure 给目标累计一次失败；达到 threshold 则熔断 targetBreakerCooldown。
@@ -301,6 +410,7 @@ func (p *Pool) RecordTargetFailure(targetID string, threshold int) {
 		p.targets[targetID] = h
 	}
 	h.consecutiveFails++
+	h.halfOpen = false // 探测名额已消耗，无论成败都由本次结果裁决
 	if h.consecutiveFails >= threshold {
 		h.until = time.Now().Add(targetBreakerCooldown)
 		h.consecutiveFails = 0
@@ -310,12 +420,17 @@ func (p *Pool) RecordTargetFailure(targetID string, threshold int) {
 }
 
 // RecordTargetSuccess 清零目标的连续失败计数（成功即认为健康）。
+//
+// **不碰until**：熔断期内的成功可能来自熔断之前就已发出的在途请求
+// （非流式默认超时 120s，远长于 60s 熔断），拿它解除熔断等于让陈旧响应
+// 推翻新判定的故障。只有冷却期真正结束后的成功才允许清零计数 ——
+// 而那本来就由 TargetAvailable 的时间比较负责，无需显式动作。
 func (p *Pool) RecordTargetSuccess(targetID string) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if h, ok := p.targets[targetID]; ok {
 		h.consecutiveFails = 0
-		h.until = time.Time{}
+		h.halfOpen = false // 探测成功，目标确认健康，释放名额
 	}
 }
 
@@ -466,7 +581,18 @@ func DiscoverUpstreamModels(ctx context.Context, st *store.Store, providerID str
 		urls = []string{base + "/v1/models", base + "/models"}
 	}
 
-	client := &http.Client{Timeout: 15 * time.Second}
+	// 不跟随重定向。默认的 10 跳 + 跨主机跟随意味着：一个 302 就能把
+	// 探测面从「管理员填的那个 endpoint」扩大到「任意主机」—— 包括
+	// 169.254.169.254 这类元数据地址。API key 也会被带去新主机
+	//（Go 在跨主机跳转时会剥离敏感头，但 URL 里的东西不会）。
+	// ErrUseLastResponse 让 3xx 原样作为响应返回，fetchModels 走非-200
+	// 分支把状态码报给管理员 —— 信息足够排障，探测能力被切断。
+	client := &http.Client{
+		Timeout: 15 * time.Second,
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+	}
 	var lastErr error
 	for _, u := range urls {
 		cands, err := fetchModels(ctx, client, u, p.Protocol, apiKey)
@@ -500,8 +626,22 @@ func fetchModels(ctx context.Context, client *http.Client, url, protocol, apiKey
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
+		// 响应体片段**只进日志，不进 error**。
+		//
+		// 旧实现把上游响应体前 512 字节塞进 error，而这个 error 经
+		// model_handler / provider_handler 原样回显给调用方。管理员把某
+		// provider 的 endpoint 指到内网服务（127.0.0.1、169.254.169.254、
+		// 任何未暴露端口）后调 discover，就拿到了内网的**可读**响应 ——
+		// 这把盲打变成了读取原语。真实上游的错误页里也常带内部主机名、
+		// 路径、框架版本。
+		//
+		// 单租户下「管理员能配任意 endpoint」本身不算越权（内网自建
+		// LLM 服务是常见用法，禁掉内网地址会打断它），所以这里只切断
+		// 「响应体回显」这一条，它才是把盲打变成读取的那一步。
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
-		return nil, fmt.Errorf("上游返回 HTTP %d：%s", resp.StatusCode, strings.TrimSpace(string(body)))
+		slog.Warn("upstream models discovery returned non-200",
+			"url", url, "status", resp.StatusCode, "body_preview", strings.TrimSpace(string(body)))
+		return nil, fmt.Errorf("上游返回 HTTP %d（响应体已记入网关日志）", resp.StatusCode)
 	}
 
 	var payload struct {

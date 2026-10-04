@@ -3,6 +3,7 @@ package admin
 import (
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -117,7 +118,10 @@ func (h *ProviderHandler) List(w http.ResponseWriter, r *http.Request) {
 // 若填写了 api_key，会顺带创建一条名为 default 的凭据。
 func (h *ProviderHandler) Create(w http.ResponseWriter, r *http.Request) {
 	var req providerCreateRequest
-	if err := decodeJSON(r, &req); err != nil {
+	if err := decodeJSON(w, r, &req); err != nil {
+		if errors.Is(err, errUnsupportedMediaType) {
+			return
+		}
 		writeError(w, http.StatusBadRequest, "invalid JSON: "+err.Error())
 		return
 	}
@@ -215,7 +219,10 @@ func (h *ProviderHandler) Update(w http.ResponseWriter, r *http.Request, id stri
 	}
 
 	var req providerUpdateRequest
-	if err := decodeJSON(r, &req); err != nil {
+	if err := decodeJSON(w, r, &req); err != nil {
+		if errors.Is(err, errUnsupportedMediaType) {
+			return
+		}
 		writeError(w, http.StatusBadRequest, "invalid JSON: "+err.Error())
 		return
 	}
@@ -322,10 +329,19 @@ func (h *ProviderHandler) Test(w http.ResponseWriter, r *http.Request, id string
 	})
 }
 
+// maxSlugLen 与 config 侧 bootstrap 的 slug 正则 `^[a-z0-9]{2,32}$` 一致。
+// 超过就截断 —— slug 会进 /v1/models/{model} 路径解析、日志、以及
+// routing.RouteIndex.providers 的键，无界增长没有任何收益。
+const maxSlugLen = 32
+
 // uniqueSlug 基于 base 生成一个未被占用的 slug：命中已有 slug 就追加 -2/-3…。
 // GetProviderBySlug 对「不存在」返回 (nil, nil)，对真实 DB 故障返回 (nil, err)。
 // 旧实现 `if err != nil || p == nil { return slug }` 把 err 当「可用」——查询挂了
 // 会返回一个可能其实已被占用的 slug，最终撞上 UNIQUE 约束报成 500，掩盖真实原因。
+//
+// 追加后缀必须**重新截断**：`-2` 追加到 32 字符的 base 上就变成 34 字符，
+// 与 config 侧的正则不一致；而继续往后加 -3/-4… 只会更长。所以先给 base
+// 留出后缀空间，再截断。
 func (h *ProviderHandler) uniqueSlug(ctx context.Context, base string) (string, error) {
 	slug := base
 	for i := 2; ; i++ {
@@ -336,7 +352,18 @@ func (h *ProviderHandler) uniqueSlug(ctx context.Context, base string) (string, 
 		if p == nil {
 			return slug, nil
 		}
-		slug = fmt.Sprintf("%s-%d", base, i)
+		next := fmt.Sprintf("%s-%d", base, i)
+		if len(next) > maxSlugLen {
+			// 数字后缀吃掉的位置从 base 尾部截，仍然唯一（后缀不同）。
+			suffix := fmt.Sprintf("-%d", i)
+			next = base[:maxSlugLen-len(suffix)] + suffix
+			if len(next) > len(base) {
+				// base 已经短到放不下后缀，用哈希兜底避免死循环。
+				sum := sha256.Sum256([]byte(fmt.Sprintf("%s#%d", base, i)))
+				next = base[:1] + "-" + hex.EncodeToString(sum[:])[:maxSlugLen-2]
+			}
+		}
+		slug = next
 	}
 }
 
@@ -356,6 +383,15 @@ func slugify(s string) string {
 	slug := strings.Trim(b.String(), "-")
 	if slug == "" {
 		slug = "provider"
+	}
+	// 截断到 config 侧 bootstrap 正则 ^[a-z0-9]{2,32}$ 的上界。
+	// 不截的话，一个长显示名会产出任意长度的 slug，与 bootstrap 路径
+	// 的校验口径不一致（那条会直接被 config.validate 拒掉）。
+	if len(slug) > maxSlugLen {
+		slug = strings.Trim(slug[:maxSlugLen], "-")
+		if slug == "" {
+			slug = "provider"
+		}
 	}
 	return slug
 }

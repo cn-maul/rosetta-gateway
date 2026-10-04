@@ -83,7 +83,10 @@ func writeRouteWriteError(w http.ResponseWriter, action string, err error) {
 
 func (h *RouteHandler) Create(w http.ResponseWriter, r *http.Request) {
 	var req routeRequest
-	if err := decodeJSON(r, &req); err != nil {
+	if err := decodeJSON(w, r, &req); err != nil {
+		if errors.Is(err, errUnsupportedMediaType) {
+			return
+		}
 		writeError(w, http.StatusBadRequest, "invalid JSON: "+err.Error())
 		return
 	}
@@ -93,6 +96,15 @@ func (h *RouteHandler) Create(w http.ResponseWriter, r *http.Request) {
 	upstreamModelID := strings.TrimSpace(derefStr(req.UpstreamModelID))
 	if publicName == "" || providerID == "" || upstreamModelID == "" {
 		writeError(w, http.StatusBadRequest, "public_name, provider_id, and upstream_model_id are required")
+		return
+	}
+	// public_name 不得含 "/"：它与 provider/model 直连形式（"acme/gpt-4"）
+	// 共用同一个命名空间。允许两者共存会让「显式禁用一条路由」变得不可靠 ——
+	// 名字落在直连命名空间里时，禁用的效果取决于是否恰好有同名 provider
+	// 与 model（见 routing.Resolve）。从源头拒绝歧义名字。
+	if strings.Contains(publicName, "/") {
+		writeError(w, http.StatusBadRequest,
+			`public_name 不得包含 "/"，该字符用于 provider/model 直连形式（如 "acme/gpt-4"）`)
 		return
 	}
 
@@ -144,7 +156,10 @@ func (h *RouteHandler) Update(w http.ResponseWriter, r *http.Request, id string)
 	}
 
 	var req routeRequest
-	if err := decodeJSON(r, &req); err != nil {
+	if err := decodeJSON(w, r, &req); err != nil {
+		if errors.Is(err, errUnsupportedMediaType) {
+			return
+		}
 		writeError(w, http.StatusBadRequest, "invalid JSON: "+err.Error())
 		return
 	}
@@ -154,6 +169,12 @@ func (h *RouteHandler) Update(w http.ResponseWriter, r *http.Request, id string)
 		v := strings.TrimSpace(*req.PublicName)
 		if v == "" {
 			writeError(w, http.StatusBadRequest, "public_name cannot be empty")
+			return
+		}
+		// 同 Create：不得含 "/"，否则与 provider/model 直连形式撞命名空间。
+		if strings.Contains(v, "/") {
+			writeError(w, http.StatusBadRequest,
+				`public_name 不得包含 "/"，该字符用于 provider/model 直连形式（如 "acme/gpt-4"）`)
 			return
 		}
 		existing.PublicName = v

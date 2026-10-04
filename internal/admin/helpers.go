@@ -5,6 +5,7 @@ import (
 	"errors"
 	"log/slog"
 	"net/http"
+	"strings"
 
 	"github.com/cn-maul/rosetta-gateway/internal/crypto"
 	"github.com/cn-maul/rosetta-gateway/internal/store"
@@ -85,9 +86,54 @@ func writeDeleteError(w http.ResponseWriter, action string, err error) {
 	}
 }
 
-func decodeJSON(r *http.Request, v any) error {
+// decodeJSON 解析 JSON 请求体。
+//
+// **必须先断言 Content-Type**：这是管理面最重要的一道 CSRF 防线。
+// POST /admin/api/password/set 在「尚未配置凭据」时被豁免鉴权（见
+// server.AdminAuth），而 text/plain 是 CORS 的 safelisted Content-Type ——
+// 浏览器发它**不触发预检**。旧实现不校验 Content-Type，等于让任意第三方
+// 页面在管理员首次访问网关的那次会话里，用
+//
+//	POST /admin/api/password/set
+//	Content-Type: text/plain
+//
+//	{"password":"attacker123"}
+//
+// 抢先把管理员密码设成自己的（text/plain 下 JSON body 照样能 Decode 成功）。
+// 跨域读不到响应不重要：攻击者随后用自己的客户端正常登录，读走全部上游
+// API Key、改任意路由。断言 Content-Type 为 application/json 后，浏览器
+// 必须先发预检，而管理面不设任何 CORS 头、预检被同源策略拦下。
+func decodeJSON(w http.ResponseWriter, r *http.Request, v any) error {
 	defer r.Body.Close()
+	if !isJSONContentType(r) {
+		writeError(w, http.StatusUnsupportedMediaType,
+			"Content-Type 必须是 application/json")
+		return errUnsupportedMediaType
+	}
 	return json.NewDecoder(r.Body).Decode(v)
+}
+
+var errUnsupportedMediaType = errors.New("unsupported media type")
+
+// isJSONContentType 报告请求的 Content-Type 是否是 JSON。
+//
+// 只认 application/json 与 application/*+json（RFC 6839 的结构化后缀），
+// 带参数（charset）也接受。缺失 Content-Type 视为否 —— 浏览器对简单请求
+// 可以省略，而我们要的就是让这些请求进不来。
+func isJSONContentType(r *http.Request) bool {
+	ct := r.Header.Get("Content-Type")
+	if ct == "" {
+		return false
+	}
+	if i := strings.IndexByte(ct, ';'); i >= 0 {
+		ct = ct[:i]
+	}
+	ct = strings.ToLower(strings.TrimSpace(ct))
+	if ct == "application/json" {
+		return true
+	}
+	// application/vnd.api+json / application/problem+json 这类后缀形式。
+	return strings.HasPrefix(ct, "application/") && strings.HasSuffix(ct, "+json")
 }
 
 // ---------- PATCH 部分更新语义（2026-09-21 重构）----------

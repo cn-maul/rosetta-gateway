@@ -53,20 +53,101 @@ func LoadMasterKey(envName, dir string) (key []byte, generated bool, weak bool, 
 	}
 
 	path := filepath.Join(dir, KeyFileName)
-	if content, readErr := os.ReadFile(path); readErr == nil {
-		if raw := strings.TrimSpace(string(content)); raw != "" {
-			sum := sha256.Sum256([]byte(raw))
-			return sum[:], false, WeakMaterial(raw), nil
+	content, readErr := os.ReadFile(path)
+	switch {
+	case readErr == nil:
+		raw := strings.TrimSpace(string(content))
+		if raw == "" {
+			// 文件存在但为空 —— 只可能是「上次写被截断」（旧实现用 O_TRUNC
+			// 非原子写，进程在写入中途被 kill 就会留下 0 字节）。绝不能静默
+			// 当作「没有密钥」而重新生成一把：库里全部凭据都是用旧密钥加密的，
+			// 换密钥等于全部永久解不开，PrepareFromStore 会逐条 continue，
+			// 结果是所有 provider 变成零凭据、/v1 全站 404，且无任何告警。
+			return nil, false, false, fmt.Errorf(
+				"%s 存在但内容为空：上次写入可能被截断。用旧密钥（环境变量 %s）启动；"+
+					"若确已丢失，需手动删除该文件并重新配置全部上游凭据", path, envName)
 		}
+		if !validKeyFormat(raw) {
+			// 自动生成的密钥恒为 base64url(32B) = 44 字符；环境变量可以是任意
+			// 长度。文件路径只走这条分支，所以格式不符 = 文件损坏或被手工截断。
+			return nil, false, false, fmt.Errorf(
+				"%s 内容格式非法（长度 %d，自动生成的密钥应为 44 字符 base64url）："+
+					"文件很可能已损坏。库里凭据依赖此密钥，请勿删除；"+
+					"若确需更换，先用环境变量 %s 指定旧密钥启动", path, len(raw), envName)
+		}
+		sum := sha256.Sum256([]byte(raw))
+		return sum[:], false, WeakMaterial(raw), nil
+	case !os.IsNotExist(readErr):
+		return nil, false, false, fmt.Errorf("read %s: %w", path, readErr)
 	}
 
-	// 自动生成的密钥是 64 hex（256 bit 熵），永远不会 weak。
+	// 自动生成的密钥是 32 字节随机数的 base64url 编码（44 字符），永远不会 weak。
 	raw := GenerateKey()
-	if err := os.WriteFile(path, []byte(raw+"\n"), 0o600); err != nil {
+	if err := writeKeyAtomic(path, []byte(raw+"\n")); err != nil {
 		return nil, false, false, fmt.Errorf("write %s: %w", path, err)
 	}
 	sum := sha256.Sum256([]byte(raw))
 	return sum[:], true, false, nil
+}
+
+// validKeyFormat 报告一段密钥材料是否符合自动生成的格式。
+//
+// 用于区分「用户手填的环境变量口令」与「本程序生成的 master.key」：
+// 后者恒为 base64.URLEncoding(32 字节) = 44 字符。文件路径上的内容若不满足，
+// 说明文件被截断或损坏 —— 此时静默采纳等于拿半截密钥去解密，
+// 而重新生成则让全部存量凭据永久不可解。两种后果都不可接受，直接报错。
+func validKeyFormat(raw string) bool {
+	if len(raw) != 44 {
+		return false
+	}
+	dec, err := base64.URLEncoding.DecodeString(raw)
+	return err == nil && len(dec) == 32
+}
+
+// writeKeyAtomic 原子写密钥文件：临时文件 → fsync → rename → fsync 目录。
+//
+// 旧实现用 os.WriteFile（O_TRUNC），进程在写入中途被 kill / 断电会留下
+// 0 字节或半截文件，而下一次启动会静默采纳 —— 参见调用处的注释。
+// 同项目的 adminauth.Store.persist 已经是这个写法，这里补齐同样的纪律。
+func writeKeyAtomic(path string, data []byte) error {
+	dir := filepath.Dir(path)
+	f, err := os.CreateTemp(dir, filepath.Base(path)+".tmp-*")
+	if err != nil {
+		return err
+	}
+	tmp := f.Name()
+	defer func() {
+		if tmp != "" {
+			os.Remove(tmp)
+		}
+	}()
+	if err := f.Chmod(0o600); err != nil {
+		f.Close()
+		return err
+	}
+	if _, err := f.Write(data); err != nil {
+		f.Close()
+		return err
+	}
+	// 不 Sync 就 Close 的话，rename 之后的崩溃仍可能让文件系统回放出
+	// 空内容 —— 崩溃一致性要求数据先落盘。
+	if err := f.Sync(); err != nil {
+		f.Close()
+		return err
+	}
+	if err := f.Close(); err != nil {
+		return err
+	}
+	if err := os.Rename(tmp, path); err != nil {
+		return err
+	}
+	tmp = "" // 已生效，defer 不再删
+	// 目录项本身也要落盘，否则 rename 可能在崩溃后丢失。
+	if d, err := os.Open(dir); err == nil {
+		_ = d.Sync()
+		_ = d.Close()
+	}
+	return nil
 }
 
 // DecryptWithFallback 用 masterKey 解密。masterKey 为空时直接按明文返回；

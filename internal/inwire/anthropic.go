@@ -26,18 +26,18 @@ import (
 //     不在两个协议的保留集合里，不会撞车。
 
 type AnthropicMessagesRequest struct {
-	Model   string              `json:"model"`
-	MaxTokens int               `json:"max_tokens"`
-	System  json.RawMessage     `json:"system,omitempty"` // string | [{type:"text",text,cache_control}]
-	Messages []AnthropicMessage `json:"messages"`
+	Model     string             `json:"model"`
+	MaxTokens int                `json:"max_tokens"`
+	System    json.RawMessage    `json:"system,omitempty"` // string | [{type:"text",text,cache_control}]
+	Messages  []AnthropicMessage `json:"messages"`
 
 	Temperature *float64 `json:"temperature,omitempty"`
 	TopP        *float64 `json:"top_p,omitempty"`
 	TopK        *int     `json:"top_k,omitempty"`
 
-	StopSequences []string         `json:"stop_sequences,omitempty"`
-	Stream        bool             `json:"stream,omitempty"`
-	Tools         []AnthropicTool  `json:"tools,omitempty"`
+	StopSequences []string             `json:"stop_sequences,omitempty"`
+	Stream        bool                 `json:"stream,omitempty"`
+	Tools         []AnthropicTool      `json:"tools,omitempty"`
 	ToolChoice    *AnthropicToolChoice `json:"tool_choice,omitempty"`
 	Thinking      *AnthropicThinking   `json:"thinking,omitempty"`
 
@@ -233,7 +233,10 @@ func (a *AnthropicMessagesRequest) ApplyUpstreamExtras(req *rosetta.ChatRequest,
 		if len(extra) > 0 {
 			mergeExtra(req, extra)
 		}
-	case "", "openai-chat":
+	case "", "openai-chat", "auto":
+		// "auto" 必须与 ""/"openai-chat" 同组：upstream.buildClient 对 auto
+		// 不加 WithProtocol，让 SDK 自动探测，实际落到的几乎总是 OpenAI 方言。
+		// 把 auto 漏在这里会让「协议自动探测」这条最常用的配置静默丢掉 tool_choice。
 		if a.ToolChoice == nil {
 			return
 		}

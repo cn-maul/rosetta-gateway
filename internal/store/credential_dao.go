@@ -103,6 +103,23 @@ func (s *Store) UpdateCredential(ctx context.Context, id string, c *Credential) 
 	return checkAffected(res, err)
 }
 
+// SetCredentialCooldown 只更新凭据的冷却状态与冷却截止时间。
+//
+// 与 UpdateCredential 分开的原因：冷却是**运行时状态**，由数据面在每次
+// 上游 401/5xx 时写入；它必须落库，否则任何一次 admin 写操作触发的池重建
+// （Install 重新 PrepareFromStore）都会把内存里的 CooldownUntil 读回成库里的
+// 0，刚被判坏的 key 立刻复活。凭据 id 不存在时返回 ErrNotFound。
+func (s *Store) SetCredentialCooldown(ctx context.Context, id, status string, until time.Time) error {
+	var untilMs int64
+	if !until.IsZero() {
+		untilMs = until.UnixMilli()
+	}
+	res, err := s.db.ExecContext(ctx,
+		`UPDATE provider_credentials SET status = ?, cooldown_until = ? WHERE id = ?`,
+		status, untilMs, id)
+	return checkAffected(res, err)
+}
+
 // DeleteCredential 删除一把凭据；id 不存在时返回 ErrNotFound。
 func (s *Store) DeleteCredential(ctx context.Context, id string) error {
 	return deleteByID(ctx, s.db, "provider_credentials", id)

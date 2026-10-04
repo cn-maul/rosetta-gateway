@@ -46,6 +46,12 @@ type ResponsesSSE struct {
 	toolOpen bool
 	toolID   string
 	toolName string
+	// toolIdx 是当前开放 function_call item 对应的 ToolIndex。
+	// 同项判据必须是它而不是 toolID：rosetta 的续片（Responses 侧的
+	// function_call_arguments.delta）只带 ToolIndex+ArgumentsDelta，ToolID 为空。
+	// 用 ToolID 判会把一个工具调用的参数分片拆成多个 item，客户端按 call_id
+	// 分发工具执行时拿到的是空参数 + 空call_id 的幽灵项。
+	toolIdx  int
 	toolArgs strings.Builder
 	fcSeq    int
 
@@ -180,14 +186,18 @@ func (s *ResponsesSSE) Event(ev *rosetta.Event) {
 		})
 	case rosetta.EventToolCall:
 		s.ensureStarted("")
-		if !s.toolOpen || s.toolID != ev.ToolID {
+		if !s.toolOpen || s.toolIdx != ev.ToolIndex {
 			s.closeMessage()
 			s.closeTool()
 			idx := s.outputIndex
 			s.outputIndex++
 			s.toolOpen = true
-			s.toolID = ev.ToolID
-			s.toolName = ev.ToolName
+			s.toolIdx = ev.ToolIndex
+			// 首片带 call_id/name；续片两者皆空，沿用上一次的值。
+			if ev.ToolID != "" {
+				s.toolID = ev.ToolID
+				s.toolName = ev.ToolName
+			}
 			s.toolArgs.Reset()
 			itemID := s.id + "-fc-" + itoa(idx)
 			s.writeEvent("response.output_item.added", map[string]any{
@@ -273,13 +283,20 @@ func WriteResponsesResponse(w http.ResponseWriter, resp *rosetta.ChatResponse, m
 		id = fmt.Sprintf("resp_%d", time.Now().UnixNano())
 	}
 	output := make([]map[string]any, 0, len(resp.Content))
+	// msgIdx 参与 message item 的 id 生成。旧实现恒用 `id + "-msg"`，
+	// 于是「文本 → tool_use → 文本」形态（resp.Content 里有多个 text 块）
+	// 会产出**多个 id 完全相同的 message item** —— 下游按 id 索引/去重时
+	// 互相覆盖，第二个文本段凭空消失。流式路径用的是 s.outputIndex 递增，
+	// 这里必须对称。
+	msgIdx := 0
 	for _, blk := range resp.Content {
 		switch blk.Type {
 		case rosetta.BlockText:
 			output = append(output, map[string]any{
-				"type": "message", "id": id + "-msg", "status": "completed", "role": "assistant",
+				"type": "message", "id": id + "-msg-" + itoa(msgIdx), "status": "completed", "role": "assistant",
 				"content": []map[string]any{{"type": "output_text", "text": blk.Text, "annotations": []any{}}},
 			})
+			msgIdx++
 		case rosetta.BlockToolCall:
 			args := blk.Arguments
 			if strings.TrimSpace(args) == "" {
@@ -299,6 +316,19 @@ func WriteResponsesResponse(w http.ResponseWriter, resp *rosetta.ChatResponse, m
 		incomplete = map[string]any{"reason": "max_output_tokens"}
 	}
 
+	usage := map[string]any{
+		"input_tokens":  resp.Usage.InputTokens,
+		"output_tokens": resp.Usage.OutputTokens,
+		"total_tokens":  resp.Usage.TotalTokens,
+	}
+	// 缓存命中的 input token 必须报出，否则客户端按全价计费，成本偏差一个
+	// 数量级。与 OpenAI Chat 非流式侧的 prompt_tokens_details 对齐。
+	if resp.Usage.CachedInputTokens > 0 {
+		usage["input_tokens_details"] = map[string]any{
+			"cached_tokens": resp.Usage.CachedInputTokens,
+		}
+	}
+
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]any{
 		"id":                  id,
@@ -308,13 +338,9 @@ func WriteResponsesResponse(w http.ResponseWriter, resp *rosetta.ChatResponse, m
 		"model":               model,
 		"output":              output,
 		"parallel_tool_calls": true,
-		"usage": map[string]any{
-			"input_tokens":  resp.Usage.InputTokens,
-			"output_tokens": resp.Usage.OutputTokens,
-			"total_tokens":  resp.Usage.TotalTokens,
-		},
-		"error":              nil,
-		"incomplete_details": incomplete,
+		"usage":               usage,
+		"error":               nil,
+		"incomplete_details":  incomplete,
 	})
 }
 

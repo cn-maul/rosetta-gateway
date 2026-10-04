@@ -51,14 +51,14 @@ func TestReserveTPM_ReserveAndCommit(t *testing.T) {
 	}
 
 	// 提交真实用量 200：预占 600 → 校正为 200，窗口余 800。
-	l.CommitTPM("k1", 600, 200)
+	l.CommitTPM("k1", 1000, 600, 200)
 	if ok, _ := l.ReserveTPM("k1", 1000, 800); !ok {
 		t.Fatalf("800 should fit after commit correction")
 	}
 
 	// 全额退还（请求失败，actual=0）：第二次预占的 800 全退，
 	// 窗口回到已提交的真实用量 200 —— 退还语义是「退预占差值」，不是清零。
-	l.CommitTPM("k1", 800, 0)
+	l.CommitTPM("k1", 1000, 800, 0)
 	if ok, _ := l.ReserveTPM("k1", 1000, 800); !ok {
 		t.Fatalf("refund should restore window to committed usage (200), leaving 800 available")
 	}
@@ -77,7 +77,7 @@ func TestTPM_UnlimitedAndZero(t *testing.T) {
 	if ok, _ := l.ReserveTPM("k2", 1, 0); !ok {
 		t.Fatalf("zero estimate should pass")
 	}
-	l.CommitTPM("k2", 0, 50)
+	l.CommitTPM("k2", 1, 0, 50)
 	// 校正后窗口 tokens=50 > 1 → 拒绝。
 	if ok, _ := l.ReserveTPM("k2", 1, 0); ok {
 		t.Fatalf("window should reflect committed usage")

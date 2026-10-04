@@ -16,7 +16,7 @@ func TestKeyHandler_QuotaWritePath(t *testing.T) {
 
 	// create with quota
 	rec := httptest.NewRecorder()
-	req := httptest.NewRequest(http.MethodPost, "/admin/api/keys",
+	req := jsonRequest(http.MethodPost, "/admin/api/keys",
 		bytes.NewBufferString(`{"name":"cli","quota_tokens":1000}`))
 	h.Create(rec, req)
 	if rec.Code != http.StatusCreated {
@@ -37,7 +37,7 @@ func TestKeyHandler_QuotaWritePath(t *testing.T) {
 
 	// PATCH 显式改为 0（不限）：验证 0 是合法写入而非被「非空才覆盖」吞掉
 	rec2 := httptest.NewRecorder()
-	req2 := httptest.NewRequest(http.MethodPatch, "/admin/api/keys/"+created.ID,
+	req2 := jsonRequest(http.MethodPatch, "/admin/api/keys/"+created.ID,
 		bytes.NewBufferString(`{"quota_tokens":0}`))
 	h.Update(rec2, req2, created.ID)
 	if rec2.Code != http.StatusOK {
@@ -51,7 +51,7 @@ func TestKeyHandler_QuotaWritePath(t *testing.T) {
 
 	// PATCH 负数 → 400
 	rec3 := httptest.NewRecorder()
-	req3 := httptest.NewRequest(http.MethodPatch, "/admin/api/keys/"+created.ID,
+	req3 := jsonRequest(http.MethodPatch, "/admin/api/keys/"+created.ID,
 		bytes.NewBufferString(`{"quota_tokens":-5}`))
 	h.Update(rec3, req3, created.ID)
 	if rec3.Code != http.StatusBadRequest {

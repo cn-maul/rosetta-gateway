@@ -71,8 +71,10 @@ func TestResponsesSSE_ToolCallAndFailure(t *testing.T) {
 	rec := httptest.NewRecorder()
 	s := NewResponsesSSE(rec, nil, "resp_1", "gw-model")
 	s.Event(&rosetta.Event{Type: rosetta.EventMessageStart, ID: "up-1"})
-	s.Event(&rosetta.Event{Type: rosetta.EventToolCall, ToolID: "c1", ToolName: "f", ArgumentsDelta: `{"a":`})
-	s.Event(&rosetta.Event{Type: rosetta.EventToolCall, ToolID: "c1", ToolName: "f", ArgumentsDelta: `1}`})
+	// 续片只带 ToolIndex（SDK 的 function_call_arguments.delta 不填 ToolID/Name）。
+	s.Event(&rosetta.Event{Type: rosetta.EventToolCall, ToolIndex: 0, ToolID: "c1", ToolName: "f"})
+	s.Event(&rosetta.Event{Type: rosetta.EventToolCall, ToolIndex: 0, ArgumentsDelta: `{"a":`})
+	s.Event(&rosetta.Event{Type: rosetta.EventToolCall, ToolIndex: 0, ArgumentsDelta: `1}`})
 	s.Finish("truncated", "", rosetta.Usage{}, false)
 
 	raw := rec.Body.String()
@@ -122,10 +124,10 @@ func TestWriteResponsesResponse(t *testing.T) {
 	}, "gw-model")
 
 	var out struct {
-		ID       string `json:"id"`
-		Object   string `json:"object"`
-		Status   string `json:"status"`
-		Model    string `json:"model"`
+		ID         string `json:"id"`
+		Object     string `json:"object"`
+		Status     string `json:"status"`
+		Model      string `json:"model"`
 		Incomplete *struct {
 			Reason string `json:"reason"`
 		} `json:"incomplete_details"`

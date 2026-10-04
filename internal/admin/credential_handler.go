@@ -1,6 +1,7 @@
 package admin
 
 import (
+	"errors"
 	"net/http"
 	"strings"
 
@@ -63,7 +64,10 @@ func (h *CredentialHandler) Create(w http.ResponseWriter, r *http.Request, provi
 	}
 
 	var req credentialRequest
-	if err := decodeJSON(r, &req); err != nil {
+	if err := decodeJSON(w, r, &req); err != nil {
+		if errors.Is(err, errUnsupportedMediaType) {
+			return
+		}
 		writeError(w, http.StatusBadRequest, "invalid JSON: "+err.Error())
 		return
 	}
@@ -121,7 +125,10 @@ func (h *CredentialHandler) Update(w http.ResponseWriter, r *http.Request, id st
 	}
 
 	var req credentialRequest
-	if err := decodeJSON(r, &req); err != nil {
+	if err := decodeJSON(w, r, &req); err != nil {
+		if errors.Is(err, errUnsupportedMediaType) {
+			return
+		}
 		writeError(w, http.StatusBadRequest, "invalid JSON: "+err.Error())
 		return
 	}

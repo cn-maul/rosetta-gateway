@@ -187,21 +187,38 @@ func (c *Config) validate() error {
 	// panic 恢复后下游收到的是「200 + text/event-stream + 一段 JSON 错误体」，
 	// 且这次调用的 usage 完全没落库。运维用 -1 表达「禁用超时」是很自然的直觉，
 	// 所以这里必须是硬校验而不是「填个默认值蒙混过去」。
+	// maxDurMillis 是毫秒 → time.Duration 的安全上界。
+	//
+	// time.Duration 是 int64 **纳秒**，上限 ≈ 9.223e18 ns。任何
+	// `time.Duration(ms) * time.Millisecond` 中 ms > 9.223e12 都会整数回绕
+	// 成负数 —— 实测 9223372036855 ms（≈292 年）得到 -9.223e18 ns。
+	// 负 Duration 的后果比「超时太长」严重得多：
+	//   - context.WithTimeout 传负值 → deadline 立即过期 → 全部非流式请求秒挂；
+	//   - time.AfterFunc 传负值 → 立即开火 → 流式响应刚发出头就被自己关掉。
+	//
+	// 24 小时对任何网关超时都远超实际需要，同时离溢出点有 380 倍余量。
+	const maxDurMillis = 86_400_000
+
 	for _, f := range []struct {
 		name string
 		val  int
 		min  int
+		max  int // 0 = 不限上界
 	}{
-		{"upstream_timeout_ms", c.Defaults.UpstreamTimeoutMs, 1},
-		{"stream_idle_timeout_ms", c.Defaults.StreamIdleTimeoutMs, 1},
-		{"stream_first_token_timeout_ms", c.Defaults.StreamFirstTokenTimeoutMs, 1},
-		{"max_retries", c.Defaults.MaxRetries, 0},
-		{"max_request_body_bytes", c.Defaults.MaxRequestBodyBytes, 1},
-		{"failover_max_targets", c.Defaults.FailoverMaxTargets, 1},
-		{"failover_failure_threshold", c.Defaults.FailoverFailureThreshold, 1},
+		{"upstream_timeout_ms", c.Defaults.UpstreamTimeoutMs, 1, maxDurMillis},
+		{"stream_idle_timeout_ms", c.Defaults.StreamIdleTimeoutMs, 1, maxDurMillis},
+		{"stream_first_token_timeout_ms", c.Defaults.StreamFirstTokenTimeoutMs, 1, maxDurMillis},
+		{"max_retries", c.Defaults.MaxRetries, 0, 0},
+		{"max_request_body_bytes", c.Defaults.MaxRequestBodyBytes, 1, 0},
+		// 熔断阈值过大等于永不熔断，故也加上界（1000 次连续失败足够）。
+		{"failover_max_targets", c.Defaults.FailoverMaxTargets, 1, 100},
+		{"failover_failure_threshold", c.Defaults.FailoverFailureThreshold, 1, 1000},
 	} {
 		if f.val < f.min {
 			return fmt.Errorf("defaults.%s: must be >= %d, got %d", f.name, f.min, f.val)
+		}
+		if f.max > 0 && f.val > f.max {
+			return fmt.Errorf("defaults.%s: must be <= %d, got %d", f.name, f.max, f.val)
 		}
 	}
 

@@ -44,33 +44,50 @@ func clampLimit(raw string, def, max int64) int64 {
 }
 
 // queryRange 解析 from/to（毫秒时间戳），缺省取「最近 window」。
-func queryRange(q url.Values, window time.Duration) (from, to int64) {
-	from, _ = strconv.ParseInt(q.Get("from"), 10, 64)
-	to, _ = strconv.ParseInt(q.Get("to"), 10, 64)
+//
+// 解析失败必须显式报错，不能像旧实现那样把错误丢进 `_` 后置 0 ——
+// `?from=abc` 会让 from=0，而「from=0 且未显式」本该回落到默认 window，
+// 于是要么退化成全表扫描（explicit 路径），要么静默查了一个错误的区间。
+// usage_records 没有保留策略、行数无上界，全表聚合是本项目最重的一条查询。
+func queryRange(q url.Values, window time.Duration) (from, to int64, err error) {
+	from, err = parseOptionalUnixMilli(q.Get("from"), "from")
+	if err != nil {
+		return 0, 0, err
+	}
+	to, err = parseOptionalUnixMilli(q.Get("to"), "to")
+	if err != nil {
+		return 0, 0, err
+	}
 	if from == 0 {
 		from = time.Now().Add(-window).UnixMilli()
 	}
 	if to == 0 {
 		to = time.Now().UnixMilli()
 	}
-	return from, to
+	return from, to, nil
 }
 
 // queryRangeExplicit 解析 from/to，并区分「显式传 from=0（=全部历史）」与
 // 「未传 from（=取默认 window）」。总览页的「全部」档需要前者。
 // 返回 (from, to, explicit)；explicit 为 true 表示请求里带了 from 参数。
-func queryRangeExplicit(q url.Values, window time.Duration) (from, to int64, explicit bool) {
+func queryRangeExplicit(q url.Values, window time.Duration) (from, to int64, explicit bool, err error) {
 	rawFrom := q.Get("from")
-	from, _ = strconv.ParseInt(rawFrom, 10, 64)
-	to, _ = strconv.ParseInt(q.Get("to"), 10, 64)
+	from, err = parseOptionalUnixMilli(rawFrom, "from")
+	if err != nil {
+		return 0, 0, false, err
+	}
+	to, err = parseOptionalUnixMilli(q.Get("to"), "to")
+	if err != nil {
+		return 0, 0, false, err
+	}
 	explicit = rawFrom != ""
-	if !explicit && from == 0 {
+	if !explicit {
 		from = time.Now().Add(-window).UnixMilli()
 	}
 	if to == 0 {
 		to = time.Now().UnixMilli()
 	}
-	return from, to, explicit
+	return from, to, explicit, nil
 }
 
 // groupRangeClause 构造分组查询的 ts 过滤子句。from=0 且 explicit 时表示
@@ -178,7 +195,11 @@ type usageSummary struct {
 
 func (h *UsageHandler) Query(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query()
-	from, to, explicit := queryRangeExplicit(q, 24*time.Hour)
+	from, to, explicit, err := queryRangeExplicit(q, 24*time.Hour)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
 	limit := clampLimit(q.Get("limit"), defaultUsageLimit, maxUsageLimit)
 
 	where, args := usageFilter(from, to, explicit, q)
@@ -318,7 +339,11 @@ func clampOffset(raw string) int64 {
 // Content-Disposition 带 filename，浏览器直接触发下载。
 func (h *UsageHandler) ExportCSV(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query()
-	from, to := queryRange(q, 7*24*time.Hour)
+	from, to, err := queryRange(q, 7*24*time.Hour)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
 	limit := clampLimit(q.Get("limit"), maxUsageLimit, maxUsageLimit)
 	where, args := usageHistoryFilters(from, to, q.Get("status"), q.Get("model"), q.Get("key_id"))
 
@@ -361,7 +386,11 @@ func (h *UsageHandler) ExportCSV(w http.ResponseWriter, r *http.Request) {
 // 用它当 tiebreaker 才能保证翻页不漏不重。
 func (h *UsageHandler) History(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query()
-	from, to := queryRange(q, 7*24*time.Hour)
+	from, to, err := queryRange(q, 7*24*time.Hour)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
 	limit := clampLimit(q.Get("limit"), 200, maxUsageLimit)
 	offset := clampOffset(q.Get("offset"))
 	where, args := usageHistoryFilters(from, to, q.Get("status"), q.Get("model"), q.Get("key_id"))
@@ -440,7 +469,11 @@ func (h *UsageHandler) GroupByDay(w http.ResponseWriter, r *http.Request) {
 
 func (h *UsageHandler) groupBy(w http.ResponseWriter, r *http.Request, column string) {
 	q := r.URL.Query()
-	from, to, explicit := queryRangeExplicit(q, 7*24*time.Hour)
+	from, to, explicit, err := queryRangeExplicit(q, 7*24*time.Hour)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
 	limit := clampLimit(q.Get("limit"), defaultUsageLimit, maxUsageLimit)
 
 	// 按天分组时返回时间序列，必须按日期升序；
@@ -470,11 +503,16 @@ func (h *UsageHandler) groupBy(w http.ResponseWriter, r *http.Request, column st
 // 调用方把 SQL 拆成两段传入：
 //   - head：SELECT 列 + FROM + JOIN（**不含** WHERE）；
 //   - tail：GROUP BY + ORDER BY 等（在 WHERE 之后的部分）。
+//
 // 时间过滤在这里用 groupRangeClause 生成 WHERE 插到 head 与 tail 之间，
 // 保证 WHERE 位于 FROM/JOIN 之后、GROUP BY 之前（SQLite 语法要求）。
 func (h *UsageHandler) groupByNamed(w http.ResponseWriter, r *http.Request, head, tail string) {
 	q := r.URL.Query()
-	from, to, explicit := queryRangeExplicit(q, 7*24*time.Hour)
+	from, to, explicit, err := queryRangeExplicit(q, 7*24*time.Hour)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
 	limit := clampLimit(q.Get("limit"), defaultUsageLimit, maxUsageLimit)
 
 	// 本分支的查询都 JOIN 了 usage_records u，ts 用 u. 前缀限定。

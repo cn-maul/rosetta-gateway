@@ -39,29 +39,51 @@ func anthropicErrorType(code string, status int) string {
 			return "permission_error"
 		}
 		return "authentication_error"
-	case "invalid_request_error", "context_length_exceeded":
+	case "invalid_request_error", "context_length_exceeded", "request_too_large":
 		return "invalid_request_error"
 	case "model_not_found":
 		return "not_found_error"
-	case "insufficient_quota", "rate_limit_exceeded":
+	case "insufficient_quota", "rate_limit_exceeded", "upstream_quota_exhausted":
 		return "rate_limit_error"
-	case "request_too_large":
-		return "request_too_large"
+	case "upstream_auth_error":
+		// 上游 401/403：目标级凭据问题，报成 api_error 会让客户端以为是自己
+		// 请求的问题而不重试、不换凭据。
+		if status == http.StatusForbidden {
+			return "permission_error"
+		}
+		return "authentication_error"
+	case "upstream_timeout":
+		return "timeout_error"
 	case "internal_error":
 		return "api_error"
 	default:
 		// upstream_* 一族：网关把上游问题翻译成 502/504/404/429 带给下游，
 		// 类型按状态码归类，不在消息里暴露内部 code。
+		//
+		// overloaded_error 值得单独一类：Claude Code 与 Anthropic 官方 SDK
+		// 对 529 有专门的指数退避重试策略，收到 api_error 时行为可能不同。
 		switch {
 		case status == http.StatusNotFound:
 			return "not_found_error"
 		case status == http.StatusTooManyRequests:
 			return "rate_limit_error"
+		case status == statusOverloaded:
+			return "overloaded_error"
+		case status == http.StatusGatewayTimeout:
+			return "timeout_error"
+		case status == http.StatusPaymentRequired:
+			return "billing_error"
+		case status == http.StatusConflict:
+			return "conflict_error"
 		default:
 			return "api_error"
 		}
 	}
 }
+
+// statusOverloaded 是 Anthropic 的「上游过载」状态码。它不是标准 HTTP 码，
+// 由 Anthropic 自定义；SDK 依据它 + overloaded_error 类型做退避重试。
+const statusOverloaded = 529
 
 // ---- 非流式响应 ----
 
@@ -163,7 +185,12 @@ type AnthropicSSE struct {
 	started    bool // message_start 已发出
 	blockIndex int
 	openType   string // "" | "text" | "thinking" | "tool_use"
-	openToolID string
+	// openToolIdx 是当前开放 tool_use 块对应的 ToolIndex（同块判据，见 ensureBlock）。
+	openToolIdx int
+	// pendingToolID/pendingToolName 只在首片（ToolID 非空）有意义，
+	// 由 EventToolCall 在切块前填入。
+	pendingToolID   string
+	pendingToolName string
 
 	wroteContent bool
 	sawTerminal  bool
@@ -172,7 +199,9 @@ type AnthropicSSE struct {
 // NewAnthropicSSE 构造 sink。id 是网关生成的兜底响应 id：message_start 若等
 // 不到上游的 message_start 事件（某些上游直接吐内容），用兜底 id 开场。
 func NewAnthropicSSE(w io.Writer, flusher http.Flusher, id, model string) *AnthropicSSE {
-	return &AnthropicSSE{w: w, flusher: flusher, id: id, model: model}
+	// openToolIdx 初始为 -1（而非零值 0）：否则「还没开过块」与
+	//「开了 ToolIndex=0 的块」不可区分，首片会被误判为同块而复用。
+	return &AnthropicSSE{w: w, flusher: flusher, id: id, model: model, openToolIdx: -1}
 }
 
 func (s *AnthropicSSE) writeRaw(event, data string) {
@@ -226,10 +255,17 @@ func (s *AnthropicSSE) ensureStarted(id string) {
 	})
 }
 
-// ensureBlock 切到指定类型的开放块：类型不变则复用；变化则先 stop 旧块再
+// ensureBlock 切到指定类型的开放块：同一块则复用；变化则先 stop 旧块再
 // start 新块（index 严格递增）。
-func (s *AnthropicSSE) ensureBlock(blockType, toolID, toolName string) {
-	if s.openType == blockType && (blockType != "tool_use" || s.openToolID == toolID) {
+//
+// **同块的判据是 ToolIndex，不是 ToolID**：rosetta 的流式契约是首片带
+// ToolID/ToolName、续片只带 ToolIndex+ArgumentsDelta（SDK 侧
+// anthropic 的 input_json_delta、openai-chat 的续 chunk、responses 的
+// function_call_arguments.delta 都不填 ToolID）。用 ToolID 判会让每个参数
+// 分片都切出一个新块：客户端收到两个 tool_use —— 一个有 id/name 但参数
+// 为空、一个有参数但没 id/name，工具调用整体失效。
+func (s *AnthropicSSE) ensureBlock(blockType string, toolIdx int) {
+	if s.openType == blockType && (blockType != "tool_use" || s.openToolIdx == toolIdx) {
 		return
 	}
 	s.closeOpenBlock()
@@ -243,13 +279,14 @@ func (s *AnthropicSSE) ensureBlock(blockType, toolID, toolName string) {
 	case "thinking":
 		cb = map[string]any{"type": "thinking", "thinking": ""}
 	case "tool_use":
-		cb = map[string]any{"type": "tool_use", "id": toolID, "name": toolName, "input": map[string]any{}}
+		// 首片（ToolID 非空）才带 id/name；续片复用同一个块，不再重开。
+		cb = map[string]any{"type": "tool_use", "id": s.pendingToolID, "name": s.pendingToolName, "input": map[string]any{}}
 	}
 	s.writeEvent("content_block_start", map[string]any{
 		"type": "content_block_start", "index": idx, "content_block": cb,
 	})
 	s.openType = blockType
-	s.openToolID = toolID
+	s.openToolIdx = toolIdx
 }
 
 func (s *AnthropicSSE) closeOpenBlock() {
@@ -259,8 +296,11 @@ func (s *AnthropicSSE) closeOpenBlock() {
 	s.writeEvent("content_block_stop", map[string]any{
 		"type": "content_block_stop", "index": s.blockIndex - 1,
 	})
+	// 注意：这里只清「开放块」状态，**不能**清 pendingToolID/pendingToolName ——
+	// ensureBlock 的执行顺序是先 closeOpenBlock() 再拿 pending* 构造新块，
+	// 清了就会把第二个工具的 id/name 掏成空串。
 	s.openType = ""
-	s.openToolID = ""
+	s.openToolIdx = -1
 }
 
 // Event 消费一个上游事件。EventMessageEnd 只留痕不编码 —— 终止序列
@@ -273,7 +313,7 @@ func (s *AnthropicSSE) Event(ev *rosetta.Event) {
 	case rosetta.EventMessageStart:
 		s.ensureStarted(ev.ID)
 	case rosetta.EventTextDelta:
-		s.ensureBlock("text", "", "")
+		s.ensureBlock("text", 0)
 		if ev.Text != "" {
 			s.wroteContent = true
 		}
@@ -282,7 +322,7 @@ func (s *AnthropicSSE) Event(ev *rosetta.Event) {
 			"delta": map[string]any{"type": "text_delta", "text": ev.Text},
 		})
 	case rosetta.EventThinkingDelta:
-		s.ensureBlock("thinking", "", "")
+		s.ensureBlock("thinking", 0)
 		if ev.Text != "" {
 			s.wroteContent = true
 			s.writeEvent("content_block_delta", map[string]any{
@@ -299,7 +339,11 @@ func (s *AnthropicSSE) Event(ev *rosetta.Event) {
 			})
 		}
 	case rosetta.EventToolCall:
-		s.ensureBlock("tool_use", ev.ToolID, ev.ToolName)
+		// 首片会带 ToolID/ToolName；续片两者皆空，此时沿用上一次的值开块。
+		if ev.ToolID != "" {
+			s.pendingToolID, s.pendingToolName = ev.ToolID, ev.ToolName
+		}
+		s.ensureBlock("tool_use", ev.ToolIndex)
 		s.wroteContent = true
 		s.writeEvent("content_block_delta", map[string]any{
 			"type": "content_block_delta", "index": s.blockIndex - 1,

@@ -5,24 +5,18 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <meta name="color-scheme" content="light" />
     <title>Rosetta Gateway · 管理后台</title>
-    <script>
-      // 暗色主题防闪：Vue 的 initTheme() 在 onMounted 才跑，首帧永远是浅色，
-      // 老暗色用户会看到「白一下」。这里在 <head> 同步、解析 CSS 之前先把
-      // data-theme 打上，让首帧即正确。逻辑与 App.vue 的 THEME_KEY/回退保持一致。
-      (function () {
-        try {
-          var saved = localStorage.getItem('rosetta_gw_theme');
-          var dark = saved === 'dark' || (!saved && matchMedia('(prefers-color-scheme: dark)').matches);
-          if (dark) {
-            document.documentElement.setAttribute('data-theme', 'dark');
-            var m = document.querySelector('meta[name=color-scheme]');
-            if (m) m.setAttribute('content', 'dark');
-          }
-        } catch (e) {}
-      })();
-    </script>
-    <script type="module" crossorigin src="./assets/index-B8ypuDw6.js"></script>
-    <link rel="stylesheet" crossorigin href="./assets/index-DI5lksKG.css">
+    <!--
+      暗色主题防闪。**必须外置、必须是同步脚本**：
+      - 外置是因为管理面 CSP 为 script-src 'self'（无 'unsafe-inline'），
+        内联 IIFE 会被浏览器静默拦掉，防闪功能直接失效（暗色用户首帧白闪
+        回归），而浏览器只在控制台报一条违规，构建与测试全绿；
+      - 不能用 type="module"：module 是 defer 语义，等它执行时 CSS 已应用、
+        首帧已画完，防闪就没有意义了。
+      脚本本体见 public/theme-init.js，逻辑与 src/App.vue 的主题三态一致。
+    -->
+    <script src="./theme-init.js"></script>
+    <script type="module" crossorigin src="./assets/index-SYB3HUtt.js"></script>
+    <link rel="stylesheet" crossorigin href="./assets/index-C8ncBb6Z.css">
   </head>
   <body>
     <div id="app"></div>

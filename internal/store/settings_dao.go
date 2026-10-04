@@ -11,9 +11,14 @@ import (
 const settingModelDefaultsKey = "model_defaults"
 
 // 未显式配置时的兜底默认：探测不到模型容量时使用。
+//
+// 兜底值刻意取**当代主流模型的真实规格**（128K 上下文 / 64K 最大输出），
+// 而不是早期保守值：既然是「探测不到才用」，就应当按当下模型的水位给，
+// 否则一个没暴露 context_length 的新模型会被凭空削成 8K，用户侧表现为
+// 「刚接的模型只会说 8K 字」这种难以自查的静默降级。
 const (
-	defaultContextWindowFallback   = 8192
-	defaultMaxOutputTokensFallback = 4096
+	defaultContextWindowFallback   = 131_072 // 128K tokens
+	defaultMaxOutputTokensFallback = 65_536  // 64K tokens
 )
 
 type ModelDefaults struct {

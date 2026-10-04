@@ -3,6 +3,7 @@ package admin
 import (
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"net/http"
 	"strings"
 
@@ -63,7 +64,10 @@ func (h *KeyHandler) List(w http.ResponseWriter, r *http.Request) {
 
 func (h *KeyHandler) Create(w http.ResponseWriter, r *http.Request) {
 	var req keyRequest
-	if err := decodeJSON(r, &req); err != nil {
+	if err := decodeJSON(w, r, &req); err != nil {
+		if errors.Is(err, errUnsupportedMediaType) {
+			return
+		}
 		writeError(w, http.StatusBadRequest, "invalid JSON: "+err.Error())
 		return
 	}
@@ -137,7 +141,10 @@ func (h *KeyHandler) Update(w http.ResponseWriter, r *http.Request, id string) {
 	}
 
 	var req keyRequest
-	if err := decodeJSON(r, &req); err != nil {
+	if err := decodeJSON(w, r, &req); err != nil {
+		if errors.Is(err, errUnsupportedMediaType) {
+			return
+		}
 		writeError(w, http.StatusBadRequest, "invalid JSON: "+err.Error())
 		return
 	}
@@ -190,6 +197,27 @@ func (h *KeyHandler) Delete(w http.ResponseWriter, r *http.Request, id string) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]string{"status": "deleted"})
+}
+
+// RecomputeUsage 从 usage_records 重算该密钥的已用量并覆盖 used_tokens。
+//
+// 存在的理由：used_tokens 由数据库触发器单调累加，没有任何回退路径。
+// 一旦因误写或 bug 偏高，配额预检会从此恒返回 429，而 Update 刻意不写
+// used_tokens（防止请求体随意改配额计数）—— 于是这把 key 在管理界面上
+// 变成「怎么改配置都救不回来」的死 key，只能直接改库。这个端点把
+// 恢复能力还给运维。
+func (h *KeyHandler) RecomputeUsage(w http.ResponseWriter, r *http.Request, id string) {
+	used, err := h.store.RecomputeUsedTokens(r.Context(), id)
+	if err != nil {
+		// key 不存在时 DAO 返回 ErrNotFound → 404，而不是把「重算了一把
+		// 不存在的 key」报成 200 + used_tokens=0（前端会以为重算已完成）。
+		writeNotFoundOrError(w, "recompute key usage", "密钥不存在", err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"status":      "ok",
+		"used_tokens": used,
+	})
 }
 
 func toKeyResponse(k store.AccessKey) keyResponse {

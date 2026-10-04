@@ -58,11 +58,16 @@ type UpstreamModel struct {
 }
 
 type RouteIndex struct {
-	byPublicName   map[string]*Route
-	byID           map[string]*Route
-	providers      map[string]*ProviderRef
-	providerModels map[string]map[string]*UpstreamModel // providerID -> upstreamModelID -> model
-	targetsByRoute map[string][]*Target                  // routeID -> 有序目标链
+	byPublicName map[string]*Route
+	byID         map[string]*Route
+	providers    map[string]*ProviderRef
+	// providerModels: providerID -> upstream_models.id -> model，解析 route 外键用。
+	providerModels map[string]map[string]*UpstreamModel
+	// modelsByModelID: providerID -> upstream_models.model_id -> model，
+	// 解析 provider/model 直连形式用。两者分开是因为键不同：外键指向行主键
+	// （32 位 hex），而 client 传的是上游模型名。
+	modelsByModelID map[string]map[string]*UpstreamModel
+	targetsByRoute  map[string][]*Target
 }
 
 // Candidate 是一个可执行的解析结果：链上的一个目标，已解析到 provider 与上游模型。
@@ -82,11 +87,12 @@ type Resolution struct {
 
 func NewRouteIndex() *RouteIndex {
 	return &RouteIndex{
-		byPublicName:   make(map[string]*Route),
-		byID:           make(map[string]*Route),
-		providers:      make(map[string]*ProviderRef),
-		providerModels: make(map[string]map[string]*UpstreamModel),
-		targetsByRoute: make(map[string][]*Target),
+		byPublicName:    make(map[string]*Route),
+		byID:            make(map[string]*Route),
+		providers:       make(map[string]*ProviderRef),
+		providerModels:  make(map[string]map[string]*UpstreamModel),
+		modelsByModelID: make(map[string]map[string]*UpstreamModel),
+		targetsByRoute:  make(map[string][]*Target),
 	}
 }
 
@@ -101,36 +107,71 @@ func (ri *RouteIndex) AddRouteTarget(t *Target) {
 	ri.targetsByRoute[t.RouteID] = append(ri.targetsByRoute[t.RouteID], t)
 }
 
+// AddProvider 登记一个上游。
+//
+// ID 与 Slug 放进**同一张 map**：Resolve 的 provider/model 直连分支要按
+// slug 查，而 findProviderByID 要按 ID 查。代价是两个命名空间没有隔离 ——
+// 理论上 slug 恰好等于另一 provider 的 32 位 hex ID 时会取到错误对象。
+// 现实中不可达（slug 由 slugify 从显示名生成，见 admin/provider_handler.go），
+// 故不拆成两张表：多一次 map 查找换取热路径（Resolve 每次请求都调
+// findProviderBySlug）少一次分支。
 func (ri *RouteIndex) AddProvider(p *ProviderRef) {
 	ri.providers[p.ID] = p
 	ri.providers[p.Slug] = p
 	if _, ok := ri.providerModels[p.ID]; !ok {
 		ri.providerModels[p.ID] = make(map[string]*UpstreamModel)
 	}
+	if _, ok := ri.modelsByModelID[p.ID]; !ok {
+		ri.modelsByModelID[p.ID] = make(map[string]*UpstreamModel)
+	}
 }
 
 // AddUpstreamModel 以上游模型的主键 ID 建索引。
 // Route.UpstreamModelID 外键指向 upstream_models.id，Resolve 便是拿它来查，
 // 因此这里必须按 ID（而非 ModelID）分类，否则按公开模型名解析必然失败。
+//
+// 同时维护 modelsByModelID 反向索引：provider/model 直连形式
+// （client 传 "myslug/gpt-4"）走 FindUpstreamModelByModelID，而那是**每个请求
+// 都会走**的热路径。旧实现是遍历 providerModels[providerID] 逐个字符串比较，
+// 上游模型一多（单 provider 挂几十个模型很常见）就成 O(N)。反查表把它变成
+// 两次 O(1) 查找 —— 团队已把 Keys 从 O(N) 改成 map，只是漏了这里。
 func (ri *RouteIndex) AddUpstreamModel(m *UpstreamModel) {
 	if _, ok := ri.providerModels[m.ProviderID]; !ok {
 		ri.providerModels[m.ProviderID] = make(map[string]*UpstreamModel)
 	}
 	ri.providerModels[m.ProviderID][m.ID] = m
+	if _, ok := ri.modelsByModelID[m.ProviderID]; !ok {
+		ri.modelsByModelID[m.ProviderID] = make(map[string]*UpstreamModel)
+	}
+	ri.modelsByModelID[m.ProviderID][m.ModelID] = m
 }
 
 // FindUpstreamModelByModelID 按 (providerID, modelID) 反查，供需要上游模型名的场景使用。
+//
+// 走 modelsByModelID 反查表，O(1)。同名 ModelID 在同一 provider 下重复时
+// 返回最后 Add 的那个 —— 与旧线性扫描「返回第一个匹配」的行为差异在
+// 配置层就被排除了（同一 provider 下 ModelID 唯一）。
 func (ri *RouteIndex) FindUpstreamModelByModelID(providerID, modelID string) *UpstreamModel {
-	for _, m := range ri.providerModels[providerID] {
-		if m.ModelID == modelID {
-			return m
-		}
-	}
-	return nil
+	return ri.modelsByModelID[providerID][modelID]
 }
 
 func (ri *RouteIndex) Resolve(model string) (*Resolution, error) {
-	if r, ok := ri.byPublicName[model]; ok && r.Enabled {
+	if r, ok := ri.byPublicName[model]; ok {
+		if !r.Enabled {
+			// 命中一条被显式禁用的具名路由 → 立即否决，**不得**继续往下走
+			// provider/model 直连兜底。
+			//
+			// 旧实现写成 `if r, ok := ...; ok && r.Enabled`，!r.Enabled 时条件
+			// 短路、控制流直接落到下一个分支，而下一支只看 p.Enabled/m.Enabled，
+			// 完全不再看「这个名字是否已被显式禁用」。触发路径完全现实：
+			// public_name 只校验非空、不限制含 "/"，所以「acme/gpt-4」这种
+			// 按客户分模型名的路由是合法的 —— 运维把它禁掉后，客户端请求该名字
+			// 会命中直连兜底、请求成功打到上游，禁用形同虚设。
+			//
+			// 这与 buildCandidates 里「绝不复活死目标」是同一条原则：显式的
+			// 禁用必须胜过任何兜底。
+			return nil, ErrModelNotFound
+		}
 		cands := ri.buildCandidates(r)
 		if len(cands) == 0 {
 			return nil, ErrModelNotFound

@@ -11,24 +11,70 @@ import (
 )
 
 type OpenAIChatRequest struct {
-	Model              string              `json:"model"`
-	Messages           []OpenAIMessage     `json:"messages"`
-	MaxTokens          *int                `json:"max_tokens,omitempty"`
-	MaxCompletionTokens *int               `json:"max_completion_tokens,omitempty"`
-	Temperature        *float64            `json:"temperature,omitempty"`
-	TopP               *float64            `json:"top_p,omitempty"`
-	Stop               []string            `json:"stop,omitempty"`
-	Stream             bool                `json:"stream,omitempty"`
-	StreamOptions      *StreamOptions      `json:"stream_options,omitempty"`
-	Tools              []OpenAITool        `json:"tools,omitempty"`
-	ToolChoice         any                 `json:"tool_choice,omitempty"`
-	PresencePenalty     *float64            `json:"presence_penalty,omitempty"`
-	FrequencyPenalty    *float64            `json:"frequency_penalty,omitempty"`
-	N                  *int                `json:"n,omitempty"`
-	ResponseFormat     json.RawMessage     `json:"response_format,omitempty"`
-	Seed               *int                `json:"seed,omitempty"`
-	User               string              `json:"user,omitempty"`
-	ParallelToolCalls  *bool               `json:"parallel_tool_calls,omitempty"`
+	Model               string          `json:"model"`
+	Messages            []OpenAIMessage `json:"messages"`
+	MaxTokens           *int            `json:"max_tokens,omitempty"`
+	MaxCompletionTokens *int            `json:"max_completion_tokens,omitempty"`
+	Temperature         *float64        `json:"temperature,omitempty"`
+	TopP                *float64        `json:"top_p,omitempty"`
+	// Stop 是 FlexibleStringList 而非 []string：OpenAI 官方允许
+	// `"stop": "END"` 或 `"stop": ["END","X"]` 两种形态。声明成 []string 时
+	// 传 string 会让 json.Unmarshal 报
+	// "cannot unmarshal string into Go struct field Req.stop of type []string"，
+	// 而 decode 是全字段反序列化、一处报错整体返回 —— 于是一个完全合法的
+	// OpenAI 请求被网关硬 400，且错误消息里是 Go 的结构体字段名，对客户端毫无意义。
+	Stop          FlexibleStringList `json:"stop,omitempty"`
+	Stream        bool               `json:"stream,omitempty"`
+	StreamOptions *StreamOptions     `json:"stream_options,omitempty"`
+	Tools         []OpenAITool       `json:"tools,omitempty"`
+	ToolChoice    any                `json:"tool_choice,omitempty"`
+	// ReasoningEffort 是 o1/GPT-5 系列的思考强度。旧实现根本没有这个字段，
+	// encoding/json 静默忽略 → 客户端设了 reasoning_effort:"high" 完全失效，
+	// 无日志、无报错，而 rosetta 与上游 OpenAI 侧都完整支持它。
+	// 这是最常用的入站协议，丢它的代价最大（用户以为在用推理模式，实际没有）。
+	ReasoningEffort   *string         `json:"reasoning_effort,omitempty"`
+	PresencePenalty   *float64        `json:"presence_penalty,omitempty"`
+	FrequencyPenalty  *float64        `json:"frequency_penalty,omitempty"`
+	N                 *int            `json:"n,omitempty"`
+	ResponseFormat    json.RawMessage `json:"response_format,omitempty"`
+	Seed              *int            `json:"seed,omitempty"`
+	User              string          `json:"user,omitempty"`
+	ParallelToolCalls *bool           `json:"parallel_tool_calls,omitempty"`
+}
+
+// FlexibleStringList 接受 JSON 的 string、array、null 三种形态，统一成
+// []string。OpenAI 的 stop / stop_sequences 两个字段都是这个规格。
+type FlexibleStringList []string
+
+// UnmarshalJSON 实现 json.Unmarshaler。
+func (f *FlexibleStringList) UnmarshalJSON(data []byte) error {
+	if len(data) == 0 || string(data) == "null" {
+		*f = nil
+		return nil
+	}
+	var single string
+	if err := json.Unmarshal(data, &single); err == nil {
+		if single == "" {
+			*f = nil
+		} else {
+			*f = []string{single}
+		}
+		return nil
+	}
+	var many []string
+	if err := json.Unmarshal(data, &many); err != nil {
+		return fmt.Errorf("must be a string or an array of strings: %w", err)
+	}
+	*f = many
+	return nil
+}
+
+// MarshalJSON 保持数组形态（不做无损往返，够用即可）。
+func (f FlexibleStringList) MarshalJSON() ([]byte, error) {
+	if f == nil {
+		return []byte("null"), nil
+	}
+	return json.Marshal([]string(f))
 }
 
 type StreamOptions struct {
@@ -36,17 +82,26 @@ type StreamOptions struct {
 }
 
 type OpenAIMessage struct {
-	Role       string          `json:"role"`
-	Content    json.RawMessage `json:"content,omitempty"`
-	Name       string          `json:"name,omitempty"`
+	Role       string           `json:"role"`
+	Content    json.RawMessage  `json:"content,omitempty"`
+	Name       string           `json:"name,omitempty"`
 	ToolCalls  []OpenAIToolCall `json:"tool_calls,omitempty"`
-	ToolCallID string          `json:"tool_call_id,omitempty"`
+	ToolCallID string           `json:"tool_call_id,omitempty"`
+	// Refusal 是模型拒答时的正文（OpenAI 的
+	// {"role":"assistant","content":null,"refusal":"..."} 形态）。
+	//
+	// 不解析它会直接卡死会话：content 为 null → extractText 得空串 →
+	// rosetta.Assistant("") → 校验报 "message has no content blocks" → 400。
+	// 于是「模型正当拒绝后，客户端换个说法再问一次」永远拿不到回答。
+	// rosetta 解码侧自己把 refusal 折成文本块（provider_openai_chat.go），
+	// 网关入站侧必须对称处理。
+	Refusal *string `json:"refusal,omitempty"`
 }
 
 type OpenAIToolCall struct {
-	ID       string          `json:"id"`
-	Type     string          `json:"type"`
-	Function OpenAIFunction  `json:"function"`
+	ID       string         `json:"id"`
+	Type     string         `json:"type"`
+	Function OpenAIFunction `json:"function"`
 }
 
 type OpenAIFunction struct {
@@ -55,8 +110,8 @@ type OpenAIFunction struct {
 }
 
 type OpenAITool struct {
-	Type     string          `json:"type"`
-	Function OpenAIFuncDef   `json:"function"`
+	Type     string        `json:"type"`
+	Function OpenAIFuncDef `json:"function"`
 }
 
 type OpenAIFuncDef struct {
@@ -119,6 +174,16 @@ func (r *OpenAIChatRequest) ToRosetta() *rosetta.ChatRequest {
 		Temperature:     r.Temperature,
 		TopP:            r.TopP,
 		StopSequences:   r.Stop,
+	}
+
+	// reasoning_effort → Thinking.Effort。rosetta 只认 low/medium/high
+	// （request.go 的 validate 会拒其它值），OpenAI 官方也是这三档。
+	// 未知值静默忽略而不是报错：客户端可能是按更新的模型能力发的，
+	// 直接 400 会让整个请求不可用，而忽略只是退回默认强度。
+	if r.ReasoningEffort != nil {
+		if eff := parseEffort(*r.ReasoningEffort); eff != rosetta.EffortUnset {
+			req.Thinking = &rosetta.ThinkingConfig{Effort: eff}
+		}
 	}
 
 	if len(r.Tools) > 0 {
@@ -184,6 +249,12 @@ func (r *OpenAIChatRequest) ApplyProtocolPrivateExtra(req *rosetta.ChatRequest, 
 	if r.ParallelToolCalls != nil {
 		extra["parallel_tool_calls"] = *r.ParallelToolCalls
 	}
+	// reasoning_effort 原样透传：rosetta 已在 ToRosetta 里把它归一到
+	// Thinking.Effort，同协议路径由 SDK 负责写出；但 OpenAI 系的私有扩展
+	// 直传更保真（不会因为归一丢掉 minimal/xhigh 这类上游认识的原始值）。
+	if r.ReasoningEffort != nil && *r.ReasoningEffort != "" {
+		extra["reasoning_effort"] = *r.ReasoningEffort
+	}
 	if len(extra) == 0 {
 		return
 	}
@@ -225,17 +296,43 @@ func convertMessage(m OpenAIMessage) rosetta.Message {
 			}
 			return rosetta.AssistantBlocks(blocks...)
 		}
-		return rosetta.Assistant(extractText(m.Content))
+		return rosetta.Assistant(assistantText(m))
 	case "tool":
 		return rosetta.ToolResult(m.ToolCallID, "", extractText(m.Content))
+	case "developer":
+		// o1/GPT-5 系列用 developer 取代 system。降级成 user 会让上游把它当
+		// 对话轮次的一部分，指令优先级下降、行为与直连上游不一致。
+		return rosetta.System(extractText(m.Content))
+	case "function":
+		// 老式 function 角色（角色名直接承载函数名）本质是工具结果。
+		return rosetta.ToolResult(m.Name, "", extractText(m.Content))
 	default:
 		// 角色未知时按 user 处理（rosetta 的 validate 随后会拒绝非法角色）。
 		return userMessage(m.Content)
 	}
 }
 
-// openAIContentPart 是 OpenAI「内容块数组」里的一块。
+// assistantText 取 assistant 消息的正文，refusal 作为 content 为空时的兜底。
 //
+// OpenAI 的拒答形态是 {"role":"assistant","content":null,"refusal":"I can't…"}：
+// content 是 null，拒答正文在 refusal 字段。只读 content 会得到空串，而
+// rosetta 的校验要求 assistant 至少有一个非空块 —— 于是
+// "message has no content blocks" → 400。后果是模型正当拒绝之后，
+// 客户端**任何**后续续聊（哪怕只是换个说法）都必然 400，整条会话卡死。
+//
+// 优先级：content 有正文时用它（refusal 字段此时按 OpenAI 语义也为空），
+// 否则回落 refusal。
+func assistantText(m OpenAIMessage) string {
+	if t := extractText(m.Content); t != "" {
+		return t
+	}
+	if m.Refusal != nil && *m.Refusal != "" {
+		return *m.Refusal
+	}
+	return ""
+}
+
+// openAIContentPart 是 OpenAI「内容块数组」里的一块。
 // 只声明我们真的会透传的字段：多出来的（image_url.detail / input_audio / file…）
 // 由 encoding/json 忽略，不会被误当成正文。
 type openAIContentPart struct {
@@ -325,4 +422,30 @@ func userMessage(raw json.RawMessage) rosetta.Message {
 		blocks = append(blocks, rosetta.Block{Type: rosetta.BlockImage, ImageURL: u})
 	}
 	return rosetta.Message{Role: rosetta.RoleUser, Blocks: blocks}
+}
+
+// parseEffort 把各协议的各种思考强度写法归一到 rosetta 的三档。
+//
+// 入口不止 OpenAI Chat 的 reasoning_effort：Responses 的 reasoning.effort
+// 还会有 minimal（gpt-5 系列新增，比 low 更省）与 xhigh（比 high 更强），
+// 直连上游时这两档是合法值。rosetta 侧只认 low/medium/high，所以做映射：
+//
+//	minimal → low（都属"少想一点"这一侧）
+//	xhigh   → high
+//
+// 未知值返回 EffortUnset，调用方据此不设 Thinking —— 退回上游默认强度，
+// 而不是把整个请求 400 掉（客户端可能按更新的模型能力在发请求）。
+func parseEffort(s string) rosetta.Effort {
+	switch strings.ToLower(strings.TrimSpace(s)) {
+	case "minimal":
+		return rosetta.EffortLow
+	case "low":
+		return rosetta.EffortLow
+	case "medium":
+		return rosetta.EffortMedium
+	case "high", "xhigh":
+		return rosetta.EffortHigh
+	default:
+		return rosetta.EffortUnset
+	}
 }

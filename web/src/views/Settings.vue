@@ -46,8 +46,10 @@ watch(tab, (t) => {
 const loading = ref(true)
 const saving = ref(false)
 const form = reactive({
-  default_context_window: 8192,
-  default_max_output_tokens: 4096,
+  // 与后端 internal/store/settings_dao.go 的兜底常量保持一致：
+  // GET 失败时界面也不该回落到明显偏小的早期值（会被误当成真实生效值）。
+  default_context_window: 131072,
+  default_max_output_tokens: 65536,
   // 运行时全局默认（超时 + 故障转移策略）。原先散落在每条路由上，现统一在此配置。
   upstream_timeout_ms: 120000,
   stream_idle_timeout_ms: 60000,

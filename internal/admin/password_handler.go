@@ -43,7 +43,8 @@ type passwordStatusResponse struct {
 }
 
 // Check 报告凭据状态。该端点经中间件豁免，无需鉴权：
-// 响应里只有一个布尔值和来源标签，不含任何可用于登录的信息。
+// 响应里只有一个布尔值和来源标签，不含任何可用于登录的信息 ——
+// 也不能含凭据文件的绝对路径（文件系统布局本身就是不该外泄的信息）。
 func (h *PasswordHandler) Check(w http.ResponseWriter, r *http.Request) {
 	if err := h.auth.LockedError(); err != nil {
 		writeJSON(w, http.StatusOK, passwordStatusResponse{
@@ -51,7 +52,7 @@ func (h *PasswordHandler) Check(w http.ResponseWriter, r *http.Request) {
 			Source:      "locked",
 			Locked:      true,
 			Message: "管理凭据文件已损坏或不可读，管理后台暂时锁定（转发服务不受影响）。" +
-				"删除 " + h.auth.Path() + " 后重启网关即可重新设置密码。",
+				"删除状态目录下的 admin_auth.json 后重启网关即可重新设置密码。",
 		})
 		return
 	}
@@ -73,7 +74,10 @@ func (h *PasswordHandler) Check(w http.ResponseWriter, r *http.Request) {
 // 鉴权由中间件完成：系统已有凭据时，该请求必须带上正确的旧凭据才会被放行。
 func (h *PasswordHandler) Set(w http.ResponseWriter, r *http.Request) {
 	var req setPasswordRequest
-	if err := decodeJSON(r, &req); err != nil {
+	if err := decodeJSON(w, r, &req); err != nil {
+		if errors.Is(err, errUnsupportedMediaType) {
+			return
+		}
 		writeError(w, http.StatusBadRequest, "invalid JSON: "+err.Error())
 		return
 	}

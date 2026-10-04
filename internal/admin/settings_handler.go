@@ -1,6 +1,8 @@
 package admin
 
 import (
+	"errors"
+	"fmt"
 	"net/http"
 
 	"github.com/cn-maul/rosetta-gateway/internal/config"
@@ -83,7 +85,10 @@ func (h *SettingsHandler) Get(w http.ResponseWriter, r *http.Request) {
 // 保存后由前端触发 POST /admin/api/reload 重建快照，运行时立即生效（无需重启）。
 func (h *SettingsHandler) Update(w http.ResponseWriter, r *http.Request) {
 	var req settingsResponse
-	if err := decodeJSON(r, &req); err != nil {
+	if err := decodeJSON(w, r, &req); err != nil {
+		if errors.Is(err, errUnsupportedMediaType) {
+			return
+		}
 		writeError(w, http.StatusBadRequest, "invalid JSON: "+err.Error())
 		return
 	}
@@ -91,18 +96,31 @@ func (h *SettingsHandler) Update(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "默认上下文与最大输出必须为正整数")
 		return
 	}
+	// maxDurMillis 与 config.validate 里的同名常量一致：time.Duration 是
+	// int64 纳秒，ms > 9.223e12 时 `time.Duration(ms) * time.Millisecond`
+	// 会回绕成负数 —— 负 Duration 让 context.WithTimeout 立即过期、
+	// time.AfterFunc 立即开火，等于全站转发被打挂且 UI 上看不出异常。
+	// 详见 config.validate 的注释。
+	const maxDurMillis = 86_400_000
 	for _, f := range []struct {
 		name string
 		val  int
+		max  int
 	}{
-		{"upstream_timeout_ms", req.UpstreamTimeoutMs},
-		{"stream_idle_timeout_ms", req.StreamIdleTimeoutMs},
-		{"stream_first_token_timeout_ms", req.StreamFirstTokenTimeoutMs},
-		{"failover_max_targets", req.FailoverMaxTargets},
-		{"failover_failure_threshold", req.FailoverFailureThreshold},
+		{"upstream_timeout_ms", req.UpstreamTimeoutMs, maxDurMillis},
+		{"stream_idle_timeout_ms", req.StreamIdleTimeoutMs, maxDurMillis},
+		{"stream_first_token_timeout_ms", req.StreamFirstTokenTimeoutMs, maxDurMillis},
+		// 熔断阈值过大等于永不熔断。
+		{"failover_max_targets", req.FailoverMaxTargets, 100},
+		{"failover_failure_threshold", req.FailoverFailureThreshold, 1000},
 	} {
 		if f.val < 1 {
 			writeError(w, http.StatusBadRequest, f.name+" 必须为 >= 1 的整数")
+			return
+		}
+		if f.val > f.max {
+			writeError(w, http.StatusBadRequest,
+				fmt.Sprintf("%s 过大：%d（上限 %d）", f.name, f.val, f.max))
 			return
 		}
 	}

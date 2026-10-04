@@ -243,8 +243,11 @@ type BucketUsage struct {
 
 // SumUsageBuckets 把 [from,to]（毫秒）内的用量按 bucketSec 秒宽分桶聚合（全组织口径）。
 func (s *Store) SumUsageBuckets(ctx context.Context, from, to, bucketSec int64) ([]BucketUsage, error) {
+	if bucketSec <= 0 {
+		bucketSec = 3600 // SQLite 的 x/0 返回 NULL 而不报错，扫 int64 时才炸；这里直接兜底
+	}
 	rows, err := s.read.QueryContext(ctx,
-		`SELECT (ts / ?) * ? AS bucket, COALESCE(SUM(input_tokens),0), COALESCE(SUM(cached_tokens),0),
+		`SELECT (ts / ?) * ? / 1000 AS bucket, COALESCE(SUM(input_tokens),0), COALESCE(SUM(cached_tokens),0),
 		        COALESCE(SUM(output_tokens),0), COUNT(*)
 		   FROM usage_records WHERE ts >= ? AND ts <= ?
 		  GROUP BY bucket ORDER BY bucket`,
@@ -274,8 +277,11 @@ type BucketCost struct {
 // SumCostBuckets 把 [from,to]（毫秒）内的估算费用按 bucketSec 秒宽、按模型分桶。
 // 计费口径与 GetUsageStats 完全一致（缓存命中/未命中分开计价）。
 func (s *Store) SumCostBuckets(ctx context.Context, from, to, bucketSec int64) ([]BucketCost, error) {
+	if bucketSec <= 0 {
+		bucketSec = 3600 // 同 SumUsageBuckets：除零在 SQLite 里静默返回 NULL
+	}
 	rows, err := s.read.QueryContext(ctx,
-		`SELECT (ts / ?) * ? AS bucket, u.upstream_model,
+		`SELECT (ts / ?) * ? / 1000 AS bucket, u.upstream_model,
 		        COALESCE(SUM(
 		           MAX(u.input_tokens - u.cached_tokens, 0) * COALESCE(m.price_input, 0)
 		           + u.cached_tokens * (CASE WHEN COALESCE(m.price_cache_hit, 0) > 0 THEN m.price_cache_hit ELSE COALESCE(m.price_input, 0) END)

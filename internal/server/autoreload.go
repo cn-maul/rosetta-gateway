@@ -50,16 +50,29 @@ type WriteAuditor func(method, path string, status int, remote, fields string)
 // 由下一次写操作或手动 reload 收敛。
 func AutoReload(next http.Handler, reload func(context.Context) error, audit WriteAuditor, logger *slog.Logger) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		// 请求体只在此处缓存一份（上限 64KB）：handler 要读，审计要字段名。
-		// 管理写请求都是小 JSON，内存代价可忽略。
+		// 请求体只在此处缓存一份（上限 maxAuditBodyBytes）：handler 要读，审计要字段名。
+		// 超过上限时**必须原样放行**：body 被截断后 handler 会拿残缺 JSON 去解析，
+		// 报出一个与真实原因无关的 400（大 provider 的模型批量导入就会这样失败）。
+		// 审计字段名可以为空，body 不能被中间件改坏。
 		var auditFields string
 		switch r.Method {
 		case http.MethodPost, http.MethodPatch, http.MethodPut:
 			if r.Body != nil {
 				buf, _ := io.ReadAll(io.LimitReader(r.Body, maxAuditBodyBytes+1))
-				r.Body = io.NopCloser(bytes.NewReader(buf))
 				if int64(len(buf)) <= maxAuditBodyBytes {
+					r.Body = io.NopCloser(bytes.NewReader(buf))
 					auditFields = extractFieldNames(buf)
+				} else {
+					// 超限：只把已读部分拼回去，还原成完整的原 body。
+					// 上限本身由 decodeJSON（max_request_body_bytes）负责拒绝，
+					// 中间件不做第二道限制。
+					r.Body = struct {
+						io.Reader
+						io.Closer
+					}{
+						Reader: io.MultiReader(bytes.NewReader(buf), r.Body),
+						Closer: r.Body,
+					}
 				}
 			}
 		}

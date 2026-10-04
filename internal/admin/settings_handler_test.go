@@ -45,7 +45,7 @@ func TestSettingsHandler_RuntimeDefaults(t *testing.T) {
 	}
 	b, _ := json.Marshal(want)
 	rec2 := httptest.NewRecorder()
-	h.Update(rec2, httptest.NewRequest(http.MethodPut, "/admin/api/settings", bytes.NewReader(b)))
+	h.Update(rec2, jsonRequest(http.MethodPut, "/admin/api/settings", bytes.NewReader(b)))
 	if rec2.Code != http.StatusOK {
 		t.Fatalf("update code=%d body=%s", rec2.Code, rec2.Body.String())
 	}
@@ -77,7 +77,7 @@ func TestSettingsHandler_RejectsNonPositive(t *testing.T) {
 		FailoverFailureThreshold:  3,
 	}
 	cases := []struct {
-		name  string
+		name   string
 		mutate func(*settingsResponse)
 	}{
 		{"upstream_timeout_ms=0", func(s *settingsResponse) { s.UpstreamTimeoutMs = 0 }},
@@ -93,7 +93,7 @@ func TestSettingsHandler_RejectsNonPositive(t *testing.T) {
 			tc.mutate(&in)
 			b, _ := json.Marshal(in)
 			rec := httptest.NewRecorder()
-			h.Update(rec, httptest.NewRequest(http.MethodPut, "/admin/api/settings", bytes.NewReader(b)))
+			h.Update(rec, jsonRequest(http.MethodPut, "/admin/api/settings", bytes.NewReader(b)))
 			if rec.Code != http.StatusBadRequest {
 				t.Fatalf("want 400, got %d body=%s", rec.Code, rec.Body.String())
 			}

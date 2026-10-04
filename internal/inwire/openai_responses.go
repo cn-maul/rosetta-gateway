@@ -151,14 +151,13 @@ func (a *ResponsesRequest) ToRosetta() *rosetta.ChatRequest {
 		}
 		req.Tools = tools
 	}
+	// minimal / xhigh 是 OpenAI 为 gpt-5 系列新增的两档（比 low 更省、
+	// 比 high 更强），直连上游时合法。旧实现只认 low/medium/high，这两档
+	// 落空 → req.Thinking 保持 nil → 客户端以为自己开了推理模式，实际静默
+	// 不思考。归一逻辑见 inwire.parseEffort。
 	if a.Reasoning != nil && a.Reasoning.Effort != "" {
-		switch a.Reasoning.Effort {
-		case "low":
-			req.Thinking = &rosetta.ThinkingConfig{Effort: rosetta.EffortLow}
-		case "medium":
-			req.Thinking = &rosetta.ThinkingConfig{Effort: rosetta.EffortMedium}
-		case "high":
-			req.Thinking = &rosetta.ThinkingConfig{Effort: rosetta.EffortHigh}
+		if eff := parseEffort(a.Reasoning.Effort); eff != rosetta.EffortUnset {
+			req.Thinking = &rosetta.ThinkingConfig{Effort: eff}
 		}
 	}
 
@@ -278,7 +277,9 @@ func responsesItemOutputText(item responsesItem) string {
 // ApplyUpstreamExtras 按上游协议挂 Responses 私有字段。
 func (a *ResponsesRequest) ApplyUpstreamExtras(req *rosetta.ChatRequest, protocol string) {
 	switch protocol {
-	case "", "openai-chat":
+	case "", "openai-chat", "auto":
+		// "auto" 与 ""/"openai-chat" 同组：auto 下SDK 自动探测，落点几乎总是
+		// OpenAI 方言，漏掉它等于让最常用的协议配置静默丢字段。
 		extra := map[string]any{}
 		if v := responsesToolChoiceOpenAI(a.ToolChoice); v != nil {
 			extra["tool_choice"] = v

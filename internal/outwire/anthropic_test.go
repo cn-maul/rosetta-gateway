@@ -128,8 +128,13 @@ func TestAnthropicSSE_ToolCallBlocks(t *testing.T) {
 	s := NewAnthropicSSE(rec, nil, "msg_1", "gw-model")
 
 	s.Event(&rosetta.Event{Type: rosetta.EventMessageStart, ID: "up-1"})
-	s.Event(&rosetta.Event{Type: rosetta.EventToolCall, ToolIndex: 0, ToolID: "t1", ToolName: "get_weather", ArgumentsDelta: `{"city":`})
-	s.Event(&rosetta.Event{Type: rosetta.EventToolCall, ToolIndex: 0, ToolID: "t1", ToolName: "get_weather", ArgumentsDelta: `"北京"}`})
+	// 首片带 id/name；**续片只带 ToolIndex + ArgumentsDelta** —— 这是 rosetta
+	// 的实际契约（SDK 侧 anthropic 的 input_json_delta 不填 ToolID/ToolName）。
+	// 旧测试给每个分片都重复传 ToolID/ToolName，恰好掩盖了「用 ToolID 判同块」
+	// 导致的「每个参数分片切一个新块」缺陷。
+	s.Event(&rosetta.Event{Type: rosetta.EventToolCall, ToolIndex: 0, ToolID: "t1", ToolName: "get_weather"})
+	s.Event(&rosetta.Event{Type: rosetta.EventToolCall, ToolIndex: 0, ArgumentsDelta: `{"city":`})
+	s.Event(&rosetta.Event{Type: rosetta.EventToolCall, ToolIndex: 0, ArgumentsDelta: `"北京"}`})
 	s.Event(&rosetta.Event{Type: rosetta.EventToolCall, ToolIndex: 1, ToolID: "t2", ToolName: "get_time", ArgumentsDelta: `{}`})
 	s.Event(&rosetta.Event{Type: rosetta.EventMessageEnd, Usage: &rosetta.Usage{InputTokens: 5, OutputTokens: 9}, StopReason: rosetta.StopToolUse})
 	s.Finish("ok", rosetta.StopToolUse, rosetta.Usage{InputTokens: 5, OutputTokens: 9}, false)
@@ -260,9 +265,22 @@ func TestWriteAnthropicError(t *testing.T) {
 		{http.StatusBadRequest, "context_length_exceeded", "invalid_request_error"},
 		{http.StatusNotFound, "model_not_found", "not_found_error"},
 		{http.StatusTooManyRequests, "insufficient_quota", "rate_limit_error"},
-		{http.StatusRequestEntityTooLarge, "request_too_large", "request_too_large"},
-		{http.StatusBadGateway, "upstream_auth_error", "api_error"},
-		{http.StatusGatewayTimeout, "upstream_timeout", "api_error"},
+		// request_too_large 是网关自造的 code，Anthropic 官方错误类型表里
+		// 没有它。旧实现原样透传，于是响应里的 type 是一个官方 SDK 从未
+		// 见过、无法分类的字符串。必须归到 invalid_request_error。
+		{http.StatusRequestEntityTooLarge, "request_too_large", "invalid_request_error"},
+		// 上游_* 一族：按 code 分类，让客户端能区分「换凭据」与「退避重试」。
+		{http.StatusBadGateway, "upstream_auth_error", "authentication_error"},
+		{http.StatusForbidden, "upstream_auth_error", "permission_error"},
+		{http.StatusGatewayTimeout, "upstream_timeout", "timeout_error"},
+		// 过载：Anthropic 自定义 529 + overloaded_error，官方 SDK 对它做
+		// 指数退避重试。旧实现落 default → api_error，客户端就不重试了 ——
+		// 而过载恰恰是最该重试的场景。
+		{529, "upstream_error", "overloaded_error"},
+		{statusOverloaded, "upstream_error", "overloaded_error"},
+		{http.StatusPaymentRequired, "upstream_quota_exhausted", "rate_limit_error"},
+		{http.StatusConflict, "upstream_error", "conflict_error"},
+		{http.StatusBadGateway, "upstream_error", "api_error"},
 	}
 	for _, c := range cases {
 		rec := httptest.NewRecorder()

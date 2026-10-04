@@ -267,14 +267,36 @@ func (s *Store) persist(c *Credential) error {
 		}
 	}
 
-	tmp := s.path + ".tmp"
+	// 临时名必须唯一：固定的 "<path>.tmp" 在并发首次设置密码时会互相覆盖 ——
+	// 两个请求各写一份 tmp、再各rename，其中一份被丢掉，且丢的那份可能是
+	// 后来者（后写者胜出，先写者的密码静默失效）。
+	f, err := os.CreateTemp(dir, filepath.Base(s.path)+".tmp-*")
+	if err != nil {
+		return fmt.Errorf("创建凭据临时文件: %w", err)
+	}
+	tmp := f.Name()
+	defer func() {
+		// rename 成功后 os.Remove 会失败（文件已不在），忽略即可。
+		_ = os.Remove(tmp)
+	}()
 	// 0o600：凭据文件只有属主可读写。Windows 上该权限位不生效，
 	// 但保留它可以让同一份代码在 Linux 部署时自动获得正确权限。
-	if err := os.WriteFile(tmp, data, 0o600); err != nil {
+	if err := f.Chmod(0o600); err != nil {
+		f.Close()
+		return fmt.Errorf("设置凭据文件权限: %w", err)
+	}
+	if _, err := f.Write(data); err != nil {
+		f.Close()
 		return fmt.Errorf("写入凭据文件: %w", err)
 	}
+	if err := f.Sync(); err != nil {
+		f.Close()
+		return fmt.Errorf("刷新凭据文件: %w", err)
+	}
+	if err := f.Close(); err != nil {
+		return fmt.Errorf("关闭凭据文件: %w", err)
+	}
 	if err := os.Rename(tmp, s.path); err != nil {
-		os.Remove(tmp)
 		return fmt.Errorf("提交凭据文件: %w", err)
 	}
 	return nil

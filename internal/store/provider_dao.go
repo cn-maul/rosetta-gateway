@@ -7,17 +7,17 @@ import (
 )
 
 type Provider struct {
-	ID          string
-	Slug        string
-	Name        string
-	Protocol    string
-	Endpoint    string
-	Enabled     bool
-	TimeoutMs   int
-	MaxRetries  int
-	QuirksJSON  string
-	CreatedAt   int64
-	UpdatedAt   int64
+	ID         string
+	Slug       string
+	Name       string
+	Protocol   string
+	Endpoint   string
+	Enabled    bool
+	TimeoutMs  int
+	MaxRetries int
+	QuirksJSON string
+	CreatedAt  int64
+	UpdatedAt  int64
 }
 
 // providerColumns 是 providers 三处读路径共用的列清单。

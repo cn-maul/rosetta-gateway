@@ -1,6 +1,7 @@
 package admin
 
 import (
+	"errors"
 	"net/http"
 	"strconv"
 
@@ -39,6 +40,9 @@ type routeTargetInput struct {
 	Enabled         *bool  `json:"enabled"`
 }
 
+// maxRouteTargets 是单条 route 允许配置的目标链长度上限。
+const maxRouteTargets = 64
+
 type replaceTargetsRequest struct {
 	Targets []routeTargetInput `json:"targets"`
 }
@@ -74,12 +78,25 @@ func (h *RouteTargetHandler) Replace(w http.ResponseWriter, r *http.Request, rou
 	}
 
 	var req replaceTargetsRequest
-	if err := decodeJSON(r, &req); err != nil {
+	if err := decodeJSON(w, r, &req); err != nil {
+		if errors.Is(err, errUnsupportedMediaType) {
+			return
+		}
 		writeError(w, http.StatusBadRequest, "invalid JSON: "+err.Error())
 		return
 	}
 	if len(req.Targets) == 0 {
 		writeError(w, http.StatusBadRequest, "至少需要一个上游目标；要停用整条 route 请把 route.enabled 置 false")
+		return
+	}
+	// 上限不是语义约束，是资源约束。每个目标要走 validateTarget（约 2 条
+	// SQL），随后 ReplaceRouteTargets 在**单个事务**里 DELETE + 逐条 INSERT。
+	// 请求体上限默认 32MB、最小条目约 40 字节 → 理论 80 万条，也就是单个
+	// HTTP 请求就能发起一个覆盖全表的长事务并放大成 160 万次查询。
+	// 实际业务的故障转移链只有 1~5 个成员，64 已经宽得离谱。
+	if len(req.Targets) > maxRouteTargets {
+		writeError(w, http.StatusBadRequest,
+			"targets 数量 "+strconv.Itoa(len(req.Targets))+" 超出上限 "+strconv.Itoa(maxRouteTargets))
 		return
 	}
 
