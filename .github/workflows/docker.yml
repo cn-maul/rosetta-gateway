@@ -44,9 +44,11 @@ jobs:
           fi
           echo "tag 与 package.json 一致: ${VER}"
 
-      - name: Set up QEMU
-        uses: docker/setup-qemu-action@v3
-
+      # 不装 QEMU：只构建 linux/amd64。setup-qemu-action 装的是 binfmt 模拟器，
+# 让 buildx 能「跑」异构架构的构建步骤——本工作流的构建阶段只跑 Go 编译，
+# 产出的二进制从不执行，因此 QEMU 是纯开销：拉取约 100MB 模拟器镜像、
+# 注册 binfmt_misc 处理器，并让每个 RUN 层的执行都走一层软件模拟。
+# 单架构下 buildx 直接在本机执行这些层，反而更快。
       - name: Set up Buildx
         uses: docker/setup-buildx-action@v3
 
@@ -77,7 +79,10 @@ jobs:
         uses: docker/build-push-action@v6
         with:
           context: .
-          platforms: linux/amd64,linux/arm64
+          # 只构建 amd64：部署目标就是 x86_64 服务器，不需要 arm64 镜像。
+          # 不写 platforms 时 buildx 默认只构建运行器自身架构，等价于
+          # linux/amd64，且省去平台解析与多架构 manifest 的开销。
+          platforms: linux/amd64
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
