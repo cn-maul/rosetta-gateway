@@ -105,11 +105,13 @@ func usageSource(alias string, f UsageFilter) (string, []any) {
 	if f.To > 0 {
 		add("ts <= ?", dayEndMs+" <= ?", f.To)
 	}
-	// COALESCE(user_id, '')：usage_records.user_id 可空（无归属的历史记录），
-	// 归档表写入时已把 NULL 归一成 ''。这里同样归一，否则明细侧那一支对
-	// 任何非空 scope 都返回 0 行 —— 「无归属」是真实存在的一批用量。
+	// user_id 过滤明细支**必须**写成裸列比较（user_id = ?），不能 COALESCE：
+	// 表达式谓词吃不到 idx_usage_user_ts(user_id, ts)，用户级配额预检是每个
+	// /v1 请求都跑的热路径，退化成全表扫就是全站延迟抬升。语义上两者等价 ——
+	// user_id 为 NULL 的行（无归属的历史记录）既不等于任何非空 scope 值，
+	// 也不该被计入某个具体用户的用量。归档支本来就是裸列。
 	if f.UserID != "" {
-		add("COALESCE(user_id, '') = ?", "user_id = ?", f.UserID)
+		add("user_id = ?", "user_id = ?", f.UserID)
 	}
 	for _, c := range []struct{ val, col string }{
 		{f.KeyID, "access_key_id"},

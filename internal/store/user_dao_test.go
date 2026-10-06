@@ -254,6 +254,56 @@ func TestSetUserPassword_BumpsAuthVersion(t *testing.T) {
 	}
 }
 
+// SetInitialAdminPassword 只对「未设密码的管理员」生效**一次**。
+//
+// 这是 bootstrap「设过即 409」防线的落点：若条件 UPDATE 退化成先查后写，
+// 两个并发请求都能通过判定、后写者覆盖先写者。测试钉住三个边界 ——
+// 第二次调用必须 no-op、普通用户的空密码账号不可经此初始化、未知 id no-op。
+func TestSetInitialAdminPassword_OnlyOnce(t *testing.T) {
+	db := newStore(t)
+	ctx := context.Background()
+	if err := db.CreateUser(ctx, &User{ID: "a1", Username: "admin", PasswordHash: "", Role: RoleAdmin, AuthVersion: 1}); err != nil {
+		t.Fatalf("create admin: %v", err)
+	}
+	if err := db.CreateUser(ctx, &User{ID: "u1", Username: "alice", PasswordHash: "", Role: RoleUser, AuthVersion: 1}); err != nil {
+		t.Fatalf("create user: %v", err)
+	}
+
+	ok, err := db.SetInitialAdminPassword(ctx, "a1", "hash-1")
+	if err != nil || !ok {
+		t.Fatalf("first setup: ok=%v err=%v, want true", ok, err)
+	}
+	// 第二次必须 no-op：既不改哈希，也不再递增 auth_version。
+	ok, err = db.SetInitialAdminPassword(ctx, "a1", "hash-attacker")
+	if err != nil {
+		t.Fatalf("second setup: %v", err)
+	}
+	if ok {
+		t.Fatal("second setup reported success — the one-shot window is not closed")
+	}
+	u, _ := db.GetUser(ctx, "a1")
+	if u.PasswordHash != "hash-1" {
+		t.Errorf("password was overwritten by second call: %q", u.PasswordHash)
+	}
+	if u.AuthVersion != 2 {
+		t.Errorf("auth_version = %d, want 2 (bumped exactly once)", u.AuthVersion)
+	}
+
+	// 普通用户的空密码账号：不是 bootstrap 的目标，绝不能经此初始化。
+	ok, err = db.SetInitialAdminPassword(ctx, "u1", "hash-x")
+	if err != nil {
+		t.Fatalf("non-admin setup: %v", err)
+	}
+	if ok {
+		t.Fatal("non-admin empty-password account was initialized via SetInitialAdminPassword")
+	}
+
+	// 不存在的 id：no-op，不报错。
+	if ok, err = db.SetInitialAdminPassword(ctx, "ghost", "hash-y"); err != nil || ok {
+		t.Errorf("ghost id: ok=%v err=%v, want false/nil", ok, err)
+	}
+}
+
 // 用户名唯一且大小写不敏感：否则 "admin" 与 "Admin" 能建成两个账号，
 // 而登录查询用 NOCASE 只会命中一个 —— 表现为「密码错误」，实为账号撞车。
 func TestCreateUser_UsernameUniqueCaseInsensitive(t *testing.T) {

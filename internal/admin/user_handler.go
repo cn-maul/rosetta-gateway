@@ -3,6 +3,7 @@ package admin
 import (
 	"context"
 	"errors"
+	"log/slog"
 	"net/http"
 	"strconv"
 	"strings"
@@ -344,10 +345,18 @@ func (h *UserHandler) BootstrapSetup(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	// SetUserPassword 隐式递增 auth_version。引导账号本来没有任何会话，
-	// 递增只是把版本推到 2，保证之后签发的令牌与「设过密码」的事实一致。
-	if err := h.store.SetUserPassword(r.Context(), u.ID, hash); err != nil {
-		writeNotFoundOrError(w, "bootstrap setup: set password", "用户不存在", err)
+	// SetInitialAdminPassword 在 SQL 里带上 AND password_hash = ''：设过即不写。
+	// 上面的 FindUninitializedAdmin 判定与这里的写入是两个时刻，「判定通过」
+	// 不保证「写入时仍然未设」—— 并发下（或与本判定之后发生的正常设置竞跑）
+	// 后写者会静默覆盖先写者。条件 UPDATE 让「只设一次」由数据库原子保证，
+	// 0 行受影响即说明窗口已在两条指令之间关闭。
+	ok, err := h.store.SetInitialAdminPassword(r.Context(), u.ID, hash)
+	if err != nil {
+		writeServerError(w, "bootstrap setup: set password", err)
+		return
+	}
+	if !ok {
+		writeError(w, http.StatusConflict, "管理员密码已设置，无需重复初始化")
 		return
 	}
 	if th != nil {
@@ -413,7 +422,10 @@ func (h *UserHandler) Me(w http.ResponseWriter, r *http.Request) {
 	used, err := h.store.SumUserUsedTokens(r.Context(), u.ID)
 	if err != nil {
 		// 用量查不到不该让「我是谁」也查不出来 —— 用 0 顶上，日志留痕。
-		writeServerError(w, "me: sum used tokens", err)
+		// 注意降级**不能**走 writeServerError：那会把 500 状态头和错误体写出去，
+		// 而函数继续往下走还会再写一份 200 响应 —— 客户端收到两段拼接的 JSON，
+		// 解析必然失败。降级就是降级，只进日志，不进响应。
+		slog.Warn("me: sum used tokens failed; degrading used_tokens to 0", "error", err)
 		used = 0
 	}
 

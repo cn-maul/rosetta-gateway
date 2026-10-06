@@ -207,6 +207,30 @@ func (s *Store) SetUserPassword(ctx context.Context, id, passwordHash string) er
 	return checkAffected(res, err)
 }
 
+// SetInitialAdminPassword 为**尚未设过密码的管理员**设置初始密码，返回是否写入。
+// false = 目标已有密码、不是管理员或不存在，一个字都没动。
+//
+// 条件守卫（AND password_hash = ” AND role = 'admin'）是 bootstrap 防线的一部分，
+// 不是优化：首次设密的「查库判定 → 写库」若分两步且写入不带条件，两个并发请求
+// 都能通过判定、后写者覆盖先写者 —— 「设过即 409」在并发下就成了「最后一个说了算」，
+// 而且静默无痕。把判定收敛进 SQL 后，唯一性由数据库原子保证；role 条件让
+// 管理员建的空密码**普通用户**账号不可能经这条路径被初始化（那是 FindUninitializedAdmin
+// 之外的第二道闸）。
+func (s *Store) SetInitialAdminPassword(ctx context.Context, id, passwordHash string) (bool, error) {
+	res, err := s.db.ExecContext(ctx,
+		`UPDATE users SET password_hash = ?, auth_version = auth_version + 1, updated_at = ?
+		 WHERE id = ? AND password_hash = '' AND role = 'admin'`,
+		passwordHash, time.Now().UnixMilli(), id)
+	if err != nil {
+		return false, err
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return false, err
+	}
+	return n > 0, nil
+}
+
 // BumpAuthVersion 递增 auth_version，用于「禁用账号」「改角色」这类
 // 必须让既有会话失效、但不动密码的操作。
 func (s *Store) BumpAuthVersion(ctx context.Context, id string) error {
