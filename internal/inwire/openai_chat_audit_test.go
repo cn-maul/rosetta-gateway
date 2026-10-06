@@ -1,6 +1,8 @@
 package inwire
 
 import (
+	"context"
+	"encoding/json"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -106,44 +108,80 @@ func TestOpenAIChat_ReasoningEffortIsPreserved(t *testing.T) {
 	}
 }
 
-// TestOpenAIChat_ReasoningEffortNotInExtra 钉住一条 P0 的修复：
-// reasoning_effort **不得**进 Extra。
+// TestOpenAIChat_ReasoningEffortNotInExtra 坐实一条P0：
+// reasoning_effort 绝不能进 Extra。
 //
-// 它是 rosetta openai-chat 的保留 payload key，而网关从不设置
-// WithExtraOverrides，于是 SDK 的 mergeExtra 会把整个请求判为
-// ErrInvalidRequest → 400，且发生在**任何上游调用之前**。曾被断言的
-// 「原样透传以保真」恰恰就是这个 bug 的成因。
-//
-// 归一后的值由 Thinking.Effort 承载，SDK 在同协议路径自行写出。
+// rosetta 把 reasoning_effort 列在 openaiChatReservedPayloadKeys 里，
+// Extra 带同名键时 mergeExtra 直接报 ErrInvalidRequest，而网关没有开
+// WithExtraOverrides —— 结果是客户端只要设了这个字段，每个请求都必然 400，
+// 且请求死在网关进程内，上游一个字节都收不到。此前的实现为了"保住
+// minimal/xhigh 原始值"而直传，正是这条 400 的来源。
 func TestOpenAIChat_ReasoningEffortNotInExtra(t *testing.T) {
-	for _, protocol := range []string{"openai-chat", "auto", ""} {
-		t.Run(protocol, func(t *testing.T) {
-			r := newReq(t, `{"model":"m","messages":[{"role":"user","content":"hi"}],"reasoning_effort":"xhigh"}`)
+	for _, eff := range []string{"minimal", "low", "medium", "high", "xhigh", "HIGH"} {
+		t.Run(eff, func(t *testing.T) {
+			r := newReq(t, `{"model":"m","messages":[{"role":"user","content":"hi"}],"reasoning_effort":"`+eff+`"}`)
 			req, err := DecodeOpenAIChatRequest(r, defaultMaxBodyBytes)
 			if err != nil {
 				t.Fatalf("decode: %v", err)
 			}
 			ros := req.ToRosetta()
-			req.ApplyProtocolPrivateExtra(ros, protocol)
+			req.ApplyProtocolPrivateExtra(ros, "openai-chat")
 			if v, ok := ros.Extra["reasoning_effort"]; ok {
-				t.Fatalf("protocol=%q：Extra[reasoning_effort] = %v，期望不存在"+
-					"（保留键会让 SDK 把整个请求 400 掉）", protocol, v)
+				t.Fatalf("reasoning_effort=%q 不该进 Extra（撞 rosetta 保留键→ 必然 400），实际 %v", eff, v)
 			}
 		})
 	}
 }
 
-// TestOpenAIChat_RecognizedEffortStillReachesSDK 确认修复没有连带把功能
-// 一起关掉：SDK 认识的档位仍要落到 Thinking.Effort 上（由 SDK 写出）。
-func TestOpenAIChat_RecognizedEffortStillReachesSDK(t *testing.T) {
-	r := newReq(t, `{"model":"m","messages":[{"role":"user","content":"hi"}],"reasoning_effort":"high"}`)
-	req, err := DecodeOpenAIChatRequest(r, defaultMaxBodyBytes)
-	if err != nil {
-		t.Fatalf("decode: %v", err)
+// TestOpenAIChat_ReasoningEffortReachesUpstreamViaThinking 确认删掉直传后
+// 功能没丢：值经 Thinking.Effort 仍会真正写到上游 payload 里。
+//
+// 这是上面那条修复的补偿测试 —— 不直传不能等于"不生效"。
+func TestOpenAIChat_ReasoningEffortReachesUpstreamViaThinking(t *testing.T) {
+	cases := []struct {
+		effort string
+		want   string
+	}{
+		{"low", "low"},
+		{"medium", "medium"},
+		{"high", "high"},
+		// 归一方向正确，只是粒度变粗 —— 见 ApplyProtocolPrivateExtra 的注释。
+		{"minimal", "low"},
+		{"xhigh", "high"},
 	}
-	ros := req.ToRosetta()
-	if ros.Thinking == nil || ros.Thinking.Effort != rosetta.EffortHigh {
-		t.Fatalf("reasoning_effort=high 应落到 Thinking.Effort，实际 %+v", ros.Thinking)
+	for _, tc := range cases {
+		t.Run(tc.effort, func(t *testing.T) {
+			var got map[string]any
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				_ = json.NewDecoder(r.Body).Decode(&got)
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = w.Write([]byte(`{"id":"c1","object":"chat.completion","created":1,
+					"model":"m","choices":[{"index":0,"message":{"role":"assistant","content":"ok"},
+					"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}`))
+			}))
+			defer srv.Close()
+
+			r := newReq(t, `{"model":"m","messages":[{"role":"user","content":"hi"}],"reasoning_effort":"`+tc.effort+`"}`)
+			req, err := DecodeOpenAIChatRequest(r, defaultMaxBodyBytes)
+			if err != nil {
+				t.Fatalf("decode: %v", err)
+			}
+			ros := req.ToRosetta()
+			req.ApplyProtocolPrivateExtra(ros, "openai-chat")
+
+			// 复刻 upstream.buildClient：刻意不传 WithExtraOverrides。
+			c, err := rosetta.NewClient(rosetta.WithEndpoint(srv.URL),
+				rosetta.WithAPIKey("k"), rosetta.WithProtocol(rosetta.ProtoOpenAIChat))
+			if err != nil {
+				t.Fatalf("new client: %v", err)
+			}
+			if _, err := c.Chat(context.Background(), ros); err != nil {
+				t.Fatalf("带 reasoning_effort=%s 的请求不应失败: %v", tc.effort, err)
+			}
+			if got["reasoning_effort"] != tc.want {
+				t.Fatalf("上游收到 reasoning_effort=%v，期望 %q", got["reasoning_effort"], tc.want)
+			}
+		})
 	}
 }
 

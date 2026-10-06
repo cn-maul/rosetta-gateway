@@ -249,26 +249,18 @@ func (r *OpenAIChatRequest) ApplyProtocolPrivateExtra(req *rosetta.ChatRequest, 
 	if r.ParallelToolCalls != nil {
 		extra["parallel_tool_calls"] = *r.ParallelToolCalls
 	}
-	// reasoning_effort **刻意不进 Extra**。
+	// reasoning_effort 故意**不**进 Extra，尽管它是 OpenAI 的字段。
 	//
-	// 它是 rosetta openai-chat 路径的保留 payload key
-	// （rosetta request.go 的 openaiChatReservedPayloadKeys），而 SDK 的
-	// mergeExtra 遇到保留键且未开 WithExtraOverrides 会直接报
-	// ErrInvalidRequest —— 于是「带 reasoning_effort 的 chat 请求」被网关
-	// 自己挡在 400 上，一个字符都没到上游：
+	// rosetta 把 reasoning_effort 列在 openaiChatReservedPayloadKeys 里，
+	// Extra 一旦带上同名键，mergeExtra 就报 ErrInvalidRequest，而网关
+	// buildClient 没有开 WithExtraOverrides —— 于是客户端只要设了这个字段，
+	// 每个请求都必然 400，且死在网关自己的 SDK 校验层，一个字节都到不了上游。
+	// 此前为了"保住 minimal/xhigh 原始值"而直传，正是这条 400 的来源。
 	//
-	//	400 rosetta: invalid request: Extra key "reasoning_effort" collides
-	//	    with an SDK-managed field (pass WithExtraOverrides(true) to
-	//	    override anyway)
-	//
-	// 实测面：openai-chat 上游 400，anthropic 上游 200，thinking{} 200，
-	// responses/messages 两个入口都 200 —— 即最常用的入口 + 最常用的参数
-	// + 最常见的上游协议三者叠加时 100% 失败。
-	//
-	// 保真度上也没有损失：ToRosetta 已把它归一到 Thinking.Effort，SDK 在
-	// openai-chat 路径会自行写出该字段。代价是上游不认识的档位
-	// （minimal/xhigh）会退回默认强度，而不是原样送到上游 —— 与
-	// 「整个请求 400」相比，这是可接受的降级。
+	// 不直传的代价：Thinking.Effort 只归一到 low/medium/high，minimal→low、
+	// xhigh→high。语义方向正确（都是"少想一点"/"多想想"），只是粒度变粗。
+	// 这个取舍与本函数对未知 effort 值的既有处理一致（静默退回默认而非 400）：
+	// 客户端可能按更新的模型能力在发请求，让整个请求不可用才是更糟的失败。
 	if len(extra) == 0 {
 		return
 	}
