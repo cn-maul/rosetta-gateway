@@ -3,6 +3,7 @@ package server
 import (
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"testing"
 	"time"
 )
@@ -84,32 +85,41 @@ func TestFailureThrottleCooldownExpiry(t *testing.T) {
 	}
 }
 
-// TestAdminAuthThrottledBlocksWith429 端到端地确认限速真的接在请求路径上：
+// newSessionGate 构造「会话已启用、无任何用户」的管理门禁。
+//
+// 限速现在只挂在会话解析这一条路径上（运维凭据通道已删除），
+// 所以这才是限速真正生效的地方。
+func newSessionGate(t *testing.T) *UserAuthMiddleware {
+	t.Helper()
+	return NewUserAuth(newEnabledTestManager(t), bootstrapSessionStore{})
+}
+
+// TestSessionAuthThrottledBlocksWith429 端到端地确认限速真的接在请求路径上：
 // 前 limit 次是 401，之后必须是 429 且带 Retry-After。
-func TestAdminAuthThrottledBlocksWith429(t *testing.T) {
-	const limit = 3
-	th := NewFailureThrottle(limit, time.Minute)
-	creds := &stubCreds{token: "correct"}
-	h := AdminAuthThrottled(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusOK)
-	}), creds, th)
+func TestSessionAuthThrottledBlocksWith429(t *testing.T) {
+	a := newSessionGate(t)
 
 	do := func(token string) *httptest.ResponseRecorder {
 		req := httptest.NewRequest(http.MethodGet, "/admin/api/stats", nil)
-		req.Header.Set("Authorization", "Bearer "+token)
+		if token != "" {
+			req.Header.Set("Authorization", "Bearer "+token)
+		}
 		req.RemoteAddr = "198.51.100.4:34567"
 		rec := httptest.NewRecorder()
-		h.ServeHTTP(rec, req)
+		a.ServeHTTP(rec, req, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(http.StatusOK)
+		}))
 		return rec
 	}
 
-	for i := 0; i < limit; i++ {
-		if got := do("wrong").Code; got != http.StatusUnauthorized {
-			t.Fatalf("第 %d 次错误口令应 401，得到 %d", i+1, got)
+	limit := LoginFailLimit
+	for i := range limit {
+		if got := do("invalid-" + strconv.Itoa(i)).Code; got != http.StatusUnauthorized {
+			t.Fatalf("第 %d 次无效令牌应 401，得到 %d", i+1, got)
 		}
 	}
 
-	rec := do("wrong")
+	rec := do("invalid-again")
 	if rec.Code != http.StatusTooManyRequests {
 		t.Fatalf("超过阈值应 429，得到 %d", rec.Code)
 	}
@@ -117,27 +127,31 @@ func TestAdminAuthThrottledBlocksWith429(t *testing.T) {
 		t.Fatal("429 响应必须带 Retry-After 头")
 	}
 
-	// 冷却期内即便口令正确也拒绝 —— 否则爆破者可以靠「猜对」跳过惩罚，
-	// 而这里省掉的正是最贵的 PBKDF2 运算。
-	if got := do("correct").Code; got != http.StatusTooManyRequests {
-		t.Fatalf("冷却期内正确口令也应被限速拦截，得到 %d", got)
+	// 冷却期内即便带上格式正确的令牌也拒绝 —— 否则爆破者可以靠「猜对」跳过惩罚。
+	if got := do("well-formed-but-invalid-token").Code; got != http.StatusTooManyRequests {
+		t.Fatalf("冷却期内请求也应被限速拦截，得到 %d", got)
 	}
 }
 
-// TestAdminAuthAllowsCorrectToken 基础放行路径：正确令牌应到达下游。
-func TestAdminAuthAllowsCorrectToken(t *testing.T) {
-	h := AdminAuth(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusOK)
-	}), &stubCreds{token: "correct"})
+// TestSessionAuthBlocksAnonymous 基础拒绝路径：没有任何令牌必须 401，
+// 且不得触达下游 handler。
+func TestSessionAuthBlocksAnonymous(t *testing.T) {
+	a := newSessionGate(t)
+	reached := false
 
 	req := httptest.NewRequest(http.MethodGet, "/admin/api/stats", nil)
-	req.Header.Set("Authorization", "Bearer correct")
 	req.RemoteAddr = "198.51.100.5:1234"
 	rec := httptest.NewRecorder()
-	h.ServeHTTP(rec, req)
+	a.ServeHTTP(rec, req, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		reached = true
+		w.WriteHeader(http.StatusOK)
+	}))
 
-	if rec.Code != http.StatusOK {
-		t.Fatalf("正确令牌应放行，得到 %d", rec.Code)
+	if reached {
+		t.Fatal("未登录请求不该触达下游 handler")
+	}
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("期望 401，得到 %d", rec.Code)
 	}
 }
 
@@ -151,10 +165,3 @@ func TestClientIPIgnoresForwardedFor(t *testing.T) {
 		t.Fatalf("clientIP = %q，不应采信 X-Forwarded-For", got)
 	}
 }
-
-type stubCreds struct {
-	token string
-}
-
-func (s *stubCreds) Verify(tok string) bool { return tok == s.token }
-func (s *stubCreds) HasCredential() bool    { return true }

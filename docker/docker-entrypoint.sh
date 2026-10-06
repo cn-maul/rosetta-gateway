@@ -20,8 +20,8 @@ mkdir -p "${STATE_DIR}"
 if [ ! -f "${CONFIG}" ]; then
   cp /app/config.default.json "${CONFIG}"
   echo "[entrypoint] 已生成默认配置: ${CONFIG} (listen 0.0.0.0:8666)"
-  echo "[entrypoint] 首次访问管理后台会要求设置密码，请立即设置；"
-  echo "[entrypoint] 或用 -e ADMIN_TOKEN=xxx 先设一个兜底令牌。"
+  echo "[entrypoint] 首次访问管理后台会显示「首次设置密码」表单，请立即设置；"
+  echo "[entrypoint] 会话密钥与主密钥都落在 ${STATE_DIR}，请确保该目录持久化。"
 fi
 
 exec /app/gateway

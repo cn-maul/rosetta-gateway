@@ -17,8 +17,8 @@ import (
 )
 
 const (
-	// KeyFileName 是主密钥在可执行文件同级的文件名。
-	// 与 admin_auth.json 同理：加密身份独立于业务数据，删库不影响解密能力。
+	// KeyFileName 是主密钥在状态根目录（home）下的文件名。
+	// 密钥独立于数据库存放：删库不影响解密能力，丢密钥不连累账号体系。
 	KeyFileName = "master.key"
 	// DefaultEnvName 是主密钥环境变量名。
 	DefaultEnvName = "ROSETTA_GW_MASTER_KEY"
@@ -108,7 +108,7 @@ func validKeyFormat(raw string) bool {
 //
 // 旧实现用 os.WriteFile（O_TRUNC），进程在写入中途被 kill / 断电会留下
 // 0 字节或半截文件，而下一次启动会静默采纳 —— 参见调用处的注释。
-// 同项目的 adminauth.Store.persist 已经是这个写法，这里补齐同样的纪律。
+// userauth 的 session_secret 落盘也是 tmp → rename，理由相同。
 func writeKeyAtomic(path string, data []byte) error {
 	dir := filepath.Dir(path)
 	f, err := os.CreateTemp(dir, filepath.Base(path)+".tmp-*")

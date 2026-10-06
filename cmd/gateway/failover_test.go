@@ -133,10 +133,19 @@ func buildHarnessFull(t *testing.T, chain []struct {
 
 	// 配额预检读的是库里的 access_keys 行（id 与快照 KeySnapshot.ID 一致 = "k1"）。
 	// 默认 quota 0 = 不限，故 failover 用例不受配额影响；配额用例再自行改额度/灌用量。
+	// 归属用户必须真实存在：用量查询按 user_id 收窄（外键也要求它先在）。
+	// 之前 DB 侧无归属、快照侧却是 testUserID，两边不一致 ——
+	// 「org-wide 端点按调用者收窄」后这些用例就查不到数据了。
+	if err := db.CreateUser(context.Background(), &store.User{
+		ID: testUserID, Username: "tester", PasswordHash: "x",
+		Role: store.RoleUser, Status: store.UserStatusActive, AuthVersion: 1,
+	}); err != nil {
+		t.Fatalf("seed user: %v", err)
+	}
 	sum0 := sha256.Sum256([]byte(testAccessKey))
 	if err := db.CreateAccessKey(context.Background(), &store.AccessKey{
 		ID: "k1", KeyHash: hex.EncodeToString(sum0[:]), KeyPrefix: "sk-gw-test",
-		Name: "t", Enabled: true, QuotaTokens: 0,
+		Name: "t", Enabled: true, QuotaTokens: 0, UserID: testUserID,
 	}); err != nil {
 		t.Fatalf("seed access key: %v", err)
 	}
@@ -169,7 +178,8 @@ func buildHarnessFull(t *testing.T, chain []struct {
 	snap := &snapshot.Snapshot{
 		Routes:     ri,
 		Providers:  map[string]*snapshot.ProviderSnapshot{},
-		KeysByHash: map[string]*snapshot.KeySnapshot{sumHex: {ID: "k1", KeyHash: sumHex, Name: "t", Enabled: true}},
+		KeysByHash: map[string]*snapshot.KeySnapshot{sumHex: {ID: "k1", KeyHash: sumHex, Name: "t", Enabled: true, UserID: testUserID, AllowedModels: snapshot.AllowAll(), GroupModelAllow: snapshot.AllowAll()}},
+		UsersByID:  snapshotUsersForTest(),
 		// 故障转移策略是全局的（设置页写入），测试里用快照的 Runtime 默认驱动。
 		Runtime: snapshot.RuntimeDefaults{
 			FailoverMaxTargets:        len(chain),

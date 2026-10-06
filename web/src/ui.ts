@@ -64,9 +64,3 @@ export function settleConfirm(v: boolean) {
   confirmState.resolve?.(v)
   confirmState.resolve = null
 }
-
-// ---------- Admin Token（鉴权 modal） ----------
-
-export const authState = reactive({
-  needToken: false, // 401 后弹出输入框
-})

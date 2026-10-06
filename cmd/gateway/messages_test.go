@@ -162,8 +162,9 @@ func TestListModels_ShapeSplit(t *testing.T) {
 		Routes:     ri,
 		Providers:  map[string]*snapshot.ProviderSnapshot{},
 		KeysByHash: snapshotKeysForTest(),
+		UsersByID:  snapshotUsersForTest(),
 	})
-	defer snapshot.Init(&snapshot.Snapshot{Routes: routing.NewRouteIndex(), Providers: map[string]*snapshot.ProviderSnapshot{}, KeysByHash: map[string]*snapshot.KeySnapshot{}})
+	defer snapshot.Init(&snapshot.Snapshot{Routes: routing.NewRouteIndex(), Providers: map[string]*snapshot.ProviderSnapshot{}, KeysByHash: map[string]*snapshot.KeySnapshot{}, UsersByID: map[string]*snapshot.UserSnapshot{}})
 
 	h := handleListModels("")
 
@@ -215,9 +216,40 @@ func TestListModels_ShapeSplit(t *testing.T) {
 	}
 }
 
-// snapshotKeysForTest 构造一把测试用访问密钥快照。
+// testUserID 是测试用访问密钥的归属用户。
+//
+// 为什么必须有它：多用户改造 P0 之后，鉴权要求 key 有**存在且启用**的归属
+// 用户 —— 查不到即 ErrKeyUnowned（401）。只往快照里塞 KeysByHash 而不塞
+// 对应的 UsersByID，所有数据面测试都会 401，且错误体是
+// "authentication failed"（writeAuthError 的 default 分支），
+// 看不出真正原因是「缺用户」。
+const testUserID = "u-test"
+
+// snapshotUsersForTest 构造与测试 key 配套的用户快照。
+//
+// AllowedModels 显式写 AllowAll()：ModelAllow 的零值是「拒绝全部」
+// （见其类型注释的刻意设计），漏填会让全部模型不可见。测试要表达的是
+// 「不受限」这个明确意图，所以不能靠零值。
+func snapshotUsersForTest() map[string]*snapshot.UserSnapshot {
+	return map[string]*snapshot.UserSnapshot{
+		testUserID: {
+			ID: testUserID, Name: "tester", Role: "user", Status: "active",
+			AuthVersion: 1, AllowedModels: snapshot.AllowAll(),
+		},
+	}
+}
+
+// snapshotKeysForTest 构造一把测试用访问密钥快照（含归属用户与不限模型）。
 func snapshotKeysForTest() map[string]*snapshot.KeySnapshot {
 	sum := sha256.Sum256([]byte(testAccessKey))
 	sumHex := hex.EncodeToString(sum[:])
-	return map[string]*snapshot.KeySnapshot{sumHex: {ID: "k1", KeyHash: sumHex, Name: "t", Enabled: true}}
+	// GroupModelAllow 也要显式给 AllowAll()：鉴权读的是 key 上**已折算**的
+	// 那一份（P2 的 key 级组覆盖在快照重建时就并入了），不是用户的组。
+	// 漏掉它会命中 ModelAllow 刻意的零值 =「拒绝全部」，
+	// 症状是全部数据面用例变成 403 model_not_allowed。
+	return map[string]*snapshot.KeySnapshot{sumHex: {
+		ID: "k1", KeyHash: sumHex, Name: "t", Enabled: true,
+		UserID: testUserID, AllowedModels: snapshot.AllowAll(),
+		GroupModelAllow: snapshot.AllowAll(),
+	}}
 }

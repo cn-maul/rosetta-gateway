@@ -106,18 +106,44 @@ func TestOpenAIChat_ReasoningEffortIsPreserved(t *testing.T) {
 	}
 }
 
-// TestOpenAIChat_ReasoningEffortPassthrough 确认同协议路径会把它原样透传
-// （保真：不让归一丢掉上游认识的 minimal/xhigh 原始值）。
-func TestOpenAIChat_ReasoningEffortPassthrough(t *testing.T) {
-	r := newReq(t, `{"model":"m","messages":[{"role":"user","content":"hi"}],"reasoning_effort":"xhigh"}`)
+// TestOpenAIChat_ReasoningEffortNotInExtra 钉住一条 P0 的修复：
+// reasoning_effort **不得**进 Extra。
+//
+// 它是 rosetta openai-chat 的保留 payload key，而网关从不设置
+// WithExtraOverrides，于是 SDK 的 mergeExtra 会把整个请求判为
+// ErrInvalidRequest → 400，且发生在**任何上游调用之前**。曾被断言的
+// 「原样透传以保真」恰恰就是这个 bug 的成因。
+//
+// 归一后的值由 Thinking.Effort 承载，SDK 在同协议路径自行写出。
+func TestOpenAIChat_ReasoningEffortNotInExtra(t *testing.T) {
+	for _, protocol := range []string{"openai-chat", "auto", ""} {
+		t.Run(protocol, func(t *testing.T) {
+			r := newReq(t, `{"model":"m","messages":[{"role":"user","content":"hi"}],"reasoning_effort":"xhigh"}`)
+			req, err := DecodeOpenAIChatRequest(r, defaultMaxBodyBytes)
+			if err != nil {
+				t.Fatalf("decode: %v", err)
+			}
+			ros := req.ToRosetta()
+			req.ApplyProtocolPrivateExtra(ros, protocol)
+			if v, ok := ros.Extra["reasoning_effort"]; ok {
+				t.Fatalf("protocol=%q：Extra[reasoning_effort] = %v，期望不存在"+
+					"（保留键会让 SDK 把整个请求 400 掉）", protocol, v)
+			}
+		})
+	}
+}
+
+// TestOpenAIChat_RecognizedEffortStillReachesSDK 确认修复没有连带把功能
+// 一起关掉：SDK 认识的档位仍要落到 Thinking.Effort 上（由 SDK 写出）。
+func TestOpenAIChat_RecognizedEffortStillReachesSDK(t *testing.T) {
+	r := newReq(t, `{"model":"m","messages":[{"role":"user","content":"hi"}],"reasoning_effort":"high"}`)
 	req, err := DecodeOpenAIChatRequest(r, defaultMaxBodyBytes)
 	if err != nil {
 		t.Fatalf("decode: %v", err)
 	}
 	ros := req.ToRosetta()
-	req.ApplyProtocolPrivateExtra(ros, "openai-chat")
-	if got := ros.Extra["reasoning_effort"]; got != "xhigh" {
-		t.Fatalf("Extra[reasoning_effort] = %v，期望 \"xhigh\"（原样透传）", got)
+	if ros.Thinking == nil || ros.Thinking.Effort != rosetta.EffortHigh {
+		t.Fatalf("reasoning_effort=high 应落到 Thinking.Effort，实际 %+v", ros.Thinking)
 	}
 }
 

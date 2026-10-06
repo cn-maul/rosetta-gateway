@@ -43,7 +43,10 @@ func TestRateLimit_RPMRejectsThirdRequest(t *testing.T) {
 		Routes:     old.Routes,
 		Providers:  old.Providers,
 		KeysByHash: newKeys,
-		Runtime:    old.Runtime,
+		// UsersByID 必须一起带上：漏了它，鉴权会因「查不到归属用户」
+		// 直接 401，而本测试想验证的是限速 —— 失败信息会指向限速而非缺用户。
+		UsersByID: old.UsersByID,
+		Runtime:   old.Runtime,
 	})
 
 	for i := 0; i < 2; i++ {

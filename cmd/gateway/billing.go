@@ -8,7 +8,8 @@ package main
 //     GET /v1/organization/costs、GET /v1/organization/usage/completions。
 //     响应是 `object:"page"` + `bucket`（start_time/end_time/results）结构，
 //     costs 的 result 带 `line_item: "model:<id>"` 与 `amount:{value,currency}`。
-//     网关映射：org-wide 聚合（任一有效 sk-gw key 可查），费用按 upstream_models
+//     网关映射：**按调用者身份收窄**（管理员/运维凭据看全量，普通用户只看
+//     自己，见 orgCostsScope），费用按 upstream_models
 //     的单价实时估算（口径同 GetUsageStats），currency 诚实标 "cny"（单价配置
 //     的量纲是 元/百万 tokens，不做汇率换算）。
 //
@@ -33,6 +34,8 @@ import (
 
 	"github.com/cn-maul/rosetta-gateway/internal/auth"
 	"github.com/cn-maul/rosetta-gateway/internal/outwire"
+
+	"github.com/cn-maul/rosetta-gateway/internal/snapshot"
 	"github.com/cn-maul/rosetta-gateway/internal/store"
 )
 
@@ -97,13 +100,31 @@ func billingUsage(db *store.Store) http.HandlerFunc {
 		//（+1 天），与 one-api 系代理的行为一致，避免「查到月底少一天」。
 		startDate := r.URL.Query().Get("start_date")
 		endDate := r.URL.Query().Get("end_date")
-		from, to := billingRangeMs(startDate, endDate)
+		from, to, bad := billingRangeMs(startDate, endDate)
+		if bad {
+			outwire.WriteOpenAIError(w, http.StatusBadRequest, "invalid_request_error",
+				"start_date/end_date must be YYYY-MM-DD and start_date must be before end_date")
+			return
+		}
 
 		var totalTokens int64
 		var days []store.DayTokens
 		if to > from {
-			totalTokens, _ = db.SumTokensForKey(r.Context(), authCtx.KeyID, from, to)
-			days, _ = db.SumTokensByDayForKey(r.Context(), authCtx.KeyID, from, to)
+			// 错误必须上抛。丢弃它等于把 DB 故障报成「你什么都没用过」：
+			// ChatGPT-Next-Web / LobeChat 用这个数画余额进度条，一次
+			// 瞬时故障就会让付费用户看到「额度没用过」。同文件里的
+			// orgCosts / orgUsageCompletions 都是判错返回 500。
+			var qerr error
+			totalTokens, qerr = db.SumTokensForKey(r.Context(), authCtx.KeyID, from, to)
+			if qerr != nil {
+				outwire.WriteOpenAIError(w, http.StatusInternalServerError, "internal_error", "usage query failed")
+				return
+			}
+			days, qerr = db.SumTokensByDayForKey(r.Context(), authCtx.KeyID, from, to)
+			if qerr != nil {
+				outwire.WriteOpenAIError(w, http.StatusInternalServerError, "internal_error", "usage query failed")
+				return
+			}
 		}
 
 		lineItems := make([]map[string]any, 0, len(days))
@@ -126,9 +147,32 @@ func billingUsage(db *store.Store) http.HandlerFunc {
 	}
 }
 
+// orgCostsScope 决定 org-wide 查询能看到谁的数据。
+//
+// 这两个端点要兼容 OpenAI 官方「组织视角」的形状，但组织 = 本网关的
+// **整个部署**。多用户部署下，运维凭据持钥人（ID 为空的合成身份）看全量，
+// 普通用户只看自己 —— 与 admin 面 callerScope 的口径一致。
+//
+// 修复前这里只做 auth.Authenticate，于是任何一把 sk-gw key 都能读到
+// **别的租户**的模型名、用量与费用。实测：普通用户自己的
+// /admin/api/stats 显示 total_tokens:12、cost:0（费用对非管理员归零），
+// 而同一把 key 打 /v1/organization/usage/completions 拿到的是管理员租户的
+// input_tokens:20、num_model_requests:2；/costs 直接吐出 value:0.000072 cny
+// —— 恰好是 stats 刻意不给的那笔钱。
+//
+// 返回空串 = 不限制（仅限管理员）。
+func orgCostsScope(authCtx *auth.Context) string {
+	u := snapshot.Get().UsersByID[authCtx.UserID]
+	if u != nil && u.Role == store.RoleAdmin {
+		return ""
+	}
+	return authCtx.UserID
+}
+
 func orgCosts(db *store.Store) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		if _, err := auth.Authenticate(r); err != nil {
+		authCtx, err := auth.Authenticate(r)
+		if err != nil {
 			writeAuthError(w, err, outwire.WriteOpenAIError)
 			return
 		}
@@ -140,7 +184,7 @@ func orgCosts(db *store.Store) http.HandlerFunc {
 			return
 		}
 
-		rows, qerr := db.SumCostBuckets(r.Context(), from, to, bucketSec)
+		rows, qerr := db.SumCostBucketsScoped(r.Context(), orgCostsScope(authCtx), from, to, bucketSec)
 		if qerr != nil {
 			outwire.WriteOpenAIError(w, http.StatusInternalServerError, "internal_error", "costs query failed")
 			return
@@ -171,7 +215,8 @@ func orgCosts(db *store.Store) http.HandlerFunc {
 
 func orgUsageCompletions(db *store.Store) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		if _, err := auth.Authenticate(r); err != nil {
+		authCtx, err := auth.Authenticate(r)
+		if err != nil {
 			writeAuthError(w, err, outwire.WriteOpenAIError)
 			return
 		}
@@ -183,7 +228,7 @@ func orgUsageCompletions(db *store.Store) http.HandlerFunc {
 			return
 		}
 
-		rows, qerr := db.SumUsageBuckets(r.Context(), from, to, bucketSec)
+		rows, qerr := db.SumUsageBucketsScoped(r.Context(), orgCostsScope(authCtx), from, to, bucketSec)
 		if qerr != nil {
 			outwire.WriteOpenAIError(w, http.StatusInternalServerError, "internal_error", "usage query failed")
 			return
@@ -246,27 +291,39 @@ func orgQueryWindow(r *http.Request) (bucketSec, from, to int64, bad bool) {
 }
 
 // billingRangeMs 把 YYYY-MM-DD 日期对换成毫秒区间；end_date 含端日（+1 天）。
-// 参数缺失/非法时回退最近 30 天。
-func billingRangeMs(start, end string) (from, to int64) {
+//
+// 参数缺失时回退最近 30 天，但**给了却解析不了**必须报 400 ——
+// 静默回退意味着调用方拿到的是另一个时间窗的数据却毫不知情
+// （实测 `?start_date=garbage` 与反向区间都返回了与不带参数完全相同的
+// 数值，看起来「生效了」）。反向区间同理：那是明显的调用方 bug。
+func billingRangeMs(start, end string) (from, to int64, bad bool) {
 	now := time.Now()
 	to = now.UnixMilli()
 	from = to - 30*86400_000
-	if t, err := time.ParseInLocation("2006-01-02", start, time.UTC); err == nil {
+	if start != "" {
+		t, err := time.ParseInLocation("2006-01-02", start, time.UTC)
+		if err != nil {
+			return 0, 0, true
+		}
 		from = t.UnixMilli()
 	}
-	if t, err := time.ParseInLocation("2006-01-02", end, time.UTC); err == nil {
+	if end != "" {
+		t, err := time.ParseInLocation("2006-01-02", end, time.UTC)
+		if err != nil {
+			return 0, 0, true
+		}
 		to = t.AddDate(0, 0, 1).UnixMilli() // 含端日
 	}
 	if from >= to {
-		from, to = now.UnixMilli()-30*86400_000, now.UnixMilli()
+		return 0, 0, true
 	}
-	return from, to
+	return from, to, false
 }
 
 // isLoopbackListen 报告 listen 地址是否只绑定回环。
 //
-// 用途只有一个：判断「无管理凭据 + 绑非回环」这个组合是否构成可被
-// 任意人抢占管理员的窗口（password/set 在无凭据时被豁免鉴权）。
+// 用途：判断「首次初始化窗口 + 绑非回环」这个组合是否构成
+// **任何能连到端口的人都能抢先成为第一个管理员**的暴露面。
 // 解析失败时**保守返回 false** —— 宁可多报一次警，不可漏掉真实暴露。
 func isLoopbackListen(listen string) bool {
 	host, _, err := net.SplitHostPort(listen)

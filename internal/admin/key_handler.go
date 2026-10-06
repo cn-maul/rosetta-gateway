@@ -8,6 +8,7 @@ import (
 	"strings"
 
 	"github.com/cn-maul/rosetta-gateway/internal/crypto"
+	"github.com/cn-maul/rosetta-gateway/internal/server"
 	"github.com/cn-maul/rosetta-gateway/internal/store"
 )
 
@@ -27,21 +28,61 @@ type keyRequest struct {
 	Name        *string `json:"name"`
 	Enabled     *bool   `json:"enabled"`
 	QuotaTokens *int64  `json:"quota_tokens"`
+	// UserID 指定这把 key 归谁（仅管理员可用）。
+	//
+	// 留空时的归属规则见 Create：普通用户自动填自己，管理员留空则为无归属
+	//（而无归属 key 会被迁移退役、鉴权拒绝—— 见 store.retireOrphanKeys）。
+	UserID *string `json:"user_id"`
 	// RPMLimit / TPMLimit：Key 维度每分钟限速（DESIGN §11.4），0 = 不限。
 	RPMLimit *int `json:"rpm_limit"`
 	TPMLimit *int `json:"tpm_limit"`
+	// AllowedModels 是 key 级模型白名单（多用户改造 P1）。
+	//
+	// PATCH 语义与其它字段一致（nil = 保持原值），但这里多一层含义：
+	//   - nil     → 保持原白名单；
+	//   - []      → **清除**白名单（回到「不限制」）；
+	//   - 非空    → 设为该白名单。
+	//
+	// 「传空数组 = 不限制」而不是「拒绝全部」：管理界面「取消所有勾选后保存」
+	// 的自然读法就是「不限了」。要表达「一把模型都不给用」应该直接禁用这把 key，
+	// 让语义落在 enabled 上而不是一个反直觉的空白名单。
+	AllowedModels *[]string `json:"allowed_models"`
+	// ExpiresAt 是有效期截止（毫秒时间戳，P2）。0 = 永不过期。
+	// 用指针是为了区分「不传（保持原值）」与「传 0（改成永不过期）」。
+	ExpiresAt *int64 `json:"expires_at"`
+	// AllowedIPs 是来源 IP 白名单（逗号分隔的 CIDR 或单 IP，P2）。空串 = 不限制。
+	// 与 ExpiresAt 同理用指针：「清空白名单」必须能被表达。
+	AllowedIPs *string `json:"allowed_ips"`
+	// GroupID 是 key 级分组覆盖（P2，仅管理员可用）。空串 = 沿用归属用户的分组。
+	//
+	// 为什么只给管理员：普通用户若能自选，就能把自己的 key 指向一个更宽松的组，
+	// 绕过自己所属组的限制 —— 这是权限提升，不是配置。
+	GroupID *string `json:"group_id"`
 }
 
 type keyResponse struct {
-	ID          string `json:"id"`
-	KeyPrefix   string `json:"key_prefix"`
-	Name        string `json:"name"`
-	Enabled     bool   `json:"enabled"`
+	ID        string `json:"id"`
+	KeyPrefix string `json:"key_prefix"`
+	Name      string `json:"name"`
+	Enabled   bool   `json:"enabled"`
+	// UserID 是归属用户。空串 = **无归属**：那把 key 会被迁移退役、
+	// 鉴权直接 401（见 store.retireOrphanKeys）。界面上必须显式标注
+	// 「无归属（不可用）」，否则运维会以为它还能用。
+	UserID      string `json:"user_id"`
+	Username    string `json:"username,omitempty"`
 	QuotaTokens int64  `json:"quota_tokens"`
 	UsedTokens  int64  `json:"used_tokens"`
 	RPMLimit    int    `json:"rpm_limit"`
 	TPMLimit    int    `json:"tpm_limit"`
-	CreatedAt   int64  `json:"created_at"`
+	// AllowedModels 为空数组 = 该 key 不限制模型（与「用户所属组」求交）。
+	// 前端要能区分「空 = 不限」与「有值 = 白名单」，否则会把它渲染成
+	// 「一个模型都不允许」。
+	AllowedModels []string `json:"allowed_models"`
+	// ExpiresAt / AllowedIPs / GroupID 是 P2 的三个字段。
+	ExpiresAt  int64  `json:"expires_at"`
+	AllowedIPs string `json:"allowed_ips"`
+	GroupID    string `json:"group_id"`
+	CreatedAt  int64  `json:"created_at"`
 }
 
 type keyCreateResponse struct {
@@ -49,8 +90,27 @@ type keyCreateResponse struct {
 	PlaintextKey string `json:"plaintext_key"`
 }
 
+// List 返回访问密钥列表。
+//
+// # 作用域收窄（多用户改造 P0.5，最要命的一类漏洞）
+//
+// 改造前这里返回**全部** key。多用户后普通用户若看到全部，
+// 就等于拿到了同事的 key_prefix、已用量、以及名字里可能带的项目代号。
+//
+// 所以：admin 看全部，普通用户只看自己的。
+// 这个过滤**不靠调用方自觉** —— 它由中间件注入的 server.UserFromContext 决定，
+// 漏写在这里等于数据泄露。
 func (h *KeyHandler) List(w http.ResponseWriter, r *http.Request) {
-	keys, err := h.store.ListAccessKeys(r.Context())
+	me := server.UserFromContext(r.Context())
+	var keys []store.AccessKey
+	var err error
+	if me != nil && !me.IsAdmin() {
+		// 普通用户：只看自己的。me.ID 为空是引导态合成用户，
+		// 已被 requireAdmin 类的端点挡住，这里不重复判断。
+		keys, err = h.store.ListAccessKeysByUser(r.Context(), me.ID)
+	} else {
+		keys, err = h.store.ListAccessKeys(r.Context())
+	}
 	if err != nil {
 		writeServerError(w, "list keys", err)
 		return
@@ -107,6 +167,31 @@ func (h *KeyHandler) Create(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// 归属：普通用户只能给自己建 key（忽略请求里的 user_id），
+	// 管理员可显式指定。管理员留空则建出无归属 key —— 那把 key 会被
+	// 下次重启的 retireOrphanKeys 退役掉，鉴权直接 401。
+	// 这里**不**拒绝无归属：管理端「先建后认领」是合理流程。
+	owner := ""
+	me := server.UserFromContext(r.Context())
+	if me != nil {
+		if me.IsAdmin() {
+			owner = strings.TrimSpace(derefStr(req.UserID))
+		} else {
+			owner = me.ID
+		}
+	}
+	if owner != "" {
+		if target, terr := h.store.GetUser(r.Context(), owner); terr != nil {
+			writeServerError(w, "resolve key owner", terr)
+			return
+		} else if target == nil {
+			// 归属必须指向真实存在的用户：写进去一个不存在的 id，
+			// 鉴权时 UsersByID 查不到 → 401，key 变成「谁都用不了」的死物。
+			writeError(w, http.StatusBadRequest, "user_id 指向的用户不存在")
+			return
+		}
+	}
+
 	k := &store.AccessKey{
 		ID:          generateID(),
 		KeyHash:     keyHash,
@@ -114,8 +199,22 @@ func (h *KeyHandler) Create(w http.ResponseWriter, r *http.Request) {
 		Name:        name,
 		Enabled:     enabled,
 		QuotaTokens: quota,
+		UserID:      owner,
 		RPMLimit:    rpm,
 		TPMLimit:    tpm,
+	}
+	// 模型白名单（P1）：与组白名单求交，且 key 级只能更紧。
+	// 校验名字真实存在 —— 拼错的后果是「这个模型谁都调不了」而界面无异常。
+	if req.AllowedModels != nil {
+		if !validateModelAllowlist(w, *req.AllowedModels) {
+			return
+		}
+		k.AllowedModels = *req.AllowedModels
+	}
+
+	// P2：有效期 / 来源 IP / 分组覆盖。
+	if !h.applyP2(w, r, req, k) {
+		return
 	}
 
 	if err := h.store.CreateAccessKey(r.Context(), k); err != nil {
@@ -129,6 +228,94 @@ func (h *KeyHandler) Create(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// applyP2 写入 P2 的三个字段（有效期 / 来源 IP 白名单 / 分组覆盖）。
+// 返回 false 表示已写出错误响应，调用方应立即 return。
+//
+// 抽出来是因为 Create 与 Update 的校验必须**完全一致**：
+// 「Create 校验了 CIDR、Update 忘了校验」这种漂移，会让同一个非法值
+// 从另一个入口悄悄写进库 —— 而读路径只能把它折叠成「全拒」，
+// 症状是那把 key 从所有地址都连不上，错误信息还指向 IP 而非配置。
+func (h *KeyHandler) applyP2(w http.ResponseWriter, r *http.Request, req keyRequest, k *store.AccessKey) bool {
+	if req.ExpiresAt != nil {
+		if *req.ExpiresAt < 0 {
+			writeError(w, http.StatusBadRequest, "expires_at 不能为负（0 = 永不过期）")
+			return false
+		}
+		k.ExpiresAt = *req.ExpiresAt
+	}
+	if req.AllowedIPs != nil {
+		// 写库前解析一遍：坏值一旦落库，读路径会折叠成「全部拒绝」。
+		// 解析结果**回写**而不是保留原文：ParseAllowedNets 会逐段 trim、
+		// 丢掉空段（"10.0.0.0/8," 与 "10.0.0.0/8" 语义完全相同），
+		// 存原文等于让回显与实际生效的规则长得不一样。
+		nets, err := store.ParseAllowedNets(*req.AllowedIPs)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, err.Error())
+			return false
+		}
+		k.AllowedIPs = store.FormatAllowedNets(nets)
+	}
+	if req.GroupID != nil {
+		id := strings.TrimSpace(*req.GroupID)
+		switch {
+		case id == "":
+			k.GroupID = "" // 显式清空 = 回到「沿用归属用户的分组」
+		case !callerIsAdmin(r):
+			// 普通用户若能自选，就能把 key 指向更宽松的组来绕过自己组的限制。
+			writeError(w, http.StatusForbidden, "只有管理员可以设置分组覆盖")
+			return false
+		default:
+			g, err := h.store.GetGroup(r.Context(), id)
+			if err != nil {
+				writeServerError(w, "resolve group", err)
+				return false
+			}
+			if g == nil {
+				writeError(w, http.StatusBadRequest, "group_id 指向的分组不存在")
+				return false
+			}
+			k.GroupID = id
+		}
+	}
+	return true
+}
+
+// callerIsAdmin 报告当前调用者是否是管理员。
+//
+// 建 key 并指定归属（user_id）是管理动作，普通用户建 key 一律归属自己 ——
+// 见 Create 里对 user_id 的强制覆盖。
+func callerIsAdmin(r *http.Request) bool {
+	me := server.UserFromContext(r.Context())
+	return me != nil && me.IsAdmin()
+}
+
+// ownedByCaller 校验「当前调用者有权操作这把 key」。
+//
+// 改造前所有 /admin/api/keys/{id} 端点都不校验归属，多用户后
+// 普通用户改别人的 key 就是数据越权。这里是唯一的判定点：
+// admin 放行一切；普通用户必须满足 k.UserID == 自己。
+//
+// 注意**无归属 key（UserID 为空）对普通用户是不可见的**：
+// 放行等于让任何登录用户接管一把不属于任何人的 key。
+func (h *KeyHandler) ownedByCaller(w http.ResponseWriter, r *http.Request, k *store.AccessKey) bool {
+	me := server.UserFromContext(r.Context())
+	if me == nil {
+		writeError(w, http.StatusUnauthorized, "需要登录")
+		return false
+	}
+	// 引导态合成用户（ID 为空）拥有 admin 权限。
+	if me.ID == "" || me.IsAdmin() {
+		return true
+	}
+	if k.UserID != me.ID {
+		// 刻意回 404 而不是 403：不告诉调用者「这把 key 存在，只是
+		// 不是你的」，那本身也是信息（可枚举他人 key 的 id）。
+		writeError(w, http.StatusNotFound, "密钥不存在")
+		return false
+	}
+	return true
+}
+
 func (h *KeyHandler) Update(w http.ResponseWriter, r *http.Request, id string) {
 	existing, err := h.store.GetAccessKey(r.Context(), id)
 	if err != nil {
@@ -137,6 +324,9 @@ func (h *KeyHandler) Update(w http.ResponseWriter, r *http.Request, id string) {
 	}
 	if existing == nil {
 		writeError(w, http.StatusNotFound, "key not found")
+		return
+	}
+	if !h.ownedByCaller(w, r, existing) {
 		return
 	}
 
@@ -182,16 +372,85 @@ func (h *KeyHandler) Update(w http.ResponseWriter, r *http.Request, id string) {
 		}
 		existing.TPMLimit = *req.TPMLimit
 	}
+	// 模型白名单：nil = 保持原值，[] = 清除（回到不限制），非空 = 覆盖。
+	// 空数组归一成 nil 再落库，使「清除」与「从没配过」在数据层是同一状态
+	// —— 两个语义本来就该是同一个：都不限制。
+	if req.AllowedModels != nil {
+		if !validateModelAllowlist(w, *req.AllowedModels) {
+			return
+		}
+		if len(*req.AllowedModels) == 0 {
+			existing.AllowedModels = nil
+		} else {
+			existing.AllowedModels = *req.AllowedModels
+		}
+	}
+
+	// 归属（认领）：nil = 保持原值，非空 = 改判给该用户。
+	//
+	// 修复前 Update **从不读** req.UserID（keyRequest 里声明了它），
+	// 于是「先建后认领」这个 Create 注释里明确承诺的流程不存在：
+	// 实测 PATCH {"user_id":"<真实用户>"} -> 200，响应里 user_id 仍是 ""，
+	// 那把 key 之后永远 401（auth.go 的 ErrKeyUnowned）。
+	//
+	// 只能管理员改归属 —— 与 Create 同一口径；普通用户即使传了也忽略。
+	// 落库走独立的 ReassignAccessKey：UpdateAccessKey 刻意不写 user_id
+	// （归属不该由一个 PATCH 随手改写）。
+	claimTo := ""
+	claim := false
+	if req.UserID != nil {
+		if me := server.UserFromContext(r.Context()); me != nil && me.IsAdmin() {
+			claimTo = strings.TrimSpace(*req.UserID)
+			claim = true
+			if claimTo != "" {
+				target, terr := h.store.GetUser(r.Context(), claimTo)
+				if terr != nil {
+					writeServerError(w, "resolve key owner", terr)
+					return
+				}
+				if target == nil {
+					// 与 Create 同理：指向不存在的用户 = 一把永远用不了的死物。
+					writeError(w, http.StatusBadRequest, "user_id 指向的用户不存在")
+					return
+				}
+			}
+		}
+	}
+
+	// P2：有效期 / 来源 IP / 分组覆盖（与 Create 共用同一套校验）。
+	if !h.applyP2(w, r, req, existing) {
+		return
+	}
 
 	if err := h.store.UpdateAccessKey(r.Context(), id, existing); err != nil {
 		writeNotFoundOrError(w, "update key", "密钥不存在（可能已被并发删除）", err)
 		return
+	}
+	// 归属单独一步：UpdateAccessKey 刻意不写 user_id（见其注释）。
+	if claim {
+		if err := h.store.ReassignAccessKey(r.Context(), id, claimTo); err != nil {
+			writeNotFoundOrError(w, "reassign key owner", "密钥不存在（可能已被并发删除）", err)
+			return
+		}
+		existing.UserID = claimTo
 	}
 
 	writeJSON(w, http.StatusOK, toKeyResponse(*existing))
 }
 
 func (h *KeyHandler) Delete(w http.ResponseWriter, r *http.Request, id string) {
+	existing, err := h.store.GetAccessKey(r.Context(), id)
+	if err != nil {
+		writeServerError(w, "get key", err)
+		return
+	}
+	if existing == nil {
+		writeError(w, http.StatusNotFound, "key not found")
+		return
+	}
+	if !h.ownedByCaller(w, r, existing) {
+		return
+	}
 	if err := h.store.DeleteAccessKey(r.Context(), id); err != nil {
 		writeDeleteError(w, "delete key", err)
 		return
@@ -207,6 +466,18 @@ func (h *KeyHandler) Delete(w http.ResponseWriter, r *http.Request, id string) {
 // 变成「怎么改配置都救不回来」的死 key，只能直接改库。这个端点把
 // 恢复能力还给运维。
 func (h *KeyHandler) RecomputeUsage(w http.ResponseWriter, r *http.Request, id string) {
+	existing, err := h.store.GetAccessKey(r.Context(), id)
+	if err != nil {
+		writeServerError(w, "get key", err)
+		return
+	}
+	if existing == nil {
+		writeError(w, http.StatusNotFound, "key not found")
+		return
+	}
+	if !h.ownedByCaller(w, r, existing) {
+		return
+	}
 	used, err := h.store.RecomputeUsedTokens(r.Context(), id)
 	if err != nil {
 		// key 不存在时 DAO 返回 ErrNotFound → 404，而不是把「重算了一把
@@ -222,16 +493,40 @@ func (h *KeyHandler) RecomputeUsage(w http.ResponseWriter, r *http.Request, id s
 
 func toKeyResponse(k store.AccessKey) keyResponse {
 	return keyResponse{
-		ID:          k.ID,
-		KeyPrefix:   k.KeyPrefix,
-		Name:        k.Name,
-		Enabled:     k.Enabled,
-		QuotaTokens: k.QuotaTokens,
-		UsedTokens:  k.UsedTokens,
-		RPMLimit:    k.RPMLimit,
-		TPMLimit:    k.TPMLimit,
-		CreatedAt:   k.CreatedAt,
+		ID:            k.ID,
+		KeyPrefix:     k.KeyPrefix,
+		Name:          k.Name,
+		Enabled:       k.Enabled,
+		UserID:        k.UserID,
+		QuotaTokens:   k.QuotaTokens,
+		UsedTokens:    k.UsedTokens,
+		RPMLimit:      k.RPMLimit,
+		TPMLimit:      k.TPMLimit,
+		AllowedModels: allowedModelsForResponse(k.AllowedModels),
+		ExpiresAt:     k.ExpiresAt,
+		AllowedIPs:    k.AllowedIPs,
+		GroupID:       k.GroupID,
+		CreatedAt:     k.CreatedAt,
 	}
+}
+
+// allowedModelsForResponse 把内部的 nil（= 不限制）转成空数组，并按
+// **落库时的同一套规则**去重、排序、裁掉空白。
+//
+// 修复前它直接返回原值，于是创建响应回显**请求原文**
+// （["  "," pub-chat ","pub-chat"]），而 600ms 后 GET 读回来是
+// ["pub-chat"] —— 同一把 key 前后两个答案。界面「限 N 个模型」徽标
+// （web/src/views/Keys.vue:270）读的就是这个回显，管理员会看到「限 3 个」
+// 而实际限 1 个。归一后两个答案必然一致。
+//
+// 「空 = 拒绝全部」这个内部约定**不会**从 API 暴露出去
+// （见 store.AccessKey.AllowedModels 的注释：非 nil 空切片只出现在
+// 库里 JSON 损坏的兜底路径上，属于故障态）。
+func allowedModelsForResponse(models []string) []string {
+	if models == nil {
+		return []string{}
+	}
+	return store.NormalizeModelNames(models)
 }
 
 // limitPair 解析 rpm_limit / tpm_limit（PATCH 语义 + 非负校验）。

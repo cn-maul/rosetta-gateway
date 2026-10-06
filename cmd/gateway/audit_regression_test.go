@@ -168,14 +168,22 @@ func TestOrgBucket_TimestampsAreUnixSeconds(t *testing.T) {
 
 	ts := time.Now().UnixMilli()
 	sum := sha256.Sum256([]byte(testAccessKey))
+	// 外键要求归属用户先存在（usage_records.user_id 同理），且 org-wide
+	// 端点按调用者身份收窄 —— 归属必须三处一致。
+	if err := db.CreateUser(context.Background(), &store.User{
+		ID: testUserID, Username: "tester", PasswordHash: "x",
+		Role: store.RoleUser, Status: store.UserStatusActive, AuthVersion: 1,
+	}); err != nil {
+		t.Fatal(err)
+	}
 	if err := db.CreateAccessKey(context.Background(), &store.AccessKey{
 		ID: "k1", KeyHash: hex.EncodeToString(sum[:]), KeyPrefix: "sk-gw-test",
-		Name: "t", Enabled: true, QuotaTokens: 0,
+		Name: "t", Enabled: true, QuotaTokens: 0, UserID: testUserID,
 	}); err != nil {
 		t.Fatal(err)
 	}
 	if err := db.CreateUsageRecord(context.Background(), &store.UsageRecord{
-		ID: "u1", Ts: ts, AccessKeyID: "k1", PublicModel: "flash", ProviderID: "p1",
+		ID: "u1", Ts: ts, AccessKeyID: "k1", UserID: testUserID, PublicModel: "flash", ProviderID: "p1",
 		UpstreamModel: "p1-model", IngressProtocol: "openai-chat",
 		InputTokens: 10, OutputTokens: 5, TotalTokens: 15, Status: "ok", HTTPStatus: 200,
 	}); err != nil {
@@ -184,7 +192,8 @@ func TestOrgBucket_TimestampsAreUnixSeconds(t *testing.T) {
 	snapshot.Init(&snapshot.Snapshot{
 		Routes:     routing.NewRouteIndex(),
 		Providers:  map[string]*snapshot.ProviderSnapshot{},
-		KeysByHash: map[string]*snapshot.KeySnapshot{hex.EncodeToString(sum[:]): {ID: "k1", Enabled: true}},
+		KeysByHash: map[string]*snapshot.KeySnapshot{hex.EncodeToString(sum[:]): {ID: "k1", Enabled: true, UserID: testUserID, AllowedModels: snapshot.AllowAll(), GroupModelAllow: snapshot.AllowAll()}},
+		UsersByID:  snapshotUsersForTest(),
 	})
 
 	for name, h := range map[string]http.HandlerFunc{

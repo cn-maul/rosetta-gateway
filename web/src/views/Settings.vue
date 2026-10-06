@@ -1,19 +1,23 @@
 <script setup lang="ts">
 import { computed, onMounted, reactive, ref, watch } from 'vue'
-import { api, saveToken } from '../api'
+import { api } from '../api'
 import { toast, confirmBox } from '../ui'
 import { fmtMoney, fmtDateTime } from '../fmt'
 import AppModal from '../components/AppModal.vue'
 import type { Provider, UpstreamModel, AuditEntry } from '../types'
 
 // ---------- 分类页：设置项按分类分页展示，一次只看一类 ----------
-type TabKey = 'model' | 'runtime' | 'security' | 'price' | 'audit'
+type TabKey = 'model' | 'runtime' | 'price' | 'audit'
 
 const TABS: { key: TabKey; label: string; sub: string }[] = [
   { key: 'model', label: '模型默认', sub: '全局默认值；模型容量探测不到时回落到这里' },
   { key: 'runtime', label: '运行时', sub: '各类超时与自动故障转移的全局默认' },
-  { key: 'security', label: '安全', sub: '管理后台的登录凭据' },
-  { key: 'price', label: '模型价格', sub: '按供应商 × 模型配置单价，总览「费用」按此实时估算' },
+  // 这里曾有一个「安全」页，放的是独立于 users 表的管理密码（另有一份凭据文件兜底）。
+  // 统一认证后管理密码就是 users 表里某个用户的密码，已由「我的账号」（自助改）
+  // 与「用户管理」（管理员重置）各自承担，所以整块删除 —— 不要在这里加回跳转提示之类的残件。
+  // 改价只影响**此后**的用量：历史费用在落库时已按当时的价固化，
+  // 所以这里改的是「往后怎么算」，不是「重算历史」。
+  { key: 'price', label: '模型价格', sub: '按供应商 × 模型配置单价；改价只对之后的用量生效，不改写历史费用' },
   { key: 'audit', label: '审计日志', sub: '管理后台的写操作留痕（谁/何时/动了哪些字段）' },
 ]
 const tab = ref<TabKey>('model')
@@ -58,20 +62,6 @@ const form = reactive({
   failover_failure_threshold: 3,
 })
 
-// 密码设置相关
-const passwordForm = reactive({
-  open: false,
-  currentPassword: '',
-  newPassword: '',
-  confirmPassword: '',
-})
-const hasPassword = ref(false)
-// 当前凭据来源："password_file" | "config_token" | "none" | "locked"。
-// 决定「当前密码」框里该填什么：设过密码填密码，否则填 config 的 admin_token。
-const authSource = ref('')
-// 提交锁：防双击并发两次 password/set（两次写盘 + 两次 rename，没有意义且徒增竞态）。
-const changing = ref(false)
-
 async function load() {
   loading.value = true
   try {
@@ -87,22 +77,6 @@ async function load() {
     if ((e as { status?: number }).status !== 401) toast('加载设置失败：' + (e as Error).message, 'err')
   } finally {
     loading.value = false
-  }
-  await loadPasswordStatus()
-}
-
-// 凭据状态是**独立**信息源（/password/check 免鉴权），绝不能和 settings 共用 try。
-// 共用时 settings 一旦失败就会连坐：界面显示「尚未设置密码」并藏起「当前密码」输入框，
-// 于是用户以为在改密码，实际提交的是「首次设置」请求。
-async function loadPasswordStatus() {
-  try {
-    const res = await fetch('/admin/api/password/check')
-    if (!res.ok) return
-    const data = await res.json()
-    hasPassword.value = !!data.has_password
-    authSource.value = data.source ?? ''
-  } catch (e) {
-    console.error('检查密码状态失败:', e)
   }
 }
 
@@ -164,64 +138,6 @@ async function save(target: 'model' | 'runtime') {
     if ((e as { status?: number }).status !== 401) toast('保存失败：' + (e as Error).message, 'err')
   } finally {
     saving.value = false
-  }
-}
-
-function openPasswordModal() {
-  passwordForm.currentPassword = ''
-  passwordForm.newPassword = ''
-  passwordForm.confirmPassword = ''
-  passwordForm.open = true
-}
-
-async function changePassword() {
-  if (changing.value) return
-  if (passwordForm.newPassword.length < 6) {
-    toast('新密码长度至少为6位', 'err')
-    return
-  }
-  if (passwordForm.newPassword !== passwordForm.confirmPassword) {
-    toast('两次输入的新密码不一致', 'err')
-    return
-  }
-  // 已有凭据时 password/set 必须带旧凭据才放行。旧实现只在「填了当前密码」时才加
-  // Authorization 头，留空就直接发出去 —— 拿回一个 401，用户看到的是「设置密码失败」，
-  // 完全猜不到是「没填当前密码」。这里当场拦住，并说清原因。
-  if (hasPassword.value && !passwordForm.currentPassword) {
-    toast('请先填写当前密码', 'err')
-    return
-  }
-
-  changing.value = true
-  try {
-    const headers: Record<string, string> = { 'Content-Type': 'application/json' }
-    if (hasPassword.value && passwordForm.currentPassword) {
-      headers['Authorization'] = 'Bearer ' + passwordForm.currentPassword
-    }
-
-    const res = await fetch('/admin/api/password/set', {
-      method: 'POST',
-      headers,
-      body: JSON.stringify({ password: passwordForm.newPassword }),
-    })
-
-    // 网关错误时 body 应是 JSON，但代理层 502/504 之类不是 —— 直接 res.json() 会抛
-    // SyntaxError，被下面的 catch 裹成一句和真实原因无关的提示。
-    const data = await res.json().catch(() => null)
-    if (res.ok) {
-      toast(data?.message || '密码已更新')
-      passwordForm.open = false
-      hasPassword.value = true
-      // 旧凭据即刻失效（校验优先使用新密码），必须当场换掉本地令牌，
-      // 否则下一次请求就 401 —— 表现为「改完密码反而被锁在外面」。
-      saveToken(passwordForm.newPassword)
-    } else {
-      toast(data?.error?.message || `设置密码失败（HTTP ${res.status}）`, 'err')
-    }
-  } catch (e) {
-    toast('设置密码失败：' + (e as Error).message, 'err')
-  } finally {
-    changing.value = false
   }
 }
 
@@ -404,11 +320,15 @@ async function savePrice() {
   }
 }
 
-// 删除价格：行内按钮与编辑弹窗共用。确认后把三项单价清零（= 未配置，费用按 0 计）。
+// 删除价格：行内按钮与编辑弹窗共用。确认后把三项单价清零（= 未配置）。
+//
+// 文案必须说清「只影响以后」：历史费用在落库时已按当时的价固化，删价不会
+// 把已经算好的金额抹掉。写成「该模型的用量按 0 元计」会让人以为历史费用
+// 会一起归零 —— 那是界面在说谎，且一删就查不回来。
 async function deletePrice(modelId: string, label: string): Promise<boolean> {
   const ok = await confirmBox({
     title: `删除「${label}」的价格？`,
-    body: '删除后该模型的用量在费用统计里按 0 元计。',
+    body: '删除后该模型此后的用量按 0 元计；已经产生的费用按当时的价固化，不受影响。',
     danger: true,
     confirmLabel: '删除',
   })
@@ -543,27 +463,7 @@ onMounted(() => {
       </form>
     </div>
 
-    <!-- 分类 3：安全 -->
-    <div v-else-if="tab === 'security'" class="panel">
-      <div style="display: flex; align-items: center; gap: 1rem">
-        <div>
-          <div style="font-weight: 600">管理密码</div>
-          <div style="color: var(--text-3); font-size: 13px; margin-top: 4px">
-            <template v-if="!hasPassword">尚未设置密码（任何人都能打开后台）</template>
-            <template v-else-if="authSource === 'config_token'">
-              当前使用 <code>config.json</code> 的 <code>admin_token</code> 登录
-            </template>
-            <template v-else-if="authSource === 'locked'">凭据文件已损坏，后台处于锁定态</template>
-            <template v-else>已设置密码（存放在 admin_auth.json）</template>
-          </div>
-        </div>
-        <button class="btn" @click="openPasswordModal">
-          {{ hasPassword ? '修改密码' : '设置密码' }}
-        </button>
-      </div>
-    </div>
-
-    <!-- 分类 5：审计日志 -->
+    <!-- 分类 4：审计日志（页签顺序见 TABS） -->
     <div v-else-if="tab === 'audit'" class="panel">
       <div style="display: flex; align-items: center; justify-content: space-between; margin-bottom: 12px">
         <div class="tip">
@@ -594,7 +494,7 @@ onMounted(() => {
       </div>
     </div>
 
-    <!-- 分类 4：模型价格 -->
+    <!-- 分类 3：模型价格（页签顺序见 TABS） -->
     <div v-else class="panel">
       <div class="price-head">
         <div>
@@ -783,37 +683,6 @@ onMounted(() => {
               {{ pForm.saving ? '保存中…' : '保存' }}
             </button>
           </div>
-        </div>
-      </form>
-    </AppModal>
-
-    <!-- 密码设置弹窗 -->
-    <AppModal :open="passwordForm.open" title="设置管理密码" max-width="500px" @close="passwordForm.open = false">
-      <form @submit.prevent="changePassword">
-        <div class="form-grid">
-          <div v-if="hasPassword" class="field span2">
-            <label>当前密码 *</label>
-            <input v-model="passwordForm.currentPassword" class="input" type="password" placeholder="请输入当前密码" />
-            <span class="tip">
-              <template v-if="authSource === 'config_token'">
-                当前凭据来自配置文件，这里请填 <code>config.json</code> 的 <code>admin_token</code>（或 ADMIN_TOKEN 环境变量的值）。
-                设置新密码后该令牌立即失效。
-              </template>
-              <template v-else>填写你之前设置的管理密码。</template>
-            </span>
-          </div>
-          <div class="field span2">
-            <label>新密码 *（至少6位）</label>
-            <input v-model="passwordForm.newPassword" class="input" type="password" placeholder="请输入新密码" />
-          </div>
-          <div class="field span2">
-            <label>确认新密码 *</label>
-            <input v-model="passwordForm.confirmPassword" class="input" type="password" placeholder="请再次输入新密码" />
-          </div>
-        </div>
-        <div class="form-actions">
-          <button type="button" class="btn btn-ghost" @click="passwordForm.open = false">取消</button>
-          <button type="submit" class="btn btn-primary" :disabled="changing">{{ changing ? '保存中…' : '确定' }}</button>
         </div>
       </form>
     </AppModal>

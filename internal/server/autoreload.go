@@ -40,9 +40,9 @@ type WriteAuditor func(method, path string, status int, remote, fields string)
 // 触发规则：
 //   - 只对写方法（POST/PATCH/PUT/DELETE）触发，GET 一律跳过；
 //   - 只在响应状态码 < 400（业务成功）时触发，失败的写入不重建；
-//   - POST /admin/api/reload 本身就是重建，跳过以免双跑；password/set
-//     只动凭据文件、不影响运行时；providers 的 test / models/discover
-//     是只读探测，也不触发（但 password/set 照常审计）。
+//   - POST /admin/api/reload 本身就是重建，跳过以免双跑；providers 的
+//     test / models/discover 是只读探测，也不触发。
+//     首次设置密码（/admin/api/bootstrap）要审计但同样不重建 —— 见下方。
 //
 // 重建与请求生命周期解耦（context.Background() + 超时）：客户端写完就断开
 // 不该把重建一起取消，否则这次写入会悬空到下一次触发。
@@ -94,16 +94,19 @@ func AutoReload(next http.Handler, reload func(context.Context) error, audit Wri
 			status = sg.StatusCode()
 		}
 
-		// password/set 不触发重建（凭据文件不在快照里），但必须审计 ——
-		// 它恰恰是管理面最敏感的写操作。其余非成功写入不审计不重建。
-		isPasswordSet := p == "/admin/api/password/set"
-		if status >= http.StatusBadRequest && !isPasswordSet {
+		// 首次设置管理员密码（/admin/api/bootstrap）**必须审计但绝不重建**：
+		// 它是免鉴权写接口，是整个系统最敏感的一步；而它只改 users 表的密码
+		// 哈希，不动快照，重建纯属无谓开销。
+		// （2026-10-06 起接替已删除的 /admin/api/password/set —— 后者的豁免
+		//  窗口正是那个「任何人可劫持管理员密码」的漏洞入口。）
+		isBootstrap := p == "/admin/api/bootstrap"
+		if status >= http.StatusBadRequest && !isBootstrap {
 			return
 		}
 		if audit != nil {
 			audit(r.Method, p, status, clientIP(r), auditFields)
 		}
-		if isPasswordSet || status >= http.StatusBadRequest {
+		if isBootstrap || status >= http.StatusBadRequest {
 			return
 		}
 

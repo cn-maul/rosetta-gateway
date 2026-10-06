@@ -210,25 +210,72 @@ func convertResponsesMessage(item responsesItem) []rosetta.Message {
 	case "assistant":
 		// assistant 的正文在 output_text 分块里。
 		return []rosetta.Message{rosetta.Assistant(responsesContentText(item.Content, true))}
-	default: // user / 未知 → user
-		blocks := make([]rosetta.Block, 0, 2)
-		parts := decodeResponsesParts(item.Content)
-		var text strings.Builder
-		for _, p := range parts {
-			switch p.Type {
-			case "input_text", "output_text":
-				text.WriteString(p.Text)
-			case "input_image":
-				if p.ImageURL != "" {
-					blocks = append(blocks, rosetta.Block{Type: rosetta.BlockImage, ImageURL: p.ImageURL})
-				}
+	case "user":
+		// 显式 user：只认 input_text。output_text 是 assistant 侧的标记，
+		// 混进来等于把模型自己的输出当成用户说的话。
+		return userMessageFromContent(item.Content)
+	default: // role 缺失 / 未知角色
+		// 拿不准时**只**采信 input_text。
+		//
+		// 修复前这一支把 input_text 与 output_text 并集，于是「role 缺失
+		// 的 message 项」里的模型输出被当成人话发给上游。实测：
+		//   输入 role:user{input_text:"QUESTION"} + role 缺失{output_text:"SECRET-ASSISTANT"}
+		//   -> 上游收到 messages[1] = {role:"user", content:"SECRET-ASSISTANT"}
+		// 而同一请求里显式写 role:"assistant" 时，输出落在 assistant 轮。
+		// 丢弃 output_text 是更安全的错法：少一段历史，而不是把模型的
+		// 上一句回答伪装成用户的新指令（那会真的改变它的行为）。
+		return userMessageFromContent(item.Content)
+	}
+}
+
+// userMessageFromContent 把一个 content 变成单条 user 消息。
+//
+// 文本分块收成一段，图片分块保留 —— 与修复前的并集逻辑相比，
+// 唯一的行为变化是 user 侧不再吃 output_text。
+func userMessageFromContent(content json.RawMessage) []rosetta.Message {
+	// content 可能是纯字符串（最常见的 `{"role":"user","content":"你好"}`）。
+	// decodeResponsesParts 只认分块数组，字符串会得到空结果 —— 修复前
+	// 这里因此把那条消息整条丢掉，user 的第一句话凭空消失。
+	if s, ok := plainContentText(content); ok {
+		if s == "" {
+			return nil
+		}
+		return []rosetta.Message{rosetta.User(s)}
+	}
+	blocks := make([]rosetta.Block, 0, 2)
+	for _, p := range decodeResponsesParts(content) {
+		switch p.Type {
+		case "input_text":
+			blocks = append(blocks, rosetta.Block{Type: rosetta.BlockText, Text: p.Text})
+		case "input_image":
+			if p.ImageURL != "" {
+				blocks = append(blocks, rosetta.Block{Type: rosetta.BlockImage, ImageURL: p.ImageURL})
 			}
 		}
-		if t := text.String(); t != "" || len(blocks) == 0 {
-			blocks = append([]rosetta.Block{{Type: rosetta.BlockText, Text: t}}, blocks...)
-		}
-		return []rosetta.Message{rosetta.Message{Role: rosetta.RoleUser, Blocks: blocks}}
 	}
+	// 没有任何可采信的分块时**整条丢弃**。
+	//
+	// 不能塞一个空文本块：rosetta 的校验会判「message has no content blocks」
+	// （空串不算内容）→ 整个请求 400，那比「把 assistant 输出当用户输入」还糟
+	// —— 至少后者请求还能通。实测：role 缺失且只带 output_text 的项
+	// 直接把请求打成 400。
+	//
+	// 丢掉之后剩下的项照常转发，客户端拿到的是「少了一段它自己没标角色的
+	// 历史」，而不是整个请求失败。
+	if len(blocks) == 0 {
+		return nil
+	}
+	return []rosetta.Message{{Role: rosetta.RoleUser, Blocks: blocks}}
+}
+
+// plainContentText 报告 content 是否是纯字符串形态，并返回其值。
+// 分块数组返回 ok=false（调用方走 decodeResponsesParts）。
+func plainContentText(raw json.RawMessage) (string, bool) {
+	var s string
+	if err := json.Unmarshal(raw, &s); err == nil {
+		return s, true
+	}
+	return "", false
 }
 
 // responsesContentText 把 message 的 content（字符串或分块数组）读成纯文本。
@@ -300,12 +347,45 @@ func (a *ResponsesRequest) ApplyUpstreamExtras(req *rosetta.ChatRequest, protoco
 		if len(a.ToolChoice) > 0 {
 			extra["tool_choice"] = json.RawMessage(a.ToolChoice)
 		}
-		if len(a.Text) > 0 {
-			// responses 线格式里 text 是 {"format": ...} 的外壳。
-			extra["text"] = map[string]any{"format": json.RawMessage(a.Text)}
+		// text 是 {"format": {...}} 的外壳，所以这里要**拆开**再放回 format。
+		//
+		// 修复前是把整个 a.Text 当成 format 的值，出站变成
+		//   "text":{"format":{"format":{"type":"json_schema",…}}}
+		// 上游看到的 format 对象里没有 type、schema 埋在重复的 format 键下，
+		// 于是结构化输出**静默不生效**，而客户端以为它生效了
+		// （实测抓到的出站 body 就是双层）。同函数上面的 openai-chat 分支
+		// 用 textFormatMap() 正确拆包 —— 两个分支的处理方式本就该一致。
+		if f := a.textFormatMap(); f != nil {
+			extra["text"] = map[string]any{"format": f}
+		}
+		// text 里除 format 之外的键（verbosity 等）不能跟着丢，原样带上。
+		if rest := a.textPassthroughKeys(); len(rest) > 0 {
+			textObj, _ := extra["text"].(map[string]any)
+			if textObj == nil {
+				textObj = map[string]any{}
+				extra["text"] = textObj
+			}
+			for k, v := range rest {
+				if _, taken := textObj[k]; !taken {
+					textObj[k] = v
+				}
+			}
 		}
 		if a.ParallelToolCalls != nil {
 			extra["parallel_tool_calls"] = *a.ParallelToolCalls
+		}
+		// previous_response_id / store 交给 openai-responses 上游承接。
+		//
+		// 修复前这两个字段解析完就被丢弃：客户端拿它续会话，收到的却是
+		// 「只含本次 input」的 200，模型完全不知道前文。SDK 没把
+		// previous_response_id 列入 openai-responses 的保留键，走 Extra 合法。
+		// 非 openai-responses 上游没有对应概念（chat/anthropic 都是无状态），
+		// 继续按原样丢弃 —— 那条路径客户端本就该自带全量历史。
+		if a.PreviousResponseID != "" {
+			extra["previous_response_id"] = a.PreviousResponseID
+		}
+		if a.Store != nil {
+			extra["store"] = *a.Store
 		}
 		if len(extra) > 0 {
 			mergeExtra(req, extra)
@@ -324,6 +404,25 @@ func (a *ResponsesRequest) textFormatMap() map[string]any {
 		return nil
 	}
 	return wrapper.Format
+}
+
+// textPassthroughKeys 取出 text 对象里除 format 之外的键（verbosity 等）。
+//
+// format 由 textFormatMap 单独处理；其余键我们没有建模，但原样带给上游
+// 比静默丢弃更接近「透传」的本意，也避免修 format 时把别的字段一起弄丢。
+func (a *ResponsesRequest) textPassthroughKeys() map[string]any {
+	if len(a.Text) == 0 {
+		return nil
+	}
+	var obj map[string]any
+	if json.Unmarshal(a.Text, &obj) != nil {
+		return nil
+	}
+	delete(obj, "format")
+	if len(obj) == 0 {
+		return nil
+	}
+	return obj
 }
 
 // responsesToolChoiceOpenAI 把 Responses 的 tool_choice 翻译成 openai-chat 形状。

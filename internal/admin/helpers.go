@@ -89,20 +89,19 @@ func writeDeleteError(w http.ResponseWriter, action string, err error) {
 // decodeJSON 解析 JSON 请求体。
 //
 // **必须先断言 Content-Type**：这是管理面最重要的一道 CSRF 防线。
-// POST /admin/api/password/set 在「尚未配置凭据」时被豁免鉴权（见
-// server.AdminAuth），而 text/plain 是 CORS 的 safelisted Content-Type ——
-// 浏览器发它**不触发预检**。旧实现不校验 Content-Type，等于让任意第三方
-// 页面在管理员首次访问网关的那次会话里，用
+// text/plain 是 CORS 的 safelisted Content-Type —— 浏览器发它**不触发预检**。
+// 旧实现不校验 Content-Type，等于让任意第三方页面在管理员那次已登录的
+// 会话里用
 //
 //	POST /admin/api/password/set
 //	Content-Type: text/plain
 //
 //	{"password":"attacker123"}
 //
-// 抢先把管理员密码设成自己的（text/plain 下 JSON body 照样能 Decode 成功）。
-// 跨域读不到响应不重要：攻击者随后用自己的客户端正常登录，读走全部上游
-// API Key、改任意路由。断言 Content-Type 为 application/json 后，浏览器
-// 必须先发预检，而管理面不设任何 CORS 头、预检被同源策略拦下。
+// 抢先改掉管理员密码（text/plain 下 JSON body 照样能 Decode 成功）。跨域
+// 读不到响应不重要：改完之后攻击者用自己的客户端就能正常登录，读走全部
+// 上游 API Key、改任意路由。断言 Content-Type 为 application/json 后，
+// 浏览器必须先发预检，而管理面不设任何 CORS 头、预检被同源策略拦下。
 func decodeJSON(w http.ResponseWriter, r *http.Request, v any) error {
 	defer r.Body.Close()
 	if !isJSONContentType(r) {

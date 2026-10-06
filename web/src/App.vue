@@ -1,11 +1,13 @@
 <script setup lang="ts">
 import { computed, onMounted, onUnmounted, ref, watch } from 'vue'
-import { useRoute } from 'vue-router'
-import { toasts, confirmState, settleConfirm, authState } from './ui'
-import { saveToken, auth } from './api'
+import { useRoute, useRouter } from 'vue-router'
+import { toasts, confirmState, settleConfirm } from './ui'
+import { isAdmin, loadSession, session, logout as apiLogout } from './api'
+import { reapplyGuard } from './router'
 import AppModal from './components/AppModal.vue'
 
 const route = useRoute()
+const router = useRouter()
 const scrolled = ref(false)
 const onScroll = () => (scrolled.value = window.scrollY > 4)
 onMounted(() => window.addEventListener('scroll', onScroll, { passive: true }))
@@ -26,183 +28,15 @@ watch(
   },
 )
 
-// ---------- 管理员凭据 ----------
+// ---------- 身份 ----------
 //
-// 凭据优先级（唯一事实来源，见 internal/adminauth）：
-//   admin_auth.json 里的「用户密码」 > config.json 的 admin_token（或 ADMIN_TOKEN 环境变量）。
-//   一旦在「设置」页设置过密码，admin_token 立即失效 —— 两者不是并存，是覆盖。
+// 管理面只有一条通道：users 表里的账号 + 会话。App 不再持有任何凭据 UI，
+// 登录、首次初始化与登出都落在 Login.vue 与 api.ts 里。
 //
-// 三条铁律：
-//   1. 绝不「存下来就刷新」。必须先把候选密码送去 /admin/api/auth/verify 验证，
-//      通过才落 localStorage。否则密码一错就会被 401 弹回同一个对话框，
-//      而该对话框 dismissable=false，用户会被永久困在里面 ——
-//      这正是「输入密码后又让输入，一直重复」的成因。
-//   2. 校验失败必须显示原因，不能静默刷新。
-//   3. 是否「首次设置」由后端 first_setup 决定，不靠前端猜。
-
-const tokenInput = ref('')
-const confirmInput = ref('')
-const isFirstSetup = ref(false)
-// 凭据来源（后端 /password/check 的 source）：
-//   "none" | "config_token" | "password_file" | "locked"
-// 前端用它把「首次设置 / 令牌登录 / 密码登录」三种形态彻底分开，
-// 而不是都渲染成同一个「请输入密码」框。
-const authSource = ref('')
-// 锁定态：凭据文件存在但不可用（损坏/读不出）。后端此时 has_password 仍为 true
-// （否则 password/set 的引导窗口会向所有人敞开），所以**必须优先看 locked**，
-// 否则界面会一直让用户去猜一个永远不可能对的密码。
-const lockedMessage = ref('')
-const authError = ref('')
-const submitting = ref(false)
-
-// authMode 是弹窗的形态判定，模板与文案全部由它驱动。
-type AuthMode = 'locked' | 'setup' | 'token' | 'login'
-const authMode = computed<AuthMode>(() => {
-  if (lockedMessage.value) return 'locked'
-  if (isFirstSetup.value) return 'setup'
-  return authSource.value === 'config_token' ? 'token' : 'login'
-})
-
-const authBadge = computed(() => {
-  switch (authMode.value) {
-    case 'setup':
-      return '首次初始化'
-    case 'token':
-      return '使用配置令牌'
-    case 'login':
-      return '登录'
-    default:
-      return '已锁定'
-  }
-})
-
-const authTitle = computed(() => {
-  switch (authMode.value) {
-    case 'setup':
-      return '设置管理密码'
-    case 'token':
-      return '使用配置令牌登录'
-    case 'login':
-      return '登录管理后台'
-    default:
-      return '管理后台已锁定'
-  }
-})
-
-async function checkStatus() {
-  try {
-    const res = await fetch('/admin/api/password/check')
-    if (!res.ok) return
-    const data = await res.json()
-    isFirstSetup.value = data.first_setup ?? !data.has_password
-    authSource.value = data.source ?? ''
-    lockedMessage.value = data.locked ? data.message || '管理凭据不可用，后台已锁定。' : ''
-  } catch (e) {
-    console.error('检查密码状态失败:', e)
-  }
-}
-
-async function submit() {
-  if (authMode.value === 'locked') return
-  const pwd = tokenInput.value.trim()
-  if (!pwd || submitting.value) return
-
-  authError.value = ''
-  // 首次设置要求二次确认：这是「创建凭据」而不是「登录」，输错了没有第二个人能救。
-  if (authMode.value === 'setup') {
-    if (pwd.length < 6) {
-      authError.value = '密码长度至少 6 位'
-      return
-    }
-    if (pwd !== confirmInput.value.trim()) {
-      authError.value = '两次输入的密码不一致'
-      return
-    }
-  }
-
-  submitting.value = true
-  try {
-    if (authMode.value === 'setup') await setupPassword(pwd)
-    else await login(pwd)
-  } finally {
-    submitting.value = false
-  }
-}
-
-// 已有密码：先验证，再保存。
-async function login(pwd: string) {
-  let res: Response
-  try {
-    res = await fetch('/admin/api/auth/verify', {
-      headers: { Authorization: 'Bearer ' + pwd },
-    })
-  } catch (e) {
-    authError.value = '无法连接网关：' + (e as Error).message
-    return
-  }
-
-  if (!res.ok) {
-    authError.value =
-      res.status === 401
-        ? authMode.value === 'token'
-          ? '配置令牌不正确。请核对 config.json 的 admin_token（或 ADMIN_TOKEN 环境变量）。'
-          : '密码错误，请重新输入'
-        : `校验失败（HTTP ${res.status}）`
-    return
-  }
-
-  saveToken(pwd)
-  authState.needToken = false
-  tokenInput.value = ''
-  confirmInput.value = ''
-  // 此前所有请求都因 401 失败，页面数据是空的，必须重载才能拿到真实数据。
-  window.location.reload()
-}
-
-// 首次使用：设置密码。后端写完立即生效（凭据是运行时状态），无需重启。
-async function setupPassword(pwd: string) {
-  let res: Response
-  try {
-    res = await fetch('/admin/api/password/set', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ password: pwd }),
-    })
-  } catch (e) {
-    authError.value = '无法连接网关：' + (e as Error).message
-    return
-  }
-
-  const data = await res.json().catch(() => null)
-  if (!res.ok) {
-    authError.value = data?.error?.message || `设置密码失败（HTTP ${res.status}）`
-    return
-  }
-
-  saveToken(pwd)
-  isFirstSetup.value = false
-  authSource.value = 'password_file'
-  authState.needToken = false
-  tokenInput.value = ''
-  confirmInput.value = ''
-  window.location.reload()
-}
-
-// 对话框「刚打开」时才探测一次状态，避免 401 风暴里反复请求。
-// 同时清空输入：上一次的残值（尤其是二次确认框）不该跨会话带过来。
-let wasNeedToken = false
-watch(
-  () => authState.needToken,
-  (need) => {
-    if (need && !wasNeedToken) {
-      tokenInput.value = ''
-      confirmInput.value = ''
-      authError.value = ''
-      checkStatus()
-    }
-    wasNeedToken = need
-  },
-)
+// 不要再引入「把密码先存 localStorage 再靠 401 弹框重输」这套反模式：
+// 它要求前端自己保存密码，且对话框 dismissable=false，密码一错就把用户
+// 永久困在里面。config.json 的 admin_token / admin_auth.json 两条旁路
+// 已随之删除，别再回来。
 
 // 版本号：构建时由 vite.config.ts 的 define 注入（单一来源：package.json / go.mod），
 // 这里先落到本地常量再交给模板，避免依赖模板内联替换。
@@ -261,21 +95,72 @@ function toggleTheme() {
   persistTheme(next ? 'dark' : 'light')
 }
 
-// 退出登录：清掉本地令牌后重载（与登录成功后的 reload 对称）。
-// 令牌只存 localStorage、每次请求以 Bearer 携带，网关侧无会话状态，清掉即登出；
-// 重载后首个受限请求会 401，自动弹回凭据框。
-function logout() {
-  saveToken('')
-  window.location.reload()
+/**
+ * showShell 决定是否渲染后台外壳（导航栏 + 页脚）。
+ *
+ * 三种情形一律为 false：
+ *   - 探测未完成 → 先显示空白，避免刷新时闪一下完整后台再跳登录页；
+ *   - 后端不可达 → 后端自己会渲染「无法连接」，外壳里的每个请求都会失败，
+ *     渲染出来只是一个必然报错的空壳；
+ *   - 未登录 → 只剩登录页。
+ *
+ * 注意它**只管外壳**。<RouterView> 有意留在这个 v-if 之外：登录页也是
+ * 一条路由，被包进来就等于「未登录时唯一该出现的页面被守卫挡掉」，
+ * 表现为整页空白（登录后同一份构建正常，故不是数据问题）。
+ */
+const showShell = computed(() => {
+  if (!session.checked) return false
+  if (!session.backendReady) return false
+  return !!session.me
+})
+
+/** 登出：让后端清掉会话，再回登录页。 */
+async function doLogout() {
+  try {
+    await apiLogout()
+  } finally {
+    void router.push({ name: 'login' })
+  }
 }
 
-onMounted(() => {
+onMounted(async () => {
   initTheme()
-  checkStatus()
+  // loadSession 一次性问完「后端在不在 / 有没有建出管理员 / 我是谁」，
+  // 内部已把各种失败降级成状态（backendReady / needsSetup / me），
+  // 不往外抛 —— 所以这里不需要 try/catch。
+  await loadSession()
+
+  // 探测完成后用守卫的同一套规则重判当前路由（硬刷新不触发 beforeEach，
+  // 而 checked=false 时守卫又必然放行 —— 见 router.ts 的 reapplyGuard）：
+  // 「已登录却停在 /login」被送回后台，「未登录停在受保护页」被送去登录，
+  // 「普通用户停在 admin-only 页」被送回我的账号。
+  reapplyGuard()
 })
+
+// 登录态失效时（api.ts 在 401 里把 session.me 置空）把人送回登录页。
+// watch 而不是事件总线：api.ts 已经把状态改好了，这里只管导航。
+//
+// 只管**运行中**的掉登录：me 从非空变回 null 时源值才会改变、回调才触发。
+// 启动探测期间 me 前后都是 null、值不变，这条 watch 对全新访问不动作 ——
+// 那次纠正由 loadSession 之后的 reapplyGuard 负责（见 router.ts），
+// 两处各管一段，别合并：合并后要么漏掉启动期（值不变的转变不可见），
+// 要么在探测返回前就触发、把刚登录的人弹回登录页（曾表现为「刷新就掉登录」）。
+// 带 redirect：登录成功后 Login.vue 靠它回到原来想去的那一页。
+watch(
+  () => (session.me ? route.name : 'login'),
+  (v) => {
+    if (v === 'login' && route.name !== 'login') {
+      void router.push({ name: 'login', query: { redirect: route.fullPath } })
+    }
+  },
+)
 </script>
 
 <template>
+  <!-- 未登录时不渲染后台外壳：只剩登录页自己的头部。
+       showShell 的判定刻意包含 session.checked —— 探测完成前先显示空白，
+       避免刷新页面时闪一下完整后台再跳登录页。 -->
+  <template v-if="showShell">
   <header class="nav" :class="{ scrolled }">
     <div class="nav-in">
       <div class="brand">
@@ -286,11 +171,18 @@ onMounted(() => {
       <div ref="tabsScroll" class="tabs-scroll">
         <nav class="tabs">
           <RouterLink class="tab" to="/">总览</RouterLink>
-          <RouterLink class="tab" to="/providers">上游与模型</RouterLink>
-          <RouterLink class="tab" to="/routes">路由</RouterLink>
           <RouterLink class="tab" to="/keys">访问密钥</RouterLink>
           <RouterLink class="tab" to="/history">调用历史</RouterLink>
-          <RouterLink class="tab" to="/settings">设置</RouterLink>
+          <RouterLink class="tab" to="/profile">我的账号</RouterLink>
+          <!-- admin-only 页签对普通用户隐藏。真正的拦截在路由守卫与后端，
+               这里只是不让用户看到点进去才发现没权限的入口。 -->
+          <template v-if="isAdmin()">
+            <RouterLink class="tab" to="/users">用户</RouterLink>
+            <RouterLink class="tab" to="/groups">分组</RouterLink>
+            <RouterLink class="tab" to="/providers">上游与模型</RouterLink>
+            <RouterLink class="tab" to="/routes">路由</RouterLink>
+            <RouterLink class="tab" to="/settings">设置</RouterLink>
+          </template>
         </nav>
       </div>
       <div class="nav-actions">
@@ -309,14 +201,17 @@ onMounted(() => {
             <path d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8z" />
           </svg>
         </button>
-        <!-- 退出登录：清掉本机保存的管理凭据并重载。密码只存在浏览器 localStorage，
-             网关侧无会话，所以清空 token 即登出；重载后首个受保护请求 401 会弹回登录框。 -->
+        <!-- 登出：只有一种形态了。让后端清会话后回登录页，
+             别再引入「只清本机令牌然后重载」的旁路 —— 那要求前端持有密码。 -->
+        <span v-if="session.me" class="who" :title="`${session.me.username}（${session.me.role === 'admin' ? '管理员' : '普通用户'}）`">
+          {{ session.me.display_name || session.me.username }}
+        </span>
         <button
-          v-if="auth.token"
+          v-if="session.me"
           class="theme-toggle"
           title="退出登录"
           aria-label="退出登录"
-          @click="logout"
+          @click="doLogout"
         >
           <svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
             <path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4" />
@@ -327,15 +222,23 @@ onMounted(() => {
       </div>
     </div>
   </header>
+  </template>
 
+  <!-- RouterView 刻意留在 showShell 之外。登录页本身也是一条路由，而它原先
+       被包在 showShell 的 v-if 里 —— 未登录时 showShell 为 false，
+       于是唯一该出现的登录页被自己的守卫挡掉：浏览器里 #app 的 innerHTML
+       退化成两个空注释节点，document.body.innerText 长度为 0（实测白屏）。
+       现在只有导航栏与页脚跟着 showShell 走，路由内容一律照常渲染。 -->
   <RouterView />
 
+  <template v-if="showShell">
   <!-- 页脚版本号（构建时注入，非运行时接口） -->
   <footer class="foot">
     <span>rosetta-gateway v{{ appVersion }}</span>
     <span class="foot-sep" aria-hidden="true">·</span>
     <span>rosetta {{ rosettaVersion }}</span>
   </footer>
+  </template>
 
   <!-- Toast -->
   <div
@@ -368,136 +271,5 @@ onMounted(() => {
       </button>
     </div>
   </AppModal>
-
-  <!-- 管理凭据：锁定 / 首次初始化 / 配置令牌登录 / 密码登录 -->
-  <AppModal :open="authState.needToken" :title="authTitle" max-width="460px" :dismissable="false">
-    <!-- 形态徽章：一眼分清「创建凭据」和「使用已有凭据」 -->
-    <div class="auth-mode" :class="`auth-mode--${authMode}`">
-      <span class="auth-dot" aria-hidden="true"></span>
-      <span>{{ authBadge }}</span>
-    </div>
-
-    <div class="sheet-body">
-      <p v-if="authMode === 'locked'">{{ lockedMessage }}</p>
-
-      <template v-else-if="authMode === 'setup'">
-        <p>这台网关<strong>还没有任何管理凭据</strong>，此刻谁都能打开后台。请立即设置一个管理密码。</p>
-        <ul class="auth-facts">
-          <li>至少 6 位；经 PBKDF2 派生后存到可执行文件同级的 <code>admin_auth.json</code>。</li>
-          <li>
-            设置后 <code>config.json</code> 里的 <code>admin_token</code> 会<strong>立即失效</strong>
-            —— 用户密码优先，两者不是并存关系。
-          </li>
-        </ul>
-      </template>
-
-      <template v-else-if="authMode === 'token'">
-        <p>后台尚未设置密码，当前凭据来自<strong>配置文件</strong>。</p>
-        <ul class="auth-facts">
-          <li>请输入 <code>config.json</code> 的 <code>admin_token</code>，或环境变量 <code>ADMIN_TOKEN</code> 的值。</li>
-          <li>在「设置」页设置管理密码后，这个令牌会立即失效。</li>
-        </ul>
-      </template>
-
-      <template v-else>
-        <p>请输入你为管理后台设置的<strong>管理密码</strong>。</p>
-        <p class="auth-dim">密码只保存在本机浏览器（localStorage），不会写到网关或别处。</p>
-      </template>
-    </div>
-
-    <p v-if="authError" class="auth-error" role="alert">{{ authError }}</p>
-
-    <!-- 锁定态不给输入框：凭据文件已损坏，输什么都没用，只会让用户怀疑是自己记错了密码。 -->
-    <form v-if="authMode !== 'locked'" style="margin-top: 14px" @submit.prevent="submit">
-      <div class="field">
-        <label>{{ authMode === 'setup' ? '新管理密码' : authMode === 'token' ? '配置令牌' : '管理密码' }}</label>
-        <input
-          v-model="tokenInput"
-          class="input mono"
-          type="password"
-          :placeholder="authMode === 'setup' ? '至少 6 位' : authMode === 'token' ? 'config.json 中的 admin_token' : '请输入管理密码'"
-          autocomplete="off"
-          autofocus
-          @input="authError = ''"
-        />
-      </div>
-
-      <!-- 首次设置才要二次确认：这是「创建凭据」，输错了没人能救 -->
-      <div v-if="authMode === 'setup'" class="field" style="margin-top: 12px">
-        <label>确认密码</label>
-        <input
-          v-model="confirmInput"
-          class="input mono"
-          type="password"
-          placeholder="再次输入以确认"
-          autocomplete="off"
-          @input="authError = ''"
-        />
-      </div>
-
-      <div class="form-actions">
-        <button class="btn btn-primary" type="submit" :disabled="!tokenInput.trim() || submitting">
-          {{ submitting ? '处理中…' : authMode === 'setup' ? '设置密码并进入' : '登录' }}
-        </button>
-      </div>
-    </form>
-  </AppModal>
 </template>
 
-<style scoped>
-/* 形态徽章：用颜色把「创建凭据」（强调色）与「使用已有凭据」（中性）分开 */
-.auth-mode {
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
-  margin-bottom: 12px;
-  padding: 3px 10px;
-  border-radius: var(--r-pill);
-  font-size: 11.5px;
-  font-weight: 600;
-  letter-spacing: 0.02em;
-}
-.auth-dot {
-  width: 6px;
-  height: 6px;
-  border-radius: 50%;
-  background: currentColor;
-}
-.auth-mode--setup {
-  background: color-mix(in srgb, var(--accent) 14%, transparent);
-  color: var(--accent);
-}
-.auth-mode--token {
-  background: color-mix(in srgb, var(--heat) 16%, transparent);
-  color: var(--heat);
-}
-.auth-mode--login {
-  background: color-mix(in srgb, var(--text) 8%, transparent);
-  color: var(--text-2);
-}
-.auth-mode--locked {
-  background: color-mix(in srgb, var(--danger) 14%, transparent);
-  color: var(--danger);
-}
-.auth-facts {
-  margin: 8px 0 0;
-  padding-left: 18px;
-  display: grid;
-  gap: 4px;
-  font-size: 12.5px;
-  color: var(--text-2);
-}
-.auth-dim {
-  margin-top: 8px;
-  font-size: 12.5px;
-  color: var(--text-3);
-}
-.auth-mode code,
-.auth-facts code {
-  font-family: var(--mono);
-  font-size: 11.5px;
-  padding: 1px 4px;
-  border-radius: 4px;
-  background: color-mix(in srgb, var(--text) 8%, transparent);
-}
-</style>

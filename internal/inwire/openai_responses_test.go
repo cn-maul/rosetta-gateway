@@ -58,6 +58,10 @@ func TestDecodeResponses_Full(t *testing.T) {
 	}
 
 	// user → assistant(text) → assistant(tool_call) → tool → user(text+image)
+	//
+	// {"type":"reasoning"} 项不计入消息数：它不带 role 也不带 content，
+	// 按 F17 规则（user 侧只采信 input_text）产不出任何消息，在 dispatch
+	// 里就是空操作 —— 这与修复前一致。
 	if len(req.Messages) != 5 {
 		t.Fatalf("message count = %d, want 5: %+v", len(req.Messages), req.Messages)
 	}
@@ -167,5 +171,154 @@ func TestDecodeResponses_Validation(t *testing.T) {
 	if _, err := DecodeResponsesRequest(httptest.NewRequest(http.MethodPost, "/v1/responses",
 		strings.NewReader(`{"model":"m","input":"hi","tools":[{"type":"web_search"}]}`)), 1<<20); err == nil {
 		t.Fatalf("builtin tool should be rejected")
+	}
+}
+
+// TestResponses_TextFormatNotDoubleWrapped 钉住一条 P1 的修复。
+//
+// 修复前把整个 a.Text（已是 {"format":…} 的外壳）当成 format 的值放回去，
+// 出站变成 "text":{"format":{"format":{…}}}：上游看到的 format 里没有 type、
+// schema 埋在重复的 format 键下，于是结构化输出静默不生效，而客户端以为
+// 它生效了。同函数上面的 openai-chat 分支用 textFormatMap() 正确拆包。
+func TestResponses_TextFormatNotDoubleWrapped(t *testing.T) {
+	a := decodeResponses(t, `{"model":"m","input":"hi",
+		"text":{"format":{"type":"json_schema","name":"t","strict":true,
+			"schema":{"type":"object","properties":{"a":{"type":"string"}}}}}}`)
+
+	req := a.ToRosetta()
+	a.ApplyUpstreamExtras(req, "openai-responses")
+
+	textObj, ok := req.Extra["text"].(map[string]any)
+	if !ok {
+		t.Fatalf("extra[text] 应是 map，实际 %T（%v）", req.Extra["text"], req.Extra["text"])
+	}
+	format, ok := textObj["format"].(map[string]any)
+	if !ok {
+		t.Fatalf("text.format 应是 map，实际 %T —— 说明整包被当成 format 的值塞进去了",
+			textObj["format"])
+	}
+	if format["type"] != "json_schema" {
+		t.Fatalf("text.format.type = %v，期望 json_schema", format["type"])
+	}
+	if _, doubled := format["format"]; doubled {
+		t.Fatalf("text.format 里不该再出现一层 format（双层包裹）")
+	}
+	if _, hasName := format["name"]; !hasName {
+		t.Fatalf("text.format 丢了 schema 名：%v", format)
+	}
+}
+
+// text 里除 format 之外的键不能因为修 format 而被一起弄丢。
+func TestResponses_TextOtherKeysPassThrough(t *testing.T) {
+	a := decodeResponses(t, `{"model":"m","input":"hi",
+		"text":{"format":{"type":"json_object"},"verbosity":"low"}}`)
+
+	req := a.ToRosetta()
+	a.ApplyUpstreamExtras(req, "openai-responses")
+
+	textObj, ok := req.Extra["text"].(map[string]any)
+	if !ok {
+		t.Fatalf("extra[text] 应是 map，实际 %T", req.Extra["text"])
+	}
+	if textObj["verbosity"] != "low" {
+		t.Fatalf("text.verbosity 被丢了：%v", textObj)
+	}
+	if _, ok := textObj["format"]; !ok {
+		t.Fatalf("text.format 丢了：%v", textObj)
+	}
+}
+
+// previous_response_id / store 解析后必须送到 openai-responses 上游，
+// 否则客户端以为会话续上了，实际模型只看到本次 input。
+func TestResponses_PreviousResponseIDForwarded(t *testing.T) {
+	a := decodeResponses(t, `{"model":"m","input":"hi",
+		"previous_response_id":"resp_abc123","store":false}`)
+
+	req := a.ToRosetta()
+	a.ApplyUpstreamExtras(req, "openai-responses")
+
+	if req.Extra["previous_response_id"] != "resp_abc123" {
+		t.Fatalf("previous_response_id 未透传：%v", req.Extra["previous_response_id"])
+	}
+	if req.Extra["store"] != false {
+		t.Fatalf("显式 store:false 未透传：%v", req.Extra["store"])
+	}
+}
+
+// role 缺失的 message 项里，output_text 不得被当成用户输入。
+//
+// 修复前 default 分支取 input_text 与 output_text 的并集，于是模型自己的
+// 上一句回答被伪装成用户的新指令。实测上游曾收到
+// {role:"user", content:"SECRET-ASSISTANT-OUTPUT"}。
+func TestResponses_RolelessOutputTextNotTreatedAsUser(t *testing.T) {
+	a := decodeResponses(t, `{"model":"m","input":[
+		{"type":"message","role":"user","content":[{"type":"input_text","text":"QUESTION"}]},
+		{"type":"message","content":[{"type":"output_text","text":"SECRET-ASSISTANT-OUTPUT"}]}
+	]}`)
+
+	req := a.ToRosetta()
+	// role 缺失且只带 output_text 的那一项被**整条丢弃**：既不能变成
+	// user 轮（那是把模型输出伪装成用户指令），也不能留下「空内容消息」
+	//（rosetta 校验会判 no content blocks → 整个请求 400）。
+	if len(req.Messages) != 1 {
+		t.Fatalf("期望只剩 1 条消息，实际 %d：%+v", len(req.Messages), req.Messages)
+	}
+	// 前一条显式 user 的内容不能受影响
+	first := req.Messages[0]
+	if first.Role != rosetta.RoleUser {
+		t.Fatalf("显式 user 轮角色被改：%q", first.Role)
+	}
+	if len(first.Blocks) == 0 || first.Blocks[0].Text != "QUESTION" {
+		t.Fatalf("显式 user 轮的内容被误伤：%+v", first.Blocks)
+	}
+}
+
+// TestResponses_OutputTextOnlyItemIsDroppedNotEmitted 钉住 F17 修复的一个
+// 连带问题：role 缺失且只带 output_text 的项，丢弃后**不能**塞空文本块。
+//
+// rosetta 的校验判「空文本不算内容」（message has no content blocks），
+// 于是整个请求 400 —— 那比「把 assistant 输出当用户输入」更糟：后者至少
+// 请求还能通。实测本条曾把请求打成
+// 400 rosetta: invalid request: Messages[1]: message has no content blocks。
+func TestResponses_OutputTextOnlyItemIsDroppedNotEmitted(t *testing.T) {
+	a := decodeResponses(t, `{"model":"m","input":[
+		{"type":"message","role":"user","content":[{"type":"input_text","text":"QUESTION"}]},
+		{"type":"message","content":[{"type":"output_text","text":"ASSISTANT-ONLY"}]}
+	]}`)
+
+	req := a.ToRosetta()
+	// 只剩那条显式的 user 消息；被丢的那条不能变成「空内容消息」
+	if len(req.Messages) != 1 {
+		t.Fatalf("期望只剩 1 条消息，实际 %d：%+v", len(req.Messages), req.Messages)
+	}
+	for _, m := range req.Messages {
+		for _, b := range m.Blocks {
+			if strings.Contains(b.Text, "ASSISTANT-ONLY") {
+				t.Fatalf("assistant 的 output_text 仍被转发：%q", b.Text)
+			}
+		}
+	}
+	if len(req.Messages[0].Blocks) == 0 || req.Messages[0].Blocks[0].Text != "QUESTION" {
+		t.Fatalf("显式 user 轮内容被误伤：%+v", req.Messages[0].Blocks)
+	}
+
+	// 顺带确认：input 全是「不可采信的 role 缺失项」时，转发出去会是
+	// 一条空消息（SDK 判 no content blocks → 400）。decode 侧不拦这种情况
+	// （客户端可以只发 reasoning / function_call 项），故这里只断言
+	// 「不会把 assistant 文本当成 user 输入」。
+}
+
+// 显式 assistant 轮仍然要正常读到 output_text（别把上一条修复过头）。
+func TestResponses_AssistantRoleStillReadsOutputText(t *testing.T) {
+	a := decodeResponses(t, `{"model":"m","input":[
+		{"type":"message","role":"assistant","content":[{"type":"output_text","text":"ANSWER"}]}
+	]}`)
+
+	req := a.ToRosetta()
+	if len(req.Messages) != 1 || req.Messages[0].Role != rosetta.RoleAssistant {
+		t.Fatalf("期望 1 条 assistant 消息，实际 %+v", req.Messages)
+	}
+	if len(req.Messages[0].Blocks) == 0 || req.Messages[0].Blocks[0].Text != "ANSWER" {
+		t.Fatalf("assistant 的 output_text 丢了：%+v", req.Messages[0].Blocks)
 	}
 }

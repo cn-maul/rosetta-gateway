@@ -96,12 +96,12 @@ func (h *SettingsHandler) Update(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "默认上下文与最大输出必须为正整数")
 		return
 	}
-	// maxDurMillis 与 config.validate 里的同名常量一致：time.Duration 是
-	// int64 纳秒，ms > 9.223e12 时 `time.Duration(ms) * time.Millisecond`
-	// 会回绕成负数 —— 负 Duration 让 context.WithTimeout 立即过期、
-	// time.AfterFunc 立即开火，等于全站转发被打挂且 UI 上看不出异常。
+	// maxDurMillis：time.Duration 是 int64 纳秒，ms > 9.223e12 时
+	// `time.Duration(ms) * time.Millisecond` 会回绕成负数 —— 负 Duration 让
+	// context.WithTimeout 立即过期、time.AfterFunc 立即开火，等于全站转发
+	// 被打挂且 UI 上看不出异常。上界取 24h。
 	// 详见 config.validate 的注释。
-	const maxDurMillis = 86_400_000
+	const maxDurMillis = config.MaxDurationMillis
 	for _, f := range []struct {
 		name string
 		val  int

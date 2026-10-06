@@ -14,6 +14,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -23,7 +24,6 @@ import (
 
 	"github.com/cn-maul/rosetta"
 	"github.com/cn-maul/rosetta-gateway/internal/admin"
-	"github.com/cn-maul/rosetta-gateway/internal/adminauth"
 	"github.com/cn-maul/rosetta-gateway/internal/auth"
 	"github.com/cn-maul/rosetta-gateway/internal/config"
 	"github.com/cn-maul/rosetta-gateway/internal/crypto"
@@ -35,14 +35,27 @@ import (
 	"github.com/cn-maul/rosetta-gateway/internal/snapshot"
 	"github.com/cn-maul/rosetta-gateway/internal/store"
 	"github.com/cn-maul/rosetta-gateway/internal/upstream"
+	"github.com/cn-maul/rosetta-gateway/internal/userauth"
 	"github.com/cn-maul/rosetta-gateway/internal/webui"
 )
 
 // homeEnvVar 是状态根目录的环境变量名。
 //
-// 容器镜像靠它把 config.json、master.key、admin_auth.json 与数据库整体
+// 容器镜像靠它把 config.json、master.key、session_secret 与数据库整体
 // 指到挂载卷上，让镜像层保持无状态（见 DOCKER.md）。
 const homeEnvVar = "ROSETTA_GW_HOME"
+
+// secretSource 报告当前用的是哪一把会话密钥，只用于启动日志。
+//
+// 值得单独说一句：密钥**从哪里来**必须可见。曾经的口令是静默回退的 ——
+// 环境变量没配就退回 admin_token，而那条路径在多用户模式下根本不通，
+// 于是「配好了」与「没配好」在日志里长得一模一样。
+func secretSource(path string) string {
+	if v := strings.TrimSpace(os.Getenv(userauth.SecretEnvName)); v != "" {
+		return userauth.SecretEnvName + "（环境变量）"
+	}
+	return path + "（自动生成并持久化）"
+}
 
 // buildVersion 由构建期注入：-ldflags "-X main.buildVersion=x.y.z"。
 // 未注入时为 "dev"。取值与前端页脚的 __APP_VERSION__ 同源
@@ -162,7 +175,10 @@ func main() {
 	// 冷却状态必须落库，否则任何 admin 写操作触发的池重建都会把刚被判坏的
 	// 凭据立刻放回轮换。
 	pool.SetCooldownStore(db)
-	reloader := &runtimeReloader{db: db, masterKey: masterKey, pool: pool, cfg: cfg}
+	// logger 必须传：Reload 在「有 provider 未就绪」时要留 WARN。
+	// 漏掉它不会在启动时报错，只会在**第一次出现凭据故障时** panic ——
+	// 恰巧是最需要那条日志的时刻。
+	reloader := &runtimeReloader{db: db, masterKey: masterKey, pool: pool, cfg: cfg, logger: logger}
 	if err := reloader.Reload(context.Background()); err != nil {
 		logger.Warn("failed to build runtime from DB, falling back to config", "error", err)
 		if err := pool.BuildFromConfig(cfg); err != nil {
@@ -196,53 +212,44 @@ func main() {
 	mux.HandleFunc("GET /openai/v1/models/{model}", handleGetModel("openai"))
 	mux.HandleFunc("GET /anthropic/v1/models/{model}", handleGetModel("anthropic"))
 
-	// 管理端凭据。两个来源，优先级：用户在后台设置的密码（admin_auth.json）
-	// > config.json 的 admin_token（或 ADMIN_TOKEN 环境变量）作为兜底。
+	// 管理端身份：**只有一种来源 —— users 表**。
 	//
-	// 凭据放在可执行文件同级而不是数据库里，理由见 internal/adminauth 的包注释：
-	// gateway.db 是「可丢弃的运行时数据」（删库重建是常规操作），
-	// 而管理员密码是身份凭据 —— 放库里等于「删库 = 把自己锁在门外」。
-	adminToken := cfg.AdminToken
-	if adminToken == "" {
-		adminToken = os.Getenv("ADMIN_TOKEN")
-	}
+	// 2026-10-06 起移除了两条并行的运维凭据通道：
+	//   - config.json 的 admin_token / ADMIN_TOKEN 环境变量
+	//   - 可执行文件同级的 admin_auth.json（internal/adminauth）
+	//
+	// 移除理由不是「少一个功能」，而是它们制造了一个**死锁**：启动时
+	// ensureBootstrapAdmin 建的 admin 账号密码为空（登不进去），
+	// 而 admin_token 曾被实现成「users 表为空才放行」的一次性窗口 ——
+	// users 永远非空，于是两条路都堵死，没有任何途径设置第一个密码。
+	// MULTIUSER.md §3.5 记了这个坑；中间方案的「并行通道始终有效」
+	// 仍是绕过症状，真正的收口是让 users 表成为唯一身份来源，
+	// 并给它一个自洽的首次登录引导（见 ensureBootstrapAdmin 的注释）。
+	//
+	// 代价要说清楚：**删库 = 失明**。这是明确的取舍 ——
+	// 「可随手删掉的数据文件里存身份」正是 adminauth 当初存在的原因，
+	// 而多用户已经把身份、配额、路由、key 全部绑在同一个库上，
+	// 为身份单独造一套抗删除存储带来的复杂度远超收益。
 
-	authPath := adminauth.ResolvePath(homeDir)
-	authStore, err := adminauth.Open(authPath, adminToken)
-	switch {
-	case err != nil:
-		// 凭据文件坏了**不能**让进程起不来：/v1 数据面根本不读管理凭据，
-		// 为一份坏掉的管理凭据把全部转发拖死完全不成比例（一次磁盘写坏、
-		// 一次手工编辑失误 = 全部转发服务中断）。降级成锁定态：
-		// 后台进不去、也绝不放行设置新密码，但转发照常。
-		logger.Error("admin credential file unusable, admin API locked",
-			"path", authPath, "error", err,
-			"recovery", "删除该文件后重启：改用 config.json 的 admin_token，或重新设置密码")
-		authStore = adminauth.NewLocked(authPath, err)
-	case authStore.HasUserPassword():
-		logger.Info("admin password loaded", "path", authStore.Path())
-	case adminToken != "":
-		logger.Info("using admin_token from config; set a password in the admin UI to override it")
-		if len(adminToken) < 16 {
-			logger.Warn("admin_token is shorter than 16 chars; a weak token can be brute-forced online " +
-				"(login throttling only slows it down). Set a strong admin password in the UI to override it")
-		}
-	default:
-		// 「无凭据」本身只是一条引导提示 —— 但它和「监听非回环」叠加就
-		// 变成一个可被任意人抢占的窗口：password/set 在无凭据时被豁免鉴权
-		// （见 server.AdminAuth），默认 listen 是回环所以只有本机能碰，
-		// 可运维为对外服务把 listen 改成 0.0.0.0 是很常见的做法，那时
-		// 整个局域网都能 curl -X POST 抢走管理员。
-		if !isLoopbackListen(cfg.Listen) {
-			logger.Error("SECURITY: no admin credential AND listening on a non-loopback address — "+
-				"anyone who can reach this port can set the admin password and take over the gateway",
-				"listen", cfg.Listen,
-				"immediate_action", "设置 config.json 的 admin_token（或环境变量 ADMIN_TOKEN）后重启；"+
-					"或把 listen 改回 127.0.0.1")
-		} else {
-			logger.Warn("no admin credential configured; the admin UI will ask you to set a password on first visit",
-				"note", "监听地址是回环，仅本机可访问；一旦改为 0.0.0.0 暴露到网络，请务必先设置 admin_token")
-		}
+	// 启动期一次性操作，与任何请求无关，故用 Background 而非请求 ctx。
+	ensureBootstrapAdmin(context.Background(), db, logger)
+
+	// 首次初始化窗口对所有能连到端口的人开放（POST /admin/api/bootstrap
+	// 免鉴权，直到管理员设完密码为止）。默认 listen 绑回环，只有本机能碰；
+	// 运维把它改成 0.0.0.0 是很常见的做法，那时整个局域网都能抢先
+	// 成为第一个管理员。这个告警不能省 —— 它是唯一提醒。
+	pending, err := db.FindUninitializedAdmin(context.Background())
+	if err != nil {
+		logger.Error("cannot read bootstrap state; admin UI may be unreachable", "error", err)
+	} else if pending != nil && !isLoopbackListen(cfg.Listen) {
+		logger.Error("SECURITY: admin password not yet set AND listening on a non-loopback address — "+
+			"anyone who can reach this port can become the first administrator",
+			"listen", cfg.Listen,
+			"immediate_action", "立即在浏览器打开 /admin/ 完成首次设置密码；"+
+				"在此之前把 listen 改回 127.0.0.1")
+	} else if pending != nil {
+		logger.Warn("admin password not set yet; open the admin UI to complete first-run setup",
+			"note", "监听地址是回环，仅本机可访问；一旦改为 0.0.0.0 暴露到网络，请立即完成设置")
 	}
 
 	providerHandler := admin.NewProviderHandler(db, masterKey, cfg)
@@ -256,9 +263,44 @@ func main() {
 	reloadHandler := admin.NewReloadHandler(reloader.Reload)
 	auditHandler := admin.NewAuditHandler(db)
 	usageHandler := admin.NewUsageHandler(db)
-	passwordHandler := admin.NewPasswordHandler(authStore)
+	// 会话签名密钥。**不再要求运维配环境变量**：没配就从
+	// <homeDir>/session_secret 读，文件也没有就自动生成并原子落盘。
+	//
+	// 为什么必须持久化而不是每次启动现生成：那样每次重启都会换一把密钥，
+	// 所有人的会话在下一次重启后集体失效，症状是「莫名其妙被登出」，
+	// 且没有任何错误信息。放在 homeDir 而不是数据库，理由同 master.key：
+	// 它是身份的一部分，删库不该把所有人踢下线。
+	secretPath := filepath.Join(homeDir, userauth.SecretFileName)
+	sessionMgr, err := userauth.NewManager(secretPath)
+	if err != nil {
+		// 密钥配得太短、文件不可读、生成失败都属于部署错误：
+		// 直接拒绝启动，否则会让人以为配好了，实际所有登录都被挡在门外
+		// 却查不到原因。
+		logger.Error("session secret unusable; refusing to start", "error", err)
+		os.Exit(1)
+	}
+	if sessionMgr.Enabled() {
+		logger.Info("user sessions enabled", "ttl", sessionMgr.TTL(),
+			"source", secretSource(secretPath))
+	} else {
+		// 理论不可达：secretPath 非空时 NewManager 要么启用、要么报错退出。
+		// 留这条分支只为不把 nil 当成正常状态往下传。
+		logger.Error("user sessions unavailable; refusing to start",
+			"reason", "session secret could not be loaded or generated")
+		os.Exit(1)
+	}
+	// WithReload：禁用账号/改角色后必须立刻重建快照，否则数据面仍放行。
+	userHandler := admin.NewUserHandler(db, sessionMgr).WithReload(reloader.Reload)
 
 	adminMux := http.NewServeMux()
+	// 免鉴权 mux：登录与首次引导本身就是取得凭据的入口，
+	// 要求先有凭据是死循环。它们的防护是限速 + 失败原因不细分 + 同源判定。
+	publicAdminMux := http.NewServeMux()
+	publicAdminMux.HandleFunc("POST /admin/api/login", userHandler.Login)
+	publicAdminMux.HandleFunc("GET /admin/api/session", userHandler.SessionStatus)
+	// 首次登录引导：没有这两个端点，新部署的 admin（空密码）永远登不进去。
+	publicAdminMux.HandleFunc("GET /admin/api/bootstrap", userHandler.BootstrapStatus)
+	publicAdminMux.HandleFunc("POST /admin/api/bootstrap", userHandler.BootstrapSetup)
 	adminMux.HandleFunc("GET /admin/api/providers", providerHandler.List)
 	adminMux.HandleFunc("POST /admin/api/providers", providerHandler.Create)
 	adminMux.HandleFunc("GET /admin/api/providers/{id}", func(w http.ResponseWriter, r *http.Request) { providerHandler.Get(w, r, r.PathValue("id")) })
@@ -301,19 +343,53 @@ func main() {
 	adminMux.HandleFunc("GET /admin/api/usage/by-model", usageHandler.GroupByModel)
 	adminMux.HandleFunc("GET /admin/api/usage/by-provider", usageHandler.GroupByProvider)
 	adminMux.HandleFunc("GET /admin/api/usage/by-day", usageHandler.GroupByDay)
+	// 手动触发用量归档。admin-only 由 handler 内的 requireAdmin 把关 ——
+	// 路径在普通用户可访问的 /admin/api/usage 前缀下，白名单管不到这里。
+	adminMux.HandleFunc("POST /admin/api/usage/prune", usageHandler.Prune)
 	adminMux.HandleFunc("GET /admin/api/settings", settingsHandler.Get)
 	adminMux.HandleFunc("PUT /admin/api/settings", settingsHandler.Update)
-	adminMux.HandleFunc("GET /admin/api/password/check", passwordHandler.Check)
-	adminMux.HandleFunc("POST /admin/api/password/set", passwordHandler.Set)
-	adminMux.HandleFunc("GET /admin/api/auth/verify", passwordHandler.Verify)
 	adminMux.HandleFunc("GET /admin/api/usage/history", usageHandler.History)
+	adminMux.HandleFunc("GET /admin/api/me", userHandler.Me)
+	adminMux.HandleFunc("POST /admin/api/logout", userHandler.Logout)
+	adminMux.HandleFunc("GET /admin/api/users", userHandler.ListUsers)
+	adminMux.HandleFunc("POST /admin/api/users", userHandler.CreateUser)
+	adminMux.HandleFunc("PATCH /admin/api/users/{id}", func(w http.ResponseWriter, r *http.Request) { userHandler.UpdateUser(w, r, r.PathValue("id")) })
+	adminMux.HandleFunc("DELETE /admin/api/users/{id}", func(w http.ResponseWriter, r *http.Request) { userHandler.DeleteUser(w, r, r.PathValue("id")) })
+	adminMux.HandleFunc("POST /admin/api/users/{id}/password", func(w http.ResponseWriter, r *http.Request) { userHandler.ResetPassword(w, r, r.PathValue("id")) })
+	adminMux.HandleFunc("POST /admin/api/me/password", userHandler.ChangePassword)
+	// 分组与模型白名单（多用户改造 P1）。全部 admin-only ——
+	// server.AdminGateGuard 是**前缀白名单**，/groups 不在其中即自动要求管理员。
+	//
+	// 快照重建靠外层 AutoReload，这里不再显式调 reload（见 GroupHandler 注释）。
+	groupHandler := admin.NewGroupHandler(db)
+	adminMux.HandleFunc("GET /admin/api/groups", groupHandler.List)
+	adminMux.HandleFunc("POST /admin/api/groups", groupHandler.Create)
+	adminMux.HandleFunc("PATCH /admin/api/groups/{id}", func(w http.ResponseWriter, r *http.Request) { groupHandler.Update(w, r, r.PathValue("id")) })
+	adminMux.HandleFunc("DELETE /admin/api/groups/{id}", func(w http.ResponseWriter, r *http.Request) { groupHandler.Delete(w, r, r.PathValue("id")) })
+	// PUT 而不是 PATCH：语义是**整体替换**白名单（勾选后保存），
+	// 不是增量合并。用 PATCH 会让「取消勾选」无法表达。
+	adminMux.HandleFunc("PUT /admin/api/groups/{id}/models", func(w http.ResponseWriter, r *http.Request) { groupHandler.SetModels(w, r, r.PathValue("id")) })
+	// 模型名清单：**普通用户也要能读** —— 否则 key 级白名单对他们等于不存在
+	// （/admin/api/routes 是 admin-only，而自助收紧正是这个功能的目的）。
+	// 读到的清单已按身份收窄，见 group_handler.ModelNames。
+	adminMux.HandleFunc("GET /admin/api/model-names", groupHandler.ModelNames)
 	adminMux.HandleFunc("GET /admin/api/usage/history.csv", usageHandler.ExportCSV)
 
-	adminWrapped := server.AdminAuth(adminMux, authStore)
+	// 鉴权链：**只有用户会话一条通道**（users 表 + JWT）。
+	//
+	// 此前并行的「运维凭据」通道（admin_token / admin_auth.json）已删除。
+	// 它本来的用途是「建第一个账号」与「忘记密码时应急」，而统一认证后
+	// 这两件事都有更干净的位置：首次由 /admin/api/bootstrap 引导完成，
+	// 忘记密码由管理员在「用户管理」里重置。留着一个绕过 users 表的
+	// 管理入口，等于留一条「不产生会话、不受 auth_version 约束」的旁路。
+	adminGuarded := server.NewUserAuth(sessionMgr, db).
+		Guard(server.AdminGateGuard(adminMux))
 
-	// 管理写操作审计（DESIGN §13.3）：谁（单密码模型下记 admin + 来源 IP）、
-	// 何时、动了哪个资源、动了哪些字段（只记字段名不记值 —— body 里有
-	// api_key 与密码明文）。审计在重建之前同步落库，失败只 WARN 不阻塞。
+	// 管理写操作审计（DESIGN §13.3）：谁、何时、动了哪个资源、动了哪些字段
+	// （只记字段名不记值 —— body 里有 api_key 与密码明文）。
+	// 审计在重建之前同步落库，失败只 WARN 不阻塞。
+	// actor 写死 "admin" 是已知的不精确：回调没透传会话身份，
+	// 普通用户对自己资源的写操作也会落 "admin" 记录（见 store.AuditEntry 注释）。
 	audit := func(method, path string, status int, remote, fields string) {
 		entry := &store.AuditEntry{
 			Ts:     time.Now().UnixMilli(),
@@ -332,9 +408,19 @@ func main() {
 	// 管理写操作成功后自动重建运行时（池 + 快照）：配置生效不再依赖前端自觉调
 	// POST /admin/api/reload，任何带凭据的调用方（curl/脚本）写完立即生效 ——
 	// 包括禁用下游 Key 这类安全敏感操作（auth 读快照，不重建就照常放行）。
-	// AutoReload 在 AdminAuth 外侧：401/429 的失败响应不会触发重建。
+	// AutoReload 在鉴权链外侧：401/429 的失败响应不会触发重建。
 	// 前端 mutate() 里的 reload 调用保留为兜底（服务端重建失败时再给一次机会）。
-	adminAuto := server.AutoReload(adminWrapped, reloader.Reload, audit, logger)
+	adminAuto := server.AutoReload(adminGuarded, reloader.Reload, audit, logger)
+
+	// 免鉴权端点必须显式注册到根 mux：它们不进 adminAuto（那会走鉴权链），
+	// 但也不会因为「没注册」而落到 /admin/api/ 前缀上被鉴权拦掉 ——
+	// 那样会得到 401 而不是功能缺失，症状是「登录页一直转圈」。
+	// Go 1.22 的 ServeMux 按最具体模式匹配，精确路径优先于 /admin/api/ 前缀，
+	// 与注册顺序无关；仍写明以免后人误改。
+	mux.Handle("POST /admin/api/login", publicAdminMux)
+	mux.Handle("GET /admin/api/session", publicAdminMux)
+	mux.Handle("GET /admin/api/bootstrap", publicAdminMux)
+	mux.Handle("POST /admin/api/bootstrap", publicAdminMux)
 
 	mux.Handle("GET /admin/api/", adminAuto)
 	mux.Handle("POST /admin/api/", adminAuto)
@@ -430,9 +516,61 @@ func main() {
 		}
 	}()
 
+	shutdown := make(chan struct{})
+	// 用量归档的每日定时剪枝（设计 §4.8：明细 30 天，累计永久）。
+	//
+	// 启动后**立刻先跑一次**再进 24h 循环：只等第一个 tick 的话，长期停机后
+	// 重启的实例要等满 24h 才开始剪，而这段时间里 usage_records 还在接收新写入
+	// ——「表在涨、剪枝没跑」正是这张表当初要解决的问题。
+	//
+	// 跑在独立 goroutine 里而不是启动流程内：剪枝是全表 DELETE（首批可达
+	// 百万行），放启动路径上会让网关「起来了但还打不开页面」。
+	pruneDone := make(chan struct{})
+	go func() {
+		defer close(pruneDone)
+		runPrune := func(reason string) {
+			res, err := db.PruneOldUsage(context.Background(), store.DefaultRetentionDays)
+			switch {
+			case err != nil:
+				// 单次失败不终止循环：下个周期重试即可，而退出循环等于
+				// 永久放弃归档，明细表会一直涨到把写池堵死。
+				logger.Error("usage prune failed", "error", err, "trigger", reason)
+			case res.Skipped:
+				logger.Debug("usage prune skipped", "reason", res.Reason, "trigger", reason)
+			default:
+				logger.Info("usage pruned into daily rollups", "trigger", reason,
+					"deleted_rows", res.DeletedRows, "rollup_rows", res.RollupRows,
+					"pruned_through_day", res.PrunedThrough)
+			}
+		}
+		runPrune("startup")
+		t := time.NewTicker(24 * time.Hour)
+		defer t.Stop()
+		for {
+			select {
+			case <-t.C:
+				runPrune("daily")
+			case <-shutdown:
+				return
+			}
+		}
+	}()
+
 	quit := make(chan os.Signal, 1)
 	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
 	<-quit
+	// 先停剪枝循环再关库：它可能正在跑一条全表 DELETE，与 main 返回时的
+	// `defer db.Close()` 并发会拿到 "database is closed"。
+	//
+	// 等待有上限：剪枝是百万行量级的 DELETE，无界等待能把 SIGTERM 拖到几十秒，
+	// 而编排器的终止宽限期通常更短 —— 那就变成强杀，剪枝事务虽会整体回滚
+	// （聚合与删除同事务），但退出被拖长这件事本身已经不对。超时后照常退出。
+	close(shutdown)
+	select {
+	case <-pruneDone:
+	case <-time.After(5 * time.Second):
+		logger.Warn("usage prune still running at shutdown; exiting anyway")
+	}
 
 	logger.Info("shutting down...")
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
@@ -467,18 +605,56 @@ type runtimeReloader struct {
 	masterKey []byte
 	pool      *upstream.Pool
 	cfg       *config.Config
+	logger    *slog.Logger
 }
 
 // Reload 串行执行一次「池 + 快照」重建；任何一步失败都不改变运行状态。
+//
+// failures 会随快照下发（P4 / 设计 §4.7）：池里没建成的 provider 在管理面
+// 标成「未就绪」并给出原因。此前这些只进日志，运维看到的是
+// 「路由配了但请求莫名 500」，查不到根因。
 func (rr *runtimeReloader) Reload(ctx context.Context) error {
 	rr.mu.Lock()
 	defer rr.mu.Unlock()
 
-	providers, err := rr.pool.PrepareFromStore(ctx, rr.db, rr.masterKey, rr.cfg)
+	providers, poolFailures, err := rr.pool.PrepareFromStore(ctx, rr.db, rr.masterKey, rr.cfg)
 	if err != nil {
 		return fmt.Errorf("prepare upstream pool: %w", err)
 	}
-	snap, err := snapshot.RebuildFromDB(ctx, rr.db)
+	// 把池侧的失败投影成 snapshot 的最小视图。两类情形都要让界面看见，
+	// 但语义不同：
+	//   - 零可用凭据 / 读不到凭据清单 → provider **完全不可用**（Ready=false）；
+	//   - 个别凭据失败但还有可用的 → provider 仍在服务，界面标为降级。
+	//
+	// 同一 provider 的多条凭据失败在界面上重复标没意义，按 slug 只留一条，
+	// 「完全不可用」优先于「部分降级」。
+	type proj struct {
+		reason string
+		fatal  bool
+	}
+	bySlug := make(map[string]proj, len(poolFailures))
+	for _, f := range poolFailures {
+		fatal := f.Stage == "no_credentials" || f.Stage == "list_credentials"
+		if prev, ok := bySlug[f.Slug]; ok && prev.fatal && !fatal {
+			continue
+		}
+		bySlug[f.Slug] = proj{reason: f.Reason, fatal: fatal}
+	}
+	failures := make([]snapshot.ProviderFailure, 0, len(bySlug))
+	for slug, p := range bySlug {
+		failures = append(failures, snapshot.ProviderFailure{Slug: slug, Reason: p.reason})
+	}
+	// 排序只为让日志与任何按序展示的地方稳定（map 遍历顺序是随机的）。
+	sort.Slice(failures, func(i, j int) bool { return failures[i].Slug < failures[j].Slug })
+
+	// logger 为空时不留痕也不崩：这是「有 provider 未就绪」时唯一会走到的分支，
+	// 让它 panic 等于在最需要日志的时刻把进程打挂。
+	if len(poolFailures) > 0 && rr.logger != nil {
+		rr.logger.Warn("some providers are not ready after reload",
+			"count", len(poolFailures), "providers", len(bySlug))
+	}
+
+	snap, err := snapshot.RebuildFromDB(ctx, rr.db, failures)
 	if err != nil {
 		return fmt.Errorf("rebuild snapshot: %w", err)
 	}
@@ -677,6 +853,16 @@ func writeAuthError(w http.ResponseWriter, err error, writeErr errorWriter) {
 		writeErr(w, http.StatusForbidden, "invalid_api_key", "API key disabled")
 	case errors.Is(err, auth.ErrInvalidKey):
 		writeErr(w, http.StatusUnauthorized, "invalid_api_key", "invalid API key")
+	case errors.Is(err, auth.ErrKeyExpired):
+		// 403 而非 401：key 本身是有效的，只是不该再用。
+		// 客户端看到 401 的第一反应是「重新配 key」，那是误导 ——
+		// 真相是「换一把或让管理员续期」。
+		writeErr(w, http.StatusForbidden, "key_expired", "this API key has expired")
+	case errors.Is(err, auth.ErrIPNotAllowed):
+		// 同样 403 + 独立 code：客户端能据此区分「key 坏了」与
+		//「你的网络位置不允许用这把 key」，后者往往指向防火墙/代理配置问题。
+		writeErr(w, http.StatusForbidden, "ip_not_allowed",
+			"source IP is not allowed for this API key")
 	default:
 		writeErr(w, http.StatusUnauthorized, "invalid_api_key", "authentication failed")
 	}
@@ -903,6 +1089,31 @@ func handleIngress(pool *upstream.Pool, cfg *config.Config, usage *usageRecorder
 			return
 		}
 
+		// 用户级配额预检（MULTIUSER.md §4.3：三级配额的最外层总闸）。
+		//
+		// **只在用户配了额度时才查库**：quota_tokens=0（不限额）是常态，
+		// 为常态付一次 SUM 查询成本不合理。这一点与 key 级预检不同 ——
+		// key 的额度就在即将读取的那一行里，查是顺带。
+		//
+		// 已用量走实时 SUM（§4.3 决策 B）而不是触发器累加：触发器按
+		// access_key_id 累加，**感知不到 key 被删除**，会永久留下偏高的
+		// 计数让用户再也撞不开上限。SUM 走 idx_usage_user_ts 索引。
+		if u := snapshot.Get().UsersByID[authCtx.UserID]; u != nil && u.QuotaTokens > 0 {
+			used, uerr := db.SumUserUsedTokens(r.Context(), authCtx.UserID)
+			if uerr != nil {
+				// 与 key 级同口径：查询抖动时 fail-open，不因一次读失败
+				// 拒绝正常流量。并发下容忍至多一个在途请求超发。
+				logger.Error("user quota lookup failed", "error", uerr, "user_id", authCtx.UserID)
+			} else if used >= u.QuotaTokens {
+				logger.Warn("user quota exceeded", "user_id", authCtx.UserID,
+					"used", used, "quota", u.QuotaTokens,
+					"request_id", server.RequestIDFromContext(r.Context()))
+				codec.WriteError(w, http.StatusTooManyRequests, "insufficient_quota",
+					"this account has exhausted its token quota")
+				return
+			}
+		}
+
 		ing, err := codec.Decode(r, int64(cfg.Defaults.MaxRequestBodyBytes))
 		if err != nil {
 			// 超限时中间件的 MaxBytesReader 会返回 *http.MaxBytesError。
@@ -950,6 +1161,33 @@ func handleIngress(pool *upstream.Pool, cfg *config.Config, usage *usageRecorder
 		}
 		route := res.Route
 
+		// 模型白名单（多用户改造 P1）：组白名单 ∩ key 白名单，任一非空即生效。
+		//
+		// 判定用的 `route.PublicName` 有两个来源，必须都覆盖到：
+		//   - 具名路由命中 → 就是该 route 的公共名；
+		//   - `provider/model` 直连形式 → routing.Resolve 会**合成**一条 route，
+		//     其 PublicName 就是请求原文。
+		//
+		// 也就是说这条判定等价于「按客户端实际写的那个标识符查白名单」。
+		// 这正是我们要的：如果只按具名路由判定而放行直连形式，受限用户只要
+		// 改写成 `provider/model` 就能拿到白名单之外的上游模型 —— 白名单形同虚设。
+		// 管理员若确实要放开某个直连标识符，把它本身写进白名单即可
+		// （/v1/models?include=upstream 会列出这些标识符供挑选）。
+		//
+		// 位置排在限速与配额预检之后、触碰上游之前：白名单判定只是内存里的
+		// 线性扫描，比两次数据库预检便宜；放前面会让「超额度的请求」拿到 403
+		// 而不是 429，掩盖更该先解决的配额问题。两者都不打上游，
+		// 顺序只影响错误码优先级。
+		if !authCtx.AllowsModel(route.PublicName) {
+			rate.commit(0)
+			logger.Warn("model not allowed for caller",
+				"model", route.PublicName, "key_id", authCtx.KeyID, "user_id", authCtx.UserID,
+				"request_id", server.RequestIDFromContext(r.Context()))
+			codec.WriteError(w, http.StatusForbidden, "model_not_allowed",
+				fmt.Sprintf("model %q is not available for this API key", ing.model))
+			return
+		}
+
 		// 尝试预算：链上按 position 升序最多打 maxTargets 个目标。
 		// 未开启故障转移 → 只打主目标（等价于改造前的单目标行为，零回归）。
 		// 策略值统一来自「设置」页写入的全局默认（快照），config 只作兜底。
@@ -962,6 +1200,11 @@ func handleIngress(pool *upstream.Pool, cfg *config.Config, usage *usageRecorder
 		}
 
 		// 开故障转移时，跳过正被熔断的目标（若全被熔断则退回整条链，宁可打也不 404）。
+		//
+		// 这一步只做**查询**（TargetAvailable 已是纯函数），不占探测名额：
+		// 紧接着的预算截断会把排到 failover_max_targets 之外的目标丢掉，
+		// 它们永远进不了下面的请求循环，也就没人替它们释放名额。
+		// 名额统一在循环内、真的要发请求前由 ClaimTargetProbe 领取。
 		active := cands
 		if route.FailoverEnabled {
 			var avail []routing.Candidate
@@ -996,6 +1239,25 @@ func handleIngress(pool *upstream.Pool, cfg *config.Config, usage *usageRecorder
 				return
 			}
 
+			// 真正要打这个目标时才领 half-open 探测名额。放在这里（而不是
+			// 上面的筛选里）是因为名额只能由「随后的成功/失败记账」释放，
+			// 而记账只发生在下面这个循环体内 —— 提前领取会让被预算裁掉的
+			// 目标永久占住名额。
+			//
+			// 非主目标且没开故障转移时不用熔断器管，行为与改造前一致。
+			if route.FailoverEnabled && !pool.ClaimTargetProbe(cand.TargetID) {
+				// 仍在冷却中，或探测名额已被同链的并发请求领走 —— 沿链继续。
+				if !isLast {
+					logger.Warn("failover: target not claiming a probe slot, switching target",
+						"model", ing.model, "provider", cand.Provider.Slug, "attempt", i+1,
+						"request_id", server.RequestIDFromContext(r.Context()))
+					continue
+				}
+				out = attemptOutcome{eligible: true, statusCode: http.StatusBadGateway,
+					code: "upstream_error", message: "no available upstream provider"}
+				break
+			}
+
 			// 一次 attempt 只取该 provider 的一把凭据：某把 key 失败时本请求不就地换
 			// 同 provider 的下一把，而是让位给链上下一个目标。跨请求的 key 轮换交给
 			// 冷却 —— 坏 key 被踢出 healthy 后，下个请求自会选到好 key。这是有意取舍，
@@ -1015,9 +1277,9 @@ func handleIngress(pool *upstream.Pool, cfg *config.Config, usage *usageRecorder
 			}
 
 			if ing.stream {
-				out = attemptStream(w, r, client, ing, cand, keyID, codec, rate, cfg, snap, usage, start)
+				out = attemptStream(w, r, client, ing, cand, authCtx, codec, rate, cfg, snap, usage, start)
 			} else {
-				out = attemptNonStream(w, r, client, ing, cand, keyID, codec, rate, cfg, snap, usage, start)
+				out = attemptNonStream(w, r, client, ing, cand, authCtx, codec, rate, cfg, snap, usage, start)
 			}
 
 			if out.committed {
@@ -1092,6 +1354,8 @@ func handleIngress(pool *upstream.Pool, cfg *config.Config, usage *usageRecorder
 		usage.record(&store.UsageRecord{
 			ID:              generateID(),
 			AccessKeyID:     keyID,
+			UserID:          authCtx.UserID,
+			RequestID:       server.RequestIDFromContext(r.Context()),
 			PublicModel:     ing.model,
 			ProviderID:      provID,
 			UpstreamModel:   upstreamModel,
@@ -1222,7 +1486,7 @@ func wantsStreamUsage(req *inwire.OpenAIChatRequest) bool {
 //
 // 本函数只做与协议无关的事：看门狗、心跳、事件循环、断流状态归类、落库；
 // 「统一事件 → 下游协议分片」全部经由 codec.NewSink 的 StreamSink 完成。
-func attemptStream(w http.ResponseWriter, r *http.Request, client *rosetta.Client, ing *ingressRequest, cand routing.Candidate, keyID string, codec ingressCodec, rate *rateCommit, cfg *config.Config, snap *snapshot.Snapshot, usage *usageRecorder, start time.Time) attemptOutcome {
+func attemptStream(w http.ResponseWriter, r *http.Request, client *rosetta.Client, ing *ingressRequest, cand routing.Candidate, authCtx *auth.Context, codec ingressCodec, rate *rateCommit, cfg *config.Config, snap *snapshot.Snapshot, usage *usageRecorder, start time.Time) attemptOutcome {
 	ctx := r.Context()
 	logger := usage.logger
 	publicModel := ing.model
@@ -1285,7 +1549,7 @@ func attemptStream(w http.ResponseWriter, r *http.Request, client *rosetta.Clien
 	idleTimer := time.AfterFunc(idleTimeout, func() {
 		idleTimedOut.Store(true)
 		logger.Warn("stream idle timeout",
-			"model", publicModel, "key_id", keyID,
+			"model", publicModel, "key_id", authCtx.KeyID,
 			"idle_timeout_ms", idleTimeout.Milliseconds())
 		_ = stream.Close()
 	})
@@ -1362,31 +1626,31 @@ func attemptStream(w http.ResponseWriter, r *http.Request, client *rosetta.Clien
 		case errors.Is(err, rosetta.ErrStreamTruncated):
 			status = "truncated"
 			errorCode = "stream_truncated"
-			logger.Warn("stream truncated", "model", publicModel, "key_id", keyID, "error", err)
+			logger.Warn("stream truncated", "model", publicModel, "key_id", authCtx.KeyID, "error", err)
 		case errors.Is(err, rosetta.ErrStreamOverflow):
 			status = "overflow"
 			errorCode = "stream_overflow"
-			logger.Error("stream overflow", "model", publicModel, "key_id", keyID, "error", err)
+			logger.Error("stream overflow", "model", publicModel, "key_id", authCtx.KeyID, "error", err)
 		case isClientGone(ctx, err):
 			// 客户端主动断开不是上游故障。此前一律记 error，后果是：后台错误率虚高、
 			// 成功率虚低，且真故障被 ERROR 噪音淹没。单独一个取值才能把两者分开。
 			status = "canceled"
-			logger.Info("client disconnected mid-stream", "model", publicModel, "key_id", keyID, "error", err)
+			logger.Info("client disconnected mid-stream", "model", publicModel, "key_id", authCtx.KeyID, "error", err)
 		default:
 			status = "error"
 			errorCode = "upstream_error"
-			logger.Error("stream error", "error", err, "model", publicModel, "key_id", keyID)
+			logger.Error("stream error", "error", err, "model", publicModel, "key_id", authCtx.KeyID)
 		}
 	} else if idleTimedOut.Load() && !sink.SawTerminal() {
 		status = "truncated"
 		errorCode = "stream_idle_timeout"
 		logger.Warn("stream cut by idle watchdog without terminal event",
-			"model", publicModel, "key_id", keyID,
+			"model", publicModel, "key_id", authCtx.KeyID,
 			"idle_timeout_ms", idleTimeout.Milliseconds(),
 			"content_written", sink.WroteContent())
 	} else if !sink.WroteContent() {
 		logger.Warn("stream finished with no content",
-			"model", publicModel, "key_id", keyID,
+			"model", publicModel, "key_id", authCtx.KeyID,
 			"stop_reason", string(stopReason),
 			"input_tokens", lastUsage.InputTokens,
 			"output_tokens", lastUsage.OutputTokens,
@@ -1402,7 +1666,9 @@ func attemptStream(w http.ResponseWriter, r *http.Request, client *rosetta.Clien
 
 	usage.record(&store.UsageRecord{
 		ID:              generateID(),
-		AccessKeyID:     keyID,
+		AccessKeyID:     authCtx.KeyID,
+		UserID:          authCtx.UserID,
+		RequestID:       server.RequestIDFromContext(r.Context()),
 		PublicModel:     publicModel,
 		ProviderID:      cand.Provider.ID,
 		UpstreamModel:   cand.UpstreamModel.ModelID,
@@ -1429,7 +1695,7 @@ func attemptStream(w http.ResponseWriter, r *http.Request, client *rosetta.Clien
 	return attemptOutcome{committed: true, success: status == "ok"}
 }
 
-func attemptNonStream(w http.ResponseWriter, r *http.Request, client *rosetta.Client, ing *ingressRequest, cand routing.Candidate, keyID string, codec ingressCodec, rate *rateCommit, cfg *config.Config, snap *snapshot.Snapshot, usage *usageRecorder, start time.Time) attemptOutcome {
+func attemptNonStream(w http.ResponseWriter, r *http.Request, client *rosetta.Client, ing *ingressRequest, cand routing.Candidate, authCtx *auth.Context, codec ingressCodec, rate *rateCommit, cfg *config.Config, snap *snapshot.Snapshot, usage *usageRecorder, start time.Time) attemptOutcome {
 	publicModel := ing.model
 	// 同attemptStream：别名 → 上游 model_id 的映射与协议私有字段的透传
 	// 必须在本次 attempt 内完成，不能由调用方造好传入。
@@ -1455,7 +1721,9 @@ func attemptNonStream(w http.ResponseWriter, r *http.Request, client *rosetta.Cl
 
 	usage.record(&store.UsageRecord{
 		ID:              generateID(),
-		AccessKeyID:     keyID,
+		AccessKeyID:     authCtx.KeyID,
+		UserID:          authCtx.UserID,
+		RequestID:       server.RequestIDFromContext(r.Context()),
 		PublicModel:     publicModel,
 		ProviderID:      cand.Provider.ID,
 		UpstreamModel:   cand.UpstreamModel.ModelID,
@@ -1590,7 +1858,8 @@ func handleListModels(forceShape string) http.HandlerFunc {
 		// 与转发入口同一鉴权口径（官方 OpenAI / Anthropic 的 /v1/models 同样要求
 		// 认证）。这里不查配额 —— 列个目录不消耗 token —— 但必须校验密钥：
 		// 否则任何人都能枚举出全部公开模型名，等于白送一份路由与供应商结构图。
-		if _, err := auth.Authenticate(r); err != nil {
+		authCtx, err := auth.Authenticate(r)
+		if err != nil {
 			writeAuthError(w, err, writeErr)
 			return
 		}
@@ -1601,7 +1870,10 @@ func handleListModels(forceShape string) http.HandlerFunc {
 		ids := make([]string, 0, 16)
 		seen := make(map[string]bool)
 		for _, route := range snap.Routes.ListRoutes() {
-			if route.Enabled && !seen[route.PublicName] {
+			// 模型白名单（多用户改造 P1）：列表就是「你能用什么」的权威答案，
+			// 必须与转发路径用**同一套判定**，否则会出现「列表里有、调起来 403」
+			// 或者反过来「能调但列表不显示」。
+			if route.Enabled && authCtx.AllowsModel(route.PublicName) && !seen[route.PublicName] {
 				seen[route.PublicName] = true
 				ids = append(ids, route.PublicName)
 			}
@@ -1609,7 +1881,12 @@ func handleListModels(forceShape string) http.HandlerFunc {
 		if r.URL.Query().Get("include") == "upstream" {
 			for _, m := range snap.Routes.ListUpstreamModels() {
 				id := m.ProviderSlug + "/" + m.ModelID
-				if m.Enabled && !seen[id] {
+				// 直连标识符与公开模型名是**同一个命名空间里的字符串**：
+				// 白名单里出现哪个就放行哪个。这里直接用 id 判定即可 ——
+				// routing.Resolve 对这类形式会合成一条 PublicName 恰为 id 的
+				// route，所以「解析后判定」与「按 id 判定」完全等价，
+				// 多走一次 Resolve 只是白费。
+				if m.Enabled && !seen[id] && authCtx.AllowsModel(id) {
 					seen[id] = true
 					ids = append(ids, id)
 				}
@@ -1705,15 +1982,25 @@ func handleGetModel(forceShape string) http.HandlerFunc {
 		if shape == "anthropic" {
 			writeErr = outwire.WriteAnthropicError
 		}
-		if _, err := auth.Authenticate(r); err != nil {
+		authCtx, err := auth.Authenticate(r)
+		if err != nil {
 			writeAuthError(w, err, writeErr)
 			return
 		}
 
 		modelID := r.PathValue("model")
 		snap := snapshot.Get()
-		if _, err := snap.Routes.Resolve(modelID); err != nil {
+		res, rerr := snap.Routes.Resolve(modelID)
+		if rerr != nil {
 			writeErr(w, http.StatusNotFound, "model_not_found", fmt.Sprintf("model %q not found", modelID))
+			return
+		}
+		// 模型白名单（P1）：校验**解析后**的公开模型名，而不是 URL 原文。
+		// 虚拟名与 provider/model 两种写法都解析到同一条路由，只查原文
+		// 会让 slug 形式绕过白名单。
+		if !authCtx.AllowsModel(res.Route.PublicName) {
+			writeErr(w, http.StatusForbidden, "model_not_allowed",
+				fmt.Sprintf("model %q is not available for this API key", modelID))
 			return
 		}
 

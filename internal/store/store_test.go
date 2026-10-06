@@ -369,7 +369,7 @@ func TestUsageStats_Cost(t *testing.T) {
 	usage("u3", "free", 5_000_000, 0, 5_000_000)       // 未配置价格 → 0
 	usage("u4", "deleted-model", 2_000_000, 0, 2_000_000)
 
-	stats, err := st.GetUsageStats(ctx, 0, 0)
+	stats, err := st.GetUsageStats(ctx, 0, 0, "")
 	if err != nil {
 		t.Fatalf("stats: %v", err)
 	}
@@ -382,10 +382,10 @@ func TestUsageStats_Cost(t *testing.T) {
 	}
 
 	// 时间边界：区间外的记录不计费。
-	if _, err = st.GetUsageStats(ctx, 1700000000001, 0); err != nil {
+	if _, err = st.GetUsageStats(ctx, 1700000000001, 0, ""); err != nil {
 		t.Fatalf("stats after range: %v", err)
 	}
-	future, err := st.GetUsageStats(ctx, 1700000000001, 1700000000002)
+	future, err := st.GetUsageStats(ctx, 1700000000001, 1700000000002, "")
 	if err != nil {
 		t.Fatalf("stats future: %v", err)
 	}

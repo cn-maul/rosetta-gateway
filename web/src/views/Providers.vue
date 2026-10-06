@@ -362,9 +362,23 @@ onMounted(load)
               <div class="row-title">
                 {{ p.name }}
                 <span class="badge" :class="p.enabled ? 'badge-live' : 'badge-off'">{{ p.enabled ? '启用' : '停用' }}</span>
+                <!-- 运行时未就绪：库里配得好好的，但上游池没建出任何可用凭据，
+                     请求打过去必然失败。改造前这个状态只进日志，界面上完全看不出来，
+                     运维只能靠「莫名 500」反推。只在「已启用」时标 ——
+                     停用是主动行为，不是故障。 -->
+                <span
+                  v-if="p.enabled && !p.ready"
+                  class="badge badge-off"
+                  :title="p.ready_reason || '没有可用的上游凭据'"
+                >
+                  未就绪
+                </span>
                 <span class="badge">{{ p.protocol }}</span>
               </div>
               <div class="row-sub mono">{{ p.slug }} · {{ p.endpoint }}</div>
+              <div v-if="p.enabled && !p.ready && p.ready_reason" class="row-sub">
+                {{ p.ready_reason }}
+              </div>
             </div>
             <div class="row-side">
               <button class="btn btn-sm btn-ghost" :disabled="testing === p.id" @click="testProvider(p)">

@@ -143,83 +143,6 @@ func CORS(next http.Handler) http.Handler {
 	})
 }
 
-// AdminCredentials 是管理后台凭据的运行时视图，由 internal/adminauth.Store 实现。
-//
-// 这里声明接口而不是直接依赖具体类型，是为了让 server 包保持纯粹：
-// 它只负责「HTTP 中间件该不该放行」，不关心凭据存在哪、怎么哈希。
-type AdminCredentials interface {
-	// Verify 报告一个明文令牌是否有效。
-	Verify(token string) bool
-	// HasCredential 报告是否已配置任何凭据（用户密码或 config 的 admin_token）。
-	HasCredential() bool
-}
-
-// AdminAuth 保护管理后台的 API。
-//
-// 放行规则：
-//   - GET  /admin/api/password/check —— 恒放行。前端靠它决定弹「设置密码」还是
-//     「输入密码」，响应里只有布尔值，不含敏感信息。
-//   - POST /admin/api/password/set   —— 仅在「尚未配置任何凭据」时放行。
-//     那是一次性引导窗口：还没有密码可被绕过，且不放行的话全新部署根本
-//     无法设置密码。一旦存在凭据，改密码必须带上旧凭据 ——
-//     否则局域网内任何人都能把管理员锁在门外。
-//   - 其余一律要求 Authorization: Bearer <密码或 admin_token>。
-//
-// 注意这里**没有**「admin_token 为空就一律放行」的分支：凭据为空时除上述两个
-// 引导端点外全部拒绝，前端因此会停在「设置密码」对话框，形成一条明确的
-// 初始化路径。旧实现在凭据为空时无条件 401（和 config.go 里
-// 「admin_token 留空 = 后台免鉴权」的注释正好相反），导致首次部署只能改配置文件。
-func AdminAuth(next http.Handler, creds AdminCredentials) http.Handler {
-	return AdminAuthThrottled(next, creds, NewFailureThrottle(loginFailLimit, loginCooldown))
-}
-
-// AdminAuthThrottled 是 AdminAuth 的可注入限速版本（测试与需要调参的部署用）。
-func AdminAuthThrottled(next http.Handler, creds AdminCredentials, throttle *FailureThrottle) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		path := r.URL.Path
-
-		if path == "/admin/api/password/check" {
-			next.ServeHTTP(w, r)
-			return
-		}
-		if path == "/admin/api/password/set" && !creds.HasCredential() {
-			// 引导窗口的 CSRF 防线。decodeJSON 的 Content-Type 断言是第一道
-			// （text/plain 是 CORS safelisted 类型，不预检也能发到服务端）；
-			// 这里是第二道，且不依赖请求体形状 —— 任何「跨源页面发起的
-			// 免鉴权写请求」都被挡下，与 Content-Type 无关。
-			//
-			// 判据用 Sec-Fetch-Site（现代浏览器强制发送、不可被 JS 伪造），
-			// 回退到 Origin 比对 Host。非浏览器客户端（curl / SDK）两个头
-			// 都不带 —— 那不是浏览器 CSRF 的攻击面，放行。
-			if !sameOrigin(r) {
-				writeForbidden(w)
-				return
-			}
-			next.ServeHTTP(w, r)
-			return
-		}
-
-		ip := clientIP(r)
-		if !throttle.Allow(ip) {
-			writeTooManyAttempts(w, throttle.RetryAfter(ip))
-			return
-		}
-		// Allow 占用了一个并发额度，此后每条出口路径都必须归还：
-		// Success/Fail 内部各还一次，这里用 defer 兜住 Verify panic 之外的
-		// 中途返回，并把额度交给下一次调用。
-		defer throttle.Release(ip)
-
-		if creds.Verify(bearerToken(r)) {
-			throttle.Success(ip)
-			next.ServeHTTP(w, r)
-			return
-		}
-
-		throttle.Fail(ip)
-		writeAuthError(w)
-	})
-}
-
 // sameOrigin 报告请求是否来自同源。
 //
 // 判据优先级：
@@ -229,6 +152,12 @@ func AdminAuthThrottled(next http.Handler, creds AdminCredentials, throttle *Fai
 //     与请求的 Host 比对；反向代理后两者可能不等，此时保守判为跨源。
 //  3. 都没有 —— 非浏览器客户端（curl、SDK、服务间调用）。它不受浏览器
 //     同源策略约束，因此不是 CSRF 的攻击面，放行。
+//
+// SameOrigin 导出给 admin 包：首次登录引导的设密码端点是免鉴权写接口，
+// 必须与中间件用同一套同源判据。两处各写一份，迟早会只改一处 —— 而漏改
+// 的那处就是一个免鉴权的跨站写入口。
+func SameOrigin(r *http.Request) bool { return sameOrigin(r) }
+
 func sameOrigin(r *http.Request) bool {
 	if site := r.Header.Get("Sec-Fetch-Site"); site != "" {
 		return site == "same-origin" || site == "none"
@@ -244,12 +173,22 @@ func sameOrigin(r *http.Request) bool {
 	return strings.EqualFold(u.Host, r.Host)
 }
 
+// WriteForbidden 导出给 admin 包的引导端点复用：免鉴权写接口被跨站调用时，
+// 必须与中间件用同一句拒绝文案，否则界面上的报错会因入口不同而不同。
+func WriteForbidden(w http.ResponseWriter) { writeForbidden(w) }
+
 func writeForbidden(w http.ResponseWriter) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusForbidden)
 	//nolint:errcheck // 响应写入失败已无补救手段
 	w.Write([]byte(`{"error":{"message":"拒绝跨站请求","type":"invalid_request_error"}}`))
 }
+
+// ClientIPOf 取请求来源地址。
+//
+// 导出给admin 包的登录限速用：它必须和鉴权中间件按同一口径计数，
+// 否则两处限速各算各的，攻击者可以从较松的那处撞进来。
+func ClientIPOf(r *http.Request) string { return clientIP(r) }
 
 // clientIP 取请求来源地址。
 //
@@ -263,6 +202,13 @@ func clientIP(r *http.Request) string {
 	}
 	return host
 }
+
+// LoginFailLimit / LoginCooldown 是登录失败的限速参数，导出给
+// admin 包的登录端点复用，保证「登录失败」与「管理鉴权失败」同一套阈值。
+const (
+	LoginFailLimit = loginFailLimit
+	LoginCooldown  = loginCooldown
+)
 
 const (
 	// loginFailLimit 是同一来源 IP 连续鉴权失败多少次后进入冷却。

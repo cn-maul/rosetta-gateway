@@ -7,13 +7,13 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"github.com/cn-maul/rosetta-gateway/internal/config"
+	"github.com/cn-maul/rosetta-gateway/internal/snapshot"
+	"github.com/cn-maul/rosetta-gateway/internal/store"
+	"github.com/cn-maul/rosetta-gateway/internal/upstream"
 	"net/http"
 	"strings"
 	"time"
-
-	"github.com/cn-maul/rosetta-gateway/internal/config"
-	"github.com/cn-maul/rosetta-gateway/internal/store"
-	"github.com/cn-maul/rosetta-gateway/internal/upstream"
 )
 
 type ProviderHandler struct {
@@ -67,6 +67,19 @@ type providerResponse struct {
 	QuirksJSON string `json:"quirks_json"`
 	CreatedAt  int64  `json:"created_at"`
 	UpdatedAt  int64  `json:"updated_at"`
+	// Ready / ReadyReason 是**运行时**状态（P4 / 设计 §4.7），来自快照，
+	// 不是库里的配置字段。
+	//
+	// 为什么要下发：上游池重建时若某 provider 的凭据解密失败或客户端建不起来，
+	// 它在库里看起来一切正常（enabled=1、凭据在），但请求打过去必然失败。
+	// 此前这类失败只进日志，界面一字不提，运维只能靠「莫名 500」反推根因。
+	//
+	// Ready=false 只在「一条可用凭据都没有」时出现；个别凭据失败但仍有可用
+	// 上游时 Ready 仍为 true，只在 ReadyReason 里给一句降级说明。
+	// 注意 disabled 的 provider 本来就不会被池构建，Ready 对它是 false 且
+	// 无意义 —— 前端只在 enabled 时展示这个状态，避免「停用」被读成「故障」。
+	Ready       bool   `json:"ready"`
+	ReadyReason string `json:"ready_reason,omitempty"`
 }
 
 // validProtocols 是管理 API 接受的 protocol 取值，与 upstream.buildClient
@@ -100,15 +113,25 @@ func writeProviderWriteError(w http.ResponseWriter, action string, err error) {
 	writeServerError(w, action, err)
 }
 
+// List 列出全部 provider，并附带**运行时**就绪状态。
+//
+// 就绪状态来自当前快照而不是库：库只记录配了什么，快照才反映「池实际建出了什么」。
+// 两者不一致正是最该看见的信息（配了却没建起来 = 凭据问题）。
 func (h *ProviderHandler) List(w http.ResponseWriter, r *http.Request) {
 	providers, err := h.store.ListProviders(r.Context())
 	if err != nil {
 		writeServerError(w, "list providers", err)
 		return
 	}
+	snap := snapshot.Get()
 	result := make([]providerResponse, 0, len(providers))
 	for _, p := range providers {
-		result = append(result, toProviderResponse(p))
+		res := toProviderResponse(p)
+		if sp, ok := snap.Providers[p.Slug]; ok {
+			res.Ready = sp.Ready
+			res.ReadyReason = sp.Reason
+		}
+		result = append(result, res)
 	}
 	writeJSON(w, http.StatusOK, result)
 }
@@ -256,9 +279,21 @@ func (h *ProviderHandler) Update(w http.ResponseWriter, r *http.Request, id stri
 		existing.Enabled = *req.Enabled
 	}
 	// 0 是合法值，语义为「回到全局默认」
+	//
+	// 上界不能少：time.Duration 是 int64 纳秒，ms > 9.223e12 时
+	// `time.Duration(ms) * time.Millisecond`（internal/upstream 的两处转换）
+	// 会回绕成负数，负 Duration 让 context.WithTimeout 立即过期、
+	// time.AfterFunc 立即开火。修复前这里只拒负数，实测
+	// PATCH {"timeout_ms":9223372036854} 照单全收（200）。
+	// 与 config.validate、settings_handler 共用同一个常量。
 	if req.TimeoutMs != nil {
 		if *req.TimeoutMs < 0 {
 			writeError(w, http.StatusBadRequest, "timeout_ms cannot be negative")
+			return
+		}
+		if *req.TimeoutMs > config.MaxDurationMillis {
+			writeError(w, http.StatusBadRequest, fmt.Sprintf(
+				"timeout_ms 过大：%d（上限 %d）", *req.TimeoutMs, config.MaxDurationMillis))
 			return
 		}
 		existing.TimeoutMs = *req.TimeoutMs

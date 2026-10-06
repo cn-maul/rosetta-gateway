@@ -14,6 +14,7 @@ import (
 
 	"github.com/cn-maul/rosetta-gateway/internal/admin"
 	"github.com/cn-maul/rosetta-gateway/internal/routing"
+	"github.com/cn-maul/rosetta-gateway/internal/server"
 	"github.com/cn-maul/rosetta-gateway/internal/snapshot"
 	"github.com/cn-maul/rosetta-gateway/internal/store"
 )
@@ -22,6 +23,19 @@ func authedGet(path string) *http.Request {
 	req := httptest.NewRequest(http.MethodGet, path, nil)
 	req.Header.Set("Authorization", "Bearer "+testAccessKey)
 	return req
+}
+
+// asScopedGet 给请求注入普通用户身份，用于**管理面** handler。
+//
+// 这些 handler 按 callerScope 收窄（无身份 = 哨兵值 = 什么都看不到），
+// 所以必须显式带上身份，不能只靠 Authorization 头 —— 头只在数据面
+// （auth.Authenticate）里被读，管理面读的是 context。
+func asScopedGet(path, userID string) *http.Request {
+	req := authedGet(path)
+	return req.WithContext(context.WithValue(req.Context(), server.UserCtxKey(), &store.User{
+		ID: userID, Username: userID,
+		Role: store.RoleUser, Status: store.UserStatusActive, AuthVersion: 1,
+	}))
 }
 
 // /v1/models 带容量元数据；/v1/models/{model} 单模型详情。
@@ -33,13 +47,21 @@ func TestModels_Metadata(t *testing.T) {
 		ContextWindow: 128000, MaxOutputTokens: 16384,
 	})
 	ri.AddRoute(&routing.Route{ID: "r1", PublicName: "flash", ProviderID: "p1", UpstreamModelID: "m1", Enabled: true})
+	// /v1/models 的可见性经 auth.Authenticate 判定，而它会查快照里的归属
+	// 用户（查不到 → 401/空列表）。这个测试的快照必须带 UsersByID。
 	snapshot.Init(&snapshot.Snapshot{
 		Routes:     ri,
 		Providers:  map[string]*snapshot.ProviderSnapshot{},
 		KeysByHash: snapshotKeysForTest(),
+		UsersByID:  snapshotUsersForTest(),
 		Runtime:    snapshot.RuntimeDefaults{DefaultContextWindow: 8192, DefaultMaxOutputTokens: 4096},
 	})
-	defer snapshot.Init(&snapshot.Snapshot{Routes: routing.NewRouteIndex(), Providers: map[string]*snapshot.ProviderSnapshot{}, KeysByHash: map[string]*snapshot.KeySnapshot{}})
+	defer snapshot.Init(&snapshot.Snapshot{
+		Routes:     routing.NewRouteIndex(),
+		Providers:  map[string]*snapshot.ProviderSnapshot{},
+		KeysByHash: map[string]*snapshot.KeySnapshot{},
+		UsersByID:  map[string]*snapshot.UserSnapshot{},
+	})
 
 	h := handleListModels("")
 	rec := httptest.NewRecorder()
@@ -76,7 +98,7 @@ func TestModels_Metadata(t *testing.T) {
 	ri2.AddRoute(&routing.Route{ID: "r1", PublicName: "flash", ProviderID: "p1", UpstreamModelID: "m1", Enabled: true})
 	snapshot.Init(&snapshot.Snapshot{
 		Routes: ri2, Providers: map[string]*snapshot.ProviderSnapshot{},
-		KeysByHash: snapshotKeysForTest(),
+		KeysByHash: snapshotKeysForTest(), UsersByID: snapshotUsersForTest(),
 	})
 	rec3 := httptest.NewRecorder()
 	detailMux.ServeHTTP(rec3, authedGet("/v1/models/flash"))
@@ -109,7 +131,7 @@ func TestBillingEndpoints(t *testing.T) {
 		t.Fatalf("update key: %v", err)
 	}
 	if err := db.CreateUsageRecord(ctx, &store.UsageRecord{
-		ID: "u1", AccessKeyID: "k1", PublicModel: "flash", ProviderID: "good",
+		ID: "u1", AccessKeyID: "k1", UserID: testUserID, PublicModel: "flash", ProviderID: "good",
 		UpstreamModel: "good-model", IngressProtocol: "openai-chat",
 		InputTokens: 500_000, OutputTokens: 0, TotalTokens: 500_000,
 		UsageState: "reported", Status: "ok", HTTPStatus: 200,
@@ -160,7 +182,7 @@ func TestBillingEndpoints(t *testing.T) {
 		t.Fatalf("seed price: %v", err)
 	}
 	if err := db.CreateUsageRecord(ctx, &store.UsageRecord{
-		ID: "u2", AccessKeyID: "k1", PublicModel: "flash", ProviderID: "good",
+		ID: "u2", AccessKeyID: "k1", UserID: testUserID, PublicModel: "flash", ProviderID: "good",
 		UpstreamModel: "good-model", IngressProtocol: "openai-chat",
 		OutputTokens: 1_000_000, TotalTokens: 1_000_000,
 		UsageState: "reported", Status: "ok", HTTPStatus: 200,
@@ -206,7 +228,7 @@ func TestUsageHistoryFilterAndCSV(t *testing.T) {
 	t.Cleanup(func() { db.Close() })
 	for i, st := range []string{"ok", "error", "ok"} {
 		if err := db.CreateUsageRecord(context.Background(), &store.UsageRecord{
-			ID: "r-" + strconv.Itoa(i), AccessKeyID: "k1",
+			ID: "r-" + strconv.Itoa(i), AccessKeyID: "k1", UserID: testUserID,
 			PublicModel: "flash", UpstreamModel: "m", IngressProtocol: "openai-chat",
 			TotalTokens: 10, UsageState: "reported", Status: st, HTTPStatus: 200,
 			Ts: time.Now().UnixMilli(),
@@ -217,7 +239,7 @@ func TestUsageHistoryFilterAndCSV(t *testing.T) {
 
 	h := admin.NewUsageHandler(db).History
 	rec := httptest.NewRecorder()
-	h(rec, authedGet("/admin/api/usage/history?status=error"))
+	h(rec, asScopedGet("/admin/api/usage/history?status=error", testUserID))
 	var page struct {
 		Records []struct {
 			Status string `json:"status"`
@@ -233,7 +255,7 @@ func TestUsageHistoryFilterAndCSV(t *testing.T) {
 
 	csvH := admin.NewUsageHandler(db).ExportCSV
 	rec2 := httptest.NewRecorder()
-	csvH(rec2, authedGet("/admin/api/usage/history.csv"))
+	csvH(rec2, asScopedGet("/admin/api/usage/history.csv", testUserID))
 	if ct := rec2.Header().Get("Content-Type"); !strings.HasPrefix(ct, "text/csv") {
 		t.Fatalf("csv content type: %s", ct)
 	}

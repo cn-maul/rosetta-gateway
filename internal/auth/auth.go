@@ -3,8 +3,11 @@ package auth
 import (
 	"crypto/sha256"
 	"encoding/hex"
+	"net"
 	"net/http"
+	"net/netip"
 	"strings"
+	"time"
 
 	"github.com/cn-maul/rosetta-gateway/internal/snapshot"
 )
@@ -12,10 +15,31 @@ import (
 type Context struct {
 	KeyID string
 	Name  string
+	// UserID 是这把 key 的归属用户（多用户改造 P0）。热路径上**保证非空**。
+	UserID string
+	// UserStatus 随快照下发，让「用户被禁用」在热路径零成本生效，
+	// 不需要每请求查库。
+	UserStatus string
 	// RPMLimit / TPMLimit 是该 key 的每分钟限速额度（0 = 不限），
 	// 从快照随鉴权一并带出，供转发热路径执行限速（DESIGN §11.4）。
 	RPMLimit int
 	TPMLimit int
+	// KeyModelAllow / GroupModelAllow 是模型可见性的两个维度（P1）：
+	// key 级白名单（access_keys.allowed_models_json）与用户所属组的白名单
+	// （user_group_models）。两者求**交**，且 key 级只能更紧。
+	//
+	// 都从快照带出，热路径判定零查库、零分配（白名单是个位数长度，
+	// 线性扫描比建 map 更快也更省内存）。
+	KeyModelAllow   snapshot.ModelAllow
+	GroupModelAllow snapshot.ModelAllow
+}
+
+// AllowsModel 报告本请求是否有权使用某个公开模型名。
+//
+// 两个维度独立判定而不是先求交再查：求交要为每个请求分配一个新切片，
+// 而这里白名单只有个位数，两次线性扫描的代价更低、且零分配。
+func (c *Context) AllowsModel(model string) bool {
+	return c.KeyModelAllow.Allows(model) && c.GroupModelAllow.Allows(model)
 }
 
 func Authenticate(r *http.Request) (*Context, error) {
@@ -40,12 +64,73 @@ func Authenticate(r *http.Request) (*Context, error) {
 	if !matched.Enabled {
 		return nil, ErrKeyDisabled
 	}
+
+	// 有效期（P2）。放在这里而不是最后：过期是「这把钥匙本身到期了」，
+	// 与归属用户无关，先判可以少走一次 map 查找，也不会泄露用户状态。
+	//
+	// 用 `now >= ExpiresAt` 而不是 `>`：expires_at 语义是「到这一刻起失效」，
+	// 写成严格大于会让恰好在这一毫秒的请求通过，边界行为不可预期。
+	if matched.ExpiresAt > 0 && time.Now().UnixMilli() >= matched.ExpiresAt {
+		return nil, ErrKeyExpired
+	}
+
+	// 来源 IP 白名单（P2）。AllowsIP 在未配置限制时直接返回 true，
+	// 所以这里不需要分支；为省一次 map 查找而重复「是否配置了限制」的判断，
+	// 反而会引入两处语义漂移的风险。
+	//
+	// 取值只用 RemoteAddr（直连对端），**刻意不读 X-Forwarded-For**：
+	// 那个头由客户端随意填写，采信它等于让 allowed_ips 形同虚设
+	// （任何人都能伪造一个白名单内的来源 IP）。代价是网关前面有反向代理时，
+	// 判定的是代理的地址 —— 这一点必须在文档与界面提示里讲明。
+	addr, _ := netip.ParseAddr(peerHost(r))
+	if !matched.AllowsIP(addr) {
+		return nil, ErrIPNotAllowed
+	}
+
+	// 归属用户的启用状态随快照一并带出，热路径据此零成本拒绝已禁用账号
+	// （不查库，禁用随 Swap 立即生效）。
+	snap := snapshot.Get()
+	u := snap.UsersByID[matched.UserID]
+	if u == nil {
+		// 查不到归属用户 → 拒绝。两种成因都不该放行：
+		//   - user_id 为空：迁移前的无归属 key。多用户改造决定「不发新 key
+		//     就不给用」（MULTIUSER.md §5.1 的修订），它必须失效到有人接手为止；
+		//   - user_id 指向一个不存在的行：数据不一致，放行等于绕过归属约束。
+		//
+		// 明确 401 好过静默放行：后者会让「谁的 key 在用」彻底无从追查。
+		return nil, ErrKeyUnowned
+	}
+	if !u.IsActive() {
+		return nil, ErrUserDisabled
+	}
+
 	return &Context{
-		KeyID:    matched.ID,
-		Name:     matched.Name,
-		RPMLimit: matched.RPMLimit,
-		TPMLimit: matched.TPMLimit,
+		KeyID:         matched.ID,
+		Name:          matched.Name,
+		UserID:        matched.UserID,
+		UserStatus:    u.Status,
+		RPMLimit:      matched.RPMLimit,
+		TPMLimit:      matched.TPMLimit,
+		KeyModelAllow: matched.AllowedModels,
+		// 组白名单直接取**已解析好的**那一份：P2 的 key 级组覆盖
+		// （access_keys.group_id）在快照重建时就已折算完毕，
+		// 热路径不需要判断「该用 key 的组还是用户的组」。
+		GroupModelAllow: matched.GroupModelAllow,
 	}, nil
+}
+
+// peerHost 取请求的对端地址（host 部分）。
+//
+// 刻意不读 X-Forwarded-For / X-Real-IP：那两个头由客户端随意填写，
+// 采信它们会让任何基于来源地址的判定（IP 白名单、失败限速）都能被伪造。
+// 代价是网关前面有反向代理时看到的是代理地址 —— 对「限源」这类需求来说，
+// 宁可判定得粗一点，也不要给一个可伪造的口子。
+func peerHost(r *http.Request) string {
+	host, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		return r.RemoteAddr
+	}
+	return host
 }
 
 // extractKey 只从请求头取密钥。

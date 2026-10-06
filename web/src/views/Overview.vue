@@ -57,12 +57,24 @@ const daySeries = computed<Bucket[]>(() => {
   const p = (x: number) => String(x).padStart(2, '0')
   const fmt = (d: Date) => `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}`
 
-  // 全部历史：以数据里最早一天为起点，否则以「今天 - days」为起点。
+  // 全部历史：起点优先用终身累计里的 first_record_at。
+  //
+  // 修��前这里是「byDay 里最早的那一天」—— 明细剪掉 30 天以后，byDay 只剩
+  // 30 天，趋势图会凭空丢掉更早的历史（usage_totals.first_record_at 存的就是
+  // 这个值，HANDOFF.md §「总览全部档」要求的正是改用它）。
+  // 拿不到（普通用户 / 没请求 / 无数据）时回退到旧逻辑。
   let start: Date
   if (days === 0) {
-    const keys = byDay.value.map((e) => e.key).sort()
-    const earliest = keys[0]
-    start = earliest ? new Date(earliest + 'T00:00:00') : new Date(now.getFullYear(), now.getMonth(), now.getDate() - 30)
+    const first = stats.value?.lifetime?.first_record_at
+    if (first && first > 0) {
+      start = new Date(first)
+    } else {
+      const keys = byDay.value.map((e) => e.key).sort()
+      const earliest = keys[0]
+      start = earliest
+        ? new Date(earliest + 'T00:00:00')
+        : new Date(now.getFullYear(), now.getMonth(), now.getDate() - 30)
+    }
   } else {
     start = new Date(now.getFullYear(), now.getMonth(), now.getDate() - (days - 1))
   }
@@ -132,8 +144,11 @@ async function load() {
   loading.value = true
   try {
     const { from, to } = rangeBounds(range.value)
+    // 「全部」档额外要终身累计：明细被剪掉之后，byDay 的最早一天不再是
+    // 真正的起点（只剩 30 天），first_record_at 才是（见 stats_handler）。
+    const wantLifetime = range.value === 'all'
     const [s, d, m, k] = await Promise.all([
-      api.stats(from, to),
+      api.stats(from, to, wantLifetime),
       api.usageByDay(from, to),
       api.usageByModel(from, to),
       api.usageByKey(from, to),
@@ -227,11 +242,13 @@ onUnmounted(() => {
           <div class="k">总 Tokens</div>
           <div class="v num">{{ fmtTokens(stats.total_tokens) }}</div>
         </div>
-        <!-- 费用：后端按各模型【当前】单价实时估算（元），改价会改写历史区间的结果；
-             未配置价格的模型按 0 计，所以它不是账单，是「照这个价算大概花多少」。 -->
+        <!-- 费用：按每条用量**落库当时**的模型单价算好并固化（cost_total），再求和。
+             所以改价不会回头改写已经发生的费用 —— 拿它和上游账单核对时，
+             两边对不上的原因要去查当时的价格，而不是现在的价格。
+             未配置价格的模型按 0 计，因此它不是账单，是「按各自当时的价算大概花多少」。 -->
         <div
           class="stat-card"
-          title="按模型当前单价实时估算（元）；未配置价格的模型不计费"
+          title="按各次调用当时的单价固化计算（元）；之后改价不会改写历史费用，未配置价格的模型不计费"
         >
           <div class="k">费用</div>
           <div class="v num">¥{{ fmtMoney(stats.cost) }}</div>

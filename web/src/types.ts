@@ -11,6 +11,14 @@ export interface Provider {
   max_retries: number
   quirks_json: string
   created_at: number
+  // ready 是**运行时**状态（后端快照），不是库里的配置字段：
+  // 库只记录配了什么，快照才反映「上游池实际建出了什么」。
+  // ready=false 表示一条可用凭据都没有 —— 请求打过去必然失败，
+  // 而在改造前这个状态只躺在日志里，界面上看不出来。
+  // 只在 enabled 时有意义：已停用的 provider 本来就不参与池构建。
+  ready: boolean
+  // ready_reason 面向运维的一句话原因（凭据解密失败 / 读不到凭据清单 / 无凭据）。
+  ready_reason?: string
 }
 
 // 新增上游只需这三项 + 可选 api_key；slug、启用、超时、重试由后端决定。
@@ -136,10 +144,140 @@ export interface AccessKey {
   key_prefix: string
   name: string
   enabled: boolean
+  /**
+   * 归属用户（多用户改造）。空串 = **无归属**。
+   *
+   * 无归属的 key 会被迁移退役（store.retireOrphanKeys）、鉴权直接 401，
+   * 界面上必须显式标注「无归属（不可用）」—— 否则运维会以为它还能用。
+   */
+  user_id: string
+  username?: string
   quota_tokens: number
   used_tokens: number
   rpm_limit: number // 每分钟请求数上限，0 = 不限
   tpm_limit: number // 每分钟 token 上限，0 = 不限
+  /**
+   * key 级模型白名单（P1）。
+   *
+   * **空数组 = 不限制**（不是「一个都不允许」）。与用户所属组的白名单求交，
+   * 且 key 级只能更紧 —— 所以这个值非空时，用户实际可用的模型是
+   * 「组白名单 ∩ 这个列表」。
+   */
+  allowed_models: string[]
+  /**
+   * 有效期截止（毫秒时间戳，P2）。0 = 永不过期。
+   *
+   * 过期后该 key 的请求直接 403 `key_expired`（不是 401）—— key 本身有效，
+   * 客户端看到 401 的第一反应是「重新配一把」，那是误导。
+   */
+  expires_at: number
+  /**
+   * 来源 IP 白名单（P2）：逗号分隔的 CIDR 或单 IP。空串 = 不限制。
+   *
+   * 只按**直连对端地址**判定，不读 `X-Forwarded-For`（那个头由客户端填写，
+   * 采信它等于白名单可伪造）。网关前面有反向代理时，判定的是代理的地址。
+   */
+  allowed_ips: string
+  /**
+   * key 级分组覆盖（P2）。空串 = 沿用归属用户所属的分组。
+   * 只有管理员能设置 —— 否则用户可以指向更宽松的组来绕过自己组的限制。
+   */
+  group_id: string
+  created_at: number
+}
+
+// ---- 多用户与会话（对应 internal/admin/user_handler.go、user_admin_handler.go）----
+
+/** GET /admin/api/session 的响应：登录是否启用。免鉴权。 */
+export interface SessionStatus {
+  enabled: boolean
+  /** 未启用时提示运维配置的环境变量名。 */
+  env: string
+  min_len: number
+}
+
+export type UserRole = 'admin' | 'user'
+export type UserStatus = 'active' | 'disabled'
+
+/** POST /admin/api/login 与 POST /admin/api/bootstrap 的响应（同形）。 */
+export interface LoginResult {
+  token: string
+  expires_at: number
+  username: string
+  role: UserRole
+  /**
+   * 保留字段但统一认证后恒为 false：首次登录由 /admin/api/bootstrap 引导，
+   * 不再存在「登录成功但还得去别处设密码」的中间态。
+ */
+  must_set_password: boolean
+}
+
+/**
+ * GET /admin/api/bootstrap 的响应。
+ *
+ * needs_setup 为真表示系统里有一个「已建出但还没设密码」的管理员，
+ * 登录页据此渲染「首次设置密码」表单。
+ */
+export interface BootstrapStatus {
+  needs_setup: boolean
+  /** 待初始化的账号名，供表单标题显示。needs_setup 为 false 时为空。 */
+  username?: string
+  session_enabled: boolean
+}
+
+/** GET /admin/api/me 的响应。 */
+export interface Me {
+  username: string
+  display_name: string
+  role: UserRole
+  status: UserStatus
+  quota_tokens: number
+  used_tokens: number
+  must_set_password: boolean
+  is_admin: boolean
+  session_enabled: boolean
+}
+
+/** GET /admin/api/users 的响应项。 */
+export interface User {
+  id: string
+  username: string
+  display_name: string
+  role: UserRole
+  status: UserStatus
+  /**
+   * 所属分组（P1）。空串 = 未分组 = **不受模型白名单限制**。
+   *
+   * 与「分到一个没配白名单的组」效果相同 —— 两者都是「不限制」。
+   * 界面上要讲清这点，否则会有人以为「没分组」是一种限制。
+   */
+  group_id: string
+  quota_tokens: number
+  used_tokens: number
+  auth_version: number
+  remark?: string
+  has_password: boolean
+  key_count: number
+  created_at: number
+  last_login_at: number
+  is_self: boolean
+}
+
+// ---- 分组与模型白名单（P1，对应 internal/admin/group_handler.go）----
+
+export interface Group {
+  id: string
+  name: string
+  description: string
+  /**
+   * 该组的公开模型名白名单。
+   *
+   * **空数组 = 该组不限制可见范围**（不是「什么都看不到」）。
+   * 新建的组默认就是空的 —— 界面上必须提示这一点，否则会出现
+   * 「建了组、忘了配模型、以为收紧了权限，实际放得更开」。
+   */
+  models: string[]
+  member_count: number
   created_at: number
 }
 
@@ -168,7 +306,23 @@ export interface Stats {
   error_count: number
   avg_tokens_per_sec: number
   avg_ttfb_ms: number
-  cost: number // 费用（元），按各模型当前单价对区间内用量实时估算
+  // 费用（元）：每条用量落库**当时**按模型单价算好并固化的金额求和
+  // （usage_records.cost_total）。改价只影响此后的记录，不回溯历史。
+  cost: number
+  // lifetime 为**终身累计**（表 B usage_totals）。仅管理员、且仅当请求带了
+  // include_lifetime=true 时出现 —— 缺席 = 这次没要终身数据。
+  // 普通用户拿不到：表 B 是不分用户的全局单行，给了就是别人的数字。
+  lifetime?: {
+    request_count: number
+    success_count: number
+    error_count: number
+    total_tokens: number
+    cost_total: number
+    // 全局最早一条用量的毫秒时间戳；0 = 从未有过记录
+    first_record_at: number
+    // 明细已被剪到的水位日（YYYY-MM-DD）；空 = 未剪过
+    pruned_through_day: string
+  }
 }
 
 // usage 分组端点（by-day / by-model / by-key / by-provider）的统一返回行

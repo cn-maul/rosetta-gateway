@@ -48,8 +48,9 @@ COPY docker/config.default.json /app/config.default.json
 COPY docker/docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
 RUN chmod 0755 /app/gateway /usr/local/bin/docker-entrypoint.sh
 
-# 全部可变状态（config.json / master.key / admin_auth.json / db）都锚在这个目录上。
+# 全部可变状态（config.json / master.key / session_secret / db）都锚在这个目录上。
 # 镜像层因此完全无状态：升级镜像不会碰配置与数据。
+# session_secret 必须随卷持久化：丢了它所有登录会话立即失效（用户需重新登录）。
 ENV ROSETTA_GW_HOME=/data
 VOLUME ["/data"]
 

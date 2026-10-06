@@ -15,7 +15,6 @@ type Config struct {
 	Listen       string    `json:"listen"`
 	DBPath       string    `json:"db_path"`
 	LogLevel     string    `json:"log_level"`
-	AdminToken   string    `json:"admin_token"`
 	MasterKeyEnv string    `json:"master_key_env"`
 	Defaults     Defaults  `json:"defaults"`
 	Bootstrap    Bootstrap `json:"bootstrap"`
@@ -83,10 +82,12 @@ func Load(path string) (*Config, error) {
 // Default 返回一份可直接启动的最小配置：不含任何 provider/route，
 // 全部由管理后台在前端添加。
 //
-// admin_token 留空**不等于**后台免鉴权：管理凭据独立存放在可执行文件同级的
-// admin_auth.json（见 internal/adminauth）。留空且凭据文件不存在时，后台处于
-// 「等待首次设置密码」状态 —— 除 password/check 与首次 password/set 外的接口一律 401。
-// 这也是默认 listen 只绑回环的原因。
+// 配置里**不再有任何管理凭据字段**。身份统一由 users 表承载：
+// 全新部署启动时会建出一个待初始化的 admin 账号，登录页据此显示
+// 「首次设置密码」表单。会话签名密钥也不在配置里 —— 它自动生成并持久化到
+// <homeDir>/session_secret，运维无需干预。
+//
+// 这也是默认 listen 只绑回环的原因：引导窗口对能连到端口的人开放。
 func Default() *Config {
 	c := &Config{
 		MasterKeyEnv: "ROSETTA_GW_MASTER_KEY",
@@ -197,7 +198,7 @@ func (c *Config) validate() error {
 	//   - time.AfterFunc 传负值 → 立即开火 → 流式响应刚发出头就被自己关掉。
 	//
 	// 24 小时对任何网关超时都远超实际需要，同时离溢出点有 380 倍余量。
-	const maxDurMillis = 86_400_000
+	const maxDurMillis = MaxDurationMillis
 
 	for _, f := range []struct {
 		name string
@@ -291,3 +292,12 @@ func (c *Config) FailoverFailureThreshold() int {
 	}
 	return 3
 }
+
+// MaxDurationMillis 是「毫秒 → time.Duration」的安全上界（24h）。
+//
+// 导出是为了让管理面的 provider 级 timeout_ms 用**同一个**常量：
+// 该字段曾经只校验负数，于是 PATCH {"timeout_ms":9223372036854} 会被照单
+// 全收（实测 200），而 internal/upstream 里的
+// `time.Duration(sp.TimeoutMs) * time.Millisecond` 直接回绕成负数。
+// 三处校验各写一份字面量，迟早会再漏一处。
+const MaxDurationMillis = 86_400_000

@@ -15,11 +15,11 @@
 // 2. 任何写操作（create/update/delete）成功后都必须 POST /admin/api/reload，
 //    否则内存快照不刷新，新资源对 /v1 不可见。用 mutate() 统一封装。
 // 3. 错误响应统一为 {"error":{"message":...,"type":...}}。
-// 4. 鉴权头：Authorization: Bearer <admin_token>，401 时弹 token 输入框。
+// 4. 鉴权头：Authorization: Bearer <会话令牌>。401 只有一个含义——会话无效，
+//    清本地令牌并把人送回登录页。
 
 import { reactive } from 'vue'
-import { authState } from './ui'
-import type { ApiError } from './types'
+import type { ApiError, BootstrapStatus, Me, SessionStatus, LoginResult } from './types'
 
 const TOKEN_KEY = 'rosetta_gw_admin_token'
 
@@ -31,6 +31,138 @@ export function saveToken(t: string) {
   auth.token = t
   if (t) localStorage.setItem(TOKEN_KEY, t)
   else localStorage.removeItem(TOKEN_KEY)
+}
+
+/**
+ * 当前登录用户。
+ *
+ * 存**内存**而非 localStorage：刷新后需要重新调 /me 确认，
+ * 顺手就验证了会话是否还有效（auth_version 变了、被禁用了都会在这里暴露）。
+ * 把 is_admin 缓存起来是刻意的 —— 界面要据此隐藏 admin-only 入口，
+ * 而每次渲染都问一遍后端既慢又会让模板难写。
+ */
+export const session = reactive({
+  me: null as Me | null,
+  /**
+   * needsSetup 为真表示系统里存在一个「已建出但还没设密码」的管理员，
+   * 登录页据此渲染「首次设置密码」表单而不是登录表单。
+   *
+   * 2026-10-06 起管理面统一到 users 表：admin_token 与 admin_auth.json
+   * 两条通道已删除，第一个管理员由 /admin/api/bootstrap 建出来。
+   */
+  needsSetup: false,
+  /** 待初始化的账号名，供表单标题显示（「为 admin 设置密码」）。 */
+  setupUsername: '',
+  /** /session 探测是否成功。false 时界面显示「无法连接」而不是登录框。 */
+  backendReady: false,
+  checked: false,
+})
+
+/**
+ * isAdmin 便捷读取。
+ *
+ * 现在只有一种部署形态（users 表 + 会话），所以判定退化成最直接的一行：
+ * 看当前身份是不是管理员。未登录时为 false。
+ */
+export function isAdmin(): boolean {
+  return session.me?.is_admin ?? false
+}
+
+/**
+ * loadSession 探测后端并拉取当前身份。
+ *
+ * 必须在应用启动时调一次。三个结果都要处理：
+ *   - /session 不可用 → backendReady=false，界面显示「无法连接」；
+ *   - 未登录 → me=null，界面显示登录页；
+ *   - 已登录 → me=<用户>。
+ *
+ * 首次登录的引导状态（needs_setup）也在这里一并取：登录页要靠它决定
+ * 渲染「设密码」还是「登录」。放在这里而不是 Login.vue 里单独调，
+ * 是为了让 App 的导航守卫与 Login 的表单**看到同一份状态** ——
+ * 两处各判一次就会出现「守卫认为已初始化、登录页还在要密码」。
+ */
+export async function loadSession(): Promise<void> {
+  // 部署可用性**只**由 /session 决定，绝不能被 /me 或 /bootstrap 的成败影响。
+  //
+  // 为什么必须隔离：/session 免鉴权，永远不会 401/429。其余两者会。
+  // 混在一个 try 里时，/me 只要抛一个非 401 的错（429 限速、500、网络抖动），
+  // 异常就会冒到上层，而上层会把状态兜底成「未登录」——
+  // 于是已登录用户被踢回登录页，且没有任何错误信息。
+  try {
+    await get<SessionStatus>('/session')
+    session.backendReady = true
+  } catch {
+    session.backendReady = false
+    session.checked = true
+    return
+  }
+
+  try {
+    // 先问引导状态再问身份：全新部署时 /me 必然 401，若顺序反了，
+    // 我们会在「未登录」的错误分支里提前 return，needs_setup 永远拿不到，
+    // 登录页就会显示一个永远登不进去的输入框。
+    const bs = await get<BootstrapStatus>('/bootstrap')
+    session.needsSetup = bs.needs_setup
+    session.setupUsername = bs.username ?? ''
+  } catch {
+    // 拿不到引导状态不是致命问题：按「已初始化」处理，用户会看到登录表单。
+    // 真实情况下（全新部署）它一定能拿到 —— 该端点免鉴权。
+    session.needsSetup = false
+    session.setupUsername = ''
+  }
+
+  try {
+    session.me = await get<Me>('/me')
+  } catch {
+    // 未登录（401）是正常状态，不是错误 —— 交给调用方渲染登录页。
+    // 其余状态码（429/500）同样只表示「拿不到身份」，一律降级成未登录。
+    session.me = null
+  } finally {
+    session.checked = true
+  }
+}
+
+/**
+ * login 用用户名+密码换取会话令牌。
+ *
+ * 成功后必须重新拉一次 /me：token 里有 auth_version 的副本，
+ * 而界面要的是「服务端此刻怎么看我」（角色、额度、是否被禁用），
+ * 不能只信 token 里那份签发时的快照。
+ */
+export async function login(username: string, password: string) {
+  const r = await post<LoginResult>('/login', { username, password })
+  saveToken(r.token)
+  session.me = await get<Me>('/me')
+  return r
+}
+
+/**
+ * bootstrapSetup 为「已建出但未设密码」的管理员设置密码并**直接登录**。
+ *
+ * 一步完成是刻意的：旧流程要先用 admin_token 进后台、再找到 admin、
+ * 再重置密码 —— 三步，且中间那步需要知道「去用户管理里找谁」。
+ * 统一认证后那条路已经不存在，引导必须自成闭环。
+ *
+ * 成功后 needs_setup 立刻置 false：这个免鉴权窗口就此关闭，
+ * 界面上不该再有任何「设密码」的入口。
+ */
+export async function bootstrapSetup(password: string) {
+  const r = await post<LoginResult>('/bootstrap', { password })
+  saveToken(r.token)
+  session.me = await get<Me>('/me')
+  session.needsSetup = false
+  session.setupUsername = ''
+  return r
+}
+
+/** logout 清除本地会话。后端清 cookie，失败也不阻塞前端登出。 */
+export async function logout() {
+  try {
+    await post('/logout')
+  } finally {
+    saveToken('')
+    session.me = null
+  }
 }
 
 export class ApiFail extends Error {
@@ -66,8 +198,15 @@ async function request<T>(method: string, path: string, body?: unknown): Promise
   }
 
   if (res.status === 401) {
-    authState.needToken = true
-    throw new ApiFail(401, '需要管理员令牌')
+    // 401 只有一个含义：**会话无效**（未登录 / 过期 / 密码已改 / 账号被禁用）。
+    // 统一认证后没有第二种情况了 —— 此前还有一个 admin_token 通道需要区分，
+    // 那个通道已删除。
+    //
+    // 清掉本地令牌并把 me 置空，让 App.vue 的 watch 把人送回登录页。
+    // 不能「什么都不做只弹框」：界面会停在一个永远 401 的空壳上。
+    saveToken('')
+    session.me = null
+    throw new ApiFail(401, '登录已失效，请重新登录')
   }
 
   const text = await res.text()
@@ -133,6 +272,10 @@ import type {
   Stats,
   UsageGroupEntry,
   UsageHistoryPage,
+  User,
+  UserRole,
+  UserStatus,
+  Group,
 } from './types'
 
 export const api = {
@@ -178,16 +321,149 @@ export const api = {
 
   // access keys
   keys: () => get<AccessKey[]>('/keys'),
-  createKey: (b: { name: string; quota_tokens?: number; rpm_limit?: number; tpm_limit?: number }) =>
-    mutate(() => post<KeyCreateResponse>('/keys', b)),
-  updateKey: (id: string, b: { name?: string; enabled?: boolean; quota_tokens?: number; rpm_limit?: number; tpm_limit?: number }) =>
-    mutate(() => patch<AccessKey>(`/keys/${id}`, b)),
+  createKey: (b: {
+    name: string
+    quota_tokens?: number
+    rpm_limit?: number
+    tpm_limit?: number
+    /**
+     * 归属用户（多用户改造）。
+     *
+     * 只有管理员需要显式传 —— 普通用户调用时后端会**忽略**这个字段
+     * 并强制归为自己（见 internal/admin/key_handler.go 的 Create）。
+     * 所以普通用户界面不需要这个输入框。
+     */
+    user_id?: string
+    /**
+     * key 级模型白名单（P1）。
+     *
+     * 空数组 / 不传 = 不限制（与「用户所属组」的白名单求交，且 key 级只能更紧）。
+     */
+    allowed_models?: string[]
+    /** 有效期截止（毫秒时间戳，P2）。0 = 永不过期。 */
+    expires_at?: number
+    /** 来源 IP 白名单：逗号分隔的 CIDR 或单 IP。空串 = 不限制。 */
+    allowed_ips?: string
+    /** key 级分组覆盖（P2，仅管理员有效）。空串 = 沿用用户所属分组。 */
+    group_id?: string
+  }) => mutate(() => post<KeyCreateResponse>('/keys', b)),
+  updateKey: (
+    id: string,
+    b: {
+      name?: string
+      enabled?: boolean
+      quota_tokens?: number
+      rpm_limit?: number
+      tpm_limit?: number
+      /**
+       * PATCH 语义：
+       *   - 不传（字段缺席）→ 保持原白名单；
+       *   - 传 []          → **清除**白名单（回到「不限制」）；
+       *   - 传非空数组     → 覆盖。
+       * 「清除」用空数组表达是因为界面上的动作就是「取消所有勾选后保存」。
+       */
+      allowed_models?: string[]
+      /** 0 = 改成永不过期；字段不传 = 保持原值。 */
+      expires_at?: number
+      /** 空串 = 清空白名单（不限制）；字段不传 = 保持原值。 */
+      allowed_ips?: string
+      /** 空串 = 取消分组覆盖（沿用用户所属分组）；仅管理员可设。 */
+      group_id?: string
+    },
+  ) => mutate(() => patch<AccessKey>(`/keys/${id}`, b)),
   deleteKey: (id: string) => mutate(() => del(`/keys/${id}`)),
+
+  // ---------- 多用户与会话 ----------
+
+  /**
+   * 用户列表（仅管理员）。
+   *
+   * 刻意**不包 mutate**：它不改变运行时快照，改账号不需要 reload。
+   * 真正需要 reload 的是「禁用账号」—— 那条在后端自己调了 reload
+   * （user_admin_handler.UpdateUser），因为被禁用用户的 key 要立刻失效。
+   */
+  users: () => get<User[]>('/users'),
+  createUser: (b: {
+    username: string
+    password?: string
+    display_name?: string
+    role?: UserRole
+    /** 分组 id（P1）。不传 / 空串 = 未分组 = 不受模型白名单限制。 */
+    group_id?: string
+    quota_tokens?: number
+    remark?: string
+  }) => post<User>('/users', b),
+  updateUser: (
+    id: string,
+    b: {
+      display_name?: string
+      role?: UserRole
+      status?: UserStatus
+      /**
+       * PATCH 语义：
+       *   - 不传 → 保持原分组；
+       *   - 传 ""  → 移出分组；
+       *   - 传 id  → 换到该组。
+       * 「移出分组」必须能用空串表达，因为那是界面上的一个明确动作。
+       */
+      group_id?: string
+      quota_tokens?: number
+      remark?: string
+    },
+  ) => patch<User>(`/users/${id}`, b),
+  deleteUser: (id: string) => del(`/users/${id}`),
+  /** 管理员重置他人密码。会递增该用户的 auth_version，其所有会话立即失效。 */
+  resetUserPassword: (id: string, password: string) =>
+    post(`/users/${id}/password`, { password }),
+  /** 自助改密码。会递增自己的 auth_version，**当前会话也随即失效**。 */
+  changeMyPassword: (old_password: string, new_password: string) =>
+    post('/me/password', { old_password, new_password }),
   // 审计日志：管理后台写操作留痕（只记字段名，不记值）
   audit: (limit = 50) => get<{ entries: AuditEntry[]; server_ts: number }>(`/audit?limit=${limit}`),
 
+  // ---------- 分组与模型白名单（P1）----------
+  //
+  // 全部走 mutate()：模型可见性随内存快照下发，写操作后必须 reload 才生效。
+  // （后端还有 server.AutoReload 兜底，这里是前端自己的契约，两边都做不冲突
+  //   —— 重复重建只是一次内存重建，而漏掉重建是「改了权限不生效」的静默故障。）
+
+  groups: () => get<Group[]>('/groups'),
+  createGroup: (b: { name: string; description?: string }) =>
+    mutate(() => post<Group>('/groups', b)),
+  updateGroup: (id: string, b: { name?: string; description?: string }) =>
+    mutate(() => patch<Group>(`/groups/${id}`, b)),
+  /**
+   * 删除分组。组里还有账号时后端返回 409（否则那批人的模型权限会被放大），
+   * 调用方要把这条错误原样展示给管理员，别吞掉。
+   */
+  deleteGroup: (id: string) => mutate(() => del(`/groups/${id}`)),
+  /**
+   * 整体替换某组的模型白名单（PUT 而非 PATCH：勾选后保存是「替换」语义，
+   * 取消勾选无法用增量表达）。
+   *
+   * 传空数组 = 清空白名单 = 该组**不限制**可见范围。
+   */
+  setGroupModels: (id: string, models: string[]) =>
+    mutate(() => put<{ models: string[]; note: string }>(`/groups/${id}/models`, { models })),
+
+  /**
+   * 当前调用者可选用的公开模型名清单（普通用户也可用，已按身份收窄）。
+   *
+   * 刻意不复用 /admin/api/routes：那是 admin-only（会暴露全部路由拓扑），
+   * 而 key 级白名单的设计意图就是「用户自己收紧」—— 普通用户读不到清单，
+   * 这个功能对他们就等于不存在。
+   */
+  modelNames: () =>
+    get<{ models: string[]; restricted: boolean }>('/model-names').then((r) => ({
+      models: r.models ?? [],
+      restricted: r.restricted ?? false,
+    })),
+
   // stats & usage（注意：usage 端点的 from/to 是【毫秒】时间戳；from=0 表示全部历史）
-  stats: (from = 0, to = Date.now()) => get<Stats>(`/stats?from=${from}&to=${to}`),
+  // includeLifetime 会让响应带上 lifetime（表 B 终身累计，含 first_record_at）。
+  // 后端只对管理员返回该字段；普通用户传了也只会缺席。
+  stats: (from = 0, to = Date.now(), includeLifetime = false) =>
+    get<Stats>(`/stats?from=${from}&to=${to}${includeLifetime ? '&include_lifetime=true' : ''}`),
   settings: () => get<Settings>('/settings'),
   // 设置里含运行时全局默认（超时 + 故障转移策略），这些值由快照驱动转发路径，
   // 所以必须走 mutate() 触发 reload 才能即时生效（模型容量默认也一并保存）。

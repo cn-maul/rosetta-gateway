@@ -39,7 +39,7 @@ func TestKeyHandler_QuotaWritePath(t *testing.T) {
 	rec2 := httptest.NewRecorder()
 	req2 := jsonRequest(http.MethodPatch, "/admin/api/keys/"+created.ID,
 		bytes.NewBufferString(`{"quota_tokens":0}`))
-	h.Update(rec2, req2, created.ID)
+	h.Update(rec2, asAdmin(req2), created.ID)
 	if rec2.Code != http.StatusOK {
 		t.Fatalf("update code=%d body=%s", rec2.Code, rec2.Body.String())
 	}
@@ -53,7 +53,7 @@ func TestKeyHandler_QuotaWritePath(t *testing.T) {
 	rec3 := httptest.NewRecorder()
 	req3 := jsonRequest(http.MethodPatch, "/admin/api/keys/"+created.ID,
 		bytes.NewBufferString(`{"quota_tokens":-5}`))
-	h.Update(rec3, req3, created.ID)
+	h.Update(rec3, asAdmin(req3), created.ID)
 	if rec3.Code != http.StatusBadRequest {
 		t.Fatalf("negative quota should 400, got %d body=%s", rec3.Code, rec3.Body.String())
 	}

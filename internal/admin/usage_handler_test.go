@@ -12,10 +12,10 @@ import (
 	"github.com/cn-maul/rosetta-gateway/internal/store"
 )
 
-// 回归测试：GroupByKey 走 groupByNamed，查询 JOIN 了 usage_records u。
-// 曾因调用方 SQL 自带 WHERE 又被 groupByNamed 拼接一个 WHERE 而报
+// 回归测试：GroupByKey 与其它 by-* 端点共用 groupBy，过滤条件统一由
+// store.UsageSource 下发（时间 + 作用域），JOIN access_keys 只取展示名。
+// 曾因调用方 SQL 自带 WHERE 又被拼接一个 WHERE 而报
 // `SQL logic error: near "WHERE"`（usage group by named 500）。
-// 现在时间过滤统一由 groupByNamed 用 groupRangeClause 拼接（u. 前缀），
 // 本测试验证带 / 不带 from/to 参数都能正常返回 200 + 分组结果。
 func TestUsageGroupByKey_NoDoubleWhere(t *testing.T) {
 	st := newTestStore(t)
@@ -56,7 +56,7 @@ func TestUsageGroupByKey_NoDoubleWhere(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			rec := httptest.NewRecorder()
 			req := httptest.NewRequest(http.MethodGet, tc.url, nil)
-			h.GroupByKey(rec, req)
+			h.GroupByKey(rec, asAdmin(req))
 			if rec.Code != http.StatusOK {
 				t.Fatalf("code=%d body=%s", rec.Code, rec.Body.String())
 			}
@@ -68,6 +68,147 @@ func TestUsageGroupByKey_NoDoubleWhere(t *testing.T) {
 				t.Fatalf("want %d groups, got %d: %+v", tc.want, len(entries), entries)
 			}
 		})
+	}
+}
+
+// TestUsageGroupBy_AfterPrune 守住「剪枝后 by-* 端点仍然出数」。
+//
+// 总览页的四个 by-*（by-day 趋势 / by-model / by-key / by-provider）是运维判断
+// 流量分布的依据。它们改走 store.UsageSource 后若拼错，症状是**端点 500 或
+// 静默变空** —— 而这类缺陷在「还没剪过枝」的库上完全看不出来，
+// 因为归档那一支恒为空。所以这条用例必须先剪枝再断言。
+//
+// 顺带守住 by-day 的趋势起点：合并来源后最早的一天来自表 A，
+// 剪枝不该让图上凭空少掉保留窗口以前的历史（设计 §4.8「趋势起点」一节）。
+func TestUsageGroupBy_AfterPrune(t *testing.T) {
+	st := newTestStore(t)
+	h := NewUsageHandler(st)
+	ctx := t.Context()
+
+	// 两条记录：一条在保留窗口外（会被剪进表 A），一条在窗口内（留在明细）。
+	old := time.Now().AddDate(0, 0, -(store.DefaultRetentionDays + 5)).UnixMilli()
+	recent := time.Now().Add(-time.Hour).UnixMilli()
+	for i, ts := range []int64{old, recent} {
+		if err := st.CreateUsageRecord(ctx, &store.UsageRecord{
+			ID:              fmt.Sprintf("u%d", i),
+			Ts:              ts,
+			AccessKeyID:     "kA",
+			PublicModel:     "m",
+			ProviderID:      "p1",
+			UpstreamModel:   "x",
+			IngressProtocol: "openai-chat",
+			InputTokens:     10,
+			OutputTokens:    5,
+			TotalTokens:     15,
+			Status:          "ok",
+			HTTPStatus:      200,
+		}); err != nil {
+			t.Fatalf("create usage: %v", err)
+		}
+	}
+
+	// 「全部历史」档：from=0 且显式传参。
+	groups := map[string]func(http.ResponseWriter, *http.Request){
+		"by-day":      h.GroupByDay,
+		"by-model":    h.GroupByModel,
+		"by-key":      h.GroupByKey,
+		"by-provider": h.GroupByProvider,
+	}
+	before := make(map[string]int)
+	for dim, fn := range groups {
+		n := callGroup(t, fn, "/admin/api/usage/"+dim+"?from=0")
+		before[dim] = n
+		if n == 0 {
+			t.Fatalf("%s returned 0 groups before pruning", dim)
+		}
+	}
+
+	if _, err := st.PruneOldUsage(ctx, store.DefaultRetentionDays); err != nil {
+		t.Fatalf("prune: %v", err)
+	}
+
+	for dim, fn := range groups {
+		after := callGroup(t, fn, "/admin/api/usage/"+dim+"?from=0")
+		if after == 0 {
+			t.Fatalf("%s returned no groups after pruning (archive branch not wired)", dim)
+		}
+		if after != before[dim] {
+			t.Errorf("%s group count changed across prune: %d -> %d", dim, before[dim], after)
+		}
+	}
+}
+
+// callGroup 请求一个 by-* 端点并返回分组数；非 200 直接失败并带上响应体。
+func callGroup(t *testing.T, fn func(http.ResponseWriter, *http.Request), url string) int {
+	t.Helper()
+	rec := httptest.NewRecorder()
+	fn(rec, asAdmin(httptest.NewRequest(http.MethodGet, url, nil)))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("%s code=%d body=%s", url, rec.Code, rec.Body.String())
+	}
+	var entries []usageGroupEntry
+	if err := json.Unmarshal(rec.Body.Bytes(), &entries); err != nil {
+		t.Fatalf("%s unmarshal: %v body=%s", url, err, rec.Body.String())
+	}
+	return len(entries)
+}
+
+// TestUsageGroupBy_ScopeNarrowsArchive 守住「归档那一支也要按用户收窄」。
+//
+// 这是本次改造最严重的潜在缺陷面：UsageSource 有明细与归档**两支**，
+// 作用域收窄任何一支漏掉，普通用户就能读到别人的数据。
+// 而漏掉归档支在「还没剪过枝」的库上完全测不出来（那一支恒为空），
+// 所以这条用例必须先剪枝 —— 剪完后 by-* 的数据只可能来自表 A。
+//
+// 白名单前缀只保证「能进来」，不保证「只看到自己的」，所以这条断言不能省。
+func TestUsageGroupBy_ScopeNarrowsArchive(t *testing.T) {
+	st := newTestStore(t)
+	h := NewUsageHandler(st)
+	ctx := t.Context()
+
+	// 两个用户各一把 key，各一条记录，都在保留窗口外（剪枝后进表 A）。
+	old := time.Now().AddDate(0, 0, -(store.DefaultRetentionDays + 5)).UnixMilli()
+	for i, u := range []string{"u1", "u2"} {
+		if err := st.CreateUsageRecord(ctx, &store.UsageRecord{
+			ID:              "rec-" + u,
+			Ts:              old,
+			UserID:          u,
+			AccessKeyID:     "k-" + u,
+			PublicModel:     "m",
+			ProviderID:      "p1",
+			UpstreamModel:   "x",
+			IngressProtocol: "openai-chat",
+			InputTokens:     100 * int64(i+1),
+			OutputTokens:    10,
+			TotalTokens:     100 * int64(i+1),
+			Status:          "ok",
+			HTTPStatus:      200,
+		}); err != nil {
+			t.Fatalf("create usage: %v", err)
+		}
+	}
+	if _, err := st.PruneOldUsage(ctx, store.DefaultRetentionDays); err != nil {
+		t.Fatalf("prune: %v", err)
+	}
+
+	// 此时 by-* 的数据只可能来自归档（明细里的老记录已被删）。
+	rec := httptest.NewRecorder()
+	h.GroupByKey(rec, asUser(httptest.NewRequest(http.MethodGet, "/admin/api/usage/by-key?from=0", nil), "u1"))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("code=%d body=%s", rec.Code, rec.Body.String())
+	}
+	var entries []usageGroupEntry
+	if err := json.Unmarshal(rec.Body.Bytes(), &entries); err != nil {
+		t.Fatalf("unmarshal: %v body=%s", err, rec.Body.String())
+	}
+	if len(entries) != 1 {
+		t.Fatalf("u1 should see exactly 1 group, got %d: %+v", len(entries), entries)
+	}
+	if entries[0].Key != "k-u1" {
+		t.Errorf("u1 saw another user's key: %q", entries[0].Key)
+	}
+	if entries[0].Tokens != 100 {
+		t.Errorf("tokens = %d, want 100 (u1's own usage)", entries[0].Tokens)
 	}
 }
 
@@ -116,7 +257,7 @@ func TestUsageHistory_PaginationNoDupNoSkip(t *testing.T) {
 		rec := httptest.NewRecorder()
 		req := httptest.NewRequest(http.MethodGet,
 			fmt.Sprintf("/admin/api/usage/history?from=0&to=%d&limit=%d&offset=%d", ts+1, limit, offset), nil)
-		h.History(rec, req)
+		h.History(rec, asAdmin(req))
 		if rec.Code != http.StatusOK {
 			t.Fatalf("offset=%d code=%d body=%s", offset, rec.Code, rec.Body.String())
 		}
@@ -164,7 +305,7 @@ func TestUsageHistory_ClampsPagingParams(t *testing.T) {
 		"limit=abc&offset=xyz",
 	} {
 		rec := httptest.NewRecorder()
-		h.History(rec, httptest.NewRequest(http.MethodGet, "/admin/api/usage/history?"+q, nil))
+		h.History(rec, asAdmin(httptest.NewRequest(http.MethodGet, "/admin/api/usage/history?"+q, nil)))
 		if rec.Code != http.StatusOK {
 			t.Fatalf("q=%q code=%d body=%s", q, rec.Code, rec.Body.String())
 		}

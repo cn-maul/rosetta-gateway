@@ -78,6 +78,32 @@ type ProviderEntry struct {
 	Credentials []*CredentialEntry
 }
 
+// ProviderFailure 描述「一个 provider 为什么没能在本次重建里就绪」。
+//
+// # 为什么必须有这个结构（P4 / 设计 §4.7）
+//
+// 重建池时单个 provider 可能因凭据解密失败、client 构建失败而跳过。
+// 在此之前这些失败**只进日志**：运维看到的现象是「路由配好了、请求莫名 500」，
+// 而根因（某个 key 解不开）躺在日志里没人看 —— 配置界面对此一字不提，
+// 这正是本项目最忌讳的「界面在说谎」。
+//
+// 现在失败项随快照下发到管理面，Providers 页能直接标出
+// 「这个 provider 未就绪：原因」。
+//
+// # 为什么是「一条凭据失败整个 provider 就算失败」
+//
+// 池里一个 provider 若一条可用凭据都没有，它就没有任何 client ——
+// 路由过去必然失败。部分凭据可用时 provider **不算失败**（还能服务），
+// 所以只有「零可用凭据」或「连凭据清单都读不出来」才记入这里。
+type ProviderFailure struct {
+	ID     string // provider id（与 store.Provider.ID 同域）
+	Slug   string
+	Name   string
+	Reason string // 面向运维的一句话原因，直接来自下面的失败分支
+	Stage  string // "list_credentials" | "decrypt" | "build_client" | "no_credentials"
+	Detail string // 原始错误文本（可能含凭据标签；不含密钥本身）
+}
+
 func NewPool(logger *slog.Logger) *Pool {
 	return &Pool{
 		providers: make(map[string]*ProviderEntry),
@@ -158,10 +184,19 @@ func (p *Pool) BuildFromConfig(cfg *config.Config) error {
 	return nil
 }
 
+// BuildFromStore 重建池并 Install。
+//
+// 失败清单**刻意不在这里消费**：本函数只在启动路径上用一次，
+// 「哪些 provider 未就绪」的可见化由 reload 路径经快照下发到管理面。
+// 这里仍保留原语义（整体失败才返回 error），未就绪的 provider 只记日志。
 func (p *Pool) BuildFromStore(ctx context.Context, st *store.Store, masterKey []byte, cfg *config.Config) error {
-	providers, err := p.PrepareFromStore(ctx, st, masterKey, cfg)
+	providers, failures, err := p.PrepareFromStore(ctx, st, masterKey, cfg)
 	if err != nil {
 		return err
+	}
+	for _, f := range failures {
+		p.logger.Warn("provider not ready after pool build",
+			"provider", f.Slug, "stage", f.Stage, "reason", f.Reason, "detail", f.Detail)
 	}
 	p.Install(providers, liveTargetIDsFromStore(ctx, st))
 	return nil
@@ -185,16 +220,29 @@ func liveTargetIDsFromStore(ctx context.Context, st *store.Store) map[string]boo
 }
 
 // PrepareFromStore 从数据库构建一份完整的 provider 表（含解密、建 client），
-// **不触碰池的现有状态**。任何失败都以 error 返回，调用方手里的池保持原样 ——
-// 旧实现「先清空 p.providers 再查库」在 ListProviders 失败时会留下一个空池，
-// 之后所有 /v1 请求都选不到上游，直到下一次成功的 reload。
-// 单 provider 级的失败（凭据解密失败、client 构建失败）仍只跳过该 provider 并记日志。
-func (p *Pool) PrepareFromStore(ctx context.Context, st *store.Store, masterKey []byte, cfg *config.Config) (map[string]*ProviderEntry, error) {
+// **不触碰池的现有状态**。旧实现「先清空 p.providers 再查库」在 ListProviders
+// 失败时会留下一个空池，之后所有 /v1 请求都选不到上游，直到下一次成功 reload。
+//
+// 三个返回值的分工（P4 / 设计 §4.7 的 partial-failure 通道）：
+//   - providers：建好的表；
+//   - failures：**没能就绪的 provider 清单**（单 provider 的凭据问题）；
+//   - err：整体失败（如 ListProviders 读库失败），此时 providers 为 nil，
+//     调用方不得 Install。
+//
+// failures 与 err 分开是刻意的：单个 provider 的凭据问题不该让整个 reload
+// 失败（其它 provider 照样要更新），但**必须可观测** —— 此前这些信息只在日志里，
+// 管理面看不到，运维只能靠「路由配了却莫名 500」反推。调用方要把它带进快照，
+// 让界面能标出来。
+//
+// 判定「未就绪」：一条可用凭据都没有。部分凭据可用时 provider 仍能服务，
+// 不计入 failures。
+func (p *Pool) PrepareFromStore(ctx context.Context, st *store.Store, masterKey []byte, cfg *config.Config) (map[string]*ProviderEntry, []ProviderFailure, error) {
 	providers, err := st.ListProviders(ctx)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
+	var failures []ProviderFailure
 	newProviders := make(map[string]*ProviderEntry, len(providers))
 	for _, sp := range providers {
 		timeout := cfg.UpstreamTimeout()
@@ -217,9 +265,17 @@ func (p *Pool) PrepareFromStore(ctx context.Context, st *store.Store, masterKey 
 			MaxRetries: maxRetries,
 		}
 
+		credErrs := 0
+
 		creds, err := st.ListCredentials(ctx, sp.ID)
 		if err != nil {
 			p.logger.Error("failed to list credentials", "provider", sp.Slug, "error", err)
+			failures = append(failures, ProviderFailure{
+				ID: sp.ID, Slug: sp.Slug, Name: sp.Name,
+				Stage:  "list_credentials",
+				Reason: "读取凭据失败，该 provider 本次未建立任何上游连接",
+				Detail: err.Error(),
+			})
 			continue
 		}
 
@@ -231,12 +287,28 @@ func (p *Pool) PrepareFromStore(ctx context.Context, st *store.Store, masterKey 
 			apiKey, err := decryptCredentialKey(sc.APIKeyEnc, masterKey)
 			if err != nil {
 				p.logger.Error("failed to decrypt credential", "provider", sp.Slug, "credential", sc.Label, "error", err)
+				credErrs++
+				// 同一 provider 的多条凭据可能各自失败，界面上要看到的是
+				// 「哪一条、为什么」，所以每条都留一条记录，而不是只留第一条。
+				failures = append(failures, ProviderFailure{
+					ID: sp.ID, Slug: sp.Slug, Name: sp.Name,
+					Stage:  "decrypt",
+					Reason: fmt.Sprintf("凭据「%s」解密失败", sc.Label),
+					Detail: err.Error(),
+				})
 				continue
 			}
 
 			client, err := buildClient(prov, apiKey, cfg)
 			if err != nil {
 				p.logger.Error("failed to build client", "provider", sp.Slug, "credential", sc.Label, "error", err)
+				credErrs++
+				failures = append(failures, ProviderFailure{
+					ID: sp.ID, Slug: sp.Slug, Name: sp.Name,
+					Stage:  "build_client",
+					Reason: fmt.Sprintf("凭据「%s」建客户端失败（协议/端点不合法？）", sc.Label),
+					Detail: err.Error(),
+				})
 				continue
 			}
 
@@ -258,9 +330,19 @@ func (p *Pool) PrepareFromStore(ctx context.Context, st *store.Store, masterKey 
 			prov.Credentials = append(prov.Credentials, cred)
 		}
 
+		// 「零可用凭据」才是真正的未就绪：一条可用凭据都没有，路由过来必然失败。
+		// 部分凭据可用时 provider 仍能服务，那几条失败已在上面各自留痕。
+		if len(prov.Credentials) == 0 && credErrs == 0 {
+			failures = append(failures, ProviderFailure{
+				ID: sp.ID, Slug: sp.Slug, Name: sp.Name,
+				Stage:  "no_credentials",
+				Reason: "没有已启用的凭据，该 provider 不会有可用上游",
+			})
+		}
+
 		newProviders[sp.Slug] = prov
 	}
-	return newProviders, nil
+	return newProviders, failures, nil
 }
 
 // Install 以构建好的新表原子替换运行状态。
@@ -281,7 +363,15 @@ func (p *Pool) Install(providers map[string]*ProviderEntry, liveTargetIDs map[st
 	kept := make(map[string]*targetHealth, len(liveTargetIDs))
 	for tid := range liveTargetIDs {
 		if h, ok := p.targets[tid]; ok {
-			kept[tid] = h // 沿用旧的健康状态（含未到期的 until）
+			// 沿用旧的健康状态（含未到期的 until），但**清掉 halfOpen**。
+			//
+			// halfOpen 的含义是「有一个探测请求正在途」，只对该请求所在的
+			// 进程实例有效。重建时上一个在途请求要么已完成（结果已记账、
+			// 名额已释放），要么随旧池一起作废 —— 两种情况下把它继承下来
+			// 都是错的，而错的方向是「永久不可用」：没有任何东西会再来
+			// 释放它。until 没到期时本来就该熔断，保留它即可。
+			h.halfOpen = false
+			kept[tid] = h
 		} else {
 			kept[tid] = &targetHealth{}
 		}
@@ -370,20 +460,42 @@ func (p *Pool) RecordCredentialSuccess(credID string) {
 	}
 }
 
-// TargetAvailable 报告链上某目标当前是否可打（未处于熔断冷却期）。
+// TargetAvailable 报告链上某目标当前是否**可能**可打（未处于熔断冷却期）。
 //
-// 冷却刚到期时实行 **half-open**：只放行一个探测请求，其余仍视为不可用。
-// 该副作用（占用探测名额）是刻意的 —— 不这样做，冷却到期瞬间所有请求会同时
-// 打向这个目标：若已自愈则是并发尖峰，若仍坏则全体真实失败并各自计一次，
-// 熔断-惊群会按「冷却时长 + 攒满阈值的时长」周期性循环。
-// 探测请求的成败由 RecordTargetSuccess / RecordTargetFailure 收敛：
-// 成功清零计数并释放名额，失败立刻重新熔断。
+// 它是**纯查询**，不占用任何名额 —— 「冷却到期后只放一个探测请求」这个
+// half-open 语义由 ClaimTargetProbe 承担，两者必须分开：调用方会先把整条链
+// 问一遍，再按 failover_max_targets 预算截断，被截掉的目标根本没进请求
+// 循环，也就永远等不到 RecordTargetSuccess/RecordTargetFailure 来释放名额。
+// 副作用留在查询里会让「探测名额」被预算裁掉的健康目标永久占住：
+// 主目标熔断期间明明有可用上游，却稳定返回 502，且必须人工调高预算或重启
+// 才能恢复（Install 沿用旧健康状态，reload 也救不回来）。
 func (p *Pool) TargetAvailable(targetID string) bool {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	h, ok := p.targets[targetID]
 	if !ok {
 		return true
+	}
+	return !time.Now().Before(h.until)
+}
+
+// ClaimTargetProbe 在**真的要向该目标发请求**时调用：原子地判断可用并占用
+// half-open 探测名额。
+//
+// 冷却刚到期时只放行一个探测请求，其余请求仍看到不可用 —— 不这样做，
+// 冷却到期瞬间所有请求会同时打向这个目标：若已自愈则是并发尖峰，若仍坏则
+// 全体真实失败并各自计一次，熔断-惊群会按「冷却时长 + 攒满阈值的时长」
+// 周期性循环。成败由 RecordTargetSuccess / RecordTargetFailure 收敛：
+// 成功清零计数并释放名额，失败立刻重新熔断。
+//
+// 返回 false 表示「此刻不打」：仍在冷却中，或探测名额已被别的请求领走。
+// 调用方应当把该目标当作本次不可用并继续沿链转移。
+func (p *Pool) ClaimTargetProbe(targetID string) bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	h, ok := p.targets[targetID]
+	if !ok {
+		return true // 从未见过的目标没有熔断状态，直接可打
 	}
 	if time.Now().Before(h.until) {
 		return false
