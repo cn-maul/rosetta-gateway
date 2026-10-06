@@ -357,3 +357,75 @@ export interface ApiError {
   message: string
   type: string
 }
+
+// ---------- 供应商 / 模型的导入导出 ----------
+
+/**
+ * 导出文件的结构。明文模式下三个数组有值；加密模式下只有 body/salt 有值，
+ * 其余为空 —— 真正的内容在 body 里，用口令解开后是同一种结构。
+ *
+ * 前端要读它只是为了「告诉用户这份文件里有什么」以及判断要不要口令，
+ * 不参与解析密文（那是后端的事，前端不该持有解密逻辑）。
+ */
+export interface ConfigExportFile {
+  version: number
+  exported_at: number
+  encrypted?: boolean
+  body?: string
+  kdf?: string
+  cipher?: string
+  salt?: string
+  iterations?: number
+  providers?: ConfigExportProvider[]
+  credentials?: ConfigExportCredential[]
+  models?: ConfigExportModel[]
+}
+
+export interface ConfigExportProvider {
+  slug: string
+  name: string
+  protocol: string
+  endpoint: string
+  enabled: boolean
+  timeout_ms: number
+  max_retries: number
+  quirks_json?: string
+}
+
+export interface ConfigExportCredential {
+  provider_slug: string
+  label: string
+  api_key: string
+  enabled: boolean
+  weight: number
+}
+
+export interface ConfigExportModel {
+  provider_slug: string
+  model_id: string
+  display_name?: string
+  enabled: boolean
+  context_window?: number
+  max_output_tokens?: number
+  supports_thinking?: boolean
+  price_input?: number
+  price_cache_hit?: number
+  price_output?: number
+}
+
+/**
+ * 导入结果。**逐项**而不是只给总数：导入是「改一个可能正在服务线上」的库，
+ * 用户需要知道哪几条进去了、哪几条被改名、哪几条被跳过。
+ */
+export interface ConfigImportResult {
+  dry_run: boolean
+  providers_created: number
+  /** 原 slug → 改名后的 slug。只有发生冲突的才有条目。 */
+  providers_renamed?: Record<string, string>
+  models_created: number
+  models_skipped: number
+  credentials_added: number
+  credentials_skipped: number
+  warnings?: string[]
+  notes?: string[]
+}

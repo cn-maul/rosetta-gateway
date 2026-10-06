@@ -4,10 +4,16 @@ import { api } from '../api'
 import { toast, confirmBox } from '../ui'
 import { fmtMoney, fmtDateTime } from '../fmt'
 import AppModal from '../components/AppModal.vue'
-import type { Provider, UpstreamModel, AuditEntry } from '../types'
+import type {
+  Provider,
+  UpstreamModel,
+  AuditEntry,
+  ConfigExportFile,
+  ConfigImportResult,
+} from '../types'
 
 // ---------- 分类页：设置项按分类分页展示，一次只看一类 ----------
-type TabKey = 'model' | 'runtime' | 'price' | 'audit'
+type TabKey = 'model' | 'runtime' | 'price' | 'audit' | 'transfer'
 
 const TABS: { key: TabKey; label: string; sub: string }[] = [
   { key: 'model', label: '模型默认', sub: '全局默认值；模型容量探测不到时回落到这里' },
@@ -19,6 +25,11 @@ const TABS: { key: TabKey; label: string; sub: string }[] = [
   // 所以这里改的是「往后怎么算」，不是「重算历史」。
   { key: 'price', label: '模型价格', sub: '按供应商 × 模型配置单价；改价只对之后的用量生效，不改写历史费用' },
   { key: 'audit', label: '审计日志', sub: '管理后台的写操作留痕（谁/何时/动了哪些字段）' },
+  {
+    key: 'transfer',
+    label: '导入导出',
+    sub: '导出供应商与模型配置，或从文件导入。只影响供应商与模型，不含路由与密钥',
+  },
 ]
 const tab = ref<TabKey>('model')
 
@@ -46,6 +57,112 @@ async function loadAudit() {
 watch(tab, (t) => {
   if (t === 'audit' && !auditLoadedOnce.value && !auditLoading.value) loadAudit()
 })
+
+// ---------- 导入 / 导出 ----------
+//
+// 两个动作都是「文件进、文件出」，没有表单要保存，所以单独一节。
+//
+// 界面上刻意把「带凭据」做成需要主动勾选、且与「加密」分开的两件事：
+// 加密防的是文件被别人捡到，带凭据决定的是文件里有没有钱。前者保护
+// 传输与存储，后者决定内容 —— 混成一个开关会让人以为"加密了所以带
+// 凭据也没关系"，而实际上明文带凭据正是最该避免的组合。
+const transferBusy = ref(false)
+const exportPass = ref('')
+const exportCreds = ref(false)
+
+// 导入分两步：先读文件并干跑，把「会发生什么」摆出来，确认后才真写。
+// 导入是改一个可能正在跑流量的库的动作，不能一击生效。
+const importFile = ref<File | null>(null)
+const importParsed = ref<ConfigExportFile | null>(null)
+const importPass = ref('')
+const importPreview = ref<ConfigImportResult | null>(null)
+const importError = ref('')
+
+function resetImport() {
+  importFile.value = null
+  importParsed.value = null
+  importPass.value = ''
+  importPreview.value = null
+  importError.value = ''
+}
+
+async function doExport() {
+  transferBusy.value = true
+  try {
+    await api.exportConfig(exportPass.value, exportCreds.value)
+    toast('导出已开始下载，请确认文件已保存', 'ok')
+  } catch (e) {
+    if ((e as { status?: number }).status !== 401) toast('导出失败：' + (e as Error).message, 'err')
+  } finally {
+    transferBusy.value = false
+  }
+}
+
+// onPickFile 读文件并立刻干跑一次，让用户先看到结果再决定要不要真导入。
+async function onPickFile(ev: Event) {
+  resetImport()
+  const f = (ev.target as HTMLInputElement).files?.[0]
+  if (!f) return
+  importFile.value = f
+  try {
+    const text = await f.text()
+    const parsed = JSON.parse(text) as ConfigExportFile
+    if (!parsed || typeof parsed.version !== 'number') {
+      importError.value = '这不是有效的导出文件（缺少版本号）'
+      return
+    }
+    importParsed.value = parsed
+    // 加密文件没有口令就没法看内容，先让用户填，而不是直接报一句错。
+    if (parsed.encrypted && !importPass.value) return
+    await runImport(true)
+  } catch (e) {
+    importError.value = '读取文件失败：' + (e as Error).message
+  }
+}
+
+// runImport 调后端导入。dryRun=true 时只算不写。
+async function runImport(dryRun: boolean) {
+  if (!importParsed.value) return
+  transferBusy.value = true
+  try {
+    const res = await api.importConfig(importParsed.value, importPass.value, dryRun)
+    importPreview.value = res
+    if (!dryRun) {
+      toast(`导入完成：新增 ${res.providers_created} 个供应商、${res.models_created} 个模型`, 'ok')
+      resetImport()
+      // 导入改的是供应商与模型，审计里会多一条记录 —— 重取一次，
+      // 让用户切回审计页时看到的是最新状态而不是缓存的旧列表。
+      loadAudit()
+    }
+  } catch (e) {
+    if ((e as { status?: number }).status !== 401) {
+      importError.value = (e as Error).message
+    }
+  } finally {
+    transferBusy.value = false
+  }
+}
+
+async function confirmImport() {
+  const p = importPreview.value
+  if (!p) return
+  const renamed = Object.entries(p.providers_renamed ?? {})
+  const ok = await confirmBox({
+    title: '确认导入',
+    body:
+      `将新增 ${p.providers_created} 个供应商、${p.models_created} 个模型` +
+      (p.credentials_added ? `、${p.credentials_added} 条凭据` : '') +
+      '。\n\n' +
+      (renamed.length
+        ? `以下供应商因重名会自动改名（原数据不受影响）：\n` +
+          renamed.map(([a, b]) => `　${a} → ${b}`).join('\n') +
+          '\n\n'
+        : '') +
+      `已存在的同名模型保留库里的配置，不覆盖。`,
+    confirmLabel: '导入',
+  })
+  if (ok) await runImport(false)
+}
 
 const loading = ref(true)
 const saving = ref(false)
@@ -494,7 +611,159 @@ onMounted(() => {
       </div>
     </div>
 
-    <!-- 分类 3：模型价格（页签顺序见 TABS） -->
+    <!-- 分类 5：导入 / 导出（页签顺序见 TABS） -->
+    <div v-else-if="tab === 'transfer'" class="panel">
+      <div class="xfer-grid">
+        <!-- 导出 -->
+        <section class="xfer-card">
+          <h3>导出</h3>
+          <p class="xfer-note">
+            导出当前全部供应商、模型与它们的参数（超时、重试、协议、端点、价格）。
+            <b>不含路由与访问密钥</b> —— 路由的公开名是给调用方看的契约，
+            跨环境照抄容易撞名；密钥则根本不该离开这个库。
+          </p>
+
+          <div class="field">
+            <label>加密口令（留空则导出明文）</label>
+            <input
+              v-model="exportPass"
+              class="input"
+              type="password"
+              autocomplete="new-password"
+              placeholder="至少 8 位"
+            />
+            <span class="tip">
+              {{
+                exportPass.trim().length === 0
+                  ? '明文导出：文件可直接查看，但转发给别人等于把配置交出去。'
+                  : '加密导出：整个文件用这个口令加密，没有口令的人打不开。'
+              }}
+            </span>
+          </div>
+
+          <label class="xfer-check">
+            <input v-model="exportCreds" type="checkbox" />
+            <span>
+              同时导出 API Key
+              <span class="tip" style="display: block">
+                不勾选则只导出结构，凭据留空 —— 导入后需要在界面上手工填写。
+                勾选后凭据以<b>解密后的明文</b>写进文件（受上面的口令保护）。
+              </span>
+            </span>
+          </label>
+
+          <div v-if="exportCreds && !exportPass.trim()" class="warn-line">
+            明文文件里会包含全部上游凭据，等同于密码本。请确认这份文件不会离开你的机器。
+          </div>
+
+          <button
+            class="btn btn-primary"
+            type="button"
+            :disabled="transferBusy"
+            @click="doExport"
+          >
+            {{ transferBusy ? '处理中…' : '导出为文件' }}
+          </button>
+        </section>
+
+        <!-- 导入 -->
+        <section class="xfer-card">
+          <h3>导入</h3>
+          <p class="xfer-note">
+            选择一份此前导出的文件。先「预演」看清会发生什么，确认后才真正写入。
+          </p>
+
+          <div class="field">
+            <label>导出文件</label>
+            <input class="input" type="file" accept=".json,application/json" @change="onPickFile" />
+            <span v-if="importFile" class="tip">已选择：{{ importFile.name }}</span>
+          </div>
+
+          <div v-if="importParsed?.encrypted" class="field">
+            <label>文件口令 *</label>
+            <input
+              v-model="importPass"
+              class="input"
+              type="password"
+              autocomplete="off"
+              placeholder="导出时设置的那个"
+              @input="importPreview = null"
+            />
+            <span class="tip">该文件已加密，必须输入导出时用的口令</span>
+            <button
+              class="btn btn-sm"
+              type="button"
+              :disabled="!importPass.trim() || transferBusy"
+              @click="runImport(true)"
+            >
+              预演导入
+            </button>
+          </div>
+
+          <div v-if="importError" class="err-line">{{ importError }}</div>
+
+          <div v-if="importParsed && !importParsed.encrypted" class="xfer-file-stat">
+            文件内容：{{ importParsed.providers?.length ?? 0 }} 个供应商、
+            {{ importParsed.models?.length ?? 0 }} 个模型、
+            {{ importParsed.credentials?.length ?? 0 }} 条凭据
+            <span v-if="importParsed.version !== 1" class="warn-line">
+              （文件版本 {{ importParsed.version }}，可能来自更新的网关）
+            </span>
+          </div>
+
+          <!-- 预演结果：逐项说明，而不是只给一个总数 -->
+          <div v-if="importPreview" class="xfer-preview">
+            <h4>
+              {{
+                importPreview.dry_run ? '预演结果（尚未写入）' : '导入结果'
+              }}
+            </h4>
+            <ul>
+              <li>新增供应商 <b>{{ importPreview.providers_created }}</b></li>
+              <li>新增模型 <b>{{ importPreview.models_created }}</b></li>
+              <li v-if="importPreview.credentials_added">
+                新增凭据 <b>{{ importPreview.credentials_added }}</b>
+              </li>
+              <li v-if="importPreview.models_skipped">
+                跳过已存在的模型 <b>{{ importPreview.models_skipped }}</b>
+              </li>
+            </ul>
+
+            <div v-if="Object.keys(importPreview.providers_renamed ?? {}).length" class="xfer-renames">
+              重命名（原有数据不受影响）：
+              <ul>
+                <li v-for="[from, to] in Object.entries(importPreview.providers_renamed ?? {})" :key="from">
+                  <code>{{ from }}</code> → <code>{{ to }}</code>
+                </li>
+              </ul>
+            </div>
+
+            <details v-if="importPreview.notes?.length" class="xfer-notes">
+              <summary>说明（{{ importPreview.notes.length }} 条）</summary>
+              <ul><li v-for="(n, i) in importPreview.notes" :key="i">{{ n }}</li></ul>
+            </details>
+
+            <details v-if="importPreview.warnings?.length" class="xfer-notes">
+              <summary>警告（{{ importPreview.warnings.length }} 条）</summary>
+              <ul><li v-for="(n, i) in importPreview.warnings" :key="i">{{ n }}</li></ul>
+            </details>
+
+            <button
+              v-if="importPreview.dry_run"
+              class="btn btn-primary"
+              type="button"
+              :disabled="transferBusy"
+              @click="confirmImport"
+            >
+              确认导入
+            </button>
+            <button v-else class="btn" type="button" @click="resetImport">再导一个</button>
+          </div>
+        </section>
+      </div>
+    </div>
+
+    <!-- 分类 4：模型价格（页签顺序见 TABS） -->
     <div v-else class="panel">
       <div class="price-head">
         <div>

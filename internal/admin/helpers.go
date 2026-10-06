@@ -17,6 +17,18 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 	json.NewEncoder(w).Encode(v)
 }
 
+// writeIndentedJSON 输出缩进过的 JSON。
+//
+// 导出文件是给人看和给人改的：一行到底的 minified JSON 在编辑器里没法
+// 手工检查，而"导入前先看一眼这个文件对不对"恰恰是防止误操作的关键一环。
+// 缩进后的体积差异对几十条配置来说无所谓。
+func writeIndentedJSON(w http.ResponseWriter, v any) error {
+	enc := json.NewEncoder(w)
+	enc.SetIndent("", "  ")
+	enc.SetEscapeHTML(false)
+	return enc.Encode(v)
+}
+
 func writeError(w http.ResponseWriter, status int, message string) {
 	writeJSON(w, status, map[string]any{
 		"error": map[string]string{

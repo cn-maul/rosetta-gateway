@@ -263,6 +263,9 @@ func main() {
 	reloadHandler := admin.NewReloadHandler(reloader.Reload)
 	auditHandler := admin.NewAuditHandler(db)
 	usageHandler := admin.NewUsageHandler(db)
+	// 供应商 + 模型的导入导出。写在 settings 附近是因为它在界面上的入口
+	// 也在「设置」页里，与设置项同一层级。
+	configTransferHandler := admin.NewConfigTransferHandler(db, masterKey, cfg)
 	// 会话签名密钥。**不再要求运维配环境变量**：没配就从
 	// <homeDir>/session_secret 读，文件也没有就自动生成并原子落盘。
 	//
@@ -348,6 +351,11 @@ func main() {
 	adminMux.HandleFunc("POST /admin/api/usage/prune", usageHandler.Prune)
 	adminMux.HandleFunc("GET /admin/api/settings", settingsHandler.Get)
 	adminMux.HandleFunc("PUT /admin/api/settings", settingsHandler.Update)
+	// 供应商 + 模型的导入导出。admin-only 由 handler 内的 requireAdmin 把关
+	// —— 路径在 /admin/api/config- 前缀下，白名单管不到这里，而导出体里
+	// 可能含全部上游凭据，绝不能落到普通用户手里。
+	adminMux.HandleFunc("POST /admin/api/config-export/export", configTransferHandler.Export)
+	adminMux.HandleFunc("POST /admin/api/config-export/import", configTransferHandler.Import)
 	adminMux.HandleFunc("GET /admin/api/usage/history", usageHandler.History)
 	adminMux.HandleFunc("GET /admin/api/me", userHandler.Me)
 	adminMux.HandleFunc("POST /admin/api/logout", userHandler.Logout)

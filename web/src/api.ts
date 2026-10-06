@@ -19,7 +19,7 @@
 //    清本地令牌并把人送回登录页。
 
 import { reactive } from 'vue'
-import type { ApiError, BootstrapStatus, Me, SessionStatus, LoginResult } from './types'
+import type { ApiError, BootstrapStatus, Me, SessionStatus, LoginResult, ConfigImportResult } from './types'
 
 const TOKEN_KEY = 'rosetta_gw_admin_token'
 
@@ -225,6 +225,74 @@ async function request<T>(method: string, path: string, body?: unknown): Promise
 }
 
 export const get = <T>(path: string) => request<T>('GET', path)
+
+/**
+ * 下载一个文件（导出配置用）。
+ *
+ * 为什么不用 fetch + a[download]：那要求 blob URL 与 <a> 元素同源可用，
+ * 而这里要处理的是服务端 Content-Disposition 里的文件名、以及可能很大的
+ * 配置清单 —— 直接读 blob、复用同一个 URL 并及时 revoke，避免大文件在
+ * 内存里留两份。
+ */
+async function downloadFile(path: string, body: unknown): Promise<void> {
+  const headers: Record<string, string> = { 'Content-Type': 'application/json' }
+  if (auth.token) headers['Authorization'] = 'Bearer ' + auth.token
+
+  let res: Response
+  try {
+    res = await fetch('/admin/api' + path, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify(body),
+      signal: AbortSignal.timeout(60_000),
+    })
+  } catch (e) {
+    const name = e instanceof DOMException ? e.name : ''
+    if (name === 'TimeoutError' || name === 'AbortError') {
+      throw new ApiFail(0, '导出超时，请稍后重试')
+    }
+    throw new ApiFail(0, '网络错误：' + (e instanceof Error ? e.message : String(e)))
+  }
+
+  if (res.status === 401) {
+    // 与 request() 同语义：401 只代表会话失效，必须原样处理，
+    // 否则页面停在一个永远失败的导出按钮上。
+    saveToken('')
+    session.me = null
+    throw new ApiFail(401, '登录已失效，请重新登录')
+  }
+  if (!res.ok) {
+    // 错误响应仍是 JSON，形状与其他端点一致。
+    let msg = `导出失败 (HTTP ${res.status})`
+    try {
+      const data = await res.json()
+      if (data?.error?.message) msg = data.error.message
+    } catch {
+      /* 非 JSON 错误体，保留通用文案 */
+    }
+    throw new ApiFail(res.status, msg)
+  }
+
+  // 服务端给的文件名形如 rosetta-config-20261006-230815.json
+  const cd = res.headers.get('Content-Disposition') ?? ''
+  const m = /filename="?([^";]+)"?/.exec(cd)
+  const filename = m ? m[1] : 'rosetta-config.json'
+
+  const blob = await res.blob()
+  const url = URL.createObjectURL(blob)
+  try {
+    const a = document.createElement('a')
+    a.href = url
+    a.download = filename
+    document.body.appendChild(a)
+    a.click()
+    a.remove()
+  } finally {
+    // 立刻 revoke：配置清单可能含全部上游凭据，让它尽可能短地留在内存里。
+    // 延后到下一轮事件循环 revoke 是为了确保点击已经派发。
+    setTimeout(() => URL.revokeObjectURL(url), 0)
+  }
+}
 export const post = <T>(path: string, body?: unknown) => request<T>('POST', path, body ?? {})
 export const put = <T>(path: string, body: unknown) => request<T>('PUT', path, body)
 export const patch = <T>(path: string, body: unknown) => request<T>('PATCH', path, body)
@@ -468,6 +536,16 @@ export const api = {
   // 设置里含运行时全局默认（超时 + 故障转移策略），这些值由快照驱动转发路径，
   // 所以必须走 mutate() 触发 reload 才能即时生效（模型容量默认也一并保存）。
   saveSettings: (b: Settings) => mutate(() => put<Settings>('/settings', b)),
+
+  // ---------- 供应商 / 模型 导入导出 ----------
+  //
+  // 导出走独立的下载路径而**不是** request<T>：响应是文件而非 JSON，
+  // 而 request() 无条件 JSON.parse 一个文件大小的配置清单纯属浪费，
+  // 真正需要读 JSON 的只有「导入前预览文件内容」那一步。
+  exportConfig: (passphrase: string, includeCredentials: boolean) =>
+    downloadFile('/config-export/export', { passphrase, include_credentials: includeCredentials }),
+  importConfig: (data: unknown, passphrase: string, dryRun: boolean) =>
+    post<ConfigImportResult>('/config-export/import', { data, passphrase, dry_run: dryRun }),
   usageByDay: (from: number, to: number) => get<UsageGroupEntry[]>(`/usage/by-day?from=${from}&to=${to}`),
   usageByModel: (from = 0, to = Date.now()) => get<UsageGroupEntry[]>(`/usage/by-model?from=${from}&to=${to}&limit=10`),
   usageByKey: (from = 0, to = Date.now()) => get<UsageGroupEntry[]>(`/usage/by-key?from=${from}&to=${to}&limit=10`),

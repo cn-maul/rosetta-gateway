@@ -1111,3 +1111,112 @@ textarea {
     padding: 16px;
   }
 }
+
+/* ---------- 设置 · 导入导出 ---------- */
+.xfer-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(340px, 1fr));
+  gap: 18px;
+  align-items: start;
+}
+.xfer-card {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  padding: 18px;
+  border: 1px solid var(--border);
+  border-radius: var(--r-card);
+  background: var(--surface);
+}
+.xfer-card h3 {
+  margin: 0;
+  font-size: 14px;
+  font-weight: 600;
+}
+.xfer-note {
+  margin: 0;
+  font-size: 12.5px;
+  line-height: 1.6;
+  color: var(--muted);
+}
+.xfer-note b {
+  color: var(--foreground);
+  font-weight: 600;
+}
+.xfer-check {
+  display: flex;
+  gap: 9px;
+  align-items: flex-start;
+  font-size: 13px;
+  line-height: 1.5;
+  cursor: pointer;
+}
+.xfer-check input {
+  margin-top: 2px;
+  flex: 0 0 auto;
+}
+/* 明文带凭据是唯一真正危险的组合，所以给它一条独立的醒目提示 ——
+   加密与"要不要带凭据"是两件事，混在一起会让人以为加密了就没事了。 */
+.warn-line {
+  padding: 8px 10px;
+  border-radius: var(--r-chip);
+  background: var(--danger-soft);
+  color: var(--danger);
+  font-size: 12px;
+  line-height: 1.55;
+}
+.err-line {
+  padding: 8px 10px;
+  border-radius: var(--r-chip);
+  background: var(--danger-soft);
+  color: var(--danger);
+  font-size: 12.5px;
+}
+.xfer-file-stat {
+  font-size: 12.5px;
+  color: var(--muted);
+  line-height: 1.6;
+}
+.xfer-preview {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 14px;
+  border: 1px solid var(--border);
+  border-radius: var(--r-thumb);
+  background: var(--surface-secondary);
+}
+.xfer-preview h4 {
+  margin: 0;
+  font-size: 13px;
+  font-weight: 600;
+}
+.xfer-preview ul {
+  margin: 0;
+  padding-left: 20px;
+  font-size: 12.5px;
+  line-height: 1.7;
+  color: var(--muted);
+}
+.xfer-preview b {
+  color: var(--foreground);
+}
+.xfer-renames {
+  font-size: 12.5px;
+  color: var(--muted);
+}
+.xfer-renames code {
+  font-size: 12px;
+  padding: 1px 5px;
+  border-radius: 4px;
+  background: var(--surface-tertiary);
+}
+.xfer-notes summary {
+  cursor: pointer;
+  font-size: 12.5px;
+  color: var(--muted);
+  user-select: none;
+}
+.xfer-notes[open] summary {
+  margin-bottom: 6px;
+}
