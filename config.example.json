@@ -1,5 +1,5 @@
 {
-  "listen": "127.0.0.1:8080",
+  "listen": "127.0.0.1:8666",
   "db_path": "./data/gateway.db",
   "log_level": "info",
   "master_key_env": "ROSETTA_GW_MASTER_KEY",

@@ -43,13 +43,13 @@ function Die([string]$msg) { Write-Host "[X] $msg" -ForegroundColor Red; exit 1 
 
 # ---------- 配置：由网关自身管理，位于可执行文件同级（bin\config.json） ----------
 # 网关不接受命令行参数；首次启动若无配置会自动生成默认文件。
-# 这里只为端口探测 / 停止旧进程读取该配置，缺失时按默认 8080 处理即可。
+# 这里只为端口探测 / 停止旧进程读取该配置，缺失时按默认 8666 处理即可。
 $ConfigPath = Join-Path (Split-Path $Bin) 'config.json'
 
 # 从 listen 字段提取端口。取最后一个冒号之后的部分——IPv6 地址自带多个冒号
-# （如 "[::1]:8080"、"[fe80::1]:8080"），按最后一个冒号切才拿到端口而非半截地址。
-# 解析失败/越界按默认 8080 处理。
-$Port = 8080
+# （如 "[::1]:8666"、"[fe80::1]:8666"），按最后一个冒号切才拿到端口而非半截地址。
+# 解析失败/越界按默认 8666 处理。
+$Port = 8666
 if (Test-Path $ConfigPath) {
   try {
     $cfg = Get-Content $ConfigPath -Raw -Encoding UTF8 | ConvertFrom-Json

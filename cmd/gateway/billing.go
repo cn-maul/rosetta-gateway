@@ -328,7 +328,7 @@ func billingRangeMs(start, end string) (from, to int64, bad bool) {
 func isLoopbackListen(listen string) bool {
 	host, _, err := net.SplitHostPort(listen)
 	if err != nil {
-		// 可能是 ":8080"（空 host = 所有接口）或压根不是 host:port。
+		// 可能是 ":8666"（空 host = 所有接口）或压根不是 host:port。
 		if strings.HasPrefix(listen, ":") {
 			return false
 		}

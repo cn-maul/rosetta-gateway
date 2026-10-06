@@ -116,5 +116,5 @@ $sizeMb = [math]::Round((Get-Item $Bin).Length / 1MB, 1)
 Write-Host ""
 Write-Host "[OK] 编译完成：$Bin（$sizeMb MB）" -ForegroundColor Green
 Write-Host "  直接运行：.\bin\gateway.exe          # 无需参数，配置自动落在 bin\config.json" -ForegroundColor DarkGray
-Write-Host "  首次进入：http://127.0.0.1:8080/admin/" -ForegroundColor DarkGray
+Write-Host "  首次进入：http://127.0.0.1:8666/admin/" -ForegroundColor DarkGray
 Write-Host "  或走脚本：.\gateway.ps1 -NoBuild     # 前台（注入密钥/落日志）；加 -Detached 挂后台" -ForegroundColor DarkGray

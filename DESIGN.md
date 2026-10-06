@@ -899,7 +899,7 @@ users 表 + 会话一条通道后，管理员只是一个 `role='admin'` 的普�
 
 ```json
 {
-  "listen": "127.0.0.1:8080",
+  "listen": "127.0.0.1:8666",
   "db_path": "./data/gateway.db",
   "log_level": "info",
   "master_key_env": "ROSETTA_GW_MASTER_KEY",
@@ -939,7 +939,9 @@ users 表 + 会话一条通道后，管理员只是一个 `role='admin'` 的普�
 这些值同时也是「设置」页可热改项（写入 `app_settings.runtime_defaults`）。**优先级：设置页 > 本文件**：
 设置页里显式保存过的值覆盖 config，未配置的字段回落到这里的 `defaults`，见 §10「参数落点」。
 
-**关于 `listen`**：默认（含程序自动生成的配置）是 `127.0.0.1:8080`。
+**关于 `listen`**：默认（含程序自动生成的配置）是 `127.0.0.1:8666` —— 端口与
+Docker 侧对齐，且避开浏览器的保留端口表（6666 是 IRC 段，浏览器会直接
+`ERR_UNSAFE_PORT`，黑名单见 `internal/config/ports.go`，完整讨论见 DOCKER.md）。
 网关对外提供 `/v1` 是常态，但**首次启动时第一个管理员的密码还没设**，
 此时绑 `0.0.0.0` 等于把「抢先完成首次设置密码」的权利交给局域网里第一个访问 `/admin/` 的人。
 要对外服务就显式改成 `0.0.0.0:<port>` —— 启动日志会打印实际监听地址，
