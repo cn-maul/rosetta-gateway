@@ -124,9 +124,23 @@ func (s *Store) ensureRollupDimensions() error {
 // 去建，老库升级时 SQLite 直接报「no such column: cost_total」→ migrate() 失败
 // → **整个网关起不来**（与 ensureUserIndexes 同一类问题）。
 //
-// CREATE TRIGGER IF NOT EXISTS 本身幂等，所以每次启动都可安全执行。
+// 先 DROP 再 CREATE（不用 CREATE ... IF NOT EXISTS）：后者在触发器已存在时
+// 会完全跳过，于是改过触发器体之后**老库永远保留旧体**，与新库静默分叉且不报错
+// —— totals 漂移只有在对账时才可能发现。DROP + CREATE 同样幂等。
 func (s *Store) ensureUsageTotalsTrigger() error {
-	_, err := s.db.Exec(`CREATE TRIGGER IF NOT EXISTS trg_update_usage_totals
+	// DROP 与 CREATE 放在**同一条写事务**里。分两次 Exec 时若 DROP 成功、
+	// CREATE 失败，就会留下「触发器已删但没重建」的窗口 —— 那段时间内
+	// usage_totals 完全不再累加，且没有任何信号（DROP 本身不报错）。
+	tx, err := s.db.Begin()
+	if err != nil {
+		return fmt.Errorf("begin usage totals trigger tx: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }() //nolint:errcheck // 已提交时是 no-op
+
+	if _, err := tx.Exec(`DROP TRIGGER IF EXISTS trg_update_usage_totals`); err != nil {
+		return fmt.Errorf("drop usage totals trigger: %w", err)
+	}
+	_, err = tx.Exec(`CREATE TRIGGER trg_update_usage_totals
 		AFTER INSERT ON usage_records
 		BEGIN
 		  UPDATE usage_totals SET
@@ -146,6 +160,9 @@ func (s *Store) ensureUsageTotalsTrigger() error {
 		END`)
 	if err != nil {
 		return fmt.Errorf("create usage totals trigger: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit usage totals trigger tx: %w", err)
 	}
 	return nil
 }
@@ -258,7 +275,19 @@ func (s *Store) reconcileUsageTotals() error {
 	//
 	// pruned_through_day 为空时表 A 必然为空（归档与水位同事务写入），
 	// 所以这个来源在两种状态下都对。
-	src, args := UsageSource(UsageFilter{})
+	//
+	// ⚠️ src 下面被引用**十次**，而 args 只在末尾整体传一次。
+	// 这只在 UsageFilter{} **零占位符**时正确 —— 十个子查询各自含 N 个 ?，
+	// args 却只有一份，按顺序绑定时第 k 个子查询的占位符会绑到 args 的第
+	// 1..N 位，于是**第二个及之后的子查询全部错绑**（读到别的值，或报
+	// "column index out of range"）。
+	//
+	// 当前恰好成立：UsageFilter{} 的所有字段都是零值 → usageSource 不
+	// append 任何参数。将来若给对账加过滤条件（例如只对账某 provider），
+	// 下面十处引用必须同步改成各带一份 args，否则静默算错总额。
+	// 这也是为什么不把 filter 参数化 —— 一旦参数化，这条约束立刻变成地雷。
+	// 对账的口径必须是「全部」，否则终身累计本身就错了。
+	src, args := UsageSource(UsageFilter{}) //nolint:staticcheck // 见上方：args 必须为零长度
 	if _, err := s.db.ExecContext(ctx,
 		`UPDATE usage_totals SET
 		     request_count    = (SELECT `+UsageSumExpr("n", "u")+` FROM `+src+`),
@@ -408,17 +437,49 @@ func (s *Store) PruneOldUsage(ctx context.Context, keepDays int) (*PruneResult, 
 		res.RollupRows = n
 	}
 
+	// 本次最多剪多少行明细。
+	//
+	// 写池只有单连接，这个事务从聚合到删除全程持锁。首次剪枝（部署已久、
+	// 从没剪过）可能有百万行级明细，一条 DELETE 全删会把写连接占住几十秒，
+	// 期间**所有**写入排队 —— 表现为网关整体卡顿，而不是「后台在忙」。
+	//
+	// 超出的部分留给下一次剪枝：谓词是ts < cutoffTs，与「已经删了多少行」
+	// 无关，下一次自然接着删。水位只在本次事务内推进到 cut-1，所以中途
+	// 失败不会留下「已删但未记账」的空洞 —— 聚合与删除始终同事务。
+	const maxPruneDelete = 20000
+
 	// DELETE 与上面的聚合共用同一个谓词、同一个事务 —— 这是「剪枝前后同一窗口
 	// 数字完全相等」的全部依据：进了表 A 的行必然被删掉，没进表 A 的一行不动。
-	if delRes, err := tx.ExecContext(ctx, `DELETE FROM usage_records WHERE ts < ?`, cutoffTs); err != nil {
+	//
+	// 子查询取最老的 maxPruneDelete 行（按 id 排序，id 含时间前缀因而与
+	// ts 单调），而不是「前 N 行」—— 保证删的是**连续的一段**，
+	// 不会在明细里打散出许多时间碎片影响后续统计。
+	if delRes, err := tx.ExecContext(ctx,
+		`DELETE FROM usage_records WHERE rowid IN (
+		     SELECT rowid FROM usage_records WHERE ts < ? ORDER BY id LIMIT ?
+		 )`, cutoffTs, maxPruneDelete); err != nil {
 		return nil, fmt.Errorf("delete pruned details: %w", err)
 	} else if n, aerr := delRes.RowsAffected(); aerr == nil {
 		res.DeletedRows = n
 	}
 
-	if _, err := tx.ExecContext(ctx,
-		`UPDATE usage_totals SET pruned_through_day = ? WHERE id = 1`, res.PrunedThrough); err != nil {
-		return nil, fmt.Errorf("advance prune watermark: %w", err)
+	// 水位只在**明细确实清空到cutoff** 时推进，否则不动。
+	//
+	// 上一版无条件推进：若本次因 maxPruneDelete 截断而没删干净，水位却已
+	// 标成「已剪到 cut-1」，下一轮剪枝就会跳过这一段 —— 那段明细既留在
+	// 明细表里（占空间、拖慢查询）又不被计入归档，账目与实际永久脱节。
+	// 所以必须先确认 cutoffTs 之前已无残留行。
+	var remaining int64
+	if err := tx.QueryRowContext(ctx,
+		`SELECT EXISTS(SELECT 1 FROM usage_records WHERE ts < ? LIMIT 1)`,
+		cutoffTs).Scan(&remaining); err != nil {
+		return nil, fmt.Errorf("check prune remainder: %w", err)
+	}
+	if remaining == 0 {
+		if _, err := tx.ExecContext(ctx,
+			`UPDATE usage_totals SET pruned_through_day = ? WHERE id = 1`, res.PrunedThrough); err != nil {
+			return nil, fmt.Errorf("advance prune watermark: %w", err)
+		}
 	}
 
 	if err := tx.Commit(); err != nil {

@@ -239,7 +239,15 @@ func (s *Store) migrate() error {
 			created_at        INTEGER NOT NULL
 		)`,
 		`CREATE INDEX IF NOT EXISTS idx_route_targets_route ON route_targets(route_id, position)`,
-		`CREATE TRIGGER IF NOT EXISTS trg_update_used_tokens
+		// 触发器**先 DROP 再 CREATE**，不用 CREATE ... IF NOT EXISTS。
+		//
+		// 后者在触发器已存在时**完全跳过**，于是一旦改了触发器体（口径调整、
+		// 补字段），老库会永远保留旧体、新库用新体 —— 两边静默分叉，
+		// 且不报任何错：totals 悄悄漂移，只有对账时才可能发现。
+		// DROP + CREATE 是幂等的（每次都得到代码里这份定义），代价只是
+		// 启动时重建一次触发器，可忽略。
+		`DROP TRIGGER IF EXISTS trg_update_used_tokens`,
+		`CREATE TRIGGER trg_update_used_tokens
 		 AFTER INSERT ON usage_records
 		 BEGIN
 		   UPDATE access_keys SET used_tokens = used_tokens + NEW.total_tokens WHERE id = NEW.access_key_id;

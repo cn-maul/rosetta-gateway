@@ -2,6 +2,9 @@ package store
 
 import (
 	"context"
+	"database/sql"
+	"errors"
+	"math"
 	"strings"
 	"time"
 )
@@ -43,6 +46,38 @@ type UsageRecord struct {
 // 而且因为字段名和列名都叫 ts，看不出哪里错了。
 func (s *Store) CreateUsageRecord(ctx context.Context, r *UsageRecord) error {
 	ts := r.Ts
+
+	// token 数一律不许为负。
+	//
+	// 上游（或某个不守规矩的中转）回报负数时，负值会经两条路径放大：
+	//   - AFTER INSERT 触发器把 total_tokens 累加进 access_keys.used_tokens
+	//     与 usage_totals —— **终身累计**直接被拉低，且不会自行恢复；
+	//   - 配额判定「used >= quota」因此永远不成立，等于凭空发放配额。
+	// 两个后果都不是「显示难看」，是账目与配额同时失真。
+	//
+	// 为什么在入口 clamp 而不是加 DDL CHECK：SQLite 无法给**已有表**追加
+	// CHECK 约束（要重建表 = 搬全部历史明细 + 重建索引 + 重建触发器），
+	// 迁移风险远大于收益。而这里是唯一写入口（CreateUsageRecord），
+	// 在此归一已覆盖所有调用方 —— 导入、剪枝回填、E2E 都走它。
+	//
+	// 归一为 0 而不是报错：一条用量记录的可信度本就由 usage_state 表达，
+	// 为一条脏数据拒绝整个请求会让上游的不当行为变成网关的可用性问题。
+	// 已在 DESIGN §11.1 的「宁可少算」原则内。
+	if r.InputTokens < 0 {
+		r.InputTokens = 0
+	}
+	if r.OutputTokens < 0 {
+		r.OutputTokens = 0
+	}
+	if r.TotalTokens < 0 {
+		r.TotalTokens = 0
+	}
+	if r.ReasoningTokens < 0 {
+		r.ReasoningTokens = 0
+	}
+	if r.CachedTokens < 0 {
+		r.CachedTokens = 0
+	}
 	if ts == 0 {
 		ts = time.Now().UnixMilli()
 	}
@@ -85,6 +120,16 @@ func (s *Store) freezeUsageCost(ctx context.Context, r *UsageRecord) float64 {
 		   FROM upstream_models WHERE provider_id = ? AND model_id = ?`,
 		r.ProviderID, r.UpstreamModel).Scan(&pin, &phit, &pout)
 	if err != nil {
+		// 查价失败**不能静默计0**：费用是固化字段，之后所有报表一律读它，
+		// 不再按当前价重算。所以此刻的 0 不是「免费」，而是**永久漏账** ——
+		// 一次读池抖动就固定下来，事后没有任何对账线索能发现。
+		//
+		// 只记 WARN：写路径不能因读池抖动而失败（那会把上游的计费问题
+		// 变成网关的可用性问题）。真正的补救是 RecomputeCost —— 事后按
+		// 当时的单价重算这一条，见 usage_dao.go 的同名函数。
+		s.logger.Warn("freeze usage cost: price lookup failed, cost recorded as 0",
+			"provider_id", r.ProviderID, "upstream_model", r.UpstreamModel,
+			"request_id", r.RequestID, "error", err)
 		return 0
 	}
 	uncached := r.InputTokens - r.CachedTokens
@@ -95,7 +140,51 @@ func (s *Store) freezeUsageCost(ctx context.Context, r *UsageRecord) float64 {
 	if hit <= 0 {
 		hit = pin
 	}
-	return (float64(uncached)*pin + float64(r.CachedTokens)*hit + float64(r.OutputTokens)*pout) / 1_000_000.0
+	total := (float64(uncached)*pin + float64(r.CachedTokens)*hit + float64(r.OutputTokens)*pout) / 1_000_000.0
+	// 舍入到 1e-9 元。float64 的二进制表示无法精确表达十进制小数，
+	// 于是「×3 个单价再除 1e6」会带出长尾（如 0.0030000000000000005），
+	// 这些值原样进 JSON 响应，前端展示与对账都会看到脏尾巴。
+	//
+	// 精度取 1e-9 而非更高：1 纳元的 1% 仍远小于任何真实计费的最小粒度，
+	// 而更长的尾数只会把噪声带得更远。
+	if total != 0 {
+		total = math.Round(total*1e9) / 1e9
+	}
+	return total
+}
+
+// RecomputeCost 按**当前**单价重算某条用量的固化费用。
+//
+// 用途：freezeUsageCost 因读池抖动失败而记 0 时，事后补救。它是唯一一处
+// 允许用「当前价」覆盖已固化费用的地方 —— 因为原值本就是错的（0），
+// 不覆盖会把错误永久保留。
+//
+// 按ID 精确重算，不做批量：这类记录的量级极小（读池抖动属偶发），
+// 逐条处理即可，不必引入「重算区间」这种会误伤正常固化值的批量语义。
+func (s *Store) RecomputeCost(ctx context.Context, recordID string) (bool, error) {
+	var r UsageRecord
+	err := s.read.QueryRowContext(ctx,
+		`SELECT COALESCE(provider_id, ''), COALESCE(upstream_model, ''),
+		        COALESCE(input_tokens, 0), COALESCE(cached_tokens, 0), COALESCE(output_tokens, 0)
+		   FROM usage_records WHERE id = ?`, recordID).
+		Scan(&r.ProviderID, &r.UpstreamModel, &r.InputTokens, &r.CachedTokens, &r.OutputTokens)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	cost := s.freezeUsageCost(ctx, &r)
+	res, err := s.db.ExecContext(ctx,
+		`UPDATE usage_records SET cost_total = ? WHERE id = ?`, cost, recordID)
+	if err != nil {
+		return false, err
+	}
+	n, aerr := res.RowsAffected()
+	if aerr != nil {
+		return false, nil //nolint:nilerr // 无法确认影响行数时不谎报成功
+	}
+	return n > 0, nil
 }
 
 type UsageStats struct {
@@ -443,22 +532,29 @@ func (s *Store) SumTokensByDayForKey(ctx context.Context, keyID string, from, to
 	                    WHERE access_key_id = ? AND ts >= ? AND ts <= ?`
 	// 归档支：本地 day → 本地午夜秒 → UTC 日期，与明细支对齐。
 	//
-	// 窗口过滤必须在这里自己下发给 day：不能借用 UsageSource（它的 day 是
-	// **本地**日界，与这里的 UTC 日界不是同一套，借过来会把边缘那天算漏或算重）。
-	// 上界用「该 UTC 日的结束」、下界用「该 UTC 日的开始」，与明细支的
-	// ts >= ? AND ts <= ? 同一个语义。
+	// 窗口过滤必须在这里自己下发：不能借用 UsageSource（它的 day 是**本地**日界，
+	// 与这里的 UTC 日界不是同一套，借过来会把边缘那天算漏或算重）。
+	//
+	// 边界规则与 UsageSource 一致：**只取完整落在窗口内的天**。
+	// 归档的分辨率就是一天，窗口边缘若切在某天中间，那一天的部分数据已不可得。
+	// 原实现用 `day <= date(to,...)` 把边界日**整天计入**（多算），与
+	// UsageSource 的「宁可少算、不越界多算」相反 —— 账单多报最多一整天。
+	// 费用口径下多算会被当成错账，少算可解释，故统一取整日包含。
+	//
+	// ⚠️ 86400000 假定一天 24 小时。有 DST 的时区里那天可能是 23 或 25 小时，
+	// dayEnd 会偏差 1 小时，只影响恰好落在这一小时内的窗口边缘。
 	const rollupPart = `SELECT date(CAST(strftime('%s', day, 'utc') AS INTEGER), 'unixepoch') AS day,
 	                            total_tokens
 	                      FROM usage_daily_rollups
 	                     WHERE access_key_id = ?
-	                       AND day >= date(?, 'unixepoch', 'localtime')
-	                       AND day <= date(?, 'unixepoch', 'localtime')`
+	                       AND (CAST(strftime('%s', day, 'utc') AS INTEGER) * 1000) >= ?
+	                       AND (CAST(strftime('%s', day, 'utc') AS INTEGER) * 1000 + 86400000) <= ?`
 	rows, err := s.read.QueryContext(ctx,
 		`SELECT x.day, COALESCE(SUM(x.total_tokens), 0)
 		   FROM (`+detailPart+`
 		         UNION ALL `+rollupPart+`) x
 		  GROUP BY x.day ORDER BY x.day`,
-		keyID, from, to, keyID, from/1000, to/1000)
+		keyID, from, to, keyID, from, to)
 	if err != nil {
 		return nil, err
 	}

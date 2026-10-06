@@ -28,14 +28,14 @@ type Group struct {
 	UpdatedAt   int64
 }
 
-// ErrGroupNotEmpty 表示组里还有成员，拒绝删除。
+// ErrGroupNotEmpty 表示组里还有成员（用户或访问密钥），拒绝删除。
 //
 // 为什么拒绝而不是靠外键的 ON DELETE SET NULL 放行：
 // 组的白名单非空时，成员被 SET NULL 后会**从「受限」变成「不受限」**——
 // 删一个组等于悄悄给一组人扩权。这类「静默放宽」正是多用户改造要消除的东西，
 // 所以宁可让删除失败，要求管理员先把成员迁走。
 // （foreign key 上的 SET NULL 仍保留，作为直接改库时的安全网。）
-var ErrGroupNotEmpty = errors.New("group still has members")
+var ErrGroupNotEmpty = errors.New("group still has members or keys")
 
 // groupColumns 是 groups 表的读列清单。抽成常量避免多处 SELECT 漏改
 // （同 user_dao.userColumns 的理由）。
@@ -100,7 +100,8 @@ func (s *Store) UpdateGroup(ctx context.Context, g *Group) error {
 	return checkAffected(res, err)
 }
 
-// DeleteGroup 删除组及其模型白名单。组内仍有成员时返回 ErrGroupNotEmpty。
+// DeleteGroup 删除组及其模型白名单。组内仍有**用户或 key** 时返回
+// ErrGroupNotEmpty —— 两类成员都会因 SET NULL 而丢失组约束。
 //
 // 成员检查与删除在同一个事务里做：分两步会出现「检查通过 → 别人刚好把用户
 // 加进来 → 删除成功」的竞态，而那次竞态的后果正是把那个用户的权限放大。
@@ -111,12 +112,27 @@ func (s *Store) DeleteGroup(ctx context.Context, id string) error {
 	}
 	defer tx.Rollback()
 
+	// 同时挡users 与 **access_keys**。
+	//
+	// access_keys.group_id 是 ON DELETE SET NULL（见 DDL），删组时 key 的
+	// 组归属被清空 → 该key 从「受组模型白名单约束」变成「不受约束」。
+	// 这是**静默放宽**：用户的模型权限凭空变大，且界面上看不出任何变化
+	// （key 还在，只是 group_id 变空）。只挡 users 时，一组key 就能拆掉
+	// 管理员设的模型白名单。
 	var members int
 	if err := tx.QueryRowContext(ctx,
 		`SELECT COUNT(*) FROM users WHERE group_id = ?`, id).Scan(&members); err != nil {
 		return err
 	}
 	if members > 0 {
+		return ErrGroupNotEmpty
+	}
+	var keys int
+	if err := tx.QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM access_keys WHERE group_id = ?`, id).Scan(&keys); err != nil {
+		return err
+	}
+	if keys > 0 {
 		return ErrGroupNotEmpty
 	}
 
