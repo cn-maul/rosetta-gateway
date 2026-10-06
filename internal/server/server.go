@@ -378,13 +378,6 @@ func bearerToken(r *http.Request) string {
 	return ""
 }
 
-func writeAuthError(w http.ResponseWriter) {
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(http.StatusUnauthorized)
-	// 与内部 admin 包的 writeError 保持同样的错误信封，前端只需一套解析逻辑。
-	w.Write([]byte(`{"error":{"message":"需要管理员密码","type":"authentication_error"}}`))
-}
-
 // writeTooManyAttempts 在限速冷却期内拒绝请求。
 func writeTooManyAttempts(w http.ResponseWriter, retryAfter time.Duration) {
 	seconds := int(retryAfter.Seconds()) + 1

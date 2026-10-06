@@ -428,7 +428,10 @@ func main() {
 	mux.Handle("POST /admin/api/login", publicAdminMux)
 	mux.Handle("GET /admin/api/session", publicAdminMux)
 	mux.Handle("GET /admin/api/bootstrap", publicAdminMux)
-	mux.Handle("POST /admin/api/bootstrap", publicAdminMux)
+	// bootstrap 是免鉴权写接口，挂在 publicAdminMux 上因而**绕过**了 adminAuto
+	// 里的审计 —— 而它恰恰是整个系统最敏感的一步（设置管理员密码）。
+	// 单独套 AuditOnly：只补审计，不触发快照重建（它只改密码哈希，不动快照）。
+	mux.Handle("POST /admin/api/bootstrap", server.AuditOnly(publicAdminMux, audit))
 
 	mux.Handle("GET /admin/api/", adminAuto)
 	mux.Handle("POST /admin/api/", adminAuto)

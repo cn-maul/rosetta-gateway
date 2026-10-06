@@ -290,10 +290,17 @@ func (h *GroupHandler) ModelNames(w http.ResponseWriter, r *http.Request) {
 	}
 	sort.Strings(all)
 
-	// 管理员不受分组白名单约束。ID 为空的会话身份在统一认证后不应再出现
-	// （会话都对应 users 行），这里保留兜底：宁可多放一个不可能的空 ID，
-	// 也不让管理员被误判成受限用户。
-	if me.ID == "" || me.IsAdmin() {
+	// 管理员不受分组白名单约束。
+	//
+	// 空 ID **不**当admin（fail-closed）：统一认证后所有会话都对应 users 行，
+	// 该状态不可达；原实现把它当admin 是静默提权，方向全错。
+	// 代价：若真出现空 ID，用户会看到「模型列表受限」而非全量——这是
+	// 可见且可修的失败方向，远好于「拿不到身份 = 拿到最高权限」。
+	if me.ID == "" {
+		writeError(w, http.StatusUnauthorized, "需要登录")
+		return
+	}
+	if me.IsAdmin() {
 		writeJSON(w, http.StatusOK, map[string]any{"models": all, "restricted": false})
 		return
 	}

@@ -29,6 +29,37 @@ type UserHandler struct {
 	// 等于把限速打散成「每请求一个」—— 那就等于没有限速。
 	mu  sync.Mutex
 	thr *server.FailureThrottle
+	// pwThr 是**改密专用**的限速器，按用户 ID 而非 IP 归键。
+	//
+	// 为什么与登录限速分开：登录限速按 IP，保护的是「猜密码」；
+	// 改密限速保护的是「已窃获会话后在线爆破旧密码」—— 攻击者换 IP
+	// 就该被挡住，按用户归键才做得到。共用一个会让「改密失败几次」
+	// 把该IP 的正常登录一起锁掉。
+	//
+	// 不用另一个 mu：pwThr 只在 ChangePassword 里用，那是低频端点，
+	// 但仍可能并发（前端重复提交），故复用同一把mu 取惰性初始化。
+	pwThr *server.FailureThrottle
+}
+
+// passwordChangeThrottleLimit / Cooldown：改密的失败阈值与冷却。
+//
+// 5 次 / 5 分钟：PBKDF2 210k 次迭代把单次校验压到几十毫秒，对交互无感，
+// 够挡住在线爆破又不至于让「手抖连点」被锁。冷却取5 分钟而非登录的 1 分钟，
+// 因为这里的一「次」是已登录用户的主动操作，代价更高。
+const (
+	passwordChangeThrottleLimit    = 5
+	passwordChangeThrottleCooldown = 5 * time.Minute
+)
+
+// throttleForPassword 按用户 ID 取改密限速器（惰性构造）。
+func (h *UserHandler) throttleForPassword() *server.FailureThrottle {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.pwThr == nil {
+		h.pwThr = server.NewFailureThrottle(
+			passwordChangeThrottleLimit, passwordChangeThrottleCooldown)
+	}
+	return h.pwThr
 }
 
 func NewUserHandler(st *store.Store, mgr *userauth.Manager) *UserHandler {
@@ -131,13 +162,19 @@ func (h *UserHandler) Login(w http.ResponseWriter, r *http.Request) {
 	// 这类账号会拿到「用户名或密码错误」（实测确认），语义完全不对：
 	// 不是密码错了，而是这个账号**根本没有密码可输**，用户会反复重试。
 	//
-	// 安全性不变：只有「用户名确实存在 **且** 该账号哈希为空」时才回不同文案，
-	// 泄露的是「这个账号还没初始化」，不是「这个账号存在」——
-	// 而引导账号的存在本来就是公开事实（启动日志就写了）。
+	// 安全性：只在「是**引导账号**」时才回不同文案，判定条件与
+	// FindUninitializedAdmin 完全一致 —— role='admin' **且** password_hash 为空。
 	//
-	// 代价：这多出一次可区分的失败分支。接受它 —— 与其让用户对着
-	// 「密码错误」无限重试，不如给一条能照着做的指引。
-	if u != nil && u.PasswordHash == "" {
+	// 原实现只判 password_hash == ''，于是管理员为别人建的空密码账号
+	// 也拿到这条文案。它泄露的不只是「没初始化」，而是「**这个账号存在**」——
+	// 文案覆盖了所有空密码账号，而注释声称的范围只有引导admin。
+	// 一个可用的枚举 oracle：拿到用户名列表即可确认哪些账号存在且未设密。
+	//
+	// 收紧后：非 admin 的空密码账号走下面的通用失败路径（与「用户不存在」
+	// 和「密码错误」同一条），泄露面回到零。代价是那种账号的本人看到的是
+	// 「密码错误」而非引导指引 —— 但那种账号本来就该由管理员重置密码，
+	// 不该让本人自助设密（否则绕过管理员）。
+	if u != nil && u.PasswordHash == "" && u.Role == store.RoleAdmin {
 		if th != nil {
 			th.Fail(server.ClientIPOf(r))
 		}

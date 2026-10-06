@@ -184,7 +184,13 @@ func callerScope(r *http.Request) string {
 		// 刻意**不返回空串**（那是 admin 语义），否则未鉴权请求会看到全量。
 		return "\x00none"
 	}
-	if me.ID == "" || me.IsAdmin() {
+	// 空 ID **不**当admin（fail-closed）：返回哨兵值而非空串，
+	// 空串是 admin 语义（不限作用域）。统一认证后该状态不可达，
+	// 但留着等于给「拿不到身份」发一张全量通行证。
+	if me.ID == "" {
+		return "\x00none"
+	}
+	if me.IsAdmin() {
 		return "" // admin
 	}
 	return me.ID

@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"net/http"
+	"strconv"
 	"strings"
 
 	"github.com/cn-maul/rosetta-gateway/internal/server"
@@ -490,10 +491,28 @@ func (h *UserHandler) ChangePassword(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "invalid JSON: "+err.Error())
 		return
 	}
+
+	// 旧密码校验必须限速，且按**用户 ID** 而非 IP 归键。
+	//
+	// 会话被临时窃取时（XSS 后的凭据），攻击者已能无限次调用本端点；
+	// 没有限速时他可以对着旧密码做在线爆破，撞中即永久改掉密码、
+	// 把受害者锁在门外。会话本身不携带失败计数，这是那条防护的缺口。
+	//
+	// 用与登录端点同族的 FailureThrottle（成功即释限），但独立实例 ——
+	// 共用会让「改密输错几次」把该 IP 的正常登录一起锁掉。
+	thr := h.throttleForPassword()
+	if !thr.Allow(u.ID) {
+		w.Header().Set("Retry-After", strconv.Itoa(int(thr.RetryAfter(u.ID).Seconds())+1))
+		writeError(w, http.StatusTooManyRequests, "原密码尝试过于频繁，请稍后再试")
+		return
+	}
+
 	if !userauth.VerifyPassword(u.PasswordHash, req.OldPassword) {
+		thr.Fail(u.ID)
 		writeError(w, http.StatusUnauthorized, "原密码不正确")
 		return
 	}
+	thr.Success(u.ID)
 	hash, err := userauth.HashPassword(req.NewPassword)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())

@@ -425,8 +425,16 @@ func (h *KeyHandler) ownedByCaller(w http.ResponseWriter, r *http.Request, k *st
 		writeError(w, http.StatusUnauthorized, "需要登录")
 		return false
 	}
-	// 引导态合成用户（ID 为空）拥有 admin 权限。
-	if me.ID == "" || me.IsAdmin() {
+	// 只有真admin 才放行。**空 ID 一律拒绝**（fail-closed）：
+	// 统一认证后代码里已无任何构造 ID=="" 用户的路径（会话都对应 users 行），
+	// 所以这条分支形同虚设；但它一旦可达就是**静默提权** —— 空 ID 等于
+	// admin，方向全错。宁可让某个真 admin 被误判成普通用户（可见、可修），
+	// 也不要让「拿不到身份」等价于「拿到最高权限」。
+	if me.ID == "" {
+		writeError(w, http.StatusUnauthorized, "需要登录")
+		return false
+	}
+	if me.IsAdmin() {
 		return true
 	}
 	if k.UserID != me.ID {

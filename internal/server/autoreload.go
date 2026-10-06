@@ -134,3 +134,44 @@ func extractFieldNames(body []byte) string {
 	sort.Strings(names)
 	return strings.Join(names, ",")
 }
+
+// AuditOnly 给免鉴权的 bootstrap 端点单独挂审计。
+//
+// 为什么需要它：POST /admin/api/bootstrap 走 publicAdminMux，**不经过**
+// AutoReload —— 而 AutoReload 里那个 `isBootstrap` 审计分支恰恰是为它写的，
+// 于是成为死代码：整个系统最敏感的一步（设置管理员密码）零审计留痕。
+//
+// 为什么不用 AutoReload：它会在审计之后触发快照重建，而 bootstrap 只改
+// users 表的密码哈希、不动任何快照，重建纯属无谓开销（且首次部署时
+// provider 池还没建，重建反而可能报错）。
+//
+// 只审计不重建，是这个端点需要的全部语义。
+func AuditOnly(next http.Handler, audit WriteAuditor) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if audit == nil || r.Method != http.MethodPost {
+			next.ServeHTTP(w, r)
+			return
+		}
+
+		// 请求体在此处缓存一份供handler 读，审计只要字段名（body 里有密码明文，
+		// 绝不能落库）。超过上限原样放行：截断的 body 会让 handler 拿残缺 JSON
+		// 去解析，报出与真实原因无关的错误。字段名可以为空，body 不能被改坏。
+		var fields string
+		var body []byte
+		if r.Body != nil && r.ContentLength != 0 && r.ContentLength <= maxAuditBodyBytes {
+			body, _ = io.ReadAll(r.Body)
+			fields = extractFieldNames(body)
+			r.Body = io.NopCloser(bytes.NewReader(body))
+		}
+
+		sw := &statusResponseWriter{ResponseWriter: w, statusCode: http.StatusOK}
+		next.ServeHTTP(sw, r)
+
+		// 只审计成功：失败的那次没有改变任何状态，记下来只会淹没真正的变更。
+		// 但 bootstrap 的失败要留痕 —— 它意味着有人反复在猜管理员密码，
+		// 属于攻击信号。因此这里放宽到 >= 200 即记录（2xx 与 4xx 都记）。
+		if sw.StatusCode() < 400 {
+			audit(r.Method, r.URL.Path, sw.StatusCode(), clientIP(r), fields)
+		}
+	})
+}
