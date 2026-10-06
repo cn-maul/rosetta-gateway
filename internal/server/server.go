@@ -404,6 +404,11 @@ func SecurityHeaders(next http.Handler) http.Handler {
 			h.Set("Content-Security-Policy",
 				"default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; "+
 					"img-src 'self' data:; connect-src 'self'; base-uri 'self'; "+
+					// object-src 'none'：禁用 <object>/<embed>。管理页没有这类元素，
+					// 而缺了它时 default-src 会放行插件内容 —— 一次被注入的
+					// <object data="..."> 就能执行远端代码，绕开 script-src 'self'
+					// 的全部限制。零成本，无副作用。
+					"object-src 'none'; "+
 					"form-action 'self'; frame-ancestors 'none'")
 			// 禁止被嵌入 iframe（点击劫持防护）。
 			h.Set("X-Frame-Options", "DENY")

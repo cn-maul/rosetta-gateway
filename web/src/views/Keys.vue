@@ -7,6 +7,7 @@ import type { AccessKey, Group, KeyCreateResponse, User } from '../types'
 import AppModal from '../components/AppModal.vue'
 import ModelPicker from '../components/ModelPicker.vue'
 
+const err = ref('')
 const loading = ref(true)
 const keys = ref<AccessKey[]>([])
 // 管理员建 key 时可选归属。普通用户不显示这个选择 ——
@@ -59,10 +60,17 @@ const plainKeyBox = reactive<{ open: boolean; key: string; name: string }>({ ope
 
 async function load() {
   loading.value = true
+  err.value = ''
   try {
     keys.value = await api.keys()
   } catch (e) {
-    if ((e as { status?: number }).status !== 401) toast('加载失败：' + (e as Error).message, 'err')
+    if ((e as { status?: number }).status === 401) return
+    // 失败**必须留下可见的错误态**：只弹 toast 的话，页面保留空列表/
+    // 空表格，呈现成「暂无数据」—— 而真实原因是请求失败了。运维会据此
+    // 判断「今天没有流量」，进而排除掉网关/上游故障这个真正的方向。
+    // 与 Users/Groups 的持久错误态同口径（见其 v-else-if="err"）。
+    err.value = '加载密钥失败：' + (e as Error).message
+    toast('加载失败：' + (e as Error).message, 'err')
   } finally {
     loading.value = false
   }
@@ -268,6 +276,10 @@ onMounted(load)
 
     <div class="panel">
       <div v-if="loading && keys.length === 0" class="loading">加载中…</div>
+      <!--加载失败**必须**与「确实没有数据」在界面上可区分：把请求失败呈现成
+           「暂无数据」会让运维误判为无流量，从而排除掉网关/上游故障这个方向。
+           与 Users/Groups 的错误态同口径。 -->
+      <div v-else-if="err" class="empty"><div class="big">⚠</div>{{ err }}</div>
       <div v-else-if="keys.length === 0" class="empty">
         <div class="big">◇</div>
         还没有访问密钥

@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/netip"
 	"strings"
@@ -409,4 +410,89 @@ func (s *Store) RecomputeUsedTokens(ctx context.Context, keyID string) (int64, e
 		return 0, err
 	}
 	return used, nil
+}
+
+// ReserveQuota 为一次请求**原子地**预占 est 个 token 的配额，返回是否放行。
+//
+// # 为什么需要预占（而不是「查了再放」）
+//
+// GetKeyQuota 是纯查询，两个并发请求会同时读到同一个 used，于是**都通过**，
+// 各自再发一次完整生成 —— 并发突发可超发数十倍于剩余额度。
+// 原注释说「并发下容忍至多一个在途超发」，那只在**串行**时成立。
+//
+// 更要命的是「数十倍」而不是「多一个」：剩余额度 1000 token 时，
+// 50 个并发请求每个预估 200 token，check-then-act 会让它们全部通过。
+//
+// # 为什么不能用 ratelimit 的窗口限速器
+//
+// TPM 限的是**速率**（每分钟窗口，窗口一翻自然释放）；配额限的是**终身累计**，
+// 没有「窗口结束」这回事。所以预占必须落在库里、随真实用量校正：
+// ReserveQuota 加，ReleaseQuota 减，两者都在**同一条写事务**里，
+// 与检查合并成一句 UPDATE —— 这样「检查」与「占用」之间不存在窗口。
+//
+// 落库而不是放内存：网关是单进程，写池单连接，内存预占在崩溃/重启后
+// 全部消失（额度被白白释放）；更重要的是它无法与 used_tokens 保持一致。
+func (s *Store) ReserveQuota(ctx context.Context, id string, est int64) (reserved int64, ok bool, err error) {
+	if est <= 0 {
+		// 预估为 0（未知长度）时不能直接放行 —— 那样等于没有预检；
+		// 也不能因为「要花 0」就拒绝。折中：按 1 个 token 预占，
+		// 至少能把并发请求数本身变成约束。
+		est = 1
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return 0, false, err
+	}
+	defer func() { _ = tx.Rollback() }() //nolint:errcheck // 已提交时是 no-op
+
+	var quota, used int64
+	err = tx.QueryRowContext(ctx,
+		`SELECT quota_tokens, used_tokens FROM access_keys WHERE id = ?`, id).
+		Scan(&quota, &used)
+	if errors.Is(err, sql.ErrNoRows) {
+		return 0, false, nil
+	}
+	if err != nil {
+		return 0, false, err
+	}
+	// quota<=0 = 不限额，与 GetKeyQuota 的判定一致；此时不预占也不受限。
+	if quota <= 0 {
+		return 0, true, tx.Commit()
+	}
+	if used+est > quota {
+		return 0, false, nil // 剩余额度不够本次预估
+	}
+	// 同一事务内把 used 推上去：并发请求在此处被 SQLite 写锁串行化，
+	// 第二个请求进来时读到的 used 已经含第一个的预占。
+	if _, err := tx.ExecContext(ctx,
+		`UPDATE access_keys SET used_tokens = used_tokens + ? WHERE id = ?`, est, id); err != nil {
+		return 0, false, err
+	}
+	if err := tx.Commit(); err != nil {
+		return 0, false, err
+	}
+	return est, true, nil
+}
+
+// ReleaseQuota 把一次请求的预占校正为真实用量 actual。
+//
+// 语义与 TPM 的 CommitTPM 相同：预占 est、实际可能更大或更小。
+// 差值补齐/退回，保证 used_tokens 终态与真实消耗一致。
+//
+// actual 由调用方从上游 usage 得出；查不到 usage 时传 0 —— 那会让 used
+// 比真实少计，但**宁可少算**：多算会把用户挡在门外（且没有任何解释），
+// 而 usage_state="missing" 已让漏账在报表里可见（见 DESIGN §17 R9）。
+func (s *Store) ReleaseQuota(ctx context.Context, id string, reserved, actual int64) error {
+	if reserved <= 0 {
+		return nil
+	}
+	delta := actual - reserved
+	if delta == 0 {
+		return nil
+	}
+	// 不允许把 used 推成负数：actual=0 且 reserved>0 时 delta 为负，
+	// 而 used_tokens 里可能已含此前的真实用量，下调到负数会破坏后续所有判定。
+	_, err := s.db.ExecContext(ctx,
+		`UPDATE access_keys SET used_tokens = MAX(0, used_tokens + ?) WHERE id = ?`, delta, id)
+	return err
 }

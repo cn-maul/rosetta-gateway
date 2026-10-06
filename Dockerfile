@@ -40,8 +40,9 @@ RUN CGO_ENABLED=0 GOOS=linux \
 # ---- 运行阶段 -------------------------------------------------------------
 FROM alpine:3.21
 
-# ca-certificates：访问上游 HTTPS 必需；tzdata：日志时间戳按容器时区显示
-RUN apk add --no-cache ca-certificates tzdata
+# ca-certificates：访问上游 HTTPS 必需；tzdata：日志时间戳按容器时区显示；
+# su-exec：以非 root 身份降权启动（entrypoint 用它 exec 掉 root 外壳）。
+RUN apk add --no-cache ca-certificates tzdata su-exec
 
 COPY --from=build /out/gateway /app/gateway
 COPY docker/config.default.json /app/config.default.json
@@ -58,6 +59,16 @@ VOLUME ["/data"]
 # （net/base/port_util.cc 的 kRestrictedPorts，IRC 段）里，浏览器会在
 # 发起请求前就拒绝，报 ERR_UNSAFE_PORT，且服务端看不到任何连接日志。
 EXPOSE 8666
+
+# HEALTHCHECK：死锁时容器不会自动重启，编排系统也探不到活性。
+# 探 /admin/（静态产物）而不是 /v1/models —— 后者要鉴权，会稳定返回 401，
+# 那种「健康」毫无意义。前者只依赖 embed FS，不碰数据库，
+# 所以「能返回 200」证明的是**进程还在跑且路由活着**，这正是要探的东西。
+#
+# 间隔 30s / 超时 5s / 宽限 10s：SQLite 启动剪枝偶发慢，宽限期别太短，
+# 否则滚动更新时新容器会被反复判死并重启。
+HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
+	CMD wget -q -O /dev/null http://127.0.0.1:8666/admin/ || exit 1
 
 WORKDIR /app
 ENTRYPOINT ["/usr/local/bin/docker-entrypoint.sh"]

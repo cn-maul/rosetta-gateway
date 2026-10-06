@@ -336,9 +336,22 @@ func unknownModels(models []string) (unknown []string, blanks bool) {
 	if len(models) == 0 {
 		return nil, false
 	}
+	snap := snapshot.Get()
 	known := make(map[string]struct{}, 32)
-	for _, route := range snapshot.Get().Routes.ListRoutes() {
+	for _, route := range snap.Routes.ListRoutes() {
 		known[route.PublicName] = struct{}{}
+	}
+	// **直连形式**（`provider/model`）也是合法的模型名，必须一起认。
+	//
+	// 数据面的 Resolve 先查具名路由，查不到再按 provider/model 直连兜底，
+	// 所以组白名单只放行具名路由的话，会出现「数据面认得、白名单不认」的不一致：
+	// 用户照着 `/v1/models?include=upstream` 给出的 id 填白名单（界面就是列这些），
+	// 写入端却恒回 400 —— 而界面上没有任何提示说这些 id 不能用。
+	//
+	// 这个方向的失败尤其坏：它会逼运维「干脆不设白名单」（fail-closed 的一侧
+	// 被改成 fail-open），等于把一次校验 bug 变成权限漏洞。
+	for _, m := range snap.Routes.ListUpstreamModels() {
+		known[m.ProviderSlug+"/"+m.ModelID] = struct{}{}
 	}
 	seen := make(map[string]struct{}, len(models))
 	for _, m := range models {

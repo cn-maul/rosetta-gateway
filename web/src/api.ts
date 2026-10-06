@@ -23,14 +23,30 @@ import type { ApiError, BootstrapStatus, Me, SessionStatus, LoginResult, ConfigI
 
 const TOKEN_KEY = 'rosetta_gw_admin_token'
 
+// sessionStorage 而非 localStorage（AUDIT P2-29）。
+//
+// 差别只在「关掉标签页后是否还在」：localStorage 里的令牌会**长期驻留**，
+// 于是任何能在这个源上执行脚本的东西（供应链投毒的依赖、XSS）都能在
+// 用户关掉页面很久之后仍偷到一枚 8 小时有效期的凭证；sessionStorage
+// 随标签页关闭即消失，暴露窗口从「8 小时」缩到「这个标签页开着的时间」。
+//
+// 代价是关掉标签页就要重新登录 —— 对一个局域网管理后台可以接受，
+// 而这恰恰是 localStorage 唯一能买到的东西。
+//
+// 关于「多标签页不同步」：不再需要 storage 事件做同步，因为登出现在
+// **服务端真的吊销**了（Logout 递增 auth_version，该用户全部旧令牌立即
+// 失效）。A 标签页登出后，B 标签页的下一次请求就会拿到 401，走既有的
+// 「清本地令牌 + 跳登录页」路径。为此在浏览器里维护一份跨标签页的
+// 「登出了」标记是多余的 —— 标记本身还要处理「什么时候该清」的边界，
+// 而服务端已经给了唯一权威答案。
 export const auth = reactive({
-  token: localStorage.getItem(TOKEN_KEY) ?? '',
+  token: sessionStorage.getItem(TOKEN_KEY) ?? '',
 })
 
 export function saveToken(t: string) {
   auth.token = t
-  if (t) localStorage.setItem(TOKEN_KEY, t)
-  else localStorage.removeItem(TOKEN_KEY)
+  if (t) sessionStorage.setItem(TOKEN_KEY, t)
+  else sessionStorage.removeItem(TOKEN_KEY)
 }
 
 /**

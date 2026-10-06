@@ -208,14 +208,39 @@ docker run --rm -v rosetta-gateway-data:/data -v "$PWD:/backup" alpine \
 docker compose pull && docker compose up -d
 ```
 
-## 已知问题
+## 以非 root 运行（2026-10-07 起）
 
-`AUDIT.md`（2026-10-06）记的两条容器相关问题**尚未修复**，此处显式说明以免误判：
+进程不再以 root 运行。容器仍以 root 启动（需要 `chown` 状态目录），
+但 entrypoint 会把 `/data` 的属主改成 `ROSETTA_GW_UID:GID`（默认 1000:1000），
+然后用 `su-exec` 把网关 exec 成那个用户。
 
-- **容器以 root 运行**：Dockerfile 里没有 `USER` 指令，进程被攻破即持容器 root。
-  加 `USER` 需先处理 `/data` 的属主，否则 SQLite 写不进去。
-- **无 `HEALTHCHECK`**：进程死锁时容器不会重启，编排系统也探不到活性。
-  目前只能靠外部探活。
+宿主机目录属主与容器内 uid 不一致时（bind mount 很常见），显式传：
+
+```bash
+docker run -d --name rosetta-gw -p 8666:8666 \
+  -v /srv/rosetta-gw:/data \
+  -e ROSETTA_GW_UID=$(id -u) -e ROSETTA_GW_GID=$(id -g) \
+  ghcr.io/cn-maul/rosetta-gateway:latest
+```
+
+若属主改不动（NFS、只读根文件系统等），entrypoint 会在 **stderr 明确告警**
+后以 root 继续运行 —— 不静默降级，否则运维会以为容器已加固。
+
+## 健康检查
+
+镜像自带 `HEALTHCHECK`，探 `127.0.0.1:8666/admin/`：
+
+```
+--interval=30s --timeout=5s --start-period=10s --retries=3
+```
+
+探 `/admin/` 而不是 `/v1/models` —— 后者要鉴权、稳定返回 401，那种「健康」
+毫无意义。`/admin/` 只依赖 embed 的静态产物、不碰数据库，能返回 200 就证明
+进程还活着且路由正常。
+
+```
+docker inspect --format '{{.State.Health.Status}}' rosetta-gw
+```
 
 ## 常见问题
 

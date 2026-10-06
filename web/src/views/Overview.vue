@@ -5,6 +5,7 @@ import { toast } from '../ui'
 import { fmtNum, fmtTokens, fmtSpeed, fmtSec, fmtPercent, fmtMoney } from '../fmt'
 import type { Stats, UsageGroupEntry } from '../types'
 
+const err = ref('')
 const loading = ref(true)
 const stats = ref<Stats | null>(null)
 const byDay = ref<UsageGroupEntry[]>([])
@@ -142,6 +143,7 @@ let reqSeq = 0
 async function load() {
   const seq = ++reqSeq
   loading.value = true
+  err.value = ''
   try {
     const { from, to } = rangeBounds(range.value)
     // 「全部」档额外要终身累计：明细被剪掉之后，byDay 的最早一天不再是
@@ -160,7 +162,12 @@ async function load() {
     byKey.value = k
   } catch (e) {
     if (seq !== reqSeq) return
-    if ((e as { status?: number }).status !== 401) toast('加载总览失败：' + (e as Error).message, 'err')
+    if ((e as { status?: number }).status === 401) return
+    // 总览有四个并发请求，任一失败整页都拿不到数据。不留错误态的话，
+    // 页面呈现的是「加载中…」消失后的空卡片，运维会读成「今天没有流量」，
+    // 恰好把网关/上游故障这个方向排除掉 —— 而这正是需要排查的方向。
+    err.value = '加载总览失败：' + (e as Error).message
+    toast(err.value, 'err')
   } finally {
     if (seq === reqSeq) loading.value = false
   }
@@ -231,6 +238,8 @@ onUnmounted(() => {
     </div>
 
     <div v-if="loading && !stats" class="loading">加载中…</div>
+    <!-- 与 Users/Groups 同口径：加载失败与「确实没有数据」必须可区分。 -->
+    <div v-else-if="err" class="empty"><div class="big">⚠</div>{{ err }}</div>
 
     <template v-if="stats">
       <div class="stat-grid">

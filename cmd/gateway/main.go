@@ -918,13 +918,33 @@ type rateCommit struct {
 	keyID    string
 	limit    int // 预占时的 tpmLimit；0 = 未启用，CommitTPM 据此直接返回
 	reserved int64
+
+	// store 用于**终身配额**的预占校正；为 nil 时跳过（不限额或测试）。
+	store  *store.Store
+	logger *slog.Logger
+	// quotaReserved 是本次请求预占的 token 数（0 = 未预占）。
+	quotaReserved int64
 }
 
+// commit 把两种预占一并校正为真实用量。
+//
+// 两种预占必须**同一个函数**收尾：TPM 预占靠 limiter 回补，配额预占靠
+// store 回补。分开调用时容易只改一处 —— 那种情况下 limiter 的窗口会
+// 在一分钟内自动放行（看不出来），而配额是终身累计，漏掉就是永久偏差。
 func (rc *rateCommit) commit(actual int64) {
 	if rc == nil {
 		return
 	}
 	rc.limiter.CommitTPM(rc.keyID, rc.limit, rc.reserved, actual)
+	if rc.store != nil && rc.quotaReserved > 0 {
+		if err := rc.store.ReleaseQuota(context.Background(), rc.keyID, rc.quotaReserved, actual); err != nil {
+			if rc.logger != nil {
+				rc.logger.Warn("release quota reservation failed",
+					"key_id", rc.keyID, "reserved", rc.quotaReserved,
+					"actual", actual, "error", err)
+			}
+		}
+	}
 }
 
 // setRetryAfter 写 Retry-After 响应头（向上取整秒，至少 1）。
@@ -1093,19 +1113,6 @@ func handleIngress(pool *upstream.Pool, cfg *config.Config, usage *usageRecorder
 			return
 		}
 
-		// 终身 token 配额预检（DESIGN §11.2）：quota>0 且 used>=quota 直接 429。
-		// 读的是库里的权威 used_tokens（触发器实时累加）；查询抖动时 fail-open，
-		// 不因一次读失败拒绝正常流量。并发下容忍至多一个在途请求超发（post-deduct 语义）。
-		if quota, used, ok, qerr := db.GetKeyQuota(r.Context(), authCtx.KeyID); qerr != nil {
-			logger.Error("quota lookup failed", "error", qerr, "key_id", authCtx.KeyID)
-		} else if ok && quota > 0 && used >= quota {
-			logger.Warn("quota exceeded", "key_id", authCtx.KeyID, "used", used, "quota", quota,
-				"request_id", server.RequestIDFromContext(r.Context()))
-			codec.WriteError(w, http.StatusTooManyRequests, "insufficient_quota",
-				"this API key has exhausted its token quota")
-			return
-		}
-
 		// 用户级配额预检（MULTIUSER.md §4.3：三级配额的最外层总闸）。
 		//
 		// **只在用户配了额度时才查库**：quota_tokens=0（不限额）是常态，
@@ -1154,9 +1161,17 @@ func handleIngress(pool *upstream.Pool, cfg *config.Config, usage *usageRecorder
 		// 会遍历全部消息与工具定义拼出一个与请求体同量级的字符串再估算，
 		// 是一次纯浪费的全量分配；而它算出的 est 随后必然被丢弃。
 		// 同一个请求在 attempt* 里还会再 buildRosetta 一次，估算那次是多余的第 N 次。
+		// 两种预占共用同一个 est 与同一个 rateCommit 收尾 —— 分开放两次
+		// 估算/两次收尾只会让两边在某条路径上被漏掉一处（且配额那条漏掉是
+		// **终身**偏差，不像 TPM 窗口会自愈）。
+		//
+		// est 的计算按需触发：TPMLimit==0 且 key 未配quota 时整个函数跳过，
+		// 不做那次「遍历全部消息与工具定义拼出请求体同量级字符串」的估算。
 		var rate *rateCommit
-		if authCtx.TPMLimit > 0 {
-			est := estimateRequestTokens(ing.buildRosetta())
+		var est int64
+		needEstimate := authCtx.TPMLimit > 0
+		if needEstimate {
+			est = estimateRequestTokens(ing.buildRosetta())
 			if ok, retry := limiter.ReserveTPM(authCtx.KeyID, authCtx.TPMLimit, est); !ok {
 				logger.Warn("rate limited (tpm)", "key_id", authCtx.KeyID,
 					"estimated_tokens", est, "retry_after", retry.String(),
@@ -1166,7 +1181,52 @@ func handleIngress(pool *upstream.Pool, cfg *config.Config, usage *usageRecorder
 					"token rate limit exceeded for this API key")
 				return
 			}
-			rate = &rateCommit{limiter: limiter, keyID: authCtx.KeyID, limit: authCtx.TPMLimit, reserved: est}
+			rate = &rateCommit{
+				limiter: limiter, keyID: authCtx.KeyID, limit: authCtx.TPMLimit,
+				reserved: est, store: db, logger: logger,
+			}
+		}
+
+		// 终身 token 配额**原子预占**（DESIGN §11.2）。
+		//
+		// 原实现是纯查询（GetKeyQuota）：读 used → 比较 → 放行。并发下多个
+		// 请求读到同一个 used 并**全部通过** —— 注释说「容忍至多一个在途超发」，
+		// 那只在串行时成立：剩余额度 1000 token 时，50 个并发请求各预估 200
+		// token 会全部放行，超发数十倍。
+		//
+		// ReserveQuota 把「检查」与「占用」合并进同一条写事务，并发请求被
+		// SQLite 写锁串行化，第二个进来时读到的 used 已含第一个的预占。
+		// 真实用量在收尾处校正（rateCommit.commit → ReleaseQuota）。
+		//
+		// 为什么不套用 ratelimit 的窗口限速器：TPM 限**速率**（分钟窗口一翻
+		// 自然释放），配额限**终身累计**（没有「窗口结束」）。两者语义不同，
+		// 拿窗口限速器去限终身额度会在窗口翻转时凭空释放额度。
+		if _, quota, _, qerr := db.GetKeyQuota(r.Context(), authCtx.KeyID); qerr != nil {
+			// 查询抖动 fail-open：读池故障不该变成流量全拒。但记 ERROR——
+			// fail-open 的代价是真超发，无声无息就查不到了。
+			logger.Error("quota lookup failed (fail-open)", "error", qerr, "key_id", authCtx.KeyID)
+		} else if quota > 0 {
+			if !needEstimate {
+				est = estimateRequestTokens(ing.buildRosetta())
+			}
+			reserved, rok, rerr := db.ReserveQuota(r.Context(), authCtx.KeyID, est)
+			switch {
+			case rerr != nil:
+				logger.Error("quota reserve failed (fail-open)",
+					"error", rerr, "key_id", authCtx.KeyID)
+			case !rok:
+				logger.Warn("quota exceeded", "key_id", authCtx.KeyID,
+					"estimated_tokens", est,
+					"request_id", server.RequestIDFromContext(r.Context()))
+				codec.WriteError(w, http.StatusTooManyRequests, "insufficient_quota",
+					"this API key has exhausted its token quota")
+				return
+			default:
+				if rate == nil {
+					rate = &rateCommit{limiter: limiter, keyID: authCtx.KeyID, store: db, logger: logger}
+				}
+				rate.quotaReserved = reserved
+			}
 		}
 
 		snap := snapshot.Get()

@@ -9,6 +9,7 @@ import (
 
 	"github.com/cn-maul/rosetta-gateway/internal/crypto"
 	"github.com/cn-maul/rosetta-gateway/internal/server"
+	"github.com/cn-maul/rosetta-gateway/internal/snapshot"
 	"github.com/cn-maul/rosetta-gateway/internal/store"
 )
 
@@ -165,6 +166,42 @@ func (h *KeyHandler) Create(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		writeServerError(w, "parse limits", err)
 		return
+	}
+
+	// 自助建 key 的额度必须**封顶**。
+	//
+	// 原实现让普通用户在创建请求里任意填 quota/rpm/tpm，而 0 = 不限 ——
+	// 于是任何人建一把 key 就能得到「不限额、不限速」的凭证，key 级限速
+	// 被完全架空。用户级配额（users.quota_tokens）是三级配额的**外层总闸**，
+	// 但内层被自己拆掉之后，总闸形同虚设：只要额度够，总闸本就会拦住，
+	// 于是真正起作用的是「无限的内层」，总闸反而成了摆设。
+	//
+	// 上限从哪来：用户级**只有** quota_tokens（users 表刻意没有 rpm/tpm 列，
+	// 见 store.go 的注释 —— 那两个能力没有用户级执行点）。所以：
+	//   - quota ≤ 用户级额度；用户级不限（0）时才允许 key 不限；
+	//   - rpm/tpm **强制为 0**（不限速）。它们没有用户级上限可比，保留
+	//     任意填的能力就是留一个不限速的口子，而 rpm/tpm 的**约束**已由
+	//     用户级配额间接实现（总额封顶）。
+	//
+	// 管理员不受此限制：管理员本来就该能建任意额度的 key。
+	if me := server.UserFromContext(r.Context()); me != nil && !me.IsAdmin() {
+		var userQuota int64
+		if u := snapshot.Get().UsersByID[me.ID]; u != nil {
+			userQuota = u.QuotaTokens
+		}
+		if quota == 0 {
+			if userQuota > 0 {
+				quota = userQuota
+			}
+			// userQuota==0 时保持 0（不限）：用户自己没有总额上限，
+			// 不该由 key 级凭空造一个。
+		} else if userQuota > 0 && quota > userQuota {
+			writeError(w, http.StatusForbidden,
+				"quota_tokens 不能超过你的用户级额度")
+			return
+		}
+		// rpm/tpm 一律清零：没有用户级上限可比，留任意填就是不限速的口子。
+		rpm, tpm = 0, 0
 	}
 
 	// 归属：普通用户只能给自己建 key（忽略请求里的 user_id），
@@ -627,13 +664,26 @@ func (h *KeyHandler) RecomputeUsage(w http.ResponseWriter, r *http.Request, id s
 	})
 }
 
+// toKeyResponse 把内部结构转成响应。username 从**快照**里的
+// snapshot.Get().UsersByID 取，不额外查库。
+//
+// 此前 username 字段声明了却**永远为空**（死契约）：管理员在密钥列表里
+// 只能看到裸 user_id，要确认「这把 key 属于谁」只能去用户页逐个比对 id。
+// 用快照零成本 —— UsersByID 本来就随每次重建全量更新（数据面鉴权要读它）。
 func toKeyResponse(k store.AccessKey) keyResponse {
+	username := ""
+	if k.UserID != "" {
+		if u := snapshot.Get().UsersByID[k.UserID]; u != nil {
+			username = u.Name
+		}
+	}
 	return keyResponse{
 		ID:            k.ID,
 		KeyPrefix:     k.KeyPrefix,
 		Name:          k.Name,
 		Enabled:       k.Enabled,
 		UserID:        k.UserID,
+		Username:      username,
 		QuotaTokens:   k.QuotaTokens,
 		UsedTokens:    k.UsedTokens,
 		RPMLimit:      k.RPMLimit,

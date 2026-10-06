@@ -214,8 +214,20 @@ func groupByClause(groupBy string) (selectCols, groupClause string, ok bool) {
 
 	switch groupBy {
 	case "day":
-		// (ts / 86400000) * 86400000 = 当天 00:00 的毫秒时间戳（UTC）。
-		return `(ts / 86400000) * 86400000 as ts, ` + blank + `, ` + agg, ` GROUP BY (ts / 86400000)`, true
+		// 日界用**本地时区**，与 /usage/by-day、归档表 day 列、前端 GroupByDay
+		// 同一套口径。原实现写的是 `(ts/86400000)*86400000` —— 那是
+		// 「epoch 以来的第几天」（UTC），与中国区相差 8 小时，于是同一个界面里
+		// 两个按天趋势的数字对不上。
+		//
+		// 仍是**毫秒时间戳**（不是日期字符串）：ts 列被 Scan 进 int64，
+		// 换类型会把整个请求打成 500（usageRecordEntry.Ts 是 int64）。
+		// 所以把「本地日期的午夜」换算回毫秒 —— strftime('%s') 按 **UTC**
+		// 解释 epoch，得先减一个时区偏移才能得到真正的本地午夜。
+		//
+		// 口径必须逐字等于 store.dayExpr 的分桶，否则剪枝前后同一窗口差一天。
+		const localMidnightMs = `CAST(strftime('%s', ts / 1000, 'unixepoch', 'localtime') AS INTEGER) * 1000`
+		return localMidnightMs + ` as ts, ` + blank + `, ` + agg,
+			` GROUP BY ` + localMidnightMs, true
 	case "key":
 		return `0 as ts, ` + blank + `, ` + agg, ` GROUP BY access_key_id`, true
 	case "model":

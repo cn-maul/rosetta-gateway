@@ -432,8 +432,36 @@ func (h *UserHandler) BootstrapSetup(w http.ResponseWriter, r *http.Request) {
 // 无状态 JWT 的登出天然是「客户端不再携带」—— 服务端不维护黑名单
 // （见 userauth.Manager 的注释）。要真正作废某张令牌，改密码或禁用账号
 // 即可让 auth_version 前进，所有旧令牌一次性失效。
+// Logout 作废当前会话。
+//
+// **服务端吊销**（此前只清 cookie，P2-29）：会话是自包含 JWT，Manager 里没有
+// 任何服务端状态，所以清 cookie 只让**这一个浏览器**不再发送令牌 —— 已经
+// 复制出去的令牌（另一个标签页、另一台机器、或已被 XSS 偷走）仍能用到自然
+// 过期（最长 8 小时）。用户点了登出却发现在别处仍能操作，就是这个缺口。
+//
+// 递增 auth_version 作废该用户的**全部**会话。这是**有界**的吊销：一个
+// 数字让全量作废，不必维护逐令牌的吊销表（那要处理表增长、清理，以及
+// JWT 无状态带来的存储需求）。Verify 每次都比对当前版本号，版本一变
+// 旧令牌立刻全部失效。
+//
+// 代价：同一账号的所有设备都被踢下线。对管理后台这是期望行为 —— 用户
+// 显式点了「登出」，语义就该是「这个身份不再可用」。
 func (h *UserHandler) Logout(w http.ResponseWriter, r *http.Request) {
 	server.ClearSessionCookie(w)
+	if u := server.UserFromContext(r.Context()); u != nil && u.ID != "" {
+		if err := h.store.BumpAuthVersion(r.Context(), u.ID); err != nil {
+			// 吊销失败必须让用户知道：此时令牌在自然过期前仍可用，
+			// 而界面上却显示「已登出」。属降级路径，记 ERROR 但仍回 200 ——
+			// cookie 已清，本浏览器确实登出了。
+			slog.Error("logout: revoke sessions failed",
+				"user_id", u.ID, "error", err)
+			writeJSON(w, http.StatusOK, map[string]string{
+				"status":  "ok",
+				"message": "已登出，但未能作废其他设备上的会话",
+			})
+			return
+		}
+	}
 	writeJSON(w, http.StatusOK, map[string]string{
 		"status":  "ok",
 		"message": "已登出",

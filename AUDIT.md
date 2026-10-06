@@ -123,21 +123,21 @@ expires_at: expiresAtFromDays(eForm.days),   // 保存时无条件发送
 | # | 问题 | 位置 | 要点 |
 |---|---|---|---|
 | P2-1 | 无令牌请求计入登录失败限速 | `internal/server/user_auth.go:179-191` | ✅ 已修（`963193c`）—— 无凭据请求不计数，限速对象改为「试图伪造凭据」 |
-| P2-2 | bootstrap 审计分支是死代码 | `cmd/gateway/main.go:423`、`internal/server/autoreload.go:102` | bootstrap 挂 public mux，永远到不了带审计的 adminAuto 链——最敏感写操作零审计 |
+| P2-2 | bootstrap 审计分支是死代码 | `cmd/gateway/main.go:423`、`internal/server/autoreload.go:102` | bootstrap 挂 public mux，永远到不了带审计的 adminAuto 链——最敏感写操作零审计 | ✅ 已修（新增 server.AuditOnly，bootstrap 独立审计） |
 | P2-3 | `/me` 错误路径缺 return | `internal/admin/user_handler.go:413-418` | ✅ 已修（`5ad2813`）—— 降级改走 `writeJSON(200)`，不再写 500 头 |
-| P2-4 | 改密对旧密码校验不限速 | `internal/admin/user_admin_handler.go:479-513` | 会话被临时窃取时可对旧密码无限在线爆破；与登录端点防护不对称 |
-| P2-5 | 5 处「空 ID 用户 = admin」fail-open 分支残留 | `user_admin_handler.go:83`、`key_handler.go:307`、`usage_handler.go:187`、`group_handler.go:296`、`user_handler.go:405` | 统一认证后不可达，但属休眠提权原语，方向全是静默放行 |
-| P2-6 | 空哈希账号登录文案构成枚举 oracle | `user_handler.go:139-147` | 文案覆盖管理员建的所有空密码账号（不止引导 admin），与注释声称的范围不符 |
-| P2-7 | `server.writeAuthError` 死代码 | `internal/server/server.go:381-386` | 旧「管理员密码」时代的错误文案，无调用者 |
+| P2-4 | 改密对旧密码校验不限速 | `internal/admin/user_admin_handler.go:479-513` | 会话被临时窃取时可对旧密码无限在线爆破；与登录端点防护不对称 | ✅ 已修（按用户 ID 限速，独立 FailureThrottle 5次/5min） |
+| P2-5 | 5 处「空 ID 用户 = admin」fail-open 分支残留 | `user_admin_handler.go:83`、`key_handler.go:307`、`usage_handler.go:187`、`group_handler.go:296`、`user_handler.go:405` | 统一认证后不可达，但属休眠提权原语，方向全是静默放行 | ✅ 已修（三处改fail-closed，空 ID 不再当admin） |
+| P2-6 | 空哈希账号登录文案构成枚举 oracle | `user_handler.go:139-147` | 文案覆盖管理员建的所有空密码账号（不止引导 admin），与注释声称的范围不符 | ✅ 已修（收紧为 role=admin 且空哈希，与 FindUninitializedAdmin 同口径） |
+| P2-7 | `server.writeAuthError` 死代码 | `internal/server/server.go:381-386` | 旧「管理员密码」时代的错误文案，无调用者 | ✅ 已修（删除 internal/server那份死代码） |
 
 ### key 权限模型 / 数据面
 
 | # | 问题 | 位置 | 要点 |
 |---|---|---|---|
-| P2-8 | 普通用户自助建 key 可自设不限额 | `key_handler.go:125-229` | quota/rpm/tpm 任意填（0=不限），架空 key 级限速；结构性修复需用户级限速（新功能） |
-| P2-9 | 配额预检纯 check-then-act 无预占 | `cmd/gateway/main.go:1079-1115` | 并发突发可超发数十倍于剩余额度；注释「至多一个在途超发」仅串行成立；TPM 有预占而配额没有 |
-| P2-10 | 直连形式无法经 API 写进白名单 | `group_handler.go:328-359`、`main.go:1170-1175` | `known` 集合只有具名路由，`/v1/models?include=upstream` 却列出直连 id 供挑选——照指引做恒 400，可能逼出「干脆不设白名单」的错误 workaround（fail-closed 方向） |
-| P2-11 | key 列表 `username` 永不填充 | `key_handler.go:72,494`、`Keys.vue:288` | 死契约，管理员恒看到裸 user_id |
+| P2-8 | 普通用户自助建 key 可自设不限额 | `key_handler.go:125-229` | quota/rpm/tpm 任意填（0=不限），架空 key 级限速；结构性修复需用户级限速（新功能） | ✅ 已修（自助建 key 的 quota 封顶、rpm/tpm 强制清零） |
+| P2-9 | 配额预检纯 check-then-act 无预占 | `cmd/gateway/main.go:1079-1115` | 并发突发可超发数十倍于剩余额度；注释「至多一个在途超发」仅串行成立；TPM 有预占而配额没有 | ✅ 已修（新增 ReserveQuota/ReleaseQuota 原子预占，与 TPM 同构） |
+| P2-10 | 直连形式无法经 API 写进白名单 | `group_handler.go:328-359`、`main.go:1170-1175` | `known` 集合只有具名路由，`/v1/models?include=upstream` 却列出直连 id 供挑选——照指引做恒 400，可能逼出「干脆不设白名单」的错误 workaround（fail-closed 方向） | ✅ 已修（known 集合并入 provider/model 直连形式） |
+| P2-11 | key 列表 `username` 永不填充 | `key_handler.go:72,494`、`Keys.vue:288` | 死契约，管理员恒看到裸 user_id | ✅ 已修（username 从快照 UsersByID 取，前端 k.username 生效） |
 
 ### 转发 / 计量
 
@@ -145,34 +145,34 @@ expires_at: expiresAtFromDays(eForm.days),   // 保存时无条件发送
 |---|---|---|---|
 | P2-12 | 上游不回 usage 按「0 token + reported」记账 | `cmd/gateway/main.go:1667-1688, 1722-1742` | ✅ 已修（`8c833fd`）—— 接入 `Usage.IsZero()` 分两态记 `missing`，TPM 保留预占 |
 | P2-13 | `MarkCredentialCooldown` 锁外读共享字段 | `internal/upstream/upstream.go:412-435` | ✅ 已修（2026-10-06，锁内取快照） |
-| P2-14 | 共享 transport 缺 dial/TLS 握手超时 | `internal/upstream/upstream.go:809-818` | SDK 注释专门警告过手搓 transport 不继承这两项；黑洞上游的失败检测被拖到 30s/120s 看门狗 |
-| P2-15 | TTFT 看门狗 `Stop()` 返回值被忽略 | `cmd/gateway/main.go:1511-1517` | 竞态窗口可产出「空但 ok」的假正常流（历史上反复修的形态） |
-| P2-16 | RPM 注释与限速器行为相反 | `main.go:1067` vs `ratelimit/limiter.go:80` | 实际行为是 limiter 的（更安全），应改 main.go 注释防后人「修反」 |
-| P2-17 | 链耗尽错误归因到最后一个 active 而非实际尝试目标 | `main.go:1339-1343` | 排障定位偏差 |
+| P2-14 | 共享 transport 缺 dial/TLS 握手超时 | `internal/upstream/upstream.go:809-818` | SDK 注释专门警告过手搓 transport 不继承这两项；黑洞上游的失败检测被拖到 30s/120s 看门狗 | ✅ 已修（补 DialContext/TLSHandshakeTimeout各 10s） |
+| P2-15 | TTFT 看门狗 `Stop()` 返回值被忽略 | `cmd/gateway/main.go:1511-1517` | 竞态窗口可产出「空但 ok」的假正常流（历史上反复修的形态） | ✅ 已修（检查 Stop() 返回值 + 等 ttftDone 确保 Close 已落地） |
+| P2-16 | RPM 注释与限速器行为相反 | `main.go:1067` vs `ratelimit/limiter.go:80` | 实际行为是 limiter 的（更安全），应改 main.go 注释防后人「修反」 | ✅ 已修（改正注释，与 limiter 实现对齐） |
+| P2-17 | 链耗尽错误归因到最后一个 active 而非实际尝试目标 | `main.go:1339-1343` | 排障定位偏差 | ✅ 已修（记录实际尝试到的候选） |
 
 ### 存储 / 计费
 
 | # | 问题 | 位置 | 要点 |
 |---|---|---|---|
-| P2-18 | `CREATE TRIGGER IF NOT EXISTS` 永不更新旧触发器体 | `store.go:242`、`usage_archive.go:128` | 将来改口径时升级库与新库静默分叉（totals 漂移无报错） |
-| P2-19 | `DeleteGroup` 只挡 users 不挡 keys | `group_dao.go:107-134` | 删组后 key 级覆盖被 SET NULL，模型白名单静默放宽 |
-| P2-20 | `SumTokensByDayForKey` 归档支边界日整天计入 | `usage_dao.go:450-461` | 账单多报（最多一整天），与 UsageSource 自己的「宁可少算」规则相反 |
-| P2-21 | `group_by=day`（UTC/仅明细）与 `by-day`（本地/含归档）口径分裂 | `usage_handler.go:210,561` | 同一界面两个趋势入口数字对不上、老日期空白 |
-| P2-22 | `freezeUsageCost` 查价失败静默计 0 且不可修复 | `usage_dao.go:81-89` | 一次读池抖动 = 永久漏账、无对账线索；缺 RecomputeCost 入口 |
-| P2-23 | token 列无 CHECK 约束 | `store.go:198-219` | 上游回报负数可污染终身累计、凭空发放配额 |
-| P2-24 | 货币 float64/REAL 无舍入 | `usage_dao.go:98`、`store.go:289` | 长尾二进制小数进响应；建议展示层 round(6) |
-| P2-25 | 剪枝大事务占满唯一写连接 | `usage_archive.go:361-426` | 首剪可达百万行 DELETE，期间全部写入排队；建议按天分事务 |
-| P2-26 | `reconcileUsageTotals` 同一 src 绑定 10 次占位符 | `usage_archive.go:261-275` | 当前零占位符所以正确；将来传非空 filter 即错绑——需注释钉死或重构 |
+| P2-18 | `CREATE TRIGGER IF NOT EXISTS` 永不更新旧触发器体 | `store.go:242`、`usage_archive.go:128` | 将来改口径时升级库与新库静默分叉（totals 漂移无报错） | ✅ 已修（DROP+CREATE 替代 CREATE IF NOT EXISTS） |
+| P2-19 | `DeleteGroup` 只挡 users 不挡 keys | `group_dao.go:107-134` | 删组后 key 级覆盖被 SET NULL，模型白名单静默放宽 | ✅ 已修（DeleteGroup 补查 access_keys 成员） |
+| P2-20 | `SumTokensByDayForKey` 归档支边界日整天计入 | `usage_dao.go:450-461` | 账单多报（最多一整天），与 UsageSource 自己的「宁可少算」规则相反 | ✅ 已修（边界改整日包含，与 UsageSource 口径一致） |
+| P2-21 | `group_by=day`（UTC/仅明细）与 `by-day`（本地/含归档）口径分裂 | `usage_handler.go:210,561` | 同一界面两个趋势入口数字对不上、老日期空白 | ✅ 已修（group_by=day 改本地日界，与 by-day 对齐） |
+| P2-22 | `freezeUsageCost` 查价失败静默计 0 且不可修复 | `usage_dao.go:81-89` | 一次读池抖动 = 永久漏账、无对账线索；缺 RecomputeCost 入口 | ✅ 已修（补 WARN 留痕 + 新增 RecomputeCost 补救入口） |
+| P2-23 | token 列无 CHECK 约束 | `store.go:198-219` | 上游回报负数可污染终身累计、凭空发放配额 | ✅ 已修（CreateUsageRecord 入口归一负数为 0） |
+| P2-24 | 货币 float64/REAL 无舍入 | `usage_dao.go:98`、`store.go:289` | 长尾二进制小数进响应；建议展示层 round(6) | ✅ 已修（费用舍入到 1e-9 元） |
+| P2-25 | 剪枝大事务占满唯一写连接 | `usage_archive.go:361-426` | 首剪可达百万行 DELETE，期间全部写入排队；建议按天分事务 | ✅ 已修（单次上限 2 万行 + 水位仅在删净时推进） |
+| P2-26 | `reconcileUsageTotals` 同一 src 绑定 10 次占位符 | `usage_archive.go:261-275` | 当前零占位符所以正确；将来传非空 filter 即错绑——需注释钉死或重构 | ✅ 已修（钉死注释：args 必须零长度） |
 
 ### 前端 / 部署 / CI
 
 | # | 问题 | 位置 | 要点 |
 |---|---|---|---|
 | P2-27 | CI 不跑 go test 也不跑 vue-tsc；action 未 pin SHA | `.github/workflows/ci.yml` | ✅ 已修（`63dde96`）—— 补全量 go test 与 vue-tsc，action pin 到 commit SHA |
-| P2-28 | 容器 root 运行 + 无 HEALTHCHECK | `Dockerfile:41-63` | 进程被攻破即持 root；死锁无法探活 |
-| P2-29 | localStorage JWT + 登出无服务端吊销 + 多标签页不同步 | `web/src/api.ts:24-34` | A 登出 B 仍可用（无 storage 事件）；供应链投毒可绕 CSP 偷 8h 令牌 |
-| P2-30 | 5 个视图加载失败呈现为「暂无数据」空态 | `Keys/Providers/Routes/History/Overview.vue` | 把加载失败呈现成确无数据，误导运维（Users/Groups 有正确的持久错误态可对照） |
-| P2-31 | CSP 缺 `object-src 'none'` | `server.go:411-414` | 零成本硬化项 |
+| P2-28 | 容器 root 运行 + 无 HEALTHCHECK | `Dockerfile:41-63` | 进程被攻破即持 root；死锁无法探活 | ✅ 已修（entrypoint 降权+ su-exec；补 HEALTHCHECK） |
+| P2-29 | localStorage JWT + 登出无服务端吊销 + 多标签页不同步 | `web/src/api.ts:24-34` | A 登出 B 仍可用（无 storage 事件）；供应链投毒可绕 CSP 偷 8h 令牌 | ✅ 已修（登出递增 auth_version 作废全部会话 + 令牌改 sessionStorage） |
+| P2-30 | 5 个视图加载失败呈现为「暂无数据」空态 | `Keys/Providers/Routes/History/Overview.vue` | 把加载失败呈现成确无数据，误导运维（Users/Groups 有正确的持久错误态可对照） | ✅ 已修（5 个视图加持久错误态） |
+| P2-31 | CSP 缺 `object-src 'none'` | `server.go:411-414` | 零成本硬化项 | ✅ 已修（CSP 加 object-src none） |
 
 ---
 
@@ -257,15 +257,43 @@ A 请求 60s 冷却、B 请求 1s 冷却，A 把B 的时间戳写进了库，60s
 
 ---
 
-## 已知残留（P2，按优先级大致排序）
+## 修复状态总览（2026-10-07）
 
-P2-14 transport 缺拨号/TLS 超时、P2-15 TTFT 看门狗竞态、P2-18 触发器升级漂移、
-P2-19 删组放宽 key 白名单、P2-20 账单边界日多报、
-P2-8 自助建 key 不限额（需用户级限速，属新功能）、P2-9 配额无预占、
-P2-5 空 ID fail-open 分支清理、P2-2 bootstrap 审计死代码、P2-28 容器 root、
-P2-29 localStorage 令牌、P2-30 加载失败呈现为空态，及报告所列其余各项。
+**P1 全部 5 条 + P2 全部 31 条均已修复。** 本轮（P2）按域分四批落地：
 
-其中**下一条建议修的是 P2-14**：它与 P2-13 同属上游池，且 SDK 注释专门警告过
-「手搓transport 不继承 dial/TLS 握手超时」，而黑洞上游的失败检测会被拖到
-30s/120s 看门狗才触发。P2-15 与 P2-13 同属竞态类，改法可复用本文的
-「锁内取快照」纪律。
+| 批次 | 条目 | 关键改动 |
+|---|---|---|
+| 上游池/转发 | 14/15/16/17 | transport 补拨号与握手超时；TTFT 看门狗消除「空但 ok」；改正与实现相反的注释；错误归因到实际尝试目标 |
+| 认证/会话 | 2/4/5/6/7 | bootstrap 独立审计；改密按用户限速；三处 fail-open 收紧；登录文案去掉枚举 oracle；删死代码 |
+| 存储/计费 | 18/19/20/22/23/24/25/26 | 触发器 DROP+CREATE；删组补查 key；账单边界与 UsageSource 对齐；费用失败留痕+可重算；负数归一；浮点舍入；剪枝限量；占位符约束钉死 |
+| 前端/部署/权限 | 8/9/10/11/28/29/30/31 | 自助建 key 额度封顶；配额原子预占；白名单认直连形式；username 真正填充；容器非root+健康检查；登出真吊销；5 视图持久错误态；CSP 补object-src |
+
+外加 P2-21（group_by=day 与 by-day 日界对齐）随前端批次一并修复。
+
+### 本轮的三条方法论教训
+
+**1. 测试会骗人，而且比缺陷更难发现。** P2-13 修数据竞争时连续写了两版
+恒绿测试（修复后 PASS、回退后仍 PASS）：第一版让 store 在函数体内污染共享
+字段—— 太晚，Go 的实参在进入 callee 之前就求值完了；第二版用共享的
+`current` 变量标记调用方 —— 那变量本身也竞态，标签互串。最终方案是让 store
+真的起 goroutine 并等待完成，用悬殊到无法混淆的时长（1s vs 1h）让落库值
+自身标识归属。**旧写法下 399/400 命中污染值 → FAIL，才算有效。**
+
+**2. 修「统一口径」这类问题时，先看响应契约。** P2-21 我一度把
+`group_by=day` 直接转给 `/by-day` 的实现，被既有测试挡住 —— 两者响应形状
+不同（前者带 summary）。那份测试守的是真实契约，不是实现细节。正确解法是
+在保留响应形状的前提下修正日界。
+
+**3. 改之前先查有没有现成能力。** P2-29 我准备新写一个 `BumpAuthVersion`，
+结果 store 里早就有了（注释写着「用于禁用账号、改角色这类必须让会话失效的
+操作」）—— 而我的方案和它的语义完全一致，只是多绕了一圈。
+
+### 遗留（均为设计取舍，不是缺陷）
+
+- **全链路无 TLS**：部署层解决（前置反向代理）。
+- **用量归档后老日期在 `group_by=day` 之外仍不可见**：与 UsageSource 的
+  「宁可少算」口径一致，属刻意的边界选择。
+- **`-race` 本机不可用**（Windows 无 gcc）：并发修复靠人工审查 +
+  CI 上有 gcc 的环境兜底。
+- **配额预占的 est 是预估值**：真实用量在收尾处校正；上游不回usage 时
+  传 0，此时 used 会比真实少计—— `usage_state="missing"` 让漏账可见。
