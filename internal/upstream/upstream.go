@@ -410,11 +410,20 @@ func (p *Pool) GetAnyClient(providerSlug string) (*rosetta.Client, string, error
 
 // MarkCredentialCooldown 把一把凭据踢出健康轮换一段时间（冷却）。
 func (p *Pool) MarkCredentialCooldown(credID string, duration time.Duration) {
+	// until 必须在锁内取值：cred 是**共享指针**，解锁后别的 goroutine 可能正在
+	// 改写 CooldownUntil/Status。锁外读会把撕裂值传进 SetCredentialCooldown，
+	// 而冷却是**要落库持久化**的——写进去的就是错的值，且没有任何迹象。
+	// （RecordCredentialSuccess 同理，见下。）
+	var until time.Time
+	var ok bool
+
 	p.mu.Lock()
-	cred, ok := p.credIndex[credID]
-	if ok {
+	cred, found := p.credIndex[credID]
+	if found {
 		cred.CooldownUntil = time.Now().Add(duration)
 		cred.Status = "cooling"
+		until = cred.CooldownUntil // 快照：锁外只用它，不再碰 cred
+		ok = true
 	}
 	store := p.cooldownSto
 	p.mu.Unlock()
@@ -423,12 +432,12 @@ func (p *Pool) MarkCredentialCooldown(credID string, duration time.Duration) {
 		return
 	}
 	p.logger.Info("credential cooling down",
-		"credential", credID, "until", cred.CooldownUntil, "duration", duration)
+		"credential", credID, "until", until, "duration", duration)
 	// 必须落库：冷却是运行时状态，而池会被任何 admin 写操作重建。
 	// 只改内存的话，重建时 PrepareFromStore 从库读到 cooldown_until=0，
 	// 刚被判 401 无效的 key 立刻回到轮换里。
 	if store != nil {
-		if err := store.SetCredentialCooldown(context.Background(), credID, "cooling", cred.CooldownUntil); err != nil {
+		if err := store.SetCredentialCooldown(context.Background(), credID, "cooling", until); err != nil {
 			p.logger.Warn("persist credential cooldown failed", "credential", credID, "error", err)
 		}
 	}
@@ -438,15 +447,22 @@ func (p *Pool) MarkCredentialCooldown(credID string, duration time.Duration) {
 // 不这样做的话：一次偶发 5xx 把 key 打进 60s cooling，即便它马上又好了，
 // 这一分钟内仍被 getHealthyCredentials 跳过 —— 对单 key provider 等于凭空造 outage。
 func (p *Pool) RecordCredentialSuccess(credID string) {
+	// 与 MarkCredentialCooldown 同一个纪律：**锁内判断、锁外只用自己的局部值**。
+	// 这里的落库参数是常量，天然不受竞态影响；但 changed 这个判定若放到锁外
+	// 去读 cred.Status，就会与并发的 MarkCredentialCooldown 抢读同一行 ——
+	// 后者会把 CooldownUntil 改成未来某一刻，而前者据此判定「本来就是 healthy」，
+	// 于是**刚被冷却的凭据被误判为无需恢复**，落库与内存就此分叉。
+	var changed bool
+	var store CooldownStore
+
 	p.mu.Lock()
 	cred, ok := p.credIndex[credID]
-	changed := false
 	if ok && (cred.Status != "healthy" || !cred.CooldownUntil.IsZero()) {
 		cred.Status = "healthy"
 		cred.CooldownUntil = time.Time{}
 		changed = true
 	}
-	store := p.cooldownSto
+	store = p.cooldownSto
 	p.mu.Unlock()
 
 	if !changed {
