@@ -183,12 +183,6 @@
   box-shadow: var(--overlay-shadow), 0 0 0 1px var(--border);
 }
 
-@media (prefers-reduced-transparency: reduce) {
-  [data-theme='dark'] .nav {
-    background: var(--background);
-  }
-}
-
 * {
   margin: 0;
   padding: 0;
@@ -223,107 +217,194 @@ textarea {
   font-variant-numeric: tabular-nums;
 }
 
-/* ---------- 顶部导航（HeroUI 风格：细描边 + 轻模糊，不留投影） ---------- */
-.nav {
-  position: sticky;
-  top: 0;
-  z-index: 50;
-  background: color-mix(in oklab, var(--background) 82%, transparent);
-  backdrop-filter: saturate(180%) blur(20px);
-  -webkit-backdrop-filter: saturate(180%) blur(20px);
-  border-bottom: 1px solid transparent;
-  transition:
-    border-color 0.25s var(--ease-out-quart),
-    background 0.25s var(--ease-out-quart);
-}
-.nav.scrolled {
-  border-bottom-color: var(--border);
-}
-.nav-in {
-  max-width: var(--maxw);
-  margin: 0 auto;
-  padding: 0 var(--gutter);
-  height: 56px;
+/* ---------- 侧边栏布局（参考 hirezo：可收起 rail + 右侧主列） ----------
+   结构：.shell（横排，占满视口高）> .side（品牌 + 导航 + 版本/收起钮）
+   + .main-col（.topbar 工具栏 + .content 滚动区）。
+   内容在 .content 里滚而不是整页滚 —— 侧栏与顶栏因此天然固定。
+   亮暗主题全部走令牌，无需按主题写分支。 */
+.shell {
   display: flex;
-  align-items: center;
-  gap: 14px;
+  height: 100vh;
+  overflow: hidden;
 }
-.brand {
+.side {
   display: flex;
-  align-items: center;
-  gap: 9px;
-  min-width: 0;
+  flex-shrink: 0;
+  flex-direction: column;
+  width: 224px;
+  background: var(--background);
+  border-right: 1px solid var(--separator);
+  transition: width 300ms var(--ease-out-quart);
 }
-.brand-mark {
-  width: 24px;
-  height: 24px;
-  border-radius: var(--r-chip);
-  flex: none;
-  background: var(--accent);
+.side.collapsed {
+  width: 64px;
+}
+
+.side-brand {
+  display: flex;
+  height: 60px;
+  flex-shrink: 0;
+  align-items: center;
+  gap: 10px;
+  padding: 0 12px;
+}
+.side.collapsed .side-brand {
+  justify-content: center;
+  padding: 0;
+}
+.side-logo {
   display: grid;
+  width: 30px;
+  height: 30px;
+  flex: none;
   place-items: center;
+  border-radius: var(--r-chip);
+  background: var(--accent);
   color: var(--accent-foreground);
   font: 700 11px/1 var(--sans);
 }
-.brand-txt {
-  font-size: 15px;
+.side-title {
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+  line-height: 1.25;
+}
+.side-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 14.5px;
   font-weight: 650;
   letter-spacing: -0.01em;
-  white-space: nowrap;
 }
-.brand-sub {
-  font-size: 12.5px;
+.side-sub {
+  font-size: 12px;
   color: var(--muted);
   white-space: nowrap;
 }
 
-/* 分段式页签（HeroUI segmented：默认底 + 选中白胶囊） */
-.tabs-scroll {
-  overflow-x: auto;
-  scrollbar-width: none;
+.side-nav {
   flex: 1;
-  min-width: 0;
+  overflow-y: auto;
+  padding: 0 8px 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  scrollbar-width: none;
 }
-.tabs-scroll::-webkit-scrollbar {
+.side-nav::-webkit-scrollbar {
   display: none;
 }
-.tabs {
+.side-item {
   display: flex;
-  gap: 2px;
-  position: relative;
-  width: max-content;
-  margin: 0 auto;
-  padding: 3px;
-  border-radius: var(--r-pill);
-  background: var(--default);
-}
-.tab {
-  position: relative;
-  z-index: 1;
-  padding: 5px 15px;
-  border-radius: var(--r-pill);
-  font-size: 13px;
+  align-items: center;
+  gap: 12px;
+  border-radius: var(--r-thumb);
+  padding: 8px 12px;
+  font-size: 14px;
   font-weight: 500;
-  color: var(--muted);
+  color: var(--text-2);
   text-decoration: none;
   white-space: nowrap;
   transition:
-    color 0.2s var(--ease-out-quart),
-    background 0.25s var(--ease-spring);
+    background-color 200ms var(--ease-out-quart),
+    color 200ms var(--ease-out-quart);
 }
-.tab:hover {
-  color: var(--foreground);
+.side-item svg {
+  flex: none;
 }
-.tab.router-link-active {
-  color: var(--segment-foreground);
-  background: var(--segment);
-  box-shadow: var(--field-shadow);
+.side-item:hover {
+  background: var(--hover);
+  color: var(--text);
 }
-.nav-actions {
+.side-item.router-link-active {
+  background: var(--accent-soft);
+  color: var(--accent-link);
+}
+.side.collapsed .side-item {
+  justify-content: center;
+  padding: 8px;
+}
+
+.side-foot {
+  flex-shrink: 0;
+  padding: 8px;
   display: flex;
+  flex-direction: column;
   align-items: center;
   gap: 8px;
-  flex: none;
+}
+.side-version {
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--text-3);
+}
+.side.collapsed .side-version {
+  display: none;
+}
+/* 收起钮：与顶栏的 .theme-toggle 同配方的幽灵图标钮，但不描边 ——
+   它在侧栏内部，边框会显得像第二个导航层级。 */
+.side-collapse {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 34px;
+  height: 34px;
+  border: none;
+  border-radius: var(--r-pill);
+  background: transparent;
+  color: var(--muted);
+  cursor: pointer;
+  transition:
+    color 0.15s var(--ease-smooth),
+    background 0.15s var(--ease-smooth);
+}
+.side-collapse:hover {
+  color: var(--accent);
+  background: var(--hover);
+}
+.side-collapse:active {
+  transform: scale(0.94);
+}
+.side.collapsed .side-collapse {
+  margin: 0 auto;
+}
+
+/* ---------- 主列：顶栏 + 内容滚动区 ---------- */
+.main-col {
+  display: flex;
+  min-width: 0;
+  flex: 1;
+  flex-direction: column;
+}
+.topbar {
+  z-index: 20;
+  display: flex;
+  height: 56px;
+  flex-shrink: 0;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 8px;
+  padding: 0 var(--gutter);
+  border-bottom: 1px solid transparent;
+  transition:
+    border-color 0.25s var(--ease-out-quart),
+    box-shadow 0.25s var(--ease-out-quart);
+}
+.topbar.scrolled {
+  border-bottom-color: var(--border);
+  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.03);
+}
+[data-theme='dark'] .topbar.scrolled {
+  box-shadow: none;
+}
+.content {
+  flex: 1;
+  overflow-y: auto;
 }
 
 /* 导航栏右侧的当前用户标识（多用户模式）。
@@ -369,23 +450,6 @@ textarea {
   max-width: var(--maxw);
   margin: 0 auto;
   padding: 28px var(--gutter) 80px;
-}
-/* 页脚版本号：压到最低视觉层级，只做信息交代，不与主体内容竞争 */
-.foot {
-  max-width: var(--maxw);
-  margin: 0 auto;
-  padding: 22px var(--gutter) 44px;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  flex-wrap: wrap;
-  gap: 8px;
-  color: var(--muted);
-  font-family: var(--mono);
-  font-size: 12px;
-}
-.foot-sep {
-  color: var(--faint);
 }
 .page-head {
   display: flex;
@@ -998,9 +1062,6 @@ textarea {
   }
 }
 @media (prefers-reduced-transparency: reduce) {
-  .nav {
-    background: var(--background);
-  }
   .scrim {
     backdrop-filter: none;
     -webkit-backdrop-filter: none;
@@ -1016,7 +1077,7 @@ textarea {
     --muted: oklch(0.42 0.014 285.94);
     --border: oklch(0.72 0.004 286.32);
   }
-  .tab.router-link-active {
+  .side-item.router-link-active {
     box-shadow: 0 0 0 1px var(--border);
   }
 }
@@ -1031,10 +1092,6 @@ textarea {
   }
 }
 @media (max-width: 640px) {
-  .brand-txt,
-  .brand-sub {
-    display: none;
-  }
   .stat-grid {
     grid-template-columns: repeat(2, 1fr);
   }

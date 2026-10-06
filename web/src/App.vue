@@ -8,23 +8,56 @@ import AppModal from './components/AppModal.vue'
 
 const route = useRoute()
 const router = useRouter()
-const scrolled = ref(false)
-const onScroll = () => (scrolled.value = window.scrollY > 4)
-onMounted(() => window.addEventListener('scroll', onScroll, { passive: true }))
-onUnmounted(() => window.removeEventListener('scroll', onScroll))
 
-// 窄屏页签滚动跟随（选中页签滚到可视区中央）
-const tabsScroll = ref<HTMLElement | null>(null)
+// ---------- 侧边栏（布局参考 hirezo） ----------
+//
+// 左侧可收起 rail（品牌 + 图标导航 + 版本/收起钮），右侧主列
+// （工具栏 + 滚动内容区）。收起状态持久化到 localStorage；
+// ≤900px 视口强制图标栏（224px 会吃掉平板宽度），但用户自己的
+// 选择在回到宽屏后仍然生效 —— narrow 只影响显示，不写回存储。
+const COLLAPSE_KEY = 'rosetta_gw_sidebar_collapsed'
+const collapsed = ref(false)
+try {
+  collapsed.value = localStorage.getItem(COLLAPSE_KEY) === '1'
+} catch {
+  /* 隐私模式下可能读不了 localStorage，按默认展开 */
+}
+const narrow = ref(window.matchMedia('(max-width: 900px)').matches)
+let mq: MediaQueryList | null = null
+function onNarrowChange(e: MediaQueryListEvent) {
+  narrow.value = e.matches
+}
+const railCollapsed = computed(() => collapsed.value || narrow.value)
+
+function toggleCollapse() {
+  collapsed.value = !collapsed.value
+  try {
+    localStorage.setItem(COLLAPSE_KEY, collapsed.value ? '1' : '0')
+  } catch {
+    /* 忽略 */
+  }
+}
+
+// 内容区在 .content 里滚（不是 window）：顶栏的发丝线在滚过 4px 后出现。
+// 监听器必须挂在模板 ref 的 watch 上而不是 onMounted —— 外壳只在
+// loadSession 完成后渲染，onMounted 时 contentRef 还是 null。
+const scrolled = ref(false)
+const contentRef = ref<HTMLElement | null>(null)
+watch(contentRef, (el, _prev, onCleanup) => {
+  if (!el) return
+  const onScroll = () => {
+    scrolled.value = el.scrollTop > 4
+  }
+  el.addEventListener('scroll', onScroll, { passive: true })
+  onCleanup(() => el.removeEventListener('scroll', onScroll))
+})
+
+// 路由切换把内容区滚回顶部；顶栏阴影随之复位。
 watch(
   () => route.path,
-  async () => {
-    const ts = tabsScroll.value
-    if (!ts || ts.scrollWidth <= ts.clientWidth) return
-    await Promise.resolve()
-    const active = ts.querySelector('.router-link-active') as HTMLElement | null
-    if (!active) return
-    const target = active.offsetLeft - (ts.clientWidth - active.offsetWidth) / 2
-    ts.scrollTo({ left: Math.max(0, target), behavior: 'smooth' })
+  () => {
+    contentRef.value?.scrollTo({ top: 0 })
+    scrolled.value = false
   },
 )
 
@@ -96,7 +129,7 @@ function toggleTheme() {
 }
 
 /**
- * showShell 决定是否渲染后台外壳（导航栏 + 页脚）。
+ * showShell 决定是否渲染后台外壳（侧栏 + 顶栏 + 内容区）。
  *
  * 三种情形一律为 false：
  *   - 探测未完成 → 先显示空白，避免刷新时闪一下完整后台再跳登录页；
@@ -104,9 +137,9 @@ function toggleTheme() {
  *     渲染出来只是一个必然报错的空壳；
  *   - 未登录 → 只剩登录页。
  *
- * 注意它**只管外壳**。<RouterView> 有意留在这个 v-if 之外：登录页也是
- * 一条路由，被包进来就等于「未登录时唯一该出现的页面被守卫挡掉」，
- * 表现为整页空白（登录后同一份构建正常，故不是数据问题）。
+ * 模板里外壳（v-if）与登录页（v-else）是互斥的两个分支，同一时刻
+ * 只挂载一个 RouterView。曾经把登录页放进无 else 的 v-if 里，
+ * 未登录时它被外壳的判定整个藏掉 —— #app 只剩空注释节点（实测白屏）。
  */
 const showShell = computed(() => {
   if (!session.checked) return false
@@ -125,6 +158,8 @@ async function doLogout() {
 
 onMounted(async () => {
   initTheme()
+  mq = window.matchMedia('(max-width: 900px)')
+  mq.addEventListener('change', onNarrowChange)
   // loadSession 一次性问完「后端在不在 / 有没有建出管理员 / 我是谁」，
   // 内部已把各种失败降级成状态（backendReady / needsSetup / me），
   // 不往外抛 —— 所以这里不需要 try/catch。
@@ -135,6 +170,10 @@ onMounted(async () => {
   // 「已登录却停在 /login」被送回后台，「未登录停在受保护页」被送去登录，
   // 「普通用户停在 admin-only 页」被送回我的账号。
   reapplyGuard()
+})
+
+onUnmounted(() => {
+  mq?.removeEventListener('change', onNarrowChange)
 })
 
 // 登录态失效时（api.ts 在 401 里把 session.me 置空）把人送回登录页。
@@ -157,35 +196,126 @@ watch(
 </script>
 
 <template>
-  <!-- 未登录时不渲染后台外壳：只剩登录页自己的头部。
-       showShell 的判定刻意包含 session.checked —— 探测完成前先显示空白，
-       避免刷新页面时闪一下完整后台再跳登录页。 -->
-  <template v-if="showShell">
-  <header class="nav" :class="{ scrolled }">
-    <div class="nav-in">
-      <div class="brand">
-        <span class="brand-mark">RG</span>
-        <span class="brand-txt">Rosetta Gateway</span>
-        <span class="brand-sub">管理后台</span>
+  <!-- 登录页与后台外壳是两个互斥分支，同一时刻只挂载一个 RouterView。
+       旧布局把 RouterView 留在 showShell 之外、只包住顶部导航；侧边栏
+       外壳包裹整个内容区后改用 v-if / v-else —— 未登录时 v-else 分支的
+       登录页照样渲染，不会复现「登录页被自己的外壳挡掉」的白屏
+       （那是把 RouterView 放进 v-if 内且没有 else 分支时的事故）。 -->
+  <div v-if="showShell" class="shell">
+    <aside class="side" :class="{ collapsed: railCollapsed }">
+      <div class="side-brand">
+        <div class="side-logo">RG</div>
+        <div v-if="!railCollapsed" class="side-title">
+          <span class="side-name">Rosetta Gateway</span>
+          <span class="side-sub">管理后台</span>
+        </div>
       </div>
-      <div ref="tabsScroll" class="tabs-scroll">
-        <nav class="tabs">
-          <RouterLink class="tab" to="/">总览</RouterLink>
-          <RouterLink class="tab" to="/keys">访问密钥</RouterLink>
-          <RouterLink class="tab" to="/history">调用历史</RouterLink>
-          <RouterLink class="tab" to="/profile">我的账号</RouterLink>
-          <!-- admin-only 页签对普通用户隐藏。真正的拦截在路由守卫与后端，
-               这里只是不让用户看到点进去才发现没权限的入口。 -->
-          <template v-if="isAdmin()">
-            <RouterLink class="tab" to="/users">用户</RouterLink>
-            <RouterLink class="tab" to="/groups">分组</RouterLink>
-            <RouterLink class="tab" to="/providers">上游与模型</RouterLink>
-            <RouterLink class="tab" to="/routes">路由</RouterLink>
-            <RouterLink class="tab" to="/settings">设置</RouterLink>
-          </template>
-        </nav>
+
+      <!-- admin-only 页签对普通用户隐藏。真正的拦截在路由守卫与后端，
+           这里只是不让用户看到点进去才发现没权限的入口。 -->
+      <nav class="side-nav" aria-label="管理后台导航">
+        <RouterLink class="side-item" to="/" :title="railCollapsed ? '总览' : undefined">
+          <svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <rect width="7" height="9" x="3" y="3" rx="1" />
+            <rect width="7" height="5" x="14" y="3" rx="1" />
+            <rect width="7" height="9" x="14" y="12" rx="1" />
+            <rect width="7" height="5" x="3" y="16" rx="1" />
+          </svg>
+          <span v-if="!railCollapsed">总览</span>
+        </RouterLink>
+        <RouterLink class="side-item" to="/keys" :title="railCollapsed ? '访问密钥' : undefined">
+          <svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <path d="M2 18v3c0 .6.4 1 1 1h4v-3h3v-3h2l1.4-1.4a6.5 6.5 0 1 0-4-4Z" />
+            <circle cx="16.5" cy="7.5" r=".5" fill="currentColor" />
+          </svg>
+          <span v-if="!railCollapsed">访问密钥</span>
+        </RouterLink>
+        <RouterLink class="side-item" to="/history" :title="railCollapsed ? '调用历史' : undefined">
+          <svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <path d="M3 12a9 9 0 1 0 9-9 9.75 9.75 0 0 0-6.74 2.74L3 8" />
+            <path d="M3 3v5h5" />
+            <path d="M12 7v5l4 2" />
+          </svg>
+          <span v-if="!railCollapsed">调用历史</span>
+        </RouterLink>
+        <RouterLink class="side-item" to="/profile" :title="railCollapsed ? '我的账号' : undefined">
+          <svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <path d="M18 20a6 6 0 0 0-12 0" />
+            <circle cx="12" cy="10" r="4" />
+            <circle cx="12" cy="12" r="10" />
+          </svg>
+          <span v-if="!railCollapsed">我的账号</span>
+        </RouterLink>
+        <template v-if="isAdmin()">
+          <RouterLink class="side-item" to="/users" :title="railCollapsed ? '用户' : undefined">
+            <svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2" />
+              <circle cx="9" cy="7" r="4" />
+              <path d="M22 21v-2a4 4 0 0 0-3-3.87" />
+              <path d="M16 3.13a4 4 0 0 1 0 7.75" />
+            </svg>
+            <span v-if="!railCollapsed">用户</span>
+          </RouterLink>
+          <RouterLink class="side-item" to="/groups" :title="railCollapsed ? '分组' : undefined">
+            <svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <path d="m12.83 2.18a2 2 0 0 0-1.66 0L2.6 6.08a1 1 0 0 0 0 1.83l8.58 3.91a2 2 0 0 0 1.66 0l8.58-3.9a1 1 0 0 0 0-1.83Z" />
+              <path d="m22 17.65-9.17 4.16a2 2 0 0 1-1.66 0L2 17.65" />
+              <path d="m22 12.65-9.17 4.16a2 2 0 0 1-1.66 0L2 12.65" />
+            </svg>
+            <span v-if="!railCollapsed">分组</span>
+          </RouterLink>
+          <RouterLink class="side-item" to="/providers" :title="railCollapsed ? '上游与模型' : undefined">
+            <svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <rect width="20" height="8" x="2" y="2" rx="2" ry="2" />
+              <rect width="20" height="8" x="2" y="14" rx="2" ry="2" />
+              <line x1="6" x2="6.01" y1="6" y2="6" />
+              <line x1="6" x2="6.01" y1="18" y2="18" />
+            </svg>
+            <span v-if="!railCollapsed">上游与模型</span>
+          </RouterLink>
+          <RouterLink class="side-item" to="/routes" :title="railCollapsed ? '路由' : undefined">
+            <svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <circle cx="6" cy="19" r="3" />
+              <path d="M9 19h8.5a3.5 3.5 0 0 0 0-7h-11a3.5 3.5 0 0 1 0-7H15" />
+              <circle cx="18" cy="5" r="3" />
+            </svg>
+            <span v-if="!railCollapsed">路由</span>
+          </RouterLink>
+          <RouterLink class="side-item" to="/settings" :title="railCollapsed ? '设置' : undefined">
+            <svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <path d="M12.22 2h-.44a2 2 0 0 0-2 2v.18a2 2 0 0 1-1 1.73l-.43.25a2 2 0 0 1-2 0l-.15-.08a2 2 0 0 0-2.73.73l-.22.38a2 2 0 0 0 .73 2.73l.15.1a2 2 0 0 1 1 1.72v.51a2 2 0 0 1-1 1.74l-.15.09a2 2 0 0 0-.73 2.73l.22.38a2 2 0 0 0 2.73.73l.15-.08a2 2 0 0 1 2 0l.43.25a2 2 0 0 1 1 1.73V20a2 2 0 0 0 2 2h.44a2 2 0 0 0 2-2v-.18a2 2 0 0 1 1-1.73l.43-.25a2 2 0 0 1 2 0l.15.08a2 2 0 0 0 2.73-.73l.22-.39a2 2 0 0 0-.73-2.73l-.15-.08a2 2 0 0 1-1-1.74v-.5a2 2 0 0 1 1-1.74l.15-.09a2 2 0 0 0 .73-2.73l-.22-.38a2 2 0 0 0-2.73-.73l-.15.08a2 2 0 0 1-2 0l-.43-.25a2 2 0 0 1-1-1.73V4a2 2 0 0 0-2-2z" />
+              <circle cx="12" cy="12" r="3" />
+            </svg>
+            <span v-if="!railCollapsed">设置</span>
+          </RouterLink>
+        </template>
+      </nav>
+
+      <div class="side-foot">
+        <span class="side-version">v{{ appVersion }} · rosetta {{ rosettaVersion }}</span>
+        <button
+          class="side-collapse"
+          :title="railCollapsed ? '展开侧边栏' : '收起侧边栏'"
+          :aria-label="railCollapsed ? '展开侧边栏' : '收起侧边栏'"
+          @click="toggleCollapse"
+        >
+          <svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <rect width="18" height="18" x="3" y="3" rx="2" />
+            <path d="M9 3v18" />
+          </svg>
+        </button>
       </div>
-      <div class="nav-actions">
+    </aside>
+
+    <div class="main-col">
+      <header class="topbar" :class="{ scrolled }">
+        <span
+          v-if="session.me"
+          class="who"
+          :title="`${session.me.username}（${session.me.role === 'admin' ? '管理员' : '普通用户'}）`"
+        >
+          {{ session.me.display_name || session.me.username }}
+        </span>
         <!-- 亮/暗主题切换 -->
         <button
           class="theme-toggle"
@@ -201,11 +331,7 @@ watch(
             <path d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8z" />
           </svg>
         </button>
-        <!-- 登出：只有一种形态了。让后端清会话后回登录页，
-             别再引入「只清本机令牌然后重载」的旁路 —— 那要求前端持有密码。 -->
-        <span v-if="session.me" class="who" :title="`${session.me.username}（${session.me.role === 'admin' ? '管理员' : '普通用户'}）`">
-          {{ session.me.display_name || session.me.username }}
-        </span>
+        <!-- 登出：让后端清掉会话，再回登录页。 -->
         <button
           v-if="session.me"
           class="theme-toggle"
@@ -219,26 +345,15 @@ watch(
             <path d="M21 12H9" />
           </svg>
         </button>
-      </div>
+      </header>
+
+      <!-- 内容在 .content 里滚而不是整页滚：侧栏与顶栏因此天然固定 -->
+      <main ref="contentRef" class="content">
+        <RouterView />
+      </main>
     </div>
-  </header>
-  </template>
-
-  <!-- RouterView 刻意留在 showShell 之外。登录页本身也是一条路由，而它原先
-       被包在 showShell 的 v-if 里 —— 未登录时 showShell 为 false，
-       于是唯一该出现的登录页被自己的守卫挡掉：浏览器里 #app 的 innerHTML
-       退化成两个空注释节点，document.body.innerText 长度为 0（实测白屏）。
-       现在只有导航栏与页脚跟着 showShell 走，路由内容一律照常渲染。 -->
-  <RouterView />
-
-  <template v-if="showShell">
-  <!-- 页脚版本号（构建时注入，非运行时接口） -->
-  <footer class="foot">
-    <span>rosetta-gateway v{{ appVersion }}</span>
-    <span class="foot-sep" aria-hidden="true">·</span>
-    <span>rosetta {{ rosettaVersion }}</span>
-  </footer>
-  </template>
+  </div>
+  <RouterView v-else />
 
   <!-- Toast -->
   <div
