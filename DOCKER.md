@@ -6,7 +6,7 @@
 发布 `v1.1.1` tag 会得到 `:1.1.1` 与 `:latest` 两个标签；CI 会校验 tag 与
 `package.json` 一致，不一致直接构建失败（防止打出名不副实的镜像）。
 
-架构：`linux/amd64`、`linux/arm64`。
+架构：`linux/amd64`（CI 只构建这一种；需要 arm64 再说）。
 
 ---
 
@@ -21,7 +21,8 @@ docker run -d \
   ghcr.io/cn-maul/rosetta-gateway:1.1.1
 ```
 
-然后打开 `http://<主机>:8666/admin/` —— 首次进入会要求设置管理员密码。
+然后打开 `http://<主机>:8666/admin/` —— 首次进入会显示「首次设置密码」表单，
+为自动创建的 `admin` 账号设一个密码，设完直接进入后台。
 
 > 局域网里别的机器访问，要用宿主机的**局域网 IP**，不是 `localhost`。
 
@@ -70,9 +71,9 @@ Chrome / Edge / Brave / Opera 一律硬拦；Firefox 也拦，只是报错文案
 /data                     唯一需要持久化的目录（VOLUME）
 ├── config.json           生效中的配置
 ├── master.key            上游凭据加密主密钥，自动生成
-├── admin_auth.json       管理员密码（PBKDF2-SHA256 加盐，无明文）
+├── session_secret        会话签名密钥，自动生成；丢失 = 所有登录会话失效
 └── db/
-    └── gateway.db        SQLite：上游 / 模型 / 路由 / 访问密钥 / 用量记录
+    └── gateway.db        SQLite：上游 / 模型 / 路由 / 访问密钥 / 用户 / 用量记录
 ```
 
 镜像层本身是无状态的：`/data` 之外没有任何东西需要保存，升级镜像不会碰配置与数据。
@@ -104,9 +105,10 @@ Chrome / Edge / Brave / Opera 一律硬拦；Firefox 也拦，只是报错文案
 > ```
 > （`mkdir` 了 `db`，因为 `db_path` 指向 `/data/db/gateway.db`，父目录必须存在。）
 
-主密钥 `master.key` 与管理员密码 `admin_auth.json` 也都在 `/data` 下，
+主密钥 `master.key` 与会话密钥 `session_secret` 也都在 `/data` 下，
 **跟着 `/data` 一起持久化。** 若只单独挂了 `config.json` 和 `db/` 而没挂 `/data`，
-这两者会落在容器可写层、随容器重建丢失 —— 上游凭据将无法解密，管理员密码会回到未设置。
+这两者会落在容器可写层、随容器重建丢失 —— `master.key` 丢了上游凭据将无法解密；
+`session_secret` 丢了所有登录会话立即失效（用户被登出，重新登录即可，数据无损）。
 要精细挂载就把它们也一起挂上。
 
 > **`config.json` 一旦生成就不会跟镜像更新。** 升级镜像后它仍然是老内容
@@ -126,7 +128,7 @@ services:
       - ./rosetta/config.json:/data/config.json   # 配置文件
       - ./rosetta/db:/data/db                     # 数据库目录
       - ./rosetta/master.key:/data/master.key     # 凭据加密主密钥
-      - ./rosetta/admin_auth.json:/data/admin_auth.json
+      - ./rosetta/session_secret:/data/session_secret  # 会话签名密钥
 ```
 
 （若不需要精细控制，把上面四条换成一个 `- ./rosetta:/data` 即可。）
@@ -138,22 +140,26 @@ services:
 
 | 变量 | 作用 | 默认 |
 |---|---|---|
-| `ROSETTA_GW_HOME` | 状态根目录（配置 / 主密钥 / 凭据 / 数据库） | 镜像内已设为 `/data` |
+| `ROSETTA_GW_HOME` | 状态根目录（配置 / 密钥 / 数据库） | 镜像内已设为 `/data` |
 | `ROSETTA_GW_MASTER_KEY` | 覆盖主密钥。**设了就不用 `master.key` 文件** | 空（走 `/data/master.key`） |
-| `ADMIN_TOKEN` | 管理员兜底令牌，用户设过密码后失效 | 空 |
+| `ROSETTA_GW_SESSION_SECRET` | 覆盖会话签名密钥。**设了就不用 `session_secret` 文件** | 空（走 `/data/session_secret`，没有就自动生成） |
 | `TZ` | 容器时区，影响日志时间戳 | `UTC` |
 
 `ROSETTA_GW_MASTER_KEY` 只在应急时用：它优先于 `master.key`，**两边取值不同会导致
 已加密的上游凭据全部解不开**。平时不要设。
 
+会话密钥无需预先配置：没设环境变量时会自动生成 `session_secret` 并落盘。
+它**必须随 `/data` 持久化** —— 换了密钥，所有登录会话立即失效。
+
 ## 首次启动的安全提示
 
-默认配置是 `listen: 0.0.0.0:8666` 且 `admin_token` 为空 —— 这是「端口已发布、
-但还没有任何管理凭据」的状态，**在设置密码之前，能访问到该端口的人可以先设密码**。
+默认配置是 `listen: 0.0.0.0:8666`，而第一个管理员的密码要等人打开 `/admin/` 来设 ——
+**在设好密码之前，能访问到该端口的人都可以抢先完成设置**。网关启动时检测到这种
+「未初始化 + 非回环监听」的状态会打一条 ERROR 日志提醒。
 
-所以：**容器起来后第一时间去 `/admin/` 设置管理员密码**。
-若要挂在公网，建议先设 `-e ADMIN_TOKEN=<随机串>` 再启动，或者只绑回环
-（`-p 127.0.0.1:8666:8666`）。
+所以：**容器起来后第一时间去 `/admin/` 完成首次设置密码**。
+若要挂在公网，建议只绑回环（`-p 127.0.0.1:8666:8666`）再加反代鉴权，
+或至少先在本机完成密码设置再放开端口。
 
 ## 日志
 
@@ -209,9 +215,9 @@ docker compose pull && docker compose up -d
 所以服务端无日志。换成黑名单外的端口，宿主机和容器都用同一个，例如 8666。
 判断方法：容器内 `wget` 和宿主机 `curl` 都通、只有浏览器不通，就是这个。
 
-**起来就退出，日志报 `credentials file ... 内容无效`**
-`admin_auth.json` 被写坏了（比如挂载了一个空文件）。删掉它重启即可，
-届时改用 `ADMIN_TOKEN` 或重新设置密码。
+**起来就退出，日志报会话密钥相关错误（secret 无效 / 太短 / 为空）**
+`session_secret` 被写坏了（比如挂载了一个空文件 —— 网关把它当故障，不会静默重新生成）。
+删掉它重启即可：会自动生成新密钥，代价是所有用户需要重新登录。
 
 **上游请求 502，日志里有 `cipher: message authentication failed`**
 `master.key` 变了或丢了，库里已加密的凭据解不开。恢复原来的 `master.key`；

@@ -31,7 +31,9 @@
 - 不做 prompt 编排 / Agent 框架 / 会话托管
 - 不做 RAG、向量库
 - 不做计费结算与账务（只做用量记账，不做钱）
-- 不做上游 Responses 的会话状态托管（`previous_response_id` 走 `Extra` 透传）
+- 不做上游 Responses 的会话状态托管：`previous_response_id` / `store` 在上游协议为
+  `openai-responses` 时经 `Extra` 透传给上游承接；chat / anthropic 上游无此概念，
+  这两个字段被丢弃，客户端须自带全量历史
 - 不做 Embeddings / Rerank 的对外入口（Rosetta 已具备上游能力，P3 之后再评估）
 - 不做多节点集群（单进程，SQLite 本地文件）
 
@@ -360,49 +362,51 @@ resolve(model):
 
 ### 6.2 下游鉴权
 
-接受三种承载方式，任一命中即通过：
+接受两种承载方式，任一命中即通过：
 
-| 方式 | 头 / 参数 |
+| 方式 | 头 |
 |---|---|
 | Bearer | `Authorization: Bearer sk-gw-...` |
 | Anthropic 风格 | `x-api-key: sk-gw-...` |
-| Query（兼容兜底） | `?key=sk-gw-...` |
 
 校验：`SHA-256(明文)` 查 `access_keys.key_hash` 索引。上游 Key 是高熵随机串，无需 bcrypt 类慢哈希。
 
-失败返回 401；Key 被停用返回 403；过期返回 401；配额耗尽返回 429。
+**刻意不支持 `?key=sk-gw-...`**（早期文档里有，现已移除）：query 串会被写进访问日志、
+反向代理日志与 `Referer`，等于把凭据复制到系统里每一个会记录 URL 的地方
+（见 `internal/auth/auth.go` 的 `extractKey` 注释）。SDK 与脚本改用 Bearer 头即可。
+
+失败返回 401；Key 被停用、过期、来源 IP 不在白名单均返回 **403**
+（`invalid_api_key` / `key_expired` / `ip_not_allowed`）；配额耗尽返回
+429 `insufficient_quota`；模型不在该 key 的白名单内返回 403 `model_not_allowed`。
+无归属的 key 返回 401（`ErrKeyUnowned`）—— 见 §6.4「先建后认领」。
 
 ### 6.3 管理接口
 
-统一挂在 `/admin/api/*`。管理鉴权独立于下游 Key：凭据存放在**可执行文件同级的 `admin_auth.json`**
-（PBKDF2-HMAC-SHA256 + 随机盐，见 `internal/adminauth`），`config.json` 的 `admin_token`
-仅作为「尚未设置密码」时的兜底与应急恢复通道。**凭证是运行时状态，设置后立即生效、无需重启。**
+统一挂在 `/admin/api/*`。管理鉴权只有一条通道：**users 表 + JWT 会话**
+（设计与演进史见 `MULTIUSER.md`），不存在任何旁路 —— 旧版「`admin_auth.json` 密码文件 +
+`config.json` 的 `admin_token` / `ADMIN_TOKEN` 环境变量」双通道已整体删除
+（`internal/adminauth` 包不复存在，`Config.AdminToken` 字段已删）。
+**凭据是运行时状态，改密码后旧会话立即失效、无需重启。**
 
-**凭据优先级（唯一事实来源）** —— 两者是**覆盖**关系，不是并存：
+首次初始化由 `GET/POST /admin/api/bootstrap` 完成：
 
-| 状态 | 实际生效的凭据 | 判定依据 |
-|---|---|---|
-| ① `admin_auth.json` 存在且可解析 | **只认其中的用户密码**；`admin_token` **完全失效** | `Store.cred != nil` → 走 `cred.matches()` |
-| ② `admin_auth.json` 不存在 | `config.json` 的 `admin_token`；若它为空则用 `ADMIN_TOKEN` 环境变量 | `Store.cred == nil` → 走 `verifyFallback()` |
-| ③ 两者都没有 | 无凭据：除 `password/check` 与首次 `password/set` 外一律 401 | `HasCredential() == false` |
-| ④ `admin_auth.json` 存在但损坏 | 一律拒绝（锁定态）；`HasCredential()` 仍为真 | `Store.locked != nil` |
-
-要点：
-- **一旦在「设置」页设过密码，`admin_token` 就再也不认了**（不是「都能用」）。这是最常见的困惑来源。
-- 忘了密码的恢复通道：删掉 `admin_auth.json` 重启 → 回到状态 ②/③（用 `admin_token` 登录，或重新设置密码）。
-- 状态 ④ 的 `HasCredential()` 必须为真，否则一个损坏的文件就等于把 `password/set` 引导窗口向所有人敞开。
-- 上述四条由 `internal/adminauth/store_test.go` 钉住（`TestVerify_PasswordBeatsConfigToken` 等）。
-
-前端 `GET /admin/api/password/check` 返回 `source` 字段（`none` / `config_token` / `password_file` / `locked`）
-与 `first_setup`，登录弹窗据此渲染成三种**明显不同**的形态（首次初始化需二次确认 / 令牌登录 / 密码登录），
-避免「创建凭据」与「使用凭据」长得一样。
+- 系统启动时若 users 表没有任何**已设密码**的 admin，自动建出一个空密码 admin 账号
+  （`cmd/gateway/bootstrap_admin.go`）；
+- 登录页探测到这种状态就渲染「首次设置密码」表单（不是登录表单），
+  提交后一步完成设密码 + 登录（`internal/admin/user_handler.go` 的 `BootstrapSetup`）；
+- 三重防线：只对 `role='admin' AND password_hash=''` 的账号生效、
+  设过即 409（不静默覆盖）、同源校验 + Content-Type 断言（防 CSRF）；
+- 暴露面边界：全新部署且监听非回环时，任何能连到端口的人都能抢先成为第一个管理员
+  —— 与旧实现「无凭据时 `password/set` 免鉴权」的暴露面完全相同，只是挪了位置；
+  缓解是默认回环监听 + 启动时的 ERROR 告警
+  （`FindUninitializedAdmin != nil && !isLoopbackListen`）。
 
 | 端点 | 放行规则 |
 |---|---|
-| `GET /admin/api/password/check` | 恒放行（只返回布尔值与来源标签，不含任何可用于登录的信息） |
-| `POST /admin/api/password/set` | 仅当系统尚无任何凭据时放行；已有凭据则必须带正确的旧凭据 |
-| `GET /admin/api/auth/verify` | 需鉴权（给前端「先验证再保存」用） |
-| 其余 | `Authorization: Bearer <密码或 admin_token>` |
+| `GET /admin/api/bootstrap` | 恒放行（返回是否需要初始化与待初始化账号名） |
+| `POST /admin/api/bootstrap` | 仅当存在未初始化 admin 时放行（同源 + JSON Content-Type） |
+| `POST /admin/api/login` / `POST /admin/api/logout` | 免鉴权（登录 / 登出本体） |
+| 其余 | `Authorization: Bearer <会话令牌>`，查 users 表比对 `auth_version` |
 
 ```
 GET    /admin/api/providers                     列表
@@ -460,10 +464,21 @@ POST   /admin/api/reload                        从 DB 重建内存快照
 
 | 端点 | 形状来源 | 数据口径 |
 |---|---|---|
-| `GET /v1/organization/costs` | OpenAI 官方 Usage/Costs API（page + bucket + `organization.costs.result`） | 全组织；费用按 upstream_models 单价实时估算（口径同 §11.1 统计），`amount.currency` 诚实标 `cny` |
-| `GET /v1/organization/usage/completions` | 同上 | 全组织；input/cached/output/请求数按 1h/1d 桶聚合 |
+| `GET /v1/organization/costs` | OpenAI 官方 Usage/Costs API（page + bucket + `organization.costs.result`） | **按调用者身份收窄**（管理员/运维凭据=全组织，普通用户=自己名下）；费用按 upstream_models 单价实时估算（口径同 §11.1 统计），`amount.currency` 诚实标 `cny` |
+| `GET /v1/organization/usage/completions` | 同上 | 同上；input/cached/output/请求数按 1h/1d 桶聚合 |
 | `GET /dashboard/billing/subscription`（含 `/v1/` 前缀别名） | one-api/new-api 时代起客户端通用 | **per-key**：`hard_limit_usd` 等承载 key 的 token 配额 |
 | `GET /dashboard/billing/usage`（含别名） | 同上 | **per-key**：区间内已用 token 折算 `total_usage`（美分） |
+
+「组织」= 本网关整个部署，因此上面两个 `/v1/organization/*` 端点**按调用者身份收窄**
+（实现见 `cmd/gateway/billing.go` 的 `orgCostsScope` + `store.SumUsageBucketsScoped` /
+`SumCostBucketsScoped`）。作用域只由服务端根据会话身份判定，绝不从 query 参数读取。
+修复前它们只做 `auth.Authenticate`，任何一把 `sk-gw` key 都能读到**别的租户**的
+模型名、用量与费用（实测普通用户的 `/admin/api/stats` 显示 `cost:0`，而同一把 key
+打 `/v1/organization/costs` 直接拿到 `value:0.000072 cny` —— 恰好是 stats 不给的那笔）。
+
+`/dashboard/billing/usage` 的 `start_date` / `end_date`（`YYYY-MM-DD`）**给了但解析不了、
+或区间反向，一律 400**：静默回退到「最近 30 天」等于把另一个窗口的数据返回给调用方
+却让它以为生效了。参数**缺省**才回退近 30 天。
 
 **单位映射（重要）**：dashboard billing 系把 **百万 tokens 记作 1 美元等价单位（PTM）**
 —— 客户端 UI 只消费两个数的比值（余额/进度条），同量纲保证比例正确；绝对值是
@@ -493,6 +508,25 @@ PATCH 端点一律「只看请求体里出现了哪些字段」：
   （注意：故障转移与超时策略**不是**路由的 PATCH 字段，它们在「设置」页，见 §10。）
 
 管理端登录限速（§11.4）与配额预检（§11.2）都不走 PATCH 语义，别混。
+
+三处刻意偏离上面这套通用规则，各有理由：
+
+- **`PATCH /admin/api/keys/{id}` 的 `user_id`**（仅管理员有效）：这就是「先建后认领」
+  —— 管理员建出一把无归属 key（`user_id:""` 的 key 鉴权时得到 `ErrKeyUnowned` → 401），
+  之后用这个字段把它认领给某个**已存在**的用户。落库走独立的
+  `store.ReassignAccessKey`；`UpdateAccessKey` 刻意不写 `user_id`（归属不该由一个
+  PATCH 随手改写，见 `user_dao_test.go` 的断言）。指向不存在的用户 → 400。
+- **模型白名单 `allowed_models`（key 与组）**：出现**空白条目**（trim 后为空）→ 400。
+  静默丢弃会把「收紧到某模型」变成「完全不限制」（归一后为空 → 落库 NULL →
+  读回 `nil` → `AllowAll()`），而界面看不出任何区别。清空白名单用**显式的空数组 `[]`**。
+  响应回显一律是**归一后**的值（去空白、去重、排序），与随后的 `GET` 一致。
+- **`allowed_ips`**：逗号分隔，落库前逐段 trim 并丢掉空段（`"10.0.0.0/8,"` 与
+  `"10.0.0.0/8"` 语义完全相同），回显的也是归一后的原文。无法解析的段 → 400。
+
+`providers.timeout_ms` 除「非负」外还有**上界 86 400 000 ms（24h）**
+（`config.MaxDurationMillis`）：`time.Duration(ms) * time.Millisecond` 在
+ms > 9.223e12 时会回绕成**负数**，负 Duration 让 `context.WithTimeout` 立即过期。
+`config.json`、设置页、provider PATCH 三处共用同一个常量。
 
 实现约束：结构体的标量字段必须是指针，合并处写 `if req.X != nil { ... }`。
 用 `if *req.X != ""` 或解引用后判断零值的写法会把「显式置空」重新变回「未提供」，
@@ -792,45 +826,65 @@ UPDATE access_keys SET used_tokens = used_tokens + NEW.total_tokens WHERE id = N
 
 | 配置类别 | 存放位置 | 可否运行时改 |
 |---|---|---|
-| Provider / 模型 / Route / Key | **数据库** | 是（管理 API / Web 界面） |
-| **管理后台密码** | **`<exeDir>/admin_auth.json`** | **是（「设置」页，改完立即生效）** |
+| Provider / 模型 / Route / Key / **用户与管理员账号** | **数据库** | 是（管理 API / Web 界面） |
 | 监听地址、DB 路径、日志级别、加密主密钥、全局默认超时与重试、body 大小上限 | **配置文件** | 否（改后重启） |
 | 首次 bootstrap 的 provider/route | 配置文件（仅当 DB 为空时生效） | 否 |
 
 **关键纪律**：DB 非空时，配置文件里的 `providers` / `routes` 段落被**忽略并打印 warning**。这防止出现「界面改完、重启被配置文件覆盖」这类经典事故。
 
-**为什么管理密码不进数据库**：`gateway.db` 在本项目里是「可丢弃的运行时数据」—— 加密主密钥丢失、库损坏、想重来一遍时，标准动作就是删库重建。管理员密码是**身份凭据**，放进一个会被随手删掉的文件里，等于「删库 = 把自己锁在门外」。这与 `master.key` 独立于库的理由完全一致：**身份状态必须独立于业务数据**。
+**管理员账号为什么在数据库里**（2026-10-06 统一认证改造的决策）：管理面收敛到
+users 表 + 会话一条通道后，管理员只是一个 `role='admin'` 的普通用户，
+密码哈希（PBKDF2）自然随账号落库。**代价是「删库 = 失明」**：库没了，
+管理员账号与密码一起没了 —— 但这也意味着首次初始化窗口重新打开，
+重启后登录页会再次出现「首次设置密码」表单，重建的第一个管理员就是新的你。
+这一取舍是明确接受的；真正不可重建的身份状态只有两把密钥（见 §12.1.1），
+它们仍然独立于数据库存放。
 
-**为什么也不塞进 `config.json`**：`config.json` 是运维手写的引导配置，程序回写它会丢掉注释与字段顺序；而且 `admin_token` 的语义是「运维引导用的静态令牌」，与「用户在界面上设置的管理密码」是两回事。混用会让判定逻辑互相污染 —— 早期实现因此被迫用 `len(token) == 64` 去猜「这串到底是明文还是哈希」，一个恰好 64 字符的明文令牌就会被误判成哈希而**永久锁死**。
-
-两者关系：用户设置的密码**优先**；未设置时回退到 `config.json` 的 `admin_token`（或 `ADMIN_TOKEN` 环境变量）。后者是兜底与应急恢复通道 —— 忘了密码时删掉 `admin_auth.json` 重启，就退回用 `admin_token` 登录。
+**为什么管理凭据不再有 `admin_auth.json` / `admin_token` 旁路**：双通道时代
+「界面密码」与「运维令牌」并存，判定逻辑互相污染 —— 早期实现被迫用
+`len(token) == 64` 去猜「这串到底是明文还是哈希」，一个恰好 64 字符的明文令牌
+就会被误判成哈希而**永久锁死**；而且旁路意味着绕开 users 表的状态、角色与改密审计。
+统一后只有一种凭据、一种失效路径，401 只有一个含义。
 
 ### 12.1.1 数据目录布局
 
-所有相对路径都按**可执行文件所在目录**解析（与进程 CWD 无关），因此部署形态是「一个目录装下全部状态」：
+所有相对路径默认按**可执行文件所在目录**解析（与进程 CWD 无关）；设了
+`ROSETTA_GW_HOME` 则整体重定向到该目录（容器部署就是这么把状态指到挂载卷的）。
+部署形态是「一个目录装下全部状态」：
 
 ```
-<部署目录>/
+<home>/
 ├── gateway.exe          # 单个二进制（前端已 embed）
 ├── config.json          # 手写引导配置，程序不回写
-├── master.key           # 凭据加密主密钥（缺失时程序自动生成，见下）
-├── admin_auth.json      # 管理后台密码（PBKDF2-SHA256，加盐，无明文）
+├── master.key           # 上游凭据加密主密钥（缺失时自动生成）
+├── session_secret       # 会话签名密钥（缺失时自动生成并原子落盘）
 └── data/
-    └── gateway.db       # SQLite：provider/模型/路由/key/用量记录
+    └── gateway.db       # SQLite：provider/模型/路由/key/用户/用量记录
 ```
 
-删掉 `data/` 等于重置全部业务数据；删掉 `admin_auth.json` 等于重置管理密码。两者互不影响。
+删掉 `data/` 等于重置全部业务数据（管理员账号随之消失，重启后重新走首次初始化）；
+删掉 `master.key` 等于上游凭据全部作废；删掉 `session_secret` 只影响登录态
+（所有人被登出，数据无损）。
 
 **主密钥的解析顺序**（`crypto.LoadMasterKey`）：
 
 1. 环境变量 `master_key_env`（缺省 `ROSETTA_GW_MASTER_KEY`）
-2. `<exeDir>/master.key` 文件
-3. 都没有 → **生成一个写入 `<exeDir>/master.key`** 并复用（启动日志给出路径）
+2. `<home>/master.key` 文件
+3. 都没有 → **生成一个写入 `<home>/master.key`** 并复用（启动日志给出路径）
 
-之所以必须有第 3 条：早期实现只认环境变量，而 `bin/master.key` 那套自动生成活在
-`gateway.ps1` 里 —— 结果**用脚本启动有密钥、双击 exe 启动没有**，后者会把上游 API Key
-**明文**写进 `data/gateway.db`。同一份库在两种启动方式下还会互相解不开。
-密钥落盘后两条路共用一把。
+**会话密钥的解析顺序**（`userauth.NewManager`，与主密钥同构）：
+
+1. 环境变量 `ROSETTA_GW_SESSION_SECRET`
+2. `<home>/session_secret` 文件
+3. 都没有 → **生成一个并原子落盘**（先写 `.tmp` 再 rename；启动日志说明来源）
+
+两个「都没有」分支是刻意设计：早期实现只认环境变量 —— 主密钥那边，`bin/master.key`
+的自动生成活在 `gateway.ps1` 里，结果**用脚本启动有密钥、双击 exe 启动没有**，后者会把
+上游 API Key **明文**写进 `data/gateway.db`；会话密钥这边，没配就起不来，或者更糟 ——
+静默用临时密钥，重启后所有人被登出。自动落盘让两条密钥都「零配置可用」，
+代价是运维必须把 `<home>` 当状态目录持久化（容器要挂载卷）。
+注意：**空文件视为故障**（长度不足会被拒），不会静默重新生成 ——
+静默换密钥等于悄悄作废所有会话/解不开旧凭据，宁可让网关起不来并报错。
 
 ⚠️ **选定启动方式后不要来回换。** 环境变量优先级高于文件：先双击（密钥落在 `master.key`）、
 后来改成设环境变量启动，两把密钥不同 → 先前加密的凭据解不开。
@@ -848,7 +902,6 @@ UPDATE access_keys SET used_tokens = used_tokens + NEW.total_tokens WHERE id = N
   "listen": "127.0.0.1:8080",
   "db_path": "./data/gateway.db",
   "log_level": "info",
-  "admin_token": "",
   "master_key_env": "ROSETTA_GW_MASTER_KEY",
   "defaults": {
     "upstream_timeout_ms": 120000,
@@ -887,13 +940,14 @@ UPDATE access_keys SET used_tokens = used_tokens + NEW.total_tokens WHERE id = N
 设置页里显式保存过的值覆盖 config，未配置的字段回落到这里的 `defaults`，见 §10「参数落点」。
 
 **关于 `listen`**：默认（含程序自动生成的配置）是 `127.0.0.1:8080`。
-网关对外提供 `/v1` 是常态，但**首次启动时后台还没有任何凭据**，
-此时绑 `0.0.0.0` 等于把「抢先设置管理员密码」的权利交给局域网里第一个访问 `/admin/` 的人。
-要对外服务就显式改成 `0.0.0.0:<port>` —— 启动日志会打印实际监听地址，改完记得回头核对。
+网关对外提供 `/v1` 是常态，但**首次启动时第一个管理员的密码还没设**，
+此时绑 `0.0.0.0` 等于把「抢先完成首次设置密码」的权利交给局域网里第一个访问 `/admin/` 的人。
+要对外服务就显式改成 `0.0.0.0:<port>` —— 启动日志会打印实际监听地址，
+并在这种「未初始化 + 非回环」状态下打 ERROR 告警。
 
-**关于 `admin_token`**：留空**不等于**免鉴权。真实凭据在 `<exeDir>/admin_auth.json`。
-留空且该文件不存在时，后台处于「等待首次设置密码」状态，
-此时除 `password/check` 与首次 `password/set` 外的接口一律 401。
+**关于管理员凭据**：配置文件里没有任何管理员字段 —— 管理面走 users 表 + 会话
+（§6.3）。首次打开 `/admin/` 会出现「首次设置密码」表单，设完即进入后台；
+此后再无免鉴权窗口。
 
 ---
 
@@ -933,7 +987,8 @@ UPDATE access_keys SET used_tokens = used_tokens + NEW.total_tokens WHERE id = N
 
 ### 13.3 安全
 
-- 管理界面仅监听内网，但**默认要求 `ADMIN_TOKEN`**，不做「内网免鉴权」的假设
+- 管理面只有 users 表 + 会话一条通道（§6.3），不做「内网免鉴权」的假设；
+  首次初始化窗口只对未设密码的 admin 开启，且启动时对「非回环监听 + 未初始化」打 ERROR
 - 上游 key 在界面只显示掩码（`sk-...abcd`），明文不可回读
 - 所有写操作记审计日志（**已实现，2026-10-04**）：`server.AutoReload` 在每个管理写
   操作上落 `audit_log`（谁=admin+来源 IP、何时、哪个资源、**哪些字段名**）。
