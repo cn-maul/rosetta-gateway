@@ -1679,7 +1679,7 @@ func attemptStream(w http.ResponseWriter, r *http.Request, client *rosetta.Clien
 		TotalTokens:     lastUsage.TotalTokens,
 		ReasoningTokens: lastUsage.ReasoningTokens,
 		CachedTokens:    lastUsage.CachedInputTokens,
-		UsageState:      "reported",
+		UsageState:      usageStateFor(lastUsage),
 		Status:          status,
 		HTTPStatus:      httpStatus,
 		ErrorCode:       errorCode,
@@ -1687,7 +1687,12 @@ func attemptStream(w http.ResponseWriter, r *http.Request, client *rosetta.Clien
 		TTFBMs:          ttfbMs,
 	})
 	// TPM 校正：预占的估算值以真实 usage（输入+输出）替换。
-	rate.commit(lastUsage.TotalTokens)
+	// usage missing（上游没报任何 token 数）时**故意不校正**：commit(0) 会全额
+	// 退还预占，等于不报用量的上游完全绕过 TPM；保留估算值让限速继续约束这类
+	// 流量，估算值随窗口翻转自然清零。
+	if !lastUsage.IsZero() {
+		rate.commit(lastUsage.TotalTokens)
+	}
 	// committed=true（字节已写出、无法回退换目标）与「这一次算成功」是两件事：
 	// truncated / overflow / error / canceled 都已提交，但对上游而言是失败。
 	// 只有 status=="ok" 才允许外层记成功，否则「先200 再断流」这类最常见的
@@ -1734,17 +1739,33 @@ func attemptNonStream(w http.ResponseWriter, r *http.Request, client *rosetta.Cl
 		TotalTokens:     resp.Usage.TotalTokens,
 		ReasoningTokens: resp.Usage.ReasoningTokens,
 		CachedTokens:    resp.Usage.CachedInputTokens,
-		UsageState:      "reported",
+		UsageState:      usageStateFor(resp.Usage),
 		Status:          "ok",
 		HTTPStatus:      200,
 		LatencyMs:       latency,
 		TTFBMs:          ttfbMs,
 	})
-	rate.commit(resp.Usage.TotalTokens)
+	// usage missing（上游没报用量）时保留 TPM 预占不校正 —— 理由见 attemptStream。
+	if !resp.Usage.IsZero() {
+		rate.commit(resp.Usage.TotalTokens)
+	}
 	// 非流式能走到这里就意味着上游完整返回了响应 —— 一定是成功。
 	// 漏写success 会让每次非流式成功都被外层记成「目标失败」，
 	// 健康的链首目标 3 个请求后就被误熔断（详见 attemptOutcome.success）。
 	return attemptOutcome{committed: true, success: true}
+}
+
+// usageStateFor 区分「上游报了用量」与「上游一个 token 数都没给」。
+//
+// 必须区分：上游不报 usage（第三方兼容服务常见）时若按 "reported" 落 0 token，
+// 配额、费用报表、TPM 校正会把系统性漏账当成正常数据，且事后无法从库里分辨。
+// SDK 的 Usage.IsZero 把 cached/reasoning 也计入 —— 只报缓存命中或思考 token
+// 也算「报了」，否则会丢掉真实数字（见 SDK usage.go 的注释）。
+func usageStateFor(u rosetta.Usage) string {
+	if u.IsZero() {
+		return "missing"
+	}
+	return "reported"
 }
 
 // isClientGone 判断一次流式中断是否源于**客户端**断开，而不是上游故障。
