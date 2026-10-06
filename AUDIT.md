@@ -122,9 +122,9 @@ expires_at: expiresAtFromDays(eForm.days),   // 保存时无条件发送
 
 | # | 问题 | 位置 | 要点 |
 |---|---|---|---|
-| P2-1 | 无令牌请求计入登录失败限速 | `internal/server/user_auth.go:179-191` | 10 个匿名请求即让出口 IP 全员 429 一分钟（NAT 后可被当 DoS 杠杆）；刷新登录页的 `/me` 也计数 |
+| P2-1 | 无令牌请求计入登录失败限速 | `internal/server/user_auth.go:179-191` | ✅ 已修（`963193c`）—— 无凭据请求不计数，限速对象改为「试图伪造凭据」 |
 | P2-2 | bootstrap 审计分支是死代码 | `cmd/gateway/main.go:423`、`internal/server/autoreload.go:102` | bootstrap 挂 public mux，永远到不了带审计的 adminAuto 链——最敏感写操作零审计 |
-| P2-3 | `/me` 错误路径缺 return | `internal/admin/user_handler.go:413-418` | 先写 500 + 错误 JSON 再追加 200 + meResponse——DB 抖动时返回两段拼接 JSON（两个审计分片独立发现） |
+| P2-3 | `/me` 错误路径缺 return | `internal/admin/user_handler.go:413-418` | ✅ 已修（`5ad2813`）—— 降级改走 `writeJSON(200)`，不再写 500 头 |
 | P2-4 | 改密对旧密码校验不限速 | `internal/admin/user_admin_handler.go:479-513` | 会话被临时窃取时可对旧密码无限在线爆破；与登录端点防护不对称 |
 | P2-5 | 5 处「空 ID 用户 = admin」fail-open 分支残留 | `user_admin_handler.go:83`、`key_handler.go:307`、`usage_handler.go:187`、`group_handler.go:296`、`user_handler.go:405` | 统一认证后不可达，但属休眠提权原语，方向全是静默放行 |
 | P2-6 | 空哈希账号登录文案构成枚举 oracle | `user_handler.go:139-147` | 文案覆盖管理员建的所有空密码账号（不止引导 admin），与注释声称的范围不符 |
@@ -143,7 +143,7 @@ expires_at: expiresAtFromDays(eForm.days),   // 保存时无条件发送
 
 | # | 问题 | 位置 | 要点 |
 |---|---|---|---|
-| P2-12 | 上游不回 usage 按「0 token + reported」记账 | `cmd/gateway/main.go:1667-1688, 1722-1742` | 「真报 0」与「没报」不可区分；接不回 usage 的中转 = 整 provider 静默漏账、配额失效；SDK 的 missing 信号没接 |
+| P2-12 | 上游不回 usage 按「0 token + reported」记账 | `cmd/gateway/main.go:1667-1688, 1722-1742` | ✅ 已修（`8c833fd`）—— 接入 `Usage.IsZero()` 分两态记 `missing`，TPM 保留预占 |
 | P2-13 | `MarkCredentialCooldown` 锁外读共享字段 | `internal/upstream/upstream.go:412-435` | ✅ 已修（2026-10-06，锁内取快照） |
 | P2-14 | 共享 transport 缺 dial/TLS 握手超时 | `internal/upstream/upstream.go:809-818` | SDK 注释专门警告过手搓 transport 不继承这两项；黑洞上游的失败检测被拖到 30s/120s 看门狗 |
 | P2-15 | TTFT 看门狗 `Stop()` 返回值被忽略 | `cmd/gateway/main.go:1511-1517` | 竞态窗口可产出「空但 ok」的假正常流（历史上反复修的形态） |
@@ -168,7 +168,7 @@ expires_at: expiresAtFromDays(eForm.days),   // 保存时无条件发送
 
 | # | 问题 | 位置 | 要点 |
 |---|---|---|---|
-| P2-27 | CI 不跑 go test 也不跑 vue-tsc；action 未 pin SHA | `.github/workflows/ci.yml` | 唯一 job 是前端产物一致性；类型漂移与后端回归全靠本地自觉 |
+| P2-27 | CI 不跑 go test 也不跑 vue-tsc；action 未 pin SHA | `.github/workflows/ci.yml` | ✅ 已修（`63dde96`）—— 补全量 go test 与 vue-tsc，action pin 到 commit SHA |
 | P2-28 | 容器 root 运行 + 无 HEALTHCHECK | `Dockerfile:41-63` | 进程被攻破即持 root；死锁无法探活 |
 | P2-29 | localStorage JWT + 登出无服务端吊销 + 多标签页不同步 | `web/src/api.ts:24-34` | A 登出 B 仍可用（无 storage 事件）；供应链投毒可绕 CSP 偷 8h 令牌 |
 | P2-30 | 5 个视图加载失败呈现为「暂无数据」空态 | `Keys/Providers/Routes/History/Overview.vue` | 把加载失败呈现成确无数据，误导运维（Users/Groups 有正确的持久错误态可对照） |
