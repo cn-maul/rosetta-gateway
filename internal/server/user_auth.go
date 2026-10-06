@@ -185,7 +185,11 @@ func (a *UserAuthMiddleware) ServeHTTP(w http.ResponseWriter, r *http.Request, n
 
 	token := sessionToken(r)
 	if token == "" {
-		a.throttle.Fail(ip)
+		// 无凭据请求**不计入**失败限速：它不消耗任何验证资源（连 KDF 都不跑），
+		// 把它当「失败」计数只会制造一个零成本的 DoS 杠杆 —— 任何 IP 连发 10 个
+		// 匿名请求就能让同一出口（NAT/公司网关）后面的**所有人**被 429 锁出一分钟，
+		// 包括带着有效会话的正常用户；登录页每次探测 /me 也会计数，等于自己锁自己。
+		// 限速的对象是「试图伪造凭据」：token 非空但解析/校验失败才计入。
 		writeAdminErr(w, http.StatusUnauthorized, "需要登录")
 		return
 	}

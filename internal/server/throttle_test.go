@@ -155,6 +155,40 @@ func TestSessionAuthBlocksAnonymous(t *testing.T) {
 	}
 }
 
+// 匿名请求（完全不带凭据）不得累积失败计数。
+//
+// 那会是一个零成本的 DoS 杠杆：任何 IP 连发 limit 个匿名请求就能把同一出口
+// （NAT / 公司网关）后面的所有人锁出一分钟 —— 包括带着有效会话的正常用户；
+// 登录页每次探测 /me 也是匿名请求，等于自己锁自己。匿名一律 401，
+// 计数只针对「带了凭据但凭据无效」。
+func TestSessionAuth_AnonymousRequestsDoNotCountTowardThrottle(t *testing.T) {
+	a := newSessionGate(t)
+
+	do := func(token string) *httptest.ResponseRecorder {
+		req := httptest.NewRequest(http.MethodGet, "/admin/api/stats", nil)
+		if token != "" {
+			req.Header.Set("Authorization", "Bearer "+token)
+		}
+		req.RemoteAddr = "198.51.100.5:34567"
+		rec := httptest.NewRecorder()
+		a.ServeHTTP(rec, req, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(http.StatusOK)
+		}))
+		return rec
+	}
+
+	for i := range LoginFailLimit + 3 {
+		if got := do("").Code; got != http.StatusUnauthorized {
+			t.Fatalf("第 %d 个匿名请求应 401（匿名不计入限速，绝非 429），得到 %d", i+1, got)
+		}
+	}
+	// 匿名请求没有累积计数：现在带一个无效令牌，仍应是 401 而非 429。
+	// （若实现回退成「匿名也计数」，这里会得到 429，测试立刻红。）
+	if got := do("invalid-after-anon").Code; got != http.StatusUnauthorized {
+		t.Fatalf("匿名请求之后的首个无效令牌应 401，得到 %d（说明匿名请求被计入了限速）", got)
+	}
+}
+
 // TestClientIPIgnoresForwardedFor 来源 IP 不采信可伪造头，
 // 否则攻击者换个 X-Forwarded-For 就能重置自己的计数。
 func TestClientIPIgnoresForwardedFor(t *testing.T) {
