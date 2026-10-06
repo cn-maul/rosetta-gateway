@@ -1123,7 +1123,7 @@ rosetta-gateway/
 | 三协议上游调用 | ✅ | `Client.Chat` / `ChatStream` |
 | Embed / Rerank 上游 | ✅ | `Client.Embed` / `Rerank` |
 | 统一 usage | ✅ | `Usage` + `UsageTracker` 接口（网关实现它落库） |
-| 上游重试 / 退避 | ⚠️ | `WithMaxRetries` 只对**幂等**方法生效（GET/HEAD/OPTIONS/PUT/DELETE）。对话是 POST，SDK **不重试**，故 `max_retries` 对 chat 无效——聊天路径的重试由本网关的故障转移链承担（`route_targets`）。含 `Retry-After`（60s 硬上限）。 |
+| 上游重试 / 退避 | ⚠️ | SDK v1.0.0 起对话 POST 默认带传输层重试（标 `RetryIdempotent`，429/503 与传输错误都会重发同一请求）。网关**必须**传 `WithQuirks(NoIdempotencyKey: true)` 把它关掉（`buildClient` 已传）——否则非流式慢生成在 `ResponseHeaderTimeout` 处被掐后原地重发，上游重复生成重复计费。关闭后 POST 的失败一律立即上抛，重试职责由本网关的故障转移链承担（`route_targets`）。含 `Retry-After`（60s 硬上限）。 |
 | 上游凭证 | ✅ | 每 Client 一套，网关按 provider × credential 建实例 |
 | 流式拉取 | ✅ | `Stream.Next()`，逐事件转下游 SSE 很顺 |
 | 流截断识别 | ✅ | `ErrStreamTruncated` |

@@ -822,6 +822,14 @@ func buildClient(prov *ProviderEntry, apiKey string, cfg *config.Config) (*roset
 		rosetta.WithEndpoint(prov.Endpoint),
 		rosetta.WithAPIKey(apiKey),
 		rosetta.WithMaxRetries(prov.MaxRetries),
+		// NoIdempotencyKey 关闭 SDK 自带的对话 POST 重试（传输层错误与 429/503）。
+		// SDK v1.0.0 起把 chat POST 标为 RetryIdempotent（"behaves like RetryAlways"），
+		// 而 MaxRetries 默认 2 —— 与 DESIGN「对话是 POST，SDK 不重试，重试由
+		// 故障转移链承担」的假设相反。不改的话，非流式慢生成（响应头晚于
+		// ResponseHeaderTimeout=60s）会被原样重发，上游重复生成重复计费，
+		// 且 Idempotency-Key 对 DeepSeek/vLLM/各类中转普遍无效。
+		// 网关自己的重试策略：故障转移链（route_targets），不是同一个上游反复打。
+		rosetta.WithQuirks(rosetta.Quirks{NoIdempotencyKey: true}),
 		rosetta.WithHTTPClient(upstreamHTTPClient),
 	}
 	if prov.Protocol != "" && prov.Protocol != "auto" {
