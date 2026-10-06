@@ -167,6 +167,14 @@ const eForm = reactive({
   // 所以「取消勾选」= 传 [] = 清除限制（后端 PATCH 语义：字段缺席才是保持原值）。
   models: [] as string[],
   days: 0,
+  // 打开编辑框时的天数快照。保存时只在用户**显式改过**天数后才发送 expires_at：
+  // 总是发送会把「改个名字」变成「把截止时间重锚定到现在」（剩余不足 1 天的 key
+  // 被顺延），而已过期的 key 会被 daysLeft 的 0 值静默改写成「永不过期」——
+  // 等于凭空复活。PATCH 语义下「不传 = 保持原值」正是这里需要的。
+  daysOrig: 0,
+  // 打开编辑框时这把 key 是否已过期（expires_at 在过去）。影响编辑框里的提示文案：
+  // 「已过期」与「永不过期」在 daysLeft 里都是 0，不看这个标记就会混为一谈。
+  keyExpired: false,
   ips: '',
   groupId: '',
 })
@@ -179,6 +187,8 @@ function openEdit(k: AccessKey) {
   eForm.tpm = k.tpm_limit ?? 0
   eForm.models = [...(k.allowed_models ?? [])]
   eForm.days = daysLeft(k.expires_at ?? 0)
+  eForm.daysOrig = eForm.days
+  eForm.keyExpired = (k.expires_at ?? 0) > 0 && k.expires_at <= Date.now()
   eForm.ips = k.allowed_ips ?? ''
   eForm.groupId = k.group_id ?? ''
   eForm.open = true
@@ -198,7 +208,10 @@ async function submitEdit() {
       rpm_limit: Number(eForm.rpm) || 0,
       tpm_limit: Number(eForm.tpm) || 0,
       allowed_models: eForm.models,
-      expires_at: expiresAtFromDays(eForm.days),
+      // 见 eForm.daysOrig 注释：改过天数才发，保持原值就不带这个字段。
+      ...(Number(eForm.days) !== Number(eForm.daysOrig)
+        ? { expires_at: expiresAtFromDays(eForm.days) }
+        : {}),
       allowed_ips: eForm.ips.trim(),
       ...(isAdmin() ? { group_id: eForm.groupId } : {}),
     })
@@ -411,7 +424,8 @@ onMounted(load)
           <div class="field">
             <label>有效期（天）</label>
             <input v-model.number="eForm.days" class="input num" type="number" min="0" step="1" placeholder="0" />
-            <span class="tip">0 = 永不过期。保存后按「从现在起 N 天」重算截止时间。</span>
+            <span v-if="eForm.keyExpired" class="tip">该密钥已过期。改动天数会重新设定有效期（从现在起 N 天）；不改动则维持过期状态。</span>
+            <span v-else class="tip">0 = 永不过期。改动天数会按「从现在起 N 天」重设截止时间；不改动则保持原值。</span>
           </div>
           <div class="field">
             <label>来源 IP 白名单</label>

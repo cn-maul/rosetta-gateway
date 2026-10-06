@@ -289,6 +289,128 @@ func callerIsAdmin(r *http.Request) bool {
 	return me != nil && me.IsAdmin()
 }
 
+// guardNoLoosening 对普通用户执行「只能收紧」规则：管理员通过 Create/Update
+// 施加的强制措施（禁用、配额、限速、有效期、IP 白名单）不能被归属者用一条
+// PATCH 撤销 —— 否则「因泄露禁用某把 key」这个安全动作对懂 API 的用户形同虚设
+// （审计 actor 恒为 "admin"，事后连是谁翻转的都查不到）。
+//
+// 各字段规则（管理员不受限，直接放行）：
+//   - enabled：被禁用的 key 不能自行重新启用（自行禁用仍允许）；
+//   - 配额/限速（0 = 不限）：现值非 0 时新值必须是相等或更紧的正数，
+//     现值为 0（还没设过）时允许任意设置 —— 那是给自己加限制；
+//   - 有效期：现值非 0 时只能缩短或保持，不能清零或顺延（已过期 key 的
+//     「复活」路径就在这里堵死）；现值为 0（永不过期）时可设期限；
+//   - IP 白名单：现值为空（不限）时可任意收紧；现值非空时新集合必须 ⊆ 现集合
+//     （每个新网段都落在某个现有网段内），且不能清空。
+//
+// allowed_models 刻意不在此列：它有组白名单兜底（管理员控制的有效上限），
+// 且自助建 key 本来就能建出一把无白名单的 key —— 只拦这里的「清空」拦不住
+// 任何真实威胁，却会破坏「取消所有勾选后保存」的既有界面流程。
+//
+// 返回 false 表示已写出 403，调用方应立即 return。必须在任何字段写入前调用。
+func (h *KeyHandler) guardNoLoosening(w http.ResponseWriter, r *http.Request, req keyRequest, existing *store.AccessKey) bool {
+	if callerIsAdmin(r) {
+		return true
+	}
+	if req.Enabled != nil && *req.Enabled && !existing.Enabled {
+		writeError(w, http.StatusForbidden, "密钥已被管理员禁用，不能自行重新启用")
+		return false
+	}
+	if req.QuotaTokens != nil && !canTightenQuota(existing.QuotaTokens, *req.QuotaTokens) {
+		writeError(w, http.StatusForbidden, "配额只能收紧不能放宽或清零（0 = 不限，需管理员修改）")
+		return false
+	}
+	if req.RPMLimit != nil && !canTightenLimit(int64(existing.RPMLimit), int64(*req.RPMLimit)) {
+		writeError(w, http.StatusForbidden, "RPM 限速只能调紧不能放宽或清零（0 = 不限，需管理员修改）")
+		return false
+	}
+	if req.TPMLimit != nil && !canTightenLimit(int64(existing.TPMLimit), int64(*req.TPMLimit)) {
+		writeError(w, http.StatusForbidden, "TPM 限速只能调紧不能放宽或清零（0 = 不限，需管理员修改）")
+		return false
+	}
+	if req.ExpiresAt != nil && !canTightenExpiry(existing.ExpiresAt, *req.ExpiresAt) {
+		writeError(w, http.StatusForbidden, "有效期只能缩短不能顺延或清除（0 = 永不过期，需管理员修改）")
+		return false
+	}
+	if req.AllowedIPs != nil {
+		if msg := ipAllowlistWidened(existing.AllowedIPs, *req.AllowedIPs); msg != "" {
+			writeError(w, http.StatusForbidden, msg)
+			return false
+		}
+	}
+	return true
+}
+
+// canTightenQuota / canTightenLimit：0 = 不限。现值非 0 时新值必须是相等或更紧的正数；
+// 现值为 0 时任何非负新值都是收紧或保持。负值返回 true —— 那是非法值不是放宽，
+// 交给调用方的 400 校验去拒绝。
+func canTightenQuota(existing, new int64) bool {
+	if new < 0 {
+		return true
+	}
+	if existing <= 0 {
+		return true
+	}
+	return new > 0 && new <= existing
+}
+
+func canTightenLimit(existing, new int64) bool {
+	return canTightenQuota(existing, new)
+}
+
+// canTightenExpiry：0 = 永不过期。现值非 0（设过期限）时新值必须是相等或更早的
+// 正数时间戳；现值为 0 时可设任何期限（含 0 = 保持不过期）。负值同上交给 400。
+func canTightenExpiry(existing, new int64) bool {
+	if new < 0 {
+		return true
+	}
+	if existing <= 0 {
+		return true
+	}
+	return new > 0 && new <= existing
+}
+
+// ipAllowlistWidened 报告把 allowed_ips 从 old 改成 new 是否构成放宽。
+// 返回空串 = 允许；非空 = 403 文案。
+//
+// 两个方向都要拦：清空（= 全部来源放行）与「换个更大的网段」。包含判定用
+// 「新集合的每个网段都落在旧集合的某个网段内」—— 保守方向：个别合法的
+// 拆分组合会被拒（要求管理员改），漏放比错拒严重得多。
+//
+// 新值解析失败时返回空串交给 applyP2 去报 400 —— 非法值本来就该 400 而非 403。
+// 旧值解析失败（损坏数据）则一律拒绝：在不知道旧集合是什么的情况下，
+// 任何改写都可能是在放宽。
+func ipAllowlistWidened(old, new string) string {
+	oldNets, err := store.ParseAllowedNets(old)
+	if err != nil {
+		return "现有 IP 白名单无法解析，请联系管理员修正后再改"
+	}
+	newNets, err := store.ParseAllowedNets(new)
+	if err != nil {
+		return ""
+	}
+	if len(oldNets) == 0 {
+		// 现在是不限：设任何集合都是收紧（含清空 = 维持不限）。
+		return ""
+	}
+	if len(newNets) == 0 {
+		return "IP 白名单只能收紧不能清空（清空 = 不限制来源，需管理员修改）"
+	}
+	for _, p := range newNets {
+		covered := false
+		for _, q := range oldNets {
+			if q.Bits() <= p.Bits() && q.Contains(p.Addr()) {
+				covered = true
+				break
+			}
+		}
+		if !covered {
+			return "IP 白名单只能收紧不能放宽（新网段必须落在现有网段内）"
+		}
+	}
+	return ""
+}
+
 // ownedByCaller 校验「当前调用者有权操作这把 key」。
 //
 // 改造前所有 /admin/api/keys/{id} 端点都不校验归属，多用户后
@@ -336,6 +458,12 @@ func (h *KeyHandler) Update(w http.ResponseWriter, r *http.Request, id string) {
 			return
 		}
 		writeError(w, http.StatusBadRequest, "invalid JSON: "+err.Error())
+		return
+	}
+
+	// 「只能收紧」守卫必须在任何字段写入**之前**：它比较的是请求想写的新值
+	// 与库里现值，先改后判就没了比较基准。
+	if !h.guardNoLoosening(w, r, req, existing) {
 		return
 	}
 
