@@ -7,6 +7,7 @@ import (
 	"io"
 	"log/slog"
 	"math/rand/v2"
+	"net"
 	"net/http"
 	"os"
 	"strings"
@@ -830,6 +831,26 @@ var upstreamHTTPClient = &http.Client{
 		IdleConnTimeout:       90 * time.Second,
 		ForceAttemptHTTP2:     true,
 		ResponseHeaderTimeout: 60 * time.Second,
+		// 手搓 transport **不会**继承 net/http 的这两个默认值
+		// （它们只在 http.DefaultTransport 上预置）。缺了会怎样：
+		//
+		//   - 无 DialContext：内核 TCP 握手默认要等 2 分钟+
+		//     （Windows 更久），黑洞上游（SYN 无响应、丢包）的连接建立
+		//     会一直挂着，直到 ctx 超时或系统级 TCP 超时。
+		//   - 无 TLSHandshakeTimeout：TLS 握手阶段同样无上限，
+		//     对端接受 TCP 后不回应 TLS 记录即永久挂起。
+		//
+		// 后果不是「慢」而是「失败检测被拖到看门狗」：本该在几秒内判定
+		// 「这个上游死了」并走故障转移，实际要拖到 30s/120s 的流空闲 /
+		// 非流式看门狗才触发，期间这一个目标占着整条链的请求预算。
+		//
+		// 值取 10s：本地与同机房上游的握手在百毫秒级，10s 足够宽松；
+		// 而它把「上游已死」的判定从分钟级拉回十秒级。
+		DialContext: (&net.Dialer{
+			Timeout:   10 * time.Second,
+			KeepAlive: 30 * time.Second,
+		}).DialContext,
+		TLSHandshakeTimeout: 10 * time.Second,
 	},
 }
 

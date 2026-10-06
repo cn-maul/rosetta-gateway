@@ -1073,7 +1073,13 @@ func handleIngress(pool *upstream.Pool, cfg *config.Config, usage *usageRecorder
 		}
 
 		// RPM 限速（DESIGN §11.4）：额度随鉴权从快照带出（0 = 不限）。
-		// 被拒的请求同样计数 —— 固定窗口语义下请求就是发生了。
+		// 被拒的请求**不**计数 —— 实现见 ratelimit.AllowRPM 的注释：
+		// 若计数，客户端在窗口内疯狂重试会让计数只增不减，把整个窗口
+		// 永久锁死（直到窗口翻转才恢复），一个配错 RPM 的客户端就能把
+		// 自己彻底堵死。计数只记真正被放行的请求。
+		//
+		// （此前这里写的是「被拒的请求同样计数」，与实现相反。实现是对的，
+		//  错的是注释——留着会诱导后人「修反」成count-on-reject。）
 		if ok, retry := limiter.AllowRPM(authCtx.KeyID, authCtx.RPMLimit); !ok {
 			logger.Warn("rate limited (rpm)", "key_id", authCtx.KeyID,
 				"retry_after", retry.String(),
@@ -1233,6 +1239,9 @@ func handleIngress(pool *upstream.Pool, cfg *config.Config, usage *usageRecorder
 		keyID := authCtx.KeyID
 
 		var out attemptOutcome
+		// lastTried 记录实际尝试到哪个候选（链耗尽时据此归因，不猜链上最后一个）。
+		var lastTried routing.Candidate
+		var triedAny bool
 		for i, cand := range active {
 			isLast := i == len(active)-1
 
@@ -1289,6 +1298,11 @@ func handleIngress(pool *upstream.Pool, cfg *config.Config, usage *usageRecorder
 			} else {
 				out = attemptNonStream(w, r, client, ing, cand, authCtx, codec, rate, cfg, snap, usage, start)
 			}
+			// 记住**实际尝试到**的候选，供链耗尽时记账归因。
+			// 不能用 active[len(active)-1] —— 那是链上最后一个候选，而实际最后
+			// 尝试的可能是链上第一个（failover_max_targets=1、或前面的目标被
+			// 跳过时）。归因错目标会让排障指向一个从未真正打过的上游。
+			lastTried = cand
 
 			if out.committed {
 				// 只有真成功才记成功 —— 断流/溢出/上游错误虽已提交，却是失败，
@@ -1345,9 +1359,10 @@ func handleIngress(pool *upstream.Pool, cfg *config.Config, usage *usageRecorder
 		}
 		rate.commit(0)
 		provID, upstreamModel := "", ""
-		if len(active) > 0 {
-			last := active[len(active)-1]
-			provID, upstreamModel = last.Provider.ID, last.UpstreamModel.ModelID
+		// 归因到**实际尝试过**的目标，而不是 active 的最后一个：
+		// failover_max_targets=1、或前面的候选被跳过时，两者不是同一个。
+		if triedAny {
+			provID, upstreamModel = lastTried.Provider.ID, lastTried.UpstreamModel.ModelID
 		}
 		status := "error"
 		if clientGone {
@@ -1517,14 +1532,28 @@ func attemptStream(w http.ResponseWriter, r *http.Request, client *rosetta.Clien
 	// 尚未写头 → 未提交 → 外层可转移。与下面的 idle 看门狗是两回事。
 	ttftTimeout := firstTokenTimeout(snap, cfg)
 	var ttftTimedOut atomic.Bool
+	// ttftDone 让「定时器已触发」这件事变成可等待的：Stop() 返回 false 只说明
+	// 回调已经**开始**跑（或跑完），不保证 stream.Close() 已落地。这个 channel
+	// 由回调关闭，用于消除那个窗口。
+	ttftDone := make(chan struct{})
 	ttftTimer := time.AfterFunc(ttftTimeout, func() {
 		ttftTimedOut.Store(true)
 		_ = stream.Close()
+		close(ttftDone)
 	})
 	gotFirst := stream.Next()
-	ttftTimer.Stop()
 
-	if !gotFirst {
+	// **必须看 Stop() 的返回值**：返回 false = 定时器已触发，而回调里的
+	// stream.Close() 可能刚刚或即将执行。此时即便 gotFirst 为真，流也已经/
+	// 即将被关掉，若继续往下走就会写 200 与 SSE 头，产出「空但 ok」的假正常流
+	// —— 客户端拿到 200 与正确的响应头，正文却是空的，且状态码无法表达失败。
+	// 等 ttftDone 闭合，确保 Close 一定已发生，再按「超时」处理。
+	ttftFired := !ttftTimer.Stop()
+	if ttftFired {
+		<-ttftDone
+	}
+
+	if !gotFirst || ttftTimedOut.Load() {
 		if cerr := stream.Err(); cerr != nil {
 			return outcomeFromErr(cerr)
 		}
