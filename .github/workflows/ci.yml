@@ -1,13 +1,18 @@
 name: ci
 
-# 校验「前端产物已同步入库」。
+# 三道检查，全部在 push/PR 时跑：
+#
+# 1. go：gofmt / build / vet / 全量测试。历史上 P0 与 P2 阶段各出过一次
+#    「只跑 -run TestXxx 让 cmd/gateway 整包红了一轮」的事故 —— 契约改动
+#    必须全量跑，这条红绿灯保证它不靠本地自觉。
+# 2. 前端类型检查（vue-tsc）。类型全绿证明不了界面正确（见 AUDIT-2026-10-06），
+#    但能拦住字段漂移这类最低级的错。
+# 3. 校验「前端产物已同步入库」。
 #
 # Docker 镜像只是 `COPY . .` + `go build`，用 go:embed 打包仓库里的
 # internal/webui/dist —— 它**从不**重新构建前端。于是改完 web/src 却忘了
-# `npm run build && node sync-embed.mjs` 就打 tag，旧 UI 会被静默发出去，
-# 而整条流水线没有任何一步会发现（docker.yml 只在 tag 时跑，且也不碰前端）。
-#
-# 这里在 push/PR 时重新构建一遍，若与入库产物不一致即失败 —— 把「忘 sync」
+# `npm run build && node sync-embed.mjs` 就打 tag，旧 UI 会被静默发出去。
+# 这里重新构建一遍，若与入库产物不一致即失败 —— 把「忘 sync」
 # 从一次线上事故变成一次红灯。
 on:
   push:
@@ -19,6 +24,38 @@ permissions:
   contents: read
 
 jobs:
+  go:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        # v4.4.0
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+
+      - name: Set up Go
+        # v4.3.0；版本来自 go.mod（go-version-file），单一来源
+        uses: actions/setup-go@7b8cf10d4e4a01d4992d18a89f4d7dc5a3e6d6f4
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: gofmt 检查
+        run: |
+          unformatted=$(gofmt -l cmd/ internal/)
+          if [ -n "$unformatted" ]; then
+            echo "::error::以下文件未过 gofmt：$unformatted"
+            exit 1
+          fi
+
+      - name: Build 与 Vet
+        run: |
+          go build ./...
+          go vet ./...
+
+      - name: 全量测试
+        # -count=1 禁用缓存：改契约后只跑 -run TestXxx 的老坑（cmd/gateway
+        # 整包红一轮）就是这么漏进主干的。
+        run: go test -count=1 -timeout 300s ./internal/... ./cmd/gateway/
+
   webui-sync:
     runs-on: ubuntu-latest
     defaults:
@@ -26,10 +63,12 @@ jobs:
         working-directory: web
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        # v4.4.0
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
 
       - name: Set up Node
-        uses: actions/setup-node@v4
+        # v4.4.0
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
         with:
           node-version: '22'
           cache: npm
@@ -37,6 +76,9 @@ jobs:
 
       - name: 安装依赖
         run: npm ci
+
+      - name: 类型检查
+        run: npm run typecheck
 
       - name: 构建前端并同步到 go:embed 目录
         run: |
