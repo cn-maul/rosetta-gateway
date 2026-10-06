@@ -208,6 +208,15 @@ docker run --rm -v rosetta-gateway-data:/data -v "$PWD:/backup" alpine \
 docker compose pull && docker compose up -d
 ```
 
+## 已知问题
+
+`AUDIT.md`（2026-10-06）记的两条容器相关问题**尚未修复**，此处显式说明以免误判：
+
+- **容器以 root 运行**：Dockerfile 里没有 `USER` 指令，进程被攻破即持容器 root。
+  加 `USER` 需先处理 `/data` 的属主，否则 SQLite 写不进去。
+- **无 `HEALTHCHECK`**：进程死锁时容器不会重启，编排系统也探不到活性。
+  目前只能靠外部探活。
+
 ## 常见问题
 
 **浏览器报 `ERR_UNSAFE_PORT`，但容器日志一切正常**

@@ -252,7 +252,7 @@ CREATE TABLE usage_records (
   total_tokens      INTEGER NOT NULL DEFAULT 0,
   reasoning_tokens  INTEGER NOT NULL DEFAULT 0,
   cached_tokens     INTEGER NOT NULL DEFAULT 0,
-  usage_state       TEXT NOT NULL,         -- reported|estimated|missing
+  usage_state       TEXT NOT NULL,         -- reported|missing
   status            TEXT NOT NULL,         -- ok|truncated|overflow|canceled|error（见 §8.2）
   http_status       INTEGER NOT NULL,
   error_code        TEXT,
@@ -759,7 +759,11 @@ Client 是 goroutine 安全的，进程内单例复用（内含连接池）。
 
 - 单位：**token**。`total = input + output`（reasoning token 若上游给出，计入 output 不重复累加，单独记录）
 - 来源：`ChatResponse.Usage` / `EventMessageEnd.Usage`
-- **usage 缺失时**：Rosetta 会标记 `IsZero()` 并计入 `usage_missing`。网关的处置是**按估算值扣减**（`rosetta.EstimateTokens` 输入 + 输出按字符数估），并记 `usage_state='estimated'`。理由：记 0 等于放行白嫖。界面里把 `estimated` 单独统计，便于发现是哪个上游不吐 usage。
+- **usage 缺失时**：SDK 的 `Usage.IsZero()` 为真即视为「上游一个 token 数都没给」，记
+  `usage_state='missing'`（**不是** `reported`，理由见 §17 R9）。此状态不做估算扣减 ——
+  估算值是编的，拿它当账单只会把漏账伪装成正常数据。处置是：TPM **保留预占量不回滚**
+  （否则客户端可用「让上游不吐 usage」把限速绕过），配额侧按 0 扣但界面单列统计
+  `missing`，让「哪个上游不吐 usage」这件事暴露出来而不是静默。
 
 ### 11.2 为什么不可能精确（Key 总量配额 · 已实现）
 
@@ -967,25 +971,75 @@ Docker 侧对齐，且避开浏览器的保留端口表（6666 是 IRC 段，浏
 > 变成一次 CI 失败。本地二进制版本号由 `build.ps1` 从 `web/package.json` 读取并经
 > `-ldflags` 注入 `main.buildVersion`，与 CI/前端页脚同源。
 
-**鉴权**：管理 API 由 `server.AdminAuth` 中间件保护，凭据逻辑在 `internal/adminauth`。三个端点例外/半例外：
-- `GET /admin/api/password/check` —— 恒免鉴权，前端靠它决定弹「设置密码」还是「输入密码」；
-- `POST /admin/api/password/set` —— **仅在系统尚无任何凭据时免鉴权**（一次性引导窗口），已有凭据后必须带上正确的旧凭据；
-- `GET /admin/api/auth/verify` —— 需鉴权，专门给前端做「先验证再保存」。
+**鉴权**：管理 API 由 `adminGuarded` 鉴权链保护，凭据逻辑在 `internal/userauth` +
+`internal/admin`（users 表 + JWT 会话，见 §6.3）。**恰好 4 条路由免鉴权**，且必须显式
+注册到根 mux（`cmd/gateway/main.go`）—— 它们不进 `adminAuto`（那会走鉴权链），但也不能
+因为「没注册」而落到 `/admin/api/` 前缀上被鉴权拦掉，那样会得到 401 而非功能缺失，
+症状是「登录页一直转圈」：
 
-前端有一条硬规则：**绝不「把输入存进 localStorage 就刷新」**。必须先用 `/admin/api/auth/verify` 验证通过再落盘，否则密码一错就会被 401 弹回同一个对话框，而该对话框是 `dismissable=false` 的 —— 用户会被永久困在「输入密码 → 又要求输入」的循环里。
+| 路由 | 用途 |
+|---|---|
+| `POST /admin/api/login` | 提交账号密码换 JWT |
+| `GET /admin/api/session` | 探测是否已登录（前端启动时决定去登录页还是主页） |
+| `GET /admin/api/bootstrap` | 查询是否需要引导（未初始化 → 前端弹「设置密码」） |
+| `POST /admin/api/bootstrap` | 设初始管理员密码，**仅在系统尚无任何凭据时开放** |
+
+> **历史沿革（2026-10-06 已整体删除）**：统一认证之前是「`admin_auth.json` 密码文件 +
+> `config.json` 的 `admin_token`」双通道，前端存的是**管理密码**而不是令牌，靠三个
+> 端点驱动：`GET /admin/api/password/check`（决定弹「设置密码」还是「输入密码」）、
+> `POST /admin/api/password/set`（一次性引导窗口）、`GET /admin/api/auth/verify`
+>（保存前先验证）。**这三条路由现已不存在**，职责分别由上表的 `/session`、`/bootstrap`、
+> `/me` 接管。前端那条「绝不把输入存进 localStorage 就刷新」的硬规则也随通道一起作废 ——
+> 旧规则存在的原因是密码一错就会被 401 弹回同一个 `dismissable=false` 对话框，
+> 用户被永久困在「输入密码 → 又要求输入」循环里（`AUDIT-2026-09-21.md` §0 记录的正是这个故障）；
+> 现在 localStorage 里是 JWT（`rosetta_gw_admin_token`），验证由服务端完成，
+> 登录失败走正常的错误提示而非困住对话框。
 
 
 ### 13.2 页面清单
 
-| 页面 | 期 | 内容 |
-|---|---|---|
-| Providers | P1 | 列表（协议/端点/凭证健康）、新建/编辑、连通性测试 |
-| 模型 | P1 | 某 provider 下的模型列表、手动添加、从上游 `/models` 批量导入、能力覆盖 |
-| Routes | P1 | 虚拟名 ↔ (provider, model) 映射表、启停 |
-| Keys | P1 | 列表、新建（明文只显示一次）、启停、配额编辑 |
-| 用量总览 | P1 | 今日请求数 / token / 错误率 / 各 provider 健康灯 |
-| 用量看板 | P2 | 按天、按 Key、按模型、按 provider 的 token 趋势 |
-| 系统 | P1 | 版本、DB 大小、重建快照、日志级别 |
+实际路由（`web/src/router.ts`，2026-10-06 核实）共 **9 页**，其中 5 页
+`adminOnly` —— 未登录或非 admin 看不到也进不去：
+
+| 路由 | 页签 | 可见 | 内容 |
+|---|---|---|---|
+| `/login` | 登录 | 公开 | 账号密码换 JWT；未初始化时改走引导设密 |
+| `/` | 总览 | 全体 | 今日请求数 / token / 错误率 / 各 provider 健康灯 |
+| `/keys` | 访问密钥 | 全体 | 列表、新建（明文只显示一次）、启停、配额编辑 |
+| `/history` | 调用历史 | 全体 | 按时间倒序的调用明细，含 usage_state 与耗时 |
+| `/profile` | 我的账号 | 全体 | 自改密码、看自己的配额与用量 |
+| `/users` | 用户 | admin | 用户 CRUD、角色、启停；普通用户自助建 key 可自设不限额（P2-8） |
+| `/groups` | 分组 | admin | 分组配额与模型白名单；key 级覆盖被 SET NULL 后白名单会静默放宽（P2-19） |
+| `/providers` | 上游与模型 | admin | 列表（协议/端点/凭证健康）、新建/编辑、连通性测试、模型管理、导入导出 |
+| `/routes` | 路由 | admin | 虚拟名 ↔ (provider, model) 映射表、启停、故障转移链 |
+| `/settings` | 设置 | admin | 版本、DB 大小、重建快照、日志级别、审计日志、配置导入导出 |
+
+「用量看板」不是独立页 —— 按天 / 按 Key / 按模型 / 按 provider 的 token 趋势以
+分组切换的形式内嵌在 `/history`。设置页的导入导出即 §13.4 描述的新增功能。
+
+> 布局在 2026-10-06 改为**侧边栏**（`329a7ca`，参考 hirezo），此前是顶部标签页。
+
+### 13.4 配置导入导出（2026-10-06 新增）
+
+`POST /admin/api/config-export/{export,import}`，入口在设置页。**只做供应商 +
+模型**两项：路由与故障转移链是本部署的组织结构（公开名是给调用方看的契约，
+跨环境照抄会撞名），访问密钥与分组根本不该离开这个库。
+
+- **明文导出默认不带凭据**，要带得显式勾选；**加密导出默认带**（口令的意义就是保护
+  它们）。明文文件的扩散成本远高于加密文件。
+- **导入语义是「只增不改」**：已存在的 slug 原样保留，新来的改名加 `-2`/`-3` 后缀。
+  覆盖要先删、删错了就没了；加后缀最坏只是库里多一个重复供应商，用户自己能看出来。
+- 导入**必须先干跑**（`dry_run`），界面先展示预览再确认写入。
+- 导出响应是文件下载（`Content-Disposition`），前端走独立的 `downloadFile()` 而非
+  通用 `request<T>` —— 后者会 `JSON.parse` 一整个配置清单。
+- 两个端点都在 handler 内 `requireAdmin`：路径虽在 `/admin/api/` 前缀下（白名单管不到），
+  但导出体可能含全部上游凭据，绝不能落到普通用户手里。
+
+配套的**跨版本数据迁移**是一次性工具 `cmd/migrate-legacy`（把 v1.4.1 旧库的
+provider / 模型 / 路由搬进当前版本空库），不能简单复制 db 文件 —— master.key 不同，
+凭据是 AES-256-GCM 加密的（密钥 = sha256(master.key 文件内容)），直接搬密文会导致
+全部 provider 解不开凭据、表现为 `/v1` 全站 404 且无任何告警；且 v1.4.1 → 当前版之间
+`routes`/`access_keys` 有过 ALTER，列顺序不同，故按列名显式 INSERT。
 
 ### 13.3 安全
 
@@ -1010,7 +1064,7 @@ Docker 侧对齐，且避开浏览器的保留端口表（6666 是 IRC 段，浏
 | 密钥加密 | `crypto/aes` + GCM（标准库） | 主密钥来自环境变量或 0600 权限文件 |
 | Key 哈希 | `crypto/sha256`（标准库） | 高熵随机串，不需要慢哈希 |
 | UUID | `crypto/rand` 自造 16 字节 hex | 避免引入依赖 |
-| 前端 | 原生 HTML + JS + `go:embed` | 见 §13.1 |
+| 前端 | **Vue 3 + Vite + TS**，`go:embed` 打包 | 原定原生 HTML + JS，理由是「内网管理页不超过 8 个，引入框架收益不成比例」，并预设升级边界「一旦出现多页 + 复杂表单联动 + 图表就换框架」。**该边界后来真的被触发了**（六页 + 表单弹窗 + 图表），于是按当初约定迁到 Vue 3（见 §13.1） |
 | 上游调用 | `github.com/cn-maul/rosetta` | 本项目存在的理由 |
 | 部署 | 单个二进制 + 一个 SQLite 文件 + 一个配置文件 | `scp` 过去就能跑 |
 
@@ -1018,37 +1072,48 @@ Docker 侧对齐，且避开浏览器的保留端口表（6666 是 IRC 段，浏
 
 ## 15. 目录结构
 
+> **2026-10-06 按实际仓库核实重写。** 原版本列的是 P1 时期的规划结构，与代码已严重脱节：
+> `quota/` 包从未存在（配额逻辑最终落在 `cmd/gateway/main.go` 的请求热路径里）、
+> `examples/curl.md` 从未创建、`inwire`/`outwire` 下标注「P3」的三个文件早已实现、
+> 缺了后来新增的 `userauth` 与 `ratelimit`。
+
 ```
 rosetta-gateway/
-├── go.mod
 ├── DESIGN.md                       本文件
-├── config.example.json
+├── MULTIUSER.md                    多用户 / 分组 / 权限模型（§6.3 的展开）
+├── DOCKER.md                       容器化部署
+├── AUDIT.md                        最新一轮全局审计（2026-10-06，5 P1 + ~15 P2）
+├── AUDIT-2026-09-21.md             上一轮审计（历史归档，保留供追溯踩坑）
+├── config.example.json             配置样例（config.json 本身不入库）
 ├── cmd/
-│   └── gateway/
-│       └── main.go                 装配与启动
+│   ├── gateway/
+│   │   ├── main.go                 装配与启动；**配额检查、限速、故障转移链、usage 记账
+│   │   │                           都在这里**（请求热路径，非独立包）
+│   │   └── upstream_mapping_test.go
+│   └── migrate-legacy/             一次性工具：v1.4.1 旧库 → 当前版本（见 §13.4）
 ├── internal/
-│   ├── config/                     启动配置加载与校验
-│   ├── store/                      SQLite 连接、迁移、各表 DAO
-│   ├── snapshot/                   运行时快照：路由索引、Provider 池、Key 索引
+│   ├── config/                     启动配置加载、校验、端口占用检查
+│   ├── store/                      SQLite 连接、迁移、各表 DAO、归档与对账
+│   ├── snapshot/                   运行时快照：路由索引、Provider 池，atomic.Pointer 热替换
 │   ├── routing/                    模型名解析（§5）
 │   ├── upstream/                   凭证池、健康与冷却、Client 生命周期、故障转移
+│   ├── ratelimit/                  RPM / TPM 固定窗口限速器
+│   ├── auth/                       下游 Key 校验
+│   ├── userauth/                   登录、PBKDF2、会话密钥、JWT 签发
 │   ├── inwire/                     下游 → 统一模型
 │   │   ├── openai_chat.go
-│   │   ├── openai_responses.go     P3
-│   │   └── anthropic.go            P3
+│   │   ├── openai_responses.go
+│   │   └── anthropic.go
 │   ├── outwire/                    统一模型 → 下游（响应 + SSE）
 │   │   ├── openai_chat.go
-│   │   ├── openai_responses.go     P3
-│   │   ├── anthropic.go            P3
+│   │   ├── openai_responses.go
+│   │   ├── anthropic.go
 │   │   └── errors.go               错误形状映射（§9）
-│   ├── auth/                       下游 Key 校验
-│   ├── quota/                      配额检查、扣减、限速
-│   ├── admin/                      管理 API handlers
-│   ├── webui/                      embed 静态资源
-│   ├── crypto/                     上游 key 加解密
+│   ├── admin/                      管理 API handlers（含配置导入导出）
+│   ├── crypto/                     上游 key 加解密（AES-256-GCM）
+│   ├── webui/                      embed 静态资源（dist 由 web/ 构建同步而来）
 │   └── server/                     HTTP 装配、中间件、请求 ID、访问日志
-└── examples/
-    └── curl.md                     各客户端的接入手册
+└── web/                            Vue 3 + Vite + TS 工程（npm run build && npm run sync）
 ```
 
 ---
@@ -1111,7 +1176,7 @@ rosetta-gateway/
 | R6 | 流式配额必然可能超发 | 需接受 | 设计明示，界面明示（§11.2） |
 | R7 | 多模态 base64 让请求体很大 | 内存与 body 限制 | `max_request_body_bytes` 默认 32 MiB；注意 Rosetta chat 的 1 MiB 限制是**响应**侧，不冲突 |
 | R8 | 每凭证一个 `rosetta.Client` ⇒ 连接池随 key 数增长 | 上百把 key 时资源偏高 | 共享 `WithHTTPClient` 的 Transport，或后续向 Rosetta 提 per-request 覆盖 |
-| R9 | 上游 usage 缺失时按估算扣减 | 配额不完全准确 | 记 `usage_state='estimated'`，界面单列统计 |
+| R9 | 上游 usage 缺失时无法区分「真报 0」与「没报」 | 配额失效、账单漏账且不可见 | **已改为两态显式区分**（2026-10-06）：`usageStateFor()` 按 SDK `Usage.IsZero()` 判「上游一个 token 数都没给」→ 记 `missing`，否则 `reported`。关键在于旧实现按「0 token + reported」记账，接不回 usage 的第三方兼容服务等于整 provider 静默漏账、配额形同虚设，且事后无法从库里分辨。`missing` 在界面单列统计，TPM 保留预占量不回滚。注意 `IsZero` 把 cached/reasoning 也计入 —— 只报缓存命中或思考 token 仍算「报了」，否则会丢掉真实数字 |
 | R10 | 同类成熟产品（one-api / new-api / LiteLLM / Portkey / Higress）功能面重合 | 自研投入产出比 | 自研的唯一正当理由是「Rosetta 作内核」与「深度定制」。已确认走自研 |
 
 ---
@@ -1127,7 +1192,7 @@ rosetta-gateway/
 | 上游凭证 | ✅ | 每 Client 一套，网关按 provider × credential 建实例 |
 | 流式拉取 | ✅ | `Stream.Next()`，逐事件转下游 SSE 很顺 |
 | 流截断识别 | ✅ | `ErrStreamTruncated` |
-| 脏数据容错 | ✅ | `internal/jsonx` 宽松解码 |
+| 脏数据容错 | ✅ | Rosetta 侧宽松解码；网关管理 API 另用 `internal/admin` 的 `decodeJSON`（断言 Content-Type） |
 | 兼容服务降级 | ✅ | quirks + sticky probe |
 | 模型元数据 | ✅ | `ModelInfo` / 手动配置注入（可覆盖 context window、输出上限、thinking 支持） |
 | 上下文预估 | ✅ | `EstimateTokens`（网关用于 usage 缺失兜底） |
