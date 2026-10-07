@@ -77,7 +77,7 @@ func TestUpdateUser_RejectsPromotingPasswordlessUser(t *testing.T) {
 }
 
 // 已有密码的账号正常升级：role 生效，且会话失效仍由 BumpAuthVersion 承担
-//（UpdateUser 从不写 auth_version，角色变更恰好 bump 一次）。
+// （UpdateUser 从不写 auth_version，角色变更恰好 bump 一次）。
 func TestUpdateUser_PromotesUserWithPassword(t *testing.T) {
 	st := newScopeStore(t)
 	h := NewUserHandler(st, newTestManager(t))

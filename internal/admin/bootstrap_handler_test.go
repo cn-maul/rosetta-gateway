@@ -272,7 +272,7 @@ func TestBootstrapSetup_IgnoresNonAdminAccount(t *testing.T) {
 
 // 标记已置时引导窗口必须**永久**关闭 —— 哪怕库里又出现了空密码 admin。
 //
-// 旧判定「存在 role=admin 且 password_hash='' 的账号」是窗口曾经开放的原因，
+// 旧判定「存在 role=admin 且 password_hash=” 的账号」是窗口曾经开放的原因，
 // 不是开关：bug 期间建出/升级出的空密码 admin 会让仅凭该判定的窗口
 // 永久重开。修复后窗口绑定一次性标记（bootstrap_completed，与设密同事务
 // 写入），标记置位即关死。这里模拟 bug 期间的残留状态做行为断言。
