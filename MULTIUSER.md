@@ -3,10 +3,10 @@
 | 项    | 值                                                                       |
 | ---- | ----------------------------------------------------------------------- |
 | 项目   | **rosetta-gateway**                                                     |
-| 文档性质 | 多用户能力改造设计（v1 草案）                                                        |
-| 日期   | 2026-10-05                                                              |
+| 文档性质 | 多用户能力改造设计（含实现记录）                                                       |
+| 日期   | 2026-10-05（初稿）；2026-10-07 随计费/鉴权修复同步更新                                    |
 | 触发场景 | 已部署到公司局域网，**已有外部用户接入**                                                  |
-| 状态   | **主体已实现**（users/分组/配额/归档/会话均落地）。其中与旧双通道鉴权相关的段落（§1 现状、§3.5、§4.1 去留、§5 引导）**已被 2026-10-06 的统一认证改造推翻**——admin_token / admin_auth.json 两条旁路整体删除，详见 §3.5 顶部的废弃说明与 `DESIGN.md` §6.3 |
+| 状态   | **已全部落地**（P0–P3 完成）。与旧双通道鉴权相关的段落（§1 现状、§3.5、§4.1 去留、§5 引导）已被 2026-10-06 的统一认证改造推翻——admin_token / admin_auth.json 两条旁路整体删除，现行方案见各节顶部说明与 `DESIGN.md` §6.3 |
 | 参考   | new-api（`QuantumNous/new-api`，AGPLv3）、cc-switch（`farion1231/cc-switch`） |
 | 参考方式 | **源码通读**，非文档推测。关键结论均标注源文件                                               |
 
@@ -603,6 +603,13 @@ ALTER TABLE access_keys ADD COLUMN allowed_ips  TEXT;
 > - 免鉴权初始化窗口的暴露面与旧实现「无凭据时 `password/set` 免鉴权」完全相同：
 >   默认回环监听 + 启动时对「非回环 + 未初始化」打 ERROR 告警。
 >
+> **2026-10-07 加固（审计 P0-4）**：窗口判定由「存在任意空密码 admin」改为绑定
+> **安装级一次性标记**——`app_settings` 的 `bootstrap_completed` 与首次设密在同一
+> 事务写入，设过一次后窗口永不重开（旧判定下，管理员建出/升级出一个空密码
+> admin 就会把免鉴权窗口永久重开，任何能连到端口的人都能抢到 admin）。
+> 同时堵住「空密码 admin」的两种产生路径：创建 admin 必须带初始密码；
+> 空密码账号禁止升级为 admin（先设密码再升级）。
+>
 > 以下原文仅作设计演进的历史记录保留；「实现警示」里主张的
 > `WithAdminCredentials` 并行通道也已随统一认证删除。
 
@@ -769,6 +776,15 @@ KeysByHash map[string]*KeySnapshot  // KeySnapshot 内嵌 UserID/GroupID/限额
 >
 > 读失败与 key 级同口径 **fail-open**（记 ERROR 日志后放行）：
 > 一次查询抖动不该让正常流量全部 429。
+>
+> **2026-10-07 修订（审计 P0-1/P0-2/P1-3）**：key 级配额从「纯查询预检」升级为
+> **原子预占** —— `ReserveQuota` 在单条写事务内检查 `used+reserved+est <= quota`
+> 并把预占计入独立的 `access_keys.reserved_tokens` 列；`usage_records` 触发器记
+> 真实用量；`ReleaseQuota` 在请求收尾退预占（usage missing 时也必须退）。
+> 纯 check-then-act 在并发下会整体放行（超发数十倍），且曾因 `GetKeyQuota`
+> 返回值解构错误让**新 key 的配额完全不生效**、预占与触发器叠加造成
+> **每请求双倍扣费**——三段式的完整口径见 `DESIGN.md` §11.2。用户级预检
+> （实时 SUM，仅 quota>0 时查）不变。
 
 **前瞻说明**：`SUM` 方案在「单用户几十万条用量」时会变慢，
 与 §4.8 想解决的全局累计慢是同一类问题、只是推迟到了用户维度。
@@ -854,10 +870,15 @@ type Scope struct {
 > 明确列出普通用户可访问的前缀，其余默认要求管理员：
 >
 > ```go
+> // 2026-10-07 与 internal/server/user_auth.go 对齐（旧清单里的
+> // /admin/api/password/ 与 /admin/api/auth/ 已随统一认证删除）：
 > var userAccessiblePrefixes = []string{
->     "/admin/api/keys", "/admin/api/usage", "/admin/api/stats",
->     "/admin/api/me", "/admin/api/logout",
->     "/admin/api/password/", "/admin/api/auth/",
+>     "/admin/api/keys",  // 作用域收窄：只看自己的
+>     "/admin/api/usage", // 含 by-* 与 history，均按 user_id 收窄
+>     "/admin/api/stats", // 同上；费用对普通用户归零（见 stats_handler）
+>     "/admin/api/me",
+>     "/admin/api/logout",
+>     "/admin/api/model-names", // 公开模型名，供白名单自助收紧（已收窄）
 > }
 > ```
 >
@@ -1261,8 +1282,12 @@ UPDATE access_keys SET enabled = 0 WHERE user_id IS NULL AND enabled = 1
 2. 逐个发新 key（管理端创建时指定 `user_id`）；
 3. 通知使用者更新本地配置。
 
-**新建的 key 必须带 `user_id`**：用户自助创建时自动填自己，
-管理端创建时显式指定。
+**新建的 key 必须带 `user_id`**：管理端创建时显式指定。
+**自助创建已收敛为管理员专属（2026-10-07，审计 P1-5）**：发 key 曾对普通用户
+开放并配「额度封顶」兜底，但兜底挡不住绕过——管理员落在具体 key 上的
+禁用/配额/限速/有效期/IP，用户重新建一把即可全部绕开。在用户/组级强制
+ceiling 存在之前，发 key 只能是管理动作（`internal/admin/key_handler.go` 的
+Create 注释记了完整论证）。
 
 ### 5.2 迁移必须幂等
 

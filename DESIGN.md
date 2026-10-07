@@ -2,14 +2,13 @@
 
 | 项 | 值 |
 |---|---|
-| 项目名 | **rosetta-gateway**（2026-09-15 定） |
-| 项目性质 | **独立新项目**，不在 Rosetta 上改造（2026-09-15 定） |
-| 目录 | `C:\Users\louis\Desktop\project\rosetta-gateway` |
-| module path | `github.com/cn-maul/rosetta-gateway`（建议值，仓库创建后确认） |
-| 依赖 | `github.com/cn-maul/rosetta` v0.4.0+ |
-| 版本 | v0.1 草案 |
-| 日期 | 2026-09-15 |
-| 状态 | 待评审 |
+| 项目名 | **rosetta-gateway** |
+| 项目性质 | 独立项目，不在 Rosetta 上改造（2026-09-15 定，理由见 §2.1） |
+| module path | `github.com/cn-maul/rosetta-gateway` |
+| 运行时依赖 | `github.com/cn-maul/rosetta` v1.0.0（上游 SDK）、`modernc.org/sqlite`（纯 Go SQLite）、`github.com/golang-jwt/jwt/v5`（管理会话） |
+| 版本 | 与 `web/package.json` 同源（当前 1.4.1），镜像与二进制共用 |
+| 状态 | **已实现**（P0–P3 全部落地，多用户、用量归档、配置导入导出均已上线） |
+| 更新 | 2026-10-07 |
 
 ---
 
@@ -49,10 +48,10 @@
 | D4 | 配置的事实来源 | **数据库唯一**，配置文件只管进程级参数 + 首次 bootstrap | 避免「界面改了、重启被配置文件覆盖」 |
 | D5 | 热更新机制 | 内存快照 + `atomic.Pointer` 原子替换，请求路径无锁 | 路由热改不影响在途请求 |
 | D6 | 上游凭证 | 每凭证一个 `rosetta.Client` 实例，由网关池化管理 | Rosetta 的 endpoint/key 是 per-client 的（见 §10） |
-| D7 | 配额检查时机 | **请求前粗检 + 请求后按真实 usage 扣减**，容忍超发 | 流式下 token 只能在流结束后得知，事前精确拒绝不存在 |
+| D7 | 配额检查时机 | **请求前原子预占（used+reserved vs quota）+ 请求后按真实 usage 记账、退预占** | 纯 check-then-act 在并发下会整体放行；预占把「检查+占用」合并进同一条写事务（§11.2） |
 | D8 | 流空闲超时 | **网关自己实现看门狗** | Rosetta 无此能力（已核实，全仓无 idle 相关实现） |
 | D9 | `/v1/models` 形状冲突 | 按认证头分流 + 显式别名路径 | OpenAI 与 Anthropic 的该路径完全相同、响应形状不同 |
-| D10 | 前端形态 | `go:embed` + 原生 HTML/fetch，不上框架 | 内网管理页不超过 8 个，构建链收益不成比例 |
+| D10 | 前端形态 | `go:embed` + **Vue 3 + Vite + TS**（原定原生 HTML/fetch，预设的升级边界触发后迁移，见 §13.1） | 产物仍进二进制单文件交付 |
 | D11 | 配置格式 | JSON | 零依赖，与 Rosetta 的 models 文件一致 |
 | D12 | SQLite 驱动 | `modernc.org/sqlite`（纯 Go） | 交叉编译无 cgo，保持单二进制干净 |
 
@@ -114,18 +113,19 @@
 
 ```
 下游 HTTP 请求
-  → auth       校验 sk-gw-... → access_key 记录
-  → quota      读 used_tokens，超配额即拒（429）
-  → inwire     按入口协议解码 body → *rosetta.ChatRequest
-  → routing    解析 model → 确定 (provider, upstream_model)
-  → upstream   选凭证（池 + 冷却状态），构造/取出 rosetta.Client
+  → auth       校验 sk-gw-... → access_key 记录（快照 O(1)，含归属用户/组/白名单）
+  → quota      RPM 限速（快照）→ 解码 → TPM 预占 + 终身配额原子预占（§11），
+               超额即拒（429）
+  → routing    解析 model → 候选链（route_targets，故障转移见 §10）；
+               候选按「能否满足请求硬约束」预过滤（如结构化输出 vs anthropic 上游）
+  → upstream   逐目标尝试：选凭证（池 + 冷却状态），构造/取出 rosetta.Client
   → client.ChatStream(ctx, req)          ← ctx 来自 r.Context()
-      ├─ 返回 error  → 映射状态码，写 JSON 错误响应，结束
+      ├─ 返回 error  → 映射状态码，可转移则换链上下一个目标，否则写 JSON 错误响应
       └─ 返回 stream → 写 200 + text/event-stream
-                      启动看门狗 + 心跳
+                      启动 TTFT/空闲看门狗 + 心跳
                       loop: stream.Next() → outwire 编码 → Flush
                       结束：EventMessageEnd → usage 入账 + 下游结束事件
-  → store      异步写入 usage_records
+  → store      异步写入 usage_records（触发器同步累加 used_tokens 与终身累计）
 ```
 
 ---
@@ -220,28 +220,67 @@ CREATE TABLE route_targets (
 );
 CREATE INDEX idx_route_targets_route ON route_targets(route_id, position);
 
--- 下游访问凭证（D7 的配额载体）
--- 只做「总量配额」这一维。expires_at / rpm_limit / tpm_limit / last_used_at 曾在表里
--- 但没有任何读写路径（能读、无写、无人用），2026-09-24 随 dropDeadColumns() 一并删除——
--- 留着它们只会让「支持过期/RPM/TPM」看起来像是已实现的功能。
+-- 下游访问凭证（归属主体见 users；完整列清单以 internal/store/store.go 为准）
 CREATE TABLE access_keys (
-  id            TEXT PRIMARY KEY,
-  key_hash      TEXT NOT NULL UNIQUE,      -- SHA-256(明文)，不存明文
-  key_prefix    TEXT NOT NULL,             -- 形如 "sk-gw-a1b2"，用于界面展示
-  name          TEXT NOT NULL,
-  enabled       INTEGER NOT NULL DEFAULT 1,
-  quota_tokens  INTEGER NOT NULL DEFAULT 0,     -- 0 = 不限；累计 input+output token 上限
-  used_tokens   INTEGER NOT NULL DEFAULT 0,     -- 累计，只增（由 usage_records 触发器维护）
-  rpm_limit     INTEGER NOT NULL DEFAULT 0,     -- 每分钟请求数上限，0 = 不限（§11.4）
-  tpm_limit     INTEGER NOT NULL DEFAULT 0,     -- 每分钟 token 上限，0 = 不限（§11.4）
-  created_at    INTEGER NOT NULL
+  id              TEXT PRIMARY KEY,
+  user_id         TEXT REFERENCES users(id) ON DELETE CASCADE,
+                  -- NULL = 无归属：迁移期存量 key 已被 retireOrphanKeys 禁用，
+                  -- 鉴权直接 401（ErrKeyUnowned），见 MULTIUSER.md §5.1
+  key_hash        TEXT NOT NULL UNIQUE,      -- SHA-256(明文)，不存明文
+  key_prefix      TEXT NOT NULL,             -- 形如 "sk-gw-a1b2"，用于界面展示
+  name            TEXT NOT NULL,
+  enabled         INTEGER NOT NULL DEFAULT 1,
+  quota_tokens    INTEGER NOT NULL DEFAULT 0,     -- 0 = 不限；终身累计 input+output 上限
+  used_tokens     INTEGER NOT NULL DEFAULT 0,     -- 累计真实用量（usage_records 触发器维护）
+  reserved_tokens INTEGER NOT NULL DEFAULT 0,     -- 在途预占（2026-10-07 计费修复，§11.2）
+  rpm_limit       INTEGER NOT NULL DEFAULT 0,     -- 每分钟请求数上限，0 = 不限（§11.4）
+  tpm_limit       INTEGER NOT NULL DEFAULT 0,     -- 每分钟 token 上限，0 = 不限（§11.4）
+  expires_at      INTEGER NOT NULL DEFAULT 0,     -- 毫秒时间戳，0 = 永不过期
+  allowed_models_json TEXT,                       -- key 级模型白名单，NULL/空 = 不限制
+  allowed_ips     TEXT,                           -- CIDR 逗号分隔原文，空 = 不限制
+  group_id        TEXT REFERENCES groups(id) ON DELETE SET NULL,
+                  -- key 级分组覆盖，空 = 沿用归属用户的分组；仅管理员可设/清
+  created_at      INTEGER NOT NULL
 );
 
--- 逐请求用量
+-- 身份主体（管理员也是 role='admin' 的普通用户，users 表是唯一身份来源）
+CREATE TABLE users (
+  id            TEXT PRIMARY KEY,
+  username      TEXT NOT NULL COLLATE NOCASE UNIQUE,
+  display_name  TEXT,
+  password_hash TEXT NOT NULL,           -- PBKDF2-HMAC-SHA256，21 万次迭代
+  role          TEXT NOT NULL DEFAULT 'user',   -- admin | user
+  status        TEXT NOT NULL DEFAULT 'active', -- active | disabled
+  group_id      TEXT REFERENCES groups(id) ON DELETE SET NULL,
+  quota_tokens  INTEGER NOT NULL DEFAULT 0,      -- 用户级总配额（三级配额最外层）
+  used_tokens   INTEGER NOT NULL DEFAULT 0,      -- 展示值；执行走实时 SUM（MULTIUSER.md §4.3）
+  auth_version  INTEGER NOT NULL DEFAULT 1,      -- 会话失效栅栏（改密/禁用/改角色 +1）
+  remark        TEXT,
+  created_at    INTEGER NOT NULL,
+  updated_at    INTEGER NOT NULL,
+  last_login_at INTEGER NOT NULL DEFAULT 0
+);
+
+-- 分组与组级模型白名单（groups 刻意不带 quota/rpm/tpm 列 —— 没有执行点的列不建）
+CREATE TABLE groups (
+  id          TEXT PRIMARY KEY,
+  name        TEXT NOT NULL COLLATE NOCASE UNIQUE,
+  description TEXT,
+  created_at  INTEGER NOT NULL,
+  updated_at  INTEGER NOT NULL
+);
+CREATE TABLE user_group_models (
+  group_id     TEXT NOT NULL REFERENCES groups(id) ON DELETE CASCADE,
+  public_model TEXT NOT NULL,
+  PRIMARY KEY (group_id, public_model)
+);
+
+-- 逐请求用量（user_id / cost_total 由迁移补列；归档与累计见表后说明）
 CREATE TABLE usage_records (
   id                TEXT PRIMARY KEY,
   ts                INTEGER NOT NULL,
   access_key_id     TEXT NOT NULL,
+  user_id           TEXT,                  -- 冗余固化归属：历史事实不随改名/删 key 变
   public_model      TEXT NOT NULL,         -- 下游看到的名字
   provider_id       TEXT NOT NULL,
   upstream_model    TEXT NOT NULL,
@@ -252,13 +291,14 @@ CREATE TABLE usage_records (
   total_tokens      INTEGER NOT NULL DEFAULT 0,
   reasoning_tokens  INTEGER NOT NULL DEFAULT 0,
   cached_tokens     INTEGER NOT NULL DEFAULT 0,
+  cost_total        REAL NOT NULL DEFAULT 0,  -- 落库时按当时单价固化；费用查询只 SUM 本列
   usage_state       TEXT NOT NULL,         -- reported|missing
   status            TEXT NOT NULL,         -- ok|truncated|overflow|canceled|error（见 §8.2）
   http_status       INTEGER NOT NULL,
   error_code        TEXT,
   latency_ms        INTEGER NOT NULL,
   ttfb_ms           INTEGER NOT NULL DEFAULT 0,
-  request_id        TEXT
+  request_id        TEXT                   -- 与访问日志同 ID，30 天内按库追查单次调用
 );
 
 CREATE INDEX idx_usage_ts        ON usage_records(ts);
@@ -267,9 +307,15 @@ CREATE INDEX idx_usage_model_ts  ON usage_records(public_model, ts);
 CREATE INDEX idx_usage_prov_ts   ON usage_records(provider_id, ts);
 ```
 
-**不做的事**：`usage_records` 不做分区与归档策略（单机局域网量级，一年也到不了千万行）；`used_tokens` 不做对账重算（如果真要，可以用 `SUM(usage_records)` 定期校正——记入 P2 可选）。
+**保留与归档（已实现，MULTIUSER.md §4.8）**：`usage_records` 明细保留 30 天，
+超期由每日剪枝聚合进 `usage_daily_rollups`（按维度按天的表 A）后删除；
+`usage_totals`（恒定单行的表 B）由触发器在落库时实时累加，**与剪枝完全解耦**，
+保证「明细可删、终身累计不变」。聚合与删除在同一事务内对**同一批行**执行
+（先按 `id` 圈批，聚合与删除共用该集合），水位只在明细清空到切点时推进。
+对账入口：`POST /admin/api/keys/{id}/recompute-usage`（key 级）与
+`POST /admin/api/usage/prune`（手动剪枝）。
 
-**查询侧的防线**（保留策略不做，但重查询必须加界）：「近期表现」类统计（模型速度/成功率/TTFB，`ListModelThroughput`）固定只回看近 30 天（`throughputWindow`）——窗口函数要对全历史排序，调用量大的 provider 积累几十万行后，挂它的 `GET /providers/{id}/models` 会变成重查询并阻塞唯一的 DB 连接。总览页「全部」档的全区间聚合保留（只在打开总览页时触发），缓存命中率与总统计合并在同一条 SELECT 里完成。
+**查询侧的防线**：「近期表现」类统计（模型速度/成功率/TTFB，`ListModelThroughput`）固定只回看近 30 天（`throughputWindow`）——窗口函数要对全历史排序，调用量大的 provider 积累几十万行后，挂它的 `GET /providers/{id}/models` 会变成重查询并阻塞唯一的 DB 连接。总览页「全部」档的全区间聚合保留（只在打开总览页时触发），缓存命中率与总统计合并在同一条 SELECT 里完成。
 
 ---
 
@@ -394,17 +440,20 @@ resolve(model):
   （`cmd/gateway/bootstrap_admin.go`）；
 - 登录页探测到这种状态就渲染「首次设置密码」表单（不是登录表单），
   提交后一步完成设密码 + 登录（`internal/admin/user_handler.go` 的 `BootstrapSetup`）；
-- 三重防线：只对 `role='admin' AND password_hash=''` 的账号生效、
-  设过即 409（不静默覆盖）、同源校验 + Content-Type 断言（防 CSRF）；
-- 暴露面边界：全新部署且监听非回环时，任何能连到端口的人都能抢先成为第一个管理员
-  —— 与旧实现「无凭据时 `password/set` 免鉴权」的暴露面完全相同，只是挪了位置；
-  缓解是默认回环监听 + 启动时的 ERROR 告警
-  （`FindUninitializedAdmin != nil && !isLoopbackListen`）。
+- **窗口是一次性的**（2026-10-07 加固）：`app_settings` 里的 `bootstrap_completed`
+  标记与首次设密在同一事务写入 —— 设过一次后，无论日后是否再出现空密码 admin
+  （该形态本身已被下一条堵死），免鉴权窗口永不重开；
+- 防 线：只对 `role='admin' AND password_hash=''` 的账号生效（条件 UPDATE，
+  设过即 409）、创建 admin 必须带初始密码、空密码账号禁止升级为 admin、
+  同源校验 + Content-Type 断言（防 CSRF）；
+- 暴露面边界：全新部署且监听非回环时，任何能连到端口的人都能抢先完成首次设置
+  —— 窗口只开这一次，抢到的人成为第一个管理员；缓解是默认回环监听 +
+  启动时的 ERROR 告警（`FindUninitializedAdmin != nil && !isLoopbackListen`）。
 
 | 端点 | 放行规则 |
 |---|---|
 | `GET /admin/api/bootstrap` | 恒放行（返回是否需要初始化与待初始化账号名） |
-| `POST /admin/api/bootstrap` | 仅当存在未初始化 admin 时放行（同源 + JSON Content-Type） |
+| `POST /admin/api/bootstrap` | 仅当 `bootstrap_completed` 标记未写入且存在未初始化 admin 时放行（同源 + JSON Content-Type；标记与首次设密同事务写入，窗口一次性） |
 | `POST /admin/api/login` / `POST /admin/api/logout` | 免鉴权（登录 / 登出本体） |
 | 其余 | `Authorization: Bearer <会话令牌>`，查 users 表比对 `auth_version` |
 
@@ -437,26 +486,45 @@ DELETE /admin/api/routes/{id}
 GET    /admin/api/routes/{id}/targets             读有序上游链（含 provider/model 展示名）
 PUT    /admin/api/routes/{id}/targets             原子整体替换链；链首回写 routes 主目标列
 
-GET    /admin/api/keys
-POST   /admin/api/keys                          返回明文一次
-PATCH  /admin/api/keys/{id}                      可改 name / enabled / quota_tokens /
-                                                 rpm_limit / tpm_limit（每分钟限速，0=不限）
-DELETE /admin/api/keys/{id}
+GET    /admin/api/users                         用户列表（admin）
+POST   /admin/api/users                         新建用户；role=admin 必须带初始密码
+PATCH  /admin/api/users/{id}                    角色/状态/配额/分组/备注；改角色或状态
+                                                 自动递增 auth_version 使旧会话失效
+DELETE /admin/api/users/{id}
+POST   /admin/api/users/{id}/reset-password     管理员重置密码
 
-GET    /admin/api/audit?limit=                   管理写操作审计（新→旧，只记字段名不记值）
-GET    /admin/api/usage/history.csv              调用明细 CSV 导出（与 history 同一套
-                                                 status/model/key_id 过滤，无分页）
+GET    /admin/api/groups                        分组与组级模型白名单（admin）
+
+GET    /admin/api/keys                          列表（普通用户只看到自己的）
+POST   /admin/api/keys                          **仅管理员**（2026-10-07 起）：自助发 key
+                                                 可绕过 key 级全部强制措施，已收敛
+PATCH  /admin/api/keys/{id}                     可改 name / enabled / quota_tokens /
+                                                 rpm_limit / tpm_limit / expires_at /
+                                                 allowed_models / allowed_ips / group_id；
+                                                 普通用户只能收紧不能放宽（guardNoLoosening）
+DELETE /admin/api/keys/{id}
+POST   /admin/api/keys/{id}/recompute-usage     从用量记录重算 used_tokens（配额漂移自愈）
+
+GET    /admin/api/audit?limit=                  管理写操作审计（新→旧，只记字段名不记值）
 GET    /admin/api/usage?from=&to=&group_by=key|model|provider|day
-                                                  from/to 为毫秒时间戳；**from=0 一律表示
-                                                  「全部历史」**（本端点与 by-* 系列语义统一，
-                                                  未传 from 时 Query 默认近 24h）
+                                                 from/to 为毫秒时间戳；**from=0 一律表示
+                                                 「全部历史」**（本端点与 by-* 系列语义统一，
+                                                 未传 from 时 Query 默认近 24h）
+GET    /admin/api/usage/by-provider|by-day|by-model|by-key    分维度用量（按身份收窄）
+GET    /admin/api/usage/history.csv             调用明细 CSV 导出（与 history 同一套
+                                                 status/model/key_id 过滤，无分页）
+POST   /admin/api/usage/prune                   手动触发归档剪枝（每日定时之外的人口）
 GET    /admin/api/stats                         当前快照：总请求/总 token/错误率/各 provider 健康
+GET/PUT /admin/api/settings                     运行时全局默认（超时/故障转移策略，§10）
+POST   /admin/api/config-export/export|import   配置导出/导入（§13.3，requireAdmin）
+GET    /admin/api/model-names                   公开模型名清单（按身份收窄，供白名单选择）
+GET    /admin/api/me / POST /admin/api/logout   当前用户信息 / 登出（递增 auth_version）
 POST   /admin/api/reload                        从 DB 重建内存快照
 ```
 
 所有写操作的事务边界：**先写 DB，提交成功后再重建快照**。DB 写失败则快照不动。
 
-**重建由服务端自动执行**（2026-10-01 起）：管理写请求成功（2xx）后，`server.AutoReload` 中间件就地调用 `runtimeReloader.Reload`（池重建 + 快照重建，`sync.Mutex` 串行化，两边都构建成功才原子替换，任一步失败运行时保持旧状态）。此前生效路径完全依赖前端写完自觉调 `POST /admin/api/reload`——任何绕过前端的调用方（curl/脚本）写完不调 reload 就是静默分叉，最敏感的是**禁用下游 Key 后 auth 读旧快照照常放行**。前端 `mutate()` 里的 reload 调用保留为兜底。
+**重建由服务端自动执行**（2026-10-01 起）：管理写请求成功（2xx）后，`server.AutoReload` 中间件就地调用 `runtimeReloader.Reload`（池重建 + 快照重建，`sync.Mutex` 串行化，两边都构建成功才原子替换，任一步失败运行时保持旧状态）。**重建失败有后台兜底**（2026-10-07 起）：失败即置 `dirty` 标志，后台循环按 30s 起步、指数退避（封顶 10 分钟）反复重试直至收敛，避免「响应已 200 +『已禁用』而数据面仍在放行」的分叉无限期存在（健康检查可读 `IsDirty`）。此前生效路径完全依赖前端写完自觉调 `POST /admin/api/reload`——任何绕过前端的调用方（curl/脚本）写完不调 reload 就是静默分叉，最敏感的是**禁用下游 Key 后 auth 读旧快照照常放行**。前端 `mutate()` 里的 reload 调用保留为兜底。
 
 ### 6.4 额度/费用查询（2026-10-04）
 
@@ -559,10 +627,12 @@ PATCH 结构体里刻意不含该字段，传了也会被忽略。
 - `WithTimeout` 对**流式无效**（`client.go:147` 注释：仅约束 unary 调用），流只受传入 `ctx` 约束。
 - **Rosetta 没有流空闲超时**（全仓检索 `idle` 仅命中一句注释），看门狗是网关职责。
 
-**P0 只需实现 OpenAI Chat 那一套**，是 9 件里的 3 件。其余 6 件留到 P3。
-> 落地更新（2026-10-02）：OpenAI Chat 与 Anthropic Messages 两套入口已实现，
-> 转发骨架（鉴权/配额/路由/故障转移/看门狗/落库）通过 `ingressCodec` 接口复用，
-> 各协议只实现「解码请求 + 渲染错误/响应/SSE」。OpenAI Responses 入口仍未实现。
+**已实现（2026-10-02 起分批落地）**：三套入口全部完成——OpenAI Chat（P0）、
+Anthropic Messages（2026-10-02）、OpenAI Responses（2026-10-04）。转发骨架
+（鉴权/配额/路由/故障转移/看门狗/落库）通过 `ingressCodec` 接口复用，
+各协议只实现「解码请求 + 渲染错误/响应/SSE」。跨协议的私有字段翻译
+（tool_choice 三方互译、response_format ↔ text.format 等）与硬约束过滤
+（结构化输出请求不打 anthropic 上游）见 §10 与 `internal/inwire`。
 
 ---
 
@@ -577,7 +647,7 @@ PATCH 结构体里刻意不含该字段，传了也会被忽略。
 | 项 | 做法 |
 |---|---|
 | 取消传播 | 上游 ctx 直接取 `r.Context()`。下游断开 → ctx 取消 → Rosetta 中止流 → 上游连接关闭。**这是最直接的止损点，必须做对**。下游断开**不算错误**：`usage_records.status` 记 `canceled`（见 §8.2），不计入错误率 |
-| 空闲看门狗 | 独立 `time.AfterFunc`，默认 60s 无事件则 `stream.Close()`。每收到一个事件重置定时器。超时视为 `status=truncated`。**注意 `Stream.Close()` 不写 `stream.Err()`**（Rosetta 只在真的读失败时才置 err），所以看门狗必须自己用 `atomic.Bool` 留痕；否则 `Err()==nil` → 状态保持 `ok` → 下游收到 `finish_reason:"stop"` + `[DONE]`，卡死的上游被伪装成正常收尾（详见 §8.2） |
+| 空闲看门狗 | 独立 `time.AfterFunc`，默认 60s 无事件则 `stream.Close()`。每收到一个事件重置定时器，**回调执行时按「距最近事件的间隔」复核**——`Timer.Reset` 追不回已派发的回调，超时边界上事件与回调竞速时不复核会误杀健康流（2026-10-07 修复）。超时视为 `status=truncated`。**注意 `Stream.Close()` 不写 `stream.Err()`**（Rosetta 只在真的读失败时才置 err），所以看门狗必须自己用 `atomic.Bool` 留痕；否则 `Err()==nil` → 状态保持 `ok` → 下游收到 `finish_reason:"stop"` + `[DONE]`，卡死的上游被伪装成正常收尾（详见 §8.2） |
 | 心跳 | 空闲超过 `idle/2` 时下发 `: keepalive\n\n`，防中间代理超时断连 |
 | Flush | 用 `http.NewResponseController(w).Flush()`（Go 1.20+），不用 `http.Flusher` 类型断言 |
 | 首字节时机 | `ChatStream` 成功后才写 `200 + Content-Type: text/event-stream` + `Cache-Control: no-cache` + `X-Accel-Buffering: no` |
@@ -658,7 +728,7 @@ Rosetta 用 `ErrStreamTruncated` 区分「干净结束」与「连接被掐断�
 | 下游 Key 无效 | 401 | `invalid_api_key` | |
 | 下游 Key 停用 / 过期 | 403 / 401 | | |
 | 配额耗尽（Key 总量） | 429 | `insufficient_quota` | 已实现，见 §11.2；预检读库，OpenAI 计费语义同款 code |
-| 限速（RPM/TPM） | 429 | `rate_limit_exceeded` | 尚未实现，§11.4 |
+| 限速（RPM/TPM） | 429 | `rate_limit_exceeded` | 已实现，§11.4；被拒请求不计数，避免客户端重试把窗口锁死 |
 | 上下文超长（`ErrContextTooLong`） | 400 | `context_length_exceeded` | Rosetta strict 模式产生 |
 | 请求体非法（`ErrInvalidRequest`） | 400 | `invalid_request_error` | 含 Rosetta 的结构校验失败 |
 
@@ -708,7 +778,7 @@ Client 是 goroutine 安全的，进程内单例复用（内含连接池）。
 
 一条 route 背后是 `route_targets` 承载的**有序上游链**——对外同一个 `public_name` 可挂多个 `(provider, model)`，按 `position` 升序尝试。`routes.provider_id / upstream_model_id` 退化为链首兼容列。
 
-请求热路径（`handleChatCompletions` 的转移循环）语义：
+请求热路径（`handleIngress` 的转移循环）语义：
 
 - 仅当 `failover_enabled=1` 才进入多目标循环；否则只打链首，上游错误原样透出。
 - 单次请求最多尝试 `failover_max_targets` 个候选（**全局设置**，见下方「参数落点」），按链顺序推进。
@@ -722,8 +792,9 @@ Client 是 goroutine 安全的，进程内单例复用（内含连接池）。
 - **每次 attempt 只取该 provider 的一把凭证**：单请求内不会就地换同 provider 的下一把 key，失败即让位链上下一个目标；坏 key 的轮换交给跨请求冷却（下个请求自会选到好 key）。有意如此，避免「一个请求把某 provider 所有 key 各打一遍」放大延迟与配额消耗。
 - **客户端断开即收手**：转移循环每轮顶部检查 `r.Context().Err()`，非空则直接返回——不再往链上后续目标打（半路跑掉的客户端不该消耗下游配额），也不记 error 用量（断流是客户端行为，非上游故障）。
   - 同理，**客户端在调用进行中断开时不做任何健康态记账**（`out.eligible && r.Context().Err() == nil`）。SDK 会把 context 取消包成 `TransportError` 落进可转移集合，若照记就会把一把健康凭据冷却 60s 并累计目标熔断 —— 对单 key provider 等于「几次用户点停止 = 该上游 60 秒整体不可用」（冷却期内凭据不再被选中，也就没有任何请求能成功以触发复苏）。判据用 `r.Context()`：它只在客户端断开/服务关停时取消，上游超时用的是派生 ctx，两者不会混淆。
+  - **没走到记账的探测名额必须显式归还**（2026-10-07 修复）：熔断 half-open 名额由 `ClaimTargetProbe` 领取，正常由成功/失败记账释放；不可转移错误与客户端断开两种形态不会走到记账，循环尾部用 `ReleaseTargetProbe` 归还 —— 否则一次 400 就把目标占死到下一次池重建。
 - 命中成功目标：回写清除该凭证冷却 + 复位该目标熔断计数。
-- 全链耗尽：透出最后一个上游错误（映射到对应 5xx/4xx），并记一条 error 用量。
+- 全链耗尽：透出最后一个上游错误（映射到对应 5xx/4xx），并记一条 error 用量，归因到**实际尝试到**的目标（而非链上最后一个候选）。
 
 **主目标列与链的一致性**：`routes.provider_id / upstream_model_id` 是链首（position 0）的兼容视图，但运行时解析以 `route_targets` 为准（一旦有目标行就不再回看主目标列）。因此 `PATCH /admin/api/routes/{id}` 改这两列时，`SyncHeadTarget` 会把改动落到链首，避免「DB 列变了、响应回显新值、实际流量仍打旧目标」的静默分叉；链为空则补一条 position 0。整体换链走 `PUT .../targets`，其内部再用链首反向同步主目标列。
 
@@ -762,22 +833,43 @@ Client 是 goroutine 安全的，进程内单例复用（内含连接池）。
 - **usage 缺失时**：SDK 的 `Usage.IsZero()` 为真即视为「上游一个 token 数都没给」，记
   `usage_state='missing'`（**不是** `reported`，理由见 §17 R9）。此状态不做估算扣减 ——
   估算值是编的，拿它当账单只会把漏账伪装成正常数据。处置是：TPM **保留预占量不回滚**
-  （否则客户端可用「让上游不吐 usage」把限速绕过），配额侧按 0 扣但界面单列统计
-  `missing`，让「哪个上游不吐 usage」这件事暴露出来而不是静默。
+  （否则客户端可用「让上游不吐 usage」把限速绕过），终身配额侧**退回预占**
+  （净计入 0），界面单列统计 `missing`，让「哪个上游不吐 usage」这件事暴露出来而不是静默。
 
-### 11.2 为什么不可能精确（Key 总量配额 · 已实现）
+### 11.2 终身配额：原子预占 + 触发器记账（已实现）
 
-流式请求的 output token 只有流结束才知道。所以**不存在请求前精确拒绝**。落地实现（`handleChatCompletions` 预检 + 请求后落库）：
+流式请求的 output token 只有流结束才知道，**不存在请求前精确拒绝**。最早的实现是纯查询
+（`GetKeyQuota` 读 used → 比较 → 放行），两个致命问题：check-then-act 在并发下全部通过
+（剩余 1000 token、50 个并发各预估 200 会全部放行，超发数十倍）；且曾因返回值解构错误
+让「全新 key 的配额完全不生效」（2026-10-07 P0-1）。现行实现是三段式：
 
 ```
-请求前：GetKeyQuota 从库里读 (quota_tokens, used_tokens)；若 quota>0 且 used>=quota → 429 insufficient_quota
+请求前（ReserveQuota，单条写事务内「检查 + 占用」）：
+  读 (quota_tokens, used_tokens, reserved_tokens)
+  quota<=0            → 不限额，直接放行
+  used+reserved+est > quota → 429 insufficient_quota
+  否则 reserved_tokens += est          ← 预占进**独立列**，不碰 used_tokens
+
 请求中：放行
-请求后：usage_records 触发器 trg_update_used_tokens 令 used_tokens += total_tokens
+
+请求后（rateCommit 收尾）：
+  usage_records INSERT → 触发器 used_tokens += total_tokens   （真实用量，唯一写 used 的路径）
+  ReleaseQuota：reserved_tokens -= reserved                       （退预占）
 ```
 
-- **读库而非读快照**：`used_tokens` 每次请求都在变，而内存快照只在管理写操作后重建，拿它做配额判断会严重滞后——所以预检直查 SQLite（主键单行读，局域网量级可忽略）。
-- **超发容忍**：并发下多个在途请求可同时通过预检，最多多放行「一个请求」的量。**这是设计上接受的**（§11.2 前提），界面与文档都明说，不当 bug。
+- **预占为什么独立成列**（2026-10-07 P0-2）：最初预占直接加进 `used_tokens`，与
+  「触发器累加真实用量」叠加后每请求净记账 2×真实值 —— 差值校正语义与触发器语义
+  在同一列上纠缠。分列后 `used_tokens` 只归触发器写、`reserved_tokens` 只归
+  预占/释放写，两列各只有一个写入者，口径不再打架。
+- **预占口径**：`est` = 请求字符估算 + `max_tokens` 全额（输出侧按上限预占，
+  宁可先多占后退也不先少占再超发）；预占为 0 时按 1 计，让并发请求数本身成为约束。
+- **usage missing**：收尾仍必须退预占（2026-10-07 P1-3 修复——此前整段收尾被跳过，
+  一次请求可永久吃掉数万 token 额度）；TPM 窗口预占保留（窗口自愈）。
+- **读库而非读快照**：`used_tokens` 每次请求都在变，内存快照只在管理写操作后重建；
+  预检直查 SQLite，写锁天然把并发请求串行化，「检查」与「占用」之间不存在窗口。
 - **查询抖动 fail-open**：预检读库出错时记 error 日志并放行，不因一次读失败拒绝正常流量。
+- **自愈入口**：`POST /admin/api/keys/{id}/recompute-usage`（`RecomputeUsedTokens`）从
+  用量来源重算 `used_tokens`，是派生值漂移的唯一修正手段。
 - **语义**：终身累计、不自动重置；`quota_tokens=0` = 不限（默认，向后兼容存量 key）。
 
 ### 11.3 并发安全
@@ -787,7 +879,13 @@ Client 是 goroutine 安全的，进程内单例复用（内含连接池）。
 UPDATE access_keys SET used_tokens = used_tokens + NEW.total_tokens WHERE id = NEW.access_key_id;
 ```
 
-扣减不再由请求路径手写 UPDATE，而是挂在 `usage_records` 插入上的 SQLite 触发器，与 INSERT 同语句原子完成。落库本身走 `recordUsage`（goroutine 异步），故扣减在响应返回后就近实时生效——配合上面的超发容忍，无需同步阻塞。写放大：每条请求一次 INSERT（触发器顺带一次 UPDATE），WAL 下无压力。
+真实用量的扣减不由请求路径手写 UPDATE，而是挂在 `usage_records` 插入上的 SQLite
+触发器，与 INSERT 同语句原子完成。`used_tokens` 的写入者**只有这一个触发器**，
+`reserved_tokens` 的写入者只有 `ReserveQuota` / `ReleaseQuota`（各自单条 UPDATE）——
+三个写入点互不重叠，配额判定 `used+reserved+est <= quota` 在写锁串行化下无竞态窗口。
+落库本身走 `recordUsage`（goroutine 异步），故扣减在响应返回后就近实时生效。
+写放大：每条请求一次 INSERT（触发器顺带两次 UPDATE：key 级 used_tokens 与
+终身累计表 `usage_totals`），WAL 下无压力。
 
 ### 11.4 限速（已实现，2026-10-04）
 
@@ -820,7 +918,9 @@ UPDATE access_keys SET used_tokens = used_tokens + NEW.total_tokens WHERE id = N
 
 ### 11.5 配额维度
 
-只做 **Key 总量**（已实现，见 11.2）。per-model 配额、per-provider 配额记入后续路线，不进 P2。
+两级终身配额均已实现：**key 级**（§11.2，原子预占）与**用户级**（`users.quota_tokens`，
+总闸，热路径按实时 SUM 校验、仅额度 >0 时查库，设计论证见 MULTIUSER.md §4.3）。
+per-model 配额、per-provider 配额仍不做，记入后续路线。
 
 ---
 
@@ -991,7 +1091,7 @@ Docker 侧对齐，且避开浏览器的保留端口表（6666 是 IRC 段，浏
 >（保存前先验证）。**这三条路由现已不存在**，职责分别由上表的 `/session`、`/bootstrap`、
 > `/me` 接管。前端那条「绝不把输入存进 localStorage 就刷新」的硬规则也随通道一起作废 ——
 > 旧规则存在的原因是密码一错就会被 401 弹回同一个 `dismissable=false` 对话框，
-> 用户被永久困在「输入密码 → 又要求输入」循环里（`AUDIT-2026-09-21.md` §0 记录的正是这个故障）；
+> 用户被永久困在「输入密码 → 又要求输入」循环里（全局审计时代记录过的真实故障：密码一错就被困在循环里）；
 > 现在 localStorage 里是 JWT（`rosetta_gw_admin_token`），验证由服务端完成，
 > 登录失败走正常的错误提示而非困住对话框。
 
@@ -1005,21 +1105,21 @@ Docker 侧对齐，且避开浏览器的保留端口表（6666 是 IRC 段，浏
 |---|---|---|---|
 | `/login` | 登录 | 公开 | 账号密码换 JWT；未初始化时改走引导设密 |
 | `/` | 总览 | 全体 | 今日请求数 / token / 错误率 / 各 provider 健康灯 |
-| `/keys` | 访问密钥 | 全体 | 列表、新建（明文只显示一次）、启停、配额编辑 |
+| `/keys` | 访问密钥 | 全体 | 列表（按身份收窄）、启停、配额/有效期/IP/模型白名单编辑（普通用户只能收紧）、重算用量；**新建仅管理员**（明文只显示一次） |
 | `/history` | 调用历史 | 全体 | 按时间倒序的调用明细，含 usage_state 与耗时 |
 | `/profile` | 我的账号 | 全体 | 自改密码、看自己的配额与用量 |
-| `/users` | 用户 | admin | 用户 CRUD、角色、启停；普通用户自助建 key 可自设不限额（P2-8） |
+| `/users` | 用户 | admin | 用户 CRUD、角色、启停、密码重置；admin 账号必须带初始密码 |
 | `/groups` | 分组 | admin | 分组配额与模型白名单；key 级覆盖被 SET NULL 后白名单会静默放宽（P2-19） |
 | `/providers` | 上游与模型 | admin | 列表（协议/端点/凭证健康）、新建/编辑、连通性测试、模型管理、导入导出 |
 | `/routes` | 路由 | admin | 虚拟名 ↔ (provider, model) 映射表、启停、故障转移链 |
 | `/settings` | 设置 | admin | 版本、DB 大小、重建快照、日志级别、审计日志、配置导入导出 |
 
 「用量看板」不是独立页 —— 按天 / 按 Key / 按模型 / 按 provider 的 token 趋势以
-分组切换的形式内嵌在 `/history`。设置页的导入导出即 §13.4 描述的新增功能。
+分组切换的形式内嵌在 `/history`。设置页的导入导出即 §13.3 描述的功能。
 
 > 布局在 2026-10-06 改为**侧边栏**（`329a7ca`，参考 hirezo），此前是顶部标签页。
 
-### 13.4 配置导入导出（2026-10-06 新增）
+### 13.3 配置导入导出（2026-10-06 新增，2026-10-07 补数值校验）
 
 `POST /admin/api/config-export/{export,import}`，入口在设置页。**只做供应商 +
 模型**两项：路由与故障转移链是本部署的组织结构（公开名是给调用方看的契约，
@@ -1032,6 +1132,10 @@ Docker 侧对齐，且避开浏览器的保留端口表（6666 是 IRC 段，浏
 - 导入**必须先干跑**（`dry_run`），界面先展示预览再确认写入。
 - 导出响应是文件下载（`Content-Disposition`），前端走独立的 `downloadFile()` 而非
   通用 `request<T>` —— 后者会 `JSON.parse` 一整个配置清单。
+- **导入与手工创建同一套校验**（2026-10-07）：超时/重试/上下文窗口/单价等数值字段
+  不再绕过 provider/model handler 的非负与上界校验，违例跳过并进 warnings；
+  凭据的 `enabled` 跟随导出文件（旧版文件缺该字段按启用处理），
+  不再硬编码复活为启用。
 - 两个端点都在 handler 内 `requireAdmin`：路径虽在 `/admin/api/` 前缀下（白名单管不到），
   但导出体可能含全部上游凭据，绝不能落到普通用户手里。
 
@@ -1041,7 +1145,7 @@ provider / 模型 / 路由搬进当前版本空库），不能简单复制 db �
 全部 provider 解不开凭据、表现为 `/v1` 全站 404 且无任何告警；且 v1.4.1 → 当前版之间
 `routes`/`access_keys` 有过 ALTER，列顺序不同，故按列名显式 INSERT。
 
-### 13.3 安全
+### 13.4 安全
 
 - 管理面只有 users 表 + 会话一条通道（§6.3），不做「内网免鉴权」的假设；
   首次初始化窗口只对未设密码的 admin 开启，且启动时对「非回环监听 + 未初始化」打 ERROR
@@ -1079,18 +1183,15 @@ provider / 模型 / 路由搬进当前版本空库），不能简单复制 db �
 
 ```
 rosetta-gateway/
+├── README.md                       项目门面：简介、快速开始、文档索引
 ├── DESIGN.md                       本文件
 ├── MULTIUSER.md                    多用户 / 分组 / 权限模型（§6.3 的展开）
 ├── DOCKER.md                       容器化部署
-├── AUDIT.md                        最新一轮全局审计（2026-10-06，5 P1 + ~15 P2）
-├── AUDIT-2026-09-21.md             上一轮审计（历史归档，保留供追溯踩坑）
 ├── config.example.json             配置样例（config.json 本身不入库）
 ├── cmd/
-│   ├── gateway/
-│   │   ├── main.go                 装配与启动；**配额检查、限速、故障转移链、usage 记账
-│   │   │                           都在这里**（请求热路径，非独立包）
-│   │   └── upstream_mapping_test.go
-│   └── migrate-legacy/             一次性工具：v1.4.1 旧库 → 当前版本（见 §13.4）
+│   ├── gateway/                    装配与启动；**配额预占、限速、故障转移链、usage 记账
+│   │                               都在这里**（请求热路径，非独立包）
+│   └── migrate-legacy/             一次性工具：v1.4.1 旧库 → 当前版本（见 §13.3）
 ├── internal/
 │   ├── config/                     启动配置加载、校验、端口占用检查
 │   ├── store/                      SQLite 连接、迁移、各表 DAO、归档与对账
@@ -1100,15 +1201,9 @@ rosetta-gateway/
 │   ├── ratelimit/                  RPM / TPM 固定窗口限速器
 │   ├── auth/                       下游 Key 校验
 │   ├── userauth/                   登录、PBKDF2、会话密钥、JWT 签发
-│   ├── inwire/                     下游 → 统一模型
-│   │   ├── openai_chat.go
-│   │   ├── openai_responses.go
-│   │   └── anthropic.go
-│   ├── outwire/                    统一模型 → 下游（响应 + SSE）
-│   │   ├── openai_chat.go
-│   │   ├── openai_responses.go
-│   │   ├── anthropic.go
-│   │   └── errors.go               错误形状映射（§9）
+│   ├── inwire/                     下游 → 统一模型（openai_chat / openai_responses / anthropic
+│   │                               + 跨协议字段翻译与硬约束判定）
+│   ├── outwire/                    统一模型 → 下游（响应 + SSE + 错误映射 §9）
 │   ├── admin/                      管理 API handlers（含配置导入导出）
 │   ├── crypto/                     上游 key 加解密（AES-256-GCM）
 │   ├── webui/                      embed 静态资源（dist 由 web/ 构建同步而来）
@@ -1120,7 +1215,9 @@ rosetta-gateway/
 
 ## 16. 里程碑
 
-### P0 — 打通链路
+> **P0–P3 已全部交付**（2026-10 上旬完成）。以下保留原始验收标准作为回归参照。
+
+### P0 — 打通链路 ✅
 
 **做**：`cmd/gateway` 骨架；启动配置（JSON）；Provider 抽象与 `rosetta.Client` 构建；路由解析（§5 轨道一 + 二）；OpenAI Chat 入口的解码/编码/SSE；错误映射（§9）；看门狗、心跳、取消传播；静态 bootstrap 配置（暂不建 DB）。
 
@@ -1133,7 +1230,7 @@ rosetta-gateway/
 4. 上游返回 401 时，下游收到的是 502 `upstream_auth_error`，不是 401
 5. 上游卡住不吐字节，60s 后看门狗关闭流，下游收到断流
 
-### P1 — 管起来
+### P1 — 管起来 ✅
 
 **做**：SQLite + 迁移；Provider / 模型 / Route / Key 的 CRUD 管理 API；管理鉴权；内存快照热更新；Web 界面（Providers、模型、Routes、Keys、用量总览、系统页）；连通性测试。
 
@@ -1143,7 +1240,7 @@ rosetta-gateway/
 3. DB 非空时，配置文件里的 bootstrap 段落被忽略并打 warning
 4. 上游 key 在界面不可回读明文
 
-### P2 — 管住量
+### P2 — 管住量 ✅
 
 **做**：`usage_records` 落库；配额检查与同步扣减；RPM/TPM 限速；用量看板；凭证池（多 key、加权、冷却）；**自动故障转移**——最终落地形态是 `route_targets` 有序上游链（取代原设想的 `fallback_route_id` 单跳兜底），每条路由只有一个 `failover_enabled` 开关，策略参数是全局的（「设置」页 → `app_settings.runtime_defaults`），详见 §10。
 
@@ -1153,7 +1250,7 @@ rosetta-gateway/
 3. 并发 50 个请求，`SUM(usage_records.total_tokens)` 与 `used_tokens` 一致，不漏记
 4. 一条 route 挂 2 个上游目标、链首返回 5xx 时，自动在写出任何字节前转移到链上次个目标 ✅（`cmd/gateway/failover_test.go` 覆盖）
 
-### P3 — 补协议
+### P3 — 补协议 ✅
 
 **做**：Anthropic Messages 入口；Responses 入口；`/v1/models` 形状分流与别名路径；Anthropic thinking signature 的跨协议处理（§17 R4）。
 
@@ -1173,7 +1270,7 @@ rosetta-gateway/
 | R3 | `/v1/models` 在两种协议下路径相同、形状不同 | 客户端拿错格式 | 按认证头分流 + 显式别名路径（§6.1） |
 | R4 | **Anthropic thinking block 带 `signature`，跨协议转换会失效** | 下游 Anthropic + 上游非 Anthropic 时，多轮回传 thinking 会 400 | **已解决（2026-10-02）**：thinking（含签名）在统一模型里原生表达（`Block.Thinking/Signature`），Anthropic 上游完整回放；OpenAI 系上游由 SDK 适配器剥除历史 thinking 块。无需开关 |
 | R5 | 流式断流无法回滚 | 下游可能收到半截回答 | 约定：不发终止事件，直接断连（§8.2） |
-| R6 | 流式配额必然可能超发 | 需接受 | 设计明示，界面明示（§11.2） |
+| R6 | 流式配额只能事后记账 | 预占 + 退预占把并发超发封死（§11.2）；残余误差仅剩 est 与真实用量的估算差 | 预占含 max_tokens 全额，宁可先多占后退 |
 | R7 | 多模态 base64 让请求体很大 | 内存与 body 限制 | `max_request_body_bytes` 默认 32 MiB；注意 Rosetta chat 的 1 MiB 限制是**响应**侧，不冲突 |
 | R8 | 每凭证一个 `rosetta.Client` ⇒ 连接池随 key 数增长 | 上百把 key 时资源偏高 | 共享 `WithHTTPClient` 的 Transport，或后续向 Rosetta 提 per-request 覆盖 |
 | R9 | 上游 usage 缺失时无法区分「真报 0」与「没报」 | 配额失效、账单漏账且不可见 | **已改为两态显式区分**（2026-10-06）：`usageStateFor()` 按 SDK `Usage.IsZero()` 判「上游一个 token 数都没给」→ 记 `missing`，否则 `reported`。关键在于旧实现按「0 token + reported」记账，接不回 usage 的第三方兼容服务等于整 provider 静默漏账、配额形同虚设，且事后无法从库里分辨。`missing` 在界面单列统计，TPM 保留预占量不回滚。注意 `IsZero` 把 cached/reasoning 也计入 —— 只报缓存命中或思考 token 仍算「报了」，否则会丢掉真实数字 |
@@ -1210,3 +1307,18 @@ rosetta-gateway/
 2. **流空闲超时选项** `WithStreamIdleTimeout(d)`。目前每个调用方都要自己写看门狗。
 3. **per-request endpoint / key 覆盖**，让网关不必为每把凭证维护一个 Client（连接池问题）。
 4. **`WithTimeout` 对流式生效**——或明确文档化为「仅 unary」，并给出推荐的看门狗实现范式。
+
+## 附录 C：已知取舍与边界（有意接受，非遗留缺陷）
+
+> 本清单是**正式的、当前有效的**取舍记录（2026-10-07 收编自历轮审计的「遗留」小节）。
+> 收录标准：复核确认影响有界、修复代价大于收益、或有明确的其他兜底。
+> 新一轮审计复核后应更新本表，而不是让取舍散落在历史报告里。
+
+| 取舍 | 说明 | 影响与兜底 |
+|---|---|---|
+| 全链路无 TLS | 定位是局域网网关，设计上不做传输加密 | 对外暴露由部署层解决（反向代理终结 TLS，见 DOCKER.md） |
+| 删库 = 失明 | 身份、配额、路由、key 全部绑在同一个 SQLite 文件上（§12.1） | 不可重建的身份状态只有 `master.key` 与 `session_secret` 两把密钥，独立于库存放；删库后重新走首次初始化 |
+| `audit.actor` 恒为 "admin" | `WriteAuditor` 回调未透传会话身份，普通用户对自己资源的写操作也落 "admin" 记录 | 审计无法区分操作者；修法需改回调签名波及全部调用点，单独立项 |
+| 配额预占 est 是预估值 | 预占含 `max_tokens` 全额，请求收尾按真实 usage 退预占；上游不回 usage 时退预占、漏账以 `usage_state="missing"` 显形（§11.1/§11.2） | 在途瞬间不精确，终态正确；漏账可从界面察觉 |
+| 归档明细的可见性边界 | 明细只保留 30 天，更老区间的分组统计从日归档表取，按「宁可少算」口径（§4） | 极老日期的部分维度不可查；30 天内可按 `request_id` 查明细 |
+| `-race` 本机不可用 | Windows 开发机无 gcc | 并发修复靠人工审查 + 反向验证测试，CI 环境兜底 |

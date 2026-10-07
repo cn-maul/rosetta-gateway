@@ -68,13 +68,17 @@ Chrome / Edge / Brave / Opera 一律硬拦；Firefox 也拦，只是报错文案
 ```
 /app/gateway              网关本体（Linux 静态二进制，随镜像更新）
 /app/config.default.json  首次启动用的配置模板（listen 0.0.0.0:8666）
-/data                     唯一需要持久化的目录（VOLUME）
+/data                     唯一需要持久化的目录（VOLUME），即 ROSETTA_GW_HOME
 ├── config.json           生效中的配置
 ├── master.key            上游凭据加密主密钥，自动生成
 ├── session_secret        会话签名密钥，自动生成；丢失 = 所有登录会话失效
-└── db/
+└── data/
     └── gateway.db        SQLite：上游 / 模型 / 路由 / 访问密钥 / 用户 / 用量记录
 ```
+
+> `db_path` 在模板里是相对 `ROSETTA_GW_HOME` 的 `./data/gateway.db`（2026-10-07 起，
+> 与裸机部署的代码默认值对齐；此前模板曾写 `./db/gateway.db`）。**已有部署不受影响**：
+> 旧模板生成的 `config.json` 里仍是老路径，库照常落在 `/data/db/`，升级镜像不会挪库。
 
 镜像层本身是无状态的：`/data` 之外没有任何东西需要保存，升级镜像不会碰配置与数据。
 
@@ -92,18 +96,19 @@ Chrome / Edge / Brave / Opera 一律硬拦；Firefox 也拦，只是报错文案
 
 ```bash
 -v /srv/rosetta/config.json:/data/config.json \
--v /srv/rosetta/db:/data/db
+-v /srv/rosetta/data:/data/data
 ```
 
 > **注意**：bind mount 单个**文件**时，宿主机上的该文件必须**先存在**，
 > 否则 Docker 会把它当成目录创建，程序会读到「is a directory」而启动失败。
 > 第一次可以这样初始化：
 > ```bash
-> mkdir -p /srv/rosetta/db
+> mkdir -p /srv/rosetta/data
 > docker run --rm ghcr.io/cn-maul/rosetta-gateway:1.1.1 \
 >   cat /app/config.default.json > /srv/rosetta/config.json
 > ```
-> （`mkdir` 了 `db`，因为 `db_path` 指向 `/data/db/gateway.db`，父目录必须存在。）
+> （`mkdir` 了 `data`，因为 `db_path` 指向 `/data/data/gateway.db`，父目录必须存在；
+> 若你的 `config.json` 是旧模板生成的、`db_path` 仍为 `./db/gateway.db`，则挂 `/data/db`。）
 
 主密钥 `master.key` 与会话密钥 `session_secret` 也都在 `/data` 下，
 **跟着 `/data` 一起持久化。** 若只单独挂了 `config.json` 和 `db/` 而没挂 `/data`，
@@ -126,7 +131,7 @@ services:
       - "8666:8666"
     volumes:
       - ./rosetta/config.json:/data/config.json   # 配置文件
-      - ./rosetta/db:/data/db                     # 数据库目录
+      - ./rosetta/data:/data/data                 # 数据库目录（旧模板路径为 /data/db）
       - ./rosetta/master.key:/data/master.key     # 凭据加密主密钥
       - ./rosetta/session_secret:/data/session_secret  # 会话签名密钥
 ```
@@ -155,7 +160,9 @@ services:
 
 默认配置是 `listen: 0.0.0.0:8666`，而第一个管理员的密码要等人打开 `/admin/` 来设 ——
 **在设好密码之前，能访问到该端口的人都可以抢先完成设置**。网关启动时检测到这种
-「未初始化 + 非回环监听」的状态会打一条 ERROR 日志提醒。
+「未初始化 + 非回环监听」的状态会打一条 ERROR 日志提醒。窗口是**一次性**的：
+首次设密成功即写入 `bootstrap_completed` 标记、永久关闭，且创建 admin 必须带初始密码
+（不存在「空密码 admin 重新打开窗口」的路径）。
 
 所以：**容器起来后第一时间去 `/admin/` 完成首次设置密码**。
 若要挂在公网，建议只绑回环（`-p 127.0.0.1:8666:8666`）再加反代鉴权，
@@ -223,8 +230,10 @@ docker run -d --name rosetta-gw -p 8666:8666 \
   ghcr.io/cn-maul/rosetta-gateway:latest
 ```
 
-若属主改不动（NFS、只读根文件系统等），entrypoint 会在 **stderr 明确告警**
-后以 root 继续运行 —— 不静默降级，否则运维会以为容器已加固。
+若属主改不动（NFS、只读根文件系统等），entrypoint **不会放开目录权限**（回退是
+`chmod 0700` 收紧，而不是曾经的世界可写），会在 **stderr 明确告警**后以 root 继续运行
+—— 不静默降级，否则运维会以为容器已加固。以 root 运行意味着进程被攻破即持容器 root，
+请优先修复属主问题。
 
 ## 健康检查
 
