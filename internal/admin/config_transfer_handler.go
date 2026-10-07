@@ -35,14 +35,12 @@ func NewConfigTransferHandler(st *store.Store, masterKey []byte, cfg *config.Con
 
 // exportRequest 是导出请求。
 //
-// Passphrase 为空即导出明文 JSON —— 那是给「同机备份 / 版本控制」准备的，
-// 文件已经在自己磁盘上。带口令则整个文件被加密，见 export_format.go。
+// Passphrase **必填**（2026-10-07 起）：导出体总是包含上游凭据，「只导结构」的
+// 明文模式已删除。理由：明文与加密两种产物让导入侧要兼容两套形态，而明文带
+// 凭据的文件（微信/邮件/网盘是它最常见的去向）等于把 API Key 白送；
+// 收敛成单一形态 —— **必带凭据 + 必加密**，产物统一是 .json.enc。
 type exportRequest struct {
 	Passphrase string `json:"passphrase"`
-	// IncludeCredentials 为假时只导出结构，凭据留空。
-	// 加密导出时默认带上凭据（口令的意义就是保护它们），明文导出时默认不带
-	// —— 明文文件太容易被随手转发。具体规则见 Export 的注释。
-	IncludeCredentials *bool `json:"include_credentials"`
 }
 
 // Export 打包当前库里的供应商与模型。
@@ -51,7 +49,8 @@ func (h *ConfigTransferHandler) Export(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var req exportRequest
-	// 导出也接受空 body：界面上的「直接导出」按钮不发请求体。
+	// 请求体是可选的：没有 body 时按「缺口令」处理，走下面统一的报错，
+	// 让调用方拿到的永远是同一句「必须设置加密口令」而不是 JSON 解析错误。
 	if r.ContentLength != 0 {
 		if err := decodeJSON(w, r, &req); err != nil {
 			if errors.Is(err, errUnsupportedMediaType) {
@@ -63,35 +62,28 @@ func (h *ConfigTransferHandler) Export(w http.ResponseWriter, r *http.Request) {
 	}
 
 	pass := strings.TrimSpace(req.Passphrase)
-	withCreds := req.IncludeCredentials != nil && *req.IncludeCredentials
-	if pass == "" && req.IncludeCredentials == nil {
-		// 未明确要求时：明文导出**不带**凭据。理由是明文文件的扩散成本
-		// 远高于加密文件，宁可让人多勾一次。
-		withCreds = false
+	if pass == "" {
+		writeError(w, http.StatusBadRequest,
+			"必须设置加密口令（至少 8 位）：导出文件包含全部上游 API Key，不允许明文导出")
+		return
 	}
 
-	body, err := h.buildExport(r.Context(), withCreds)
+	body, err := h.buildExport(r.Context())
 	if err != nil {
 		writeServerError(w, "build export", err)
 		return
 	}
 
-	payload := body
-	if pass != "" {
-		payload, err = sealExport(body, pass)
-		if err != nil {
-			writeError(w, http.StatusBadRequest, err.Error())
-			return
-		}
+	payload, err := sealExport(body, pass)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
 	}
 
 	// 走文件下载而非 JSON 响应：响应体会被浏览器内联显示，而这份内容
-	// 可能含凭据，落到磁盘才是用户预期的去向。
+	// 含全部凭据，落到磁盘才是用户预期的去向。
 	stamp := time.Now().Format("20060102-150405")
-	name := "rosetta-config-" + stamp + ".json"
-	if payload.Encrypted {
-		name += ".enc"
-	}
+	name := "rosetta-config-" + stamp + ".json.enc"
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	w.Header().Set("Content-Disposition", "attachment; filename="+strconv.Quote(name))
 	w.Header().Set("Cache-Control", "no-store")
@@ -100,8 +92,8 @@ func (h *ConfigTransferHandler) Export(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// buildExport 从库里读出供应商与模型。
-func (h *ConfigTransferHandler) buildExport(ctx context.Context, withCreds bool) (configExport, error) {
+// buildExport 从库里读出供应商与模型（含凭据 —— 导出总是带全量数据）。
+func (h *ConfigTransferHandler) buildExport(ctx context.Context) (configExport, error) {
 	out := configExport{
 		Version:    exportFormatVersion,
 		ExportedAt: time.Now().UnixMilli(),
@@ -139,9 +131,6 @@ func (h *ConfigTransferHandler) buildExport(ctx context.Context, withCreds bool)
 				PriceCacheHit:    m.PriceCacheHit,
 				PriceOutput:      m.PriceOutput,
 			})
-		}
-		if !withCreds {
-			continue
 		}
 		creds, err := h.store.ListCredentials(ctx, p.ID)
 		if err != nil {

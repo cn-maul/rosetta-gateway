@@ -591,8 +591,9 @@ export const api = {
   // 导出走独立的下载路径而**不是** request<T>：响应是文件而非 JSON，
   // 而 request() 无条件 JSON.parse 一个文件大小的配置清单纯属浪费，
   // 真正需要读 JSON 的只有「导入前预览文件内容」那一步。
-  exportConfig: (passphrase: string, includeCredentials: boolean) =>
-    download('POST', '/config-export/export', { passphrase, include_credentials: includeCredentials }),
+  // 导出必加密、必带凭据（2026-10-07）：后端对空口令直接 400。
+  exportConfig: (passphrase: string) =>
+    download('POST', '/config-export/export', { passphrase }, 'rosetta-config.json.enc'),
   importConfig: (data: unknown, passphrase: string, dryRun: boolean) =>
     post<ConfigImportResult>('/config-export/import', { data, passphrase, dry_run: dryRun }),
   usageByDay: (from: number, to: number) => get<UsageGroupEntry[]>(`/usage/by-day?from=${from}&to=${to}`),

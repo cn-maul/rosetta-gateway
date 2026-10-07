@@ -98,7 +98,7 @@ func TestE2E_EncryptedExportToFreshInstance(t *testing.T) {
 	src, _ := e2eSource(t)
 
 	const pass = "deploy-secret-2026"
-	file := doExport(t, src, `{"passphrase":"`+pass+`","include_credentials":true}`)
+	file := doExport(t, src, `{"passphrase":"`+pass+`"}`)
 	if !file.Encrypted {
 		t.Fatalf("应产出加密文件")
 	}
@@ -161,7 +161,12 @@ func TestE2E_EncryptedExportToFreshInstance(t *testing.T) {
 // 关键断言是「原有的一个字都没被改动」—— 合并语义的核心承诺。
 func TestE2E_MergeIntoExistingDeployment(t *testing.T) {
 	src, _ := e2eSource(t)
-	file := doExport(t, src, "")
+	enc := doExport(t, src, `{"passphrase":"e2e-pass-123"}`)
+	plain, err := openExport(enc, "e2e-pass-123")
+	if err != nil {
+		t.Fatalf("解开导出体: %v", err)
+	}
+	file := *plain
 
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	dstStore, err := store.Open(t.TempDir()+"/dst.db", logger)
@@ -233,7 +238,13 @@ func TestE2E_MergeIntoExistingDeployment(t *testing.T) {
 // 因为用户会照着一个错的预览做决定。
 func TestE2E_DryRunThenApplyMatches(t *testing.T) {
 	src, _ := e2eSource(t)
-	file := doExport(t, src, `{"include_credentials":true}`)
+	// 导出必加密；此用例关心的是导入语义，解开成明文体作为导入输入。
+	enc := doExport(t, src, `{"passphrase":"e2e-pass-123"}`)
+	plain, err := openExport(enc, "e2e-pass-123")
+	if err != nil {
+		t.Fatalf("解开导出体: %v", err)
+	}
+	file := *plain
 
 	newDst := func(t *testing.T) (*ConfigTransferHandler, *store.Store) {
 		logger := slog.New(slog.NewTextHandler(io.Discard, nil))
@@ -284,19 +295,16 @@ func TestE2E_DryRunThenApplyMatches(t *testing.T) {
 	}
 }
 
-// TestE2E_PlaintextExportNeverLeaksKeysWhenUnchecked 复核最容易出事的一条：
-// 用户什么选项都没改就点导出，文件里不能有任何凭据。
-func TestE2E_PlaintextExportNeverLeaksKeysWhenUnchecked(t *testing.T) {
+// TestE2E_ExportWithoutPassphraseRejected 钉住策略反转（2026-10-07）：
+// 没有口令就不能导出。这是防「顺手点一下导出 → 明文凭据文件躺在下载目录」
+// 的那道闸；导出体总是含凭据，所以无口令时唯一正确的反应是拒绝。
+func TestE2E_ExportWithoutPassphraseRejected(t *testing.T) {
 	src, _ := e2eSource(t)
 
 	r := asAdmin(httptest.NewRequest(http.MethodPost, "/admin/api/config-export/export", nil))
 	w := httptest.NewRecorder()
 	src.Export(w, r)
-	body := w.Body.String()
-
-	for _, needle := range []string{"api_key", "sk-", "APIKey"} {
-		if strings.Contains(body, needle) {
-			t.Fatalf("默认导出里出现了 %q —— 凭据不该被带出", needle)
-		}
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("无口令导出应 400，实际 %d body=%s", w.Code, w.Body.String())
 	}
 }

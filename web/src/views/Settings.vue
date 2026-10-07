@@ -63,13 +63,14 @@ watch(tab, (t) => {
 //
 // 两个动作都是「文件进、文件出」，没有表单要保存，所以单独一节。
 //
-// 界面上刻意把「带凭据」做成需要主动勾选、且与「加密」分开的两件事：
-// 加密防的是文件被别人捡到，带凭据决定的是文件里有没有钱。前者保护
-// 传输与存储，后者决定内容 —— 混成一个开关会让人以为"加密了所以带
-// 凭据也没关系"，而实际上明文带凭据正是最该避免的组合。
+// 导出策略（2026-10-07 收敛）：**必带凭据 + 必加密**，产物统一是 .json.enc。
+// 曾经「带凭据」是勾选、「加密」是可选项，四种组合里最危险的
+// 「明文 + 带凭据」恰恰是最容易顺手点出来的那种；且两种产物格式让导入侧
+// 要兼容两套形态。现在只有一个开关 —— 口令，没有它就导不出来。
+// 「同时导出 API Key」的勾选随之删除：不带走凭据的导出文件在目标机器上
+// 还要手工补密钥，实际没人这么用。
 const transferBusy = ref(false)
 const exportPass = ref('')
-const exportCreds = ref(false)
 
 // 导入分两步：先读文件并干跑，把「会发生什么」摆出来，确认后才真写。
 // 导入是改一个可能正在跑流量的库的动作，不能一击生效。
@@ -88,9 +89,15 @@ function resetImport() {
 }
 
 async function doExport() {
+  // 与后端同口径的前置校验：后端也会 400，这里先拦一层省一次往返，
+  // 并把按钮的可用态与这条规则对齐（见模板 disabled）。
+  if (exportPass.value.trim().length < 8) {
+    toast('请先设置至少 8 位的加密口令：导出文件包含全部上游 API Key', 'err')
+    return
+  }
   transferBusy.value = true
   try {
-    await api.exportConfig(exportPass.value, exportCreds.value)
+    await api.exportConfig(exportPass.value)
     toast('导出已开始下载，请确认文件已保存', 'ok')
   } catch (e) {
     if ((e as { status?: number }).status !== 401) toast('导出失败：' + (e as Error).message, 'err')
@@ -668,51 +675,35 @@ onMounted(() => {
         <section class="xfer-card">
           <h3>导出</h3>
           <p class="xfer-note">
-            导出当前全部供应商、模型与它们的参数（超时、重试、协议、端点、价格）。
-            <b>不含路由与访问密钥</b> —— 路由的公开名是给调用方看的契约，
-            跨环境照抄容易撞名；密钥则根本不该离开这个库。
+            导出当前全部供应商、模型、它们的参数（超时、重试、协议、端点、价格）
+            以及<b>上游 API Key</b>。文件用口令整体加密，产物是
+            <code>.json.enc</code> —— 不设口令无法导出。
+            <b>不含路由与下游访问密钥</b>：路由的公开名是给调用方看的契约，
+            跨环境照抄容易撞名；下游密钥属于本库的身份体系，不随文件走。
           </p>
 
           <div class="field">
-            <label>加密口令（留空则导出明文）</label>
+            <label>加密口令（必填，至少 8 位）</label>
             <input
               v-model="exportPass"
               class="input"
               type="password"
               autocomplete="new-password"
-              placeholder="至少 8 位"
+              placeholder="导入这份文件时要用同一个口令"
             />
             <span class="tip">
-              {{
-                exportPass.trim().length === 0
-                  ? '明文导出：文件可直接查看，但转发给别人等于把配置交出去。'
-                  : '加密导出：整个文件用这个口令加密，没有口令的人打不开。'
-              }}
+              文件里包含全部上游 API Key，口令是唯一的保护 —— 请用区别于登录密码的独立口令，
+              并把口令与文件分开传递。
             </span>
-          </div>
-
-          <label class="xfer-check">
-            <input v-model="exportCreds" type="checkbox" />
-            <span>
-              同时导出 API Key
-              <span class="tip" style="display: block">
-                不勾选则只导出结构，凭据留空 —— 导入后需要在界面上手工填写。
-                勾选后凭据以<b>解密后的明文</b>写进文件（受上面的口令保护）。
-              </span>
-            </span>
-          </label>
-
-          <div v-if="exportCreds && !exportPass.trim()" class="warn-line">
-            明文文件里会包含全部上游凭据，等同于密码本。请确认这份文件不会离开你的机器。
           </div>
 
           <button
             class="btn btn-primary"
             type="button"
-            :disabled="transferBusy"
+            :disabled="transferBusy || exportPass.trim().length < 8"
             @click="doExport"
           >
-            {{ transferBusy ? '处理中…' : '导出为文件' }}
+            {{ transferBusy ? '处理中…' : '导出为加密文件' }}
           </button>
         </section>
 
@@ -725,7 +716,7 @@ onMounted(() => {
 
           <div class="field">
             <label>导出文件</label>
-            <input class="input" type="file" accept=".json,application/json" @change="onPickFile" />
+            <input class="input" type="file" accept=".json,.json.enc,.enc,application/json" @change="onPickFile" />
             <span v-if="importFile" class="tip">已选择：{{ importFile.name }}</span>
           </div>
 

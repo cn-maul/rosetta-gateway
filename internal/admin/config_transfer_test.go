@@ -75,15 +75,23 @@ func seedSource(t *testing.T, h *ConfigTransferHandler, st *store.Store) {
 	}
 }
 
+// testExportPass 是 exportBody 在未显式给口令时使用的默认口令。
+const testExportPass = "export-pass-123"
+
 // exportBody 调一次 Export，返回解析后的导出体与原始响应。
+//
+// body 为空串 = 用默认口令走完整加密导出，然后**解开**返回明文体 ——
+// 大多数用例只关心导出内容本身；显式传带口令的 body 时（测加密形态的
+// 用例）返回的就是加密包装体，原样不解。
+// 2026-10-07 起导出必须带口令、必带凭据，「无口令导出」的用例见
+// TestExportRequiresPassphrase。
 func exportBody(t *testing.T, h *ConfigTransferHandler, body string) (configExport, *httptest.ResponseRecorder) {
 	t.Helper()
-	var r *http.Request
-	if body == "" {
-		r = asAdmin(httptest.NewRequest(http.MethodPost, "/admin/api/config-export/export", nil))
-	} else {
-		r = asAdmin(jsonRequest(http.MethodPost, "/admin/api/config-export/export", strings.NewReader(body)))
+	defaultPass := body == ""
+	if defaultPass {
+		body = `{"passphrase":"` + testExportPass + `"}`
 	}
+	r := asAdmin(jsonRequest(http.MethodPost, "/admin/api/config-export/export", strings.NewReader(body)))
 	w := httptest.NewRecorder()
 	h.Export(w, r)
 	if w.Code != http.StatusOK {
@@ -92,6 +100,13 @@ func exportBody(t *testing.T, h *ConfigTransferHandler, body string) (configExpo
 	var out configExport
 	if err := json.Unmarshal(w.Body.Bytes(), &out); err != nil {
 		t.Fatalf("导出结果不是合法 JSON: %v", err)
+	}
+	if defaultPass && out.Encrypted {
+		plain, err := openExport(out, testExportPass)
+		if err != nil {
+			t.Fatalf("默认口令解不开导出体: %v", err)
+		}
+		return *plain, w
 	}
 	return out, w
 }
@@ -121,24 +136,50 @@ func importInto(t *testing.T, h *ConfigTransferHandler, req importRequest) impor
 //
 // 导出文件最常见的去向是聊天工具与网盘，明文带凭据等于把上游的钱包
 // 发出去。默认不带、想要得主动勾，是唯一不容易出事的方向。
-func TestExportPlaintextOmitsCredentialsByDefault(t *testing.T) {
+func TestExportRequiresPassphrase(t *testing.T) {
+	h, _ := transferFixture(t)
+	seedSource(t, h, h.store)
+
+	cases := []struct {
+		name string
+		body []byte // nil = 不发请求体
+	}{
+		{"无请求体", nil},
+		{"空口令", []byte(`{"passphrase":""}`)},
+		{"纯空白口令", []byte(`{"passphrase":"   "}`)},
+	}
+	for _, tc := range cases {
+		var r *http.Request
+		if tc.body == nil {
+			r = asAdmin(httptest.NewRequest(http.MethodPost, "/admin/api/config-export/export", nil))
+		} else {
+			r = asAdmin(jsonRequest(http.MethodPost, "/admin/api/config-export/export", bytes.NewReader(tc.body)))
+		}
+		w := httptest.NewRecorder()
+		h.Export(w, r)
+		if w.Code != http.StatusBadRequest {
+			t.Errorf("%s: 应 400，实际 %d body=%s", tc.name, w.Code, w.Body.String())
+		}
+	}
+}
+
+// TestExportAlwaysIncludesCredentials 确认导出（解开后）带全部凭据，
+// 且供应商/模型的结构性字段完整 —— 凭据可以加密，配置不能丢。
+func TestExportAlwaysIncludesCredentials(t *testing.T) {
 	h, _ := transferFixture(t)
 	seedSource(t, h, h.store)
 
 	out, _ := exportBody(t, h, "")
-	if out.Encrypted {
-		t.Fatalf("未给口令时不该加密")
+	if len(out.Credentials) != 2 {
+		t.Fatalf("凭据数 = %d，期望 2", len(out.Credentials))
 	}
-	if len(out.Providers) != 2 {
-		t.Fatalf("供应商数 = %d，期望 2", len(out.Providers))
+	keys := map[string]string{}
+	for _, c := range out.Credentials {
+		keys[c.ProviderSlug] = c.APIKey
 	}
-	if len(out.Models) != 3 {
-		t.Fatalf("模型数 = %d，期望 3", len(out.Models))
+	if keys["alpha"] != "sk-alpha-secret" || keys["beta"] != "sk-beta-secret" {
+		t.Fatalf("凭据明文不对: %v", keys)
 	}
-	if len(out.Credentials) != 0 {
-		t.Fatalf("默认导出不该带凭据，实际带了 %d 条", len(out.Credentials))
-	}
-	// 结构性字段必须完整：凭据可以不导出，供应商与模型的配置不能丢。
 	byslug := map[string]providerExport{}
 	for _, p := range out.Providers {
 		byslug[p.Slug] = p
@@ -150,25 +191,6 @@ func TestExportPlaintextOmitsCredentialsByDefault(t *testing.T) {
 	}
 	if b := byslug["beta"]; b.Enabled {
 		t.Fatalf("beta 应保持 disabled，实际 enabled")
-	}
-}
-
-// TestExportIncludesCredentialsWhenAsked 确认显式要求时凭据会带上，
-// 且解密后是原文。
-func TestExportIncludesCredentialsWhenAsked(t *testing.T) {
-	h, _ := transferFixture(t)
-	seedSource(t, h, h.store)
-
-	out, _ := exportBody(t, h, `{"include_credentials":true}`)
-	if len(out.Credentials) != 2 {
-		t.Fatalf("凭据数 = %d，期望 2", len(out.Credentials))
-	}
-	keys := map[string]string{}
-	for _, c := range out.Credentials {
-		keys[c.ProviderSlug] = c.APIKey
-	}
-	if keys["alpha"] != "sk-alpha-secret" || keys["beta"] != "sk-beta-secret" {
-		t.Fatalf("凭据明文不对: %v", keys)
 	}
 }
 
@@ -214,7 +236,7 @@ func TestExportEncryptedWrongPassphraseRejected(t *testing.T) {
 	h, _ := transferFixture(t)
 	seedSource(t, h, h.store)
 
-	enc, _ := exportBody(t, h, `{"passphrase":"right-password","include_credentials":true}`)
+	enc, _ := exportBody(t, h, `{"passphrase":"right-password"}`)
 
 	if _, err := openExport(enc, "wrong-password"); err == nil {
 		t.Fatalf("错误口令应被拒")
@@ -245,7 +267,7 @@ func TestExportEncryptedRequiresStrongPassphrase(t *testing.T) {
 func TestImportIntoEmptyDB(t *testing.T) {
 	src, _ := transferFixture(t)
 	seedSource(t, src, src.store)
-	file, _ := exportBody(t, src, `{"include_credentials":true}`)
+	file, _ := exportBody(t, src, "")
 
 	dst, _ := transferFixture(t)
 	resp := importInto(t, dst, importRequest{Data: file})
@@ -445,7 +467,7 @@ func resp3ID(t *testing.T, h *ConfigTransferHandler, slug string) string {
 func TestImportModelsFollowRenamedProvider(t *testing.T) {
 	src, _ := transferFixture(t)
 	seedSource(t, src, src.store)
-	file, _ := exportBody(t, src, `{"include_credentials":true}`)
+	file, _ := exportBody(t, src, "")
 
 	dst, _ := transferFixture(t)
 	ctx := context.Background()
@@ -480,7 +502,7 @@ func TestImportModelsFollowRenamedProvider(t *testing.T) {
 func TestImportEncryptedFileEndToEnd(t *testing.T) {
 	src, _ := transferFixture(t)
 	seedSource(t, src, src.store)
-	file, _ := exportBody(t, src, `{"passphrase":"export-pass-1","include_credentials":true}`)
+	file, _ := exportBody(t, src, `{"passphrase":"export-pass-1"}`)
 
 	dst, _ := transferFixture(t)
 
@@ -507,7 +529,7 @@ func TestImportEncryptedFileEndToEnd(t *testing.T) {
 func TestImportDryRunWritesNothing(t *testing.T) {
 	src, _ := transferFixture(t)
 	seedSource(t, src, src.store)
-	file, _ := exportBody(t, src, `{"include_credentials":true}`)
+	file, _ := exportBody(t, src, "")
 
 	dst, _ := transferFixture(t)
 	ctx := context.Background()
