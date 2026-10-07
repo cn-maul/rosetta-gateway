@@ -1,6 +1,7 @@
 package inwire
 
 import (
+	"encoding/json"
 	"errors"
 	"net/http"
 	"net/http/httptest"
@@ -135,17 +136,58 @@ func TestDecodeAnthropicMessages_ToolChoice(t *testing.T) {
 	if tc, ok := req2.Extra["tool_choice"].(map[string]any); !ok || tc["type"] != "any" {
 		t.Fatalf("anthropic tool_choice passthrough: %+v", req2.Extra)
 	}
-	// responses 上游跳过：不挂任何 Extra。
+	// responses 上游拿翻译后的形状（P1-8：不再整个跳过、静默丢 tool_choice）。
 	req3 := anyChoice.ToRosetta()
 	anyChoice.ApplyUpstreamExtras(req3, "openai-responses")
-	if len(req3.Extra) != 0 {
-		t.Fatalf("responses upstream should skip extras, got %+v", req3.Extra)
+	if req3.Extra["tool_choice"] != "required" {
+		t.Fatalf("responses tool_choice translation (any→required): %+v", req3.Extra)
+	}
+	// top_k 不跟随：responses 上游没有对应物，丢弃。
+	req4 := decodeAnthropic(t, `{"model":"m","max_tokens":8,"top_k":40,
+		"messages":[{"role":"user","content":"hi"}]}`)
+	req4Ros := req4.ToRosetta()
+	req4.ApplyUpstreamExtras(req4Ros, "openai-responses")
+	if len(req4Ros.Extra) != 0 {
+		t.Fatalf("responses upstream must not receive top_k, got %+v", req4Ros.Extra)
 	}
 
 	bad := httptest.NewRequest(http.MethodPost, "/v1/messages",
 		strings.NewReader(`{"model":"m","max_tokens":8,"tool_choice":{"type":"tool"},"messages":[{"role":"user","content":"hi"}]}`))
 	if _, err := DecodeAnthropicMessagesRequest(bad, 1<<20); err == nil {
 		t.Fatalf("tool_choice.type=tool without name should fail")
+	}
+}
+
+// anthropic → openai-responses：tool_choice 等价翻译矩阵（P1-8 补齐的方向）。
+func TestAnthropic_ResponsesToolChoiceMatrix(t *testing.T) {
+	cases := []struct {
+		name       string
+		toolChoice string
+		wantJSON   string // "" = 应被丢弃
+	}{
+		{"auto→auto", `{"type":"auto"}`, `"auto"`},
+		{"any→required", `{"type":"any"}`, `"required"`},
+		{"tool→function", `{"type":"tool","name":"weather"}`, `{"name":"weather","type":"function"}`},
+		// "none" 在 Responses 无对齐语义：丢弃。
+		{"none dropped", `{"type":"none"}`, ""},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			got := decodeAnthropic(t, `{"model":"m","max_tokens":8,
+				"tool_choice":`+c.toolChoice+`,"messages":[{"role":"user","content":"hi"}]}`)
+			req := got.ToRosetta()
+			got.ApplyUpstreamExtras(req, "openai-responses")
+			if c.wantJSON == "" {
+				if _, exists := req.Extra["tool_choice"]; exists {
+					t.Fatalf("tool_choice 应被丢弃，实际 %v", req.Extra["tool_choice"])
+				}
+				return
+			}
+			raw, _ := json.Marshal(req.Extra["tool_choice"])
+			if string(raw) != c.wantJSON {
+				t.Fatalf("tool_choice = %s, want %s", raw, c.wantJSON)
+			}
+		})
 	}
 }
 

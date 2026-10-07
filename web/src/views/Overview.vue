@@ -11,6 +11,7 @@ const stats = ref<Stats | null>(null)
 const byDay = ref<UsageGroupEntry[]>([])
 const byModel = ref<UsageGroupEntry[]>([])
 const byKey = ref<UsageGroupEntry[]>([])
+const byProvider = ref<UsageGroupEntry[]>([])
 
 // ---------- 时间范围选择 ----------
 // key 传给后端换算 from/to；label 显示在下拉里。
@@ -114,13 +115,32 @@ const daySeries = computed<Bucket[]>(() => {
     const slice = daily.slice(i, i + bucketDays)
     const first = slice[0]
     const last = slice[slice.length - 1]
+    // 尾桶不足整桶宽（「近 1 年」末尾常只剩几天）：标签加 * 标记、tip 写明实际
+    // 天数 —— 不加标记的话，一个只有 2 天的桶会被读成「流量腰斩」。刻意**不**
+    // 按桶宽做高度归一：那会把「只有 2 天的量」放大成「一整桶的量」，数据语义就变了。
+    const partial = slice.length < bucketDays
+    const mark = partial ? '*' : ''
+    const partialNote = partial ? `（部分桶：仅 ${slice.length} 天）` : ''
+    // 月桶跨月时标签补上止月：只写首月「2026-03」会被读成整桶都落在 3 月。
+    // 同年给「2026-03~04」，跨年给完整两段，避免「~04」被误读成日期里的日。
+    const sameMonth = first.date.slice(0, 7) === last.date.slice(0, 7)
+    let labFullMonth = first.date.slice(0, 7)
+    if (!sameMonth) {
+      labFullMonth +=
+        first.date.slice(0, 4) === last.date.slice(0, 4)
+          ? `~${last.date.slice(5, 7)}`
+          : `~${last.date.slice(0, 7)}`
+    }
+    const m1 = parseInt(first.date.slice(5, 7), 10)
+    const m2 = parseInt(last.date.slice(5, 7), 10)
     out.push({
       key: first.date,
       count: slice.reduce((a, b) => a + b.count, 0),
       tokens: slice.reduce((a, b) => a + b.tokens, 0),
-      labFull: monthly ? first.date.slice(0, 7) : first.date.slice(5),
-      labShort: monthLabel(first.date),
-      tip: monthly ? first.date.slice(0, 7) : `${first.date.slice(5)} ~ ${last.date.slice(5)}`,
+      labFull: (monthly ? labFullMonth : first.date.slice(5)) + mark,
+      labShort: (monthly ? (sameMonth ? monthLabel(first.date) : `${m1}~${m2}月`) : monthLabel(first.date)) + mark,
+      // 月桶的 tip 也给真实日期范围（与周桶同口径），悬停即可确认桶的覆盖范围。
+      tip: `${first.date.slice(5)} ~ ${last.date.slice(5)}${partialNote}`,
     })
   }
   return out
@@ -134,6 +154,7 @@ const maxTokens = computed(() => Math.max(1, ...daySeries.value.map((d) => d.tok
 
 const topModelMax = computed(() => Math.max(1, ...byModel.value.map((e) => e.tokens)))
 const topKeyMax = computed(() => Math.max(1, ...byKey.value.map((e) => e.tokens)))
+const topProviderMax = computed(() => Math.max(1, ...byProvider.value.map((e) => e.tokens)))
 
 // 请求序号守卫：快速切换时间范围会并发多个 load()，晚到的旧响应若写回状态，
 // 会把新范围的数据覆盖成旧范围的（下拉显示「近 1 天」、表里却是「近 1 年」）。
@@ -149,17 +170,19 @@ async function load() {
     // 「全部」档额外要终身累计：明细被剪掉之后，byDay 的最早一天不再是
     // 真正的起点（只剩 30 天），first_record_at 才是（见 stats_handler）。
     const wantLifetime = range.value === 'all'
-    const [s, d, m, k] = await Promise.all([
+    const [s, d, m, k, p] = await Promise.all([
       api.stats(from, to, wantLifetime),
       api.usageByDay(from, to),
       api.usageByModel(from, to),
       api.usageByKey(from, to),
+      api.usageByProvider(from, to),
     ])
     if (seq !== reqSeq) return // 期间切换了新范围，本响应已过时
     stats.value = s
     byDay.value = d
     byModel.value = m
     byKey.value = k
+    byProvider.value = p
   } catch (e) {
     if (seq !== reqSeq) return
     if ((e as { status?: number }).status === 401) return
@@ -323,7 +346,7 @@ onUnmounted(() => {
       </div>
 
       <div class="panel">
-        <div class="expand-grid">
+        <div class="expand-grid is-3col">
           <div class="expand-col">
             <h4>模型用量 Top 10</h4>
             <div v-if="byModel.length === 0" class="empty">暂无用量记录</div>
@@ -348,6 +371,20 @@ onUnmounted(() => {
                 class="bar"
                 style="width: 72px; flex: none; border-radius: 3px"
                 :style="{ height: '8px', opacity: 0.35 + 0.65 * (e.tokens / topKeyMax) }"
+              ></div>
+              <span class="num" style="width: 64px; text-align: right; flex: none">{{ fmtTokens(e.tokens) }}</span>
+            </div>
+          </div>
+          <div class="expand-col">
+            <h4>供应商用量 Top 10</h4>
+            <div v-if="byProvider.length === 0" class="empty">暂无用量记录</div>
+            <div v-for="e in byProvider" :key="e.key" class="mini-row">
+              <span class="mini-main mono">{{ e.key }}</span>
+              <span class="badge badge-accent num">{{ fmtNum(e.count) }} 次</span>
+              <div
+                class="bar"
+                style="width: 72px; flex: none; border-radius: 3px"
+                :style="{ height: '8px', opacity: 0.35 + 0.65 * (e.tokens / topProviderMax) }"
               ></div>
               <span class="num" style="width: 64px; text-align: right; flex: none">{{ fmtTokens(e.tokens) }}</span>
             </div>
@@ -429,6 +466,17 @@ onUnmounted(() => {
 .range-item.active {
   background: var(--accent);
   color: var(--accent-foreground);
+}
+/* 三个 by-* 维度并排（expand-grid 默认两列）；窄屏沿用全局的单列降级。
+   注意这里的选择器特异性高于 styles.css 里媒体查询内的 .expand-grid，
+   所以窄屏降级必须在这里重写一遍。 */
+.expand-grid.is-3col {
+  grid-template-columns: 1fr 1fr 1fr;
+}
+@media (max-width: 900px) {
+  .expand-grid.is-3col {
+    grid-template-columns: 1fr;
+  }
 }
 /* 柱状图双形态标签：桌面显示完整日期，窄屏只显示尾部 */
 .bar-full {

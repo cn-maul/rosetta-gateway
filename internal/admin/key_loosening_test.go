@@ -196,3 +196,69 @@ func TestKeyUpdate_AdminBypassesLooseningGuard(t *testing.T) {
 		t.Errorf("admin relax not applied: %+v", k)
 	}
 }
+
+// P1-5 回归：发 key 收敛为管理员专属。
+//
+// 自助发 key 的「额度封顶」兜底挡不住绕过：管理员落在具体 key 上的
+// 禁用/配额/限速/有效期/IP，用户重新建一把（enabled=true、无期限、
+// 无 IP）即可全部绕开。在用户/组级强制 ceiling 存在之前，发 key 只能是
+// 管理动作 —— 这里钉住两个方向：普通用户 403 且库里无新 key，管理员照常。
+func TestKeyCreate_AdminOnly(t *testing.T) {
+	st, h := newLooseningStore(t)
+
+	rec := httptest.NewRecorder()
+	req := asUser(jsonRequest(http.MethodPost, "/admin/api/keys",
+		strings.NewReader(`{"name":"bypass"}`)), "u1")
+	h.Create(rec, req)
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("user create key: code=%d body=%s, want 403", rec.Code, rec.Body.String())
+	}
+	keys, _ := st.ListAccessKeysByUser(context.Background(), "u1")
+	if len(keys) != 0 {
+		t.Fatalf("user create key: %d key(s) were created, want 0", len(keys))
+	}
+
+	rec = httptest.NewRecorder()
+	req = asAdmin(jsonRequest(http.MethodPost, "/admin/api/keys",
+		strings.NewReader(`{"name":"by-admin","user_id":"u1"}`)))
+	h.Create(rec, req)
+	if rec.Code != http.StatusOK && rec.Code != http.StatusCreated {
+		t.Fatalf("admin create key: code=%d body=%s, want 2xx", rec.Code, rec.Body.String())
+	}
+}
+
+// P1-5 回归：分组覆盖的**清除**与设置一样是管理员动作。
+//
+// 原实现的清空分支排在管理员判定之前，管理员把 key 压到更严的组后，
+// 用户一条 {"group_id":""} 就能退回归属用户的（更宽松）分组。
+func TestKeyUpdate_OwnerCannotClearGroupOverride(t *testing.T) {
+	st, h := newLooseningStore(t)
+	if err := st.CreateGroup(context.Background(), &store.Group{
+		ID: "g-strict", Name: "strict",
+	}); err != nil {
+		t.Fatalf("seed group: %v", err)
+	}
+	k := seedRestrictedKey(t, st)
+	k.GroupID = "g-strict"
+	if err := st.UpdateAccessKey(context.Background(), "kr", k); err != nil {
+		t.Fatalf("seed group override: %v", err)
+	}
+
+	rec := patchKey(h, func(r *http.Request) *http.Request { return asUser(r, "u1") }, `{"group_id":""}`)
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("clear group override: code=%d body=%s, want 403", rec.Code, rec.Body.String())
+	}
+	got, _ := st.GetAccessKey(context.Background(), "kr")
+	if got.GroupID != "g-strict" {
+		t.Fatalf("group override was cleared: %q", got.GroupID)
+	}
+
+	rec = patchKey(h, asAdmin, `{"group_id":""}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("admin clear group override: code=%d body=%s, want 200", rec.Code, rec.Body.String())
+	}
+	got, _ = st.GetAccessKey(context.Background(), "kr")
+	if got.GroupID != "" {
+		t.Fatalf("admin clear did not take effect: %q", got.GroupID)
+	}
+}

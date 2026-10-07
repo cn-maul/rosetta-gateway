@@ -9,9 +9,11 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"unicode"
 	"unicode/utf8"
 )
@@ -150,9 +152,20 @@ func writeKeyAtomic(path string, data []byte) error {
 	return nil
 }
 
+// plaintextFallbackWarned 节流「命中明文回退」的告警：解密发生在每次池重建
+// 与管理面读凭据时，逐条打会刷爆日志，而「库里存在明文凭据」这一事实
+// 说一遍就够。进程级一次性，代价是重启后才会再提醒 —— 可接受。
+var plaintextFallbackWarned atomic.Bool
+
 // DecryptWithFallback 用 masterKey 解密。masterKey 为空时直接按明文返回；
 // 解密失败时，只有当数据看起来是可打印文本才退化为明文
 // —— 兼容早期「无主密钥 → 明文落库」的历史数据，同时避免把密文当 API Key 发出去。
+//
+// 兼容不等于无声：命中文本回退说明库里有一条**未加密**的凭据（主密钥存在
+// 却解不开 = 数据不是本密钥加密的，而是明文落库的历史行/手工插入行）。
+// 此时数据库备份等于该凭据泄露，且这条数据永远不会自己升级成密文 ——
+// 必须 WARN 让运维知道去重新保存一次凭据完成加密迁移。日志只记长度，
+// 不记内容：那是明文密钥本身。
 func DecryptWithFallback(data, masterKey []byte) (string, error) {
 	if len(masterKey) == 0 {
 		return string(data), nil
@@ -162,6 +175,12 @@ func DecryptWithFallback(data, masterKey []byte) (string, error) {
 		return string(plain), nil
 	}
 	if looksLikeText(data) {
+		if plaintextFallbackWarned.CompareAndSwap(false, true) {
+			slog.Warn("credential accepted as PLAINTEXT by fallback decryption; "+
+				"database backups expose it and it will never self-encrypt — "+
+				"re-save the credential to migrate it into encrypted form",
+				"bytes", len(data))
+		}
 		return string(data), nil
 	}
 	return "", err

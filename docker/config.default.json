@@ -1,6 +1,6 @@
 {
   "listen": "0.0.0.0:8666",
-  "db_path": "./db/gateway.db",
+  "db_path": "./data/gateway.db",
   "log_level": "info",
   "master_key_env": "ROSETTA_GW_MASTER_KEY",
   "defaults": {

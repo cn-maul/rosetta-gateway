@@ -21,8 +21,11 @@ import (
 type UserHandler struct {
 	store *store.Store
 	mgr   *userauth.Manager
-	// reload 在**角色/状态变更后**必须被调用：被禁用用户的 key 在数据面
-	// 仍会放行，直到快照重建。留 nil 时（测试）跳过重建。
+	// reload 是运行时快照重建的注入点。**重建的唯一所有者是外层
+	// server.AutoReload**（写操作成功后触发；失败置脏，交 cmd/gateway 的
+	// 后台重试兜底）—— 本 handler 的端点不再自行调用重建：handler 内的
+	// 同步重建一旦失败，响应变 500，恰好绕过 AutoReload 的审计与置脏路径。
+	// 字段与 WithReload 仅为兼容 cmd/gateway 的构造注入面保留，留 nil 无副作用。
 	reload func(context.Context) error
 	// thr 惰性初始化（构造时不建，登录路径上才用）。
 	// mu 保护它：登录端点是并发入口，裸读裸写会造出多个限速器，
@@ -66,7 +69,8 @@ func NewUserHandler(st *store.Store, mgr *userauth.Manager) *UserHandler {
 	return &UserHandler{store: st, mgr: mgr}
 }
 
-// WithReload 注入运行时重建函数。
+// WithReload 注入运行时重建函数（仅为兼容 cmd/gateway 的构造注入面保留；
+// 重建统一由外层 server.AutoReload 负责，见 reload 字段的注释）。
 func (h *UserHandler) WithReload(fn func(context.Context) error) *UserHandler {
 	h.reload = fn
 	return h
@@ -268,11 +272,24 @@ func writeTooMany(w http.ResponseWriter, retryAfter time.Duration) {
 // 这个账号**登不进去**（空哈希过不了校验），但它让「第一个管理员」这件事
 // 有了明确的落点。BootstrapStatus 告诉前端「现在该显示设密码表单」，
 // BootstrapSetup 负责真正设置并直接签发会话 —— 设完即可用，无第二个步骤。
+//
+// # 窗口的判定依据是一次性标记，不是「当前是否存在空密码 admin」
+//
+// 引导窗口挂在免鉴权的 publicAdminMux 上（首次部署别无选择），它开放与否
+// 必须绑定「本安装是否完成过引导」（app_settings 的 bootstrap_completed 标记，
+// 与设密同事务写入，见 store.SetInitialAdminPassword）。若改用「存在空密码
+// admin」判定：管理员一旦建出/升级出空密码 admin，任何人都能 POST bootstrap
+// 给该账号设上自己的密码并直接拿到 admin 会话 —— 免鉴权窗口**永久**重开。
+// 标记只前进一次，窗口因此最多开到第一次设密成功为止。
+//
+// 兼容性：老库已完成引导但没有标记时，行为不变（无空密码 admin，窗口本来就
+// 是关的）；只有 bug 期间恰好留下空密码 admin 的库会再开**最后**一次窗口，
+// 设完即永久关闭。
 
 // bootstrapStatusResponse 是首次登录引导的状态。
 type bootstrapStatusResponse struct {
-	// NeedsSetup 为真表示存在一个已建出但未设密码的管理员，
-	// 前端应把登录页换成「设置密码」表单。
+	// NeedsSetup 为真表示引导窗口仍然开放（本安装尚未完成过引导，且当前
+	// 存在待初始化的管理员），前端应把登录页换成「设置密码」表单。
 	NeedsSetup bool `json:"needs_setup"`
 	// Username 是那个待初始化的账号名，供前端显示「为 admin 设置密码」。
 	Username string `json:"username,omitempty"`
@@ -287,7 +304,26 @@ type bootstrapStatusResponse struct {
 // 泄露面评估：只暴露「有没有一个待初始化管理员」与它的用户名。
 // 两者都是公开事实（启动日志就写了账号名），且不提供任何可用于登录的信息。
 // 与 password/check 的区别是语义完全不同 —— 后者已随双通道一起删除。
+//
+// 判定分两层：bootstrap_completed 标记已置 → 直接报「无需引导」，**不再看**
+// 是否存在空密码 admin —— 那个条件只是窗口曾经开过的原因（见文件顶部的
+// 引导注释），把它当开关会让 bug 期间建出的空密码 admin 把免鉴权窗口永久
+// 重开。标记未置（新库或老库升级）才回落到 FindUninitializedAdmin 的旧判定。
 func (h *UserHandler) BootstrapStatus(w http.ResponseWriter, r *http.Request) {
+	done, err := h.store.BootstrapCompleted(r.Context())
+	if err != nil {
+		// 查不到状态不该让界面显示「不需要设密码」——那会把用户送去
+		// 一个必然失败的登录框。报 500，前端显示「无法连接」。
+		writeServerError(w, "bootstrap status: read completed marker", err)
+		return
+	}
+	if done {
+		writeJSON(w, http.StatusOK, bootstrapStatusResponse{
+			NeedsSetup:     false,
+			SessionEnabled: h.mgr.Enabled(),
+		})
+		return
+	}
 	u, err := h.store.FindUninitializedAdmin(r.Context())
 	if err != nil {
 		// 查不到状态不该让界面显示「不需要设密码」——那会把用户送去
@@ -324,9 +360,11 @@ type bootstrapSetupRequest struct {
 // # 安全性
 //
 // 免鉴权写接口，但受三重限制：
-//  1. 只对「role=admin 且 password_hash 为空」的那个账号有效 ——
-//     引导完成后 FindUninitializedAdmin 返回 nil，此端点即失效。
-//  2. 一旦该账号设过密码，再次调用 → 409，不是覆盖。
+//  1. 一次性标记（bootstrap_completed）先决：本安装完成过引导 → 409，
+//     此端点即失效 —— 哪怕库里恰好还存在空密码 admin（bug 期间建出的），
+//     也不能经这里被设上密码。标记与设密同事务写入，见 store.SetInitialAdminPassword。
+//  2. 只对「role=admin 且 password_hash 为空」的那个账号有效，且条件 UPDATE
+//     保证只设一次：引导完成后再调 → 409，不是覆盖。
 //  3. decodeJSON 强制 Content-Type: application/json（CSRF 防线，
 //     见 helpers.go 的说明），且上面叠一层同源判定。
 //
@@ -340,6 +378,22 @@ func (h *UserHandler) BootstrapSetup(w http.ResponseWriter, r *http.Request) {
 	// 连查库都不该做。
 	if !server.SameOrigin(r) {
 		server.WriteForbidden(w)
+		return
+	}
+
+	// 一次性标记先决：本安装完成过引导，窗口就必须关死 —— 不再看「是否存在
+	// 空密码 admin」。后者在修复前的用户管理面可能被建出/升级出来，若拿它当
+	// 开关，任何人都能给那个账号设上自己的密码并直接拿到 admin 会话。放最前：
+	// 窗口已关时连限速与查库都不必做。
+	done, err := h.store.BootstrapCompleted(r.Context())
+	if err != nil {
+		writeServerError(w, "bootstrap setup: read completed marker", err)
+		return
+	}
+	if done {
+		// 与「重复初始化」同一条 409 路径：对调用方来说语义相同 —— 管理员
+		// 密码已设置，这个免鉴权入口不再接受任何写入。
+		writeError(w, http.StatusConflict, "管理员密码已设置，无需重复初始化")
 		return
 	}
 
@@ -387,6 +441,8 @@ func (h *UserHandler) BootstrapSetup(w http.ResponseWriter, r *http.Request) {
 	// 不保证「写入时仍然未设」—— 并发下（或与本判定之后发生的正常设置竞跑）
 	// 后写者会静默覆盖先写者。条件 UPDATE 让「只设一次」由数据库原子保证，
 	// 0 行受影响即说明窗口已在两条指令之间关闭。
+	// 写入命中时**同一个事务**还会置 bootstrap_completed 标记：设密成功与
+	// 窗口关闭原子生效（见 store.SetInitialAdminPassword 的注释）。
 	ok, err := h.store.SetInitialAdminPassword(r.Context(), u.ID, hash)
 	if err != nil {
 		writeServerError(w, "bootstrap setup: set password", err)

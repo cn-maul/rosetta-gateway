@@ -16,8 +16,8 @@ func TestKeyHandler_QuotaWritePath(t *testing.T) {
 
 	// create with quota
 	rec := httptest.NewRecorder()
-	req := jsonRequest(http.MethodPost, "/admin/api/keys",
-		bytes.NewBufferString(`{"name":"cli","quota_tokens":1000}`))
+	req := asAdmin(jsonRequest(http.MethodPost, "/admin/api/keys",
+		bytes.NewBufferString(`{"name":"cli","quota_tokens":1000}`)))
 	h.Create(rec, req)
 	if rec.Code != http.StatusCreated {
 		t.Fatalf("create code=%d body=%s", rec.Code, rec.Body.String())

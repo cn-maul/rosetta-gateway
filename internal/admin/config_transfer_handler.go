@@ -159,7 +159,7 @@ func (h *ConfigTransferHandler) buildExport(ctx context.Context, withCreds bool)
 			}
 			out.Credentials = append(out.Credentials, credentialExport{
 				ProviderSlug: p.Slug, Label: c.Label, APIKey: plain,
-				Enabled: c.Enabled, Weight: c.Weight,
+				Enabled: &c.Enabled, Weight: c.Weight,
 			})
 		}
 	}
@@ -284,6 +284,22 @@ func (h *ConfigTransferHandler) apply(ctx context.Context, in *configExport, dry
 				fmt.Sprintf("供应商 %s 缺少 endpoint，已跳过", slug))
 			continue
 		}
+		// 数值字段与 provider handler 同一套边界（CONFIG-01）：导入路径原先
+		// 照单全收，绕过了 handler 的非负与 MaxDurationMillis 校验 —— 一份
+		// timeout_ms 超大的文件会让 time.Duration 回绕成负数，负 Duration
+		// 使 context.WithTimeout 立即过期，该 provider 的所有请求当场全挂。
+		// 违例按导入的既有语义跳过并告警，不让单条脏数据中断整份导入。
+		if pe.TimeoutMs < 0 || pe.TimeoutMs > config.MaxDurationMillis {
+			resp.Warnings = append(resp.Warnings, fmt.Sprintf(
+				"供应商 %s 的 timeout_ms 非法（%d，须在 0~%d 之间），已跳过",
+				slug, pe.TimeoutMs, config.MaxDurationMillis))
+			continue
+		}
+		if pe.MaxRetries < 0 {
+			resp.Warnings = append(resp.Warnings,
+				fmt.Sprintf("供应商 %s 的 max_retries 为负数（%d），已跳过", slug, pe.MaxRetries))
+			continue
+		}
 		newProviders = append(newProviders, pendingProvider{origSlug: slug, provider: p})
 	}
 
@@ -396,6 +412,17 @@ func (h *ConfigTransferHandler) attach(
 		}
 		existingModels[pid+"\x00"+modelID] = true
 
+		// 数值字段与 model handler 同一套边界（CONFIG-01）：负数原先原样落库
+		// —— 负单价尤其危险，它让该模型的每次调用**倒贴钱**，账目静默失真。
+		// 违例跳过并告警。
+		if me.ContextWindow < 0 || me.MaxOutputTokens < 0 ||
+			me.PriceInput < 0 || me.PriceCacheHit < 0 || me.PriceOutput < 0 {
+			resp.ModelsSkipped++
+			resp.Warnings = append(resp.Warnings,
+				fmt.Sprintf("模型 %s / %s 含负数的窗口/输出上限/单价字段，已跳过", slug, modelID))
+			continue
+		}
+
 		m := store.UpstreamModel{
 			// 同 provider：ID 必须现生成，DAO 是原样写入的。
 			ID:         generateID(),
@@ -440,10 +467,17 @@ func (h *ConfigTransferHandler) attach(
 		if weight <= 0 {
 			weight = 1
 		}
+		// Enabled 跟随导出文件：导出保留原状，导入也应原样落库（CONFIG-01，
+		// 原先硬编码 true，禁用凭据导入后静默复活）。字段缺失（旧版文件）
+		// 按 true 处理，与该字段加入前的行为一致 —— 见 credentialExport 注释。
+		enabled := true
+		if ce.Enabled != nil {
+			enabled = *ce.Enabled
+		}
 		c := store.Credential{
 			ID:         generateID(),
 			ProviderID: pid, Label: strings.TrimSpace(ce.Label), APIKeyEnc: enc,
-			Enabled: true, Weight: weight, Status: "healthy",
+			Enabled: enabled, Weight: weight, Status: "healthy",
 			CreatedAt: time.Now().UnixMilli(),
 		}
 		if dry {

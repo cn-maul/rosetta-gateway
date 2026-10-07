@@ -26,7 +26,7 @@ func TestDecodeJSON_RejectsNonJSONContentType(t *testing.T) {
 	req.Header.Set("Content-Type", "text/plain")
 
 	rec := httptest.NewRecorder()
-	h.Create(rec, req)
+	h.Create(rec, asAdmin(req))
 
 	if rec.Code != http.StatusUnsupportedMediaType {
 		t.Fatalf("text/plain 应被 415 拒绝，实际 %d body=%s", rec.Code, rec.Body.String())
@@ -57,7 +57,7 @@ func TestDecodeJSON_AcceptsJSONContentType(t *testing.T) {
 		req := httptest.NewRequest(http.MethodPost, "/admin/api/keys",
 			bytes.NewBufferString(`{"name":"ok"}`))
 		req.Header.Set("Content-Type", ct)
-		h.Create(rec, req)
+		h.Create(rec, asAdmin(req))
 		if rec.Code != http.StatusCreated {
 			t.Fatalf("Content-Type %q 应被接受，实际 %d body=%s", ct, rec.Code, rec.Body.String())
 		}
@@ -75,7 +75,7 @@ func TestDecodeJSON_MissingContentTypeRejected(t *testing.T) {
 	req := httptest.NewRequest(http.MethodPost, "/admin/api/keys",
 		bytes.NewBufferString(`{"name":"pwned"}`))
 	// 刻意不设 Content-Type
-	h.Create(rec, req)
+	h.Create(rec, asAdmin(req))
 
 	if rec.Code != http.StatusUnsupportedMediaType {
 		t.Fatalf("缺失 Content-Type 应被 415 拒绝，实际 %d", rec.Code)
@@ -91,7 +91,7 @@ func TestDecodeJSON_MalformedBodyStill400(t *testing.T) {
 	rec := httptest.NewRecorder()
 	req := jsonRequest(http.MethodPost, "/admin/api/keys",
 		bytes.NewBufferString(`{not json`))
-	h.Create(rec, req)
+	h.Create(rec, asAdmin(req))
 
 	if rec.Code != http.StatusBadRequest {
 		t.Fatalf("坏 JSON 应为 400，实际 %d body=%s", rec.Code, rec.Body.String())

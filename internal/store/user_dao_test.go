@@ -216,22 +216,70 @@ func TestUpdateAccessKey_DoesNotChangeOwner(t *testing.T) {
 func TestUser_DisableTakesEffect(t *testing.T) {
 	db := newStore(t)
 	ctx := context.Background()
-	if err := db.CreateUser(ctx, &User{ID: "u1", Username: "alice", Status: UserStatusActive}); err != nil {
+	if err := db.CreateUser(ctx, &User{ID: "u1", Username: "alice", Status: UserStatusActive, AuthVersion: 1}); err != nil {
 		t.Fatalf("create: %v", err)
 	}
 	u, _ := db.GetUser(ctx, "u1")
 	if !u.IsActive() {
 		t.Fatal("fresh user should be active")
 	}
+	// 复刻 handler 里真实的禁用路径：UpdateUser 改状态、BumpAuthVersion 让
+	// 既有会话失效 —— UpdateUser 从不写 auth_version，两步职责分开
+	//（见 TestUpdateUser_DoesNotRewindAuthVersion）。
 	if err := db.UpdateUser(ctx, &User{
 		ID: "u1", Username: "alice", Role: RoleUser,
-		Status: UserStatusDisabled, AuthVersion: u.AuthVersion,
+		Status: UserStatusDisabled,
 	}); err != nil {
 		t.Fatalf("disable: %v", err)
+	}
+	if err := db.BumpAuthVersion(ctx, "u1"); err != nil {
+		t.Fatalf("bump auth version: %v", err)
 	}
 	got, _ := db.GetUser(ctx, "u1")
 	if got.IsActive() {
 		t.Error("user still active after disable")
+	}
+	if got.AuthVersion != 2 {
+		t.Errorf("auth_version = %d, want 2 (disable must invalidate existing sessions)", got.AuthVersion)
+	}
+}
+
+// UpdateUser 绝不把 auth_version 写回旧值。
+//
+// 旧 SQL 无条件写 auth_version = 快照值：handler 读库（av=5）→ 用户并发改密
+// （SetUserPassword 原子递增到 av=6）→ PATCH 落库把 av 覆盖回 5 → 改密前被
+// 窃取的旧 JWT 重新通过校验，吊销被静默撤销。修复后资料更新永不触碰
+// 会话失效栅栏 —— 栅栏只能前进（SetUserPassword / BumpAuthVersion 的相对递增）。
+func TestUpdateUser_DoesNotRewindAuthVersion(t *testing.T) {
+	db := newStore(t)
+	ctx := context.Background()
+	if err := db.CreateUser(ctx, &User{
+		ID: "u1", Username: "alice", DisplayName: "Alice", AuthVersion: 5,
+	}); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	snap, err := db.GetUser(ctx, "u1") // handler 持有的旧快照
+	if err != nil || snap == nil {
+		t.Fatalf("get: %v", err)
+	}
+
+	// 读库与落库之间发生的并发改密。
+	if err := db.SetUserPassword(ctx, "u1", "new-hash"); err != nil {
+		t.Fatalf("set password: %v", err)
+	}
+
+	// 用旧快照 PATCH 落库，只改 display_name。
+	snap.DisplayName = "Alice Renamed"
+	if err := db.UpdateUser(ctx, snap); err != nil {
+		t.Fatalf("update: %v", err)
+	}
+
+	got, _ := db.GetUser(ctx, "u1")
+	if got.AuthVersion != 6 {
+		t.Errorf("auth_version = %d, want 6 (a profile PATCH must not rewind the bump made by SetUserPassword)", got.AuthVersion)
+	}
+	if got.DisplayName != "Alice Renamed" {
+		t.Errorf("display_name = %q, want \"Alice Renamed\" (profile fields must still update)", got.DisplayName)
 	}
 }
 
@@ -301,6 +349,58 @@ func TestSetInitialAdminPassword_OnlyOnce(t *testing.T) {
 	// 不存在的 id：no-op，不报错。
 	if ok, err = db.SetInitialAdminPassword(ctx, "ghost", "hash-y"); err != nil || ok {
 		t.Errorf("ghost id: ok=%v err=%v, want false/nil", ok, err)
+	}
+}
+
+// bootstrap_completed 标记必须与设密**同事务**生效：设密成功 ⇔ 标记置位。
+//
+// 标记是免鉴权引导窗口的开关（为什么不能只看「当前是否存在空密码 admin」，
+// 见 settings_dao.go 的注释）。分两步写的两种残态都不可接受 ——
+// 「设密成功但置标失败」留下窗口仍开着的库（而密码已是抢先者设的那把）；
+// 「置标成功但设密失败」把真正要引导的人锁在门外。这里钉住两件事：
+// 成功路径两个写入同时可观测；任何 no-op 失败路径都不产生标记。
+func TestSetInitialAdminPassword_BootstrapMarkerAtomic(t *testing.T) {
+	db := newStore(t)
+	ctx := context.Background()
+
+	// 从未引导过的库：标记必须不存在。
+	if done, err := db.BootstrapCompleted(ctx); err != nil || done {
+		t.Fatalf("fresh db BootstrapCompleted = %v (err %v), want false", done, err)
+	}
+
+	if err := db.CreateUser(ctx, &User{ID: "a1", Username: "admin", Role: RoleAdmin, AuthVersion: 1}); err != nil {
+		t.Fatalf("create admin: %v", err)
+	}
+	// 失败路径 1：目标是空密码普通用户（不是引导对象）—— 不写标记。
+	if err := db.CreateUser(ctx, &User{ID: "u1", Username: "bob", Role: RoleUser, AuthVersion: 1}); err != nil {
+		t.Fatalf("create user: %v", err)
+	}
+	if ok, err := db.SetInitialAdminPassword(ctx, "u1", "hash-x"); err != nil || ok {
+		t.Fatalf("non-admin setup: ok=%v err=%v, want false/nil", ok, err)
+	}
+	if done, err := db.BootstrapCompleted(ctx); err != nil || done {
+		t.Fatalf("failed setup flipped the marker: %v (err %v), want false", done, err)
+	}
+
+	// 失败路径 2：id 不存在 —— 同样不写标记。
+	if ok, err := db.SetInitialAdminPassword(ctx, "ghost", "hash-y"); err != nil || ok {
+		t.Fatalf("ghost setup: ok=%v err=%v, want false/nil", ok, err)
+	}
+	if done, err := db.BootstrapCompleted(ctx); err != nil || done {
+		t.Fatalf("ghost setup flipped the marker: %v (err %v), want false", done, err)
+	}
+
+	// 成功路径：密码与标记必须同时可观测（同一事务提交）。
+	if ok, err := db.SetInitialAdminPassword(ctx, "a1", "hash-1"); err != nil || !ok {
+		t.Fatalf("first setup: ok=%v err=%v, want true", ok, err)
+	}
+	done, err := db.BootstrapCompleted(ctx)
+	if err != nil || !done {
+		t.Fatalf("BootstrapCompleted after successful setup = %v (err %v), want true", done, err)
+	}
+	// 重复初始化（0 行受影响）：无任何写入，标记保持不变。
+	if ok, err := db.SetInitialAdminPassword(ctx, "a1", "hash-2"); err != nil || ok {
+		t.Fatalf("second setup: ok=%v err=%v, want false/nil", ok, err)
 	}
 }
 

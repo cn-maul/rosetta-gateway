@@ -184,14 +184,21 @@ func (s *Store) CreateUser(ctx context.Context, u *User) error {
 //
 // 刻意不写 used_tokens —— 它是派生值，改它等于让请求体随意篡改用量计数。
 // 修正用法的入口是 RecomputeUserUsage。
+//
+// 同样刻意**不写 auth_version**：会话失效栅栏只能前进，不能被资料更新碰。
+// 本方法处理的调用方（PATCH handler）拿到的是**读库时的旧快照**，若把快照里的
+// auth_version 原样写回，读库与落库之间发生的改密（SetUserPassword 已把版本
+// 原子递增）会被覆盖回旧值 —— 改密前被窃取的旧 JWT 重新通过校验，等于吊销被
+// 静默撤销。需要让既有会话失效的操作（禁用/改角色）走 BumpAuthVersion：
+// 它在 SQL 里做相对递增，不依赖任何快照值。
 func (s *Store) UpdateUser(ctx context.Context, u *User) error {
 	u.UpdatedAt = time.Now().UnixMilli()
 	res, err := s.db.ExecContext(ctx,
 		`UPDATE users SET display_name = ?, role = ?, status = ?, group_id = ?,
-		                  quota_tokens = ?, auth_version = ?, remark = ?, updated_at = ?
+		                  quota_tokens = ?, remark = ?, updated_at = ?
 		 WHERE id = ?`,
 		u.DisplayName, u.Role, u.Status, nullIfEmpty(u.GroupID), u.QuotaTokens,
-		u.AuthVersion, u.Remark, u.UpdatedAt, u.ID)
+		u.Remark, u.UpdatedAt, u.ID)
 	return checkAffected(res, err)
 }
 
@@ -216,8 +223,23 @@ func (s *Store) SetUserPassword(ctx context.Context, id, passwordHash string) er
 // 而且静默无痕。把判定收敛进 SQL 后，唯一性由数据库原子保证；role 条件让
 // 管理员建的空密码**普通用户**账号不可能经这条路径被初始化（那是 FindUninitializedAdmin
 // 之外的第二道闸）。
+//
+// # 事务边界：设密与关闭引导窗口必须原子
+//
+// 条件 UPDATE 命中（RowsAffected==1）的**同一个事务**里还会写入
+// bootstrap_completed 标记（app_settings 表，见 settings_dao.go）：窗口的关闭
+// 与密码的写入要么同时生效、要么都不生效。分两步写的话，「设密成功但置标失败」
+// 会留下一个**免鉴权窗口仍开着**的库 —— 而密码已经是攻击者（或任何抢先者）
+// 设的那把；反过来「置标成功但设密失败」会把真正要引导的人锁在门外。
+// 只有真正设上密码（UPDATE 命中）才置标，重复初始化（0 行）不产生任何写入。
 func (s *Store) SetInitialAdminPassword(ctx context.Context, id, passwordHash string) (bool, error) {
-	res, err := s.db.ExecContext(ctx,
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return false, err
+	}
+	defer tx.Rollback()
+
+	res, err := tx.ExecContext(ctx,
 		`UPDATE users SET password_hash = ?, auth_version = auth_version + 1, updated_at = ?
 		 WHERE id = ? AND password_hash = '' AND role = 'admin'`,
 		passwordHash, time.Now().UnixMilli(), id)
@@ -228,11 +250,26 @@ func (s *Store) SetInitialAdminPassword(ctx context.Context, id, passwordHash st
 	if err != nil {
 		return false, err
 	}
-	return n > 0, nil
+	if n == 0 {
+		// 窗口没开（已设过 / 非 admin / 不存在）：不写标记，交由调用方回 409。
+		return false, nil
+	}
+	if err := setSettingExec(ctx, tx, settingBootstrapCompletedKey, "1"); err != nil {
+		// 整个事务回滚，密码也没设上 —— 调用方按失败重试，窗口保持原状。
+		return false, err
+	}
+	if err := tx.Commit(); err != nil {
+		return false, err
+	}
+	return true, nil
 }
 
 // BumpAuthVersion 递增 auth_version，用于「禁用账号」「改角色」这类
 // 必须让既有会话失效、但不动密码的操作。
+//
+// 它是这类操作的**唯一**失效入口：UpdateUser 从不写 auth_version（见其注释），
+// 所以角色/状态变更后必须显式调用本方法；递增在 SQL 里相对进行，
+// 不依赖调用方读到的快照值，天然免疫「读旧值写旧值」的竞态。
 func (s *Store) BumpAuthVersion(ctx context.Context, id string) error {
 	res, err := s.db.ExecContext(ctx,
 		`UPDATE users SET auth_version = auth_version + 1, updated_at = ? WHERE id = ?`,

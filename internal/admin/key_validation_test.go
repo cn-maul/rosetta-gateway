@@ -38,8 +38,8 @@ func TestKeyHandler_ClaimOwnerOnPatch(t *testing.T) {
 	}
 
 	rec := httptest.NewRecorder()
-	h.Create(rec, jsonRequest(http.MethodPost, "/admin/api/keys",
-		bytes.NewBufferString(`{"name":"orphan"}`)))
+	h.Create(rec, asAdmin(jsonRequest(http.MethodPost, "/admin/api/keys",
+		bytes.NewBufferString(`{"name":"orphan"}`))))
 	if rec.Code != http.StatusCreated {
 		t.Fatalf("create code=%d body=%s", rec.Code, rec.Body.String())
 	}
@@ -123,7 +123,7 @@ func TestKeyHandler_BlankModelEntryRejected(t *testing.T) {
 		`{"name":"k","allowed_models":["flash"," "]}`, // 混一个有效名也一样：白名单会被静默改写
 	} {
 		rec := httptest.NewRecorder()
-		h.Create(rec, jsonRequest(http.MethodPost, "/admin/api/keys", bytes.NewBufferString(body)))
+		h.Create(rec, asAdmin(jsonRequest(http.MethodPost, "/admin/api/keys", bytes.NewBufferString(body))))
 		if rec.Code != http.StatusBadRequest {
 			t.Errorf("%s -> %d，期望 400（空白条目会静默变成「不限制」）；body=%s",
 				body, rec.Code, rec.Body.String())
@@ -132,8 +132,8 @@ func TestKeyHandler_BlankModelEntryRejected(t *testing.T) {
 
 	// 清空白名单仍然只能用显式的 []。
 	rec := httptest.NewRecorder()
-	h.Create(rec, jsonRequest(http.MethodPost, "/admin/api/keys",
-		bytes.NewBufferString(`{"name":"k","allowed_models":[]}`)))
+	h.Create(rec, asAdmin(jsonRequest(http.MethodPost, "/admin/api/keys",
+		bytes.NewBufferString(`{"name":"k","allowed_models":[]}`))))
 	if rec.Code != http.StatusCreated {
 		t.Fatalf("空数组应 201（显式「不限制」），实际 %d body=%s", rec.Code, rec.Body.String())
 	}
@@ -151,8 +151,8 @@ func TestKeyHandler_AllowedModelsResponseMatchesStore(t *testing.T) {
 	snapshotWithRoute(t, "flash")
 
 	rec := httptest.NewRecorder()
-	h.Create(rec, jsonRequest(http.MethodPost, "/admin/api/keys",
-		bytes.NewBufferString(`{"name":"k","allowed_models":[" flash "," flash "]} `)))
+	h.Create(rec, asAdmin(jsonRequest(http.MethodPost, "/admin/api/keys",
+		bytes.NewBufferString(`{"name":"k","allowed_models":[" flash "," flash "]} `))))
 	if rec.Code != http.StatusCreated {
 		t.Fatalf("create code=%d body=%s", rec.Code, rec.Body.String())
 	}
@@ -193,7 +193,7 @@ func TestKeyHandler_AllowedIPsNormalized(t *testing.T) {
 	}
 	for body, want := range cases {
 		rec := httptest.NewRecorder()
-		h.Create(rec, jsonRequest(http.MethodPost, "/admin/api/keys", bytes.NewBufferString(body)))
+		h.Create(rec, asAdmin(jsonRequest(http.MethodPost, "/admin/api/keys", bytes.NewBufferString(body))))
 		if rec.Code != http.StatusCreated {
 			t.Fatalf("%s -> %d body=%s", body, rec.Code, rec.Body.String())
 		}
@@ -207,8 +207,8 @@ func TestKeyHandler_AllowedIPsNormalized(t *testing.T) {
 	}
 	// 坏值仍然 400
 	rec := httptest.NewRecorder()
-	h.Create(rec, jsonRequest(http.MethodPost, "/admin/api/keys",
-		bytes.NewBufferString(`{"name":"e","allowed_ips":"127.0.0.0/8,hello"}`)))
+	h.Create(rec, asAdmin(jsonRequest(http.MethodPost, "/admin/api/keys",
+		bytes.NewBufferString(`{"name":"e","allowed_ips":"127.0.0.0/8,hello"}`))))
 	if rec.Code != http.StatusBadRequest {
 		t.Fatalf("不可解析的 CIDR 应 400，实际 %d body=%s", rec.Code, rec.Body.String())
 	}

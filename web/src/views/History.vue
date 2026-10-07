@@ -3,7 +3,7 @@ import { computed, onMounted, ref } from 'vue'
 import { api } from '../api'
 import { toast } from '../ui'
 import { fmtNum, fmtTokens, fmtTimeMs, fmtSec, statusLabel, statusBadge } from '../fmt'
-import type { UsageHistoryEntry } from '../types'
+import type { AccessKey, UsageHistoryEntry } from '../types'
 
 const err = ref('')
 const loading = ref(true)
@@ -13,6 +13,32 @@ const pageSize = ref(20)
 const page = ref(1)
 // 过滤后的总条数（后端返回，不受分页影响）—— 用来算总页数
 const total = ref(0)
+
+// ---------- 排障过滤器 ----------
+// 与 CSV 导出、后端 History 端点共用同一套参数（status/model/key_id，精确匹配）。
+// status 的取值与表格状态徽章同一套口径（见 fmt.statusLabel）；model 是公开模型名。
+const fStatus = ref('')
+const fModel = ref('')
+// key 过滤用下拉而非手输：key_id 是内部 id，没人背得出来。
+const fKey = ref('')
+const keyOptions = ref<AccessKey[]>([])
+
+const statuses = [
+  { value: 'ok', label: '正常' },
+  { value: 'error', label: '失败' },
+  { value: 'truncated', label: '截断' },
+  { value: 'overflow', label: '超限' },
+  { value: 'canceled', label: '已取消' },
+]
+
+// 组装当前过滤器：空值归一成 undefined，api 侧就不会把它拼进 query。
+function filters() {
+  return {
+    status: fStatus.value || undefined,
+    model: fModel.value.trim() || undefined,
+    keyId: fKey.value || undefined,
+  }
+}
 
 const ranges = [
   { label: '近 1 天', value: 1 },
@@ -35,11 +61,11 @@ let reqSeq = 0
 // 和「这个范围内没有记录」一模一样，会误导人。
 async function fetchPage(p: number) {
   const seq = ++reqSeq
-  let res = await api.usageHistory(days.value, pageSize.value, (p - 1) * pageSize.value)
+  let res = await api.usageHistory(days.value, pageSize.value, (p - 1) * pageSize.value, filters())
   let target = p
   const last = Math.max(1, Math.ceil(res.total / pageSize.value))
   if (p > last) {
-    res = await api.usageHistory(days.value, pageSize.value, (last - 1) * pageSize.value)
+    res = await api.usageHistory(days.value, pageSize.value, (last - 1) * pageSize.value, filters())
     target = last
   }
   if (seq !== reqSeq) return // 期间又发起了新请求，本响应的数据已过时，丢弃
@@ -66,13 +92,17 @@ async function load() {
   }
 }
 
-// 换时间范围 / 换每页条数都必须回到第 1 页：留在原页码毫无意义，
+// 换时间范围 / 换每页条数 / 换过滤条件都必须回到第 1 页：留在原页码毫无意义，
 // 而且极可能直接越界（原来在第 5 页，换成「近 1 天」后只有 1 页）。
 function changeDays() {
   page.value = 1
   load()
 }
 function changePageSize() {
+  page.value = 1
+  load()
+}
+function changeFilters() {
   page.value = 1
   load()
 }
@@ -83,7 +113,33 @@ function go(p: number) {
   })
 }
 
-onMounted(load)
+// ---------- CSV 导出 ----------
+const exporting = ref(false)
+
+// 导出与列表同参数（时间范围 + 三个过滤器），口径由 api.ts 的 usageHistoryQuery 统一保证。
+async function exportCSV() {
+  exporting.value = true
+  try {
+    await api.exportUsageCSV(days.value, filters())
+    toast('CSV 已开始下载')
+  } catch (e) {
+    if ((e as { status?: number }).status !== 401) toast('导出失败：' + (e as Error).message, 'err')
+  } finally {
+    exporting.value = false
+  }
+}
+
+onMounted(() => {
+  load()
+  // 密钥下拉的选项与列表同权限（admin 全部、普通用户自己的）。
+  // 拉不到只影响「按密钥过滤」这一个入口，不阻塞页面 —— 与其它惰性加载同口径。
+  api
+    .keys()
+    .then((ks) => (keyOptions.value = ks))
+    .catch(() => {
+      /* 保持空选项：下拉里只剩「全部密钥」 */
+    })
+})
 </script>
 
 <template>
@@ -100,11 +156,32 @@ onMounted(load)
         <select v-model.number="pageSize" class="select w-auto" @change="changePageSize">
           <option v-for="s in pageSizes" :key="s" :value="s">{{ s }} 条/页</option>
         </select>
+        <button class="btn" :disabled="exporting" title="按当前时间范围与过滤条件导出 CSV" @click="exportCSV">
+          {{ exporting ? '导出中…' : '导出 CSV' }}
+        </button>
         <button class="btn" :disabled="loading" @click="load">刷新</button>
       </div>
     </div>
 
     <div class="panel">
+      <!-- 排障过滤器：与「导出 CSV」共用同一组条件 -->
+      <div class="filters">
+        <select v-model="fStatus" class="select w-auto" @change="changeFilters">
+          <option value="">全部状态</option>
+          <option v-for="s in statuses" :key="s.value" :value="s.value">{{ s.label }}</option>
+        </select>
+        <input
+          v-model="fModel"
+          class="input"
+          placeholder="按模型过滤（精确匹配）"
+          @change="changeFilters"
+        />
+        <select v-model="fKey" class="select w-auto" @change="changeFilters">
+          <option value="">全部密钥</option>
+          <option v-for="k in keyOptions" :key="k.id" :value="k.id">{{ k.name }}（{{ k.key_prefix }}）</option>
+        </select>
+      </div>
+
       <div v-if="loading && rows.length === 0" class="loading">加载中…</div>
       <!--加载失败**必须**与「确实没有数据」在界面上可区分：把请求失败呈现成
            「暂无数据」会让运维误判为无流量，从而排除掉网关/上游故障这个方向。
@@ -112,7 +189,7 @@ onMounted(load)
       <div v-else-if="err" class="empty"><div class="big">⚠</div>{{ err }}</div>
       <div v-else-if="total === 0" class="empty">
         <div class="big">⌗</div>
-        该时间范围内暂无调用记录
+        当前条件下暂无调用记录
       </div>
       <template v-else>
         <div class="tbl-wrap">
@@ -165,6 +242,17 @@ onMounted(load)
 <style scoped>
 .w-auto {
   width: auto;
+}
+/* 过滤行：贴 Settings 价格筛选的同款布局 */
+.filters {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+  margin-bottom: 14px;
+}
+.filters .input {
+  width: 220px;
 }
 .tbl-wrap {
   overflow-x: auto;

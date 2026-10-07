@@ -359,8 +359,8 @@ func TestKeyHandler_AllowedModels(t *testing.T) {
 	h := NewKeyHandler(st)
 
 	rec := httptest.NewRecorder()
-	h.Create(rec, asUser(jsonRequest(http.MethodPost, "/admin/api/keys",
-		strings.NewReader(`{"name":"k","allowed_models":["flash"]}`)), "u1"))
+	h.Create(rec, asAdmin(jsonRequest(http.MethodPost, "/admin/api/keys",
+		strings.NewReader(`{"name":"k","allowed_models":["flash"],"user_id":"u1"}`))))
 	if rec.Code != http.StatusCreated {
 		t.Fatalf("create: code = %d body = %s", rec.Code, rec.Body.String())
 	}
@@ -372,8 +372,8 @@ func TestKeyHandler_AllowedModels(t *testing.T) {
 
 	// 不存在的模型名 → 400，不落库。
 	rec2 := httptest.NewRecorder()
-	h.Create(rec2, asUser(jsonRequest(http.MethodPost, "/admin/api/keys",
-		strings.NewReader(`{"name":"k2","allowed_models":["nope"]}`)), "u1"))
+	h.Create(rec2, asAdmin(jsonRequest(http.MethodPost, "/admin/api/keys",
+		strings.NewReader(`{"name":"k2","allowed_models":["nope"],"user_id":"u1"}`))))
 	if rec2.Code != http.StatusBadRequest {
 		t.Fatalf("unknown model: code = %d body = %s, want 400", rec2.Code, rec2.Body.String())
 	}
@@ -543,10 +543,11 @@ func TestKeyHandler_P2Validation(t *testing.T) {
 		{"zero-expires", admin, `{"name":"zero-expires","user_id":"u1","expires_at":0}`, http.StatusCreated},
 		{"admin-set-group", admin, `{"name":"admin-set-group","user_id":"u1","group_id":"g1"}`, http.StatusCreated},
 		{"group-missing", admin, `{"name":"group-missing","user_id":"u1","group_id":"ghost"}`, http.StatusBadRequest},
-		// 普通用户不能设分组覆盖：否则他能把 key 指向更宽松的组，
-		// 绕过自己所属组的限制 —— 那是权限提升，不是配置。
+		// 发 key 已收敛为管理员专属（P1-5）：自助发 key 让管理员落在
+		// 具体 key 上的禁用/限额/期限/IP 全部可被「重新建一把」绕过。
+		// 分组覆盖同理 —— 那是权限提升，不是配置。
 		{"user-set-group", user, `{"name":"user-set-group","group_id":"g1"}`, http.StatusForbidden},
-		{"user-set-ips", user, `{"name":"user-set-ips","allowed_ips":"10.0.0.0/8"}`, http.StatusCreated},
+		{"user-set-ips", user, `{"name":"user-set-ips","allowed_ips":"10.0.0.0/8"}`, http.StatusForbidden},
 	}
 	for _, tc := range cases {
 		rec := httptest.NewRecorder()

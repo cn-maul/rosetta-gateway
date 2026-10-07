@@ -347,6 +347,10 @@ type PruneResult struct {
 // 聚合出 0 组、DELETE 影响 0 行。另外先用 pruned_through_day 挡一道：
 // 同一水位内多次调用不必再扫明细。
 //
+// 积压超过单轮上限（maxPruneDelete）时一次剪不完：水位不推进，下一轮重新
+// 圈一批继续。聚合与删除覆盖严格同一批行（见实现内「为什么必须先圈批」），
+// 未删尽的行留到下一轮**首次**聚合，不存在重复计数。
+//
 // # 切分点用本地时区
 //
 // 与表 A 的 day 列、前端 GroupByDay 同一口径（那是用户在界面上看到的那一套）。
@@ -394,9 +398,63 @@ func (s *Store) PruneOldUsage(ctx context.Context, keepDays int) (*PruneResult, 
 	// 已 Commit 时 Rollback 是空操作，兜住中途 return 的每一条路径。
 	defer func() { _ = tx.Rollback() }()
 
-	// 聚合进表 A。ON CONFLICT 用**累加**而不是覆盖：同一天的明细若因故分两次
-	// 归档（人工调小 keepDays 再调回、水位被手工回退），覆盖会把先归档的那部分
-	// 静默抹掉。
+	// 本次最多剪多少行明细。
+	//
+	// 写池只有单连接，这个事务从圈批、聚合到删除全程持锁。首次剪枝（部署已久、
+	// 从没剪过）可能有百万行级明细，一口气全处理会把写连接占住几十秒，期间
+	// **所有**写入排队 —— 表现为网关整体卡顿，而不是「后台在忙」。
+	//
+	// 超出的部分留给下一次剪枝：下一次重新圈一批接着处理。水位只在本次事务内
+	// 推进到 cut-1，且只在明细确实清空到 cutoff 后推进，所以中途失败不会留下
+	// 「已删但未记账」的空洞 —— 圈批、聚合与删除始终同事务。
+	const maxPruneDelete = 20000
+
+	// 先把本轮要处理的 rowid 圈进临时表 prune_batch，再让聚合与删除**都以它为
+	// 谓词** —— 这是「剪枝前后同一窗口数字完全相等」的全部依据：进了表 A 的行
+	// 必然被删掉，没进表 A 的一行不动。
+	//
+	// 为什么必须先圈批，而不能像旧实现那样让聚合与删除各带一个 `ts < ?` 谓词：
+	// 旧实现聚合无界（扫全部到期行）、删除有界（只删最老 maxPruneDelete 行）。
+	// 积压超过上限时，本轮聚合过却没删掉的行，下一轮会被**再聚合一次**；而下面
+	// 的 ON CONFLICT 是累加语义，归档数字凭空变大（实测 3 万行 × 1 token：两轮
+	// 剪枝后 rollup 总数 4 万，多 33%）—— 不报错、不告警，只有对账能发现。
+	// 先圈出「严格同一批行」、两边共用，这条不变式才真正成立。
+	//
+	// 为什么用临时表而不是把 rowid 逐个绑成 IN (?,?,…)：绑定变量数受
+	// SQLITE_MAX_VARIABLE_NUMBER 硬限制（老编译默认 999，SQLite 3.32.0 起默认
+	// 32766，具体值随驱动与编译选项而变），2 万个占位符要么直接超限、要么贴着
+	// 上限走，每轮还要拼接巨型 SQL 文本与 args 切片。TEMP 表不受参数数限制，
+	// SQL 文本恒定，`rowid IN (SELECT rid FROM …)` 由 SQLite 走主键查找高效求值。
+	//
+	// TEMP 表是**每连接**对象，而 sql.Tx 钉死单连接，本事务内的所有语句必然看到
+	// 同一张表。开头的 DROP IF EXISTS 只防一种理论情形 —— 同一连接上曾有异常
+	// 残留（TEMP 的 DDL 本身参与事务，回滚会连表一起撤销）；宁可多一句防御，
+	// 也不赌「绝不可能残留」。
+	if _, err := tx.ExecContext(ctx, `DROP TABLE IF EXISTS temp.prune_batch`); err != nil {
+		return nil, fmt.Errorf("clear stale prune batch: %w", err)
+	}
+	if _, err := tx.ExecContext(ctx,
+		`CREATE TEMP TABLE prune_batch (rid INTEGER PRIMARY KEY)`); err != nil {
+		return nil, fmt.Errorf("create prune batch: %w", err)
+	}
+	// 圈批规则与旧实现 DELETE 子查询里的一致：取**最老**的 maxPruneDelete 行
+	//（按 id 排序，id 含时间前缀因而与 ts 单调），而不是「任意前 N 行」——
+	// 保证处理的是**连续的一段**，不会在明细里打散出许多时间碎片影响后续统计。
+	// 圈批到删除之间没有写入竞争：rowid 只会因本事务自己的 DELETE 而消失，
+	// 而那发生在圈批的用途全部完成之后。
+	if _, err := tx.ExecContext(ctx,
+		`INSERT INTO prune_batch (rid)
+		     SELECT rowid FROM usage_records WHERE ts < ? ORDER BY id LIMIT ?`,
+		cutoffTs, maxPruneDelete); err != nil {
+		return nil, fmt.Errorf("select prune batch: %w", err)
+	}
+
+	// 聚合进表 A，谓词严格限定为本轮圈定的那批行（不再直接用 ts，也不再有
+	// 参数）。ON CONFLICT 用**累加**而不是覆盖：同一天的明细若因故分两次归档
+	// （人工调小 keepDays 再调回、水位被手工回退），覆盖会把先归档的那部分
+	// 静默抹掉。累加不重复计数的前提由圈批给出 —— 同一批行只会聚合一次
+	//（聚合完即被删除，且与聚合同事务），累加只发生在「不同批次」之间，
+	// 每一批的量都只进账一次。
 	//
 	// COALESCE(user_id, '')：usage_records.user_id 可空（无归属的历史记录），
 	// 而表 A 的维度列 NOT NULL —— NULL 进主键会让 ON CONFLICT 永不匹配
@@ -418,7 +476,7 @@ func (s *Store) PruneOldUsage(ctx context.Context, keepDays int) (*PruneResult, 
 			       COALESCE(SUM(total_tokens), 0), COALESCE(SUM(cost_total), 0),
 			       COALESCE(SUM(latency_ms), 0)
 			  FROM usage_records
-			 WHERE ts < ?
+			 WHERE rowid IN (SELECT rid FROM prune_batch)
 			 GROUP BY day, COALESCE(user_id, ''), access_key_id, public_model, upstream_model, provider_id, ingress_protocol, stream
 			 ON CONFLICT(day, user_id, access_key_id, public_model, upstream_model, provider_id, ingress_protocol, stream) DO UPDATE SET
 			       request_count    = request_count + excluded.request_count,
@@ -430,37 +488,26 @@ func (s *Store) PruneOldUsage(ctx context.Context, keepDays int) (*PruneResult, 
 			       reasoning_tokens = reasoning_tokens + excluded.reasoning_tokens,
 			       total_tokens     = total_tokens + excluded.total_tokens,
 			       cost_total       = cost_total + excluded.cost_total,
-			       latency_sum_ms   = latency_sum_ms + excluded.latency_sum_ms`,
-		cutoffTs); err != nil {
+			       latency_sum_ms   = latency_sum_ms + excluded.latency_sum_ms`); err != nil {
 		return nil, fmt.Errorf("aggregate rollups: %w", err)
 	} else if n, aerr := rollupRes.RowsAffected(); aerr == nil {
 		res.RollupRows = n
 	}
 
-	// 本次最多剪多少行明细。
-	//
-	// 写池只有单连接，这个事务从聚合到删除全程持锁。首次剪枝（部署已久、
-	// 从没剪过）可能有百万行级明细，一条 DELETE 全删会把写连接占住几十秒，
-	// 期间**所有**写入排队 —— 表现为网关整体卡顿，而不是「后台在忙」。
-	//
-	// 超出的部分留给下一次剪枝：谓词是ts < cutoffTs，与「已经删了多少行」
-	// 无关，下一次自然接着删。水位只在本次事务内推进到 cut-1，所以中途
-	// 失败不会留下「已删但未记账」的空洞 —— 聚合与删除始终同事务。
-	const maxPruneDelete = 20000
-
-	// DELETE 与上面的聚合共用同一个谓词、同一个事务 —— 这是「剪枝前后同一窗口
-	// 数字完全相等」的全部依据：进了表 A 的行必然被删掉，没进表 A 的一行不动。
-	//
-	// 子查询取最老的 maxPruneDelete 行（按 id 排序，id 含时间前缀因而与
-	// ts 单调），而不是「前 N 行」—— 保证删的是**连续的一段**，
-	// 不会在明细里打散出许多时间碎片影响后续统计。
+	// 删除与聚合共用同一张 prune_batch：先聚合后删除、同事务、严格同一批行。
+	// 因此 RollupRows 与 DeletedRows 描述的是同一批行的两个侧面，恒等可对账。
 	if delRes, err := tx.ExecContext(ctx,
-		`DELETE FROM usage_records WHERE rowid IN (
-		     SELECT rowid FROM usage_records WHERE ts < ? ORDER BY id LIMIT ?
-		 )`, cutoffTs, maxPruneDelete); err != nil {
+		`DELETE FROM usage_records WHERE rowid IN (SELECT rid FROM prune_batch)`); err != nil {
 		return nil, fmt.Errorf("delete pruned details: %w", err)
 	} else if n, aerr := delRes.RowsAffected(); aerr == nil {
 		res.DeletedRows = n
+	}
+
+	// 用完即弃。DROP 放在 Commit **之前**，让它随本事务一起提交/回滚：若放到
+	// Commit 之后用 s.db.Exec，语句可能落到池中另一条连接上（TEMP 表是
+	// 每连接的），清理就落空了。
+	if _, err := tx.ExecContext(ctx, `DROP TABLE IF EXISTS temp.prune_batch`); err != nil {
+		return nil, fmt.Errorf("drop prune batch: %w", err)
 	}
 
 	// 水位只在**明细确实清空到cutoff** 时推进，否则不动。

@@ -124,6 +124,23 @@ func (h *KeyHandler) List(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *KeyHandler) Create(w http.ResponseWriter, r *http.Request) {
+	// 发 key 收敛为管理员专属。
+	//
+	// 自助发 key 曾对普通用户开放，并有「额度封顶」兜底（保留在下方作纵深
+	// 防御）。但兜底挡不住绕过：管理员落在**具体某把 key** 上的强制策略 ——
+	// 禁用、更紧的配额、RPM/TPM、有效期、IP 白名单 —— 用户随时重新建一把
+	// （enabled=true、无期限、无 IP 限制）即可全部绕开；而 rpm/tpm 被强制
+	// 清 0（不限速）加上「用户级额度未设即不限」，默认配置下普通用户可以
+	// 自铸不限量、不限速的凭证，把上游的真实费用敞口直接打开。
+	// 不可绕过的外层闸门（users.quota_tokens、用户禁用、组白名单）约束的是
+	// 「这个人」，替代不了「管理员要约束某把具体 key」的语义。
+	// 真正的自助发 key 需要用户/组级的强制 ceiling（schema + 热路径配合），
+	// 是独立特性；在它存在之前，发 key 只能是管理动作。
+	if !callerIsAdmin(r) {
+		writeError(w, http.StatusForbidden, "只有管理员可以创建密钥")
+		return
+	}
+
 	var req keyRequest
 	if err := decodeJSON(w, r, &req); err != nil {
 		if errors.Is(err, errUnsupportedMediaType) {
@@ -293,15 +310,19 @@ func (h *KeyHandler) applyP2(w http.ResponseWriter, r *http.Request, req keyRequ
 		k.AllowedIPs = store.FormatAllowedNets(nets)
 	}
 	if req.GroupID != nil {
-		id := strings.TrimSpace(*req.GroupID)
-		switch {
-		case id == "":
-			k.GroupID = "" // 显式清空 = 回到「沿用归属用户的分组」
-		case !callerIsAdmin(r):
-			// 普通用户若能自选，就能把 key 指向更宽松的组来绕过自己组的限制。
+		// 分组覆盖是**管理员的强制手段**，设置与清除都只该由管理员操作。
+		// 原实现只拦「设置」：清除分支（id == ""）排在管理员判定之前，
+		// 管理员把某把 key 压到更严的组之后，用户一条 {"group_id":""}
+		// 就能退回归属用户自带的（往往更宽松的）分组 —— 收紧被静默撤销，
+		// 且不走 guardNoLoosening（清空对它来说是「无此字段」）。
+		if !callerIsAdmin(r) {
 			writeError(w, http.StatusForbidden, "只有管理员可以设置分组覆盖")
 			return false
-		default:
+		}
+		id := strings.TrimSpace(*req.GroupID)
+		if id == "" {
+			k.GroupID = "" // 显式清空 = 回到「沿用归属用户的分组」
+		} else {
 			g, err := h.store.GetGroup(r.Context(), id)
 			if err != nil {
 				writeServerError(w, "resolve group", err)

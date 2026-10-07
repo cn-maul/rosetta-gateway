@@ -187,6 +187,18 @@ func main() {
 		snapshot.Init(buildSnapshotFromConfig(cfg))
 	}
 
+	// 后台重建重试：任一 admin 写操作的重建失败后置脏，这里负责兜底收敛。
+	//
+	// shutdown 通道在这里声明（原先在下方 500 行处）：重试循环必须受进程
+	// 生命周期约束，否则主流程 return 后该goroutine 仍在跑，且它持有
+	// rr.mu —— 那会让进程退出时卡在一次正在进行的重建上。
+	// 下方原声明处改为复用（不重复 make）。
+	shutdown := make(chan struct{})
+
+	reloadCtx, stopReloadRetry := context.WithCancel(context.Background())
+	defer stopReloadRetry()
+	go reloader.watchReloadRetry(reloadCtx)
+
 	usage := newUsageRecorder(db, logger)
 	mux := http.NewServeMux()
 	rateLimiter := ratelimit.New()
@@ -418,7 +430,7 @@ func main() {
 	// 包括禁用下游 Key 这类安全敏感操作（auth 读快照，不重建就照常放行）。
 	// AutoReload 在鉴权链外侧：401/429 的失败响应不会触发重建。
 	// 前端 mutate() 里的 reload 调用保留为兜底（服务端重建失败时再给一次机会）。
-	adminAuto := server.AutoReload(adminGuarded, reloader.Reload, audit, logger)
+	adminAuto := server.AutoReload(adminGuarded, reloader.Reload, audit, logger, reloader.MarkDirty)
 
 	// 免鉴权端点必须显式注册到根 mux：它们不进 adminAuto（那会走鉴权链），
 	// 但也不会因为「没注册」而落到 /admin/api/ 前缀上被鉴权拦掉 ——
@@ -527,8 +539,8 @@ func main() {
 		}
 	}()
 
-	shutdown := make(chan struct{})
 	// 用量归档的每日定时剪枝（设计 §4.8：明细 30 天，累计永久）。
+	// （shutdown 通道已在 reloader 构造处声明，供此处与后台重建重试共用。）
 	//
 	// 启动后**立刻先跑一次**再进 24h 循环：只等第一个 tick 的话，长期停机后
 	// 重启的实例要等满 24h 才开始剪，而这段时间里 usage_records 还在接收新写入
@@ -617,6 +629,109 @@ type runtimeReloader struct {
 	pool      *upstream.Pool
 	cfg       *config.Config
 	logger    *slog.Logger
+
+	// dirty 置位表示「上一次重建失败，运行时落后于数据库」。
+	//
+	// 没有它的后果：某次 admin 写操作的重建失败后，只打一条 ERROR 就结束了 ——
+	// 而**响应早已是 200 +「已禁用」**。于是调用方看到「已禁用」，
+	// 数据面却继续放行该 key，直到下一次任意 admin 写操作碰巧成功才收敛。
+	// 「禁用下游 Key」这类安全敏感操作会**无限期失效**，而日志里只有一条
+	// 早已被淹没的 ERROR，没有任何迹象指向当前仍在放行。
+	//
+	// 用 atomic 而不是复用 mu：置位/清除是高频轻操作，而 mu 被 Reload 的
+	// 整个执行过程持有（重建是百毫秒级），后台重试绝不能被它挡住。
+	dirty atomic.Bool
+
+	// dirtySince 记录首次置位时刻，用于「持续失败」时把重试间隔逐步拉长
+	// 并在日志里报出已持续多久 —— 一个失败三天的问题不该表现得像刚发生。
+	dirtySince atomic.Int64
+}
+
+// reloadRetryInterval 是后台重试的基准间隔。
+//
+// 取30 秒：短到「禁用一个 key 后最多半分钟就真的生效」，长到不会在
+// 数据库持续故障时把日志刷爆（每次重试一条 WARN，30 秒一条 = 每小时 120 条）。
+const reloadRetryInterval = 30 * time.Second
+
+// reloadTimeout 是单次重建的时间上限。与 server.autoReloadTimeout 同值但
+// 独立定义（跨包不导出私有常量）。重建只做 DB 读与 client 构建，正常毫秒级；
+// 上限只为防一个卡死的 SQLite 读把后台重试 goroutine 永久挂住。
+const reloadTimeout = 30 * time.Second
+
+// reloadRetryMaxInterval 是退避上限。持续失败时按 2 的幂次拉长，
+// 封顶 10 分钟：再长就失去了「自动收敛」的意义 —— 那时正确的做法是
+// 让人知道（见下面的告警日志），而不是继续静默重试。
+const reloadRetryMaxInterval = 10 * time.Minute
+
+// MarkDirty 记下一次失败的重建，等待后台重试兜底。
+func (rr *runtimeReloader) MarkDirty() {
+	if rr.dirty.CompareAndSwap(false, true) {
+		rr.dirtySince.Store(time.Now().UnixMilli())
+	}
+}
+
+// markClean 清脏标志。必须由 Reload 自己在**成功后**调用 ——
+// 不能放在调用方，否则「Reload 成功但调用方没记」与「Reload 失败」在
+// 标志上无法区分，那正是本缺陷的形态。
+func (rr *runtimeReloader) markClean() {
+	rr.dirty.Store(false)
+	rr.dirtySince.Store(0)
+}
+
+// IsDirty 报告运行时是否落后于数据库。供健康检查与测试读取。
+func (rr *runtimeReloader) IsDirty() bool { return rr.dirty.Load() }
+
+// watchReloadRetry 在 dirty 置位时反复重试，直到成功或 ctx 结束。
+//
+// 为什么必须有它：AutoReload 的一次性尝试失败后，若没有后续触发，
+// 「已禁用」与「仍在放行」的偏离会**无限期**存在。审计与数据面各有一条
+// 独立通道（adminAuto、bootstrap）都走 Reload，所以单一失败点会让两处
+// 同时失准。
+//
+// 退避：第 n 次失败后等 min(2^n × 30s, 10min)。数据库短暂抖动会在几秒内
+// 被自愈，而真故障不会因为高频重试变好 —— 退避让两者都得到合理对待。
+func (rr *runtimeReloader) watchReloadRetry(ctx context.Context) {
+	backoff := reloadRetryInterval
+	for {
+		// 脏标志是唯一的触发条件：干净时不轮询、不占连接、不产生日志。
+		if !rr.dirty.Load() {
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(time.Second): // 轮询间隔：1s 足够跟手
+			}
+			continue
+		}
+
+		since := rr.dirtySince.Load()
+		if since > 0 {
+			elapsed := time.Since(time.UnixMilli(since)).Round(time.Second)
+			rr.logger.Warn("runtime still lags behind database; retrying rebuild",
+				"dirty_for", elapsed.String(),
+				"next_retry_in", backoff.String())
+		}
+
+		rctx, cancel := context.WithTimeout(ctx, reloadTimeout)
+		if err := rr.Reload(rctx); err == nil {
+			rr.logger.Info("runtime caught up with database after failed reload",
+				"dirty_for", time.Since(time.UnixMilli(since)).Round(time.Second).String())
+			backoff = reloadRetryInterval
+		} else {
+			rr.logger.Warn("runtime reload retry failed; will retry again",
+				"error", err, "next_retry_in", backoff.String())
+			backoff *= 2
+			if backoff > reloadRetryMaxInterval {
+				backoff = reloadRetryMaxInterval
+			}
+		}
+		cancel()
+
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(backoff):
+		}
+	}
 }
 
 // Reload 串行执行一次「池 + 快照」重建；任何一步失败都不改变运行状态。
@@ -671,6 +786,10 @@ func (rr *runtimeReloader) Reload(ctx context.Context) error {
 	}
 	rr.pool.Install(providers, liveTargetIDs(ctx, rr.db))
 	snapshot.Swap(snap)
+	// 只有走到这里（池与快照都已换成功）才清脏标志。
+	// 上面每条 return err 的路径都保持 dirty —— 运行时确实落后于库，
+	// 后台重试循环因此知道还要再试。
+	rr.markClean()
 	return nil
 }
 
@@ -903,14 +1022,19 @@ type ingressCodec interface {
 // 上游协议可能不同，applyUpstreamExtras 会往 req.Extra 挂不同形状的协议私有
 // 字段，跨 attempt 复用同一个实例会把 A 目标的 Extra 泄漏给 B 目标。
 type ingressRequest struct {
-	buildRosetta        func() *rosetta.ChatRequest
-	stream              bool
-	model               string // 对外的公开模型名（解析前原样）
-	wantsStreamUsage    bool
-	applyUpstreamExtras func(req *rosetta.ChatRequest, upstreamProtocol string)
+	buildRosetta     func() *rosetta.ChatRequest
+	stream           bool
+	model            string // 对外的公开模型名（解析前原样）
+	wantsStreamUsage bool
+	// requiresStructuredOutput 表示请求带**硬性**结构化输出约束（chat 的
+	// response_format 或 responses 的 text.format 为 json_object / json_schema）。
+	// 这类约束打到 anthropic 上游等于「200 但约束静默丢失」，不能放行 ——
+	// handleIngress 据此把 anthropic 候选从链上滤掉，全被滤空则 400。
+	requiresStructuredOutput bool
+	applyUpstreamExtras      func(req *rosetta.ChatRequest, upstreamProtocol string)
 }
 
-// rateCommit 把一次请求的 TPM 预占在请求终结时校正为真实用量。
+// rateCommit 把一次请求的两种预占（TPM 窗口 + 终身配额）在请求终结时收尾。
 // nil 接收者安全：TPM 未启用（额度 0）时调用方可以放一个 nil ——
 // 现在主路径在 TPMLimit==0 时干脆不建这个结构，commit 就是纯 no-op。
 type rateCommit struct {
@@ -919,30 +1043,48 @@ type rateCommit struct {
 	limit    int // 预占时的 tpmLimit；0 = 未启用，CommitTPM 据此直接返回
 	reserved int64
 
-	// store 用于**终身配额**的预占校正；为 nil 时跳过（不限额或测试）。
+	// store 用于**终身配额**的预占退回；为 nil 时跳过（不限额或测试）。
 	store  *store.Store
 	logger *slog.Logger
-	// quotaReserved 是本次请求预占的 token 数（0 = 未预占）。
+	// quotaReserved 是本次请求预占的 token 数（0 = 未预占，或已释放）。
 	quotaReserved int64
 }
 
-// commit 把两种预占一并校正为真实用量。
+// commit 用量已知时的**全量**收尾：TPM 按真实用量校正 + 退配额预占。
 //
-// 两种预占必须**同一个函数**收尾：TPM 预占靠 limiter 回补，配额预占靠
-// store 回补。分开调用时容易只改一处 —— 那种情况下 limiter 的窗口会
-// 在一分钟内自动放行（看不出来），而配额是终身累计，漏掉就是永久偏差。
+// 正常路径一律走这里，别为单一预占另起入口 —— 两种预占共用同一个 est 与
+// 同一个收尾，分头调用时容易只改一处而漏掉另一处，且配额那条漏掉是
+// **终身**偏差，不像 TPM 窗口会自愈。唯一允许绕开 commit 的路径是
+// usage missing（见 releaseQuota 的说明）。
 func (rc *rateCommit) commit(actual int64) {
 	if rc == nil {
 		return
 	}
 	rc.limiter.CommitTPM(rc.keyID, rc.limit, rc.reserved, actual)
-	if rc.store != nil && rc.quotaReserved > 0 {
-		if err := rc.store.ReleaseQuota(context.Background(), rc.keyID, rc.quotaReserved, actual); err != nil {
-			if rc.logger != nil {
-				rc.logger.Warn("release quota reservation failed",
-					"key_id", rc.keyID, "reserved", rc.quotaReserved,
-					"actual", actual, "error", err)
-			}
+	rc.releaseQuota()
+}
+
+// releaseQuota 只退终身配额的预占，**不碰 TPM 窗口**。
+//
+// 独立成方法是因为有一条真实路径必须拆开收尾：上游没报 usage
+// （usage_state="missing"）时，TPM 预占要**故意保留**——commit(0) 会全额退还
+// 预占，等于不报用量的上游完全绕过 TPM；保留估算值让限速继续约束这类流量，
+// 估算值随窗口翻转自然清零。但配额预占必须退掉：它是终身累计，预占按
+// max_tokens 全额计，不退就等于每次 missing 请求永久吃掉数万 token 额度
+// （2026-10-07 修复的 P1-3 —— 修复前 missing 时整个 commit 被跳过）。
+//
+// quotaReserved 先取后清零，让释放天然幂等：任何路径重复收尾（或未来重构
+// 引入第二次调用）时第二次是空操作，不会把别的请求刚立起来的预占退掉。
+func (rc *rateCommit) releaseQuota() {
+	if rc == nil || rc.store == nil || rc.quotaReserved <= 0 {
+		return
+	}
+	reserved := rc.quotaReserved
+	rc.quotaReserved = 0
+	if err := rc.store.ReleaseQuota(context.Background(), rc.keyID, reserved); err != nil {
+		if rc.logger != nil {
+			rc.logger.Warn("release quota reservation failed",
+				"key_id", rc.keyID, "reserved", reserved, "error", err)
 		}
 	}
 }
@@ -995,11 +1137,12 @@ func (openaiChatCodec) Decode(r *http.Request, maxBytes int64) (*ingressRequest,
 		return nil, err
 	}
 	return &ingressRequest{
-		buildRosetta:        req.ToRosetta,
-		stream:              req.Stream,
-		model:               req.Model,
-		wantsStreamUsage:    wantsStreamUsage(req),
-		applyUpstreamExtras: req.ApplyProtocolPrivateExtra,
+		buildRosetta:             req.ToRosetta,
+		stream:                   req.Stream,
+		model:                    req.Model,
+		wantsStreamUsage:         wantsStreamUsage(req),
+		requiresStructuredOutput: req.RequiresStructuredOutput(),
+		applyUpstreamExtras:      req.ApplyProtocolPrivateExtra,
 	}, nil
 }
 
@@ -1032,8 +1175,11 @@ func (anthropicMessagesCodec) Decode(r *http.Request, maxBytes int64) (*ingressR
 		stream:       req.Stream,
 		model:        req.Model,
 		// Anthropic 的 message_delta 恒带 usage，没有 include_usage 开关。
-		wantsStreamUsage:    false,
-		applyUpstreamExtras: req.ApplyUpstreamExtras,
+		wantsStreamUsage: false,
+		// Anthropic 入站协议没有结构化输出概念（无 response_format 对应物），
+		// 恒为 false —— 不参与硬约束过滤。
+		requiresStructuredOutput: false,
+		applyUpstreamExtras:      req.ApplyUpstreamExtras,
 	}, nil
 }
 
@@ -1066,8 +1212,9 @@ func (openaiResponsesCodec) Decode(r *http.Request, maxBytes int64) (*ingressReq
 		stream:       req.Stream,
 		model:        req.Model,
 		// Responses 的 response.completed 恒带 usage，没有 include_usage 开关。
-		wantsStreamUsage:    false,
-		applyUpstreamExtras: req.ApplyUpstreamExtras,
+		wantsStreamUsage:         false,
+		requiresStructuredOutput: req.RequiresStructuredOutput(),
+		applyUpstreamExtras:      req.ApplyUpstreamExtras,
 	}, nil
 }
 
@@ -1195,13 +1342,21 @@ func handleIngress(pool *upstream.Pool, cfg *config.Config, usage *usageRecorder
 		// token 会全部放行，超发数十倍。
 		//
 		// ReserveQuota 把「检查」与「占用」合并进同一条写事务，并发请求被
-		// SQLite 写锁串行化，第二个进来时读到的 used 已含第一个的预占。
-		// 真实用量在收尾处校正（rateCommit.commit → ReleaseQuota）。
+		// SQLite 写锁串行化，第二个进来时读到的 used+reserved 已含第一个的预占。
+		// 预占落在独立的 reserved_tokens 列（不动 used_tokens —— 真实用量由
+		// usage 落库触发器累加，混写会让一次请求被记两次），收尾时由
+		// rateCommit 原额退回（commit → releaseQuota）。
+		//
+		// 这里只借 GetKeyQuota 判「是否配置了额度」（quota>0，决定要不要做
+		// 估算与预占），真正的额度判定（used+reserved+est<=quota）在
+		// ReserveQuota 事务内做。2026-10-07 之前这里把第一个返回值（quota）
+		// 丢弃、名叫 quota 的变量绑到的是第二个返回值（used），判定变成
+		// 「已用量>0」—— 全新 key 的终身配额因此完全不生效（P0-1）。
 		//
 		// 为什么不套用 ratelimit 的窗口限速器：TPM 限**速率**（分钟窗口一翻
 		// 自然释放），配额限**终身累计**（没有「窗口结束」）。两者语义不同，
 		// 拿窗口限速器去限终身额度会在窗口翻转时凭空释放额度。
-		if _, quota, _, qerr := db.GetKeyQuota(r.Context(), authCtx.KeyID); qerr != nil {
+		if quota, _, _, qerr := db.GetKeyQuota(r.Context(), authCtx.KeyID); qerr != nil {
 			// 查询抖动 fail-open：读池故障不该变成流量全拒。但记 ERROR——
 			// fail-open 的代价是真超发，无声无息就查不到了。
 			logger.Error("quota lookup failed (fail-open)", "error", qerr, "key_id", authCtx.KeyID)
@@ -1294,6 +1449,41 @@ func handleIngress(pool *upstream.Pool, cfg *config.Config, usage *usageRecorder
 				active = avail
 			}
 		}
+
+		// 硬约束过滤（2026-10-07 P1-8）：请求要求结构化输出（json_object /
+		// json_schema）而候选上游是 anthropic 协议时，跳过该候选。
+		//
+		// 为什么不能放行：Anthropic 没有 response_format / text.format 的对应物，
+		// inwire 层已无处可翻；照发等于接受「200 但约束静默丢失」——尤其恶劣的
+		// 是它让故障转移改变语义：同一请求打 openai-chat 目标时约束生效，转移
+		// 到 anthropic 目标后仍回 200 但约束消失。取舍：跳过候选比谎报成功更
+		// 安全 —— 客户端拿到明确错误，至少知道该改请求或改路由，而不是拿着
+		// 「看起来成功」的无约束输出去下游消费。
+		//
+		// "auto" / "" / openai 系协议不受影响：openai-chat 与 openai-responses
+		// 都能表达这两类约束（inwire 层已做等价翻译）。放在熔断筛选之后、预算
+		// 截断之前：先剔除服务不了的目标，让 failover_max_targets 的预算花在
+		// 真正可服务的候选上。
+		if ing.requiresStructuredOutput {
+			var serviceable []routing.Candidate
+			for _, c := range active {
+				if c.Provider != nil && c.Provider.Protocol != "anthropic" {
+					serviceable = append(serviceable, c)
+				}
+			}
+			if len(serviceable) == 0 {
+				rate.commit(0)
+				logger.Warn("no upstream can serve structured output request",
+					"model", ing.model, "key_id", authCtx.KeyID,
+					"candidates", len(active),
+					"request_id", server.RequestIDFromContext(r.Context()))
+				codec.WriteError(w, http.StatusBadRequest, "invalid_request_error",
+					"this request requires structured output (json_object/json_schema), "+
+						"but no candidate upstream can serve it: the anthropic protocol has no equivalent of response_format")
+				return
+			}
+			active = serviceable
+		}
 		if len(active) > limit {
 			active = active[:limit]
 		}
@@ -1303,6 +1493,8 @@ func handleIngress(pool *upstream.Pool, cfg *config.Config, usage *usageRecorder
 
 		var out attemptOutcome
 		// lastTried 记录实际尝试到哪个候选（链耗尽时据此归因，不猜链上最后一个）。
+		// triedAny 与之配对：Candidate 是值类型，「没试过」与「试过零值」无法
+		// 从 lastTried 本身区分，必须有独立布尔。
 		var lastTried routing.Candidate
 		var triedAny bool
 		for i, cand := range active {
@@ -1311,6 +1503,7 @@ func handleIngress(pool *upstream.Pool, cfg *config.Config, usage *usageRecorder
 			// 客户端已断开就收手：半路跑掉的人不该消耗整条链的下游配额，
 			// 也不该把一次在途取消误记成目标的失败。此刻尚未写出任何字节，
 			// 直接返回、不记 error usage（断流是客户端行为，不是上游故障）。
+			// 此处还没领探测名额，不存在归还义务。
 			if cerr := r.Context().Err(); cerr != nil {
 				logger.Info("client disconnected, aborting failover",
 					"model", ing.model, "attempt", i+1, "error", cerr,
@@ -1320,22 +1513,31 @@ func handleIngress(pool *upstream.Pool, cfg *config.Config, usage *usageRecorder
 			}
 
 			// 真正要打这个目标时才领 half-open 探测名额。放在这里（而不是
-			// 上面的筛选里）是因为名额只能由「随后的成功/失败记账」释放，
-			// 而记账只发生在下面这个循环体内 —— 提前领取会让被预算裁掉的
-			// 目标永久占住名额。
+			// 上面的筛选里）是因为名额要与「随后的成功/失败记账」一一配对 ——
+			// 提前领取会让被预算裁掉的目标永久占住名额。
+			//
+			// 名额有两条出路：记账释放（Record*），或没走到记账时由循环尾部
+			// 的 ReleaseTargetProbe 显式归还（probeClaimed/probeRecorded 就是
+			// 这对配对标志）。缺了后一条的话，不可转移错误与客户端中断这两种
+			// 合法形态会把名额永久占死 —— 一次 400 就废掉一个目标。
 			//
 			// 非主目标且没开故障转移时不用熔断器管，行为与改造前一致。
-			if route.FailoverEnabled && !pool.ClaimTargetProbe(cand.TargetID) {
-				// 仍在冷却中，或探测名额已被同链的并发请求领走 —— 沿链继续。
-				if !isLast {
-					logger.Warn("failover: target not claiming a probe slot, switching target",
-						"model", ing.model, "provider", cand.Provider.Slug, "attempt", i+1,
-						"request_id", server.RequestIDFromContext(r.Context()))
-					continue
+			probeClaimed, probeRecorded := false, false
+			if route.FailoverEnabled {
+				if !pool.ClaimTargetProbe(cand.TargetID) {
+					// 仍在冷却中，或探测名额已被同链的并发请求领走 —— 沿链继续。
+					// 没领到名额，也就没有归还义务。
+					if !isLast {
+						logger.Warn("failover: target not claiming a probe slot, switching target",
+							"model", ing.model, "provider", cand.Provider.Slug, "attempt", i+1,
+							"request_id", server.RequestIDFromContext(r.Context()))
+						continue
+					}
+					out = attemptOutcome{eligible: true, statusCode: http.StatusBadGateway,
+						code: "upstream_error", message: "no available upstream provider"}
+					break
 				}
-				out = attemptOutcome{eligible: true, statusCode: http.StatusBadGateway,
-					code: "upstream_error", message: "no available upstream provider"}
-				break
+				probeClaimed = true
 			}
 
 			// 一次 attempt 只取该 provider 的一把凭据：某把 key 失败时本请求不就地换
@@ -1346,6 +1548,7 @@ func handleIngress(pool *upstream.Pool, cfg *config.Config, usage *usageRecorder
 			if cerr != nil {
 				// 该目标当前无健康凭据：累计目标失败，换链上下一个。
 				pool.RecordTargetFailure(cand.TargetID, threshold)
+				probeRecorded = true // 名额由记账释放
 				out = attemptOutcome{eligible: true, statusCode: http.StatusBadGateway,
 					code: "upstream_error", message: "no available upstream provider"}
 				if !isLast {
@@ -1366,6 +1569,7 @@ func handleIngress(pool *upstream.Pool, cfg *config.Config, usage *usageRecorder
 			// 尝试的可能是链上第一个（failover_max_targets=1、或前面的目标被
 			// 跳过时）。归因错目标会让排障指向一个从未真正打过的上游。
 			lastTried = cand
+			triedAny = true
 
 			if out.committed {
 				// 只有真成功才记成功 —— 断流/溢出/上游错误虽已提交，却是失败，
@@ -1376,6 +1580,7 @@ func handleIngress(pool *upstream.Pool, cfg *config.Config, usage *usageRecorder
 				} else {
 					pool.RecordTargetFailure(cand.TargetID, threshold)
 				}
+				probeRecorded = true // 名额由记账释放
 				return
 			}
 
@@ -1393,9 +1598,19 @@ func handleIngress(pool *upstream.Pool, cfg *config.Config, usage *usageRecorder
 			// 因此这个判据能精确区分「客户端跑了」与「上游真的坏了」。
 			if out.eligible && r.Context().Err() == nil {
 				pool.RecordTargetFailure(cand.TargetID, threshold)
+				probeRecorded = true // 名额由记账释放
 				if out.credCooldown > 0 {
 					pool.MarkCredentialCooldown(credID, out.credCooldown)
 				}
+			}
+
+			// 没走到记账的两种形态 —— 不可转移错误（out.eligible==false）与
+			// 客户端中断（ctx 已取消）—— 在此归还探测名额，否则 halfOpen 卡死、
+			// 该目标被跳到下一次 Install 才复位。已记账的绝不能再还：
+			// halfOpen 是共享 bool 而非计数，重复归还会错清并发请求刚领到的
+			// 名额（见 ReleaseTargetProbe 的注释）。
+			if probeClaimed && !probeRecorded {
+				pool.ReleaseTargetProbe(cand.TargetID)
 			}
 
 			if !out.eligible || isLast {
@@ -1424,7 +1639,9 @@ func handleIngress(pool *upstream.Pool, cfg *config.Config, usage *usageRecorder
 		provID, upstreamModel := "", ""
 		// 归因到**实际尝试过**的目标，而不是 active 的最后一个：
 		// failover_max_targets=1、或前面的候选被跳过时，两者不是同一个。
-		if triedAny {
+		// Provider 判空：active 为空（理论不该发生）时 lastTried 是零值
+		// Candidate，解引用 nil Provider 会 panic —— 一行防御，零业务成本。
+		if triedAny && lastTried.Provider != nil {
 			provID, upstreamModel = lastTried.Provider.ID, lastTried.UpstreamModel.ModelID
 		}
 		status := "error"
@@ -1646,7 +1863,22 @@ func attemptStream(w http.ResponseWriter, r *http.Request, client *rosetta.Clien
 
 	idleTimeout := streamIdleTimeout(snap, cfg)
 	var idleTimedOut atomic.Bool
+	// lastEventAt 记最近一次上游事件到达的时刻，idle 回调据此**复核**后再关流。
+	//
+	// 只靠 Timer.Reset 不够：Reset 追不回已经派发的回调，超时边界上「事件按时
+	// 到达、回调却已起跑」会把健康流误杀成 stream_idle_timeout —— 与 TTFT
+	// 看门狗已用 ttftDone 修掉的是同一类竞态，但 idle 路径此前仍在。
+	// 复核判据取「回调执行时刻距最近事件是否真的已满 idleTimeout」：真空闲时
+	// 必然成立；边界竞速中到达的事件让复核不通过，此时直接退出 —— consume
+	// 里的 Reset 已把看门狗续上，流继续。
+	// lastEventAt 必须在 Reset **之前**更新：反过来会让回调读到旧时刻，
+	// 把「事件刚到」误判成「已空闲整段超时」。
+	var lastEventAt atomic.Int64
+	lastEventAt.Store(time.Now().UnixNano())
 	idleTimer := time.AfterFunc(idleTimeout, func() {
+		if time.Since(time.Unix(0, lastEventAt.Load())) < idleTimeout {
+			return // 边界竞速：事件在超时边缘合法到达，流还活着
+		}
 		idleTimedOut.Store(true)
 		logger.Warn("stream idle timeout",
 			"model", publicModel, "key_id", authCtx.KeyID,
@@ -1705,6 +1937,9 @@ func attemptStream(w http.ResponseWriter, r *http.Request, client *rosetta.Clien
 	// consume 消费一个上游事件（首个 + 后续走同一套逻辑）：看门狗续期与
 	// usage/stopReason 留档是循环的职责，协议编码全部交给 sink。
 	consume := func(ev *rosetta.Event) {
+		// 时刻先于 Reset 落账（顺序不能反，见 lastEventAt 声明处的注释），
+		// 然后 idle 看门狗续期、心跳对齐。
+		lastEventAt.Store(time.Now().UnixNano())
 		idleTimer.Reset(idleTimeout)
 		heartbeatTicker.Reset(heartbeatInterval)
 		if ev.Type == rosetta.EventMessageEnd {
@@ -1786,12 +2021,19 @@ func attemptStream(w http.ResponseWriter, r *http.Request, client *rosetta.Clien
 		LatencyMs:       latency,
 		TTFBMs:          ttfbMs,
 	})
-	// TPM 校正：预占的估算值以真实 usage（输入+输出）替换。
-	// usage missing（上游没报任何 token 数）时**故意不校正**：commit(0) 会全额
-	// 退还预占，等于不报用量的上游完全绕过 TPM；保留估算值让限速继续约束这类
-	// 流量，估算值随窗口翻转自然清零。
+	// 收尾按「usage 是否已知」分两条（2026-10-07 修复的 P1-3）：
+	//   - 已知：全量收尾 —— TPM 以真实 usage（输入+输出）替换估算值，
+	//     配额预占退回。
+	//   - missing（上游没报任何 token 数）：**只退配额预占，TPM 预占故意保留**。
+	//     commit(0) 会全额退还 TPM 预占，等于不报用量的上游完全绕过 TPM；
+	//     保留估算值让限速继续约束这类流量，估算值随窗口翻转自然清零。
+	//     但配额预占不能跟着一起跳过 —— 它是终身累计，预占按 max_tokens 全额
+	//     计，不退就等于每次 missing 请求永久吃掉数万 token 额度（修复前整个
+	//     commit 被跳过的正是这条路径）。
 	if !lastUsage.IsZero() {
 		rate.commit(lastUsage.TotalTokens)
+	} else {
+		rate.releaseQuota()
 	}
 	// committed=true（字节已写出、无法回退换目标）与「这一次算成功」是两件事：
 	// truncated / overflow / error / canceled 都已提交，但对上游而言是失败。
@@ -1845,9 +2087,12 @@ func attemptNonStream(w http.ResponseWriter, r *http.Request, client *rosetta.Cl
 		LatencyMs:       latency,
 		TTFBMs:          ttfbMs,
 	})
-	// usage missing（上游没报用量）时保留 TPM 预占不校正 —— 理由见 attemptStream。
+	// 收尾口径与 attemptStream 一致（见该处的注释）：usage 已知 → 全量收尾；
+	// missing → 只退配额预占，TPM 预占保留（窗口自愈）。
 	if !resp.Usage.IsZero() {
 		rate.commit(resp.Usage.TotalTokens)
+	} else {
+		rate.releaseQuota()
 	}
 	// 非流式能走到这里就意味着上游完整返回了响应 —— 一定是成功。
 	// 漏写success 会让每次非流式成功都被外层记成「目标失败」，

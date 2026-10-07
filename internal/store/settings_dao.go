@@ -10,6 +10,35 @@ import (
 // 设置以 JSON 值存在 app_settings 表里，key 区分不同配置块。
 const settingModelDefaultsKey = "model_defaults"
 
+// settingBootstrapCompletedKey 是「本安装已完成过首次引导」的一次性标记。
+//
+// 为什么需要它（而不只靠「当前是否存在空密码 admin」判定引导窗口）：
+// 空密码 admin 只是引导窗口**曾经**开放的原因，不是窗口该不该开的依据。
+// 曾经由管理员建出/升级出空密码 admin（bug 期间的口子，已在用户管理面堵住）
+// 时，仅凭后者判定会让免鉴权的 POST /admin/api/bootstrap **永久**重开 ——
+// 任何人都能给那个账号设上自己的密码并拿到 admin 会话。窗口必须绑定到
+// 「本安装是否完成过引导」这个只会前进一次的事实上。
+//
+// 值固定为 "1"：布尔语义，不需要结构化内容。写入与 SetInitialAdminPassword
+// 的条件 UPDATE 在**同一个事务**里（见 user_dao.go），「设密成功」与「窗口关闭」
+// 原子生效，不存在「密码设上了但窗口还开着」的中间态。
+//
+// 兼容性：老库已完成引导但缺这个标记时，窗口本来就由「无空密码 admin」关着，
+// 行为不变；只有 bug 期间恰好留下空密码 admin 的库会再开**最后**一次窗口，
+// 设完即永久关闭。
+const settingBootstrapCompletedKey = "bootstrap_completed"
+
+// BootstrapCompleted 报告本安装是否已完成过首次引导。
+// 未写过标记（含老库升级）返回 false —— 此时窗口是否开放仍由
+// FindUninitializedAdmin 的旧判定兜底。
+func (s *Store) BootstrapCompleted(ctx context.Context) (bool, error) {
+	v, ok, err := s.getSetting(ctx, settingBootstrapCompletedKey)
+	if err != nil || !ok {
+		return false, err
+	}
+	return v == "1", nil
+}
+
 // 未显式配置时的兜底默认：探测不到模型容量时使用。
 //
 // 兜底值刻意取**当代主流模型的真实规格**（128K 上下文 / 64K 最大输出），

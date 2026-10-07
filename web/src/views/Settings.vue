@@ -2,7 +2,7 @@
 import { computed, onMounted, reactive, ref, watch } from 'vue'
 import { api } from '../api'
 import { toast, confirmBox } from '../ui'
-import { fmtMoney, fmtDateTime } from '../fmt'
+import { fmtMoney, fmtDateTime, fmtNum } from '../fmt'
 import AppModal from '../components/AppModal.vue'
 import type {
   Provider,
@@ -10,6 +10,7 @@ import type {
   AuditEntry,
   ConfigExportFile,
   ConfigImportResult,
+  PruneResult,
 } from '../types'
 
 // ---------- 分类页：设置项按分类分页展示，一次只看一类 ----------
@@ -255,6 +256,34 @@ async function save(target: 'model' | 'runtime') {
     if ((e as { status?: number }).status !== 401) toast('保存失败：' + (e as Error).message, 'err')
   } finally {
     saving.value = false
+  }
+}
+
+// ---------- 用量归档维护 ----------
+//
+// 明细默认保留 30 天，每日自动剪枝成按天累计（设计 §4.8）。自动任务之外，
+// 运维还需要一个「现在就要」的入口：排查完问题立即收掉明细，或确认归档
+// 是否真的在跑 —— 否则唯一手段是 curl。
+const pruning = ref(false)
+const pruneResult = ref<PruneResult | null>(null)
+
+async function runPrune() {
+  const ok = await confirmBox({
+    title: '立即执行归档剪枝？',
+    body: '保留窗口（默认 30 天）之前的调用明细将聚合进按天累计后删除。累计数据保留，但单次调用的明细不可恢复。',
+    confirmLabel: '执行',
+  })
+  if (!ok) return
+  pruning.value = true
+  try {
+    pruneResult.value = await api.pruneUsage()
+    const r = pruneResult.value
+    // skipped 不是失败：水位已到位 / 无待归档数据都会走这条，原因在 reason。
+    toast(r.skipped ? `本次跳过：${r.reason || '无待归档的数据'}` : '归档剪枝已完成')
+  } catch (e) {
+    if ((e as { status?: number }).status !== 401) toast('归档剪枝失败：' + (e as Error).message, 'err')
+  } finally {
+    pruning.value = false
   }
 }
 
@@ -578,6 +607,27 @@ onMounted(() => {
           </button>
         </div>
       </form>
+
+      <!-- 用量归档维护：与上面的表单无关（不保存任何设置项，是立即执行的动作），
+           单独成块放在运行时页签下，而不是让运维去 curl /usage/prune。 -->
+      <div v-if="!loading" class="maint">
+        <h2 class="section-h">用量归档</h2>
+        <p class="tip">
+          调用明细默认保留 30 天，更早的记录由每日定时任务聚合进「按天累计」后删除
+          （累计永久保留）。这里可以手动立即执行一次剪枝，结果实时回显。
+        </p>
+        <button class="btn" :disabled="pruning" @click="runPrune">
+          {{ pruning ? '剪枝中…' : '立即归档剪枝' }}
+        </button>
+        <div v-if="pruneResult" class="prune-result">
+          <template v-if="pruneResult.skipped">本次跳过：{{ pruneResult.reason || '无待归档的数据' }}</template>
+          <template v-else>
+            已删除明细 <b>{{ fmtNum(pruneResult.deleted_rows) }}</b> 行，写入按天累计
+            <b>{{ fmtNum(pruneResult.rollup_rows) }}</b> 组；归档水位
+            {{ pruneResult.pruned_through_day }}（保留窗口自 {{ pruneResult.cutoff_day }} 起）
+          </template>
+        </div>
+      </div>
     </div>
 
     <!-- 分类 4：审计日志（页签顺序见 TABS） -->
@@ -967,6 +1017,26 @@ onMounted(() => {
   margin: 6px 0 -2px;
   padding-bottom: 6px;
   border-bottom: 1px solid var(--hairline);
+}
+
+/* 用量归档维护块：与上方表单分隔，宽度对齐表单 */
+.maint {
+  max-width: 560px;
+  margin-top: 18px;
+  padding-top: 14px;
+  border-top: 1px solid var(--hairline);
+}
+.maint .tip {
+  margin: 8px 0 12px;
+  line-height: 1.6;
+}
+.prune-result {
+  margin-top: 10px;
+  font-size: 12.5px;
+  color: var(--text-2);
+}
+.prune-result b {
+  font-variant-numeric: tabular-nums;
 }
 
 /* 分类页签：形态对齐顶栏 .tabs（胶囊分段），选中态用 segment 底色 */

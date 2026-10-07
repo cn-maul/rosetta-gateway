@@ -97,11 +97,20 @@ func TestDecodeResponses_ToolChoice(t *testing.T) {
 	if _, ok := req2.Extra["tool_choice"].(json.RawMessage); !ok {
 		t.Fatalf("responses tool_choice passthrough: %+v", req2.Extra)
 	}
-	// anthropic 上游跳过：不挂任何 Extra。
+	// anthropic 上游拿翻译后的形状（P1-8：不再整个跳过、静默丢 tool_choice）。
 	req3 := got.ToRosetta()
 	got.ApplyUpstreamExtras(req3, "anthropic")
-	if len(req3.Extra) != 0 {
-		t.Fatalf("anthropic upstream should skip extras, got %+v", req3.Extra)
+	if tc, ok := req3.Extra["tool_choice"].(map[string]any); !ok || tc["type"] != "tool" || tc["name"] != "weather" {
+		t.Fatalf("anthropic tool_choice translation: %+v", req3.Extra)
+	}
+	// text.format 不跟随：anthropic 上游没有对应物（结构化输出这类硬约束由
+	// 网关层 requiresStructuredOutput 拦截，不放行后丢失）。
+	got2 := decodeResponses(t, `{"model":"m","input":"hi",
+		"text":{"format":{"type":"json_object"}}}`)
+	req4 := got2.ToRosetta()
+	got2.ApplyUpstreamExtras(req4, "anthropic")
+	if len(req4.Extra) != 0 {
+		t.Fatalf("anthropic upstream must not receive text.format, got %+v", req4.Extra)
 	}
 }
 
@@ -125,6 +134,59 @@ func TestDecodeResponses_TextFormat(t *testing.T) {
 	got.ApplyUpstreamExtras(req2, "openai-responses")
 	if _, ok := req2.Extra["text"].(map[string]any); !ok {
 		t.Fatalf("responses text passthrough: %+v", req2.Extra)
+	}
+}
+
+// responses → anthropic：tool_choice 等价翻译矩阵（P1-8 补齐的方向）。
+func TestResponses_AnthropicToolChoiceMatrix(t *testing.T) {
+	cases := []struct {
+		name       string
+		toolChoice string
+		wantJSON   string // "" = 应被丢弃
+	}{
+		{"auto→auto", `"auto"`, `{"type":"auto"}`},
+		{"required→any", `"required"`, `{"type":"any"}`},
+		{"object auto→auto", `{"type":"auto"}`, `{"type":"auto"}`},
+		{"object required→any", `{"type":"required"}`, `{"type":"any"}`},
+		{"function→tool", `{"type":"function","name":"weather"}`, `{"name":"weather","type":"tool"}`},
+		// "none" 在 Anthropic 无对应物：丢弃。
+		{"none dropped", `"none"`, ""},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			got := decodeResponses(t, `{"model":"m","input":"hi","tool_choice":`+c.toolChoice+`}`)
+			req := got.ToRosetta()
+			got.ApplyUpstreamExtras(req, "anthropic")
+			if c.wantJSON == "" {
+				if _, exists := req.Extra["tool_choice"]; exists {
+					t.Fatalf("tool_choice 应被丢弃，实际 %v", req.Extra["tool_choice"])
+				}
+				return
+			}
+			raw, _ := json.Marshal(req.Extra["tool_choice"])
+			if string(raw) != c.wantJSON {
+				t.Fatalf("tool_choice = %s, want %s", raw, c.wantJSON)
+			}
+		})
+	}
+}
+
+// 硬约束判定（Responses 入口）：text.format 为 json_object / json_schema 才算。
+func TestResponses_RequiresStructuredOutput(t *testing.T) {
+	cases := []struct {
+		body string
+		want bool
+	}{
+		{`{"model":"m","input":"hi","text":{"format":{"type":"json_object"}}}`, true},
+		{`{"model":"m","input":"hi","text":{"format":{"type":"json_schema","name":"o","schema":{}}}}`, true},
+		{`{"model":"m","input":"hi","text":{"format":{"type":"text"}}}`, false},
+		{`{"model":"m","input":"hi"}`, false},
+	}
+	for i, c := range cases {
+		got := decodeResponses(t, c.body)
+		if got.RequiresStructuredOutput() != c.want {
+			t.Fatalf("case %d: RequiresStructuredOutput = %v, want %v", i, !c.want, c.want)
+		}
 	}
 }
 

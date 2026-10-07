@@ -422,6 +422,104 @@ func TestPrune_Idempotent(t *testing.T) {
 	}
 }
 
+// TestPrune_LargeBacklogAggregatesOnce 是 P0-3 的回归：积压超过单轮删除上限
+// （maxPruneDelete = 20000）时，聚合与删除必须覆盖**严格同一批行**。
+//
+// 旧实现在同一事务里先「无界聚合全部到期行」、再「只删最老 2 万行」：积压
+// 3 万行时，第一轮把 3 万行全部聚合进表 A 却只删掉 2 万，剩下的 1 万行在
+// 下一轮被**再聚合一次** —— 而 ON CONFLICT 是累加语义，归档数字凭空变大
+// （实测 3 万行 × 1 token：两轮剪枝后 rollup 总数 4 万，多 33%）。偏差不报
+// 任何错、不告警，只有对账才能发现，这正是它危险的地方。
+//
+// 复现的关键是**不许**放大单轮上限来绕过：30000 行全部早于 cutoff，第一轮
+// 必须恰好删 20000 行、留下 10000 行逼出第二轮。两轮之后归档总数必须恒等于
+// 30000 —— 这条断言同时堵住另一种「修法」（把 ON CONFLICT 改成覆盖）：
+// 覆盖会让第二轮把第一轮的量抹掉，同样在这里失败。
+func TestPrune_LargeBacklogAggregatesOnce(t *testing.T) {
+	ctx := context.Background()
+	st := testStore(t, t.TempDir()+"/gw.db")
+	base := time.Now()
+	freezeNow(t, base)
+
+	// 与 PruneOldUsage 内部同口径的切分点：本地午夜 - keepDays。
+	local := base.In(time.Local)
+	cutoff := time.Date(local.Year(), local.Month(), local.Day(), 0, 0, 0, 0, time.Local).
+		AddDate(0, 0, -DefaultRetentionDays)
+
+	// 30000 行同一维度、同一天、各 1 token：归档后应恰好聚成 1 行，
+	// SUM(total_tokens) 每一轮都严格等于「已归档的明细行数」。
+	// 只要有任何一批行被聚合两次，这个数就会越过 30000。
+	const total = 30000
+	ts := cutoff.AddDate(0, 0, -5).Add(9 * time.Hour).UnixMilli()
+	for i := 1; i <= total; i++ {
+		if err := st.CreateUsageRecord(ctx, &UsageRecord{
+			ID:              seqName(i),
+			Ts:              ts,
+			AccessKeyID:     "k-bulk",
+			PublicModel:     "sonnet",
+			ProviderID:      "p-bulk",
+			UpstreamModel:   "sonnet",
+			IngressProtocol: "openai-chat",
+			TotalTokens:     1,
+			UsageState:      "reported",
+			Status:          "ok",
+			HTTPStatus:      200,
+		}); err != nil {
+			t.Fatalf("seed record %d: %v", i, err)
+		}
+	}
+
+	first, err := st.PruneOldUsage(ctx, DefaultRetentionDays)
+	if err != nil {
+		t.Fatalf("first prune: %v", err)
+	}
+	if first.Skipped {
+		t.Fatalf("first prune should do work, got skipped: %s", first.Reason)
+	}
+	// 单轮上限必须仍然生效：只删 20000，留下 10000 行逼出第二轮。
+	// （刻意写字面量而不是引用常量：要钉死的就是「上限是 20000、没被放大」。）
+	if first.DeletedRows != 20000 {
+		t.Fatalf("first prune deleted %d rows, want 20000 (maxPruneDelete cap)", first.DeletedRows)
+	}
+	// 第一轮只允许归档它删掉的那批：20000。旧实现在这里就已经聚合了全部 30000。
+	if _, tokens := rollupTotals(t, st); tokens != 20000 {
+		t.Fatalf("rollup total_tokens after first prune = %d, want 20000 (over-aggregation)", tokens)
+	}
+
+	second, err := st.PruneOldUsage(ctx, DefaultRetentionDays)
+	if err != nil {
+		t.Fatalf("second prune: %v", err)
+	}
+	if second.Skipped {
+		t.Fatalf("second prune must not be skipped: watermark must wait until the cutoff is clean, got %s", second.Reason)
+	}
+	if second.DeletedRows != 10000 {
+		t.Fatalf("second prune deleted %d rows, want 10000", second.DeletedRows)
+	}
+	// 核心断言：两轮之后归档总数恒等于 30000 —— 第二轮只补上自己那批的量，
+	// 不把第一轮没删掉的行再聚合一遍。
+	if _, tokens := rollupTotals(t, st); tokens != total {
+		t.Fatalf("rollup total_tokens after both prunes = %d, want exactly %d (double aggregation)", tokens, total)
+	}
+	// 水位推进的前提是明细真的清空：cutoff 之前一行不剩。
+	var due int64
+	if err := st.read.QueryRow(
+		`SELECT COUNT(*) FROM usage_records WHERE ts < ?`, cutoff.UnixMilli()).Scan(&due); err != nil {
+		t.Fatalf("count due details: %v", err)
+	}
+	if due != 0 {
+		t.Fatalf("%d detail rows remain before cutoff after both prunes", due)
+	}
+	// 水位已推进：第三轮应直接跳过（批量改造不得破坏幂等）。
+	third, err := st.PruneOldUsage(ctx, DefaultRetentionDays)
+	if err != nil {
+		t.Fatalf("third prune: %v", err)
+	}
+	if !third.Skipped {
+		t.Errorf("third prune should be skipped by the watermark, got %+v", third)
+	}
+}
+
 func rollupTotals(t *testing.T, st *Store) (rows, tokens int64) {
 	t.Helper()
 	if err := st.read.QueryRow(

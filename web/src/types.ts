@@ -352,6 +352,36 @@ export interface UsageHistoryPage {
   total: number
 }
 
+/**
+ * 调用历史列表 / CSV 导出共用的排障过滤器（后端 usageHistoryFilters）。
+ * 三个维度都是**精确匹配**；undefined / 空串 = 不过滤。
+ * keyId 是密钥 id（不是前缀），界面上用密钥下拉把名字翻成 id。
+ */
+export interface HistoryFilters {
+  status?: string
+  model?: string
+  keyId?: string
+}
+
+/**
+ * POST /usage/prune 的响应：一次归档剪枝的影响面（internal/store.PruneResult）。
+ * skipped=true 不是错误 —— 水位已到位 / 参数不合理都会走这条，原因在 reason。
+ */
+export interface PruneResult {
+  rollup_rows: number // 写进按天累计表的聚合分组数
+  deleted_rows: number // 从明细表删除的行数
+  cutoff_day: string // 保留窗口第一天（本地 YYYY-MM-DD）
+  pruned_through_day: string // 归档水位：已剪到含哪一天
+  skipped: boolean
+  reason?: string
+}
+
+/** POST /keys/{id}/recompute-usage 的响应：重算后的已用量。 */
+export interface RecomputeUsageResult {
+  status: string
+  used_tokens: number
+}
+
 // 通用错误响应：{"error":{"message":"...","type":"invalid_request_error"}}
 export interface ApiError {
   message: string

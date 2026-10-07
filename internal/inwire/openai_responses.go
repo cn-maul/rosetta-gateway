@@ -24,7 +24,9 @@ import (
 //   - previous_response_id / store：网关不托管会话状态（DESIGN §1 明确不做），
 //     两者被忽略；Codex 等客户端在 store:false 下随请求带全量历史，天然兼容。
 //   - text.format 映射到 openai-chat 上游的 response_format（json_object 直映、
-//     json_schema 翻译外壳）；responses 上游经 Extra 原样回传。
+//     json_schema 翻译外壳）；responses 上游经 Extra 原样回传；anthropic 上游
+//     没有对应物 —— tool_choice 仍做等价翻译（any/tool），结构化输出这类
+//     硬约束则由网关层拒绝（见 RequiresStructuredOutput 与 handleIngress）。
 
 type ResponsesRequest struct {
 	Model           string          `json:"model"`
@@ -322,8 +324,26 @@ func responsesItemOutputText(item responsesItem) string {
 }
 
 // ApplyUpstreamExtras 按上游协议挂 Responses 私有字段。
+//
+// anthropic 分支（2026-10-07 P1-8）：此前对 anthropic 整个跳过、把 tool_choice
+// 静默丢掉 —— 故障转移前后同一请求行为不一致。现在能等价翻译的 tool_choice
+// 必须翻译；text.format 在 Anthropic 无对应物，属硬约束，由网关层
+// requiresStructuredOutput 拒绝，不会带着丢失的约束放行。
 func (a *ResponsesRequest) ApplyUpstreamExtras(req *rosetta.ChatRequest, protocol string) {
 	switch protocol {
+	case "anthropic":
+		// tool_choice 等价翻译：auto→{"type":"auto"}、required→{"type":"any"}、
+		// 命名函数→{"type":"tool"}；"none" 在 Anthropic 无对应物（无法表达
+		// 「工具照常声明但本轮禁止调用」），丢弃 —— 见 responsesToolChoiceAnthropic。
+		if tc := responsesToolChoiceAnthropic(a.ToolChoice); tc != nil {
+			mergeExtra(req, map[string]any{"tool_choice": tc})
+		}
+		// text.format 在 Anthropic 无对应物。json_object / json_schema 是硬约束，
+		// 不允许「200 但约束丢失」—— 这类请求在 handleIngress 就被
+		// requiresStructuredOutput 挡在 anthropic 候选之外，到不了这里。
+		// parallel_tool_calls 亦无开关对应物，丢弃不改变正确性。
+		return
+
 	case "", "openai-chat", "auto":
 		// "auto" 与 ""/"openai-chat" 同组：auto 下SDK 自动探测，落点几乎总是
 		// OpenAI 方言，漏掉它等于让最常用的协议配置静默丢字段。
@@ -454,6 +474,52 @@ func responsesToolChoiceOpenAI(raw json.RawMessage) any {
 	return nil
 }
 
+// responsesToolChoiceAnthropic 把 Responses 的 tool_choice 翻译成 Anthropic 形状。
+//
+//	"auto" / {"type":"auto"}       → {"type":"auto"}
+//	"required" / {"type":"required"} → {"type":"any"}（Anthropic 的「必须调一个」）
+//	{"type":"function","name":…}   → {"type":"tool","name":…}
+//	"none"                          → nil（丢弃）
+//
+// "none" 丢弃的原因与 chatToolChoiceAnthropic 相同：Anthropic 无法表达
+// 「工具照常声明、但本轮禁止调用」。decode 已把 tool_choice 收敛为字符串或
+// {type,name} 两种形状，未知取值返回 nil 丢弃（防御）。
+func responsesToolChoiceAnthropic(raw json.RawMessage) any {
+	if len(raw) == 0 {
+		return nil
+	}
+	var s string
+	if json.Unmarshal(raw, &s) == nil {
+		switch s {
+		case "auto":
+			return map[string]any{"type": "auto"}
+		case "required":
+			return map[string]any{"type": "any"}
+		default: // "none" 等：无对应物，丢弃。
+			return nil
+		}
+	}
+	var obj struct {
+		Type string `json:"type"`
+		Name string `json:"name"`
+	}
+	if json.Unmarshal(raw, &obj) != nil {
+		return nil
+	}
+	switch obj.Type {
+	case "auto":
+		return map[string]any{"type": "auto"}
+	case "required":
+		return map[string]any{"type": "any"}
+	case "function":
+		if obj.Name == "" {
+			return nil
+		}
+		return map[string]any{"type": "tool", "name": obj.Name}
+	}
+	return nil
+}
+
 // textFormatToResponseFormat 把 Responses 的 text.format 翻译成 openai-chat 的
 // response_format。text（默认）返回 nil（无需表达）；json_object 直映；
 // json_schema 翻译外壳（Responses 平铺 name/schema/strict，chat 嵌套在
@@ -476,4 +542,48 @@ func textFormatToResponseFormat(f map[string]any) map[string]any {
 	default:
 		return map[string]any{"type": t}
 	}
+}
+
+// responseFormatToTextFormat 把 openai-chat 的 response_format 翻译回 Responses
+// 的 text.format —— textFormatToResponseFormat 的反向（chat 入口打到
+// responses 上游时用）。json_object 直映；json_schema 把 chat 嵌套在
+// json_schema 子对象里的 name/schema/strict/description 摊平回 Responses 的
+// 平铺形状；"text"/缺省是两协议共同的默认值，返回 nil 不显式表达；未知类型
+// 摊平原样透传，交给上游 SDK 拒绝 —— 不在这里静默吞。
+func responseFormatToTextFormat(raw json.RawMessage) map[string]any {
+	var f map[string]any
+	if json.Unmarshal(raw, &f) != nil {
+		return nil
+	}
+	switch t, _ := f["type"].(string); t {
+	case "", "text":
+		return nil
+	case "json_object":
+		return map[string]any{"type": "json_object"}
+	case "json_schema":
+		inner, _ := f["json_schema"].(map[string]any)
+		out := map[string]any{"type": "json_schema"}
+		for _, k := range []string{"name", "schema", "strict", "description"} {
+			if v, ok := inner[k]; ok {
+				out[k] = v
+			}
+		}
+		return out
+	default:
+		return map[string]any{"type": t}
+	}
+}
+
+// RequiresStructuredOutput 报告该请求是否带**硬性**结构化输出约束
+// （text.format.type 为 json_object / json_schema）。与 chat 入口的同名方法
+// 同一用途：Anthropic 上游没有对应物，网关据此把 anthropic 候选从链上滤掉
+// 而不是放行后让约束静默失效（见 handleIngress）。format 缺失或为默认的
+// "text" 时返回 false。
+func (a *ResponsesRequest) RequiresStructuredOutput() bool {
+	f := a.textFormatMap()
+	if f == nil {
+		return false
+	}
+	t, _ := f["type"].(string)
+	return t == "json_object" || t == "json_schema"
 }

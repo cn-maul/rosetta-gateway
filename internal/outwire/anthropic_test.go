@@ -252,6 +252,119 @@ func TestWriteAnthropicResponse(t *testing.T) {
 	}
 }
 
+// 非流式 usage：统一 Usage 的缓存 token 必须从 input_tokens 拆出，填进各自的
+// 互斥计费桶。SDK 折叠语义（Cached ⊆ Input）下直接抄 InputTokens 会把缓存
+// 算两遍（P1-7）：Input=100/Cached=30/Creation=20 → input=50、cache_read=30、
+// cache_creation=20。
+func TestWriteAnthropicResponse_UsageCacheBucketsSplit(t *testing.T) {
+	rec := httptest.NewRecorder()
+	WriteAnthropicResponse(rec, &rosetta.ChatResponse{
+		ID:    "up-cache",
+		Model: "claude",
+		Usage: rosetta.Usage{InputTokens: 100, OutputTokens: 8, CachedInputTokens: 30, CachedCreationTokens: 20},
+	}, "gw-model")
+
+	var out struct {
+		Usage struct {
+			Input         int64 `json:"input_tokens"`
+			Output        int64 `json:"output_tokens"`
+			CacheRead     int64 `json:"cache_read_input_tokens"`
+			CacheCreation int64 `json:"cache_creation_input_tokens"`
+		} `json:"usage"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil {
+		t.Fatalf("unmarshal: %v body=%s", err, rec.Body.String())
+	}
+	if out.Usage.Input != 50 || out.Usage.CacheRead != 30 || out.Usage.CacheCreation != 20 {
+		t.Fatalf("usage buckets = input:%d read:%d creation:%d, want 50/30/20 (cached tokens must not double-count into input_tokens)",
+			out.Usage.Input, out.Usage.CacheRead, out.Usage.CacheCreation)
+	}
+	if out.Usage.Output != 8 {
+		t.Fatalf("output_tokens = %d, want 8", out.Usage.Output)
+	}
+}
+
+// 无缓存时三字段形状不变：只有 input_tokens / output_tokens，不出现
+// cache_read / cache_creation 键 —— 且 input_tokens 与统一 InputTokens 相等。
+func TestWriteAnthropicResponse_UsageNoCacheShapeUnchanged(t *testing.T) {
+	rec := httptest.NewRecorder()
+	WriteAnthropicResponse(rec, &rosetta.ChatResponse{
+		ID:    "up-nocache",
+		Model: "claude",
+		Usage: rosetta.Usage{InputTokens: 10, OutputTokens: 4},
+	}, "gw-model")
+
+	var out struct {
+		Usage struct {
+			Input  int64 `json:"input_tokens"`
+			Output int64 `json:"output_tokens"`
+		} `json:"usage"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil {
+		t.Fatalf("unmarshal: %v body=%s", err, rec.Body.String())
+	}
+	if out.Usage.Input != 10 || out.Usage.Output != 4 {
+		t.Fatalf("usage = %d/%d, want 10/4", out.Usage.Input, out.Usage.Output)
+	}
+	raw := rec.Body.String()
+	for _, k := range []string{"cache_read_input_tokens", "cache_creation_input_tokens"} {
+		if strings.Contains(raw, k) {
+			t.Fatalf("无缓存时不应出现 %s 键：%s", k, raw)
+		}
+	}
+}
+
+// 流式路径（message_delta 的 usage）与非流式同口径：缓存桶拆分必须两条路径都生效。
+func TestAnthropicSSE_UsageCacheBucketsSplit(t *testing.T) {
+	rec := httptest.NewRecorder()
+	s := NewAnthropicSSE(rec, nil, "msg_1", "gw-model")
+	s.Event(&rosetta.Event{Type: rosetta.EventMessageStart, ID: "up-1"})
+	s.Event(&rosetta.Event{Type: rosetta.EventTextDelta, Text: "答"})
+	s.Event(&rosetta.Event{Type: rosetta.EventMessageEnd, StopReason: rosetta.StopEnd})
+	s.Finish("ok", rosetta.StopEnd,
+		rosetta.Usage{InputTokens: 100, OutputTokens: 8, CachedInputTokens: 30, CachedCreationTokens: 20}, false)
+
+	var delta struct {
+		Usage struct {
+			Input         int64 `json:"input_tokens"`
+			CacheRead     int64 `json:"cache_read_input_tokens"`
+			CacheCreation int64 `json:"cache_creation_input_tokens"`
+		} `json:"usage"`
+	}
+	for _, e := range collect(t, rec.Body.String()) {
+		if e[0] != "message_delta" {
+			continue
+		}
+		if err := json.Unmarshal([]byte(e[1]), &delta); err != nil {
+			t.Fatalf("parse message_delta: %v (%s)", err, e[1])
+		}
+	}
+	if delta.Usage.Input != 50 || delta.Usage.CacheRead != 30 || delta.Usage.CacheCreation != 20 {
+		t.Fatalf("stream usage buckets = input:%d read:%d creation:%d, want 50/30/20",
+			delta.Usage.Input, delta.Usage.CacheRead, delta.Usage.CacheCreation)
+	}
+}
+
+// 流式无缓存：input_tokens 照常补权威值，不出现缓存键（形状与修复前一致）。
+func TestAnthropicSSE_UsageNoCacheShapeUnchanged(t *testing.T) {
+	rec := httptest.NewRecorder()
+	s := NewAnthropicSSE(rec, nil, "msg_1", "gw-model")
+	s.Event(&rosetta.Event{Type: rosetta.EventMessageStart, ID: "up-1"})
+	s.Event(&rosetta.Event{Type: rosetta.EventTextDelta, Text: "答"})
+	s.Event(&rosetta.Event{Type: rosetta.EventMessageEnd, StopReason: rosetta.StopEnd})
+	s.Finish("ok", rosetta.StopEnd, rosetta.Usage{InputTokens: 7, OutputTokens: 3}, false)
+
+	raw := rec.Body.String()
+	if !strings.Contains(raw, `"input_tokens":7`) {
+		t.Fatalf("message_delta 应补 input_tokens=7：\n%s", raw)
+	}
+	for _, k := range []string{"cache_read_input_tokens", "cache_creation_input_tokens"} {
+		if strings.Contains(raw, k) {
+			t.Fatalf("无缓存时不应出现 %s 键：\n%s", k, raw)
+		}
+	}
+}
+
 // 错误形状与类型映射（含 401/403 的 authentication/permission 区分）。
 func TestWriteAnthropicError(t *testing.T) {
 	cases := []struct {

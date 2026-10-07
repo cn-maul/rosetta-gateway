@@ -40,7 +40,7 @@ if [ "$(id -u)" = "0" ]; then
 	# 递归操作，而多数情况属主已经对了。
 	if [ "$(stat -c '%u:%g' "${STATE_DIR}")" != "${RUN_UID}:${RUN_GID}" ]; then
 		chown "${RUN_UID}:${RUN_GID}" "${STATE_DIR}" 2>/dev/null ||
-			chmod 0777 "${STATE_DIR}" 2>/dev/null || true
+			chmod 0700 "${STATE_DIR}" 2>/dev/null || true
 	fi
 
 	if [ "$(stat -c '%u' "${STATE_DIR}")" = "${RUN_UID}" ]; then

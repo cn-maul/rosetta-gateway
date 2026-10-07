@@ -201,29 +201,79 @@ func (r *OpenAIChatRequest) ToRosetta() *rosetta.ChatRequest {
 	return req
 }
 
-// ApplyProtocolPrivateExtra forwards the OpenAI-only request fields the SDK
-// does not model onto req.Extra, so they reach the upstream instead of being
-// silently dropped on the floor.
+// ApplyProtocolPrivateExtra 把 OpenAI-Chat 私有请求字段按**目标上游协议**处理：
+// 能等价翻译的必须翻译，不能翻译的按「软偏好丢弃 / 硬约束由网关层拒绝」分别处置。
+// 此前的实现是「目标为 anthropic / openai-responses 就整个 return」，把
+// response_format、tool_choice 等全部静默丢掉 —— 故障转移到不同协议的目标后，
+// 同一请求的行为悄然改变，路由不再语义透明（2026-10-07 P1-8）。
 //
-// Only an OpenAI-Chat upstream parses this shape. Anthropic spells tool_choice
-// as an object rather than a bare string and has no penalty knobs at all, so
-// forwarding OpenAI-shaped values there would turn today's silent drop into a
-// hard 400; the Responses API has no penalty fields either. Both are skipped
-// and the fields stay dropped, as before.
-//
-// "auto" and an empty protocol are let through on purpose: they resolve to an
-// OpenAI-compatible dialect in practice, and whitelisting only "openai-chat"
-// would disable the passthrough for the common bootstrap config.
+// 各目标的处置矩阵：
+//   - openai-chat / "" / auto：OpenAI 方言原样直传（含未知协议值 —— 池构建期
+//     已拒绝拼写错误的协议名，这里保持旧的宽容行为不做二次拦截）。
+//   - openai-responses：response_format → text.format（等价约束，反向复用
+//     textFormatToResponseFormat 的翻译）、tool_choice 摊平成 Responses 形状、
+//     parallel_tool_calls 直传。penalty / seed / user 无对应物：三者是**软偏好**
+//     （采样倾向、缓存归并、租户标注），丢弃不改变请求的正确性，注释留痕即可。
+//   - anthropic：tool_choice 翻译（auto→{"type":"auto"}、required→{"type":"any"}、
+//     命名函数→{"type":"tool"}；"none" 无对应物，见 chatToolChoiceAnthropic）。
+//     response_format 是**硬约束**，Anthropic 无对应物 —— 它不允许静默降级，
+//     由 ingressRequest.requiresStructuredOutput 在网关层把「只余 anthropic
+//     候选」的这类请求整体 400（见 handleIngress），到不了本函数。penalty /
+//     seed / user / parallel_tool_calls 同为软偏好或无效开关，丢弃不破坏正确性。
 //
 // n is deliberately absent. rosetta models a single assistant turn -- the
 // unary decoder reads Choices[0] and the streaming decoder skips every
 // index != 0 -- so n > 1 would bill the caller for candidates the gateway
 // then discards. Dropping it is the safer outcome.
 func (r *OpenAIChatRequest) ApplyProtocolPrivateExtra(req *rosetta.ChatRequest, protocol string) {
-	if protocol == "anthropic" || protocol == "openai-responses" {
+	switch protocol {
+	case "openai-responses":
+		// —— 能等价翻译的必须翻译 ——
+		extra := map[string]any{}
+		// response_format → Responses 的 text.format。json_object 直映、
+		// json_schema 摊平外壳，与 textFormatToResponseFormat 互为镜像；
+		// "text"/缺省是两协议共同的默认值，无需显式表达。
+		if len(r.ResponseFormat) > 0 {
+			if tf := responseFormatToTextFormat(r.ResponseFormat); tf != nil {
+				extra["text"] = map[string]any{"format": tf}
+			}
+		}
+		// 字符串三档（auto/none/required）两协议同名；命名函数从 chat 的
+		// 嵌套 {"type":"function","function":{"name"}} 摊平成 Responses 的
+		// {"type":"function","name"}。
+		if r.ToolChoice != nil {
+			if tc := chatToolChoiceResponses(r.ToolChoice); tc != nil {
+				extra["tool_choice"] = tc
+			}
+		}
+		if r.ParallelToolCalls != nil {
+			extra["parallel_tool_calls"] = *r.ParallelToolCalls
+		}
+		// presence_penalty / frequency_penalty / seed / user：Responses API 无对应物。
+		// 它们是软偏好或标注类字段，丢弃不改变请求的正确性 —— 与结构化输出这类
+		// 硬约束不同（后者在网关层被拒绝，绝不静默降级）。
+		if len(extra) > 0 {
+			mergeExtra(req, extra)
+		}
+		return
+
+	case "anthropic":
+		// tool_choice 有等价翻译（映射表见 chatToolChoiceAnthropic）。
+		if r.ToolChoice != nil {
+			if tc := chatToolChoiceAnthropic(r.ToolChoice); tc != nil {
+				mergeExtra(req, map[string]any{"tool_choice": tc})
+			}
+		}
+		// response_format 在 Anthropic 无对应物。json_object / json_schema 是
+		// **硬约束**：静默丢弃会让客户端拿到「200 但约束失效」的响应，且故障
+		// 转移前后行为不一致 —— 这类请求不会走到这里（requiresStructuredOutput
+		// 已在 handleIngress 把 anthropic 候选过滤掉，全被滤空则 400）。
+		// penalty / seed / user 是软偏好，parallel_tool_calls 是 Anthropic
+		// 没有开关表达的控制位 —— 丢弃均不改变请求的正确性。
 		return
 	}
 
+	// "" / "openai-chat" / "auto"（及未知值）：OpenAI 方言直传。
 	extra := map[string]any{}
 	if r.ToolChoice != nil {
 		extra["tool_choice"] = r.ToolChoice
@@ -282,6 +332,95 @@ func maxTokens(r *OpenAIChatRequest) int {
 		return *r.MaxTokens
 	}
 	return 0
+}
+
+// chatToolChoiceAnthropic 把 chat 的 tool_choice 翻译成 Anthropic wire 形状。
+//
+//	"auto"                → {"type":"auto"}
+//	"required"            → {"type":"any"}（Anthropic 的「必须调一个工具」）
+//	命名函数（嵌套 function 形状） → {"type":"tool","name":…}
+//	"none"                → nil（丢弃）
+//
+// "none" 丢弃的原因：Anthropic 无法表达「工具照常声明、但本轮禁止调用」——
+// 官方语义里最接近的做法是把 tools 列表整个去掉，那是对请求内容的改动而不是
+// 翻译，只能放弃该控制位。tool_choice 是 any 类型（decode 未收敛其形状），
+// 不认识的形状一律返回 nil 丢弃，绝不把 OpenAI 形状原样发给 Anthropic 上游。
+func chatToolChoiceAnthropic(v any) any {
+	switch t := v.(type) {
+	case string:
+		switch t {
+		case "auto":
+			return map[string]any{"type": "auto"}
+		case "required":
+			return map[string]any{"type": "any"}
+		default: // "none" 等：无对应物，丢弃。
+			return nil
+		}
+	case map[string]any:
+		if t["type"] != "function" {
+			return nil
+		}
+		fn, ok := t["function"].(map[string]any)
+		if !ok {
+			return nil
+		}
+		name, _ := fn["name"].(string)
+		if name == "" {
+			return nil
+		}
+		return map[string]any{"type": "tool", "name": name}
+	}
+	return nil
+}
+
+// chatToolChoiceResponses 把 chat 的 tool_choice 翻译成 Responses 形状。
+// 字符串三档（auto/none/required）两协议同名直取；命名函数只差外壳 ——
+// chat 嵌套 {"type":"function","function":{"name"}}，Responses 摊平为
+// {"type":"function","name"}。不认识的形状返回 nil 丢弃。
+func chatToolChoiceResponses(v any) any {
+	switch t := v.(type) {
+	case string:
+		switch t {
+		case "auto", "none", "required":
+			return t
+		}
+		return nil
+	case map[string]any:
+		if t["type"] != "function" {
+			return nil
+		}
+		fn, ok := t["function"].(map[string]any)
+		if !ok {
+			return nil
+		}
+		name, _ := fn["name"].(string)
+		if name == "" {
+			return nil
+		}
+		return map[string]any{"type": "function", "name": name}
+	}
+	return nil
+}
+
+// RequiresStructuredOutput 报告该请求是否带**硬性**结构化输出约束
+// （response_format.type 为 json_object / json_schema）。
+//
+// 为什么需要单独判定：这两类约束在 Anthropic 协议没有对应物，透传等于
+// 「200 但约束静默丢失」。网关据此把 anthropic 候选从链上滤掉（全被滤空
+// 则 400），而不是放行后让约束悄悄失效 —— 跳过候选比谎报成功更安全
+// （见 handleIngress 的过滤逻辑）。response_format 缺失、type 为 "text"
+// 或畸形 JSON 时返回 false：前两者本就无约束，畸形体交给上游拒绝。
+func (r *OpenAIChatRequest) RequiresStructuredOutput() bool {
+	if len(r.ResponseFormat) == 0 {
+		return false
+	}
+	var f struct {
+		Type string `json:"type"`
+	}
+	if json.Unmarshal(r.ResponseFormat, &f) != nil {
+		return false
+	}
+	return f.Type == "json_object" || f.Type == "json_schema"
 }
 
 func convertMessage(m OpenAIMessage) rosetta.Message {

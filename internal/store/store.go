@@ -134,14 +134,20 @@ func (s *Store) migrate() error {
 			created_at        INTEGER NOT NULL
 		)`,
 		`CREATE TABLE IF NOT EXISTS access_keys (
-			id            TEXT PRIMARY KEY,
-			key_hash      TEXT NOT NULL UNIQUE,
-			key_prefix    TEXT NOT NULL,
-			name          TEXT NOT NULL,
-			enabled       INTEGER NOT NULL DEFAULT 1,
-			quota_tokens  INTEGER NOT NULL DEFAULT 0,
-			used_tokens   INTEGER NOT NULL DEFAULT 0,
-			created_at    INTEGER NOT NULL
+			id              TEXT PRIMARY KEY,
+			key_hash        TEXT NOT NULL UNIQUE,
+			key_prefix      TEXT NOT NULL,
+			name            TEXT NOT NULL,
+			enabled         INTEGER NOT NULL DEFAULT 1,
+			quota_tokens    INTEGER NOT NULL DEFAULT 0,
+			used_tokens     INTEGER NOT NULL DEFAULT 0,
+			-- reserved_tokens 是**在途预占**（2026-10-07 计费修复 P0-2）。
+			-- 必须与 used_tokens 分列：used_tokens 由 usage_records 的 AFTER INSERT
+			-- 触发器累加（真实用量），预占若混写进去，收尾按差值校正时一次请求的
+			-- 净记账是 2×actual（每个请求双倍扣费）。判定用 used+reserved+est，
+			-- 释放只减 reserved_tokens，两列各自只有一个写入者，口径不再纠缠。
+			reserved_tokens INTEGER NOT NULL DEFAULT 0,
+			created_at      INTEGER NOT NULL
 		)`,
 		// groups：模型可见性的分组（多用户改造 P1）。
 		//
@@ -246,6 +252,12 @@ func (s *Store) migrate() error {
 		// 且不报任何错：totals 悄悄漂移，只有对账时才可能发现。
 		// DROP + CREATE 是幂等的（每次都得到代码里这份定义），代价只是
 		// 启动时重建一次触发器，可忽略。
+		//
+		// used_tokens 是这个触发器的专属输出：真实用量落一条记录涨一次。
+		// 配额**预占**绝不允许写进 used_tokens —— 那会让一次请求被记两次
+		// （预占一次、触发器一次），2026-10-07 的 P0-2 缺陷正是这个成因。
+		// 预占走独立的 reserved_tokens 列（ReserveQuota / ReleaseQuota 维护，
+		// 见 key_dao.go），本触发器不需要、也不得感知它。
 		`DROP TRIGGER IF EXISTS trg_update_used_tokens`,
 		`CREATE TRIGGER trg_update_used_tokens
 		 AFTER INSERT ON usage_records
@@ -426,6 +438,12 @@ func (s *Store) ensureColumns() error {
 		// Key 维度每分钟限速（DESIGN §11.4，2026-10-04 落地）：0 = 不限。
 		{"access_keys", "rpm_limit", "INTEGER NOT NULL DEFAULT 0"},
 		{"access_keys", "tpm_limit", "INTEGER NOT NULL DEFAULT 0"},
+		// 配额在途预占列（2026-10-07 计费修复 P0-2）。为什么在 CREATE TABLE 里
+		// 写了还要在这里再写一遍：`CREATE TABLE IF NOT EXISTS` 对**已存在**的表
+		// 是空操作，老库升级必须靠这里拿到该列 —— 缺了它 ReserveQuota 的
+		// SELECT/UPDATE 直接报「无此列」，配额预检 fail-open，终身配额整体失效。
+		// NOT NULL DEFAULT 0：ALTER 加列时存量行自动填 0（无在途预占），语义正确。
+		{"access_keys", "reserved_tokens", "INTEGER NOT NULL DEFAULT 0"},
 		// 模型单价（元 / 百万 tokens），可空：NULL = 未配置价格，统计费用按 0 计。
 		// price_input 是「缓存未命中输入」单价；命中的输入另按 price_cache_hit 计
 		// （为 0 时回退到 price_input，见 usage_dao 的费用口径）。

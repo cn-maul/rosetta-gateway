@@ -214,7 +214,12 @@ func (h *UserHandler) CreateUser(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 密码可以留空（建号后由本人设置，或管理员稍后重置）。
+	// 密码对普通用户可以留空：空密码账号登不进去，由管理员稍后重置（普通
+	// 用户没有自助设密通道，那等于绕过管理员）。**admin 没有留空的资格**：
+	// 空密码 admin 会让引导判定（存在 role=admin 且 password_hash='' 的账号）
+	// 重新命中，而免鉴权的 POST /admin/api/bootstrap 恰好认这个条件 ——
+	// 任何能连到端口的人都能给该账号设上自己的密码并直接拿到 admin 会话。
+	// 在产生的源头堵住（一次性 marker 是第二层防线，见 user_handler.go）。
 	hash := ""
 	if req.Password != "" {
 		var err error
@@ -223,6 +228,9 @@ func (h *UserHandler) CreateUser(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusBadRequest, err.Error())
 			return
 		}
+	} else if role == store.RoleAdmin {
+		writeError(w, http.StatusBadRequest, "创建管理员必须设置初始密码（admin 不允许空密码账号）")
+		return
 	}
 
 	u := &store.User{
@@ -254,18 +262,19 @@ func (h *UserHandler) CreateUser(w http.ResponseWriter, r *http.Request) {
 		writeServerError(w, "create user", err)
 		return
 	}
-	// 新建用户若带分组，其模型可见性已被收窄，必须重建快照才对数据面生效
-	// —— 否则「刚建好就能看到全部模型，过一会儿才变正常」。
-	if u.GroupID != "" {
-		if err := h.reloadNow(r.Context()); err != nil {
-			writeServerError(w, "reload after user create", err)
-			return
-		}
-	}
+	// 新建用户若带分组，其模型可见性已被收窄，需要重建快照才对数据面生效。
+	// 重建统一由外层 server.AutoReload 负责，handler 不再自己调：此前这里的
+	// 同步重建一旦失败就回 500，而 AutoReload 对 >=400 的响应直接返回 ——
+	// 既不审计也不 MarkDirty，后台兜底完全不触发，库里的写却已提交，数据面
+	// 继续按旧快照放行（这正是本缺陷的形态）。重建的唯一所有者是 AutoReload。
 	writeJSON(w, http.StatusCreated, toUserResponse(u, "", 0))
 }
 
-// reloadNow 在注入过 reload 时重建运行时快照（测试里可能没注入）。
+// reloadNow 保留但已无调用点：运行时快照的重建统一由外层 server.AutoReload
+// 负责（成功触发一次；失败置脏，交 cmd/gateway 的后台重试兜底收敛）。
+// 此前各 handler 自己同步重建，失败即回 500，恰好绕过 AutoReload 的
+// 兜底路径。函数与 reload 字段仅为兼容构造注入面保留（cmd/gateway/main.go
+// 仍经 WithReload 注入），新代码不要再调用。
 func (h *UserHandler) reloadNow(ctx context.Context) error {
 	if h.reload == nil {
 		return nil
@@ -315,10 +324,11 @@ func (h *UserHandler) UpdateUser(w http.ResponseWriter, r *http.Request, id stri
 	isSelf := self != nil && self.ID == id
 
 	bumpVersion := false
-	// groupChanged 与 bumpVersion 分开：改分组**不需要**让会话失效
-	// （用户的身份没变），但**必须**重建快照（模型可见性随之改变）。
-	// 混用一个标志会导致「改个分组把所有人踢下线」这种不必要的副作用。
-	groupChanged := false
+	// 改分组与改角色/状态的语义边界：分组变化**不需要** bumpVersion ——
+	// 用户的身份没变，把会话踢下线是过度反应；它需要的是重建快照
+	// （模型可见性随之改变），生效由外层 server.AutoReload 统一承担。
+	// 这个边界此前由独立的 groupChanged 标志表达，重建收口到 AutoReload
+	// 后 handler 不再需要该标志，但「不混用两种失效语义」的原则不变。
 	if req.DisplayName != nil {
 		u.DisplayName = strings.TrimSpace(*req.DisplayName)
 	}
@@ -333,8 +343,9 @@ func (h *UserHandler) UpdateUser(w http.ResponseWriter, r *http.Request, id stri
 			return
 		}
 		if groupID != u.GroupID {
+			// 只改分组：不 bumpVersion（既有会话仍有效），模型可见性的生效
+			// 交给 AutoReload 的快照重建。
 			u.GroupID = groupID
-			groupChanged = true
 		}
 	}
 	if req.QuotaTokens != nil {
@@ -355,6 +366,17 @@ func (h *UserHandler) UpdateUser(w http.ResponseWriter, r *http.Request, id stri
 		}
 		if isSelf && role != store.RoleAdmin {
 			writeError(w, http.StatusBadRequest, "不能降低自己的权限（会把自己锁在门外）")
+			return
+		}
+		// 升级成 admin 前必须已有密码：空密码账号不能当管理员 —— 它会让
+		// 免鉴权引导端点（POST /admin/api/bootstrap）的判定重新命中，任何
+		// 能连到端口的人都能借道给它设上自己的密码并拿到 admin 会话。
+		// 只拦「user → admin」这一步；存量空密码 admin 改其它字段不受影响
+		// （那样只会把人锁死，堵不住任何口子）。拒绝而非代设密码：设密码
+		// 是管理员的显式动作（ResetPassword），顺手代劳会掩盖真实意图。
+		if role == store.RoleAdmin && u.Role != store.RoleAdmin && u.PasswordHash == "" {
+			writeError(w, http.StatusBadRequest,
+				"该账号尚未设置密码，请先为其重置密码，再升级为管理员")
 			return
 		}
 		if role != u.Role {
@@ -378,6 +400,11 @@ func (h *UserHandler) UpdateUser(w http.ResponseWriter, r *http.Request, id stri
 		}
 	}
 
+	// store.UpdateUser 刻意不写 auth_version（见 store.UpdateUser 注释）：
+	// 这里的 u 是读库时的旧快照，若随 UPDATE 把快照里的旧版本号写回，
+	// 读库与落库之间发生的改密（auth_version 已原子递增）会被覆盖回旧值，
+	// 改密前被窃取的旧 JWT 重新通过校验。角色/状态变更需要的会话失效
+	// 由下面的 BumpAuthVersion 承担 —— 它在 SQL 里相对递增，不依赖快照。
 	if err := h.store.UpdateUser(ctx, u); err != nil {
 		writeNotFoundOrError(w, "update user", "用户不存在", err)
 		return
@@ -389,15 +416,12 @@ func (h *UserHandler) UpdateUser(w http.ResponseWriter, r *http.Request, id stri
 		}
 		u.AuthVersion++
 	}
-	// 角色/状态/分组变了都要立刻重建快照：
+	// 角色/状态/分组变了都需要重建快照才能对数据面生效：
 	//   - 角色/状态 → 被禁用用户的 key 在数据面还能用；
 	//   - 分组     → 模型可见性（组白名单）在数据面还是旧的。
-	if bumpVersion || groupChanged {
-		if err := h.reloadNow(ctx); err != nil {
-			writeServerError(w, "reload after user update", err)
-			return
-		}
-	}
+	// 重建统一由外层 server.AutoReload 负责：handler 内的同步重建一旦失败
+	// 就回 500，AutoReload 对 >=400 的响应直接返回 —— 既不审计也不 MarkDirty，
+	// 后台兜底完全不触发，而库里的写已提交（与 CreateUser 同一缺陷形态）。
 
 	keys, _ := h.store.ListAccessKeysByUser(ctx, id)
 	writeJSON(w, http.StatusOK, toUserResponse(u, selfIDOf(self), len(keys)))
@@ -416,14 +440,10 @@ func (h *UserHandler) DeleteUser(w http.ResponseWriter, r *http.Request, id stri
 		writeNotFoundOrError(w, "delete user", "用户不存在", err)
 		return
 	}
-	// 名下 key 被外键级联删除，快照里的 KeysByHash 仍有旧条目
-	// （虽然它们已被禁用逻辑挡下，但 map 会一直涨）。重建后清掉。
-	if h.reload != nil {
-		if err := h.reload(r.Context()); err != nil {
-			writeServerError(w, "reload after user delete", err)
-			return
-		}
-	}
+	// 名下 key 被外键级联删除，快照里的 KeysByHash 仍有旧条目（虽然它们已被
+	// 禁用逻辑挡下，但 map 会一直涨），重建后清掉。重建统一由外层
+	// server.AutoReload 负责：handler 内的同步重建失败会回 500，恰好绕过
+	// AutoReload 的审计与置脏兜底（与 CreateUser/UpdateUser 同一缺陷形态）。
 	writeJSON(w, http.StatusOK, map[string]string{"status": "deleted"})
 }
 

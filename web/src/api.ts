@@ -189,21 +189,23 @@ export class ApiFail extends Error {
   }
 }
 
-async function request<T>(method: string, path: string, body?: unknown): Promise<T> {
+async function request<T>(method: string, path: string, body?: unknown, timeoutMs = 30_000): Promise<T> {
   const headers: Record<string, string> = {}
   if (auth.token) headers['Authorization'] = 'Bearer ' + auth.token
   if (body !== undefined) headers['Content-Type'] = 'application/json'
 
   // 超时：网关若挂起（连接不响应），没有 signal 的 fetch 会一直 pending，
   // 页面永远停在「加载中」。AbortSignal.timeout 到点主动中断，让 finally 收场。
-  // 30s 对管理端足够：这些接口不代理 /v1 长对话，最慢的 test/discover 也只是一次上游 /models。
+  // 默认 30s 对管理端足够：这些接口不代理 /v1 长对话。例外是真的要打上游的
+  // 端点（test/discover）：慢上游可能吃满设置页配的 upstream_timeout_ms，
+  // 调用方按需传更长的 timeoutMs，别在这里一刀切。
   let res: Response
   try {
     res = await fetch('/admin/api' + path, {
       method,
       headers,
       body: body === undefined ? undefined : JSON.stringify(body),
-      signal: AbortSignal.timeout(30_000),
+      signal: AbortSignal.timeout(timeoutMs),
     })
   } catch (e) {
     const name = e instanceof DOMException ? e.name : ''
@@ -240,26 +242,28 @@ async function request<T>(method: string, path: string, body?: unknown): Promise
   return data as T
 }
 
-export const get = <T>(path: string) => request<T>('GET', path)
+export const get = <T>(path: string, timeoutMs?: number) => request<T>('GET', path, undefined, timeoutMs)
 
 /**
- * 下载一个文件（导出配置用）。
+ * 下载一个文件（导出配置、调用历史 CSV 用）。
  *
- * 为什么不用 fetch + a[download]：那要求 blob URL 与 <a> 元素同源可用，
- * 而这里要处理的是服务端 Content-Disposition 里的文件名、以及可能很大的
- * 配置清单 —— 直接读 blob、复用同一个 URL 并及时 revoke，避免大文件在
- * 内存里留两份。
+ * 为什么不用 <a href> / window.open 直链：管理 API 的凭据由前端显式带
+ * Authorization 头（令牌在 sessionStorage），不依赖登录时种下的会话 cookie
+ * —— 直链在 cookie 缺失（过期被清、脚本环境）时会拿到一个 401 的 JSON
+ * 而不是文件，用户只会看到「下载了个打不开的东西」。走 fetch 还能复用
+ * request() 的 401 处理：会话失效时当场清令牌送回登录页。
  */
-async function downloadFile(path: string, body: unknown): Promise<void> {
-  const headers: Record<string, string> = { 'Content-Type': 'application/json' }
+async function download(method: string, path: string, body?: unknown, fallbackName = 'rosetta-config.json'): Promise<void> {
+  const headers: Record<string, string> = {}
   if (auth.token) headers['Authorization'] = 'Bearer ' + auth.token
+  if (body !== undefined) headers['Content-Type'] = 'application/json'
 
   let res: Response
   try {
     res = await fetch('/admin/api' + path, {
-      method: 'POST',
+      method,
       headers,
-      body: JSON.stringify(body),
+      body: body === undefined ? undefined : JSON.stringify(body),
       signal: AbortSignal.timeout(60_000),
     })
   } catch (e) {
@@ -292,7 +296,7 @@ async function downloadFile(path: string, body: unknown): Promise<void> {
   // 服务端给的文件名形如 rosetta-config-20261006-230815.json
   const cd = res.headers.get('Content-Disposition') ?? ''
   const m = /filename="?([^";]+)"?/.exec(cd)
-  const filename = m ? m[1] : 'rosetta-config.json'
+  const filename = m ? m[1] : fallbackName
 
   const blob = await res.blob()
   const url = URL.createObjectURL(blob)
@@ -309,7 +313,8 @@ async function downloadFile(path: string, body: unknown): Promise<void> {
     setTimeout(() => URL.revokeObjectURL(url), 0)
   }
 }
-export const post = <T>(path: string, body?: unknown) => request<T>('POST', path, body ?? {})
+export const post = <T>(path: string, body?: unknown, timeoutMs?: number) =>
+  request<T>('POST', path, body ?? {}, timeoutMs)
 export const put = <T>(path: string, body: unknown) => request<T>('PUT', path, body)
 export const patch = <T>(path: string, body: unknown) => request<T>('PATCH', path, body)
 export const del = <T>(path: string) => request<T>('DELETE', path)
@@ -356,11 +361,31 @@ import type {
   Stats,
   UsageGroupEntry,
   UsageHistoryPage,
+  HistoryFilters,
+  PruneResult,
+  RecomputeUsageResult,
   User,
   UserRole,
   UserStatus,
   Group,
 } from './types'
+
+/**
+ * 调用历史列表 / CSV 导出共用的 query 构造。
+ *
+ * 两个端点在后端共用同一套 WHERE（status / model / key_id 精确过滤），
+ * 这里也只写一处，避免「列表带过滤、导出丢过滤」的口径漂移。
+ * undefined / 空串的维度不拼进 query（后端视为不过滤）。
+ */
+function usageHistoryQuery(days: number, filters?: HistoryFilters): string {
+  const to = Date.now()
+  const from = to - days * 86400_000
+  const q = new URLSearchParams({ from: String(from), to: String(to) })
+  if (filters?.status) q.set('status', filters.status)
+  if (filters?.model) q.set('model', filters.model)
+  if (filters?.keyId) q.set('key_id', filters.keyId)
+  return q.toString()
+}
 
 export const api = {
   // providers
@@ -368,7 +393,8 @@ export const api = {
   createProvider: (b: ProviderCreatePayload) => mutate(() => post<Provider>('/providers', b)),
   updateProvider: (id: string, b: ProviderUpdatePayload) => mutate(() => patch<Provider>(`/providers/${id}`, b)),
   deleteProvider: (id: string) => mutate(() => del(`/providers/${id}`)),
-  testProvider: (id: string) => post<{ status?: string; message?: string }>(`/providers/${id}/test`),
+  testProvider: (id: string, timeoutMs?: number) =>
+    post<{ status?: string; message?: string }>(`/providers/${id}/test`, undefined, timeoutMs),
 
   // credentials（挂在 provider 下）
   credentials: (providerId: string) => get<Credential[]>(`/providers/${providerId}/credentials`),
@@ -456,6 +482,13 @@ export const api = {
     },
   ) => mutate(() => patch<AccessKey>(`/keys/${id}`, b)),
   deleteKey: (id: string) => mutate(() => del(`/keys/${id}`)),
+  /**
+   * 重算某把密钥的 used_tokens（配额漂移的自愈手段）。
+   *
+   * 刻意**不包 mutate**：它只修正库里的派生计数，不改路由/凭据快照，
+   * 没有「改完必须 reload」的语义。
+   */
+  recomputeKeyUsage: (id: string) => post<RecomputeUsageResult>(`/keys/${id}/recompute-usage`),
 
   // ---------- 多用户与会话 ----------
 
@@ -559,17 +592,30 @@ export const api = {
   // 而 request() 无条件 JSON.parse 一个文件大小的配置清单纯属浪费，
   // 真正需要读 JSON 的只有「导入前预览文件内容」那一步。
   exportConfig: (passphrase: string, includeCredentials: boolean) =>
-    downloadFile('/config-export/export', { passphrase, include_credentials: includeCredentials }),
+    download('POST', '/config-export/export', { passphrase, include_credentials: includeCredentials }),
   importConfig: (data: unknown, passphrase: string, dryRun: boolean) =>
     post<ConfigImportResult>('/config-export/import', { data, passphrase, dry_run: dryRun }),
   usageByDay: (from: number, to: number) => get<UsageGroupEntry[]>(`/usage/by-day?from=${from}&to=${to}`),
   usageByModel: (from = 0, to = Date.now()) => get<UsageGroupEntry[]>(`/usage/by-model?from=${from}&to=${to}&limit=10`),
   usageByKey: (from = 0, to = Date.now()) => get<UsageGroupEntry[]>(`/usage/by-key?from=${from}&to=${to}&limit=10`),
+  usageByProvider: (from = 0, to = Date.now()) =>
+    get<UsageGroupEntry[]>(`/usage/by-provider?from=${from}&to=${to}&limit=10`),
+  /**
+   * 手动触发用量归档剪枝（明细 → 按天累计）。
+   *
+   * 同样不包 mutate：动的是用量数据，运行时快照不受影响。
+   * 返回的 skipped=true 不是错误（水位已到位 / 无待归档数据），原因在 reason。
+   */
+  pruneUsage: () => post<PruneResult>('/usage/prune'),
+
   // 调用历史：分页查询（limit = 每页条数，offset = 偏移）。
   // 返回 { records, total }，total 是**过滤后的总条数**（不受分页影响）。
-  usageHistory: (days = 7, limit = 20, offset = 0) => {
-    const to = Date.now()
-    const from = to - days * 86400_000
-    return get<UsageHistoryPage>(`/usage/history?from=${from}&to=${to}&limit=${limit}&offset=${offset}`)
-  },
+  usageHistory: (days = 7, limit = 20, offset = 0, filters?: HistoryFilters) =>
+    get<UsageHistoryPage>(
+      `/usage/history?${usageHistoryQuery(days, filters)}&limit=${limit}&offset=${offset}`,
+    ),
+  // 调用历史 CSV 导出：与列表同参数。响应是文件，走 download() 而非 request()；
+  // 行数上限由后端钳制（maxUsageLimit），这里不重复传 limit。
+  exportUsageCSV: (days = 7, filters?: HistoryFilters) =>
+    download('GET', `/usage/history.csv?${usageHistoryQuery(days, filters)}`, undefined, 'usage-history.csv'),
 }

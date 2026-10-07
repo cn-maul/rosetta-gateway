@@ -85,6 +85,39 @@ func anthropicErrorType(code string, status int) string {
 // 由 Anthropic 自定义；SDK 依据它 + overloaded_error 类型做退避重试。
 const statusOverloaded = 529
 
+// ---- usage 编码（Anthropic 计费桶语义）----
+
+// anthropicUsageFields 把 rosetta 统一 Usage 翻译成 Anthropic wire 的 usage 对象。
+//
+// 关键在 input_tokens：SDK 的统一 Usage 沿 OpenAI 语义（CachedInputTokens ⊆
+// InputTokens，见 provider_anthropic.go 的 toUsage —— 它把缓存读写**折进**了
+// InputTokens），而 Anthropic wire 语义里 input_tokens / cache_read_input_tokens /
+// cache_creation_input_tokens 是**互斥**的计费桶。直接把统一 InputTokens 抄进
+// input_tokens 会把缓存 token 计两遍，下游按 Anthropic 口径计费时多收一次钱。
+// 所以这里先拆掉缓存部分（下限 0，防非同类上游报出含缓存的负差值），缓存
+// 读/写各填各的字段。
+//
+// emitInput 控制是否带 input_tokens：非流式恒带（官方响应里它是必有字段）；
+// 流式 message_delta 只有上游真的报了输入（原始 InputTokens > 0）才带 ——
+// message_start 阶段发 0 占位、终值在此补齐的既有约定保持不变。
+func anthropicUsageFields(u rosetta.Usage, emitInput bool) map[string]any {
+	uncached := u.InputTokens - u.CachedInputTokens - u.CachedCreationTokens
+	if uncached < 0 {
+		uncached = 0
+	}
+	usage := map[string]any{"output_tokens": u.OutputTokens}
+	if emitInput {
+		usage["input_tokens"] = uncached
+	}
+	if u.CachedInputTokens > 0 {
+		usage["cache_read_input_tokens"] = u.CachedInputTokens
+	}
+	if u.CachedCreationTokens > 0 {
+		usage["cache_creation_input_tokens"] = u.CachedCreationTokens
+	}
+	return usage
+}
+
 // ---- 非流式响应 ----
 
 // WriteAnthropicResponse 编码 Anthropic Messages 形状的非流式响应。
@@ -117,16 +150,9 @@ func WriteAnthropicResponse(w http.ResponseWriter, resp *rosetta.ChatResponse, m
 		}
 	}
 
-	usage := map[string]any{
-		"input_tokens":  resp.Usage.InputTokens,
-		"output_tokens": resp.Usage.OutputTokens,
-	}
-	if resp.Usage.CachedInputTokens > 0 {
-		usage["cache_read_input_tokens"] = resp.Usage.CachedInputTokens
-	}
-	if resp.Usage.CachedCreationTokens > 0 {
-		usage["cache_creation_input_tokens"] = resp.Usage.CachedCreationTokens
-	}
+	// 统一 Usage 的 InputTokens 已含缓存读写（OpenAI 语义），Anthropic wire
+	// 要求三桶互斥 —— 拆分逻辑见 anthropicUsageFields。
+	usage := anthropicUsageFields(resp.Usage, true)
 
 	id := resp.ID
 	if id == "" {
@@ -374,18 +400,10 @@ func (s *AnthropicSSE) Finish(status string, stop rosetta.StopReason, usage rose
 		return
 	}
 
-	u := map[string]any{"output_tokens": usage.OutputTokens}
 	// message_start 时 input 未知发了 0，这里补权威值。Anthropic 的增量
-	// usage 是累计口径，客户端以最终值计算成本。
-	if usage.InputTokens > 0 {
-		u["input_tokens"] = usage.InputTokens
-	}
-	if usage.CachedInputTokens > 0 {
-		u["cache_read_input_tokens"] = usage.CachedInputTokens
-	}
-	if usage.CachedCreationTokens > 0 {
-		u["cache_creation_input_tokens"] = usage.CachedCreationTokens
-	}
+	// usage 是累计口径，客户端以最终值计算成本。缓存 token 必须从 input_tokens
+	// 拆出、各填各的互斥计费桶（语义与拆分理由见 anthropicUsageFields）。
+	u := anthropicUsageFields(usage, usage.InputTokens > 0)
 	s.writeEvent("message_delta", map[string]any{
 		"type":  "message_delta",
 		"delta": map[string]any{"stop_reason": AnthropicStopReason(stop), "stop_sequence": nil},

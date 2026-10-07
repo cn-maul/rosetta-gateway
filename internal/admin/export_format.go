@@ -76,8 +76,11 @@ type credentialExport struct {
 	ProviderSlug string `json:"provider_slug"`
 	Label        string `json:"label"`
 	APIKey       string `json:"api_key"`
-	Enabled      bool   `json:"enabled"`
-	Weight       int    `json:"weight"`
+	// 指针而非 bool：导入侧要区分「文件显式写了 false」与「字段缺失」。
+	// 缺失（旧版导出体 / 手写文件）按 true 处理 —— 与该字段加入前的导入
+	// 行为一致；若用裸 bool，旧文件会把原本启用的凭据静默导成禁用。
+	Enabled *bool `json:"enabled,omitempty"`
+	Weight  int   `json:"weight"`
 }
 
 type modelExport struct {

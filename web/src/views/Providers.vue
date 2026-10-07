@@ -140,10 +140,16 @@ async function removeProvider(p: Provider) {
   }
 }
 
+// 「测试」按钮的客户端超时（FE-06）：测试走的是真实的上游调用，耗时由上游与
+// 设置页配的 upstream_timeout_ms 决定，不能沿用管理 API 的默认 30s。
+// 取「运行时非流式超时 + 5s 余量」，让后端先一步超时、把真实的失败原因带回来，
+// 而不是被浏览器端掐成一句「请求超时」。设置读取失败时退回 150s 保守值。
+const testTimeoutMs = ref(150_000 + 5_000)
+
 async function testProvider(p: Provider) {
   testing.value = p.id
   try {
-    const r = await api.testProvider(p.id)
+    const r = await api.testProvider(p.id, testTimeoutMs.value)
     toast(r.message || (r.status === 'ok' ? '连接正常' : '测试失败'), r.status === 'ok' ? 'ok' : 'err')
   } catch (e) {
     if ((e as { status?: number }).status !== 401) toast('测试失败：' + (e as Error).message, 'err')
@@ -341,7 +347,19 @@ async function removeModel(m: UpstreamModel) {
   }
 }
 
-onMounted(load)
+onMounted(() => {
+  load()
+  // 设置只需 upstream_timeout_ms 一个字段：拉不到（罕见）就保持保守值，
+  // 不阻塞列表加载。
+  api
+    .settings()
+    .then((s) => {
+      if (s.upstream_timeout_ms > 0) testTimeoutMs.value = s.upstream_timeout_ms + 5_000
+    })
+    .catch(() => {
+      /* 保持 150s 保守值 */
+    })
+})
 </script>
 
 <template>

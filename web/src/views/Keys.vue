@@ -258,6 +258,26 @@ async function removeKey(k: AccessKey) {
   }
 }
 
+// ---------- 重算用量 ----------
+// used_tokens 由数据库触发器单调累加、没有回退路径，一旦因 bug 偏高，
+// 配额预检会让这把 key 永远 429（死 key）。这里是唯一的界面自愈入口
+// （POST /keys/{id}/recompute-usage），按调用明细重算并覆盖计数。
+const recomputing = ref('')
+
+async function recomputeUsage(k: AccessKey) {
+  recomputing.value = k.id
+  try {
+    const r = await api.recomputeKeyUsage(k.id)
+    // 就地用返回的修正值刷新该行：其余行的状态（展开的弹窗等）不受打扰
+    k.used_tokens = r.used_tokens
+    toast(`已重算「${k.name}」用量：${fmtTokens(r.used_tokens)} tokens`)
+  } catch (e) {
+    if ((e as { status?: number }).status !== 401) toast('重算失败：' + (e as Error).message, 'err')
+  } finally {
+    recomputing.value = ''
+  }
+}
+
 onMounted(load)
 </script>
 
@@ -270,7 +290,9 @@ onMounted(load)
       </div>
       <div class="head-actions">
         <button class="btn" :disabled="loading" @click="load">刷新</button>
-        <button class="btn btn-primary" @click="openCreate">新建密钥</button>
+        <!-- 发 key 已收敛为管理员专属（与后端 POST /admin/api/keys 的 403 一致）：
+             自助发 key 能绕开管理员落在具体 key 上的禁用/限额/期限/IP。 -->
+        <button v-if="isAdmin()" class="btn btn-primary" @click="openCreate">新建密钥</button>
       </div>
     </div>
 
@@ -329,6 +351,9 @@ onMounted(load)
             </div>
           </div>
           <div class="row-side">
+            <button class="btn btn-sm btn-ghost" :disabled="recomputing === k.id" title="按调用明细重算已用 tokens（配额计数异常时使用）" @click="recomputeUsage(k)">
+              {{ recomputing === k.id ? '重算中…' : '重算用量' }}
+            </button>
             <button class="btn btn-sm btn-ghost" @click="openEdit(k)">编辑</button>
             <button class="btn btn-sm btn-danger" @click="removeKey(k)">删除</button>
             <button class="switch" :class="{ on: k.enabled }" :title="k.enabled ? '停用' : '启用'" @click="toggleKey(k)"></button>

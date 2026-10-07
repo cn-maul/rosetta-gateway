@@ -270,6 +270,72 @@ func TestBootstrapSetup_IgnoresNonAdminAccount(t *testing.T) {
 	}
 }
 
+// 标记已置时引导窗口必须**永久**关闭 —— 哪怕库里又出现了空密码 admin。
+//
+// 旧判定「存在 role=admin 且 password_hash='' 的账号」是窗口曾经开放的原因，
+// 不是开关：bug 期间建出/升级出的空密码 admin 会让仅凭该判定的窗口
+// 永久重开。修复后窗口绑定一次性标记（bootstrap_completed，与设密同事务
+// 写入），标记置位即关死。这里模拟 bug 期间的残留状态做行为断言。
+func TestBootstrapStatus_MarkerClosedDespiteEmptyPasswordAdmin(t *testing.T) {
+	st := newScopeStore(t)
+	h := NewUserHandler(st, newTestManager(t))
+	seedUninitializedAdmin(t, st)
+	// 真实完成一次引导（标记与密码同事务写入）。
+	if ok, err := st.SetInitialAdminPassword(t.Context(), "boot-admin",
+		"pbkdf2-sha256$210000$c2FsdA==$aGFzaA=="); err != nil || !ok {
+		t.Fatalf("complete bootstrap: ok=%v err=%v, want true", ok, err)
+	}
+	// 模拟 bug 期间残留的空密码 admin（创建入口已堵住，store 层直插只为测判定）。
+	if err := st.CreateUser(t.Context(), &store.User{
+		ID: "ghost-admin", Username: "ghost",
+		Role: store.RoleAdmin, Status: store.UserStatusActive, AuthVersion: 1,
+	}); err != nil {
+		t.Fatalf("seed empty-password admin: %v", err)
+	}
+
+	rec := httptest.NewRecorder()
+	h.BootstrapStatus(rec, jsonRequest(http.MethodGet, "/admin/api/bootstrap", nil))
+	var got bootstrapStatusResponse
+	decodeBody(t, rec, &got)
+	if got.NeedsSetup {
+		t.Error("needs_setup = true although bootstrap already completed; the unauthenticated window must not reopen")
+	}
+	if got.Username != "" {
+		t.Errorf("username = %q, want empty (no setup pending)", got.Username)
+	}
+}
+
+// 标记已置时 POST bootstrap 必须 409，且不给任何账号设上密码 ——
+// 包括库里恰好存在的空密码 admin（P0-4 的行为断言）。
+func TestBootstrapSetup_MarkerClosedBlocksEmptyPasswordAdmin(t *testing.T) {
+	st := newScopeStore(t)
+	h := NewUserHandler(st, newTestManager(t))
+	seedUninitializedAdmin(t, st)
+	if ok, err := st.SetInitialAdminPassword(t.Context(), "boot-admin",
+		"pbkdf2-sha256$210000$c2FsdA==$aGFzaA=="); err != nil || !ok {
+		t.Fatalf("complete bootstrap: ok=%v err=%v, want true", ok, err)
+	}
+	if err := st.CreateUser(t.Context(), &store.User{
+		ID: "ghost-admin", Username: "ghost",
+		Role: store.RoleAdmin, Status: store.UserStatusActive, AuthVersion: 1,
+	}); err != nil {
+		t.Fatalf("seed empty-password admin: %v", err)
+	}
+
+	rec := httptest.NewRecorder()
+	h.BootstrapSetup(rec, jsonRequest(http.MethodPost, "/admin/api/bootstrap",
+		strings.NewReader(`{"password":"Attacker#2026pw"}`)))
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("status = %d body=%s, want 409 (window must be closed by the marker)", rec.Code, rec.Body.String())
+	}
+	if userauth.VerifyPassword(mustHash(t, st, "ghost-admin"), "Attacker#2026pw") {
+		t.Fatal("attacker took over the empty-password admin via bootstrap after the window was closed")
+	}
+	if userauth.VerifyPassword(mustHash(t, st, "boot-admin"), "Attacker#2026pw") {
+		t.Fatal("attacker overwrote the initialized admin password")
+	}
+}
+
 func mustAuthVersion(t *testing.T, st *store.Store, id string) int64 {
 	t.Helper()
 	u, err := st.GetUser(t.Context(), id)

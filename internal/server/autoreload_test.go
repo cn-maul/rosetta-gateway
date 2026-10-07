@@ -31,7 +31,7 @@ func TestAutoReload_TriggersOnSuccessfulWrite(t *testing.T) {
 			w.WriteHeader(http.StatusOK)
 		}
 	})
-	h := AutoReload(base, reload, audit, logger)
+	h := AutoReload(base, reload, audit, logger, nil)
 
 	call := func(method, path string) {
 		t.Helper()
@@ -85,7 +85,7 @@ func TestAutoReload_AuditCapturesFieldNames(t *testing.T) {
 	}
 	reload := func(context.Context) error { return nil }
 	base := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {})
-	h := AutoReload(base, reload, audit, newTestLogger())
+	h := AutoReload(base, reload, audit, newTestLogger(), nil)
 
 	rec := httptest.NewRecorder()
 	sw := &statusResponseWriter{ResponseWriter: rec, statusCode: http.StatusOK}
@@ -116,7 +116,7 @@ func TestAutoReload_ReloadFailureIsLoggedNotPanicked(t *testing.T) {
 	base := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 	})
-	h := AutoReload(base, reload, nil, newTestLogger())
+	h := AutoReload(base, reload, nil, newTestLogger(), nil)
 
 	rec := httptest.NewRecorder()
 	sw := &statusResponseWriter{ResponseWriter: rec, statusCode: http.StatusOK}

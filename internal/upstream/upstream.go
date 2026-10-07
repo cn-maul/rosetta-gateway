@@ -563,6 +563,28 @@ func (p *Pool) RecordTargetSuccess(targetID string) {
 	}
 }
 
+// ReleaseTargetProbe 归还一次**未走到记账**的探测名额。
+//
+// 名额的正常出路是 RecordTargetSuccess / RecordTargetFailure，但热路径上有
+// 两种合法形态既领了名额、又永远不会走到记账：
+//  1. 不可转移错误（如上游 400）：不参与故障转移记账，直接沿链返回；
+//  2. 客户端中断：刻意不记失败（把用户点「停止」算成目标故障会把健康目标
+//     误熔断），同样直接返回。
+//
+// 两种形态若不显式归还，halfOpen 永久卡在 true，该目标被 ClaimTargetProbe
+// 恒拒绝 —— 一次 400 就把链上的目标废到下一次 Install 为止，且这正发生在
+// 上游故障期间（本来就在频繁转移）。
+//
+// 不得在已调用 Record* 之后再调：halfOpen 是共享 bool 而非计数，重复归还会
+// 错清并发请求刚领到的名额。调用方用「已记账则不归还」的本地标志保证这一点。
+func (p *Pool) ReleaseTargetProbe(targetID string) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if h, ok := p.targets[targetID]; ok {
+		h.halfOpen = false
+	}
+}
+
 func (p *Pool) TestConnection(ctx context.Context, providerSlug string) error {
 	client, _, err := p.GetAnyClient(providerSlug)
 	if err != nil {

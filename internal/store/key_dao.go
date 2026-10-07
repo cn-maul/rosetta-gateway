@@ -423,6 +423,16 @@ func (s *Store) RecomputeUsedTokens(ctx context.Context, keyID string) (int64, e
 // 更要命的是「数十倍」而不是「多一个」：剩余额度 1000 token 时，
 // 50 个并发请求每个预估 200 token，check-then-act 会让它们全部通过。
 //
+// # 为什么预占写独立的 reserved_tokens 列，而不是 used_tokens
+//
+// used_tokens 由 usage_records 的 AFTER INSERT 触发器实时累加（store.go 的
+// trg_update_used_tokens），真实用量落库时它**自己会涨**。旧实现把预占也加进
+// used_tokens、收尾 ReleaseQuota 按 actual-est 补差，一次请求的净记账是
+// est + actual + (actual - est) = 2×actual —— 每个请求双倍扣费
+// （2026-10-07 修复的 P0-2）。现在预占单独落在 reserved_tokens：
+// 判定用 used+reserved+est 三者之和，释放原额退 reserved_tokens，
+// used_tokens 全程只归触发器管，两个口径不再纠缠。
+//
 // # 为什么不能用 ratelimit 的窗口限速器
 //
 // TPM 限的是**速率**（每分钟窗口，窗口一翻自然释放）；配额限的是**终身累计**，
@@ -445,10 +455,10 @@ func (s *Store) ReserveQuota(ctx context.Context, id string, est int64) (reserve
 	}
 	defer func() { _ = tx.Rollback() }() //nolint:errcheck // 已提交时是 no-op
 
-	var quota, used int64
+	var quota, used, reservedNow int64
 	err = tx.QueryRowContext(ctx,
-		`SELECT quota_tokens, used_tokens FROM access_keys WHERE id = ?`, id).
-		Scan(&quota, &used)
+		`SELECT quota_tokens, used_tokens, reserved_tokens FROM access_keys WHERE id = ?`, id).
+		Scan(&quota, &used, &reservedNow)
 	if errors.Is(err, sql.ErrNoRows) {
 		return 0, false, nil
 	}
@@ -459,13 +469,19 @@ func (s *Store) ReserveQuota(ctx context.Context, id string, est int64) (reserve
 	if quota <= 0 {
 		return 0, true, tx.Commit()
 	}
-	if used+est > quota {
+	// 判定必须计入**在途预占**：used 只含已落库的真实用量，不含尚未终结的
+	// 请求。漏掉 reservedNow，并发的第二个请求会在第一个收尾前看到假性余量
+	// —— 正是预占要堵住的 check-then-act 窗口，只是从「读-写分离」换成了
+	// 「列分离」的形态。
+	if used+reservedNow+est > quota {
 		return 0, false, nil // 剩余额度不够本次预估
 	}
-	// 同一事务内把 used 推上去：并发请求在此处被 SQLite 写锁串行化，
-	// 第二个请求进来时读到的 used 已经含第一个的预占。
+	// 同一事务内把预占推上去：并发请求在此处被 SQLite 写锁串行化，
+	// 第二个请求进来时读到的 reserved_tokens 已含第一个的预占。
+	// 刻意**不写 used_tokens**：真实用量由触发器在 usage 落库时累加，
+	// 这里再写就是双倍记账（见上方「列分离」的说明）。
 	if _, err := tx.ExecContext(ctx,
-		`UPDATE access_keys SET used_tokens = used_tokens + ? WHERE id = ?`, est, id); err != nil {
+		`UPDATE access_keys SET reserved_tokens = reserved_tokens + ? WHERE id = ?`, est, id); err != nil {
 		return 0, false, err
 	}
 	if err := tx.Commit(); err != nil {
@@ -474,25 +490,25 @@ func (s *Store) ReserveQuota(ctx context.Context, id string, est int64) (reserve
 	return est, true, nil
 }
 
-// ReleaseQuota 把一次请求的预占校正为真实用量 actual。
+// ReleaseQuota 原额退掉一次请求的配额预占（按 reserved 全额退，不补差）。
 //
-// 语义与 TPM 的 CommitTPM 相同：预占 est、实际可能更大或更小。
-// 差值补齐/退回，保证 used_tokens 终态与真实消耗一致。
+// 真实用量**不在这里记账**：usage_records 落库时触发器已把 total_tokens 累进
+// used_tokens，这里再按 actual-est 补差就是双倍扣费（2026-10-07 修复的 P0-2，
+// 「差值补齐/退回」的旧语义随之作废）。actual 参数因此不再需要。
 //
-// actual 由调用方从上游 usage 得出；查不到 usage 时传 0 —— 那会让 used
-// 比真实少计，但**宁可少算**：多算会把用户挡在门外（且没有任何解释），
-// 而 usage_state="missing" 已让漏账在报表里可见（见 DESIGN §17 R9）。
-func (s *Store) ReleaseQuota(ctx context.Context, id string, reserved, actual int64) error {
+// 上游没报 usage 时调用方**也必须**调用本方法：预占按 max_tokens 全额计，
+// 不退就是每次 missing 请求永久吃掉一笔额度（修复前整条收尾被跳过的正是
+// 这种情况）。漏账本身已由 usage_state="missing" 在报表里可见
+// （见 DESIGN §17 R9）—— 报表可见与额度可回收是两回事，后者不能省。
+//
+// 用 MAX(0, …) 夹住下界：重复释放或与其它路径的释放竞争时可能退过头，
+// reserved_tokens 变负等于凭空多出额度，后续 used+reserved+est 判定会被
+// 静默放宽。
+func (s *Store) ReleaseQuota(ctx context.Context, id string, reserved int64) error {
 	if reserved <= 0 {
 		return nil
 	}
-	delta := actual - reserved
-	if delta == 0 {
-		return nil
-	}
-	// 不允许把 used 推成负数：actual=0 且 reserved>0 时 delta 为负，
-	// 而 used_tokens 里可能已含此前的真实用量，下调到负数会破坏后续所有判定。
 	_, err := s.db.ExecContext(ctx,
-		`UPDATE access_keys SET used_tokens = MAX(0, used_tokens + ?) WHERE id = ?`, delta, id)
+		`UPDATE access_keys SET reserved_tokens = MAX(0, reserved_tokens - ?) WHERE id = ?`, reserved, id)
 	return err
 }

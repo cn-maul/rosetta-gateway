@@ -48,7 +48,15 @@ type WriteAuditor func(method, path string, status int, remote, fields string)
 // 不该把重建一起取消，否则这次写入会悬空到下一次触发。
 // 重建失败时响应已发出、无法改写，只能 ERROR 留痕 —— 运行时与库的分叉
 // 由下一次写操作或手动 reload 收敛。
-func AutoReload(next http.Handler, reload func(context.Context) error, audit WriteAuditor, logger *slog.Logger) http.Handler {
+// onFail 在重建失败时被调用，用于通知调用方「需要后台兜底重试」。
+//
+// 为什么是显式参数而不是从 reload 函数做类型断言：reload 是
+// func(context.Context) error，函数类型不能做类型断言（编译期就报）。
+// 而从签名里加一个可选回调既保持了 AutoReload 与 reload 的解耦，
+// 又让「失败要置脏」这件事在签名上可见 —— 读函数签名就知道有兜底。
+//
+// 传 nil 表示不兜底（测试里用普通 reload 桩即可，无需实现任何接口）。
+func AutoReload(next http.Handler, reload func(context.Context) error, audit WriteAuditor, logger *slog.Logger, onFail func()) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		// 请求体只在此处缓存一份（上限 maxAuditBodyBytes）：handler 要读，审计要字段名。
 		// 超过上限时**必须原样放行**：body 被截断后 handler 会拿残缺 JSON 去解析，
@@ -113,9 +121,21 @@ func AutoReload(next http.Handler, reload func(context.Context) error, audit Wri
 		ctx, cancel := context.WithTimeout(context.Background(), autoReloadTimeout)
 		defer cancel()
 		if err := reload(ctx); err != nil {
-			logger.Error("auto reload after admin write failed; runtime lags behind database until next reload",
+			logger.Error("auto reload after admin write failed; runtime lags behind database",
 				"error", err, "path", p,
 				"request_id", RequestIDFromContext(r.Context()))
+			// 置脏标志，让后台重试兜底。
+			//
+			// 不置的后果：响应早已是 200 +「已禁用」，而数据面继续放行该 key，
+			// 直到下一次任意 admin 写操作碰巧成功才收敛 —— 对「禁用下游 Key」
+			// 这类安全敏感操作是**无限期失效**，且除了这条早已被淹没的 ERROR
+			// 没有任何迹象指向「现在还在放行」。
+			//
+			// markDirty 必须是幂等的（只在首次置位时记时刻），否则每次失败
+			// 都会刷新 dirtySince，让「已持续多久」永远显示为 0。
+			if onFail != nil {
+				onFail()
+			}
 		}
 	})
 }

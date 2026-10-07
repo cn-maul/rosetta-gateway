@@ -462,3 +462,60 @@ func TestFailover_StreamSwitchesOnFirstTokenTimeout(t *testing.T) {
 		t.Fatalf("expected served-by-good stream content, body=%s", rec.Body.String())
 	}
 }
+
+// fakeLeakProbe 链首目标：call1 返回 404（可转移且**零凭据冷却**，顺带在池里
+// 建立健康条目 —— 不能用 500 起手：60s 凭据冷却会把后续请求挡在
+// GetAnyClient，遮蔽探测名额这条被测路径），call2 返回 400（不可转移），
+// call3 起恢复 200。
+// 专用于复现 P1-1「探测名额泄漏」。
+func fakeLeakProbe() *httptest.Server {
+	var calls atomic.Int64
+	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch calls.Add(1) {
+		case 1:
+			w.WriteHeader(http.StatusNotFound)
+			_, _ = w.Write([]byte(`{"error":{"message":"model not found","type":"invalid_request_error"}}`))
+		case 2:
+			w.WriteHeader(http.StatusBadRequest)
+			_, _ = w.Write([]byte(`{"error":{"message":"bad request","type":"invalid_request_error"}}`))
+		default:
+			_, _ = w.Write([]byte(`{"id":"cmpl-1","object":"chat.completion","created":0,
+				"model":"good-model",
+				"choices":[{"index":0,"message":{"role":"assistant","content":"pong"},"finish_reason":"stop"}],
+				"usage":{"prompt_tokens":5,"completion_tokens":3,"total_tokens":8}}`))
+		}
+	}))
+}
+
+// 一次不可转移错误（上游 400）不得把 half-open 探测名额占死（P1-1）。
+//
+// 时序：req1 打链首 404 → 可转移、记账（条目建立）→ 转移到次目标 500 →
+// 整链 502。req2 打链首 400 → 不可转移、刻意不记账；修复前名额在此泄漏，
+// req3 对链首的 ClaimTargetProbe 恒 false，被迫落到恒 500 的次目标 → 502；
+// 修复后名额由循环尾部显式归还，req3 应再次打到链首并拿到 200。
+func TestFailover_NonTransferableErrorReleasesProbeSlot(t *testing.T) {
+	leak := fakeLeakProbe()
+	bad := fakeBad()
+	defer leak.Close()
+	defer bad.Close()
+
+	h, _, _ := buildHarnessFull(t, []struct {
+		slug, url string
+		fail      bool
+	}{
+		{"p1", leak.URL, true},
+		{"p2", bad.URL, true},
+	}, true, openaiChatCodec{})
+
+	if rec := postChat(h, "flash"); rec.Code != http.StatusBadGateway {
+		t.Fatalf("req1: want 502 (both upstreams fail), got %d body=%s", rec.Code, rec.Body.String())
+	}
+	if rec := postChat(h, "flash"); rec.Code != http.StatusBadRequest {
+		t.Fatalf("req2: want 400 (non-transferable error surfaced as-is), got %d body=%s", rec.Code, rec.Body.String())
+	}
+	// 修复前这条必 502：名额被 req2 占死，已恢复的链首被跳过。
+	if rec := postChat(h, "flash"); rec.Code != http.StatusOK {
+		t.Fatalf("req3: want 200 (probe slot must be released after non-transferable 400), got %d body=%s", rec.Code, rec.Body.String())
+	}
+}

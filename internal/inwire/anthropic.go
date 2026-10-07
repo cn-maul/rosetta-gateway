@@ -21,9 +21,9 @@ import (
 //   - cache_control（Claude Code 依赖它做提示缓存）逐块透传给 rosetta；
 //     OpenAI 系上游自动忽略。
 //   - top_k / tool_choice 不是 rosetta 建模字段：anthropic 上游经 Extra 原样
-//     透传，openai-chat 上游把 tool_choice 翻译成 OpenAI 形状，top_k 丢弃
-//     （OpenAI chat 没有这个旋钮）。rosessta 的保留键校验已确认这两个键
-//     不在两个协议的保留集合里，不会撞车。
+//     透传，openai-chat / openai-responses 上游把 tool_choice 翻译成各自形状
+//     （能等价翻译的必须翻译），top_k 丢弃（OpenAI 系没有这个旋钮）。
+//     rosetta 的保留键校验已确认这两个键不在各协议的保留集合里，不会撞车。
 
 type AnthropicMessagesRequest struct {
 	Model     string             `json:"model"`
@@ -216,8 +216,14 @@ func (a *AnthropicMessagesRequest) ToRosetta() *rosetta.ChatRequest {
 }
 
 // ApplyUpstreamExtras 把 Anthropic 入口的协议私有字段挂到 req.Extra。
-// 门的开口方向与 OpenAI 入口相反：这里只有 anthropic 上游拿原样字段，
-// openai-chat 拿翻译后的 tool_choice，responses 上游两者皆跳过。
+// 门的开口方向与 OpenAI 入口相反：anthropic 上游拿原样字段，openai-chat /
+// openai-responses 拿翻译后的 tool_choice，top_k 谁都拿不到（只有 Anthropic
+// 有这个旋钮）。
+//
+// openai-responses 分支（2026-10-07 P1-8）：此前对 responses 整个跳过、把
+// tool_choice 静默丢掉 —— 故障转移前后同一请求行为不一致。现在做等价翻译
+// （映射见 AnthropicToolChoice.responsesValue）；top_k 在 Responses 无对应物，
+// 丢弃不改变正确性。
 func (a *AnthropicMessagesRequest) ApplyUpstreamExtras(req *rosetta.ChatRequest, protocol string) {
 	switch protocol {
 	case "anthropic":
@@ -243,6 +249,16 @@ func (a *AnthropicMessagesRequest) ApplyUpstreamExtras(req *rosetta.ChatRequest,
 		if v := a.ToolChoice.openAIValue(); v != nil {
 			mergeExtra(req, map[string]any{"tool_choice": v})
 		}
+	case "openai-responses":
+		if a.ToolChoice == nil {
+			return
+		}
+		if v := a.ToolChoice.responsesValue(); v != nil {
+			mergeExtra(req, map[string]any{"tool_choice": v})
+		}
+		// top_k 在 Responses API 无对应物：它是采样多样性旋钮（软偏好），
+		// 丢弃只改变采样倾向、不改变请求的正确性 —— 与结构化输出这类硬约束
+		// 的处置（网关层拒绝）不同。
 	}
 }
 
@@ -281,6 +297,27 @@ func (t *AnthropicToolChoice) openAIValue() any {
 			"type":     "function",
 			"function": map[string]any{"name": t.Name},
 		}
+	}
+	return nil
+}
+
+// responsesValue 把 Anthropic 的 tool_choice 翻译成 Responses 的形状：
+// auto→"auto"、any→"required"、tool→{"type":"function","name"}。
+// "none" 返回 nil（丢弃）—— Responses 只表达「模型自主决定不调工具」，
+// 与 Anthropic 的 none（禁止调用已声明工具）语义并不完全对齐，且 OpenAI
+// 官方已将其归入 deprecated；翻译过去只会造成两协议行为漂移的错觉。
+// 不认识的类型返回 nil（上层跳过）—— decode 已把类型收敛到白名单，这是防御。
+func (t *AnthropicToolChoice) responsesValue() any {
+	switch t.Type {
+	case "auto":
+		return "auto"
+	case "any":
+		return "required"
+	case "tool":
+		if t.Name == "" {
+			return nil
+		}
+		return map[string]any{"type": "function", "name": t.Name}
 	}
 	return nil
 }

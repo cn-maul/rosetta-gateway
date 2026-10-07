@@ -621,3 +621,80 @@ func mustMarshal(t *testing.T, v any) []byte {
 	}
 	return b
 }
+
+// CONFIG-01 回归：导入不得绕过 provider/model handler 的数值校验，
+// 凭据的 Enabled 必须跟随导出文件而不是硬编码 true。
+//
+// 原先 timeout_ms 超大的文件照单全收 —— time.Duration 回绕成负数后该
+// provider 的请求当场全挂；负单价原样落库，该模型每次调用倒贴钱；
+// 导出里被禁用的凭据导入后静默复活。
+func TestImportValidatesNumericFieldsAndHonorsCredentialEnabled(t *testing.T) {
+	dst, _ := transferFixture(t)
+	enabled := true
+	disabled := false
+	file := configExport{
+		Version: exportFormatVersion,
+		Providers: []providerExport{
+			{Slug: "bad-timeout", Name: "Bad Timeout", Protocol: "openai-chat",
+				Endpoint: "https://x.example.com/v1", Enabled: true,
+				TimeoutMs: config.MaxDurationMillis + 1},
+			{Slug: "bad-retries", Name: "Bad Retries", Protocol: "openai-chat",
+				Endpoint: "https://x.example.com/v1", MaxRetries: -1},
+			{Slug: "good", Name: "Good", Protocol: "openai-chat",
+				Endpoint: "https://x.example.com/v1", Enabled: true},
+		},
+		Models: []modelExport{
+			{ProviderSlug: "good", ModelID: "m-neg-price", Enabled: true, PriceInput: -0.5},
+			{ProviderSlug: "good", ModelID: "m-ok", Enabled: true, PriceInput: 1.5, PriceOutput: 6},
+		},
+		Credentials: []credentialExport{
+			{ProviderSlug: "good", Label: "off", APIKey: "sk-disabled", Enabled: &disabled},
+			{ProviderSlug: "good", Label: "legacy", APIKey: "sk-legacy", Enabled: &enabled},
+			// 旧版导出体 / 手写文件没有 enabled 字段：按 true 处理。
+			{ProviderSlug: "good", Label: "missing-field", APIKey: "sk-missing"},
+		},
+	}
+
+	resp := importInto(t, dst, importRequest{Data: file})
+
+	provs, _ := dst.store.ListProviders(context.Background())
+	slugs := map[string]bool{}
+	for _, p := range provs {
+		slugs[p.Slug] = true
+	}
+	if slugs["bad-timeout"] || slugs["bad-retries"] {
+		t.Fatalf("非法数值的供应商不该落库，实际落了：%v", slugs)
+	}
+	if !slugs["good"] {
+		t.Fatalf("合法供应商 good 没有落库：%v", slugs)
+	}
+	if len(resp.Warnings) < 2 {
+		t.Fatalf("非法供应商应留下告警，实际 warnings=%v", resp.Warnings)
+	}
+
+	var goodID string
+	for _, p := range provs {
+		if p.Slug == "good" {
+			goodID = p.ID
+		}
+	}
+	models, _ := dst.store.ListUpstreamModels(context.Background(), goodID)
+	if len(models) != 1 || models[0].ModelID != "m-ok" {
+		t.Fatalf("负单价模型应被跳过、正常模型应落库，实际 %+v", models)
+	}
+
+	creds, _ := dst.store.ListCredentials(context.Background(), goodID)
+	states := map[string]bool{}
+	for _, c := range creds {
+		states[c.Label] = c.Enabled
+	}
+	if len(creds) != 3 {
+		t.Fatalf("应落库 3 条凭据，实际 %d", len(creds))
+	}
+	if states["off"] {
+		t.Errorf("文件里禁用的凭据被导入成启用（CONFIG-01 原缺陷）")
+	}
+	if !states["legacy"] || !states["missing-field"] {
+		t.Errorf("显式 true 与字段缺失都应导入为启用：%v", states)
+	}
+}
