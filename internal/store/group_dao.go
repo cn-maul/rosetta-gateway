@@ -156,6 +156,48 @@ func (s *Store) CountGroups(ctx context.Context) (int, error) {
 	return n, err
 }
 
+// GroupBindingCount 是分组被账号与访问密钥直接引用的数量。
+// 两类引用都会阻止删除，必须分别暴露，不能用账号数代替全部约束。
+type GroupBindingCount struct {
+	Users int
+	Keys  int
+}
+
+// ListGroupBindingCounts 一次性返回全部分组的绑定数量，供管理列表展示。
+// 使用相关子查询避免为了两个数字读出用户密码哈希或访问密钥哈希。
+func (s *Store) ListGroupBindingCounts(ctx context.Context) (map[string]GroupBindingCount, error) {
+	rows, err := s.read.QueryContext(ctx, `
+		SELECT g.id,
+		       (SELECT COUNT(*) FROM users u WHERE u.group_id = g.id),
+		       (SELECT COUNT(*) FROM access_keys k WHERE k.group_id = g.id)
+		FROM groups g`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	out := make(map[string]GroupBindingCount)
+	for rows.Next() {
+		var id string
+		var count GroupBindingCount
+		if err := rows.Scan(&id, &count.Users, &count.Keys); err != nil {
+			return nil, err
+		}
+		out[id] = count
+	}
+	return out, rows.Err()
+}
+
+// CountGroupBindings 返回单个分组的绑定数量，供删除冲突响应给出处置依据。
+func (s *Store) CountGroupBindings(ctx context.Context, groupID string) (GroupBindingCount, error) {
+	var count GroupBindingCount
+	err := s.read.QueryRowContext(ctx, `
+		SELECT (SELECT COUNT(*) FROM users WHERE group_id = ?),
+		       (SELECT COUNT(*) FROM access_keys WHERE group_id = ?)`, groupID, groupID).
+		Scan(&count.Users, &count.Keys)
+	return count, err
+}
+
 // CountGroupMembers 返回组内账号数。
 //
 // 存在的理由：删除被拒时要把「还有几个人」告诉管理员 —— 只说「删不掉」

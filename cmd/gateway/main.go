@@ -376,6 +376,11 @@ func main() {
 	adminMux.HandleFunc("PATCH /admin/api/users/{id}", func(w http.ResponseWriter, r *http.Request) { userHandler.UpdateUser(w, r, r.PathValue("id")) })
 	adminMux.HandleFunc("DELETE /admin/api/users/{id}", func(w http.ResponseWriter, r *http.Request) { userHandler.DeleteUser(w, r, r.PathValue("id")) })
 	adminMux.HandleFunc("POST /admin/api/users/{id}/password", func(w http.ResponseWriter, r *http.Request) { userHandler.ResetPassword(w, r, r.PathValue("id")) })
+	// 余额充值：走 adminMux 即自动要求管理员 + 记审计（AutoReload 对
+	// PUT 走审计分支，字段名由 extractFieldNames 自动取，见 autoreload.go）。
+	// 审计记的是**字段名**（delta_cents）而非数值 —— 这是既有审计的粒度，
+	// 不在本端点内改变。余额变更不需要重建快照：预检与扣费直接读库。
+	adminMux.HandleFunc("PUT /admin/api/users/{id}/balance", func(w http.ResponseWriter, r *http.Request) { userHandler.AdjustBalance(w, r, r.PathValue("id")) })
 	adminMux.HandleFunc("POST /admin/api/me/password", userHandler.ChangePassword)
 	// 分组与模型白名单（多用户改造 P1）。全部 admin-only ——
 	// server.AdminGateGuard 是**前缀白名单**，/groups 不在其中即自动要求管理员。
@@ -1420,6 +1425,30 @@ func handleIngress(pool *upstream.Pool, cfg *config.Config, usage *usageRecorder
 			return
 		}
 
+		// 余额预检（Lead 与用户确认的口径：预检拒绝，不做预占/退款）。
+		//
+		// 位置：白名单之后、触碰上游之前。理由与上面的白名单同级 —— 白名单
+		// 判定只是一次内存线性扫描（零 IO），而余额预检要**查库**；把便宜的
+		// 判定放前面，403 的语义就不会被 402 掩盖（一个无权用的模型，不该先
+		// 让调用方看到"你没钱"）。
+		//
+		// 位置与 token 配额预检（ReserveQuota，在 Resolve 之前）**不同**是有
+		// 意的：配额预检只要一个 est（估 token），不需要知道价格；而余额预检
+		// 必须知道单价，单价挂在**上游模型**上 → 必须先 Resolve 才知道这条链
+		// 上有哪些模型、各自多贵。两者都不打上游，顺序只影响错误码优先级。
+		//
+		// 与配额预检的另一处不同：**不做预占**。余额是浮点量，估算与真实值
+		// 必然不等，预占了就得退款（等于把 ReserveQuota/ReleaseQuota 那套再
+		// 实现一遍，而那正是 2026-10-07 的 P0-2 教训）。所以这里是纯查询。
+		if bal := precheckBalance(w, r, db, logger, authCtx, ing, res.Candidates, codec); !bal {
+			// 余额预检已写回 402/500。rate.commit(0) 不能省：走到这里说明
+			// TPM/配额预占可能已经立起来了（needEstimate 为真时），不退的话
+			// 它们会一直占着窗口/终身额度直到过期。与上面 model_not_allowed
+			// 的收尾同口径。
+			rate.commit(0)
+			return
+		}
+
 		// 尝试预算：链上按 position 升序最多打 maxTargets 个目标。
 		// 未开启故障转移 → 只打主目标（等价于改造前的单目标行为，零回归）。
 		// 策略值统一来自「设置」页写入的全局默认（快照），config 只作兜底。
@@ -2113,6 +2142,20 @@ func usageStateFor(u rosetta.Usage) string {
 	return "reported"
 }
 
+// usage_records.status / usage_state 的取值。
+//
+// 这两个字符串是 usage 记录的**判读字段**（报表、成功率、以及余额扣费的
+// 判据都在读它们），散成裸字面量时改一处忘一处的后果很隐蔽：扣费判据一旦
+// 与落库侧写的不一致，用户就会「明明成功却被免单」或「明明失败却被扣钱」，
+// 而这两种都**没有任何报错**。故在此固定成常量 —— 只给**新增**的判读方
+// （usageRecorder.charge）用，既有落库处的裸字面量保持原样，避免本次改动
+// 波及热路径上每一条 usage 记录。
+const (
+	// usageStatusOK 是「这次调用真的成功」。与 attemptOutcome.success 的
+	// 判据同源：流式只有 status=="ok" 才算成功，断流/溢出/中断都不是。
+	usageStatusOK = "ok"
+)
+
 // isClientGone 判断一次流式中断是否源于**客户端**断开，而不是上游故障。
 //
 // 请求 context 被取消（用户点「停止生成」、客户端进程退出、网络切换）时，
@@ -2164,12 +2207,98 @@ func newUsageRecorder(db *store.Store, logger *slog.Logger) *usageRecorder {
 }
 
 // worker 消费队列并落库，直到队列关闭。
+//
+// 落库**之后**按「请求是否成功」决定要不要扣余额（Lead 与用户确认的口径）。
+// 为什么扣费挂在落库之后、而不是请求结束时按内存里的估算扣：金额必须等于
+// 那条 usage 落库时固化的 cost_total。两处各算一份必然漂移，而漂移的后果是
+// 「报表显示花了 X、余额少了 Y」且无人能发现。所以这里用
+// CreateUsageRecordWithCost —— 它返回的**就是写进 cost_total 列的那个变量**
+// （不是重算一次），换句话说「扣的 = 报表的」在结构上就不可能漂移。
 func (u *usageRecorder) worker() {
 	defer u.wg.Done()
 	for rec := range u.queue {
-		if err := u.db.CreateUsageRecord(context.Background(), rec); err != nil {
+		cost, err := u.db.CreateUsageRecordWithCost(context.Background(), rec)
+		if err != nil {
 			u.logger.Error("failed to record usage", "error", err, "key_id", rec.AccessKeyID)
+			// 落库失败**不扣费**：账都记不下来时扣钱，等于凭空收了一笔
+			// 无据可查的费用。宁可漏扣（cost_total 侧有 RecomputeCost 事后
+			// 补救）也不做无据收费。
+			continue
 		}
+		u.charge(rec, cost)
+	}
+}
+
+// charge 对一条**已落库**的用量记录扣余额。cost 是本次落库时固化的费用（元），
+// 由 CreateUsageRecordWithCost 给出 —— 它与 cost_total 列是同一个值。
+//
+// # 只对成功的请求扣费（Lead 与用户确认的第四条口径）
+//
+// 判据是 usage_records.status == "ok"。它是「这一次调用真的成功」的既有
+// 事实来源，attemptStream/attemptNonStream 落库时就定好了，且**与熔断计数的
+// 判据是同一个**（见 attemptOutcome.success 的注释：committed 只说明字节已
+// 写出，断流/溢出也是 committed 却是失败）。用同一个判据，余额与健康度不会
+// 各说各话。
+//
+// 明确**不扣**的形态（它们都不该收用户钱）：上游错误与不可转移错误、
+// 流式截断/溢出/中断、客户端主动断开（canceled）、以及根本没碰上游就被拒的
+// 请求（限流、配额、余额预检自身、model_not_found）。后者压根不会走到这里
+// —— 没有 usage 记录可扣。
+//
+// 与 cost_total 的差别要记牢：cost_total **无论成败都记**（那是网关的上游
+// 成本），扣费**只看成功**（那是用户的应收）。同一次调用两个数相同、触发条件
+// 不同。见 billing.go 的口径说明。
+//
+// # 与 rateCommit 收尾的关系（两者互不干扰）
+//
+// rateCommit 管的是**预占**（TPM 窗口 + 终身 token 配额），它必须在请求
+// 结束那一刻收尾（流式是边写边收）。扣费管的是**实收**，它挂在 usage 落库
+// 之后、异步发生。两者没有共享状态：预占退回的是"还没花的额度"，扣费收的是
+// "已经花的钱"，方向相反不会互相抵消。
+//
+// usage missing（上游没报 token 数）时 cost_total 记 0 → 扣费也是 0
+// （store.ChargeBalance 对 0 元 no-op）。这与该路径"只退配额预占、保留 TPM
+// 预占"的既有决策不冲突：后者是终身累计不退就永久泄漏，前者随窗口翻转自愈，
+// 而我们收 0 元本来就是正确结果（不知道实际花了多少，就不该收钱）。
+func (u *usageRecorder) charge(rec *store.UsageRecord, costYuan float64) {
+	// 管理员短路（纵深防御：预检已短路，这里再判一次不依赖任何 DB 状态）。
+	if balanceExempt(rec.UserID) {
+		return
+	}
+	// 非成功不扣：见本函数「只对成功的请求扣费」。
+	if rec.Status != usageStatusOK {
+		return
+	}
+	// 空 request_id → 没有幂等键，扣费**不做**（宁可漏扣不可重复扣）。
+	//
+	// 生产里 request_id 由 server.Middleware 每个请求生成，必非空；为空
+	// 意味着有代码路径绕过了中间件，那属于异常而非常态。这里记 ERROR
+	// 而不是静默跳过 —— 漏扣是一次没人发现的钱（对账才看得出），而
+	// 无幂等的扣费会在重复收尾时**真的扣第二次**，用户立刻就会投诉。
+	// 两害相权取轻，但绝不无声无息。
+	if rec.RequestID == "" {
+		u.logger.Error("usage record has empty request_id, skipping charge (no idempotency key)",
+			"user_id", rec.UserID, "access_key_id", rec.AccessKeyID,
+			"public_model", rec.PublicModel, "cost_cents", store.YuanToCents(costYuan))
+		return
+	}
+	// 元 → 分走 store 的 YuanToCents（唯一实现）：预检侧估的与这里扣的
+	// 必须用同一个换算，否则「预检以为够、实际差一分钱」会成为常态。
+	err := u.db.ChargeBalance(context.Background(), rec.UserID,
+		store.YuanToCents(costYuan), rec.RequestID)
+	switch {
+	case err == nil:
+	case errors.Is(err, store.ErrInsufficientBalance):
+		// 预检在前，正常路径走不到这里。走到 = 并发透支或预检漏了。
+		// 此时上游已被调用、费用已固化进 cost_total，钱收不回，
+		// 「报欠费」比「悄悄放过」诚实。响应早已写出，改不了，只能记 ERROR。
+		u.logger.Error("charge failed: insufficient balance (precheck should have prevented this)",
+			"user_id", rec.UserID, "request_id", rec.RequestID,
+			"access_key_id", rec.AccessKeyID, "public_model", rec.PublicModel)
+	default:
+		u.logger.Error("failed to charge balance",
+			"error", err, "user_id", rec.UserID, "request_id", rec.RequestID,
+			"access_key_id", rec.AccessKeyID, "public_model", rec.PublicModel)
 	}
 }
 
@@ -2177,14 +2306,24 @@ func (u *usageRecorder) worker() {
 //
 // 队列满时退化为同步写：宁可让当前请求多等一次 SQLite 写，也不丢用量记录。
 // 同步写失败同样记日志，与异步路径口径一致。
+//
+// 扣费在两条路径上**都必须发生**，所以同步回退里那行 CreateUsageRecord 后面
+// 紧跟着 u.charge(rec)，与 worker 里完全一致。漏掉的后果是「队列一满，
+// 从此之后所有请求都不扣费」—— 一个只在高压时才出现、且不会有任何报错的
+// 漏收，正是 CreateUsageRecord 注释里说的「把'别忘了算'变成可以各自忘记的
+// 地方」。这里刻意不抽公共函数：两条路径的收尾已经足够短，抽出去反而让
+// 「它们是同一件事」这件事看不出来。
 func (u *usageRecorder) record(rec *store.UsageRecord) {
 	select {
 	case u.queue <- rec:
 	default:
 		// 队列已满 —— 背压：同步写。
-		if err := u.db.CreateUsageRecord(context.Background(), rec); err != nil {
+		cost, err := u.db.CreateUsageRecordWithCost(context.Background(), rec)
+		if err != nil {
 			u.logger.Error("failed to record usage (sync fallback)", "error", err, "key_id", rec.AccessKeyID)
+			return
 		}
+		u.charge(rec, cost)
 	}
 }
 

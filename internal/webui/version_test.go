@@ -5,6 +5,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"testing"
 )
@@ -56,26 +57,35 @@ func TestEmbeddedVersionMatchesPackageJSON(t *testing.T) {
 //
 // 不硬编码 dist/assets 下的文件名：文件名带 content hash，版本升级后会变，
 // 硬编码会让这个测试在每次版本升级时以「文件不存在」的形式失败，
-// 掩盖真正要测的东西。这里按扩展名扫。
+// 掩盖真正要测的东西。
+//
+// **按 index.html 的引用来取，而不是「目录里第一个 .js」**：
+// 路由改成懒加载后产物是一个入口 chunk 加十几个页面 chunk，版本号由
+// vite 的 define 注入、只存在于**入口**（__APP_VERSION__ 在 main.ts / App.vue
+// 这条依赖链上）。按文件名排序取第一个会命中 `_plugin-vue_export-helper-*.js`
+// 或某个页面 chunk —— 里面根本没有版本号，于是这个测试会以
+// 「版本对不上」为理由变红，而真实版本其实完全正确。这是比原缺陷更难查的
+// 一种假故障：看报错像是「忘了重新 build」，实际是取错了文件。
+// 而它恰恰是本测试想守住的那条纪律（「产物与源码同版本」）被自身实现破坏的样子，
+// 所以必须在同一处改对。
 func embeddedBundle(t *testing.T) string {
 	t.Helper()
-	fsys, err := fs.Sub(StaticFS, "dist/assets")
+
+	index := readEmbedded(t, "dist/index.html")
+	ref := regexp.MustCompile(`<script[^>]*\ssrc="([^"]*?/)?(index-[^"]+\.js)"`)
+	m := ref.FindStringSubmatch(index)
+	if m == nil {
+		t.Fatalf("index.html 里找不到入口 bundle 的 <script src>：\n%s", index)
+	}
+	return readEmbedded(t, "dist/assets/"+m[2])
+}
+
+// readEmbedded 读 embed 进来的某个文件并转成字符串。
+func readEmbedded(t *testing.T, name string) string {
+	t.Helper()
+	b, err := fs.ReadFile(StaticFS, name)
 	if err != nil {
-		t.Fatalf("embed 里没有 dist/assets: %v", err)
+		t.Fatalf("读 %s: %v", name, err)
 	}
-	ents, err := fs.ReadDir(fsys, ".")
-	if err != nil {
-		t.Fatalf("读 dist/assets: %v", err)
-	}
-	for _, e := range ents {
-		if strings.HasSuffix(e.Name(), ".js") {
-			b, err := fs.ReadFile(fsys, e.Name())
-			if err != nil {
-				t.Fatalf("读 %s: %v", e.Name(), err)
-			}
-			return string(b)
-		}
-	}
-	t.Fatal("embed 的 dist/assets 里没有 .js 文件")
-	return ""
+	return string(b)
 }

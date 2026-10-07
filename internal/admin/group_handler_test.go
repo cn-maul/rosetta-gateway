@@ -160,6 +160,45 @@ func TestGroupHandler_DeleteRefusedWhenMembersExist(t *testing.T) {
 	}
 }
 
+func TestGroupHandler_ListAndDeleteReportKeyBindings(t *testing.T) {
+	st := newScopeStore(t)
+	ctx := context.Background()
+	h := NewGroupHandler(st)
+
+	if err := st.CreateGroup(ctx, &store.Group{ID: "g1", Name: "dev"}); err != nil {
+		t.Fatalf("seed group: %v", err)
+	}
+	if err := st.CreateUser(ctx, &store.User{ID: "u1", Username: "alice"}); err != nil {
+		t.Fatalf("seed key owner: %v", err)
+	}
+	if err := st.CreateAccessKey(ctx, &store.AccessKey{
+		ID: "k1", KeyHash: "hash-1", KeyPrefix: "sk-test", Name: "build", Enabled: true,
+		UserID: "u1", GroupID: "g1",
+	}); err != nil {
+		t.Fatalf("seed key: %v", err)
+	}
+
+	listRec := httptest.NewRecorder()
+	h.List(listRec, asAdmin(httptest.NewRequest(http.MethodGet, "/admin/api/groups", nil)))
+	if listRec.Code != http.StatusOK {
+		t.Fatalf("list: code = %d body = %s", listRec.Code, listRec.Body.String())
+	}
+	var groups []groupResponse
+	decodeBody(t, listRec, &groups)
+	if len(groups) != 1 || groups[0].MemberCount != 0 || groups[0].KeyCount != 1 {
+		t.Fatalf("group counts = %+v, want 0 users and 1 key", groups)
+	}
+
+	deleteRec := httptest.NewRecorder()
+	h.Delete(deleteRec, asAdmin(httptest.NewRequest(http.MethodDelete, "/admin/api/groups/g1", nil)), "g1")
+	if deleteRec.Code != http.StatusConflict {
+		t.Fatalf("delete: code = %d body = %s, want 409", deleteRec.Code, deleteRec.Body.String())
+	}
+	if body := deleteRec.Body.String(); !strings.Contains(body, "1 把访问密钥") || !strings.Contains(body, "解除") {
+		t.Errorf("错误信息应包含密钥数量和处置办法：%s", body)
+	}
+}
+
 // ---- 白名单写入 ----
 
 func TestGroupHandler_SetModelsReplacesAndValidates(t *testing.T) {
@@ -358,22 +397,27 @@ func TestKeyHandler_AllowedModels(t *testing.T) {
 	}
 	h := NewKeyHandler(st)
 
+	// key 归创建者自己（user_id 被忽略），而下面的 PATCH 也以 u1 身份发起，
+	// 两边必须同一个人，否则 ownedByCaller 会 404。
 	rec := httptest.NewRecorder()
-	h.Create(rec, asAdmin(jsonRequest(http.MethodPost, "/admin/api/keys",
-		strings.NewReader(`{"name":"k","allowed_models":["flash"],"user_id":"u1"}`))))
+	h.Create(rec, asUser(jsonRequest(http.MethodPost, "/admin/api/keys",
+		strings.NewReader(`{"name":"k","allowed_models":["flash"]}`)), "u1"))
 	if rec.Code != http.StatusCreated {
 		t.Fatalf("create: code = %d body = %s", rec.Code, rec.Body.String())
 	}
 	var created keyResponse
 	decodeBody(t, rec, &created)
+	if created.UserID != "u1" {
+		t.Fatalf("owner = %q, want u1（Create 的归属恒为创建者）", created.UserID)
+	}
 	if len(created.AllowedModels) != 1 || created.AllowedModels[0] != "flash" {
 		t.Fatalf("AllowedModels = %v, want [flash]", created.AllowedModels)
 	}
 
 	// 不存在的模型名 → 400，不落库。
 	rec2 := httptest.NewRecorder()
-	h.Create(rec2, asAdmin(jsonRequest(http.MethodPost, "/admin/api/keys",
-		strings.NewReader(`{"name":"k2","allowed_models":["nope"],"user_id":"u1"}`))))
+	h.Create(rec2, asUser(jsonRequest(http.MethodPost, "/admin/api/keys",
+		strings.NewReader(`{"name":"k2","allowed_models":["nope"]}`)), "u1"))
 	if rec2.Code != http.StatusBadRequest {
 		t.Fatalf("unknown model: code = %d body = %s, want 400", rec2.Code, rec2.Body.String())
 	}
@@ -414,6 +458,146 @@ func TestKeyHandler_AllowedModels(t *testing.T) {
 type modelNamesResponse struct {
 	Models     []string `json:"models"`
 	Restricted bool     `json:"restricted"`
+	// Prices 与 Models **按公开名逐位对应**（见 handler 里的说明）。
+	Prices []modelPrice `json:"prices"`
+}
+
+// initPricedRouteSnapshot 装一份带单价的快照，供 prices 断言用。
+//
+// 单价挂在 upstream model 上（upstream_models 表就是按 provider+model 存
+// price_* 的），路由的公开名指向它 —— 这正是 priceForModel 走的 Resolve
+// 路径。用真实结构而非 mock，是为了顺带钉住「界面显示的价格」与
+// 「数据面解析公开名时取到的价格」同源这件事。
+func initPricedRouteSnapshot(t *testing.T, names map[string][3]float64, users map[string]*snapshot.UserSnapshot) {
+	t.Helper()
+	ri := routing.NewRouteIndex()
+	ri.AddProvider(&routing.ProviderRef{ID: "p1", Slug: "good", Protocol: "openai-chat", Enabled: true})
+	// 每个公开名对应一个独立的上游模型，价格各不相同。
+	i := 0
+	for n, p := range names {
+		i++
+		modelID := "m" + string(rune('0'+i))
+		ri.AddUpstreamModel(&routing.UpstreamModel{
+			ID: "up/" + modelID, ProviderID: "p1", ModelID: modelID, Enabled: true,
+			PriceInput: p[0], PriceCacheHit: p[1], PriceOutput: p[2],
+		})
+		ri.AddRoute(&routing.Route{
+			ID: "r-" + n, PublicName: n,
+			ProviderID: "p1", UpstreamModelID: "up/" + modelID, Enabled: true,
+		})
+	}
+	if users == nil {
+		users = map[string]*snapshot.UserSnapshot{}
+	}
+	snapshot.Init(&snapshot.Snapshot{
+		Routes: ri, Providers: map[string]*snapshot.ProviderSnapshot{},
+		KeysByHash: map[string]*snapshot.KeySnapshot{},
+		UsersByID:  users,
+	})
+	t.Cleanup(func() { snapshot.Init(&snapshot.Snapshot{}) })
+}
+
+// ---- prices 的向后兼容契约 ----
+//
+// Models.vue 要显示单价，而 Keys.vue 的 ModelPicker / Groups.vue 都按
+// string[] 用同一个端点。三者共用一个响应体的前提是：**models 仍是
+// string[]**，价格只能以平行的方式加进去。改成对象数组会同时打破那两个
+// 调用点，所以这里钉住「models 保持 string[] 且长度不变」。
+func TestModelNames_KeepsModelsAsStringArrayForExistingCallers(t *testing.T) {
+	initPricedRouteSnapshot(t, map[string][3]float64{
+		"alpha": {1.5, 0.15, 6},
+		"beta":  {2, 0.2, 8},
+	}, nil)
+	h := NewGroupHandler(newScopeStore(t))
+
+	got := fetchModelNames(t, h, asAdmin(httptest.NewRequest(http.MethodGet, "/admin/api/model-names", nil)))
+	// 既有调用方（ModelPicker 的 v-model、Set 去重、includes）都要求这是
+	// 一个纯字符串数组 —— 一旦变成对象，这里会静默炸在渲染层。
+	for _, m := range got.Models {
+		if m == "" {
+			t.Fatal("models contains an empty entry")
+		}
+	}
+	if len(got.Models) != 2 {
+		t.Fatalf("models = %v, want 2 entries", got.Models)
+	}
+	// prices 必须与之逐位对齐，否则前端按下标取价会张冠李戴。
+	if len(got.Prices) != len(got.Models) {
+		t.Fatalf("len(prices) = %d, want %d (parallel arrays must align)", len(got.Prices), len(got.Models))
+	}
+	for i, m := range got.Models {
+		if got.Prices[i].Name != m {
+			t.Errorf("prices[%d].name = %q, want %q（平行数组必须逐位对应）", i, got.Prices[i].Name, m)
+		}
+	}
+}
+
+// 价格取自公开名解析出的上游模型，且 restricted 收窄时价格也一起收窄。
+func TestModelNames_CarriesPricesAndScopesThem(t *testing.T) {
+	initPricedRouteSnapshot(t, map[string][3]float64{
+		"flash": {0.2, 0.02, 0.8},
+		"pro":   {2, 0.2, 8},
+		"opus":  {15, 1.5, 75},
+	}, map[string]*snapshot.UserSnapshot{
+		"u1": snapUser("u1", "g1", snapshot.AllowOnly([]string{"flash", "pro"})),
+	})
+	h := NewGroupHandler(newScopeStore(t))
+
+	// 管理员拿全集与全集价格。
+	all := fetchModelNames(t, h, asAdmin(httptest.NewRequest(http.MethodGet, "/admin/api/model-names", nil)))
+	if len(all.Models) != 3 || len(all.Prices) != 3 {
+		t.Fatalf("admin got %d models / %d prices, want 3 / 3", len(all.Models), len(all.Prices))
+	}
+	priceBy := func(r modelNamesResponse, name string) modelPrice {
+		for _, p := range r.Prices {
+			if p.Name == name {
+				return p
+			}
+		}
+		return modelPrice{}
+	}
+	if p := priceBy(all, "flash"); p.PriceInput != 0.2 || p.PriceCacheHit != 0.02 || p.PriceOutput != 0.8 {
+		t.Errorf("flash price = %+v, want input .2 / hit .02 / output .8", p)
+	}
+	// 未配价的模型给全 0，前端据此显示「未配置」而不是「0.00」（会被读成免费）。
+	initPricedRouteSnapshot(t, map[string][3]float64{"unpriced": {0, 0, 0}}, nil)
+	h2 := NewGroupHandler(newScopeStore(t))
+	p2 := priceBy(fetchModelNames(t, h2, asAdmin(httptest.NewRequest(http.MethodGet, "/admin/api/model-names", nil))), "unpriced")
+	if p2.PriceInput != 0 || p2.PriceOutput != 0 || p2.PriceCacheHit != 0 {
+		t.Errorf("unpriced model price = %+v, want all-zero（0 必须表示「未配置」而不是「免费」）", p2)
+	}
+
+	// 普通用户：models 与 prices **一起**收窄，且长度仍然对齐。
+	initPricedRouteSnapshot(t, map[string][3]float64{
+		"flash": {0.2, 0.02, 0.8},
+		"pro":   {2, 0.2, 8},
+		"opus":  {15, 1.5, 75},
+	}, map[string]*snapshot.UserSnapshot{
+		"u1": snapUser("u1", "g1", snapshot.AllowOnly([]string{"flash", "pro"})),
+	})
+	h3 := NewGroupHandler(newScopeStore(t))
+	scoped := fetchModelNames(t, h3, asUser(httptest.NewRequest(http.MethodGet, "/admin/api/model-names", nil), "u1"))
+	if len(scoped.Models) != 2 || len(scoped.Prices) != 2 {
+		t.Fatalf("scoped: %d models / %d prices, want 2 / 2（收窄价格漏了会让前端按下标取到别人的价）",
+			len(scoped.Models), len(scoped.Prices))
+	}
+	for i, m := range scoped.Models {
+		if scoped.Prices[i].Name != m {
+			t.Errorf("scoped prices[%d].name = %q, want %q", i, scoped.Prices[i].Name, m)
+		}
+	}
+	// 交集为空 → prices 也必须是空数组，绝不能退回全集（那等于静默放宽）。
+	initPricedRouteSnapshot(t, map[string][3]float64{
+		"flash": {0.2, 0.02, 0.8},
+	}, map[string]*snapshot.UserSnapshot{
+		"u3": snapUser("u3", "g1", snapshot.AllowOnly([]string{"nonexistent"})),
+	})
+	h4 := NewGroupHandler(newScopeStore(t))
+	none := fetchModelNames(t, h4, asUser(httptest.NewRequest(http.MethodGet, "/admin/api/model-names", nil), "u3"))
+	if len(none.Models) != 0 || len(none.Prices) != 0 {
+		t.Errorf("empty intersection: %d models / %d prices, want 0 / 0",
+			len(none.Models), len(none.Prices))
+	}
 }
 
 func fetchModelNames(t *testing.T, h *GroupHandler, r *http.Request) modelNamesResponse {
@@ -514,6 +698,14 @@ func newKeyStore(t *testing.T) *store.Store {
 	if err := st.CreateGroup(ctx, &store.Group{ID: "g1", Name: "restricted"}); err != nil {
 		t.Fatalf("seed group: %v", err)
 	}
+	// 与下面 admin() 用的 asAdminID 同一个 id：Create 的归属恒等于 me.ID，
+	// 身份只活在 context 里会撞 access_keys.user_id 的外键（表现为 500）。
+	if err := st.CreateUser(ctx, &store.User{
+		ID: "admin1", Username: "admin1",
+		Role: store.RoleAdmin, Status: store.UserStatusActive, AuthVersion: 1,
+	}); err != nil {
+		t.Fatalf("seed admin: %v", err)
+	}
 	return st
 }
 
@@ -543,11 +735,13 @@ func TestKeyHandler_P2Validation(t *testing.T) {
 		{"zero-expires", admin, `{"name":"zero-expires","user_id":"u1","expires_at":0}`, http.StatusCreated},
 		{"admin-set-group", admin, `{"name":"admin-set-group","user_id":"u1","group_id":"g1"}`, http.StatusCreated},
 		{"group-missing", admin, `{"name":"group-missing","user_id":"u1","group_id":"ghost"}`, http.StatusBadRequest},
-		// 发 key 已收敛为管理员专属（P1-5）：自助发 key 让管理员落在
-		// 具体 key 上的禁用/限额/期限/IP 全部可被「重新建一把」绕过。
-		// 分组覆盖同理 —— 那是权限提升，不是配置。
+		// 分组覆盖仍只给管理员：它能把 key 指向一个**更宽松**的组，
+		// 普通用户若能自选就是权限提升，不是配置。
+		// （user_id 字段在 Create 上被忽略，归属恒为调用者自己。）
 		{"user-set-group", user, `{"name":"user-set-group","group_id":"g1"}`, http.StatusForbidden},
-		{"user-set-ips", user, `{"name":"user-set-ips","allowed_ips":"10.0.0.0/8"}`, http.StatusForbidden},
+		// 反过来 expires_at / allowed_ips **允许**用户自设：这两个字段
+		// 没有「更宽」的方向，自设就是给自己加限制（收紧）。
+		{"user-set-ips", user, `{"name":"user-set-ips","allowed_ips":"10.0.0.0/8"}`, http.StatusCreated},
 	}
 	for _, tc := range cases {
 		rec := httptest.NewRecorder()
@@ -557,7 +751,9 @@ func TestKeyHandler_P2Validation(t *testing.T) {
 		}
 		// 失败的创建绝不能留下半条记录。按本用例独有的名字判定 ——
 		// 同表里成功过的用例也会建 key，用公共名字查会互相干扰。
-		keys, _ := st.ListAccessKeysByUser(ctx, "u1")
+		// 用 ListAccessKeys（全表）而不是按用户列：归属恒为创建者，
+		// admin 用例建出的 key 归 admin1、user 用例归 u1，按 u1 查会漏掉前者。
+		keys, _ := st.ListAccessKeys(ctx)
 		created := false
 		for _, key := range keys {
 			if key.Name == tc.name {

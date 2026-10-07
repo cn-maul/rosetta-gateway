@@ -1,33 +1,28 @@
 import { createRouter, createWebHashHistory, type RouteLocationNormalized, type RouteLocationRaw } from 'vue-router'
-import Overview from './views/Overview.vue'
-import Providers from './views/Providers.vue'
-import Routes from './views/Routes.vue'
-import Keys from './views/Keys.vue'
-import History from './views/History.vue'
-import Settings from './views/Settings.vue'
-import Login from './views/Login.vue'
-import Profile from './views/Profile.vue'
-import Users from './views/Users.vue'
-import Groups from './views/Groups.vue'
 import { isAdmin, session } from './api'
 
 // hash 路由：go:embed 单二进制场景下无需服务端 fallback 配置
 const router = createRouter({
   history: createWebHashHistory(),
   routes: [
-    { path: '/login', name: 'login', component: Login, meta: { title: '登录', public: true } },
-    { path: '/', name: 'overview', component: Overview, meta: { title: '总览' } },
-    { path: '/keys', name: 'keys', component: Keys, meta: { title: '访问密钥' } },
-    { path: '/history', name: 'history', component: History, meta: { title: '调用历史' } },
-    { path: '/profile', name: 'profile', component: Profile, meta: { title: '我的账号' } },
+    { path: '/login', name: 'login', component: () => import('./views/Login.vue'), meta: { title: '登录', public: true } },
+    { path: '/', name: 'overview', component: () => import('./views/Overview.vue'), meta: { title: '总览' } },
+    { path: '/keys', name: 'keys', component: () => import('./views/Keys.vue'), meta: { title: '访问密钥' } },
+    { path: '/history', name: 'history', component: () => import('./views/History.vue'), meta: { title: '调用历史' } },
+    { path: '/profile', name: 'profile', component: () => import('./views/Profile.vue'), meta: { title: '我的账号' } },
+    // 「我能用哪些模型」的只读清单。刻意**不加** adminOnly：后端
+    // /admin/api/model-names 本就按身份收窄后才对普通用户开放
+    // （见 server/user_auth.go 的非 admin 白名单），普通用户看不到这份
+    // 清单就只能猜模型名。管理员也能进，看到的是全集，无害。
+    { path: '/models', name: 'models', component: () => import('./views/Models.vue'), meta: { title: '可用模型' } },
     // 以下 admin-only：普通用户既看不到入口，也会被守卫踢走。
     // meta.adminOnly 让导航栏能按 isAdmin() 隐藏它们，守卫负责兜底——
     // 只做前者的话，手输 URL 就能打开。
-    { path: '/users', name: 'users', component: Users, meta: { title: '用户', adminOnly: true } },
-    { path: '/groups', name: 'groups', component: Groups, meta: { title: '分组', adminOnly: true } },
-    { path: '/providers', name: 'providers', component: Providers, meta: { title: '上游与模型', adminOnly: true } },
-    { path: '/routes', name: 'routes', component: Routes, meta: { title: '路由', adminOnly: true } },
-    { path: '/settings', name: 'settings', component: Settings, meta: { title: '设置', adminOnly: true } },
+    { path: '/users', name: 'users', component: () => import('./views/Users.vue'), meta: { title: '用户', adminOnly: true } },
+    { path: '/groups', name: 'groups', component: () => import('./views/Groups.vue'), meta: { title: '分组', adminOnly: true } },
+    { path: '/providers', name: 'providers', component: () => import('./views/Providers.vue'), meta: { title: '上游与模型', adminOnly: true } },
+    { path: '/routes', name: 'routes', component: () => import('./views/Routes.vue'), meta: { title: '路由', adminOnly: true } },
+    { path: '/settings', name: 'settings', component: () => import('./views/Settings.vue'), meta: { title: '设置', adminOnly: true } },
   ],
 })
 
@@ -79,6 +74,11 @@ function guardDecision(to: RouteLocationNormalized): true | RouteLocationRaw {
 }
 
 router.beforeEach((to) => guardDecision(to))
+
+router.afterEach((to) => {
+  const pageTitle = typeof to.meta.title === 'string' ? to.meta.title : ''
+  document.title = pageTitle ? `${pageTitle} · Rosetta Gateway` : 'Rosetta Gateway · 管理后台'
+})
 
 /**
  * 探测（loadSession）完成后用守卫规则重判**当前**路由。

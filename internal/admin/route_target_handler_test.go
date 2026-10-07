@@ -28,6 +28,13 @@ func newTestStore(t *testing.T) *store.Store {
 	_ = st.CreateUpstreamModel(ctx, &store.UpstreamModel{ID: "m1", ProviderID: "p1", ModelID: "alpha-chat", Enabled: true})
 	_ = st.CreateUpstreamModel(ctx, &store.UpstreamModel{ID: "m2", ProviderID: "p2", ModelID: "beta-chat", Enabled: true})
 	_ = st.CreateRoute(ctx, &store.Route{ID: "r1", PublicName: "flash", ProviderID: "p1", UpstreamModelID: "m1", Enabled: true})
+	// 建一把**真实存在**的 asAdmin 身份行（id 与 testhelpers 里的 asAdmin 一致）。
+	// Create 的归属恒等于 me.ID，而 access_keys.user_id 有外键约束，
+	// 身份只活在 context 里会在落库时撞 FOREIGN KEY（表现为 500）。
+	_ = st.CreateUser(ctx, &store.User{
+		ID: "admin-test", Username: "admin-test", PasswordHash: "x",
+		Role: store.RoleAdmin, Status: store.UserStatusActive, AuthVersion: 1,
+	})
 	return st
 }
 

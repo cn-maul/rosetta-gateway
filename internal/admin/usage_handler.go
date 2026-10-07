@@ -452,9 +452,16 @@ func clampOffset(raw string) int64 {
 	return n
 }
 
-// ExportCSV 以 CSV 流式导出调用明细（与 History 同一套过滤参数，无分页上限 ——
-// 上限由 maxUsageLimit 拉满）。排障取证用：把一段时间的明细拉进表格工具。
+// ExportCSV 以 CSV 流式导出调用明细（与 History 同一套过滤参数，
+// 一次最多导 maxUsageLimit 行）。排障取证用：把一段时间的明细拉进表格工具。
 // Content-Disposition 带 filename，浏览器直接触发下载。
+//
+// # 静默截断是排障场景里最贵的一种 bug
+//
+// 这个端点原本把 limit 拉满到 maxUsageLimit，于是「共 12 万条、导出后只有
+// 1000 行」看起来像是「上游只失败过 1000 次」—— 一个被截断的证据被读成了
+// 完整的证据。现在上限命中时写 X-Export-Truncated: 1 与 X-Export-Total，
+// 让前端能在下载后明确提示「已截断」而不是让人对着一个假象做判断。
 func (h *UsageHandler) ExportCSV(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query()
 	from, to, err := queryRange(q, 7*24*time.Hour)
@@ -464,6 +471,14 @@ func (h *UsageHandler) ExportCSV(w http.ResponseWriter, r *http.Request) {
 	}
 	limit := clampLimit(q.Get("limit"), maxUsageLimit, maxUsageLimit)
 	where, args := usageHistoryFilters(from, to, q.Get("status"), q.Get("model"), q.Get("key_id"), callerScope(r))
+
+	// 总条数与 History 同源：多一次 COUNT 换来「导出的到底是不是全部」。
+	var total int64
+	if err := h.store.Reader().QueryRow(
+		`SELECT COUNT(*) FROM usage_records u`+where, args...).Scan(&total); err != nil {
+		writeServerError(w, "usage export count", err)
+		return
+	}
 
 	rows, err := h.store.Reader().Query(
 		`SELECT u.ts, u.public_model, u.upstream_model, COALESCE(a.name, ''), u.access_key_id, u.total_tokens, u.ttfb_ms, u.latency_ms, u.status
@@ -477,6 +492,10 @@ func (h *UsageHandler) ExportCSV(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Content-Type", "text/csv; charset=utf-8")
 	w.Header().Set("Content-Disposition", `attachment; filename="usage-history.csv"`)
+	w.Header().Set("X-Export-Total", strconv.FormatInt(total, 10))
+	if total > limit {
+		w.Header().Set("X-Export-Truncated", "1")
+	}
 	cw := csv.NewWriter(w)
 	_ = cw.Write([]string{"ts", "public_model", "upstream_model", "key_name", "key_id", "total_tokens", "ttfb_ms", "latency_ms", "status"})
 	for rows.Next() {

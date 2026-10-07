@@ -14,6 +14,23 @@ const credsMap = reactive<Record<string, Credential[]>>({})
 const modelsMap = reactive<Record<string, UpstreamModel[]>>({})
 const testing = ref('')
 
+/**
+ * shortEndpoint 把过长的 Endpoint 压成「头 … 尾」。
+ *
+ * 为什么必须压：Endpoint 是这行里最长的字段，不压就会把整张表撑宽到需要
+ * 横向滚动 —— 而横滚会把右侧的「操作」列推出视野，那一列恰好是这一行里
+ * 唯一有交互的东西。为了一条只读文本牺牲操作入口，是最亏的交换。
+ *
+ * 为什么掐中间而不是尾部省略（…）：一个地址最有辨识度的是**两端** ——
+ * 域名说明打的是谁，路径尾巴说明打到哪。尾部省略会把「chat/completions」
+ * 这半截丢掉，留下的 `https://api.deepseek.com/v1/…` 反而不如掐中间有用。
+ * 完整地址仍在 title 里，鼠标悬停可见。
+ */
+function shortEndpoint(s: string): string {
+  if (s.length <= 44) return s
+  return s.slice(0, 22) + '…' + s.slice(-20)
+}
+
 async function load() {
   loading.value = true
   err.value = ''
@@ -385,94 +402,167 @@ onMounted(() => {
         <div class="big">⌘</div>
         还没有上游服务，点击右上角「新建上游」开始
       </div>
-      <div v-else class="row-list">
-        <template v-for="p in providers" :key="p.id">
-          <div class="row">
-            <div class="row-main">
-              <div class="row-title">
-                {{ p.name }}
-                <span class="badge" :class="p.enabled ? 'badge-live' : 'badge-off'">{{ p.enabled ? '启用' : '停用' }}</span>
-                <!-- 运行时未就绪：库里配得好好的，但上游池没建出任何可用凭据，
-                     请求打过去必然失败。改造前这个状态只进日志，界面上完全看不出来，
-                     运维只能靠「莫名 500」反推。只在「已启用」时标 ——
-                     停用是主动行为，不是故障。 -->
-                <span
-                  v-if="p.enabled && !p.ready"
-                  class="badge badge-off"
-                  :title="p.ready_reason || '没有可用的上游凭据'"
-                >
-                  未就绪
-                </span>
-                <span class="badge">{{ p.protocol }}</span>
-              </div>
-              <div class="row-sub mono">{{ p.slug }} · {{ p.endpoint }}</div>
-              <div v-if="p.enabled && !p.ready && p.ready_reason" class="row-sub">
-                {{ p.ready_reason }}
-              </div>
-            </div>
-            <div class="row-side">
-              <button class="btn btn-sm btn-ghost" :disabled="testing === p.id" @click="testProvider(p)">
-                {{ testing === p.id ? '测试中…' : '测试' }}
-              </button>
-              <button class="btn btn-sm btn-ghost" @click="openExpand(p.id)">
-                {{ expandedId === p.id ? '收起' : '展开' }}
-              </button>
-              <button class="btn btn-sm btn-ghost" @click="openProvider(p)">编辑</button>
-              <button class="btn btn-sm btn-danger" @click="removeProvider(p)">删除</button>
-              <button class="switch" :class="{ on: p.enabled }" :title="p.enabled ? '停用' : '启用'" @click="toggleProvider(p)"></button>
-            </div>
-          </div>
+      <div v-else class="tbl-wrap">
+        <table class="tbl">
+          <thead>
+            <tr>
+              <th>上游</th>
+              <th>协议</th>
+              <th>Endpoint</th>
+              <th class="c-act">操作</th>
+            </tr>
+          </thead>
+          <!-- 每个上游自带一个 tbody，展开区作为该 tbody 里的第二个 <tr>。
+               不能把展开区写成 tbody 之外的 div —— 那不是合法的表格结构，
+               浏览器会把 tbody 之间的孤立行吞掉或重排。 -->
+          <tbody v-for="p in providers" :key="p.id">
+            <tr>
+              <td>
+                <div class="cell-key">
+                  <span class="name">{{ p.name }}</span>
+                  <span class="badge" :class="p.enabled ? 'badge-live' : 'badge-off'">{{ p.enabled ? '启用' : '停用' }}</span>
+                  <!-- 运行时未就绪：库里配得好好的，但上游池没建出任何可用凭据，
+                       请求打过去必然失败。改造前这个状态只进日志，界面上完全看不出来，
+                       运维只能靠「莫名 500」反推。只在「已启用」时标 ——
+                       停用是主动行为，不是故障。 -->
+                  <span
+                    v-if="p.enabled && !p.ready"
+                    class="badge badge-err"
+                    :title="p.ready_reason || '没有可用的上游凭据'"
+                  >
+                    未就绪
+                  </span>
+                </div>
+                <div class="sub-line mono">{{ p.slug }}</div>
+              </td>
+              <td><span class="badge">{{ p.protocol }}</span></td>
+              <td>
+                <span class="mono ep" :title="p.endpoint">{{ shortEndpoint(p.endpoint) }}</span>
+                <!-- 未就绪的原因贴着 Endpoint：它说的就是「这个地址打不通」，
+                     拆到别的列会让人对不上是哪个上游出的问题。 -->
+                <div v-if="p.enabled && !p.ready && p.ready_reason" class="sub-line err">
+                  {{ p.ready_reason }}
+                </div>
+              </td>
+              <td class="c-act">
+                <div class="row-actions">
+                  <button class="btn btn-sm btn-ghost" :disabled="testing === p.id" @click="testProvider(p)">
+                    {{ testing === p.id ? '测试中…' : '测试' }}
+                  </button>
+                  <button class="btn btn-sm btn-ghost" @click="openExpand(p.id)">
+                    {{ expandedId === p.id ? '收起' : '展开' }}
+                  </button>
+                  <button class="btn btn-sm btn-ghost" @click="openProvider(p)">编辑</button>
+                  <button class="btn btn-sm btn-danger" @click="removeProvider(p)">删除</button>
+                  <button class="switch" :class="{ on: p.enabled }" :title="p.enabled ? '停用' : '启用'" @click="toggleProvider(p)"></button>
+                </div>
+              </td>
+            </tr>
 
-          <div v-if="expandedId === p.id" class="expand">
-            <div class="expand-grid">
-              <div class="expand-col">
-                <h4>
-                  凭据（{{ (credsMap[p.id] ?? []).length }}）
-                  <button class="btn btn-sm" @click="openCred(p.id)">添加凭据</button>
-                </h4>
-                <div v-if="(credsMap[p.id] ?? []).length === 0" class="empty" style="padding: 14px 0">
-                  无凭据 —— 上游鉴权必需
-                </div>
-                <div v-for="c in credsMap[p.id] ?? []" :key="c.id" class="mini-row">
-                  <span class="badge" :class="c.enabled ? 'badge-live' : 'badge-off'">{{ c.enabled ? '启用' : '停用' }}</span>
-                  <span class="mini-main">{{ c.label || c.id }}</span>
-                  <span class="mono" style="color: var(--text-3)">w{{ c.weight }}</span>
-                  <span class="badge">{{ c.status }}</span>
-                  <span class="mono" style="color: var(--text-4)">{{ fmtDate(c.created_at) }}</span>
-                  <button class="btn btn-sm btn-ghost" @click="openCred(p.id, c)">换钥</button>
-                  <button class="btn btn-sm btn-danger" @click="removeCred(c)">删</button>
-                </div>
-              </div>
+            <tr v-if="expandedId === p.id" class="expand-row">
+              <td colspan="4">
+                <div class="expand-grid">
+                  <div class="expand-col">
+                    <h4>
+                      凭据（{{ (credsMap[p.id] ?? []).length }}）
+                      <button class="btn btn-sm" @click="openCred(p.id)">添加凭据</button>
+                    </h4>
+                    <div v-if="(credsMap[p.id] ?? []).length === 0" class="empty sub-empty">
+                      无凭据 —— 上游鉴权必需
+                    </div>
+                    <table v-else class="tbl sub-tbl">
+                      <thead>
+                        <tr>
+                          <th>凭据</th>
+                          <th class="num-h">权重</th>
+                          <th>状态</th>
+                          <th>创建</th>
+                          <th class="c-act">操作</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        <tr v-for="c in credsMap[p.id] ?? []" :key="c.id">
+                          <td>
+                            <div class="cell-key">
+                              <span class="name">{{ c.label || c.id }}</span>
+                              <span class="badge" :class="c.enabled ? 'badge-live' : 'badge-off'">
+                                {{ c.enabled ? '启用' : '停用' }}
+                              </span>
+                            </div>
+                          </td>
+                          <td class="num-h">{{ c.weight }}</td>
+                          <td><span class="badge">{{ c.status }}</span></td>
+                          <td class="mono dim">{{ fmtDate(c.created_at) }}</td>
+                          <td class="c-act">
+                            <div class="row-actions">
+                              <button class="btn btn-sm btn-ghost" @click="openCred(p.id, c)">换钥</button>
+                              <button class="btn btn-sm btn-danger" @click="removeCred(c)">删除</button>
+                            </div>
+                          </td>
+                        </tr>
+                      </tbody>
+                    </table>
+                  </div>
 
-              <div class="expand-col">
-                <h4>
-                  上游模型（{{ (modelsMap[p.id] ?? []).length }}）
-                  <button class="btn btn-sm" @click="openModel(p.id)">添加模型</button>
-                </h4>
-                <div v-if="(modelsMap[p.id] ?? []).length === 0" class="empty" style="padding: 14px 0">
-                  无模型 —— 路由必须指向一个上游模型
+                  <div class="expand-col">
+                    <h4>
+                      上游模型（{{ (modelsMap[p.id] ?? []).length }}）
+                      <button class="btn btn-sm" @click="openModel(p.id)">添加模型</button>
+                    </h4>
+                    <div v-if="(modelsMap[p.id] ?? []).length === 0" class="empty sub-empty">
+                      无模型 —— 路由必须指向一个上游模型
+                    </div>
+                    <table v-else class="tbl sub-tbl">
+                      <thead>
+                        <tr>
+                          <th>模型</th>
+                          <th class="num-h">速度(tok/s)</th>
+                          <th class="num-h">首字(s)</th>
+                          <th class="num-h">成功率</th>
+                          <th class="c-act">操作</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        <tr v-for="m in modelsMap[p.id] ?? []" :key="m.id">
+                          <td>
+                            <div class="cell-key">
+                              <span class="name mono">{{ m.model_id }}</span>
+                              <span class="badge" :class="m.enabled ? 'badge-live' : 'badge-off'">
+                                {{ m.enabled ? '启用' : '停用' }}
+                              </span>
+                            </div>
+                          </td>
+                          <td class="num-h dim">{{ m.tokens_per_sec ? fmtSpeed(m.tokens_per_sec) : '—' }}</td>
+                          <td class="num-h dim">{{ m.ttfb_ms ? fmtSec(m.ttfb_ms) : '—' }}</td>
+                          <td class="num-h">
+                            <span v-if="m.call_count" class="sr" :class="{ warn: (m.success_rate ?? 1) < 1 }">
+                              {{ fmtPercent(m.success_rate ?? 1) }}%
+                            </span>
+                            <span v-else class="dim">—</span>
+                          </td>
+                          <td class="c-act">
+                            <div class="row-actions">
+                              <button class="btn btn-sm btn-ghost" @click="openModel(p.id, m)">编辑</button>
+                              <button class="btn btn-sm btn-danger" @click="removeModel(m)">删除</button>
+                            </div>
+                          </td>
+                        </tr>
+                      </tbody>
+                    </table>
+                  </div>
                 </div>
-                <div v-for="m in modelsMap[p.id] ?? []" :key="m.id" class="mini-row">
-                  <span class="badge" :class="m.enabled ? 'badge-live' : 'badge-off'">{{ m.enabled ? '启用' : '停用' }}</span>
-                  <span class="mini-main mono">{{ m.model_id }}</span>
-                  <span class="col-spd">{{ m.tokens_per_sec ? fmtSpeed(m.tokens_per_sec) + ' tok/s' : '' }}</span>
-                  <span class="col-ttfb">{{ m.ttfb_ms ? fmtSec(m.ttfb_ms) + ' s' : '' }}</span>
-                  <span class="col-sr"><span v-if="m.call_count" class="sr" :class="{ warn: (m.success_rate ?? 1) < 1 }">{{ fmtPercent(m.success_rate ?? 1) }}%</span></span>
-                  <button class="btn btn-sm btn-ghost" @click="openModel(p.id, m)">编辑</button>
-                  <button class="btn btn-sm btn-danger" @click="removeModel(m)">删</button>
-                </div>
-              </div>
-            </div>
-          </div>
-        </template>
+              </td>
+            </tr>
+          </tbody>
+        </table>
       </div>
     </div>
 
-    <!-- Provider 表单 -->
+    <!-- Provider 表单：表单填一半别丢，遮罩/Esc 都不关 -->
     <AppModal
       :open="pForm.open"
       :title="pForm.editing ? '编辑上游' : '新建上游'"
-      @close="pForm.open = false"
+      :dismissable="false"
     >
       <form @submit.prevent="submitProvider">
         <div class="form-grid">
@@ -533,12 +623,12 @@ onMounted(() => {
       </form>
     </AppModal>
 
-    <!-- 凭据表单 -->
+    <!-- 凭据表单：表单填一半别丢，遮罩/Esc 都不关 -->
     <AppModal
       :open="cForm.open"
       :title="cForm.editing ? '更新凭据' : '添加凭据'"
       max-width="480px"
-      @close="cForm.open = false"
+      :dismissable="false"
     >
       <form @submit.prevent="submitCred">
         <div class="form-grid">
@@ -564,13 +654,13 @@ onMounted(() => {
       </form>
     </AppModal>
 
-    <!-- 模型：编辑单条 -->
+    <!-- 模型：编辑单条（表单填一半别丢，遮罩/Esc 都不关） -->
     <AppModal
       v-if="mForm.editing"
       :open="mForm.open"
       title="编辑上游模型"
       max-width="500px"
-      @close="mForm.open = false"
+      :dismissable="false"
     >
       <form @submit.prevent="submitModel">
         <div class="form-grid">
@@ -604,13 +694,13 @@ onMounted(() => {
       </form>
     </AppModal>
 
-    <!-- 模型：探测 + 多选胶囊式添加 -->
+    <!-- 模型：探测 + 多选胶囊式添加（勾选状态是填到一半的「表单」，同样不许误关） -->
     <AppModal
       v-else
       :open="mForm.open"
       title="添加上游模型"
       max-width="560px"
-      @close="mForm.open = false"
+      :dismissable="false"
     >
       <div class="add-model">
         <div class="am-toolbar">
@@ -670,31 +760,22 @@ onMounted(() => {
 </template>
 
 <style scoped>
-/* 模型速度列：固定宽度 + 右对齐，跨行成列 */
-.col-spd {
-  flex: none;
-  width: 74px;
-  text-align: right;
-  font-size: 11px;
-  color: var(--text-3);
-  white-space: nowrap;
-}
-/* 模型首字用时列：与速度列等宽、同款右对齐，两栏并排才整齐 */
-.col-ttfb {
-  flex: none;
-  width: 74px;
-  text-align: right;
-  font-size: 11px;
-  color: var(--text-3);
-  white-space: nowrap;
-}
-/* 模型成功率列：固定宽度 + 右对齐 */
-.col-sr {
-  flex: none;
-  width: 56px;
-  display: flex;
-  justify-content: flex-end;
-}
+/* 表格末线的去留见 styles.css 的共享块（多 tbody 结构的理由记在那里）。 */
+/* 单元格骨架（.cell-key）用全局的（styles.css），这里只留页面私有部分。 */
+.sub-line.err { color: var(--danger); }
+/* Endpoint 的兜底宽度：shortEndpoint 已经把绝大多数地址掐到 44 字符内，
+   这条 max-width 只兜极端情况（超长自定义路径），真正的主战场是 JS 截断，
+   因为 CSS 的尾部省略会把路径尾巴吃掉。 */
+.ep { display: inline-block; max-width: 360px; overflow: hidden; text-overflow: ellipsis; vertical-align: bottom; }
+/* 展开区：整行铺满。它是详情而不是一条记录，所以不吃表格的行高亮。 */
+.expand-row:hover { background: transparent; }
+.expand-row > td { padding: 14px 12px 18px; white-space: normal; }
+/* 子表比主表更紧凑：两层同尺寸表头会把展开区撑成一堵墙，
+   而凭据/模型往往一列就是十几行。 */
+.sub-tbl { font-size: 12.5px; }
+.sub-tbl th,
+.sub-tbl td { padding: 6px 8px; }
+.sub-empty { padding: 14px 0; }
 .sr {
   font-size: 11px;
   padding: 1px 7px;

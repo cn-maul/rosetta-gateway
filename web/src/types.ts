@@ -228,11 +228,18 @@ export interface BootstrapStatus {
 /** GET /admin/api/me 的响应。 */
 export interface Me {
   username: string
-  display_name: string
   role: UserRole
   status: UserStatus
   quota_tokens: number
   used_tokens: number
+  /**
+   * 我的余额（分）与「不限额」标志。
+   *
+   * 语义与 User.balance_cents 逐字相同：`balance_unlimited = true` 才是不限额，
+   * `0 分`是「真没钱」（会被 402 拒绝）。显示层必须区分这两者。
+   */
+  balance_cents: number
+  balance_unlimited: boolean
   must_set_password: boolean
   is_admin: boolean
   session_enabled: boolean
@@ -242,7 +249,6 @@ export interface Me {
 export interface User {
   id: string
   username: string
-  display_name: string
   role: UserRole
   status: UserStatus
   /**
@@ -254,6 +260,18 @@ export interface User {
   group_id: string
   quota_tokens: number
   used_tokens: number
+  /**
+   * 账户余额，单位**分**（人民币）。
+   *
+   * 与 quota_tokens 的「0 = 不限」刻意相反：`balance_unlimited = true`
+   * 才是不限额；`balance_cents = 0` 是「账户里确实一分钱都没有」，
+   * 它会触发 402。两种状态一个放行一个拒绝，绝不能塌成同一个值。
+   *
+   * 界面必须据此显示「不限」而不是「0.00 元」—— 后者会被读成「没钱了」，
+   * 而实际含义是「不受余额限制」。判定一律看 balance_unlimited。
+   */
+  balance_cents: number
+  balance_unlimited: boolean
   auth_version: number
   remark?: string
   has_password: boolean
@@ -278,7 +296,24 @@ export interface Group {
    */
   models: string[]
   member_count: number
+  key_count: number
   created_at: number
+}
+
+/**
+ * 一个公开模型名的三项单价（元 / 百万 tokens）。
+ *
+ * **0 = 未配置，不是「免费」**：界面必须显示「未配置」而不是 0.00，
+ * 否则会被读成「确认这一档不要钱」——而未配置时实际计费按 0（见
+ * store.priceUsage），两者恰好重合但**意图完全不同**：
+ * 一个是「算过了，就是免费」，一个是「还没人填」。与 Settings.vue 的
+ * priceCell 同口径。
+ */
+export interface ModelPrice {
+  name: string
+  price_input: number
+  price_output: number
+  price_cache_hit: number
 }
 
 export interface AuditEntry {

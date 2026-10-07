@@ -3,6 +3,10 @@ import { computed, onMounted, onUnmounted, ref } from 'vue'
 import { api } from '../api'
 import { toast } from '../ui'
 import { fmtNum, fmtTokens, fmtSpeed, fmtSec, fmtPercent, fmtMoney } from '../fmt'
+// 命名空间导入并改名：下面有一个组件本地的 `const range = ref<RangeKey>(...)`
+//（当前选中的档位），同名会把这里的 range 遮住，导致 range.rangeBounds 被当成
+// 那个 ref。改用 timeRange 既避开冲突，也顺带说明它管的是「时间区间」不是「档位」。
+import * as timeRange from '../range'
 import type { Stats, UsageGroupEntry } from '../types'
 
 const err = ref('')
@@ -28,11 +32,12 @@ const RANGES: { key: RangeKey; label: string; days: number }[] = [
 const range = ref<RangeKey>('14d')
 const rangeOpen = ref(false)
 
+// 区间口径统一走 range.ts：days=1 是**今天 0 点**起算，不是滚动 24 小时。
+// 以前这里写的是 to - days * 86400_000，于是下拉写着「近 1 天」、数字算的却是
+// 「从现在往前 24 小时」：早上 0~8 点的调用明明算今天，却落在窗口之外。
 function rangeBounds(key: RangeKey): { from: number; to: number } {
-  const to = Date.now()
   const days = RANGES.find((r) => r.key === key)?.days ?? 14
-  const from = days === 0 ? 0 : to - days * 86400_000
-  return { from, to }
+  return timeRange.rangeBounds(days)
 }
 
 function rangeLabel(key: RangeKey): string {
@@ -55,13 +60,11 @@ type Bucket = {
 const daySeries = computed<Bucket[]>(() => {
   const map = new Map(byDay.value.map((e) => [e.key, e]))
   const days = RANGES.find((r) => r.key === range.value)?.days ?? 14
-  const now = new Date()
-  const p = (x: number) => String(x).padStart(2, '0')
-  const fmt = (d: Date) => `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}`
+  const now = Date.now()
 
   // 全部历史：起点优先用终身累计里的 first_record_at。
   //
-  // 修��前这里是「byDay 里最早的那一天」—— 明细剪掉 30 天以后，byDay 只剩
+  // 修复前这里是「byDay 里最早的那一天」—— 明细剪掉 30 天以后，byDay 只剩
   // 30 天，趋势图会凭空丢掉更早的历史（usage_totals.first_record_at 存的就是
   // 这个值，HANDOFF.md §「总览全部档」要求的正是改用它）。
   // 拿不到（普通用户 / 没请求 / 无数据）时回退到旧逻辑。
@@ -73,20 +76,29 @@ const daySeries = computed<Bucket[]>(() => {
     } else {
       const keys = byDay.value.map((e) => e.key).sort()
       const earliest = keys[0]
+      // 兜底（连 byDay 都空）：同样用本地日历日，now 是毫秒时间戳。
       start = earliest
         ? new Date(earliest + 'T00:00:00')
-        : new Date(now.getFullYear(), now.getMonth(), now.getDate() - 30)
+        : timeRange.localMidnight(30, now)
     }
   } else {
-    start = new Date(now.getFullYear(), now.getMonth(), now.getDate() - (days - 1))
+    // 柱子的起点必须由 rangeStart() 给，**不能**在这里另算一份。
+    //
+    // 这两处一旦各写各的就会漂移：rangeBounds 改成「今天 0 点起」而柱子还按
+    // 「24 小时前」画，就会得到「数字是今天的数据、图上却有昨天一截」——用户
+    // 读图得到的结论和读数字得到的结论相反。这正是本次要修的病根，所以图和
+    // 数字必须共用同一个起点函数（localMidnight 同样处理跨月/跨年/夏令时）。
+    start = new Date(timeRange.rangeStart(days, now))
   }
 
-  // 逐日补齐。
+  // 逐日补齐。日期串走 timeRange.localDayKey：与后端 store.dayExpr（localtime）
+  // 同一口径，本地日历日键必须与 byDay 的 key 逐字相同，否则 map 查不到、
+  // 每根柱子都被补成 0 —— 一张「全零图」比报错更难查。
   const daily: { date: string; count: number; tokens: number }[] = []
   const cursor = new Date(start.getFullYear(), start.getMonth(), start.getDate())
-  const end = new Date(now.getFullYear(), now.getMonth(), now.getDate())
+  const end = timeRange.localMidnight(0, now)
   while (cursor <= end) {
-    const date = fmt(cursor)
+    const date = timeRange.localDayKey(cursor.getTime())
     const e = map.get(date)
     daily.push({ date, count: e?.count ?? 0, tokens: e?.tokens ?? 0 })
     cursor.setDate(cursor.getDate() + 1)

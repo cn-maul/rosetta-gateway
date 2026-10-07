@@ -7,6 +7,7 @@ import (
 	"sort"
 	"strings"
 
+	"github.com/cn-maul/rosetta-gateway/internal/routing"
 	"github.com/cn-maul/rosetta-gateway/internal/server"
 	"github.com/cn-maul/rosetta-gateway/internal/snapshot"
 	"github.com/cn-maul/rosetta-gateway/internal/store"
@@ -32,16 +33,17 @@ type groupResponse struct {
 	// 否则很容易出现「建了组、忘了配模型、以为收紧了权限」。
 	Models      []string `json:"models"`
 	MemberCount int      `json:"member_count"`
+	KeyCount    int      `json:"key_count"`
 	CreatedAt   int64    `json:"created_at"`
 }
 
-func (h *GroupHandler) toGroupResponse(id, name, desc string, createdAt int64, models []string, members int) groupResponse {
+func (h *GroupHandler) toGroupResponse(id, name, desc string, createdAt int64, models []string, members, keys int) groupResponse {
 	if models == nil {
 		models = []string{}
 	}
 	return groupResponse{
 		ID: id, Name: name, Description: desc,
-		Models: models, MemberCount: members, CreatedAt: createdAt,
+		Models: models, MemberCount: members, KeyCount: keys, CreatedAt: createdAt,
 	}
 }
 
@@ -82,23 +84,18 @@ func (h *GroupHandler) List(w http.ResponseWriter, r *http.Request) {
 		writeServerError(w, "list group models", err)
 		return
 	}
-	users, err := h.store.ListUsers(ctx)
+	bindings, err := h.store.ListGroupBindingCounts(ctx)
 	if err != nil {
-		writeServerError(w, "list users", err)
+		writeServerError(w, "list group binding counts", err)
 		return
-	}
-	members := make(map[string]int, len(groups))
-	for i := range users {
-		if users[i].GroupID != "" {
-			members[users[i].GroupID]++
-		}
 	}
 
 	out := make([]groupResponse, 0, len(groups))
 	for i := range groups {
 		g := &groups[i]
+		count := bindings[g.ID]
 		out = append(out, h.toGroupResponse(g.ID, g.Name, g.Description, g.CreatedAt,
-			models[g.ID], members[g.ID]))
+			models[g.ID], count.Users, count.Keys))
 	}
 	writeJSON(w, http.StatusOK, out)
 }
@@ -146,7 +143,7 @@ func (h *GroupHandler) Create(w http.ResponseWriter, r *http.Request) {
 		writeServerError(w, "create group", err)
 		return
 	}
-	writeJSON(w, http.StatusCreated, h.toGroupResponse(g.ID, g.Name, g.Description, g.CreatedAt, nil, 0))
+	writeJSON(w, http.StatusCreated, h.toGroupResponse(g.ID, g.Name, g.Description, g.CreatedAt, nil, 0, 0))
 }
 
 // Update 改名/改描述。白名单走 ReplaceModels，不在这里改。
@@ -190,7 +187,7 @@ func (h *GroupHandler) Update(w http.ResponseWriter, r *http.Request, id string)
 		return
 	}
 	models, _ := h.store.ListGroupModelsByGroup(ctx, id)
-	writeJSON(w, http.StatusOK, h.toGroupResponse(g.ID, g.Name, g.Description, g.CreatedAt, models, 0))
+	writeJSON(w, http.StatusOK, h.toGroupResponse(g.ID, g.Name, g.Description, g.CreatedAt, models, 0, 0))
 }
 
 // Delete 删除分组。组内还有成员时拒绝（见 store.ErrGroupNotEmpty）——
@@ -201,11 +198,16 @@ func (h *GroupHandler) Delete(w http.ResponseWriter, r *http.Request, id string)
 	}
 	if err := h.store.DeleteGroup(r.Context(), id); err != nil {
 		if errors.Is(err, store.ErrGroupNotEmpty) {
-			// 把人数一起告诉管理员：只说「删不掉」会让人去查库，
-			// 而真正该做的是把这些人迁走 —— 迁移工作量取决于人数。
-			msg := "该分组下还有账号，请先把他们移到别的组或移出分组（否则他们的模型权限会被放大）"
-			if n, cerr := h.store.CountGroupMembers(r.Context(), id); cerr == nil && n > 0 {
-				msg = fmt.Sprintf("该分组下还有 %d 个账号，请先把他们移到别的组或移出分组（否则他们的模型权限会被放大）", n)
+			msg := "该分组下还有账号或访问密钥，请先将账号移到别的组，并解除访问密钥的分组覆盖（否则模型权限会被放大）"
+			if count, cerr := h.store.CountGroupBindings(r.Context(), id); cerr == nil {
+				switch {
+				case count.Users > 0 && count.Keys > 0:
+					msg = fmt.Sprintf("该分组下还有 %d 个账号和 %d 把访问密钥，请先迁移账号并解除访问密钥的分组覆盖（否则模型权限会被放大）", count.Users, count.Keys)
+				case count.Users > 0:
+					msg = fmt.Sprintf("该分组下还有 %d 个账号，请先把他们移到别的组或移出分组（否则模型权限会被放大）", count.Users)
+				case count.Keys > 0:
+					msg = fmt.Sprintf("该分组下还有 %d 把访问密钥，请先解除这些密钥的分组覆盖（否则模型权限会被放大）", count.Keys)
+				}
 			}
 			writeError(w, http.StatusConflict, msg)
 			return
@@ -281,14 +283,24 @@ func (h *GroupHandler) ModelNames(w http.ResponseWriter, r *http.Request) {
 
 	all := make([]string, 0, 32)
 	seen := make(map[string]struct{}, 32)
-	for _, route := range snapshot.Get().Routes.ListRoutes() {
+	// prices 与 all **按公开名一一对应**：prices[i] 描述 all[i]。刻意用平行
+	// 数组而不是把 models 改成对象数组 —— Keys.vue 的 ModelPicker 与
+	// Groups.vue 都按 string[] 用它（v-model 的选项、Set 去重、includes
+	// 判定），改成 [{name,...}] 会同时打破这三个调用点，且它们并不需要价格。
+	// 平行数组的风险是长度必须对齐，所以它在同一个循环里构造。
+	prices := make([]modelPrice, 0, 32)
+	routes := snapshot.Get().Routes
+	for _, route := range routes.ListRoutes() {
 		if _, dup := seen[route.PublicName]; dup {
 			continue
 		}
 		seen[route.PublicName] = struct{}{}
 		all = append(all, route.PublicName)
+		prices = append(prices, priceForModel(routes, route.PublicName))
 	}
 	sort.Strings(all)
+	// 按公开名重排价格，与上面那次排序同步做。
+	sort.Slice(prices, func(i, j int) bool { return prices[i].Name < prices[j].Name })
 
 	// 管理员不受分组白名单约束。
 	//
@@ -301,24 +313,66 @@ func (h *GroupHandler) ModelNames(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if me.IsAdmin() {
-		writeJSON(w, http.StatusOK, map[string]any{"models": all, "restricted": false})
+		writeJSON(w, http.StatusOK, map[string]any{"models": all, "restricted": false, "prices": prices})
 		return
 	}
 
 	u := snapshot.Get().UsersByID[me.ID]
 	if u == nil || u.AllowedModels.Unrestricted {
-		writeJSON(w, http.StatusOK, map[string]any{"models": all, "restricted": false})
+		writeJSON(w, http.StatusOK, map[string]any{"models": all, "restricted": false, "prices": prices})
 		return
 	}
 	// 组白名单生效：只给他组内那部分。交集为空时返回空数组而不是全集 ——
 	// 「全都看不到」和「什么都能看到」是两回事，返回全集会静默放宽。
 	filtered := make([]string, 0, len(u.AllowedModels.Models))
-	for _, m := range all {
+	filteredPrices := make([]modelPrice, 0, len(u.AllowedModels.Models))
+	for i, m := range all {
 		if u.AllowedModels.Allows(m) {
 			filtered = append(filtered, m)
+			// prices 与 all 已按同一顺序排好，逐位取即可（见上面的构造）。
+			filteredPrices = append(filteredPrices, prices[i])
 		}
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"models": filtered, "restricted": true})
+	writeJSON(w, http.StatusOK, map[string]any{"models": filtered, "restricted": true, "prices": filteredPrices})
+}
+
+// modelPrice 是某个公开模型名的三项单价（元 / 百万 tokens）。
+//
+// 语义与 routing.UpstreamModel 的三个 Price 字段逐字对应，**0 = 未配置**
+// （不是「免费」）：前端据此显示「未配置」而不是 0.00（与 Settings.vue 的
+// priceCell 同口径）。
+type modelPrice struct {
+	Name          string  `json:"name"`
+	PriceInput    float64 `json:"price_input"`
+	PriceOutput   float64 `json:"price_output"`
+	PriceCacheHit float64 `json:"price_cache_hit"`
+}
+
+// priceForModel 按公开名取该模型的单价。
+//
+// 走 routing.RouteIndex.Resolve —— 与**数据面**解析公开名的同一个函数，
+// 因此「界面显示的价格」与「实际按什么价扣费」同源：Resolve 同时覆盖具名
+// 路由和 `provider/model` 直连两种形式，取的是故障转移链的**主目标**
+// （Candidates[0]）。用别的来源会出现「界面显示 A 价、按 B 价扣费」。
+//
+// 价格取的是**本快照生成时刻**的值，与快照里的 ContextWindow 等静态元数据
+// 同性质：改价要等下一次 reload 才反映，与 cost_total 按落库当时单价固化
+// 的口径同向（见 routing.UpstreamModel 的注释）。
+//
+// 解析不出来（路由被禁用、无可用目标）时返回全 0，即「未配置」。这里
+// 不用「拿 0 当免费」去掩盖问题：前端会把 0 显示成「未配置」，用户至少看得见
+// 异常，而拿一个猜出来的价格会让账目对不上。
+func priceForModel(routes *routing.RouteIndex, name string) modelPrice {
+	p := modelPrice{Name: name}
+	res, err := routes.Resolve(name)
+	if err != nil || len(res.Candidates) == 0 || res.Candidates[0].UpstreamModel == nil {
+		return p
+	}
+	m := res.Candidates[0].UpstreamModel
+	p.PriceInput = m.PriceInput
+	p.PriceOutput = m.PriceOutput
+	p.PriceCacheHit = m.PriceCacheHit
+	return p
 }
 
 // unknownModels 返回白名单里「当前不存在」的公开模型名。

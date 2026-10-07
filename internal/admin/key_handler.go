@@ -29,10 +29,12 @@ type keyRequest struct {
 	Name        *string `json:"name"`
 	Enabled     *bool   `json:"enabled"`
 	QuotaTokens *int64  `json:"quota_tokens"`
-	// UserID 指定这把 key 归谁（仅管理员可用）。
+	// UserID 指定这把 key 归谁。
 	//
-	// 留空时的归属规则见 Create：普通用户自动填自己，管理员留空则为无归属
-	//（而无归属 key 会被迁移退役、鉴权拒绝—— 见 store.retireOrphanKeys）。
+	// Create 上**一律忽略**：任何人（含管理员）建 key 都只归属自己。
+	// 代建走 Update 的认领路径（只有管理员可用），不靠创建接口。
+	//
+	// Update 语义：nil = 保持原值，非空 = 改判给该用户（仅管理员）。
 	UserID *string `json:"user_id"`
 	// RPMLimit / TPMLimit：Key 维度每分钟限速（DESIGN §11.4），0 = 不限。
 	RPMLimit *int `json:"rpm_limit"`
@@ -124,20 +126,38 @@ func (h *KeyHandler) List(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *KeyHandler) Create(w http.ResponseWriter, r *http.Request) {
-	// 发 key 收敛为管理员专属。
+	// 自助发 key 对所有登录用户开放（普通用户与管理员同等）。
 	//
-	// 自助发 key 曾对普通用户开放，并有「额度封顶」兜底（保留在下方作纵深
-	// 防御）。但兜底挡不住绕过：管理员落在**具体某把 key** 上的强制策略 ——
-	// 禁用、更紧的配额、RPM/TPM、有效期、IP 白名单 —— 用户随时重新建一把
-	// （enabled=true、无期限、无 IP 限制）即可全部绕开；而 rpm/tpm 被强制
-	// 清 0（不限速）加上「用户级额度未设即不限」，默认配置下普通用户可以
-	// 自铸不限量、不限速的凭证，把上游的真实费用敞口直接打开。
-	// 不可绕过的外层闸门（users.quota_tokens、用户禁用、组白名单）约束的是
-	// 「这个人」，替代不了「管理员要约束某把具体 key」的语义。
-	// 真正的自助发 key 需要用户/组级的强制 ceiling（schema + 热路径配合），
-	// 是独立特性；在它存在之前，发 key 只能是管理动作。
-	if !callerIsAdmin(r) {
-		writeError(w, http.StatusForbidden, "只有管理员可以创建密钥")
+	// # 为什么当初关掉，现在又能开
+	//
+	// 这里曾有一道 callerIsAdmin → 403，把发 key 收敛为管理动作。理由是
+	// 兜底挡不住绕过：管理员落在**具体某把 key** 上的强制策略 —— 禁用、
+	// 更紧的配额、RPM/TPM、有效期、IP 白名单 —— 用户随时重新建一把
+	// （enabled=true、无期限、无 IP 限制）即可全部绕开。
+	//
+	// 现在的口径变了，关键在于「重建」不再是无条件的逃逸口：
+	//
+	//   - 额度被封顶到用户级 quota（见下方封顶段），用户级不限才是真不限；
+	//   - rpm/tpm 被强制清零，等于**放弃**限速能力而不是获得它；
+	//   - 有效期与 IP 白名单允许自设，但那是**给自己加限制**（收紧），
+	//     管理员施加的那一份仍由 guardNoLoosening 守着，撤销不了；
+	//   - 管理员能在**别人的** key 上做的事，一个用户在自己身上做不出
+	//     更宽松的结果 —— 绕开某把 key 的封顶，最优解本来就是自建一把
+	//     干净的 key，代价是失去该 key 上已有的所有限制性配置。
+	//
+	// 残留的真实敞口是「用户级 quota 未设（0）时可以自铸不限额凭证」。
+	// 这由部署侧兜：给普通用户配 users.quota_tokens 就是硬天花板。
+	// 界面上也直接提示了这一点（Keys.vue 的用量提示）。
+	//
+	// 身份缺失一律 401：不靠「拿不到身份就当普通用户」来兜底 ——
+	// 那会让匿名请求走到封顶逻辑之外。
+
+	me := server.UserFromContext(r.Context())
+	if me == nil || me.ID == "" {
+		// 与 ownedByCaller 同一口径：空 ID 绝不放行（fail-closed）。
+		// 走这个分支意味着中间件没注入身份，此时若继续执行，归属会被
+		// 写成空串，造出一把「谁都用不了」的死 key。
+		writeError(w, http.StatusUnauthorized, "需要登录")
 		return
 	}
 
@@ -185,7 +205,8 @@ func (h *KeyHandler) Create(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 自助建 key 的额度必须**封顶**。
+	// 自助建 key 的额度必须**封顶**。这段在开放自助建 key 之后**是生效的**
+	// （原实现里它被上面那道 admin 403 挡住，是永不执行的死代码）。
 	//
 	// 原实现让普通用户在创建请求里任意填 quota/rpm/tpm，而 0 = 不限 ——
 	// 于是任何人建一把 key 就能得到「不限额、不限速」的凭证，key 级限速
@@ -200,8 +221,19 @@ func (h *KeyHandler) Create(w http.ResponseWriter, r *http.Request) {
 	//     任意填的能力就是留一个不限速的口子，而 rpm/tpm 的**约束**已由
 	//     用户级配额间接实现（总额封顶）。
 	//
-	// 管理员不受此限制：管理员本来就该能建任意额度的 key。
-	if me := server.UserFromContext(r.Context()); me != nil && !me.IsAdmin() {
+	// 管理员不受此限制：管理员本来就该能建任意额度的 key —— 额度封顶的
+	// 目的是不让用户给自己造出超出其自身授权的额度，而不是限制管理员。
+	//
+	// 与 guardNoLoosening 的口径一致性：那条守的是 PATCH（与**库中现值**
+	// 比），这里守的是 CREATE（与**用户级额度**比）。两者同向 ——
+	// 普通用户的额度上限恒等于用户级额度，任何一条路径都放宽不了。
+	//
+	// expires_at / allowed_ips 这里**不**封顶：它们只有「设」和「不设」，
+	// 用户自设的方向是给**自己**加限制（更早到期、来源更窄），属于收紧，
+	// 没有「比用户级上限更宽」这个概念。反过来说，若这里允许用户把
+	// 有效期设成过去（= 立即失效）那是自伤，允许；管理员施加给具体 key
+	// 的那一份仍由 guardNoLoosening 守着不被撤销。
+	if !me.IsAdmin() {
 		var userQuota int64
 		if u := snapshot.Get().UsersByID[me.ID]; u != nil {
 			userQuota = u.QuotaTokens
@@ -221,30 +253,31 @@ func (h *KeyHandler) Create(w http.ResponseWriter, r *http.Request) {
 		rpm, tpm = 0, 0
 	}
 
-	// 归属：普通用户只能给自己建 key（忽略请求里的 user_id），
-	// 管理员可显式指定。管理员留空则建出无归属 key —— 那把 key 会被
-	// 下次重启的 retireOrphanKeys 退役掉，鉴权直接 401。
-	// 这里**不**拒绝无归属：管理端「先建后认领」是合理流程。
-	owner := ""
-	me := server.UserFromContext(r.Context())
-	if me != nil {
-		if me.IsAdmin() {
-			owner = strings.TrimSpace(derefStr(req.UserID))
-		} else {
-			owner = me.ID
-		}
-	}
-	if owner != "" {
-		if target, terr := h.store.GetUser(r.Context(), owner); terr != nil {
-			writeServerError(w, "resolve key owner", terr)
-			return
-		} else if target == nil {
-			// 归属必须指向真实存在的用户：写进去一个不存在的 id，
-			// 鉴权时 UsersByID 查不到 → 401，key 变成「谁都用不了」的死物。
-			writeError(w, http.StatusBadRequest, "user_id 指向的用户不存在")
-			return
-		}
-	}
+	// 归属：**一律是调用者自己**，管理员也不例外。
+	//
+	// 请求里的 user_id 被**完全忽略**（不报错、不生效）。管理员要替别人
+	// 建 key 只能建好之后走 Update 的「认领」（ReassignAccessKey）——
+	// 那是一次可审计的独立动作，而不是在创建接口里留一个字段。
+	// 这样 key 的来源永远是「谁建的」，而归属变更永远是「谁改的」，
+	// 审计日志里两件事不会混在一条记录里。
+	//
+	// 这里刻意选「静默忽略」而不是 403：user_id 仍在 keyRequest 里
+	// （PATCH 的认领路径要用同一个结构体），前端旧版本可能还在发它。
+	// 拒绝会让一个本来能成功的建 key 操作变成硬失败，而忽略的结果
+	// （key 归你自己）恰恰是调用方唯一能接受的结果 —— 越权没有发生，
+	// 就没有理由为此中断。
+	owner := me.ID
+	// 这里**刻意不再查库确认 owner 存在**。
+	//
+	// 原实现会查，理由是防「user_id 指向不存在的用户 → 一把永远 401 的死
+	// key」—— 那时 owner 来自**请求里的 user_id**，是不可信输入，值得校验。
+	// 现在 owner = 已认证会话的 id：中间件解析会话时就已经查过 users 行并
+	// 比对了 auth_version，能走到这里就说明这一行存在。再查一次是在校验
+	// 我们自己的认证层，而不是校验调用方的输入。
+	//
+	// 真正需要 fail-closed 的是「拿不到身份」（上面已 401）—— 那条一旦可达
+	// 就是往匿名开了一条写库路径，方向全错。
+	_ = req.UserID // 保留字段：PATCH 的认领路径复用同一结构体
 
 	k := &store.AccessKey{
 		ID:          generateID(),
@@ -340,8 +373,9 @@ func (h *KeyHandler) applyP2(w http.ResponseWriter, r *http.Request, req keyRequ
 
 // callerIsAdmin 报告当前调用者是否是管理员。
 //
-// 建 key 并指定归属（user_id）是管理动作，普通用户建 key 一律归属自己 ——
-// 见 Create 里对 user_id 的强制覆盖。
+// 现在的两处用途：applyP2 的分组覆盖判定（管理员的收紧手段）、
+// guardNoLoosening 的「只能收紧」守卫。**建 key 本身不再用它判定** ——
+// 自助建 key 已对所有登录用户开放，归属一律是自己（见 Create）。
 func callerIsAdmin(r *http.Request) bool {
 	me := server.UserFromContext(r.Context())
 	return me != nil && me.IsAdmin()

@@ -36,6 +36,30 @@ type User struct {
 	// QuotaTokens 是用户级总额度（token 计量，input+output）。
 	// 0 = 不限。与 access_keys.quota_tokens 同口径。
 	QuotaTokens int64
+	// BalanceCents 是账户余额，单位**分**（人民币，100 分 = 1 元）。
+	//
+	// # 为什么是整数分而不是浮点元
+	//
+	// 余额是一个**反复累加**的账目，而浮点的二进制表示无法精确表达十进制
+	// 小数：0.1 + 0.2 != 0.3，每加减一次都留一点长尾。几十上百次扣费之后，
+	// 尾数累积到「还剩多少钱」的判断开始不可靠 —— 尤其「扣到 0.0000001 元
+	// 就停手」这种阈值判断，在浮点下要么因误差永远差一点点而扣不下去，
+	// 要么因误差把余额扣成负数。整数分是十进制的**精确**表示，累加无误差，
+	// 判零/判负都是整数比较。币种是人民币，与 usage_records.cost_total
+	// 同一口径（元），两者相除即得分。
+	//
+	// # Unlimited=true = 不限额（**不是**「余额为零」）
+	//
+	// unlimited 的表示是**列值为 NULL**，与 QuotaTokens 的「0 = 不限」刻意
+	// 相反。原因：0 在余额语义下是一个**有意义的实数状态** ——「账户里确实
+	// 一分钱都没有」，它必须能被表达、且必须触发拒绝。若沿用 quota_tokens
+	// 的「0 = 不限」，就无法区分「不限额」与「已欠费」，而这两种状态在业务上
+	// 截然不同（前者放行、后者 402），必须用不同的值表示。
+	//
+	// 这条对比是本字段最容易被后来者踩的地方：看到 0 就当成「不限」会得到
+	// 一个**永远能用的欠费账户**。判定一律走 Unlimited 标志，不要看数值。
+	BalanceCents int64
+	Unlimited    bool
 	// UsedTokens 不由本包维护 —— 见 §4.3 决策：用户级已用量
 	// 走实时 SUM 查询，不用触发器（触发器无法感知 key 被删除，
 	// 会永久留下偏高的计数）。此字段仅供管理面展示导入用。
@@ -75,9 +99,21 @@ func (u *User) IsActive() bool { return u != nil && u.Status == UserStatusActive
 //
 // group_id 必须 COALESCE：老库升级后该列对存量行是真 NULL，
 // 扫进 string 会报 "converting NULL to string is unsupported"。
+//
+// ⚠️ **本常量与 scanUser 必须逐列同步**，新增列时两处一起改。手写列清单
+// 必然漂移，而漂移的典型后果不是报错而是**静默赋错值**：少一列时
+// database/sql 会把后面几列扫进前面的字段（把 balance_cents 扫进
+// used_tokens），编译与测试全绿，账目却在暗处对不上。key_dao.go 的 keyColumns
+// 注释记的就是同一个教训。
+//
+// balance_cents 用**布尔表达式** `IS NULL` 直接产出「不限额」标志，而不是
+// COALESCE(..,0) 再补一列：前者少一个扫描目标，也免得「NULL 与 0 谁在前面」
+// 这种顺序错位（正是上面警告的那类静默错误）。
 const userColumns = `id, username, COALESCE(display_name,''), COALESCE(password_hash,''),
 		        role, status, COALESCE(group_id,''), quota_tokens, used_tokens, auth_version,
-		        COALESCE(remark,''), created_at, updated_at, last_login_at`
+		        COALESCE(remark,''), created_at, updated_at, last_login_at,
+		        COALESCE(balance_cents, 0) AS balance_cents,
+		        (balance_cents IS NULL) AS balance_unlimited`
 
 // ListUsers 返回全部用户，按创建时间排序。
 func (s *Store) ListUsers(ctx context.Context) ([]User, error) {
@@ -149,6 +185,10 @@ func (s *Store) FindUninitializedAdmin(ctx context.Context) (*User, error) {
 
 // CreateUser 插入一个用户。用户名冲突由唯一约束报出，
 // 调用方应先用 IsUniqueViolation(err) 区分「重名」与「其他故障」。
+//
+// balance_cents **随创建写入**：新建账号时管理员通常要同时给一个初始余额。
+// Unlimited=true 落 NULL（不限额），否则落整数分。与迁移路径的编码一致
+// （见 store.ensureColumns 里对 balance_cents 可空性的说明）。
 func (s *Store) CreateUser(ctx context.Context, u *User) error {
 	now := time.Now().UnixMilli()
 	if u.CreatedAt == 0 {
@@ -167,17 +207,29 @@ func (s *Store) CreateUser(ctx context.Context, u *User) error {
 	_, err := s.db.ExecContext(ctx,
 		`INSERT INTO users (id, username, display_name, password_hash, role, status,
 		                    group_id, quota_tokens, used_tokens, auth_version, remark,
-		                    created_at, updated_at, last_login_at)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		                    created_at, updated_at, last_login_at, balance_cents)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		u.ID, u.Username, u.DisplayName, u.PasswordHash, u.Role, u.Status,
 		nullIfEmpty(u.GroupID), u.QuotaTokens, u.UsedTokens, u.AuthVersion, u.Remark,
-		u.CreatedAt, u.UpdatedAt, u.LastLoginAt)
+		u.CreatedAt, u.UpdatedAt, u.LastLoginAt, balanceValue(u.BalanceCents, u.Unlimited))
 	if err == nil {
 		// 回写归一化后的值：落库用的是局部 now，结构体可能仍是零值，
 		// 会让创建响应里的 created_at 是 0（与随后 GET 到的同一条不一致）。
 		u.UpdatedAt = now
 	}
 	return err
+}
+
+// balanceValue 把 (cents, unlimited) 编码成可直接绑定的列值。
+//
+// Unlimited → nil（SQL NULL = 不限额），否则落整数分。集中在一处是为了
+// 让「NULL 才是不限额」这条约定只有一份实现（CreateUser / SetBalance /
+// 迁移的编码必须一致，分散写必然漂移）。见 User.BalanceCents 的注释。
+func balanceValue(cents int64, unlimited bool) any {
+	if unlimited {
+		return nil
+	}
+	return cents
 }
 
 // UpdateUser 更新可管理字段。
@@ -357,12 +409,20 @@ func (s *Store) RecomputeUserUsage(ctx context.Context, userID string) (int64, e
 // 直接把可空列扫进 string/int 会在列为 NULL 时报
 // "converting NULL to string is unsupported"（见 model_dao 的同款注释），
 // 故所有可空列在 SELECT 里已用 COALESCE 兜成零值。
+//
+// 扫描目标必须与 userColumns **逐列对应**（末尾两列是余额，见 User.BalanceCents
+// 的注释）：数目或顺序对不上时，database/sql 不会报错而是**把后面几列扫进
+// 前面几个字段** —— 编译通过、测试全绿，账目却在暗处对不上。limited 扫成
+// int 而非 bool 是为了与 enabled 的既有写法一致（COALESCE 后的 NULL 兜底）。
 func scanUser(sc scanner) (*User, error) {
 	var u User
+	var unlimited int
 	if err := sc.Scan(&u.ID, &u.Username, &u.DisplayName, &u.PasswordHash,
 		&u.Role, &u.Status, &u.GroupID, &u.QuotaTokens, &u.UsedTokens, &u.AuthVersion,
-		&u.Remark, &u.CreatedAt, &u.UpdatedAt, &u.LastLoginAt); err != nil {
+		&u.Remark, &u.CreatedAt, &u.UpdatedAt, &u.LastLoginAt,
+		&u.BalanceCents, &unlimited); err != nil {
 		return nil, err
 	}
+	u.Unlimited = unlimited == 1
 	return &u, nil
 }

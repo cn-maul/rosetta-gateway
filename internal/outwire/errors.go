@@ -136,6 +136,13 @@ func errorTypeFromCode(code string) string {
 	case "insufficient_quota":
 		// 与 rate_limit 区分：额度耗尽要充值/换账号，退避没有意义。
 		return "insufficient_quota"
+	case "insufficient_balance":
+		// 余额耗尽（402）。与 insufficient_quota 刻意分开：那是**token 配额**
+		// （终身累计额度），这一条是**人民币余额**（可充值）。两者的处置动作
+		// 不同（换 key vs 充值），塌成一类会让客户端给出错误建议。
+		// 沿用 insufficient_quota 这个 type 名而不是新造：OpenAI SDK 只认得
+		// 有限几种 type，而「额度不足，去充值」这个语义两者一致。
+		return "insufficient_quota"
 	case "upstream_auth_error":
 		// 上游 401/403 —— 目标级凭据问题，故障转移链有机会换一把 key。
 		// 报成 api_error 会让客户端以为是自己请求的问题。

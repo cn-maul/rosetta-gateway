@@ -13,18 +13,18 @@ import (
 	"github.com/cn-maul/rosetta-gateway/internal/store"
 )
 
-// ---- F4：无归属 key 的「先建后认领」必须真的存在 ----
+// ---- F4：归属只能由「认领」这一个动作改变 ----
 
-// TestKeyHandler_ClaimOwnerOnPatch 钉住 F4 的修复。
+// TestKeyHandler_ClaimOwnerOnPatch 钉住归属变更的唯一入口是 PATCH。
 //
 // Update 过去**从不读** req.UserID（keyRequest 里声明了它），于是
-// Create 注释里承诺的「先建后认领」流程不存在：
+// 「认领」这个流程不存在：
 //
-//	POST  {"name":"k"}                      -> 201 user_id:""（那把 key 永远 401）
-//	PATCH {"user_id":"<真实用户>"}            -> 200，但 user_id 仍是 ""
+//	PATCH {"user_id":"<真实用户>"} -> 200，但 user_id 仍是原值
 //
-// 无归属的 key 走 auth.Authenticate 会得到 ErrKeyUnowned（401），
-// 所以认领不上就等于「建出一把谁都用不了的死物」。
+// 建 key 现在恒归属创建者本人（自助发 key 的归属规则），
+// 所以「先建后认领」不再有意义 —— 管理员要替别人建，正确做法是
+// 建好后立刻 PATCH 认领。本测试覆盖的是那条 PATCH 路径。
 func TestKeyHandler_ClaimOwnerOnPatch(t *testing.T) {
 	st := newTestStore(t)
 	h := NewKeyHandler(st)
@@ -37,9 +37,18 @@ func TestKeyHandler_ClaimOwnerOnPatch(t *testing.T) {
 		t.Fatalf("seed user: %v", err)
 	}
 
+	// Create 一律归属自己，所以这里先以普通用户身份建一把属于 u1 的 key，
+	// 再由管理员把它认领给 u-claim。
+	if err := st.CreateUser(ctx, &store.User{
+		ID: "u1", Username: "alice", PasswordHash: "x",
+		Role: store.RoleUser, Status: store.UserStatusActive, AuthVersion: 1,
+	}); err != nil {
+		t.Fatalf("seed owner: %v", err)
+	}
+
 	rec := httptest.NewRecorder()
-	h.Create(rec, asAdmin(jsonRequest(http.MethodPost, "/admin/api/keys",
-		bytes.NewBufferString(`{"name":"orphan"}`))))
+	h.Create(rec, asUser(jsonRequest(http.MethodPost, "/admin/api/keys",
+		bytes.NewBufferString(`{"name":"k"}`)), "u1"))
 	if rec.Code != http.StatusCreated {
 		t.Fatalf("create code=%d body=%s", rec.Code, rec.Body.String())
 	}
@@ -47,8 +56,9 @@ func TestKeyHandler_ClaimOwnerOnPatch(t *testing.T) {
 	if err := json.Unmarshal(rec.Body.Bytes(), &created); err != nil {
 		t.Fatalf("unmarshal: %v", err)
 	}
-	if created.UserID != "" {
-		t.Fatalf("前置条件不成立：期望无归属，实际 %q", created.UserID)
+	// 前置条件：创建者归属自己（而不是无归属，也不是请求里指定的人）。
+	if created.UserID != "u1" {
+		t.Fatalf("前置条件不成立：期望归属 u1，实际 %q", created.UserID)
 	}
 
 	rec2 := httptest.NewRecorder()
@@ -62,9 +72,9 @@ func TestKeyHandler_ClaimOwnerOnPatch(t *testing.T) {
 		t.Fatalf("unmarshal: %v", err)
 	}
 	if upd.UserID != "u-claim" {
-		t.Fatalf("认领未生效：user_id=%q（修复前这里恒为空串，且仍返回 200）", upd.UserID)
+		t.Fatalf("认领未生效：user_id=%q", upd.UserID)
 	}
-	// 落库也必须同步 —— 否则下一次重建快照时又变回无归属。
+	// 落库也必须同步 —— 否则下一次重建快照时又变回原归属。
 	dbKey, _ := st.GetAccessKey(ctx, created.ID)
 	if dbKey == nil || dbKey.UserID != "u-claim" {
 		t.Fatalf("归属未落库：%+v", dbKey)

@@ -81,33 +81,85 @@ const form = reactive({
 // 全部删掉 —— 界面显示「保存成功」，实际故障转移链已经没了，且没有撤销路径。
 const chainError = ref('')
 
+/**
+ * 目标链的两个「能不能保存」状态，缺一不可：
+ *
+ *   - chainLoading：链是**异步**取的。打开弹窗到响应回来这段窗口里，表单里
+ *     只有一条由 route 主目标列拼出来的占位行 —— 此时放行保存，等于拿一份
+ *     伪造的单目标链去做 PUT 整体替换。
+ *   - chainReady：只有「本次打开的链确实取到了」才为真。加载失败（chainError）
+ *     和「会话已失效」都停在假，永不放行。
+ *
+ * 光有 chainError 不够（它覆盖不到加载中），光有 chainLoading 也不够（加载
+ * 结束后失败态会把它清回 false，继而放行）。两者叠起来才是「安全」。
+ */
+const chainLoading = ref(false)
+const chainReady = ref(false)
+
+/**
+ * 打开弹窗的请求序号。
+ *
+ * 连点两条路由的「编辑」会并发两个 routeTargets 请求，而响应顺序不保证与点击
+ * 顺序一致。没有序号时，慢到的**旧**响应会最后写入 form.targets —— 弹窗于是
+ * 显示「A 路由的公开名 + B 路由的上游链」。这份串了的表单一旦保存，PUT 会把
+ * B 的链整体写到 A 上（position 1..N 被重排覆盖），界面上完全看不出发生过什么。
+ */
+let chainSeq = 0
+
+// 保存中：挡住回车连点造成的重复提交（每次提交都会整体替换一次链）。
+const saving = ref(false)
+
+// 链未就绪期间禁止一切改动与保存（覆盖「加载中」与「加载失败」两种情形）
+const chainBlocked = computed(() => chainLoading.value || !chainReady.value || saving.value)
+
 function blankTarget(): TargetRow {
   return { provider_id: '', upstream_model_id: '', enabled: true }
 }
 
 async function openRoute(r?: Route) {
+  const seq = ++chainSeq
   form.editing = r?.id ?? ''
   form.public_name = r?.public_name ?? ''
   form.enabled = r?.enabled ?? true
   form.failover_enabled = r?.failover_enabled ?? false
   chainError.value = ''
+  // 每次打开都先回到「未就绪」：任何一次重新打开、以及任何一次并发的旧响应，
+  // 在没有拿到本轮链之前都不允许保存。
+  chainReady.value = false
 
   if (r) {
+    chainLoading.value = true
     try {
       const ts = await api.routeTargets(r.id)
+      if (seq !== chainSeq) return // 期间又打开了别的路由，本响应已过时，丢弃
       form.targets = ts.length
         ? ts.map((t) => ({ provider_id: t.provider_id, upstream_model_id: t.upstream_model_id, enabled: t.enabled }))
         : [{ provider_id: r.provider_id, upstream_model_id: r.upstream_model_id, enabled: true }]
+      chainReady.value = true
     } catch (e) {
-      // 载荷仍是「主目标单行」，但只用于展示；chainError 会拦住保存。
+      if (seq !== chainSeq) return
+      if ((e as { status?: number }).status === 401) {
+        // 401 只代表会话失效（api 侧已清令牌、App 会送回登录页）。
+        // 这里必须**关掉弹窗**：留在打开状态的话，屏幕停在一份永远加载不出来的
+        // 表单上，而真正的原因（请重新登录）只在 toast 里。
+        form.open = false
+        return
+      }
+      // 载荷仍是「主目标单行」，但只用于展示；chainReady 保持假，保存被拦住。
       chainError.value =
         '无法读取该路由的上游链：' +
         (e as Error).message +
         '。为避免用不完整的数据覆盖已有配置，保存已被禁用 —— 请先刷新页面重试。'
       form.targets = [{ provider_id: r.provider_id, upstream_model_id: r.upstream_model_id, enabled: true }]
+    } finally {
+      // 只清自己那一次的加载态：被丢弃的旧响应不能把新一轮的加载态提前抹掉，
+      // 否则「点第二条路由」的瞬间按钮就解禁了 —— 而链还在路上。
+      if (seq === chainSeq) chainLoading.value = false
     }
   } else {
+    // 新建：链由用户现场填，没有「读回来」这一步，直接算就绪。
     form.targets = [blankTarget()]
+    chainReady.value = true
   }
   form.open = true
 }
@@ -139,10 +191,17 @@ function onTargetProviderChange(row: TargetRow) {
 
 async function submitRoute() {
   const targets = form.targets
-  if (chainError.value) {
+  if (chainLoading.value) {
+    toast('上游链仍在加载，请稍候', 'err')
+    return
+  }
+  if (!chainReady.value) {
+    // 与 chainError 同因：链没读回来就保存 = 用一份伪造的单目标链整体替换。
+    // chainError 非空时它已经把原因写在弹窗里了，这里只补一句动作被拦下。
     toast('上游链未成功加载，已禁止保存（请先刷新页面）', 'err')
     return
   }
+  if (saving.value) return
   if (!form.public_name.trim()) {
     toast('公开模型名为必填项', 'err')
     return
@@ -168,6 +227,7 @@ async function submitRoute() {
   }))
 
   let isNew = false
+  saving.value = true
   try {
     let routeId = form.editing
     if (routeId) {
@@ -193,6 +253,8 @@ async function submitRoute() {
       const hint = isNew ? '路由已创建，但上游链写入失败：' : '保存失败：'
       toast(hint + (e as Error).message, 'err')
     }
+  } finally {
+    saving.value = false
   }
 }
 
@@ -253,30 +315,43 @@ onMounted(load)
         <div class="big">⇢</div>
         还没有路由，客户端将无法调用任何模型
       </div>
-      <div v-else class="row-list">
-        <div v-for="r in routes" :key="r.id" class="row">
-          <div class="row-main">
-            <div class="row-title">
-              <span class="mono">{{ r.public_name }}</span>
-              <span class="badge" :class="r.enabled ? 'badge-live' : 'badge-off'">{{ r.enabled ? '启用' : '停用' }}</span>
-              <span v-if="r.failover_enabled" class="badge">故障转移</span>
-            </div>
-            <div class="row-sub">
-              {{ providerMap[r.provider_id]?.name ?? r.provider_id }} →
-              <span class="mono">{{ modelLabel(r) }}</span>
-              <span v-if="r.failover_enabled" class="muted"> · 链式多上游，失败自动切换</span>
-            </div>
-          </div>
-          <div class="row-side">
-            <button class="btn btn-sm btn-ghost" @click="openRoute(r)">编辑</button>
-            <button class="btn btn-sm btn-danger" @click="removeRoute(r)">删除</button>
-            <button class="switch" :class="{ on: r.enabled }" :title="r.enabled ? '停用' : '启用'" @click="toggleRoute(r)"></button>
-          </div>
-        </div>
+      <div v-else class="tbl-wrap">
+        <table class="tbl">
+          <thead>
+            <tr>
+              <th>公开模型名</th>
+              <th>状态</th>
+              <th>主目标</th>
+              <th class="c-act">操作</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr v-for="r in routes" :key="r.id">
+              <td class="mono">{{ r.public_name }}</td>
+              <td>
+                <span class="badge" :class="r.enabled ? 'badge-live' : 'badge-off'">{{ r.enabled ? '启用' : '停用' }}</span>
+                <span v-if="r.failover_enabled" class="badge">故障转移</span>
+              </td>
+              <td>
+                {{ providerMap[r.provider_id]?.name ?? r.provider_id }} →
+                <span class="mono">{{ modelLabel(r) }}</span>
+                <div v-if="r.failover_enabled" class="sub-line">链式多上游，失败自动切换</div>
+              </td>
+              <td class="c-act">
+                <div class="row-actions">
+                  <button class="btn btn-sm btn-ghost" @click="openRoute(r)">编辑</button>
+                  <button class="btn btn-sm btn-danger" @click="removeRoute(r)">删除</button>
+                  <button class="switch" :class="{ on: r.enabled }" :title="r.enabled ? '停用' : '启用'" @click="toggleRoute(r)"></button>
+                </div>
+              </td>
+            </tr>
+          </tbody>
+        </table>
       </div>
     </div>
 
-    <AppModal :open="form.open" :title="form.editing ? '编辑路由' : '新建路由'" @close="form.open = false">
+    <!-- 表单填一半别丢：遮罩/Esc 都不关（:dismissable=false），只能走取消/保存 -->
+    <AppModal :open="form.open" :title="form.editing ? '编辑路由' : '新建路由'" :dismissable="false">
       <form @submit.prevent="submitRoute">
         <div class="form-grid">
           <div class="field span2">
@@ -290,15 +365,18 @@ onMounted(load)
         <div class="chain">
           <div class="chain-head">
             <label class="section-label">上游链（自上而下依次尝试）</label>
-            <button type="button" class="btn btn-sm btn-ghost" :disabled="!!chainError" @click="addTarget">+ 添加目标</button>
+            <button type="button" class="btn btn-sm btn-ghost" :disabled="chainBlocked" @click="addTarget">+ 添加目标</button>
           </div>
+          <!-- 链的加载态必须可见：否则弹窗里静静躺着一行占位主目标，看着就像
+               「这条路由本来就只有一个上游」，用户会直接保存。 -->
+          <p v-if="chainLoading" class="chain-loading" role="status">正在读取上游链…</p>
           <div v-for="(t, i) in form.targets" :key="i" class="chain-row">
             <span class="chain-idx">{{ i + 1 }}</span>
-            <select v-model="t.provider_id" class="select" @change="onTargetProviderChange(t)">
+            <select v-model="t.provider_id" class="select" :disabled="chainBlocked" @change="onTargetProviderChange(t)">
               <option value="" disabled>选择上游</option>
               <option v-for="p in providers" :key="p.id" :value="p.id">{{ p.name }} ({{ p.slug }})</option>
             </select>
-            <select v-model="t.upstream_model_id" class="select" :disabled="!t.provider_id">
+            <select v-model="t.upstream_model_id" class="select" :disabled="chainBlocked || !t.provider_id">
               <option value="" disabled>选择模型</option>
               <option v-for="m in modelsOf(t.provider_id)" :key="m.id" :value="m.id">
                 {{ m.display_name ? `${m.display_name} (${m.model_id})` : m.model_id }}
@@ -308,9 +386,9 @@ onMounted(load)
               <input v-model="t.enabled" type="checkbox" /> 启用
             </label>
             <div class="chain-ops">
-              <button type="button" class="btn btn-sm btn-ghost" :disabled="!!chainError || i === 0" @click="moveTarget(i, -1)">↑</button>
-              <button type="button" class="btn btn-sm btn-ghost" :disabled="!!chainError || i === form.targets.length - 1" @click="moveTarget(i, 1)">↓</button>
-              <button type="button" class="btn btn-sm btn-danger" :disabled="!!chainError" @click="removeTarget(i)">删</button>
+              <button type="button" class="btn btn-sm btn-ghost" :disabled="chainBlocked || i === 0" @click="moveTarget(i, -1)">↑</button>
+              <button type="button" class="btn btn-sm btn-ghost" :disabled="chainBlocked || i === form.targets.length - 1" @click="moveTarget(i, 1)">↓</button>
+              <button type="button" class="btn btn-sm btn-danger" :disabled="chainBlocked" @click="removeTarget(i)">删</button>
             </div>
           </div>
         </div>
@@ -339,8 +417,10 @@ onMounted(load)
         <p v-if="chainError" class="chain-error" role="alert">{{ chainError }}</p>
 
         <div class="form-actions">
-          <button type="button" class="btn btn-ghost" @click="form.open = false">取消</button>
-          <button type="submit" class="btn btn-primary" :disabled="!!chainError">保存</button>
+          <button type="button" class="btn btn-ghost" :disabled="saving" @click="form.open = false">取消</button>
+          <button type="submit" class="btn btn-primary" :disabled="chainBlocked">
+            {{ saving ? '保存中…' : '保存' }}
+          </button>
         </div>
       </form>
     </AppModal>
@@ -391,12 +471,14 @@ onMounted(load)
   border: 1px dashed var(--border);
   border-radius: var(--r-thumb, 12px);
 }
-.muted {
-  opacity: 0.6;
+/* 链加载中的说明：与失败提示同位置，避免加载态被读成「链就是这么短」 */
+.chain-loading {
+  margin: 0 0 8px;
+  font-size: 13px;
+  color: var(--text-3);
 }
 /* 链加载失败提示：warning（暖橙）是设计系统里的专用告警色 */
 .chain-error {
-  margin: 12px 0 0;
   padding: 10px 12px;
   border-radius: var(--r-chip, 6px);
   background: var(--warning-soft);

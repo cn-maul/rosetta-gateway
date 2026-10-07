@@ -44,7 +44,38 @@ type UsageRecord struct {
 // Ts 为 0 时取当前时刻；非 0 则用它。此前该字段被**整个忽略**、恒写 time.Now()，
 // 于是任何显式带 Ts 的插入都静默落在「现在」—— 回填历史数据时整条时间线错位，
 // 而且因为字段名和列名都叫 ts，看不出哪里错了。
+//
+// 它是 CreateUsageRecordWithCost 的薄包装（只返回 error，丢掉固化的费用），
+// 保留是为了让既有 26 处调用点（测试、剪枝回填、E2E）一行都不用改。
+// 需要**扣费**的调用方请用 CreateUsageRecordWithCost 拿回 cost_total ——
+// 见那里的说明。
 func (s *Store) CreateUsageRecord(ctx context.Context, r *UsageRecord) error {
+	_, err := s.CreateUsageRecordWithCost(ctx, r)
+	return err
+}
+
+// CreateUsageRecordWithCost 落一条用量记录，**并返回该条固化的费用（元）**。
+//
+// # 为什么需要这个「新方法」而不是改 CreateUsageRecord 的签名
+//
+// 余额扣费要求「扣掉的金额与 cost_total 完全相等」，而 cost_total 是在这里
+// 按**落库当时**的单价算出来的。所以最自然的两条路是：
+//   - 改签名让本方法返回 cost：调用点全要改（实测 28 处引用，其中 26 处在
+//     别的任务拥有的测试文件里），且「返回值被丢弃」在 Go 里是合法的 ——
+//     改了签名之后仍会有人写 `_ = st.CreateUsageRecord(...)` 把它照旧丢掉。
+//   - 另加 CostOfRecord 按 id 读回：多一次主键查询，且读回的是**已落库**的
+//     值，与刚算出的那个值之间隔了一次 IO 往返。
+//
+// 本方法是第三条：老签名保留为包装（零回归），新签名给出费用。既不漏
+// （唯一算费用的地方仍只有 freezeUsageCost 一处），也不多余（无额外查询）。
+//
+// 返回的 cost 与写进 cost_total 列的**是同一个变量**，不是重算一次 ——
+// 所以「报表显示花了 X、余额扣了 Y」在结构上就不可能发生。
+//
+// 落库失败时返回 (0, err)：此时没有任何记录，费用无意义。**不要**把
+// 「算出来了但没落库」的金额拿去扣费 —— 那会扣一笔永远没有对账记录的
+// 钱。
+func (s *Store) CreateUsageRecordWithCost(ctx context.Context, r *UsageRecord) (float64, error) {
 	ts := r.Ts
 
 	// token 数一律不许为负。
@@ -96,18 +127,67 @@ func (s *Store) CreateUsageRecord(ctx context.Context, r *UsageRecord) error {
 	_, err := s.db.ExecContext(ctx,
 		`INSERT INTO usage_records (id, ts, access_key_id, user_id, public_model, provider_id, upstream_model, ingress_protocol, stream, input_tokens, output_tokens, total_tokens, reasoning_tokens, cached_tokens, usage_state, status, http_status, error_code, latency_ms, ttfb_ms, request_id, cost_total) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		r.ID, ts, r.AccessKeyID, nullIfEmpty(r.UserID), r.PublicModel, r.ProviderID, r.UpstreamModel, r.IngressProtocol, stream, r.InputTokens, r.OutputTokens, r.TotalTokens, r.ReasoningTokens, r.CachedTokens, r.UsageState, r.Status, r.HTTPStatus, nullIfEmpty(r.ErrorCode), r.LatencyMs, r.TTFBMs, nullIfEmpty(r.RequestID), cost)
-	return err
+	if err != nil {
+		// 落库失败：费用随记录一起作废。返回 0 而不是 cost —— 调用方若误用
+		// 这个值去扣费，扣的金额必须与「库里真实存在的记录」对应，
+		// 而失败的记录根本不存在。
+		return 0, err
+	}
+	return cost, nil
+}
+
+// priceUsage 是**全仓唯一的单价公式**：把一次调用的 token 数换算成费用（元）。
+//
+// # 为什么必须只有这一份
+//
+// 这套公式有两个消费者，语义要求它们**永远相等**：
+//   - usage_records.cost_total（freezeUsageCost 落库时固化，报表全部读它）；
+//   - 余额扣费（balance_dao 收到 usage 落库时返回的同一个 cost 值，
+//     不重新计算 —— 见 CreateUsageRecordWithCost）。
+//
+// 两处各写一份公式时，漂移几乎必然发生，且**没有任何人会发现**：报表显示
+// 「花了 3.00 元」、余额实际扣了 2.97 元，两个数字各看都合理，只有逐条对账
+// 才看得出来 —— 而没人会对账。所以本函数是纯函数（无 IO、无状态），调用方
+// 只能取它的返回值、不得复制表达式。
+//
+// # 口径（与原 GetUsageStats 的 JOIN 重算逐字一致，单价「元/百万 tokens」）：
+//
+//	缓存未命中输入 = MAX(input - cached, 0) × price_input
+//	缓存命中输入   = cached × price_cache_hit（<=0 时回退 price_input，
+//	                 只填输入价的模型不会把命中部分算成免费）
+//	输出           = output × price_output
+//	合计           = 上述三项之和 / 1e6
+//
+// 四个入参的价格来自上游单价表，NULL/未配置一律按 0（调用方用 COALESCE 兜底），
+// 未配置价格的模型因此贡献 0 —— 与「未配价 = 0」的既有口径同语义。
+//
+// 负 token 不在这里兜：CreateUsageRecord 已在入口把负值归一为 0
+// （见其注释），而 priceUsage 的调用方只有 freezeUsageCost 一处。
+func priceUsage(priceInput, priceCacheHit, priceOutput, inputTokens, cachedTokens, outputTokens float64) float64 {
+	uncached := inputTokens - cachedTokens
+	if uncached < 0 {
+		uncached = 0
+	}
+	hit := priceCacheHit
+	if hit <= 0 {
+		hit = priceInput
+	}
+	total := (uncached*priceInput + cachedTokens*hit + outputTokens*priceOutput) / 1_000_000.0
+	// 舍入到 1e-9 元。float64 的二进制表示无法精确表达十进制小数，
+	// 于是「×3 个单价再除 1e6」会带出长尾（如 0.0030000000000000005），
+	// 这些值原样进 JSON 响应，前端展示与对账都会看到脏尾巴。
+	//
+	// 精度取 1e-9 而非更高：1 纳元的 1% 仍远小于任何真实计费的最小粒度，
+	// 而更长的尾数只会把噪声带得更远。
+	if total != 0 {
+		total = math.Round(total*1e9) / 1e9
+	}
+	return total
 }
 
 // freezeUsageCost 算出一条用量的固化费用（元）。
 //
-// 口径与原 GetUsageStats 的 JOIN 重算逐字一致（单价「元 / 百万 tokens」，
-// NULL 按 0）：
-//   - 缓存未命中输入 = MAX(input - cached, 0) × price_input；
-//   - 缓存命中输入   = cached × price_cache_hit，未单独配置时回退 price_input
-//     （只填输入价的模型，命中部分不会被算成免费）；
-//   - 输出           = output × price_output；
-//   - 未配置价格的模型贡献 0。
+// **只负责查价 + 记日志**，算钱一律委托 priceUsage（见那里的「只有一份公式」）。
 //
 // **查价失败一律返回 0，不返回错误、不阻断落库**：用量是硬需求（配额、限速、
 // 审计都靠它），费用不是。模型不存在、没配价、读池抖动，后果都只是这一条
@@ -132,25 +212,8 @@ func (s *Store) freezeUsageCost(ctx context.Context, r *UsageRecord) float64 {
 			"request_id", r.RequestID, "error", err)
 		return 0
 	}
-	uncached := r.InputTokens - r.CachedTokens
-	if uncached < 0 {
-		uncached = 0
-	}
-	hit := phit
-	if hit <= 0 {
-		hit = pin
-	}
-	total := (float64(uncached)*pin + float64(r.CachedTokens)*hit + float64(r.OutputTokens)*pout) / 1_000_000.0
-	// 舍入到 1e-9 元。float64 的二进制表示无法精确表达十进制小数，
-	// 于是「×3 个单价再除 1e6」会带出长尾（如 0.0030000000000000005），
-	// 这些值原样进 JSON 响应，前端展示与对账都会看到脏尾巴。
-	//
-	// 精度取 1e-9 而非更高：1 纳元的 1% 仍远小于任何真实计费的最小粒度，
-	// 而更长的尾数只会把噪声带得更远。
-	if total != 0 {
-		total = math.Round(total*1e9) / 1e9
-	}
-	return total
+	return priceUsage(pin, phit, pout,
+		float64(r.InputTokens), float64(r.CachedTokens), float64(r.OutputTokens))
 }
 
 // RecomputeCost 按**当前**单价重算某条用量的固化费用。

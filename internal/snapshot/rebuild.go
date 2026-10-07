@@ -81,6 +81,11 @@ func RebuildFromDB(ctx context.Context, st *store.Store, failures []ProviderFail
 			Enabled:         m.Enabled,
 			ContextWindow:   m.ContextWindow,
 			MaxOutputTokens: m.MaxOutputTokens,
+			// 价格随快照下发，供余额预检在热路径零查库地按单价估算
+			// 本次请求的费用（见 routing.UpstreamModel 的价格字段注释）。
+			PriceInput:    m.PriceInput,
+			PriceCacheHit: m.PriceCacheHit,
+			PriceOutput:   m.PriceOutput,
 		})
 	}
 

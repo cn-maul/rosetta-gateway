@@ -318,3 +318,60 @@ func TestUsageHistory_ClampsPagingParams(t *testing.T) {
 		}
 	}
 }
+
+// TestExportCSV_ReportsTruncation 守住「被截断的证据必须看起来被截断」。
+//
+// CSV 导出有一次行数上限（maxUsageLimit）。静默截断在排障场景里是最贵的一种
+// bug：界面显示「共 12 万条」、表格能翻到第 120 页，而导出的文件里只有 1000 行 ——
+// 于是「上游只失败过 1000 次」这个结论看起来有了数据支撑，实际上那份数据是被
+// 截断的取证。命中上限时必须发 X-Export-Truncated 与真实总行数。
+func TestExportCSV_ReportsTruncation(t *testing.T) {
+	st := newTestStore(t)
+	h := NewUsageHandler(st)
+	ctx := t.Context()
+
+	// 造 maxUsageLimit+1 条：刚好越过上限，截断与「差一点就满了」必须可区分。
+	for i := 0; i < maxUsageLimit+1; i++ {
+		rec := &store.UsageRecord{
+			ID: fmt.Sprintf("u%04d", i), Ts: time.Now().UnixMilli() - int64(i),
+			PublicModel: "m", ProviderID: "p1", UpstreamModel: "x",
+			TotalTokens: int64(i), Status: "ok", HTTPStatus: 200,
+		}
+		if err := st.CreateUsageRecord(ctx, rec); err != nil {
+			t.Fatalf("create usage %d: %v", i, err)
+		}
+	}
+
+	rec := httptest.NewRecorder()
+	h.ExportCSV(rec, asAdmin(httptest.NewRequest(http.MethodGet, "/admin/api/usage/history.csv", nil)))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("code=%d body=%s", rec.Code, rec.Body.String())
+	}
+	if got := rec.Header().Get("X-Export-Truncated"); got != "1" {
+		t.Errorf("命中行数上限时 X-Export-Truncated=%q, want 1", got)
+	}
+	if got := rec.Header().Get("X-Export-Total"); got != strconv.Itoa(maxUsageLimit+1) {
+		t.Errorf("X-Export-Total=%q, want %d（必须报真实总行数，不能报导出行数）", got, maxUsageLimit+1)
+	}
+
+	// 未截断时不得带这个头：否则界面上会出现「已截断」的字样而数据其实是全的。
+	st2 := newTestStore(t)
+	h2 := NewUsageHandler(st2)
+	if err := st2.CreateUsageRecord(ctx, &store.UsageRecord{
+		ID: "u1", Ts: time.Now().UnixMilli(), PublicModel: "m",
+		ProviderID: "p1", UpstreamModel: "x", TotalTokens: 1, Status: "ok", HTTPStatus: 200,
+	}); err != nil {
+		t.Fatalf("create usage: %v", err)
+	}
+	rec2 := httptest.NewRecorder()
+	h2.ExportCSV(rec2, asAdmin(httptest.NewRequest(http.MethodGet, "/admin/api/usage/history.csv", nil)))
+	if rec2.Code != http.StatusOK {
+		t.Fatalf("code=%d body=%s", rec2.Code, rec2.Body.String())
+	}
+	if got := rec2.Header().Get("X-Export-Truncated"); got != "" {
+		t.Errorf("未截断时不得写 X-Export-Truncated，实际 %q", got)
+	}
+	if got := rec2.Header().Get("X-Export-Total"); got != "1" {
+		t.Errorf("X-Export-Total=%q, want 1", got)
+	}
+}

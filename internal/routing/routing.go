@@ -55,6 +55,28 @@ type UpstreamModel struct {
 	Enabled         bool
 	ContextWindow   int
 	MaxOutputTokens int
+
+	// 单价，单位「元 / 百万 tokens」，0 = 未配置（与 store.freezeUsageCost
+	// 的「未配价按 0 计」同义）。语义与上游_models 三列逐字对应：
+	// PriceInput 是缓存未命中的输入，PriceCacheHit 是缓存命中的输入，
+	// PriceOutput 是输出。
+	//
+	// 为什么把计费字段放进这个「路由/拓扑」结构（Lead 已确认的口径）：
+	// 余额预检要在**请求前**按单价估算本次费用，而预估算是热路径上每个
+	// 非管理员请求都会做的事。若这里没有价格，就得为每个请求多打一次库
+	// （upstream_models 按 provider_id+model_id 查），把一次内存快照读
+	// 换成一次 SQLite 读 —— 而快照存在的全部意义正是「热路径无锁读」。
+	// ContextWindow / MaxOutputTokens 早就是同一类「落库时静态、请求时
+	// 只读」的元数据，价格与它们同源，不是异类。
+	//
+	// 代价与对策：这里放的是**本快照生成时刻**的价格，价格改动要等下一次
+	// reload 才在预检里生效。这与「固化费用」的口径是同向的（cost_total
+	// 也按落库当时的单价固化），且预检只是「够不够」的粗判，真正入账仍
+	// 由 store.freezeUsageCost 按扣费当时的价格算 —— 预检用旧价的窗口
+	// 最多是一笔预检尺度的偏差，不会让账目漂移。
+	PriceInput    float64
+	PriceCacheHit float64
+	PriceOutput   float64
 }
 
 type RouteIndex struct {

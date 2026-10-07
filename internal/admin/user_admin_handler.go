@@ -3,6 +3,7 @@ package admin
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net/http"
 	"strconv"
 	"strings"
@@ -43,8 +44,16 @@ type userResponse struct {
 	GroupID     string `json:"group_id"`
 	QuotaTokens int64  `json:"quota_tokens"`
 	UsedTokens  int64  `json:"used_tokens"`
-	AuthVersion int64  `json:"auth_version"`
-	Remark      string `json:"remark,omitempty"`
+	// BalanceCents 是账户余额（**分**，人民币）。与 quota_tokens 的「0 = 不限」
+	// 刻意相反：**unlimited=true 才是不限额**，0 分是「真的一分钱都没有」，
+	// 两种状态一个放行一个 402，绝不能塌成同一个值。判定一律看 unlimited。
+	//
+	// 前端必须据此显示「不限」而不是「0.00 元」—— 后者会被读成「没钱了」，
+	// 而实际含义是「不受余额限制」。
+	BalanceCents int64  `json:"balance_cents"`
+	Unlimited    bool   `json:"balance_unlimited"`
+	AuthVersion  int64  `json:"auth_version"`
+	Remark       string `json:"remark,omitempty"`
 	// HasPassword 为false 时前端应显示「未设置密码」并引导去设置。
 	HasPassword bool  `json:"has_password"`
 	KeyCount    int   `json:"key_count"`
@@ -64,13 +73,19 @@ func toUserResponse(u *store.User, selfID string, keyCount int) userResponse {
 		GroupID:     u.GroupID,
 		QuotaTokens: u.QuotaTokens,
 		UsedTokens:  u.UsedTokens,
-		AuthVersion: u.AuthVersion,
-		Remark:      u.Remark,
-		HasPassword: u.PasswordHash != "",
-		KeyCount:    keyCount,
-		CreatedAt:   u.CreatedAt,
-		LastLoginAt: u.LastLoginAt,
-		IsSelf:      u.ID == selfID,
+		// 余额直接取 store.User 的两个字段：Unlimited 是**列值为 NULL** 的
+		// 表示（见 store.User.BalanceCents），不是「数值为 0」。手写 DTO 的
+		// 好处正在这里 —— store.User 没有 json tag，漏填一个字段只会安静地
+		// 在 JSON 里少一个键，前端于是读到 undefined 而显示成「0 元」。
+		BalanceCents: u.BalanceCents,
+		Unlimited:    u.Unlimited,
+		AuthVersion:  u.AuthVersion,
+		Remark:       u.Remark,
+		HasPassword:  u.PasswordHash != "",
+		KeyCount:     keyCount,
+		CreatedAt:    u.CreatedAt,
+		LastLoginAt:  u.LastLoginAt,
+		IsSelf:       u.ID == selfID,
 	}
 }
 
@@ -242,6 +257,16 @@ func (h *UserHandler) CreateUser(w http.ResponseWriter, r *http.Request) {
 		Status:       store.UserStatusActive,
 		QuotaTokens:  req.QuotaTokens,
 		Remark:       strings.TrimSpace(req.Remark),
+		// 新建用户的余额一律是**不限额**（NULL），不是 0 分。
+		//
+		// 漏掉这一行会让 Unlimited 保持 Go 零值 false，于是 balanceValue
+		// 把 0 写进库 —— 新账号一建出来就是「余额 0 分」，下一次调用立刻 402。
+		// 而存量用户经迁移是 NULL（不限额），两者行为不一致：升级前的账号
+		// 能正常用，升级后新建的账号全部欠费，且没有任何报错线索指向这里。
+		//
+		// 「建号时给个初始额度」是另一件事，由管理员随后调
+		// PUT /users/{id}/balance 显式做，不该由创建路径偷偷决定。
+		Unlimited: true,
 	}
 	groupID, gerr := h.resolveGroupID(r.Context(), req.GroupID)
 	if gerr != nil {
@@ -484,6 +509,122 @@ func (h *UserHandler) ResetPassword(w http.ResponseWriter, r *http.Request, id s
 		"status":  "ok",
 		"message": "密码已重置，该用户的所有既有会话已失效",
 	})
+}
+
+// ---- 余额充值 ----
+
+type adjustBalanceRequest struct {
+	// DeltaCents 是**相对增减**（分）。正数=充值，负数=扣减。
+	//
+	// 用 delta 而不是「设置绝对值」是刻意的：绝对值接口上一次误操作
+	// （比如把 5000 分打成 50 分）会直接把余额清零，而充值是**高频且
+	// 意图明确**的操作，相对调整不可能产生这种结果 —— 打错也只是多充/少充。
+	//
+	// 用指针区分「没传」与「传 0」：传 0 是合法的「调平」动作，不传则是
+	// 请求畸形，两者的处置完全不同（后者要 400，不能静默当成「调平」）。
+	DeltaCents *int64 `json:"delta_cents"`
+}
+
+// AdjustBalance 管理员给某用户充值/扣减余额。
+//
+// # 为什么是「相对调整」而不是「设置绝对值」
+//
+// 充值界面上填的是「充 100 元」，不是「把余额设成 100 元」。两者在界面上
+// 只差一个字段的语义，在事故上的差别是决定性的：绝对值接口上一次手抖
+// 就能把别人账上的钱清零，而且没有任何东西拦得住它。
+//
+// 底层的 store.AdjustBalance 用 `balance_cents = MAX(0, COALESCE(…) + ?)`
+// 在 SQL 里原子自增，天然免疫「读-改-写」的丢失更新：两个管理员并发充值
+// 都生效，不会后写者覆盖先写者。
+//
+// # 不限额用户的特殊行为（store.AdjustBalance 里有完整说明）
+//
+// COALESCE 把 NULL 当 0 起算，于是「给一个不限额用户充值 +100 元」会**把
+// 不限额切成 100 元**。这是刻意的：给不限额用户充值的意图通常正是「给他设个
+// 额度」，而静默无操作会让人以为充值失败。前端因此必须把这条后果写在
+// 充值按钮旁边（见 Users.vue）。
+//
+// 余额变更**不**需要重建快照：预检与扣费都直接读库（store.BalanceOf），
+// 不用快照。加了重建只会白白多一次全量 RebuildFromDB。
+func (h *UserHandler) AdjustBalance(w http.ResponseWriter, r *http.Request, id string) {
+	if _, ok := requireAdmin(w, r); !ok {
+		return
+	}
+	var req adjustBalanceRequest
+	if err := decodeJSON(w, r, &req); err != nil {
+		if errors.Is(err, errUnsupportedMediaType) {
+			return
+		}
+		writeError(w, http.StatusBadRequest, "invalid JSON: "+err.Error())
+		return
+	}
+	if req.DeltaCents == nil {
+		writeError(w, http.StatusBadRequest, "delta_cents 必填（单位：分，正数充值 / 负数扣减）")
+		return
+	}
+	delta := *req.DeltaCents
+	if delta == 0 {
+		// 0 是合法的「调平」，但作为一次 API 调用毫无意义，且更可能是
+		// 前端把空输入框当成了 0。明确拒绝比默默成功更容易发现 bug。
+		writeError(w, http.StatusBadRequest, "delta_cents 不能为 0")
+		return
+	}
+	// 上限保护：负 delta 大于当前余额时，SQL 侧的 MAX(0, …) 会把它夹到 0，
+	// 那是一次**部分成功**的扣减 —— 管理员以为扣了 5000 分、实际只扣到 0。
+	// 这里先读一次余额把这种情况挡在门外（读-判-写不是原子的，但这条只是
+	// 防止误操作，不是资金正确性的保证；真正的并发安全由 SQL 自增负责）。
+	cents, limited, err := h.store.BalanceOf(r.Context(), id)
+	if err != nil {
+		if errors.Is(err, store.ErrNotFound) {
+			writeError(w, http.StatusNotFound, "用户不存在")
+			return
+		}
+		writeServerError(w, "adjust balance: read", err)
+		return
+	}
+	if delta < 0 && limited && cents+delta < 0 {
+		writeError(w, http.StatusBadRequest,
+			"扣减金额超过当前余额（余额 "+formatCents(cents)+" 元）")
+		return
+	}
+
+	if err := h.store.AdjustBalance(r.Context(), id, delta); err != nil {
+		writeNotFoundOrError(w, "adjust balance", "用户不存在", err)
+		return
+	}
+	// 回读一次再返回：响应里的余额必须是**调整后**的值，而 AdjustBalance
+	// 只返回 error。让前端自己减一下 delta 的话，扣减撞到 0 时界面会显示
+	// 一个负数（等于把「已夹到 0」这件事藏起来了）。
+	after, afterLimited, aerr := h.store.BalanceOf(r.Context(), id)
+	if aerr != nil {
+		writeServerError(w, "adjust balance: reread", aerr)
+		return
+	}
+	u, uerr := h.store.GetUser(r.Context(), id)
+	if uerr != nil || u == nil {
+		writeNotFoundOrError(w, "adjust balance: get user", "用户不存在", uerr)
+		return
+	}
+	keys, _ := h.store.ListAccessKeysByUser(r.Context(), id)
+	self := server.UserFromContext(r.Context())
+	resp := toUserResponse(u, selfIDOf(self), len(keys))
+	// **以回读的值为准**，不用 UpdateUser 之前那次读到的 u.BalanceCents：
+	// 充值动作本身（AdjustBalance）可能已把一个 NULL（不限额）切成有限额，
+	// 而 u 仍是调整前读出来的旧快照。BalanceOf 的 limited 是「有限额」的
+	// **正向**说法（store 层刻意如此，避免与 u.Unlimited 并排时读反），
+	// 这里显式反转。
+	resp.Unlimited = !afterLimited
+	resp.BalanceCents = after
+	writeJSON(w, http.StatusOK, resp)
+}
+
+// formatCents 把「分」渲染成「元」的中文错误文案用串。
+//
+// 刻意不复用前端的 fmtMoney：那是展示层格式化（带千分位、小额留 4 位），
+// 而这里的数字要放进一句错误提示里，格式必须与账目口径一致（两位小数即可，
+// 因为它只用于「余额不足 500.00 元」这类说明，不参与对账）。
+func formatCents(cents int64) string {
+	return strconv.FormatInt(cents/100, 10) + "." + fmt.Sprintf("%02d", cents%100)
 }
 
 // ---- 自助改密 ----

@@ -30,6 +30,7 @@ import { computed, ref } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { ApiFail, bootstrapSetup, login, session } from '../api'
 import { toast } from '../ui'
+import { checkPasswordStrength } from '../password'
 
 const route = useRoute()
 const router = useRouter()
@@ -49,26 +50,26 @@ const error = ref('')
 
 /**
  * 密码强度提示，与后端 userauth.ValidatePassword 同一套门槛
- * （≥8 字符 + 字母/数字/符号中至少两类），也和 Profile.vue 里的那份一致。
+ * （≥8 字符 + 字母/数字/符号中至少两类），与 Profile.vue、Users.vue
+ * 共用 password.ts 的同一份实现。
  *
  * 这只是提前告知，**不替代**服务端校验 —— 绕过前端直接打接口是常态。
- * 刻意保持三处同源：门槛漂移会让用户在这里看着「强度合规」却被后端拒绝。
+ * 门槛漂移会让用户在这里看着「强度合规」却被后端拒绝，而引导入口
+ * 一辈子只开一次，那等于把管理员永久锁在外面。
  */
 function checkStrength(p: string) {
-  if (!p) return ''
-  const runes = [...p]
-  if (runes.length < 8) return '至少 8 个字符'
-  let lower = false, upper = false, digit = false, other = false
-  for (const r of runes) {
-    if (r >= 'a' && r <= 'z') lower = true
-    else if (r >= 'A' && r <= 'Z') upper = true
-    else if (r >= '0' && r <= '9') digit = true
-    else other = true
-  }
-  const classes = [lower, upper, digit, other].filter(Boolean).length
-  if (classes < 2) return '需包含字母/数字/符号中的至少两类'
-  return ''
+  return checkPasswordStrength(p)
 }
+
+/** 设密码形态下的明文开关。
+ *
+ * 引导是**唯一一次**设密码的机会，且输错没有「再来一次」（窗口提交即关）。
+ * 两个输入框都遮着时，一个记错的密码会被静默提交 —— 用户以为对了，
+ * 提交后才发现进不去。允许看一眼的成本（肩膀偷窥）远低于这个后果。
+ *
+ * 只作用于 setup 形态：登录形态下遮住是默认值，且那里输入的是既有密码，
+ * 没有「把它记住」的需求。 */
+const showSetupPwd = ref(false)
 
 /**
  * 认证成功后离开本页。
@@ -163,12 +164,19 @@ async function submitSetup() {
           <p><strong>只有这一次机会</strong>，提交后这个入口永久关闭。</p>
         </div>
 
-        <label class="login-label" for="np">新密码</label>
-        <input id="np" v-model="newPwd" type="password" class="login-input" autocomplete="new-password" />
+        <!-- 「显示密码」只给这一处：引导设的密码是要记住的，且没有第二次机会。 -->
+        <div class="login-pw-row">
+          <label class="login-label" for="np">新密码</label>
+          <label class="login-show">
+            <input v-model="showSetupPwd" type="checkbox" />
+            显示密码
+          </label>
+        </div>
+        <input id="np" v-model="newPwd" :type="showSetupPwd ? 'text' : 'password'" class="login-input" autocomplete="new-password" />
         <div v-if="checkStrength(newPwd)" class="login-pw-hint">{{ checkStrength(newPwd) }}</div>
 
         <label class="login-label" for="cp">确认新密码</label>
-        <input id="cp" v-model="confirmPwd" type="password" class="login-input" autocomplete="new-password" />
+        <input id="cp" v-model="confirmPwd" :type="showSetupPwd ? 'text' : 'password'" class="login-input" autocomplete="new-password" />
 
         <div v-if="error" class="login-err">{{ error }}</div>
 
@@ -286,6 +294,26 @@ async function submitSetup() {
   font-weight: 600;
   font-size: 14px;
 }
+/* 「显示密码」与标签同一行：它是这个输入框的附属开关，
+   单独占一行会让人以为它也管下面那个框。 */
+.login-pw-row {
+  align-self: stretch;
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 8px;
+  margin: 10px 0 4px;
+}
+.login-pw-row .login-label { margin: 0; }
+.login-show {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  font-size: 12px;
+  color: var(--muted);
+  cursor: pointer;
+}
+.login-show input { accent-color: var(--accent); margin: 0; }
 .login-pw-hint {
   align-self: flex-start;
   margin-top: 6px;

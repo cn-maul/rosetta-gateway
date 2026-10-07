@@ -1,0 +1,1 @@
+const u=new RegExp("\\p{Ll}","u"),f=new RegExp("\\p{Lu}","u"),c=new RegExp("\\p{Nd}","u");function a(t){if(!t)return"";const s=[...t];if(s.length<8)return"至少 8 个字符";let r=!1,l=!1,n=!1,o=!1;for(const e of s)u.test(e)?r=!0:f.test(e)?l=!0:c.test(e)?n=!0:o=!0;return[r,l,n,o].filter(Boolean).length<2?"需包含字母/数字/符号中的至少两类":""}export{a as c};

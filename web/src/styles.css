@@ -112,11 +112,7 @@
   --text-2: var(--muted);
   --text-3: color-mix(in oklab, var(--muted) 78%, var(--background) 22%);
   --text-4: color-mix(in oklab, var(--muted) 58%, var(--background) 42%);
-  --faint: oklch(0.88 0.004 286.32);
   --hairline: var(--border);
-  --heat: var(--warning);
-  --live: var(--success);
-  --track: var(--default);
   --accent-link: color-mix(in oklab, var(--accent) 85%, var(--foreground) 15%);
 
   /* ---------- 动效 ---------- */
@@ -132,6 +128,12 @@
 
   --gutter: 22px;
   --maxw: 1180px;
+
+  /* ---------- 堆叠层级 ---------- */
+  --z-tooltip: 5;
+  --z-sticky: 20;
+  --z-modal: 90;
+  --z-toast: 120;
 }
 
 /* ============================================================
@@ -168,8 +170,6 @@
 
   --field-background: oklch(0.2103 0.0059 285.89);
   --field-foreground: var(--foreground);
-
-  --faint: oklch(0.32 0.006 286.033);
 
   --surface-shadow: 0 0 0 0 transparent inset;
   --overlay-shadow: 0 0 1px 0 rgba(255, 255, 255, 0.3) inset;
@@ -382,7 +382,7 @@ textarea {
   flex-direction: column;
 }
 .topbar {
-  z-index: 20;
+  z-index: var(--z-sticky);
   display: flex;
   height: 56px;
   flex-shrink: 0;
@@ -564,7 +564,7 @@ textarea {
 /* 总览 stat 卡网格 */
 .stat-grid {
   display: grid;
-  grid-template-columns: repeat(5, 1fr);
+  grid-template-columns: repeat(3, minmax(0, 1fr));
   gap: 14px;
   margin-bottom: 18px;
 }
@@ -723,6 +723,13 @@ textarea {
   font-size: 11.5px;
   color: var(--text-4);
 }
+/* ModelPicker 也用于不带 .field 外壳的分组弹窗，不能只依赖上面的后代选择器。 */
+.mp > .tip {
+  margin-top: 6px;
+  font-size: 11.5px;
+  line-height: 1.55;
+  color: var(--text-4);
+}
 .input,
 .select,
 .textarea {
@@ -800,7 +807,7 @@ textarea {
 .scrim {
   position: fixed;
   inset: 0;
-  z-index: 90;
+  z-index: var(--z-modal);
   background: var(--backdrop);
   backdrop-filter: blur(4px);
   -webkit-backdrop-filter: blur(4px);
@@ -881,7 +888,7 @@ textarea {
   left: 50%;
   bottom: 30px;
   transform: translateX(-50%);
-  z-index: 120;
+  z-index: var(--z-toast);
   max-width: min(92vw, 560px);
   padding: 10px 18px;
   border-radius: var(--r-thumb);
@@ -955,7 +962,7 @@ textarea {
   padding: 3px 8px;
   border-radius: var(--r-chip);
   white-space: nowrap;
-  z-index: 5;
+  z-index: var(--z-tooltip);
   box-shadow: var(--sh-overlay);
 }
 .bar-labels {
@@ -1076,6 +1083,11 @@ textarea {
   :root {
     --muted: oklch(0.42 0.014 285.94);
     --border: oklch(0.72 0.004 286.32);
+  }
+  [data-theme='dark'] {
+    --muted: oklch(0.82 0.014 286.067);
+    --border: oklch(0.52 0.006 286.033);
+    --separator: oklch(0.44 0.006 286.033);
   }
   .side-item.router-link-active {
     box-shadow: 0 0 0 1px var(--border);
@@ -1220,3 +1232,71 @@ textarea {
 .xfer-notes[open] summary {
   margin-bottom: 6px;
 }
+
+/* ---- 数据表格：Users / Keys / Providers / History / Settings 共用 ----
+   从五份 scoped 样式逐字去重而来（2026-10-07）。页面特有的单元格布局
+   （cell-user / cell-key / c-time 等）留在各自视图 —— 改表格观感只改这里。
+   末行去边线用 tbody:last-of-type：Providers 是多 tbody（展开行）结构，
+   简单的 tbody tr:last-child 会把分组之间的分隔线也一并吃掉。 */
+.tbl-wrap { overflow-x: auto; }
+.tbl { width: 100%; border-collapse: collapse; font-size: 13px; }
+.tbl th,
+.tbl td { text-align: left; padding: 9px 12px; white-space: nowrap; }
+.tbl thead th {
+  color: var(--text-3);
+  font-weight: 500;
+  font-size: 12px;
+  border-bottom: 1px solid var(--separator);
+}
+.tbl tbody tr { border-bottom: 1px solid var(--separator); }
+.tbl > tbody:last-of-type > tr:last-child { border-bottom: none; }
+.tbl tbody tr:hover { background: var(--hover); }
+.num-h { text-align: right; }
+/* 操作列不参与等宽分配：按钮多，宽度随内容走。 */
+.c-act { width: 1%; }
+.dim { color: var(--text-3); }
+.sub-line { color: var(--text-3); font-size: 12px; margin-top: 2px; }
+.row-actions { display: flex; gap: 6px; flex-wrap: nowrap; align-items: center; }
+/* 表内「名称 + 徽章」单元格：Keys / Providers 曾各抄一份（逐字相同），
+   2026-10-07 收敛为这里的一份。名称加粗是因为它是这格的主信息，徽章只是注脚。 */
+.cell-key { display: flex; align-items: center; gap: 6px; flex-wrap: nowrap; }
+.cell-key .name { font-weight: 500; }
+/* 分页条：贴表格下方，与表头分隔线同色，视觉上属于表格的页脚。
+   History / Settings 曾各抄一份（逐字相同），2026-10-07 收敛为这里的一份。 */
+.pager {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin-top: 14px;
+  padding-top: 12px;
+  border-top: 1px solid var(--separator);
+}
+.pager-info {
+  font-size: 12.5px;
+  color: var(--text-2);
+  margin: 0 4px;
+}
+.pager-info b {
+  font-variant-numeric: tabular-nums;
+}
+
+/* ---- 表单标签：与 .input 配套 ----
+   Users / Groups / Profile 曾各抄一份且已漂移（Profile 无 display:block、
+   间距 10px vs 12px），2026-10-07 收敛为这里的一份。 */
+.flabel {
+  display: block;
+  font-size: 12px;
+  color: var(--muted);
+  margin: 12px 0 4px;
+}
+
+/* ---- 表单提示：.flabel 下方的补充说明 ----
+   Users / Groups / Profile 曾各抄一份且已漂移（Groups 间距 6px vs 4px、
+   Profile 基色缺失），2026-10-07 收敛为这里的一份。
+   .fhint.warn 默认按危险色走（「必须设初始密码」这类阻塞性提示）；
+   Profile 的强度提示是建议而非错误，scoped 覆盖回 muted，.fhint.ok 也留给它。 */
+.fhint { font-size: 12px; color: var(--muted); margin-top: 4px; }
+.fhint.warn { color: var(--danger); }
+.fhint.err { color: var(--danger); margin-top: 10px; }

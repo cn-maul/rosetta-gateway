@@ -19,6 +19,7 @@
 //    清本地令牌并把人送回登录页。
 
 import { reactive } from 'vue'
+import { rangeBounds } from './range'
 import type { ApiError, BootstrapStatus, Me, SessionStatus, LoginResult, ConfigImportResult } from './types'
 
 const TOKEN_KEY = 'rosetta_gw_admin_token'
@@ -244,6 +245,15 @@ async function request<T>(method: string, path: string, body?: unknown, timeoutM
 
 export const get = <T>(path: string, timeoutMs?: number) => request<T>('GET', path, undefined, timeoutMs)
 
+/** 下载结果：除了触发保存，还要把服务端给的导出元信息带回给调用方。 */
+export interface DownloadResult {
+  filename: string
+  /** 服务端声明的行数（仅 CSV 导出等带该头的端点会填）。 */
+  total?: number
+  /** 服务端是否因行数上限截断了结果。 */
+  truncated: boolean
+}
+
 /**
  * 下载一个文件（导出配置、调用历史 CSV 用）。
  *
@@ -253,7 +263,7 @@ export const get = <T>(path: string, timeoutMs?: number) => request<T>('GET', pa
  * 而不是文件，用户只会看到「下载了个打不开的东西」。走 fetch 还能复用
  * request() 的 401 处理：会话失效时当场清令牌送回登录页。
  */
-async function download(method: string, path: string, body?: unknown, fallbackName = 'rosetta-config.json'): Promise<void> {
+async function download(method: string, path: string, body?: unknown, fallbackName = 'rosetta-config.json'): Promise<DownloadResult> {
   const headers: Record<string, string> = {}
   if (auth.token) headers['Authorization'] = 'Bearer ' + auth.token
   if (body !== undefined) headers['Content-Type'] = 'application/json'
@@ -298,6 +308,13 @@ async function download(method: string, path: string, body?: unknown, fallbackNa
   const m = /filename="?([^";]+)"?/.exec(cd)
   const filename = m ? m[1] : fallbackName
 
+  // 截断标记：命中后端行数上限时，下载到的是**一部分**记录。
+  // 调用方必须把这件事告诉用户 —— 一个被截断的证据被读成完整证据，
+  // 在排障场景里会直接得出相反的结论。
+  const totalHeader = res.headers.get('X-Export-Total')
+  const total = totalHeader ? Number(totalHeader) : undefined
+  const truncated = res.headers.get('X-Export-Truncated') === '1'
+
   const blob = await res.blob()
   const url = URL.createObjectURL(blob)
   try {
@@ -312,6 +329,7 @@ async function download(method: string, path: string, body?: unknown, fallbackNa
     // 延后到下一轮事件循环 revoke 是为了确保点击已经派发。
     setTimeout(() => URL.revokeObjectURL(url), 0)
   }
+  return { filename, total: Number.isFinite(total) ? total : undefined, truncated }
 }
 export const post = <T>(path: string, body?: unknown, timeoutMs?: number) =>
   request<T>('POST', path, body ?? {}, timeoutMs)
@@ -368,6 +386,7 @@ import type {
   UserRole,
   UserStatus,
   Group,
+  ModelPrice,
 } from './types'
 
 /**
@@ -376,10 +395,12 @@ import type {
  * 两个端点在后端共用同一套 WHERE（status / model / key_id 精确过滤），
  * 这里也只写一处，避免「列表带过滤、导出丢过滤」的口径漂移。
  * undefined / 空串的维度不拼进 query（后端视为不过滤）。
+ *
+ * 时间范围走 range.ts 的区间口径（近 1 天 = 今天 0 点起，而非滚动 24 小时），
+ * 所以 History 页与总览页的「近 N 天」说的是同一段时间。
  */
 function usageHistoryQuery(days: number, filters?: HistoryFilters): string {
-  const to = Date.now()
-  const from = to - days * 86400_000
+  const { from, to } = rangeBounds(days)
   const q = new URLSearchParams({ from: String(from), to: String(to) })
   if (filters?.status) q.set('status', filters.status)
   if (filters?.model) q.set('model', filters.model)
@@ -503,7 +524,6 @@ export const api = {
   createUser: (b: {
     username: string
     password?: string
-    display_name?: string
     role?: UserRole
     /** 分组 id（P1）。不传 / 空串 = 未分组 = 不受模型白名单限制。 */
     group_id?: string
@@ -513,7 +533,6 @@ export const api = {
   updateUser: (
     id: string,
     b: {
-      display_name?: string
       role?: UserRole
       status?: UserStatus
       /**
@@ -529,6 +548,18 @@ export const api = {
     },
   ) => patch<User>(`/users/${id}`, b),
   deleteUser: (id: string) => del(`/users/${id}`),
+  /**
+   * 管理员给某用户充值/扣减余额（单位：分，正数充值 / 负数扣减）。
+   *
+   * 刻意用 **delta**（相对调整）而不是「设置绝对值」：绝对值接口上一次误操作
+   * （把 5000 分打成 50 分）会把对方账上的钱直接清零，而充值是高频且意图
+   * 明确的操作，相对调整不可能造成这种结果 —— 打错也只是多充或少充。
+   *
+   * **刻意不包 mutate()**：余额变更不需要重建快照（预检与扣费都直接读库），
+   * 触发一次 reload 只是白白多一次全量快照重建。
+   */
+  adjustUserBalance: (id: string, deltaCents: number) =>
+    put<User>(`/users/${id}/balance`, { delta_cents: deltaCents }),
   /** 管理员重置他人密码。会递增该用户的 auth_version，其所有会话立即失效。 */
   resetUserPassword: (id: string, password: string) =>
     post(`/users/${id}/password`, { password }),
@@ -569,11 +600,24 @@ export const api = {
    * 刻意不复用 /admin/api/routes：那是 admin-only（会暴露全部路由拓扑），
    * 而 key 级白名单的设计意图就是「用户自己收紧」—— 普通用户读不到清单，
    * 这个功能对他们就等于不存在。
+   *
+   * # 为什么 prices 是**平行数组**而不是把 models 改成对象数组
+   *
+   * 这个端点有三个调用方，其中两个（Keys.vue 的 ModelPicker、Groups.vue）
+   * 只要模型名：ModelPicker 的选项是 string[]（v-model + Set 去重 +
+   * includes 判定），Groups.vue 同样。把 models 改成 [{name, …}] 会同时
+   * 打破这两处，而它们并不需要价格 —— 为了一个页面的展示去改两个组件的
+   * 数据契约，收益与风险完全不成比例。
+   *
+   * 所以 models **保持 string[] 不变**（旧调用方零改动），价格以
+   * `prices[i]` 对应 `models[i]` 的方式并行给出。两者的顺序都由后端保证
+   * 按公开名排序，长度必然相等（后端有测试钉住）。
    */
   modelNames: () =>
-    get<{ models: string[]; restricted: boolean }>('/model-names').then((r) => ({
+    get<{ models: string[]; restricted: boolean; prices?: ModelPrice[] }>('/model-names').then((r) => ({
       models: r.models ?? [],
       restricted: r.restricted ?? false,
+      prices: r.prices ?? [],
     })),
 
   // stats & usage（注意：usage 端点的 from/to 是【毫秒】时间戳；from=0 表示全部历史）
@@ -617,6 +661,8 @@ export const api = {
     ),
   // 调用历史 CSV 导出：与列表同参数。响应是文件，走 download() 而非 request()；
   // 行数上限由后端钳制（maxUsageLimit），这里不重复传 limit。
+  // 返回值里的 truncated/total 让调用方能明确提示「导出被截断」，
+  // 而不是让人对着一个缺行的 CSV 得出「上游只失败过 N 次」的错误结论。
   exportUsageCSV: (days = 7, filters?: HistoryFilters) =>
     download('GET', `/usage/history.csv?${usageHistoryQuery(days, filters)}`, undefined, 'usage-history.csv'),
 }

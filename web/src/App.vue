@@ -111,13 +111,16 @@ function readStoredTheme(): 'dark' | 'light' | 'system' {
   return 'system'
 }
 
+function onThemePreferenceChange(e: MediaQueryListEvent) {
+  if (readStoredTheme() === 'system') applyTheme(e.matches)
+}
+
 function initTheme() {
   mediaQuery = window.matchMedia('(prefers-color-scheme: dark)')
   // 运行期跟随 OS：只有当前处于「跟随系统」时才响应系统主题变化。
-  mediaQuery.addEventListener('change', (e) => {
-    if (readStoredTheme() === 'system') applyTheme(e.matches)
-  })
-  applyTheme(mediaQuery.matches)
+  mediaQuery.addEventListener('change', onThemePreferenceChange)
+  const stored = readStoredTheme()
+  applyTheme(stored === 'dark' || (stored === 'system' && mediaQuery.matches))
 }
 
 // toggleTheme 是**显式**选择：用户点一下就固化，不再跟随系统。
@@ -174,6 +177,7 @@ onMounted(async () => {
 
 onUnmounted(() => {
   mq?.removeEventListener('change', onNarrowChange)
+  mediaQuery?.removeEventListener('change', onThemePreferenceChange)
 })
 
 // 登录态失效时（api.ts 在 401 里把 session.me 置空）把人送回登录页。
@@ -237,6 +241,12 @@ watch(
             <path d="M12 7v5l4 2" />
           </svg>
           <span v-if="!railCollapsed">调用历史</span>
+        </RouterLink>
+        <RouterLink class="side-item" to="/models" :title="railCollapsed ? '可用模型' : undefined">
+          <svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <path d="m12 2 2.4 6.9L21 12l-6.6 3.1L12 22l-2.4-6.9L3 12l6.6-3.1L12 2Z" />
+          </svg>
+          <span v-if="!railCollapsed">可用模型</span>
         </RouterLink>
         <RouterLink class="side-item" to="/profile" :title="railCollapsed ? '我的账号' : undefined">
           <svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
@@ -314,7 +324,7 @@ watch(
           class="who"
           :title="`${session.me.username}（${session.me.role === 'admin' ? '管理员' : '普通用户'}）`"
         >
-          {{ session.me.display_name || session.me.username }}
+          {{ session.me.username }}
         </span>
         <!-- 亮/暗主题切换 -->
         <button

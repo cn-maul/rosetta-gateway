@@ -45,6 +45,13 @@ func anthropicErrorType(code string, status int) string {
 		return "not_found_error"
 	case "insufficient_quota", "rate_limit_exceeded", "upstream_quota_exhausted":
 		return "rate_limit_error"
+	case "insufficient_balance":
+		// 余额耗尽（402）→ Anthropic 的 billing_error。刻意不并进上面那行：
+		// token 配额耗尽是「速率/额度」语义（退避或换 key 有意义），
+		// 余额耗尽是「钱不够」语义（只能充值），客户端据此提示文案不同。
+		// 也因此不落到下面 default 分支里靠 status 猜 —— 那样两种「钱不够」
+		// 就又被合并回去了。
+		return "billing_error"
 	case "upstream_auth_error":
 		// 上游 401/403：目标级凭据问题，报成 api_error 会让客户端以为是自己
 		// 请求的问题而不重试、不换凭据。

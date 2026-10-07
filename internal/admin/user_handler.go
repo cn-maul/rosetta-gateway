@@ -100,6 +100,11 @@ type meResponse struct {
 	UsedTokens      int64  `json:"used_tokens"`
 	MustSetPassword bool   `json:"must_set_password"`
 	IsAdmin         bool   `json:"is_admin"`
+	// BalanceCents 是我的账户余额（**分**）。unlimited=true 才是不限额；
+	// 0 分是「真的一分钱都没有」（会被 402 拒绝）。前端据此显示「不限」或
+	// 具体金额，绝不能把不限额显示成「0.00 元」。
+	BalanceCents int64 `json:"balance_cents"`
+	Unlimited    bool  `json:"balance_unlimited"`
 	// SessionEnabled 告诉前端能否用密码登录（没配 secret 时为 false）。
 	SessionEnabled bool `json:"session_enabled"`
 }
@@ -550,6 +555,27 @@ func (h *UserHandler) Me(w http.ResponseWriter, r *http.Request) {
 		used = 0
 	}
 
+	// 余额要**回库读**，不能从上下文里的 u 拿：session.UserFromContext 装的是
+	// 鉴权用的那份身份（见 server 包），它不带余额字段。读库也正是余额语义的
+	// 唯一权威来源 —— 预检与扣费都走 store.BalanceOf，界面若显示另一份数字，
+	// 就会出现「界面还有钱、请求却被 402」。
+	//
+	// 查不到时**降级成不限额**而不是 0：这与 quota 的「0 = 不限」恰好相反，
+	// 但降级方向是对的 —— 显示「0 元」会让用户以为自己没钱，而查库失败
+	// 并不代表账户真的空了。fail-open 只发生在展示层，真实拦截仍由
+	// 扣费路径上的数据库读决定，不受这里的降级影响。
+	//
+	// 注意 BalanceOf 在读失败时返回 (0, limited=true, err)：即「有限额且为 0」。
+	// 所以降级必须以 err != nil 为判据，不能直接用 limited —— 那样读失败会
+	// 被渲染成「0 元」，正是这里要避开的那个误读。
+	balance, limited, berr := h.store.BalanceOf(r.Context(), u.ID)
+	unlimited := true
+	if berr != nil {
+		slog.Warn("me: balance lookup failed; degrading balance to unlimited", "error", berr)
+	} else {
+		unlimited = !limited
+	}
+
 	writeJSON(w, http.StatusOK, meResponse{
 		Username:        u.Username,
 		DisplayName:     u.DisplayName,
@@ -557,6 +583,8 @@ func (h *UserHandler) Me(w http.ResponseWriter, r *http.Request) {
 		Status:          u.Status,
 		QuotaTokens:     u.QuotaTokens,
 		UsedTokens:      used,
+		BalanceCents:    balance,
+		Unlimited:       unlimited,
 		MustSetPassword: u.PasswordHash == "",
 		IsAdmin:         u.IsAdmin(),
 		SessionEnabled:  h.mgr.Enabled(),

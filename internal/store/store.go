@@ -191,6 +191,24 @@ func (s *Store) migrate() error {
 			status        TEXT NOT NULL DEFAULT 'active',
 			quota_tokens  INTEGER NOT NULL DEFAULT 0,
 			used_tokens   INTEGER NOT NULL DEFAULT 0,
+			-- balance_cents 是**可空**的账户余额（单位：分，即人民币 0.01 元）。
+			--
+			-- 为什么是 INTEGER 而不是 REAL：余额是**反复累加**的账目，浮点的
+			-- 二进制表示无法精确表达十进制小数，每次加减都留下长尾误差，
+			-- 几十上百次扣费后「余额还剩多少」的判断就不可靠了 ——
+			-- 尤其「扣到 0.0000001 元」这种阈值判断，浮点下要么恒不成立
+			-- （永远扣不下去），要么因误差误判。整数分是十进制的精确表示，
+			-- 累加无误差，判零/判负都是整数比较。
+			--
+			-- 为什么**可空**（NULL = 不限额）而 quota_tokens 用 0 = 不限：
+			-- 两者语义相反。quota_tokens 是「额度上限」，0 可以自然地表示
+			-- 「不设上限」；而 balance_cents 的 0 是一个**有意义的实数状态** ——
+			-- 「账户里确实没钱」。若用 0 = 不限，就无法区分「不限额」与
+			-- 「一分钱都没有」，而这两种状态在业务上截然不同（前者放行、
+			-- 后者拒绝），必须用**不同的值**表示。SQLite 的 NULL 是唯一
+			-- 天然的「此处无值」载体，且 COALESCE 后可安全落进 int64 扫描，
+			-- 不会触发 "converting NULL to string/int is unsupported"。
+			balance_cents INTEGER,
 			auth_version  INTEGER NOT NULL DEFAULT 1,
 			remark        TEXT,
 			created_at    INTEGER NOT NULL,
@@ -315,6 +333,27 @@ func (s *Store) migrate() error {
 			pruned_through_day TEXT NOT NULL DEFAULT ''
 		)`,
 		`INSERT OR IGNORE INTO usage_totals (id) VALUES (1)`,
+		// balance_charges：扣费流水，按 request_id 幂等去重。
+		//
+		// 为什么需要它：网络重试与流式中断重连会让**同一次调用**的收尾
+		// 走两遍（客户端重试、上游重试后的重放）。若直接 `UPDATE ... SET
+		// balance = balance - ?` 幂等性就无从谈起 —— 每次调用都扣一遍，
+		// 余额被重复扣减且没有任何提示。
+		//
+		// 用 PRIMARY KEY (request_id) 让「去重」这件事由数据库原子保证：
+		// 同一 request_id 第二次 INSERT 撞唯一约束 → INSERT OR IGNORE 静默
+		// 跳过 → 只扣一次。**在事务内先占位再扣费**，保证「占位成功但扣费
+		// 失败」不会留下重复扣费的窗口（见 balance_dao.ChargeBalance）。
+		//
+		// amount_cents 记录实际扣掉的金额（含被夹到 0 的情况），便于
+		// 事后排查「报表显示花了 X、余额少了 Y」这类漂移。ts 是毫秒时间戳。
+		`CREATE TABLE IF NOT EXISTS balance_charges (
+			request_id   TEXT PRIMARY KEY,
+			user_id      TEXT NOT NULL,
+			amount_cents INTEGER NOT NULL,
+			ts           INTEGER NOT NULL
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_balance_charges_user ON balance_charges(user_id, ts)`,
 	}
 
 	for i, m := range migrations {
@@ -512,6 +551,18 @@ func (s *Store) ensureColumns() error {
 		{"usage_totals", "total_tokens", "INTEGER NOT NULL DEFAULT 0"},
 		// 归档水位（已剪到哪一天）。剪枝流程靠它做幂等边界。
 		{"usage_totals", "pruned_through_day", "TEXT NOT NULL DEFAULT ''"},
+		// 账户余额（单位：分）。为什么在 CREATE TABLE 里写了还要在这里再写一遍：
+		// `CREATE TABLE IF NOT EXISTS` 对**已存在**的表是空操作，老库升级必须
+		// 靠这里拿到该列 —— 缺了它所有余额 DAO 直接报「无此列」，余额功能
+		// 整体不可用。
+		//
+		// **可空且刻意不带 DEFAULT**：SQLite 的 ALTER TABLE ADD COLUMN 对带
+		// DEFAULT 的列会把存量行填成那个默认值，而「余额默认 0」对老用户
+		// 是错的 —— 他们升级后应当是「不限额」（NULL），而不是「一分钱没有」，
+		// 后者会立刻把所有存量用户挡在门外。老库升级的语义必须是：
+		// 「以前没有余额概念，现在也没有 ⇒ 不限额」。因此这里刻意**不带
+		// DEFAULT**，存量行迁移后为 NULL。
+		{"users", "balance_cents", "INTEGER"},
 	}
 
 	for _, a := range additions {

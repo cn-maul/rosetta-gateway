@@ -651,20 +651,31 @@ onMounted(() => {
         <div class="big">◇</div>
         还没有审计记录（执行一次任意后台写操作后出现）
       </div>
-      <div v-else class="row-list">
-        <div v-for="e in auditEntries" :key="e.id" class="row">
-          <div class="row-main">
-            <div class="row-title mono">
-              <span class="badge" :class="e.status < 400 ? 'badge-live' : 'badge-off'">{{ e.method }} {{ e.status }}</span>
-              {{ e.path }}
-            </div>
-            <div class="row-sub">
-              {{ e.remote }} · {{ e.actor }}
-              <template v-if="e.fields"> · 字段：{{ e.fields }}</template>
-            </div>
-          </div>
-          <div class="row-side num">{{ fmtDateTime(e.ts) }}</div>
-        </div>
+      <div v-else class="tbl-wrap">
+        <table class="tbl">
+          <thead>
+            <tr>
+              <th>时间</th>
+              <th>方法</th>
+              <th>状态</th>
+              <th>路径</th>
+              <th>来源</th>
+              <th>字段</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr v-for="e in auditEntries" :key="e.id">
+              <td class="mono">{{ fmtDateTime(e.ts) }}</td>
+              <td>{{ e.method }}</td>
+              <td>
+                <span class="badge" :class="e.status < 400 ? 'badge-live' : 'badge-off'">{{ e.status }}</span>
+              </td>
+              <td class="mono">{{ e.path }}</td>
+              <td>{{ e.remote }} · {{ e.actor }}</td>
+              <td class="dim">{{ e.fields || '—' }}</td>
+            </tr>
+          </tbody>
+        </table>
       </div>
     </div>
 
@@ -905,12 +916,12 @@ onMounted(() => {
       </template>
     </div>
 
-    <!-- 价格：新增 / 编辑 -->
+    <!-- 价格：新增 / 编辑（表单填一半别丢，遮罩/Esc 都不关） -->
     <AppModal
       :open="pForm.open"
       :title="pForm.editing ? '编辑模型价格' : '新增模型价格'"
       max-width="520px"
-      @close="pForm.open = false"
+      :dismissable="false"
     >
       <form @submit.prevent="savePrice">
         <div class="form-grid">
@@ -1097,41 +1108,6 @@ onMounted(() => {
 }
 
 /* 价格表：与「调用历史」的表格同款 */
-.tbl-wrap {
-  overflow-x: auto;
-}
-.tbl {
-  width: 100%;
-  border-collapse: collapse;
-  font-size: 13px;
-}
-.tbl th,
-.tbl td {
-  text-align: left;
-  padding: 9px 12px;
-  white-space: nowrap;
-}
-.tbl thead th {
-  color: var(--text-3);
-  font-weight: 500;
-  font-size: 12px;
-  border-bottom: 1px solid var(--separator);
-}
-.tbl tbody tr {
-  border-bottom: 1px solid var(--separator);
-}
-.tbl tbody tr:last-child {
-  border-bottom: none;
-}
-.tbl tbody tr:hover {
-  background: var(--hover);
-}
-.num-h {
-  text-align: right;
-}
-.dim {
-  color: var(--text-3);
-}
 .c-op {
   width: 186px;
 }
@@ -1142,24 +1118,6 @@ onMounted(() => {
 .actions-right {
   display: flex;
   gap: 10px;
-}
-.pager {
-  display: flex;
-  align-items: center;
-  justify-content: flex-end;
-  gap: 8px;
-  flex-wrap: wrap;
-  margin-top: 14px;
-  padding-top: 12px;
-  border-top: 1px solid var(--separator);
-}
-.pager-info {
-  font-size: 12.5px;
-  color: var(--text-2);
-  margin: 0 4px;
-}
-.pager-info b {
-  font-variant-numeric: tabular-nums;
 }
 
 @media (max-width: 720px) {

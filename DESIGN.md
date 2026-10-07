@@ -6,7 +6,7 @@
 | 项目性质 | 独立项目，不在 Rosetta 上改造（2026-09-15 定，理由见 §2.1） |
 | module path | `github.com/cn-maul/rosetta-gateway` |
 | 运行时依赖 | `github.com/cn-maul/rosetta` v1.0.0（上游 SDK）、`modernc.org/sqlite`（纯 Go SQLite）、`github.com/golang-jwt/jwt/v5`（管理会话） |
-| 版本 | 与 `web/package.json` 同源（当前 1.4.1），镜像与二进制共用 |
+| 版本 | 与 `web/package.json` 同源（当前 1.4.3），镜像与二进制共用 |
 | 状态 | **已实现**（P0–P3 全部落地，多用户、用量归档、配置导入导出均已上线） |
 | 更新 | 2026-10-07 |
 
@@ -29,7 +29,11 @@
 
 - 不做 prompt 编排 / Agent 框架 / 会话托管
 - 不做 RAG、向量库
-- 不做计费结算与账务（只做用量记账，不做钱）
+- **不做对下游的计费结算与账务**（不对客户开账单、不做充值发票/支付网关；余额只是
+  网关内部的配额闸门）。**2026-10-08 修订**：此前写的是「不做计费结算与账务（只做
+  用量记账，不做钱）」，而 v1.4.3 已引入用户余额、按 `cost_total` 自动扣费、余额耗尽
+  拒绝调用（§11.5）。口径未变的是「不做钱」那一半：余额不可提现、不与任何支付
+  渠道对接、费用按上游单价估算而非账单。
 - 不做上游 Responses 的会话状态托管：`previous_response_id` / `store` 在上游协议为
   `openai-responses` 时经 `Extra` 透传给上游承接；chat / anthropic 上游无此概念，
   这两个字段被丢弃，客户端须自带全量历史
@@ -253,6 +257,9 @@ CREATE TABLE users (
   status        TEXT NOT NULL DEFAULT 'active', -- active | disabled
   group_id      TEXT REFERENCES groups(id) ON DELETE SET NULL,
   quota_tokens  INTEGER NOT NULL DEFAULT 0,      -- 用户级总配额（三级配额最外层）
+  balance_cents INTEGER,                         -- 账户余额（分，人民币）。**NULL = 不限额**，
+                   -- 0 = 真的一分钱都没有（触发 402）。与 quota_tokens 的「0 = 不限」
+                   -- 刻意相反：0 在余额语义下是一个有意义的实数状态，必须能表达。
   used_tokens   INTEGER NOT NULL DEFAULT 0,      -- 展示值；执行走实时 SUM（MULTIUSER.md §4.3）
   auth_version  INTEGER NOT NULL DEFAULT 1,      -- 会话失效栅栏（改密/禁用/改角色 +1）
   remark        TEXT,
@@ -496,8 +503,11 @@ POST   /admin/api/users/{id}/reset-password     管理员重置密码
 GET    /admin/api/groups                        分组与组级模型白名单（admin）
 
 GET    /admin/api/keys                          列表（普通用户只看到自己的）
-POST   /admin/api/keys                          **仅管理员**（2026-10-07 起）：自助发 key
-                                                 可绕过 key 级全部强制措施，已收敛
+POST   /admin/api/keys                          **所有登录用户**（2026-10-07 重开）：
+                                                  归属恒为创建者自己，请求里的
+                                                  `user_id` 被忽略（含管理员）；
+                                                  普通用户额度封顶到用户级
+                                                  quota_tokens、rpm/tpm 清零
 PATCH  /admin/api/keys/{id}                     可改 name / enabled / quota_tokens /
                                                  rpm_limit / tpm_limit / expires_at /
                                                  allowed_models / allowed_ips / group_id；
@@ -517,7 +527,10 @@ POST   /admin/api/usage/prune                   手动触发归档剪枝（每�
 GET    /admin/api/stats                         当前快照：总请求/总 token/错误率/各 provider 健康
 GET/PUT /admin/api/settings                     运行时全局默认（超时/故障转移策略，§10）
 POST   /admin/api/config-export/export|import   配置导出/导入（§13.3，requireAdmin）
-GET    /admin/api/model-names                   公开模型名清单（按身份收窄，供白名单选择）
+GET    /admin/api/model-names                   公开模型名清单（按身份收窄，供白名单选择）；附带
+                                                  `prices[]`（与 `models` **平行**的数组，prices[i]
+                                                  对应 models[i]，三项单价元/百万 tokens，0 = 未配置）
+PUT    /admin/api/users/{id}/balance             管理员充值/扣减余额，body `{delta_cents}`（分，正充负扣）
 GET    /admin/api/me / POST /admin/api/logout   当前用户信息 / 登出（递增 auth_version）
 POST   /admin/api/reload                        从 DB 重建内存快照
 ```
@@ -579,11 +592,26 @@ PATCH 端点一律「只看请求体里出现了哪些字段」：
 
 三处刻意偏离上面这套通用规则，各有理由：
 
-- **`PATCH /admin/api/keys/{id}` 的 `user_id`**（仅管理员有效）：这就是「先建后认领」
-  —— 管理员建出一把无归属 key（`user_id:""` 的 key 鉴权时得到 `ErrKeyUnowned` → 401），
-  之后用这个字段把它认领给某个**已存在**的用户。落库走独立的
-  `store.ReassignAccessKey`；`UpdateAccessKey` 刻意不写 `user_id`（归属不该由一个
-  PATCH 随手改写，见 `user_dao_test.go` 的断言）。指向不存在的用户 → 400。
+- **`POST /admin/api/keys` 的归属恒为创建者自己**：`user_id` 被**静默忽略**（不 403）。
+  任何人都不能代建 —— 包括管理员。这样 key 的来源永远是「谁建的」，
+  归属变更永远是「谁改的」，审计里两件事不会混在一条记录里。忽略而不是拒绝，
+  是因为旧版本前端仍会带这个字段，让一个本该成功的建 key 操作硬失败没有意义；
+  越权没有发生，就不该为它中断。拿不到身份 → 401（fail-closed：绝不放行空 ID）。
+- **自助发 key 的封顶**（仅普通用户，管理员不受限）：`quota_tokens` 不得超过其
+  **用户级** `users.quota_tokens`（0 = 不限时才允许 key 不限）；`rpm_limit` /
+  `tpm_limit` **强制清零** —— users 表没有 rpm/tpm 列，没有用户级上限可比，
+  保留任意填的能力就是留一个不限速的口子。`expires_at` / `allowed_ips` 允许自设：
+  这两个字段没有「更宽」的方向，自设是**给自己加限制**（收紧），与
+  `group_id` 相反 —— 后者能指向一个更宽松的组，是**放宽**，故仍限管理员。
+  管理员对**具体某把** key 施加的收紧，用户既不能 PATCH 撤销（`guardNoLoosening`），
+  重建一把也不会「更宽松」，只会失去该 key 上已有的全部限制性配置。
+  部署侧仍应给普通用户配 `users.quota_tokens`：它不设时自助建 key 就是不限额凭证。
+- **`PATCH /admin/api/keys/{id}` 的 `user_id`**（仅管理员有效）：这是**归属变更的
+  唯一入口** —— 管理员先给自己建一把，再用这个字段认领给某个**已存在**的用户。
+  落库走独立的 `store.ReassignAccessKey`；`UpdateAccessKey` 刻意不写 `user_id`
+  （归属不该由一个 PATCH 随手改写，见 `user_dao_test.go` 的断言）。指向不存在的
+  用户 → 400。历史数据里仍可能存在 `user_id:""` 的无归属 key：鉴权时得到
+  `ErrKeyUnowned` → 401，且会被 `store.retireOrphanKeys` 在迁移时退役。
 - **模型白名单 `allowed_models`（key 与组）**：出现**空白条目**（trim 后为空）→ 400。
   静默丢弃会把「收紧到某模型」变成「完全不限制」（归一后为空 → 落库 NULL →
   读回 `nil` → `AllowAll()`），而界面看不出任何区别。清空白名单用**显式的空数组 `[]`**。
@@ -728,6 +756,7 @@ Rosetta 用 `ErrStreamTruncated` 区分「干净结束」与「连接被掐断�
 | 下游 Key 无效 | 401 | `invalid_api_key` | |
 | 下游 Key 停用 / 过期 | 403 / 401 | | |
 | 配额耗尽（Key 总量） | 429 | `insufficient_quota` | 已实现，见 §11.2；预检读库，OpenAI 计费语义同款 code |
+| **余额耗尽（用户）** | **402** | `insufficient_balance` | 与上面的 token 配额**刻意分开**：那是终身 token 额度（换 key / 换账号），这一条是人民币余额（**充值**）。两者塌成一类会让客户端给出错误建议。`error.type` 沿用 `insufficient_quota`（OpenAI SDK 只认得有限几种 type，而「额度不足、去充值」的语义一致），所以**分流要按 code + 状态码，不能只看 type**。管理员豁免；只对成功请求扣费，扣费额 = usage 落库的 `cost_total` |
 | 限速（RPM/TPM） | 429 | `rate_limit_exceeded` | 已实现，§11.4；被拒请求不计数，避免客户端重试把窗口锁死 |
 | 上下文超长（`ErrContextTooLong`） | 400 | `context_length_exceeded` | Rosetta strict 模式产生 |
 | 请求体非法（`ErrInvalidRequest`） | 400 | `invalid_request_error` | 含 Rosetta 的结构校验失败 |
@@ -1098,17 +1127,18 @@ Docker 侧对齐，且避开浏览器的保留端口表（6666 是 IRC 段，浏
 
 ### 13.2 页面清单
 
-实际路由（`web/src/router.ts`，2026-10-06 核实）共 **9 页**，其中 5 页
+实际路由（`web/src/router.ts`，2026-10-06 核实）共 **11 页**，其中 5 页
 `adminOnly` —— 未登录或非 admin 看不到也进不去：
 
 | 路由 | 页签 | 可见 | 内容 |
 |---|---|---|---|
 | `/login` | 登录 | 公开 | 账号密码换 JWT；未初始化时改走引导设密 |
 | `/` | 总览 | 全体 | 今日请求数 / token / 错误率 / 各 provider 健康灯 |
-| `/keys` | 访问密钥 | 全体 | 列表（按身份收窄）、启停、配额/有效期/IP/模型白名单编辑（普通用户只能收紧）、重算用量；**新建仅管理员**（明文只显示一次） |
+| `/keys` | 访问密钥 | 全体 | 列表（按身份收窄）、启停、配额/有效期/IP/模型白名单编辑（普通用户只能收紧）、重算用量；**新建对全体开放**（明文只显示一次，归属恒为创建者自己；普通用户额度封顶到用户级配额、限速清零，分组覆盖仍限管理员） |
 | `/history` | 调用历史 | 全体 | 按时间倒序的调用明细，含 usage_state 与耗时 |
-| `/profile` | 我的账号 | 全体 | 自改密码、看自己的配额与用量 |
-| `/users` | 用户 | admin | 用户 CRUD、角色、启停、密码重置；admin 账号必须带初始密码 |
+| `/profile` | 我的账号 | 全体 | 自改密码、看自己的配额、**余额**（`balance_unlimited` 时显示「不限」而非 0.00 元）与用量；余额为 0 时显式提示「余额已用尽，请联系管理员充值」，对应数据面真实的 402 |
+| `/models` | 可用模型 | 全体 | **只读**清单：`GET /admin/api/model-names` 按身份收窄后的模型名（普通用户 = 所属组白名单 ∩ 全部路由名）+ 输入/输出/缓存命中三项单价；`restricted=true` 时显式提示「已被分组收窄」。刻意不给勾选控件 —— 白名单的写入口在 `/keys`（只能收紧）与 `/groups`（管理员按组收紧），且**空清单一律解释为「一个模型都调不了」而非 ModelPicker 的「一个都不选 = 不限制」**（后者只属于配置态）。未配置的单价显示「未配置」并弱化，**不显示 0.00**（会被读成「确认免费」） |
+| `/users` | 用户 | admin | 用户 CRUD、角色、启停、密码重置、**余额充值**（`delta_cents` 相对调整：填 100 是「加 100 元」而非「设为 100 元」，误操作不会清零；给不限额用户充值会把它切成有限额，界面上必须写明）；admin 账号必须带初始密码。余额列同样区分「不限」与「0.00 元」 |
 | `/groups` | 分组 | admin | 分组配额与模型白名单；key 级覆盖被 SET NULL 后白名单会静默放宽（P2-19） |
 | `/providers` | 上游与模型 | admin | 列表（协议/端点/凭证健康）、新建/编辑、连通性测试、模型管理、导入导出 |
 | `/routes` | 路由 | admin | 虚拟名 ↔ (provider, model) 映射表、启停、故障转移链 |
@@ -1116,6 +1146,19 @@ Docker 侧对齐，且避开浏览器的保留端口表（6666 是 IRC 段，浏
 
 「用量看板」不是独立页 —— 按天 / 按 Key / 按模型 / 按 provider 的 token 趋势以
 分组切换的形式内嵌在 `/history`。设置页的导入导出即 §13.3 描述的功能。
+
+> **`/model-names` 加价格为什么是「平行数组」而不是把 `models` 改成对象数组**
+>
+> `/models` 页要显示单价，于是该端点的响应加了 `prices`。但它有**三个**调用方，
+> 其中两个（`/keys` 的 ModelPicker、`/groups`）只要模型名：ModelPicker 的选项是
+> `string[]`（`v-model` + `Set` 去重 + `includes` 判定），Groups.vue 同样。改成
+> `[{name, …}]` 会同时打破这两处，而它们并不需要价格 —— 为一个页面的展示去改
+> 两个组件的数据契约，收益与风险不成比例。
+>
+> 所以 `models` **保持 `string[]` 不变**（旧调用方零改动），价格以
+> `prices[i]` 对应 `models[i]` 的方式并行给出，顺序与长度由后端保证
+> （`group_handler_test.go` 有测试钉住，含「交集为空时 prices 也必须为空」）。
+> 风险是平行数组的长度必须对齐，因此它在同一个循环里构造、排序时同步重排。
 
 > 布局在 2026-10-06 改为**侧边栏**（`329a7ca`，参考 hirezo），此前是顶部标签页。
 
