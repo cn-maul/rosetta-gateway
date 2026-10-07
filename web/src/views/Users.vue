@@ -29,7 +29,6 @@ const cPassword = ref('')
 const cRole = ref<UserRole>('user')
 const cGroup = ref('')
 const cQuota = ref<number>(0)
-const cRemark = ref('')
 const cErr = ref('')
 const cBusy = ref(false)
 
@@ -94,11 +93,10 @@ async function create() {
       role: cRole.value,
       group_id: cGroup.value || undefined,
       quota_tokens: Number(cQuota.value) || 0,
-      remark: cRemark.value.trim(),
     })
     toast('已创建', 'ok')
     showCreate.value = false
-    cName.value = cDisplay.value = cPassword.value = cRemark.value = ''
+    cName.value = cDisplay.value = cPassword.value = ''
     cRole.value = 'user'
     cGroup.value = ''
     cQuota.value = 0
@@ -224,7 +222,6 @@ onMounted(load)
             </div>
             <div class="row-sub">
               <span class="mono">{{ u.username }}</span>
-              <template v-if="u.remark"> · {{ u.remark }}</template>
             </div>
             <div class="row-sub group-cell">
               分组：
@@ -266,42 +263,52 @@ onMounted(load)
       </div>
     </div>
 
-    <!-- 新建用户 -->
-    <div v-if="showCreate" class="modal-mask" @click.self="showCreate = false">
-      <div class="modal">
+    <!-- 新建用户：横版弹窗（≈16:9），字段两列排布。
+         遮罩刻意**不**响应点击关闭：表单填到一半误点遮罩就全丢，
+         关闭只走「取消 / 创建」两个明确出口。 -->
+    <div v-if="showCreate" class="modal-mask">
+      <div class="modal modal-wide">
         <h2>新建用户</h2>
-        <label class="flabel" for="cu">用户名</label>
-        <input id="cu" v-model="cName" class="fin" placeholder="3-32 位字母数字-_." />
-        <div class="fhint">登录用。不支持中文与空格。</div>
-
-        <label class="flabel" for="cd">显示名</label>
-        <input id="cd" v-model="cDisplay" class="fin" placeholder="可选，界面上展示的名字" />
-
-        <label class="flabel" for="cp">初始密码</label>
-        <input id="cp" v-model="cPassword" type="password" class="fin" placeholder="留空则由用户自行设置" />
-        <div class="fhint">留空的账号无法登录，需重置密码后才能使用。</div>
-
-        <label class="flabel" for="cr">角色</label>
-        <select id="cr" v-model="cRole" class="fin">
-          <option value="user">普通用户</option>
-          <option value="admin">管理员</option>
-        </select>
-
-        <label class="flabel" for="cg">分组</label>
-        <select id="cg" v-model="cGroup" class="fin">
-          <option value="">未分组（模型不受限）</option>
-          <option v-for="g in groups" :key="g.id" :value="g.id">
-            {{ g.name }}{{ g.models.length === 0 ? '（未限制模型）' : '' }}
-          </option>
-        </select>
-        <div class="fhint">分组决定这个人能用哪些模型。未分组 = 不限制。</div>
-
-        <label class="flabel" for="cq">额度上限（token）</label>
-        <input id="cq" v-model.number="cQuota" type="number" min="0" class="fin" />
-        <div class="fhint">0 = 不限</div>
-
-        <label class="flabel" for="crm">备注</label>
-        <input id="crm" v-model="cRemark" class="fin" placeholder="可选" />
+        <div class="fgrid">
+          <div class="fcell">
+            <label class="flabel" for="cu">用户名</label>
+            <input id="cu" v-model="cName" class="fin" placeholder="3-32 位字母数字-_." />
+            <div class="fhint">登录用。不支持中文与空格。</div>
+          </div>
+          <div class="fcell">
+            <label class="flabel" for="cd">显示名</label>
+            <input id="cd" v-model="cDisplay" class="fin" placeholder="可选，界面上展示的名字" />
+          </div>
+          <div class="fcell">
+            <label class="flabel" for="cp">初始密码</label>
+            <input id="cp" v-model="cPassword" type="password" class="fin" autocomplete="new-password" placeholder="留空则由用户自行设置" />
+            <div v-if="cRole === 'admin' && !cPassword" class="fhint warn">创建管理员必须设置初始密码。</div>
+            <div v-else class="fhint">留空的账号无法登录，需重置密码后才能使用。</div>
+          </div>
+          <div class="fcell">
+            <label class="flabel" for="cr">角色</label>
+            <select id="cr" v-model="cRole" class="fin">
+              <option value="user">普通用户</option>
+              <option value="admin">管理员</option>
+            </select>
+            <div class="fhint">管理员可见全部页面与所有用户的数据。</div>
+          </div>
+          <div class="fcell">
+            <label class="flabel" for="cg">分组</label>
+            <select id="cg" v-model="cGroup" class="fin">
+              <option value="">未分组（模型不受限）</option>
+              <option v-for="g in groups" :key="g.id" :value="g.id">
+                {{ g.name }}{{ g.models.length === 0 ? '（未限制模型）' : '' }}
+              </option>
+            </select>
+            <div class="fhint">分组决定能用哪些模型。未分组 = 不限制。</div>
+          </div>
+          <div class="fcell">
+            <label class="flabel" for="cq">额度上限（token）</label>
+            <input id="cq" v-model.number="cQuota" type="number" min="0" class="fin" />
+            <div class="fhint">0 = 不限</div>
+          </div>
+        </div>
 
         <div v-if="cErr" class="fhint err">{{ cErr }}</div>
 
@@ -367,6 +374,9 @@ onMounted(load)
   max-height: 90dvh;
   overflow-y: auto;
 }
+.modal-wide { max-width: 720px; }
+/* 字段两列一行挤一挤：六项三行，弹窗整体约 16:9，不用竖着滚一屏。 */
+.fgrid { display: grid; grid-template-columns: 1fr 1fr; gap: 2px 18px; margin-top: 6px; }
 .modal h2 { margin: 0 0 4px; font-size: 15px; }
 .modal-actions { display: flex; gap: 8px; justify-content: flex-end; margin-top: 20px; }
 </style>
