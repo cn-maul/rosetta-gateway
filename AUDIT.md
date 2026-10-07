@@ -297,3 +297,21 @@ A 请求 60s 冷却、B 请求 1s 冷却，A 把B 的时间戳写进了库，60s
   CI 上有 gcc 的环境兜底。
 - **配额预占的 est 是预估值**：真实用量在收尾处校正；上游不回usage 时
   传 0，此时 used 会比真实少计—— `usage_state="missing"` 让漏账可见。
+
+### 审计员在 §0 记下、且复核为「有界」的三条取舍
+
+这三条不是本轮引入的，也不属P1/P2 清单，但**记录在案** —— 写在这里是为了
+不随总览重写而丢失：
+
+- **`audit.actor` 恒为 "admin"**（`internal/store/audit_dao.go:15`）：
+  `WriteAuditor` 回调没有透传会话身份，多用户后**普通用户对自己资源的写
+  操作也会落一条 "admin" 记录**。排查时无法区分是谁改的。修法是把
+  `server.UserFromContext(r)` 里的身份透进回调签名 —— 改动面波及所有
+  WriteAuditor 调用点，单独一轮。
+- **reload 失败无重试**（`internal/server/autoreload.go`）：重建失败只打
+  ERROR、不重试、不置脏标志。响应早已是 200 + 「已禁用」，但该 key 会
+  **无限期继续放行**，直到下一次任意 admin 写操作。修法是
+  `dirty atomic.Bool` + 低频后台重试。
+- **删库即失明**：`reconcileUsageTotals` 的种子标记与终身累计都存于同一个
+  SQLite 文件，删库后历史累计一并消失。属单文件部署的固有代价。
+- **全链路无 TLS / reload 原子性窗口**：见上。
