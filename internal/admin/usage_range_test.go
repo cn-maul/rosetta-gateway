@@ -33,9 +33,6 @@ func TestQueryRange_RejectsGarbageInsteadOfScanningAll(t *testing.T) {
 			if err != nil {
 				t.Fatalf("parse query: %v", err)
 			}
-			if _, _, err := queryRange(q, 7*24*time.Hour); err == nil {
-				t.Fatal("非法时间参数必须报错，实际却静默放行（会退化成全表扫描）")
-			}
 			if _, _, _, err := queryRangeExplicit(q, 7*24*time.Hour); err == nil {
 				t.Fatal("非法时间参数必须报错，实际却静默放行（会退化成全表扫描）")
 			}
@@ -46,7 +43,7 @@ func TestQueryRange_RejectsGarbageInsteadOfScanningAll(t *testing.T) {
 // TestQueryRange_ValidInputsStillWork 保证修复没有误伤正常查询。
 func TestQueryRange_ValidInputsStillWork(t *testing.T) {
 	q, _ := url.ParseQuery("from=1000&to=2000")
-	from, to, err := queryRange(q, time.Hour)
+	from, to, _, err := queryRangeExplicit(q, time.Hour)
 	if err != nil {
 		t.Fatalf("合法参数不应报错: %v", err)
 	}
@@ -56,18 +53,21 @@ func TestQueryRange_ValidInputsStillWork(t *testing.T) {
 
 	// 不传 from → 回落到默认窗口，而不是 0。
 	q2, _ := url.ParseQuery("")
-	from2, _, err := queryRange(q2, time.Hour)
+	from2, _, explicit2, err := queryRangeExplicit(q2, time.Hour)
 	if err != nil {
 		t.Fatalf("不传参数不应报错: %v", err)
 	}
 	if from2 == 0 {
 		t.Fatal("不传 from 时应回落到默认窗口，实际为 0")
 	}
+	if explicit2 {
+		t.Error("未传 from 时 explicit 应为 false")
+	}
 
 	// 空串等价于「未传」—— parseOptionalUnixMilli 的既有契约，前端
 	// 表单清空输入后发出 ?from= 属于正常操作，不能报错。
 	q4, _ := url.ParseQuery("from=&to=")
-	if _, _, err := queryRange(q4, time.Hour); err != nil {
+	if _, _, _, err := queryRangeExplicit(q4, time.Hour); err != nil {
 		t.Fatalf("空串应被当作未传: %v", err)
 	}
 

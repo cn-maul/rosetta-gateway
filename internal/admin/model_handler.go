@@ -3,6 +3,7 @@ package admin
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net/http"
 	"strings"
 	"time"
@@ -257,6 +258,95 @@ func (h *ModelHandler) Delete(w http.ResponseWriter, r *http.Request, id string)
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]string{"status": "deleted"})
+}
+
+// modelTestResponse 是单模型可用性探测的响应体。
+//
+// # 为什么状态码恒为 200，失败放在 body 里
+//
+// 与 provider 的 Test 同一口径：探测失败的原因有十几种（凭据错、模型不存在、
+// 没权限、上游 5xx、超时、网络不通），每一种都是**探测的结论**而不是
+// 「这个管理接口调用失败」。用 4xx/5xx 表达它们，会让前端只能拿到
+// ApiFail 里那句统一的错误文案，反而丢掉了真正的诊断信息。
+//
+// 只有「你调的 id 不存在」才用 404 —— 那是调用方用错了接口，不是模型不可用。
+type modelTestResponse struct {
+	Status string `json:"status"` // "ok" | "error"
+	// ModelID 回显被探测的上游模型名。前端把它显示在结果里，
+	// 避免「点了 A 行、结果来自 B 行」这种复核不了的错觉。
+	ModelID    string `json:"model_id"`
+	ProviderID string `json:"provider_id"`
+	Message    string `json:"message"`
+	// LatencyMs 是端到端往返耗时（含上游生成 1 个 token 的时间）。
+	LatencyMs int64 `json:"latency_ms"`
+	// InputTokens / OutputTokens 是上游回报的真实用量。带出来是为了让
+	// 「这次探测花了多少」可见 —— 探测会真实计费，不该是个隐形成本。
+	InputTokens  int64 `json:"input_tokens,omitempty"`
+	OutputTokens int64 `json:"output_tokens,omitempty"`
+	// InBand 表示上游用 HTTP 200 + 错误体回绝了请求（部分中转网关如此）。
+	// 前端据此把文案说明白，否则「HTTP 成功却报错」看起来像网关自己坏了。
+	InBand bool `json:"in_band,omitempty"`
+}
+
+// Test 对单个上游模型发一次最小真实推理，验证它现在可用。
+//
+// 与 ProviderHandler.Test 的分工：那个测的是「provider 这个 endpoint + 凭据
+// 通不通」（拉 /models），**证明不了任何具体模型能推理** —— 模型下架、
+// 账号无权限、名字写错时 /models 全都照常返回。所以这里的判据只能是
+// 真的发一次推理请求，见 upstream.TestUpstreamModel 的说明与成本分析。
+//
+// 路径用 upstream_models.id 而不是 model_id 字符串：前者是稳定的主键，
+// 后者在同一 provider 下唯一但在跨 provider 之间会重名，拿它做路径参数
+// 无法唯一定位（而且可能含 / 等需要转义的字符）。
+func (h *ModelHandler) Test(w http.ResponseWriter, r *http.Request, id string) {
+	m, err := h.store.GetUpstreamModel(r.Context(), id)
+	if err != nil {
+		writeServerError(w, "get upstream model", err)
+		return
+	}
+	if m == nil {
+		writeError(w, http.StatusNotFound, "model not found")
+		return
+	}
+
+	// 超时取「provider 自身超时 + 余量」：探测走的是同一条上游路径，
+	// 给它比 provider 更短的预算会得到一个无法归因的 ctx 超时。
+	// 上界 60s：一次 max_tokens=1 的调用不该更久，真卡住就得报出来，
+	// 而不是让管理请求也跟着挂住。
+	//
+	// cfg 的空值兜底：NewModelHandler 的其它调用点（Discover）不碰 cfg，
+	// 所以历史上允许传 nil（测试里就是这么用的）。本端点要经 cfg 算超时、
+	// 还要把它交给 NewProviderClient，是第一个真正依赖它的路径 ——
+	// 请求路径上 deref 一个 nil 指针会把 500 变成 panic，这里补上兜底。
+	cfg := h.cfg
+	if cfg == nil {
+		cfg = config.Default()
+	}
+	timeout := cfg.UpstreamTimeout()
+	if timeout <= 0 || timeout > 60*time.Second {
+		timeout = 60 * time.Second
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), timeout)
+	defer cancel()
+
+	res := upstream.TestUpstreamModel(ctx, h.store, m, h.masterKey, cfg)
+
+	resp := modelTestResponse{
+		Status:       "ok",
+		ModelID:      m.ModelID,
+		ProviderID:   m.ProviderID,
+		LatencyMs:    res.LatencyMs,
+		InputTokens:  res.InputTokens,
+		OutputTokens: res.OutputTokens,
+		InBand:       res.InBand,
+	}
+	if res.Err != nil {
+		resp.Status = "error"
+		resp.Message = res.Err.Error()
+	} else {
+		resp.Message = fmt.Sprintf("模型可用，%dms", res.LatencyMs)
+	}
+	writeJSON(w, http.StatusOK, resp)
 }
 
 type discoveredModel struct {

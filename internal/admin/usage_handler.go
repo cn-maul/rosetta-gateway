@@ -45,33 +45,21 @@ func clampLimit(raw string, def, max int64) int64 {
 	return n
 }
 
-// queryRange 解析 from/to（毫秒时间戳），缺省取「最近 window」。
-//
-// 解析失败必须显式报错，不能像旧实现那样把错误丢进 `_` 后置 0 ——
-// `?from=abc` 会让 from=0，而「from=0 且未显式」本该回落到默认 window，
-// 于是要么退化成全表扫描（explicit 路径），要么静默查了一个错误的区间。
-// usage_records 没有保留策略、行数无上界，全表聚合是本项目最重的一条查询。
-func queryRange(q url.Values, window time.Duration) (from, to int64, err error) {
-	from, err = parseOptionalUnixMilli(q.Get("from"), "from")
-	if err != nil {
-		return 0, 0, err
-	}
-	to, err = parseOptionalUnixMilli(q.Get("to"), "to")
-	if err != nil {
-		return 0, 0, err
-	}
-	if from == 0 {
-		from = time.Now().Add(-window).UnixMilli()
-	}
-	if to == 0 {
-		to = time.Now().UnixMilli()
-	}
-	return from, to, nil
-}
-
 // queryRangeExplicit 解析 from/to，并区分「显式传 from=0（=全部历史）」与
 // 「未传 from（=取默认 window）」。总览页的「全部」档需要前者。
 // 返回 (from, to, explicit)；explicit 为 true 表示请求里带了 from 参数。
+//
+// 解析失败必须显式报错，不能像旧实现那样把错误丢进 `_` 后置 0 ——
+// `?from=abc` 会让 from=0，而「from=0 且 explicit」本会被解读为「全部历史」——
+// 不生成 ts >= ? 下界，直接退化成全表扫描。usage_records 没有保留策略、
+// 行数无上界，全表聚合是本项目最重的一条查询。
+//
+// # 唯一的区间解析入口（2026-10-10）
+//
+// 此前还有一个 queryRange，它把显式 from=0 回落成默认窗口，于是
+// 「全部历史」静默变成「最近 7 天」。/stats 用的是本函数、history 与 CSV
+// 用的是那个错的 —— 两边对同一个「全部」给出不同结果。现已全部收敛到本函数，
+// 那个错的一并删除：留着它等于留一个「看起来能用、实际静默给错数据」的坑。
 func queryRangeExplicit(q url.Values, window time.Duration) (from, to int64, explicit bool, err error) {
 	rawFrom := q.Get("from")
 	from, err = parseOptionalUnixMilli(rawFrom, "from")
@@ -398,9 +386,91 @@ type usageHistoryEntry struct {
 	KeyName       string `json:"key_name"`
 	KeyID         string `json:"key_id"`
 	TotalTokens   int64  `json:"total_tokens"`
-	TTFBMs        int64  `json:"ttfb_ms"`
-	LatencyMs     int64  `json:"latency_ms"`
-	Status        string `json:"status"`
+	// OutputTokens 是本次**生成**出来的 token 数（2026-10-11 新增）。
+	//
+	// 为什么必须单独下发、不能拿 TotalTokens 顶替：TotalTokens = 输入 + 输出，
+	// 而输入 token 是请求侧送进去的、不是模型"吐"出来的。用总量算速度会把
+	// 速度虚高好几倍（一个 1 万输入 / 2 百输出的请求，用总量算出来的"速度"
+	// 是真实生成速度的 50 倍），而表格里那一列只有数字、看不出错。
+	OutputTokens int64 `json:"output_tokens"`
+	// Tps 是本次请求的平均输出速度（token/s），**由后端算好**（2026-10-11 新增）。
+	//
+	// # 为什么在后端算而不是前端拿 output_tokens/latency_ms 现算
+	//
+	// 口径必须与总览页「平均速度」逐字一致，否则同一批请求会在两个页面给出
+	// 两个数，而这种偏差没有任何迹象。总览页读的是 store.GetRecentThroughput，
+	// 其公式是 `SUM(output_tokens) * 1000.0 / NULLIF(SUM(latency_ms), 0)`
+	// —— 单条记录下 SUM 退化，等价于 `output_tokens * 1000 / latency_ms`。
+	// 把这条公式写在后端、紧挨着 tpsFor 的注释，全项目只有一处实现；
+	// 放前端就等于让 TS 与 SQL 各持一份同样的公式，改一处忘一处时
+	// 两个页面会静默分叉。
+	//
+	// 除零/无样本的边界同理：`NULLIF(...,0)` 那半边保护只存在于后端，
+	// 前端复刻一份就要在 JS 里再写一次 `latency_ms > 0` 判断。
+	//
+	// # 0 值语义：不是「速度为零」，而是「没有可算的样本」
+	//
+	// 上游没报 usage（output_tokens=0）、非流式短请求、或错误请求
+	// （latency_ms=0）时这里恒为 0，前端据此显示 '—' 而不是 '0.0'。
+	//
+	// 为什么不能显示 0.0：本列的可算样本里 tps 恒 > 0（分子分母都 > 0 的
+	// 商不可能为 0），所以 0.0 只可能来自"没有样本"。把它印成 0.0 会被读成
+	// 「这次生成极慢」，而真相是「这次压根没有能算速度的数据」—— 与
+	// GetRecentThroughput 用 NULLIF 挡住除零是同一个意图：
+	// 宁可说"不知道"，也不给一个会被误读的数。
+	Tps       float64 `json:"tps"`
+	TTFBMs    int64   `json:"ttfb_ms"`
+	LatencyMs int64   `json:"latency_ms"`
+	Status    string  `json:"status"`
+	// Stream 标记这次调用是否为流式（2026-10-10 新增）。
+	//
+	// 为什么必要：流式与非流式的**首字时间含义完全不同** —— 非流式的 ttfb
+	// 大致等于总耗时（响应一次性回来），而流式的 ttfb 是「多久出第一个字」。
+	// 两者混在同一列里、不加标注，运维看到「首字 15 秒」无法判断是模型慢
+	// 还是压根没用流式。
+	Stream bool `json:"stream"`
+	// Cost 是该条用量的固化费用（元），2026-10-10 新增。
+	//
+	// 取的是 cost_total —— 落库**当时**按当时单价算好并固化的那个值，
+	// 与账单、报表同源。改价不回溯历史，这里也就不会被后续改价影响。
+	//
+	// 为什么必须显示：单价可能低到单次不足一分钱，而余额按分扣减，
+	// 于是「报表在涨、余额不动」。把每条的费用摆出来，用户才能对上账；
+	// 否则只能看到余额缓慢变化，无从判断钱花在哪。
+	Cost float64 `json:"cost"`
+}
+
+// tpsFor 计算单条请求的平均输出速度（token/s）；无样本时返回 0。
+//
+// # 公式来源（不许在这里"顺手改进"）
+//
+// 逐字取自 store.GetRecentThroughput：
+//
+//	SUM(output_tokens) * 1000.0 / NULLIF(SUM(latency_ms), 0)
+//
+// 单条记录下两个 SUM 各自退化成该行自己的列，于是得到
+// `output_tokens * 1000 / latency_ms`。这是刻意的：表格每行的速度与
+// 总览页的「平均速度」必须是同一套算法，否则同一批请求会出现两个数
+// （表格逐行平均 ≠ 总量加权平均），而对不上时没人知道该信哪个。
+//
+// # 口径的一个已知性质（不是缺陷）
+//
+// 分母用 latency_ms —— **总耗时**，含首字延迟与输入处理时间，不是纯粹的
+// 解码时长。所以这个数系统性略低于"吐字速率"。保持它是对的：改成分母
+// 只取 (latency - ttfb) 会让本列与总览页立刻分叉，而分叉的代价大于
+// 「略保守」这点偏差。
+//
+// # 为什么 latency_ms <= 0 或 output_tokens <= 0 直接返回 0
+//
+// latency_ms=0 是真会出现的（错误请求在触碰上游前就返回，没走计时），
+// 直接相除会得到 +Inf 并序列化成 JSON 里非法的 `Inf` 字面量 —— 前端
+// JSON.parse 会当场抛错，整张表打不开。这与 GetRecentThroughput 的
+// NULLIF(SUM(latency_ms), 0) 是同一处保护。
+func tpsFor(outputTokens, latencyMs int64) float64 {
+	if outputTokens <= 0 || latencyMs <= 0 {
+		return 0
+	}
+	return float64(outputTokens) * 1000 / float64(latencyMs)
 }
 
 // usageHistoryResponse 是「调用历史」的分页结果：当页明细 + 过滤后的总条数。
@@ -464,7 +534,10 @@ func clampOffset(raw string) int64 {
 // 让前端能在下载后明确提示「已截断」而不是让人对着一个假象做判断。
 func (h *UsageHandler) ExportCSV(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query()
-	from, to, err := queryRange(q, 7*24*time.Hour)
+	// 与 History 同一个理由改用 queryRangeExplicit：显式 from=0 是「全部」，
+	// 不能被回落成默认 7 天，否则导出的文件与页面上「全部」看到的不一致，
+	// 而这种不一致要等对账时才发现（2026-10-10 修复）。
+	from, to, _, err := queryRangeExplicit(q, 7*24*time.Hour)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
@@ -481,7 +554,7 @@ func (h *UsageHandler) ExportCSV(w http.ResponseWriter, r *http.Request) {
 	}
 
 	rows, err := h.store.Reader().Query(
-		`SELECT u.ts, u.public_model, u.upstream_model, COALESCE(a.name, ''), u.access_key_id, u.total_tokens, u.ttfb_ms, u.latency_ms, u.status
+		`SELECT u.ts, u.public_model, u.upstream_model, COALESCE(a.name, ''), u.access_key_id, u.total_tokens, u.output_tokens, u.ttfb_ms, u.latency_ms, u.status, u.stream, COALESCE(u.cost_total, 0)
 		   FROM usage_records u LEFT JOIN access_keys a ON a.id = u.access_key_id`+where+
 			` ORDER BY u.ts DESC, u.id DESC LIMIT ?`, append(args, limit)...)
 	if err != nil {
@@ -497,17 +570,43 @@ func (h *UsageHandler) ExportCSV(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("X-Export-Truncated", "1")
 	}
 	cw := csv.NewWriter(w)
-	_ = cw.Write([]string{"ts", "public_model", "upstream_model", "key_name", "key_id", "total_tokens", "ttfb_ms", "latency_ms", "status"})
+	// 列名与页面表格一一对应：导出件要能独立读懂，缺了 stream/cost 就得
+	// 回网关上看，而 CSV 的常见用途恰恰是拿出去单独分析。
+	//
+	// output_tokens / tps 追加在**末尾**而不是插在 total_tokens 之后：
+	// 页面新增了「速度」列，导出件若不给这两个数，用户就没法在表格工具里
+	// 复现这一列（连自己算都算不了，因为缺 output_tokens）——
+	// 那正是本注释开头说的「拿出去读不懂」。但列位置一动，任何按下标取值
+	// 的既有消费方（脚本、Excel 模板）会静默错位，所以新增列一律追加，
+	// 让原有 11 列的下标保持不变。
+	_ = cw.Write([]string{"ts", "public_model", "upstream_model", "key_name", "key_id",
+		"total_tokens", "ttfb_ms", "latency_ms", "status", "stream", "cost",
+		"output_tokens", "tps"})
 	for rows.Next() {
 		var e usageHistoryEntry
-		if err := rows.Scan(&e.Ts, &e.PublicModel, &e.UpstreamModel, &e.KeyName, &e.KeyID, &e.TotalTokens, &e.TTFBMs, &e.LatencyMs, &e.Status); err != nil {
+		if err := rows.Scan(&e.Ts, &e.PublicModel, &e.UpstreamModel, &e.KeyName, &e.KeyID,
+			&e.TotalTokens, &e.OutputTokens, &e.TTFBMs, &e.LatencyMs, &e.Status, &e.Stream, &e.Cost); err != nil {
 			return
+		}
+		e.Tps = tpsFor(e.OutputTokens, e.LatencyMs)
+		stream := "false"
+		if e.Stream {
+			stream = "true"
+		}
+		// tps 无样本时写空串而不是 0：CSV 是拿去做数值分析的，空单元格会被
+		// 读成"缺失"（AVERAGE 等函数自动跳过），而 0 会被算进平均值里、
+		// 把整体速度往下拽。页面显示 '—' 与这里留空是同一个意图。
+		tps := ""
+		if e.Tps > 0 {
+			tps = strconv.FormatFloat(e.Tps, 'f', -1, 64)
 		}
 		_ = cw.Write([]string{
 			time.UnixMilli(e.Ts).Format(time.RFC3339), e.PublicModel, e.UpstreamModel,
 			e.KeyName, e.KeyID,
 			strconv.FormatInt(e.TotalTokens, 10), strconv.FormatInt(e.TTFBMs, 10),
-			strconv.FormatInt(e.LatencyMs, 10), e.Status,
+			strconv.FormatInt(e.LatencyMs, 10), e.Status, stream,
+			strconv.FormatFloat(e.Cost, 'f', -1, 64),
+			strconv.FormatInt(e.OutputTokens, 10), tps,
 		})
 	}
 	cw.Flush()
@@ -523,7 +622,11 @@ func (h *UsageHandler) ExportCSV(w http.ResponseWriter, r *http.Request) {
 // 用它当 tiebreaker 才能保证翻页不漏不重。
 func (h *UsageHandler) History(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query()
-	from, to, err := queryRange(q, 7*24*time.Hour)
+	// 用 queryRangeExplicit 而不是 queryRange：前端的「全部」档发的是
+	// from=0，而 queryRange 会把显式 0 回落成默认 7 天 —— 用户选「全部」
+	// 实际只看到最近一周，且没有任何提示（2026-10-10 修复）。
+	// 与 /stats 现在是同一套口径，「总览选全部」与「历史选全部」一致。
+	from, to, _, err := queryRangeExplicit(q, 7*24*time.Hour)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
@@ -541,7 +644,7 @@ func (h *UsageHandler) History(w http.ResponseWriter, r *http.Request) {
 	}
 
 	rows, err := h.store.Reader().Query(
-		`SELECT u.ts, u.public_model, u.upstream_model, COALESCE(a.name, ''), u.access_key_id, u.total_tokens, u.ttfb_ms, u.latency_ms, u.status
+		`SELECT u.ts, u.public_model, u.upstream_model, COALESCE(a.name, ''), u.access_key_id, u.total_tokens, u.output_tokens, u.ttfb_ms, u.latency_ms, u.status, u.stream, COALESCE(u.cost_total, 0)
 		   FROM usage_records u LEFT JOIN access_keys a ON a.id = u.access_key_id`+where+
 			` ORDER BY u.ts DESC, u.id DESC LIMIT ? OFFSET ?`, append(args, limit, offset)...)
 	if err != nil {
@@ -553,10 +656,14 @@ func (h *UsageHandler) History(w http.ResponseWriter, r *http.Request) {
 	entries := make([]usageHistoryEntry, 0)
 	for rows.Next() {
 		var e usageHistoryEntry
-		if err := rows.Scan(&e.Ts, &e.PublicModel, &e.UpstreamModel, &e.KeyName, &e.KeyID, &e.TotalTokens, &e.TTFBMs, &e.LatencyMs, &e.Status); err != nil {
+		if err := rows.Scan(&e.Ts, &e.PublicModel, &e.UpstreamModel, &e.KeyName, &e.KeyID,
+			&e.TotalTokens, &e.OutputTokens, &e.TTFBMs, &e.LatencyMs, &e.Status, &e.Stream, &e.Cost); err != nil {
 			writeServerError(w, "usage history scan", err)
 			return
 		}
+		// tps 在 Scan 之后算，不放进 SELECT：公式只有一处（tpsFor），
+		// 且 SQL 里再写一遍除法意味着除零保护也要在 SQL 与 Go 两边各写一份。
+		e.Tps = tpsFor(e.OutputTokens, e.LatencyMs)
 		entries = append(entries, e)
 	}
 	if err := rows.Err(); err != nil {

@@ -105,6 +105,10 @@ type meResponse struct {
 	// 具体金额，绝不能把不限额显示成「0.00 元」。
 	BalanceCents int64 `json:"balance_cents"`
 	Unlimited    bool  `json:"balance_unlimited"`
+	// BalanceRemainder 是**不足一分**的待结算余数（微元）。余额按分扣减，
+	// 而单价可能远低于一分，所以「余额没变」不等于「没消费」—— 前端要把
+	// 它显示出来，否则用户会以为没扣钱。语义见 store.User.BalanceRemainder。
+	BalanceRemainder int64 `json:"balance_remainder"`
 	// SessionEnabled 告诉前端能否用密码登录（没配 secret 时为 false）。
 	SessionEnabled bool `json:"session_enabled"`
 }
@@ -538,8 +542,12 @@ func (h *UserHandler) Me(w http.ResponseWriter, r *http.Request) {
 	}
 	// 引导态下的合成 user 没有 ID，不返回任何真实数据。
 	if u.ID == "" {
+		// Unlimited 必须**显式**给 true，不能吃 Go 零值：false + 0 分在界面上
+		// 渲染成「0.00 元」加一个「已用尽」红标 —— 而这个账号连余额这回事
+		// 都没有，那是一次凭空捏造的账目告警。
 		writeJSON(w, http.StatusOK, meResponse{
 			Username: "(setup)", Role: u.Role, Status: u.Status,
+			Unlimited:      true,
 			SessionEnabled: h.mgr.Enabled(), IsAdmin: true,
 		})
 		return
@@ -553,6 +561,34 @@ func (h *UserHandler) Me(w http.ResponseWriter, r *http.Request) {
 		// 解析必然失败。降级就是降级，只进日志，不进响应。
 		slog.Warn("me: sum used tokens failed; degrading used_tokens to 0", "error", err)
 		used = 0
+	}
+
+	// 管理员**不读余额**（2026-10-11）：它不建 key、不调 API，不产生扣费，
+	// 也不允许被充值（AdjustBalance 已拦下给自己充值），所以库里那一列对
+	// 管理员永远是残留值。统一回「不限额 + 0 分 + 无余数」。
+	//
+	// 直接短路而不是读了再丢弃，有两个理由：
+	//  ① 省掉一次 BalanceOf 查询，而 /me 是每个页面都会打的基础请求；
+	//  ② 更重要的是**不留可被误读的数字**：读出来再判断，传给前端的仍是
+	//     一个 0/真实值，漏判一次就是一次「我还欠着钱」的假象。
+	//
+	// 前端据此把管理员的钱包页渲染成「用户消费 + 充值记录」，而不是自己的
+	// 余额（见 web/src/views/Wallet.vue）。
+	if u.IsAdmin() {
+		writeJSON(w, http.StatusOK, meResponse{
+			Username:        u.Username,
+			DisplayName:     u.DisplayName,
+			Role:            u.Role,
+			Status:          u.Status,
+			QuotaTokens:     u.QuotaTokens,
+			UsedTokens:      used,
+			BalanceCents:    0,
+			Unlimited:       true,
+			MustSetPassword: u.PasswordHash == "",
+			IsAdmin:         true,
+			SessionEnabled:  h.mgr.Enabled(),
+		})
+		return
 	}
 
 	// 余额要**回库读**，不能从上下文里的 u 拿：session.UserFromContext 装的是
@@ -570,23 +606,29 @@ func (h *UserHandler) Me(w http.ResponseWriter, r *http.Request) {
 	// 被渲染成「0 元」，正是这里要避开的那个误读。
 	balance, limited, berr := h.store.BalanceOf(r.Context(), u.ID)
 	unlimited := true
+	remainder := int64(0)
 	if berr != nil {
 		slog.Warn("me: balance lookup failed; degrading balance to unlimited", "error", berr)
 	} else {
 		unlimited = !limited
+		// 余数只对有限额用户有意义；不限额用户本来就不攒（见 ChargeBalance）。
+		if !unlimited {
+			remainder = u.BalanceRemainder
+		}
 	}
 
 	writeJSON(w, http.StatusOK, meResponse{
-		Username:        u.Username,
-		DisplayName:     u.DisplayName,
-		Role:            u.Role,
-		Status:          u.Status,
-		QuotaTokens:     u.QuotaTokens,
-		UsedTokens:      used,
-		BalanceCents:    balance,
-		Unlimited:       unlimited,
-		MustSetPassword: u.PasswordHash == "",
-		IsAdmin:         u.IsAdmin(),
-		SessionEnabled:  h.mgr.Enabled(),
+		Username:         u.Username,
+		DisplayName:      u.DisplayName,
+		Role:             u.Role,
+		Status:           u.Status,
+		QuotaTokens:      u.QuotaTokens,
+		UsedTokens:       used,
+		BalanceCents:     balance,
+		Unlimited:        unlimited,
+		BalanceRemainder: remainder,
+		MustSetPassword:  u.PasswordHash == "",
+		IsAdmin:          u.IsAdmin(),
+		SessionEnabled:   h.mgr.Enabled(),
 	})
 }

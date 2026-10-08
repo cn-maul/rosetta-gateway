@@ -333,7 +333,12 @@ func TestBalancePreflight_Boundary(t *testing.T) {
 		// 已配价但本次小到四舍五入成 0 分：仍须校验余额，否则「欠费用户
 		// 靠发足够小的请求就能一直用」，预检形同虚设。
 		{"已配价估算为0且余额为0", 0, 0, false, false, true, balanceReject},
-		{"已配价估算为0但有余额", 0, 1, false, false, true, balanceAllow},
+		// 余额低于地板线（1 元）时不允许再靠 0 分请求消耗上游（2026-10-10 P2）。
+		// 修复前这里只判 >0，于是 1 分钱余额能白嫖无限多个 0 分请求。
+		{"已配价估算为0且余额1分", 0, 1, false, false, true, balanceReject},
+		{"已配价估算为0且余额99分", 0, 99, false, false, true, balanceReject},
+		{"已配价估算为0且余额刚好1元", 0, minSubcentSpendableCents, false, false, true, balanceAllow},
+		{"已配价估算为0且余额充足", 0, 5000, false, false, true, balanceAllow},
 		// 余额 0 且估算 >0：必须拒。这是「一分钱都没有」的判定。
 		{"零余额", 1, 0, false, false, true, balanceReject},
 	}
@@ -473,23 +478,36 @@ func TestBalance_SuccessChargesRealCost(t *testing.T) {
 		"成功请求应按落库 cost_total 扣费")
 }
 
-// 管理员**完全跳过**余额逻辑：余额为 0 也不被拦，且不扣费。
+// 管理员在数据面（/v1 调模型）已被**彻底拦截**（2026-10 控制面/数据面分离）：
+// 鉴权层 auth.Authenticate 对管理员 key 直接返回 ErrAdminCannotCallModel，
+// 压根到不了预检与扣费。
 //
-// 钉住 Lead 的第三条口径。管理员短路发生在**预检之前**，所以这条用例
-// 同时证明了两件事：管理员不被余额拦住、且管理员的成功调用不扣钱
-// （库里余额恒为 0 —— 若扣费逻辑也短路了，余额会变负或报欠费）。
-func TestBalance_AdminIsExempt(t *testing.T) {
-	h, db := pricedHarness(t, store.RoleAdmin, 1_000_000, 1_000_000)
-	setBalance(t, db, 0) // 管理员也没有钱
+// 本用例钉住这条边界的**入口**：管理员带 key 打 /v1 → 403 admin_cannot_call_model，
+// **且上游一次都没被触碰**（用计数 fake 断言）。数据面的余额豁免短路
+// （balanceExempt）在这条路径上是**不可达**的（纵深防御，见 billing.go）。
+//
+// 「普通用户不受影响」由 TestBalance_SuccessChargesRealCost 等既有用例覆盖
+// （它们用同一个 harness 但角色为普通用户，管理员拦截不会波及它们）。
+func TestBalance_AdminCannotReachDataPlane(t *testing.T) {
+	var hits int64
+	up := fakeCountingGood(&hits)
+	defer up.Close()
+
+	// 把快照里的测试用户改成 admin（鉴权读快照），库里余额也设为 0，
+	// 但这里根本不该走到余额判定。
+	h, _ := pricedHarness(t, store.RoleAdmin, 1_000_000, 1_000_000)
 
 	rec := postChatWithID(h, "flash")
-	if rec.Code != http.StatusOK {
-		t.Fatalf("管理员不受余额约束，应放行；got %d body=%s", rec.Code, rec.Body.String())
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("管理员调用 /v1 应被拒（403），got %d body=%s", rec.Code, rec.Body.String())
 	}
-
-	// 扣费在 worker 里异步发生。给一点时间后余额必须**仍是 0**
-	// （不是"还没扣完"，而是压根不扣）。
-	waitNoCharge(t, db, 0, "管理员的成功调用不应扣费")
+	body := rec.Body.String()
+	if !strings.Contains(body, `"code":"admin_cannot_call_model"`) {
+		t.Fatalf("want code=admin_cannot_call_model, body=%s", body)
+	}
+	if hits != 0 {
+		t.Fatalf("上游被触碰了 %d 次：管理员必须在触碰上游之前被拒", hits)
+	}
 }
 
 // 失败请求**不扣费**（Lead 与用户确认的第四条口径）。

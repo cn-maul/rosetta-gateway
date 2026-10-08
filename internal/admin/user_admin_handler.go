@@ -50,10 +50,17 @@ type userResponse struct {
 	//
 	// 前端必须据此显示「不限」而不是「0.00 元」—— 后者会被读成「没钱了」，
 	// 而实际含义是「不受余额限制」。
-	BalanceCents int64  `json:"balance_cents"`
-	Unlimited    bool   `json:"balance_unlimited"`
-	AuthVersion  int64  `json:"auth_version"`
-	Remark       string `json:"remark,omitempty"`
+	BalanceCents int64 `json:"balance_cents"`
+	Unlimited    bool  `json:"balance_unlimited"`
+	// BalanceRemainder 是**不足一分**的待结算余数（微元）。
+	//
+	// 余额按分扣减，而单价可能远低于一分（实测 3 元/百万 token 时，一次
+	// 一万 token 的调用只有 5 厘），于是会有相当长一段时间里余额纹丝不动。
+	// 前端必须把它一起显示出来，否则用户看到「余额没变」会以为没扣钱 ——
+	// 而实际上钱已消费，只是还没攒够一分。语义与 balance_cents 正交。
+	BalanceRemainder int64  `json:"balance_remainder"`
+	AuthVersion      int64  `json:"auth_version"`
+	Remark           string `json:"remark,omitempty"`
 	// HasPassword 为false 时前端应显示「未设置密码」并引导去设置。
 	HasPassword bool  `json:"has_password"`
 	KeyCount    int   `json:"key_count"`
@@ -64,6 +71,41 @@ type userResponse struct {
 }
 
 func toUserResponse(u *store.User, selfID string, keyCount int) userResponse {
+	// 管理员账户**没有余额语义**（2026-10-11）。
+	//
+	// 管理员不建 key、不调 API，所以它既不会产生扣费，也不该被充值 ——
+	// AdjustBalance 已经拒绝「给自己充值」。那库里那一列对 admin 行就是纯粹的
+	// 历史残留：可能是升级前充值留下的，也可能压根是 NULL。
+	//
+	// 统一在这里归一成「不限额 + 0 分 + 无余数」，而不是把真实值透出去：
+	// 透出去的话，管理员在用户列表里会看到一个自己从不消耗的数字，
+	// 让人以为「我还有钱没花」或「我欠着钱」，而这两种状态都不存在。
+	//
+	// 收在这一处而不是各 handler 里手改：toUserResponse 是**唯一**的构造点
+	// （ListUsers / AdjustBalance 共用），漏一处就会出现「列表里是 0、
+	// 充值响应里是真余额」这种同一账号两个答案的矛盾。
+	if u.Role == store.RoleAdmin {
+		return userResponse{
+			ID:               u.ID,
+			Username:         u.Username,
+			DisplayName:      u.DisplayName,
+			Role:             u.Role,
+			Status:           u.Status,
+			GroupID:          u.GroupID,
+			QuotaTokens:      u.QuotaTokens,
+			UsedTokens:       u.UsedTokens,
+			BalanceCents:     0,
+			Unlimited:        true, // 「不限额」= 不参与余额计费
+			BalanceRemainder: 0,
+			AuthVersion:      u.AuthVersion,
+			Remark:           u.Remark,
+			HasPassword:      u.PasswordHash != "",
+			KeyCount:         keyCount,
+			CreatedAt:        u.CreatedAt,
+			LastLoginAt:      u.LastLoginAt,
+			IsSelf:           u.ID == selfID,
+		}
+	}
 	return userResponse{
 		ID:          u.ID,
 		Username:    u.Username,
@@ -79,13 +121,16 @@ func toUserResponse(u *store.User, selfID string, keyCount int) userResponse {
 		// 在 JSON 里少一个键，前端于是读到 undefined 而显示成「0 元」。
 		BalanceCents: u.BalanceCents,
 		Unlimited:    u.Unlimited,
-		AuthVersion:  u.AuthVersion,
-		Remark:       u.Remark,
-		HasPassword:  u.PasswordHash != "",
-		KeyCount:     keyCount,
-		CreatedAt:    u.CreatedAt,
-		LastLoginAt:  u.LastLoginAt,
-		IsSelf:       u.ID == selfID,
+		// 余数同样是「直接取、不手写换算」：手写 DTO 的好处正在这里，
+		// 漏填只会安静地少一个键，而单位换算写错则是**数字错**。
+		BalanceRemainder: u.BalanceRemainder,
+		AuthVersion:      u.AuthVersion,
+		Remark:           u.Remark,
+		HasPassword:      u.PasswordHash != "",
+		KeyCount:         keyCount,
+		CreatedAt:        u.CreatedAt,
+		LastLoginAt:      u.LastLoginAt,
+		IsSelf:           u.ID == selfID,
 	}
 }
 
@@ -523,6 +568,9 @@ type adjustBalanceRequest struct {
 	// 用指针区分「没传」与「传 0」：传 0 是合法的「调平」动作，不传则是
 	// 请求畸形，两者的处置完全不同（后者要 400，不能静默当成「调平」）。
 	DeltaCents *int64 `json:"delta_cents"`
+	// Remark 是可选备注（充值原因 / 工单号），写进充值流水供事后追溯。
+	// 不参与任何计算，纯留痕。
+	Remark string `json:"remark"`
 }
 
 // AdjustBalance 管理员给某用户充值/扣减余额。
@@ -547,7 +595,33 @@ type adjustBalanceRequest struct {
 // 余额变更**不**需要重建快照：预检与扣费都直接读库（store.BalanceOf），
 // 不用快照。加了重建只会白白多一次全量 RebuildFromDB。
 func (h *UserHandler) AdjustBalance(w http.ResponseWriter, r *http.Request, id string) {
-	if _, ok := requireAdmin(w, r); !ok {
+	self, ok := requireAdmin(w, r)
+	if !ok {
+		return
+	}
+	// 管理员**不能给自己充值**（2026-10-11）。
+	//
+	// 管理员账户不再有余额语义：它不建 key、不调 API（见 main.go 的数据面
+	// 拦截与 key_handler.Create），于是「给自己充钱」这件事在产品上没有任何
+	// 用途 —— 充进去的钱既不会被扣，也没有界面会把它花掉。
+	//
+	// 但**必须在这里挡**，不能只靠前端不显示这个选项：
+	//  ① `requireAdmin` 已经返回了当前管理员，self 就在手边，判定是免费的；
+	//  ② 这是**权限边界**而不是界面偏好 —— 前端隐藏按钮对 curl / SDK / 旧版
+	//     前端一律无效，而 PUT /users/{id}/balance 是公开的管理端点，
+	//     一个管理员 id 完全可以自己构造出来；
+	//  ③ 更实质的理由：一旦 admin 有了余额，它就会出现在「用户」列表里 ——
+	//     那张表对所有管理员可见，于是界面上出现「给自己充值」这一格，
+	//     而那笔账没有任何对应消费，是一笔纯噪声流水。
+	//
+	// 比较用的是 **id** 而不是用户名：同名账号不可能并存（users 表
+	// username 是 COLLATE NOCASE UNIQUE），但 id 比较不依赖任何字符串口径。
+	//
+	// 空 id 的引导态合成 user（requireAdmin 对它直接放行，见其注释）
+	// 同样被这条拦下：它没有真实身份，本来也不该有余额。
+	if id == "" || self.ID == id {
+		writeError(w, http.StatusBadRequest,
+			"管理员账户不能充值：管理员不参与计费，请为普通用户账户充值")
 		return
 	}
 	var req adjustBalanceRequest
@@ -588,7 +662,18 @@ func (h *UserHandler) AdjustBalance(w http.ResponseWriter, r *http.Request, id s
 		return
 	}
 
-	if err := h.store.AdjustBalance(r.Context(), id, delta); err != nil {
+	// 改余额**并记一条充值流水**。
+	//
+	// 用 AdjustBalanceWithLedger 而不是老的 AdjustBalance：后者只改余额、
+	// 不留任何痕迹，于是「谁给谁充了多少钱」事后无从查起（audit_log 只存
+	// 字段名不存值，说不出金额）。
+	//
+	// 操作者取 self（requireAdmin 的返回值，就是当前会话身份）。余额是钱，
+	// 「谁给的」必须能追溯到具体账号。流水写失败时本方法**仍返回成功**
+	// （余额确实已改，报错会诱导管理员重复充值 —— 那才是真的多充钱），
+	// 失败已由 store 层记 ERROR，见 AdjustBalanceWithLedger 的注释。
+	if _, err := h.store.AdjustBalanceWithLedger(r.Context(), id, delta,
+		self.ID, self.Username, req.Remark); err != nil {
 		writeNotFoundOrError(w, "adjust balance", "用户不存在", err)
 		return
 	}
@@ -606,7 +691,8 @@ func (h *UserHandler) AdjustBalance(w http.ResponseWriter, r *http.Request, id s
 		return
 	}
 	keys, _ := h.store.ListAccessKeysByUser(r.Context(), id)
-	self := server.UserFromContext(r.Context())
+	// 复用开头 requireAdmin 返回的 self，不再从 context 里取第二次 ——
+	// requireAdmin 读的就是同一个 context.UserFromContext，两处必然相等。
 	resp := toUserResponse(u, selfIDOf(self), len(keys))
 	// **以回读的值为准**，不用 UpdateUser 之前那次读到的 u.BalanceCents：
 	// 充值动作本身（AdjustBalance）可能已把一个 NULL（不限额）切成有限额，
@@ -625,6 +711,118 @@ func (h *UserHandler) AdjustBalance(w http.ResponseWriter, r *http.Request, id s
 // 因为它只用于「余额不足 500.00 元」这类说明，不参与对账）。
 func formatCents(cents int64) string {
 	return strconv.FormatInt(cents/100, 10) + "." + fmt.Sprintf("%02d", cents%100)
+}
+
+// ---- 充值流水查询 ----
+
+// 充值流水的分页口径：默认 50，上限 200。
+//
+// 默认值与前端 Wallet.vue 的 api.topups() 默认值一致（limit=50）。
+// 上限比用量的 1000 小：充值记录是**低频**事件（一个月可能只有几笔），
+// 上限开太大只是给了一个可被用来物化整表的入口。
+const (
+	defaultTopupLimit = 50
+	maxTopupLimit     = 200
+)
+
+// topupRecordOut 是单条充值流水的对外形状。
+//
+// 相对 store.Topup 只多一个 username：被充值用户的**用户名**。
+// 管理员看这一页时问的是「我给谁充了钱」，让他拿 user_id 去用户表里比对
+// 是这一页独有的额外一步 —— 而这一页恰好是唯一会出现别人账号的地方。
+// 用户名在写流水那一刻固化（与 operator_username 同一理由：账号可能被改名
+// 或删除，流水不该因主体消失而失去可读性）。
+type topupRecordOut struct {
+	store.Topup
+	Username string `json:"username"`
+}
+
+// ListTopups 查询充值流水（**唯一一个**查询端点）。
+//
+// # 作用域由会话身份决定，不接受请求参数指定查谁
+//
+//   - 普通用户 → 只能看到自己的（自己没流水就返回空数组）；
+//   - 管理员   → 看**全站**（2026-10-10 改）。
+//
+// 管理员看全站是需求决定的：他的钱包页要回答「我给所有用户充过多少钱」，
+// 而他**不能被充值**（自充值被本 handler 拒绝），所以「按 me.ID 查」得到
+// 的一定是空列表 —— 那个视图恒为空，需求就落不了地。
+//
+// 为什么不读 ?user_id=：那等于任何普通用户传个别人的 id 就能看别人的钱。
+// 作用域只能由**服务端**根据会话身份判定（与 usage_handler.callerScope 同一原则）。
+//
+// 判空身份时返回 401 而不是空数组：拿不到身份却返回「空列表」会被前端
+// 渲染成「你没有充值记录」，把一次鉴权故障伪装成正常状态。引导态合成 user
+// （ID 为空）同理 —— 它没有真实身份，它的「充值记录」无从谈起。
+func (h *UserHandler) ListTopups(w http.ResponseWriter, r *http.Request) {
+	me := server.UserFromContext(r.Context())
+	if me == nil || me.ID == "" {
+		writeError(w, http.StatusUnauthorized, "需要登录")
+		return
+	}
+	q := r.URL.Query()
+	limit := clampLimit(q.Get("limit"), defaultTopupLimit, maxTopupLimit)
+	// offset 也要钳制：负数在 SQLite 的 LIMIT/OFFSET 里语义不友好，
+	// 显式归零更稳（clampLimit 对 <=0 一律回落默认值 0）。
+	offset := clampLimit(q.Get("offset"), 0, 1<<31)
+
+	ctx := r.Context()
+	adminScope := me.IsAdmin()
+
+	var list []store.Topup
+	var total int64
+	var err error
+	if adminScope {
+		list, err = h.store.ListAllTopups(ctx, limit, offset)
+		if err == nil {
+			total, err = h.store.CountAllTopups(ctx)
+		}
+	} else {
+		list, err = h.store.ListTopupsByUser(ctx, me.ID, limit, offset)
+		if err == nil {
+			total, err = h.store.CountTopupsByUser(ctx, me.ID)
+		}
+	}
+	if err != nil {
+		writeServerError(w, "list topups", err)
+		return
+	}
+
+	// 补上被充值者的用户名。管理员视图是**跨用户**的，所以用户名必须
+	// 逐条查；普通用户视图恒为本人，一次就够。
+	//
+	// 为什么不一次性 JOIN users：见 CountGroupMembers 的注释 —— 全表读会把
+	// 所有用户的密码哈希扫进内存，那是一个展示字段不该付出的代价。
+	// 这里只读**当页这 limit 条**涉及的少数用户，且带缓存，避免翻页时
+	// 同一页里重复查同一个用户。
+	//
+	// 查询失败不阻断：拿不到用户名就退化成显示 id，列表仍然可读 ——
+	// 一个辅助字段缺失不该让整页查不出来。
+	nameCache := map[string]string{}
+	nameOf := func(id string) string {
+		if n, ok := nameCache[id]; ok {
+			return n
+		}
+		n := id
+		if u, gerr := h.store.GetUser(ctx, id); gerr == nil && u != nil && u.Username != "" {
+			n = u.Username
+		}
+		nameCache[id] = n
+		return n
+	}
+	if !adminScope {
+		nameCache[me.ID] = nameOf(me.ID)
+	}
+
+	out := make([]topupRecordOut, 0, len(list))
+	for _, tp := range list {
+		out = append(out, topupRecordOut{Topup: tp, Username: nameOf(tp.UserID)})
+	}
+
+	writeJSON(w, http.StatusOK, map[string]any{
+		"records": out,
+		"total":   total,
+	})
 }
 
 // ---- 自助改密 ----
@@ -667,6 +865,20 @@ func (h *UserHandler) ChangePassword(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusTooManyRequests, "原密码尝试过于频繁，请稍后再试")
 		return
 	}
+	// 必须与 Allow 配对（2026-10-10 修复的 P1）：Allow 占用的并发额度
+	// 只有 Fail 与 Release 会归还，而 Success **刻意不动** inflight
+	// （它要保留条目给仍在跑的并发请求）。所以缺了这一行，每成功校验一次
+	// 旧密码就永久漏掉一个额度。
+	//
+	// 最容易触发的方式甚至不需要改密成功：旧密码校验通过 → Success →
+	// 新密码太弱 → HashPassword 报错 → 400 返回，额度已经漏了。四次之后
+	// inflight 触顶，该账号**永久**无法改密，报的却是「原密码尝试过于频繁」
+	// —— 没有一次失败尝试发生过，这句提示纯属误导。
+	//
+	// 而限速按用户 ID 归键，这口「漏」跨登出、重登、乃至改密本身递增的
+	// auth_version 都不会自愈（sweepLocked 也不回收：它只在条目数超阈值时
+	// 清理，且这里 until 为零值）。
+	defer thr.Release(u.ID)
 
 	if !userauth.VerifyPassword(u.PasswordHash, req.OldPassword) {
 		thr.Fail(u.ID)

@@ -624,6 +624,16 @@ func (h *KeyHandler) Update(w http.ResponseWriter, r *http.Request, id string) {
 	// 只能管理员改归属 —— 与 Create 同一口径；普通用户即使传了也忽略。
 	// 落库走独立的 ReassignAccessKey：UpdateAccessKey 刻意不写 user_id
 	// （归属不该由一个 PATCH 随手改写）。
+	//
+	// # 不能认领给管理员（2026-10-10）
+	//
+	// 管理员已彻底退出数据面：internal/auth 的 Authenticate 会拒绝任何
+	// 归属管理员的 key（403 admin_cannot_call_model）。所以把 key 认领给
+	// 管理员 = 造出一把**永远用不了**的死物，且症状与「key 坏了」完全一样，
+	// 排查时会被带偏（管理员会以为是自己配置错了）。
+	//
+	// 拦在这里而不是只在前端藏下拉：前端过滤是**体验**，这里是**正确性**。
+	// 绕过界面直接 curl 就能造出死 key。
 	claimTo := ""
 	claim := false
 	if req.UserID != nil {
@@ -639,6 +649,13 @@ func (h *KeyHandler) Update(w http.ResponseWriter, r *http.Request, id string) {
 				if target == nil {
 					// 与 Create 同理：指向不存在的用户 = 一把永远用不了的死物。
 					writeError(w, http.StatusBadRequest, "user_id 指向的用户不存在")
+					return
+				}
+				if target.IsAdmin() {
+					// 明确说清「为什么不行」，而不是回一句含糊的 400 ——
+					// 管理员会问「那怎么给运维发 key」，答案是建一个普通用户。
+					writeError(w, http.StatusBadRequest,
+						"密钥不能归属管理员：管理员账号不参与 API 调用，请把 key 认领给一个普通用户")
 					return
 				}
 			}

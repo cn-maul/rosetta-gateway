@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/cn-maul/rosetta-gateway/internal/config"
@@ -86,6 +87,80 @@ func TestKeyHandler_ClaimOwnerOnPatch(t *testing.T) {
 		bytes.NewBufferString(`{"user_id":"does-not-exist"}`))), created.ID)
 	if rec3.Code != http.StatusBadRequest {
 		t.Fatalf("认领到不存在的用户应 400，实际 %d body=%s", rec3.Code, rec3.Body.String())
+	}
+}
+
+// 2026-10-10：key **不能认领给管理员**。
+//
+// 管理员已彻底退出数据面（internal/auth 的 Authenticate 拒绝归属管理员的
+// key）。所以认领给管理员 = 造出一把永远用不了的死物，症状与「key 坏了」
+// 一模一样，排查会被带偏。
+//
+// 与上面「指向不存在的用户」是同一类防护，但**原因不同**且更需要说清：
+// 那个用户是拼错了，这个用户真实存在、只是不能当 key 的归属。所以错误
+// 消息必须点明「为什么不行」并给出正确出路，而不是含糊的 400。
+func TestKeyHandler_CannotClaimToAdmin(t *testing.T) {
+	st := newTestStore(t)
+	h := NewKeyHandler(st)
+	ctx := t.Context()
+
+	for _, u := range []struct{ id, name, role string }{
+		{"u-owner", "owner", store.RoleUser},
+		{"u-admin", "root", store.RoleAdmin},
+	} {
+		if err := st.CreateUser(ctx, &store.User{
+			ID: u.id, Username: u.name, PasswordHash: "x",
+			Role: u.role, Status: store.UserStatusActive, AuthVersion: 1,
+		}); err != nil {
+			t.Fatalf("seed %s: %v", u.id, err)
+		}
+	}
+
+	rec := httptest.NewRecorder()
+	h.Create(rec, asUser(jsonRequest(http.MethodPost, "/admin/api/keys",
+		bytes.NewBufferString(`{"name":"k"}`)), "u-owner"))
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("create code=%d body=%s", rec.Code, rec.Body.String())
+	}
+	var created keyCreateResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &created); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+
+	// 认领给管理员 → 400，且**归属不得改变**（不能出现「先改了一半再报错」）。
+	rec2 := httptest.NewRecorder()
+	h.Update(rec2, asAdmin(jsonRequest(http.MethodPatch, "/admin/api/keys/"+created.ID,
+		bytes.NewBufferString(`{"user_id":"u-admin"}`))), created.ID)
+	if rec2.Code != http.StatusBadRequest {
+		t.Fatalf("认领给管理员应 400，实际 %d body=%s", rec2.Code, rec2.Body.String())
+	}
+	if !strings.Contains(rec2.Body.String(), "普通用户") {
+		t.Errorf("错误消息应指出正确出路（建普通用户），实际：%s", rec2.Body.String())
+	}
+	dbKey, _ := st.GetAccessKey(ctx, created.ID)
+	if dbKey == nil || dbKey.UserID != "u-owner" {
+		t.Fatalf("被拒的认领却改了归属：%+v", dbKey)
+	}
+
+	// 反向：认领给**普通**用户仍然允许（别把这个功能整体关掉）。
+	if err := st.CreateUser(ctx, &store.User{
+		ID: "u-normal", Username: "normal", PasswordHash: "x",
+		Role: store.RoleUser, Status: store.UserStatusActive, AuthVersion: 1,
+	}); err != nil {
+		t.Fatalf("seed normal: %v", err)
+	}
+	rec3 := httptest.NewRecorder()
+	h.Update(rec3, asAdmin(jsonRequest(http.MethodPatch, "/admin/api/keys/"+created.ID,
+		bytes.NewBufferString(`{"user_id":"u-normal"}`))), created.ID)
+	if rec3.Code != http.StatusOK {
+		t.Fatalf("认领给普通用户应 200，实际 %d body=%s", rec3.Code, rec3.Body.String())
+	}
+	var upd keyResponse
+	if err := json.Unmarshal(rec3.Body.Bytes(), &upd); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if upd.UserID != "u-normal" {
+		t.Fatalf("认领给普通用户未生效：user_id=%q", upd.UserID)
 	}
 }
 
