@@ -107,6 +107,31 @@ export interface UpstreamModel {
   // 也没有 default_extra_json：存了但没有任何地方拿它构造请求，已随列一并摘除。
 }
 
+/**
+ * 单模型可用性探测的结果。
+ *
+ * 注意 `status` 与 HTTP 状态码是两件事：探测失败（凭据错、模型下架、无权限、
+ * 上游 5xx）时 HTTP 仍是 200 —— 那是**探测的结论**，不是管理接口调用失败。
+ * 只有「id 不存在」才是 404。前端因此必须看 status 而不是 res.ok。
+ */
+export interface ModelTestResult {
+  status: 'ok' | 'error'
+  /** 被探测的上游模型名，原样回显（用于把结果与行对上）。 */
+  model_id: string
+  provider_id: string
+  message: string
+  /** 端到端往返耗时（毫秒），含上游生成 1 个 token 的时间。 */
+  latency_ms: number
+  /** 上游回报的真实用量。探测会真实计费，带出来让成本可见。 */
+  input_tokens?: number
+  output_tokens?: number
+  /**
+   * 上游用 HTTP 200 + 错误体回绝（部分中转网关如此）。
+   * 为真时需向用户说明「HTTP 成功却报错」，否则看起来像网关自己坏了。
+   */
+  in_band?: boolean
+}
+
 export interface Route {
   id: string
   public_name: string
@@ -240,6 +265,15 @@ export interface Me {
    */
   balance_cents: number
   balance_unlimited: boolean
+  /**
+   * 不足一分的待结算余数（微元，1e-6 元）。
+   *
+   * 余额按**分**扣减，而单价可能远低于一分（实测 3 元/百万 token 时，
+   * 一次一万 token 的调用只有 5 厘），于是余额会长时间不动。
+   * 界面上必须把它显示出来，否则「余额没变」会被读成「没扣钱」——
+   * 实际上钱已消费，只是还没攒够一分。
+   */
+  balance_remainder: number
   must_set_password: boolean
   is_admin: boolean
   session_enabled: boolean
@@ -272,6 +306,8 @@ export interface User {
    */
   balance_cents: number
   balance_unlimited: boolean
+  /** 不足一分的待结算余数（微元）。语义见 Me.balance_remainder。 */
+  balance_remainder: number
   auth_version: number
   remark?: string
   has_password: boolean
@@ -279,6 +315,57 @@ export interface User {
   created_at: number
   last_login_at: number
   is_self: boolean
+}
+
+// ---- 充值流水（balance_topups）----
+//
+// 对应 GET /admin/api/topups。字段名与 internal/store/topup_dao.go 里
+// store.Topup 的 json tag **逐字对齐**（2026-10-11 已核对实际实现），
+// 外加端点补的 username（被充值者的用户名）。
+//
+// ⚠️ **作用域口径待 Lead 决策**（详见 AUDIT/task-admin-wallet.md）：
+// 服务端 ListTopups 当前对**管理员也**按自己的 id 收窄 —— 而管理员不能被
+// 充值（AdjustBalance 已拦下），所以管理员调用它恒返回空列表。
+// 用户需求是「管理员看到所有用户的充值流水」，两者相反。
+// 扩作用域是服务端改动，本任务不自行修改；接口**形状**已按实际实现锁定，
+// 因此联调没有阻塞，只有「管理员看得到几张行」这一个待决问题。
+export interface TopupRecord {
+  id: string
+  /** 被充值的用户（不是操作者）。 */
+  user_id: string
+  /** 被充值用户的用户名，由端点补上。 */
+  username: string
+  /**
+   * 本次增减额（分）。正数 = 充值，负数 = 扣减。
+   *
+   * 刻意存相对量而不是「调整前/后两个绝对值」：余额是相对变动，流水要回答
+   * 的是「发生了什么变化」。逐笔核对应以 delta_cents 求和，而不是逐行比
+   * balance_after —— 并发充值下后者不保证首尾相接（见 store.Topup 的注释）。
+   */
+  delta_cents: number
+  /** 本次调整**之后**的余额（分），由 UPDATE ... RETURNING 回读的权威值。 */
+  balance_after: number
+  /**
+   * 本次是否把一个**不限额**用户切成了有限额。
+   *
+   * 不显示它的话，「+100 元」会被读成普通的加钱，而它实际可能是一次
+   * 额度降级（不限 → 100 元），那对用户是实打实的限制收紧。
+   */
+  was_unlimited: boolean
+  /** 操作者（管理员）的 id 与用户名。 */
+  operator_id: string
+  operator_username: string
+  /** 毫秒时间戳。 */
+  ts: number
+  /** 管理员可选备注（充值原因、工单号…）。可空。 */
+  remark?: string
+}
+
+/** GET /admin/api/topups 的响应（分页）。 */
+export interface TopupPage {
+  records: TopupRecord[]
+  /** 过滤后的总条数（不受 limit 影响），供「共 N 条」显示。 */
+  total: number
 }
 
 // ---- 分组与模型白名单（P1，对应 internal/admin/group_handler.go）----
@@ -343,7 +430,22 @@ export interface Stats {
   avg_ttfb_ms: number
   // 费用（元）：每条用量落库**当时**按模型单价算好并固化的金额求和
   // （usage_records.cost_total）。改价只影响此后的记录，不回溯历史。
+  //
+  // 普通用户拿到的是**自己**的合计（2026-10-10 起）—— 此前服务端对普通用户
+  // 强制归零，依据是「网关不做计费结算」，但余额计费落地后该前提已不成立。
   cost: number
+  /**
+   * 当前登录者的账户余额（分）与待结算余数（微元），随 stats 一并下发。
+   *
+   * 放在 stats 而不是让前端再调 /me：总览本来就在拉 stats，省一次请求；
+   * 且余额与费用是同一件事的两面，放一张卡片里才读得通。
+   *
+   * 语义与 Me 的同名字段逐字相同：`balance_unlimited = true` 才是不限额，
+   // `0 分`是「真没钱」。
+   */
+  balance_cents: number
+  balance_remainder: number
+  balance_unlimited: boolean
   // lifetime 为**终身累计**（表 B usage_totals）。仅管理员、且仅当请求带了
   // include_lifetime=true 时出现 —— 缺席 = 这次没要终身数据。
   // 普通用户拿不到：表 B 是不分用户的全局单行，给了就是别人的数字。
@@ -368,6 +470,67 @@ export interface UsageGroupEntry {
   name?: string // by-key：密钥名称（缺失时前端回退显示 key）
 }
 
+/**
+ * GET /admin/api/usage/by-user 的一行：**一个用户**的消费汇总。
+ *
+ * 存在的理由：钱包页要「消费汇总一表一行一个用户」。现有的 by-* 端点
+ * （by-key / by-model / by-provider / by-day）都没有用户这一维 ——
+ * 它们的分组键分别是密钥、模型、供应商、日期。
+ *
+ * 与 UsageGroupEntry 是两个类型而不是给那个加可选字段：那一行的 name 是
+ * 「密钥名」，这一行的 user_name 是「用户名」，且这一行必须带 cost。
+ * 合并成一个类型的话，by-key 端点就会下发一个恒为 0 的 cost ——
+ * 一个字段在某个端点上恒为 0，读代码的人无法分辨「没有这个字段」与
+ * 「有但还没算完」。
+ */
+export interface UsageByUserEntry {
+  /**
+   * usage_records.user_id —— **冗余固化**的归属（多用户改造 P0）。
+   *
+   * 空串 = **无归属**：迁移前的无主 key 产生的历史用量。它不是一个具体
+   * 用户，界面上必须显示成「无归属」而不是留白。
+   */
+  key: string
+  /**
+   * 用户名（JOIN users 得到）。**空串有两种含义，靠 key 区分**：
+   *   - key 非空而 user_name 空 → 该用户**已被删除**（用量是历史事实，行仍在）；
+   *   - key 本身为空            → 无归属用量。
+   * 第一种情况前端必须回退显示 key —— 留白会被读成「无归属」，而
+   * 「用户已删除」与「无归属」是两件不同的事。
+   */
+  user_name: string
+  /**
+   * 用户角色（admin / user）；用户已删除时为空。
+   *
+   * 管理员**不该**出现在这张表里（后端已拦下管理员调用模型），但升级前
+   * 可能有他的历史用量。那一行是真实发生过的消费，不能静默过滤掉
+   * （过滤会让本表合计小于全站合计 = 对不上账），所以照实显示并**加标记**。
+   */
+  role: string
+  /** 请求次数。归档行的 request_count 已聚合，故是 SUM 而非行数。 */
+  count: number
+  /** total_tokens 之和。 */
+  tokens: number
+  /** 该用户固化的消费合计（**元**）。这是这张表的主角。 */
+  cost: number
+}
+
+/**
+ * GET /admin/api/usage/by-user 的响应：当页行 + **有消费的用户总数**。
+ *
+ * 为什么这一个 by-* 端点返回对象而它的三个兄弟返回裸数组：那些由总览页调用、
+ * 固定 limit=10 画「Top 10」条形图，截断是**既定语义**；而这张表是按金额
+ * 读账的，一旦用户数超过 limit，被截断的表与完整的表在界面上完全同形 ——
+ * 把「前 N 名」读成「全部用户」会直接得出错误结论。所以必须能把
+ * 「显示前 N / 共 M」说出来。与 CSV 导出的 X-Export-Truncated 同一个原则：
+ * **截断必须可见**。
+ */
+export interface UsageByUserPage {
+  records: UsageByUserEntry[]
+  /** 有消费的用户总数（去重），**不受 limit 影响**。 */
+  total: number
+}
+
 // 调用历史（/usage/history）的一行：一次真实请求
 export interface UsageHistoryEntry {
   ts: number // 毫秒时间戳
@@ -376,9 +539,46 @@ export interface UsageHistoryEntry {
   key_name: string // 调用密钥名称（密钥删除后为空）
   key_id: string // 调用密钥 id（回退显示用）
   total_tokens: number
+  /**
+   * 本次**生成**出来的 token 数（后端 usage_records.output_tokens）。
+   *
+   * 与 total_tokens 的区别是本列的关键：total_tokens = 输入 + 输出，而输入
+   * 是请求侧送进去的、不是模型吐出来的。用总量算速度会把速度虚高好几倍
+   * （1 万输入 / 2 百输出时，用总量算出来是真实生成速度的 50 倍）。
+   */
+  output_tokens: number
+  /**
+   * 本次请求的平均输出速度（token/s），**由后端算好下发**。
+   *
+   * 为什么不让前端拿 output_tokens / (latency_ms/1000) 现算：公式必须与
+   * 总览页「平均速度」逐字一致（后端 store.GetRecentThroughput 的
+   * `SUM(output_tokens) * 1000.0 / NULLIF(SUM(latency_ms), 0)`），
+   * 前端再写一遍就等于同一公式存在两个实现，改一处忘一处时两个页面会
+   * 静默分叉 —— 而对不上时没人知道该信哪个。除零边界同理，只留在后端一处。
+   *
+   * **0 = 没有可算的样本**（output_tokens=0 的上游未报 usage / 非流式短请求，
+   * 或 latency_ms=0 的错误请求），不是「速度为零」。所以渲染时必须显示 '—'
+   * 而不是 '0.0' —— 后者会被读成「这次生成极慢」。
+   */
+  tps: number
   ttfb_ms: number // 首字节时间（毫秒）
   latency_ms: number // 总耗时（毫秒）
   status: string // 'ok' 或错误码
+  /**
+   * 是否为流式调用。
+   *
+   * 必须标注的原因：流式与非流式的 ttfb 含义完全不同 —— 非流式的首字时间
+   * 大致等于总耗时（响应一次性回来），流式才是「多久出第一个字」。混在一列
+   * 不标注，运维无法判断「首字 15 秒」是模型慢还是压根没用流式。
+   */
+  stream: boolean
+  /**
+   * 该条用量的固化费用（元），落库当时按当时单价算好并固化。
+   *
+   * 与账单、报表同源；改价不回溯历史。单次可能远低于一分（单价低时），
+   * 显示出来才能解释「报表在涨、余额按分扣减却不动」。
+   */
+  cost: number
 }
 
 // 调用历史的分页结果：当页明细 + 过滤后的总条数（用于计算总页数）

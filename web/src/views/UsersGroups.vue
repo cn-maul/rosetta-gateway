@@ -1,31 +1,69 @@
 <script setup lang="ts">
 /**
- * 用户管理（仅管理员可见）。
+ * 用户与分组（仅管理员可见）。
  *
- * 三条不能错的规则，都由后端强制、这里只是配合呈现：
- *   1. 管理员**不能对自己**降权/禁用/删除（会把自己锁在门外）。
- *      后端回 400，界面因此把按钮置灰并给提示 —— 但真正的拦截在后端。
- *   2. 禁用 / 改角色会让该用户的**所有会话立即失效**（auth_version 递增），
- *      所以这两个操作要提示管理员这一点。
- *   3. 密码**不设默认值**。建号时密码可留空，账号需自行设置或由管理员重置。
- *      留空账号无法登录（后端明确拒绝），这是刻意的。
+ * # 为什么合并成一个页面（2026-10-10）
  *
- * 列表刻意做成**只读**的：分组、角色、显示名、额度这些字段一律走「编辑」弹窗，
- * 行内不再挂下拉，连角色切换也不给按钮 —— 升级/降级都会让该用户所有会话立即失效，
- * 属于要看着后果再点确认的动作，不该由表格里的一次单击顺手完成。
- * 表格因此只留四个操作：编辑、重置密码、禁用/启用、删除。
+ * 分组不是独立实体，而是**用户的属性**（users.group_id）。拆成两页会让人
+ * 在「这个人在哪个组」与「这个组有哪些人」之间来回跳：给一个新人定分组，
+ * 要先记住组名 → 去分组页确认 → 回用户页填 → 再回去核对成员数。
+ * 页内两个页签解决，且**数据一次取完**（两边本来就互相引用，分开时每页
+ * 各拉一次同样的 groups）。
+ *
+ * # 用户侧三条不能错的规则（都由后端强制，这里只是配合呈现）
+ *
+ * 1. 管理员**不能对自己**降权/禁用/删除（会把自己锁在门外）。
+ *    后端回 400，界面因此把按钮置灰并给提示 —— 但真正的拦截在后端。
+ * 2. 禁用 / 改角色会让该用户的**所有会话立即失效**（auth_version 递增），
+ *    所以这两个操作要提示管理员这一点。
+ * 3. 密码**不设默认值**。建号时密码可留空，账号需自行设置或由管理员重置。
+ *    留空账号无法登录（后端明确拒绝），这是刻意的。
+ *
+ * 用户列表刻意做成**只读**的：分组、角色、显示名、额度这些字段一律走
+ * 「编辑」弹窗，行内不再挂下拉，连角色切换也不给按钮 —— 升级/降级都会让
+ * 该用户所有会话立即失效，属于要看着后果再点确认的动作。
+ *
+ * # 分组侧两条最容易踩错的产品语义
+ *
+ * 1. **空白名单 = 不限制**，不是「什么都看不到」。新建的组默认就是空的，
+ *    所以「建了组但没配模型」= 权限比不分组还宽。
+ * 2. **组里还有人、还有密钥时不能删**（后端 409）。删掉会让那批账号与密钥
+ *    从「受限」变成「不受限」—— 一次删除操作等于给一组人**扩权**，而且是
+ *    静默的：账号还在、密钥还能用，只是模型白名单凭空消失了。
+ *    所以两类绑定都在界面上分别显示数量，且任一 count > 0 时**不给删除入口**：
+ *    后端一定会拒绝，让管理员先按一次确认、再收到一句 409，等于把
+ *    「我早就知道会失败」包装成一次操作。
+ *
+ * # 白名单是精确匹配
+ *
+ * 模型清单直接从 /admin/api/model-names 取（与后端校验同源），不给自由
+ * 输入框 —— 拼错一个字符的结果是「这个模型谁都看不到」而界面上毫无异常。
  */
 import { computed, onMounted, ref } from 'vue'
 import { api, ApiFail } from '../api'
 import type { Group, User, UserRole, UserStatus } from '../types'
-import { fmtTokens, fmtDateTime, fmtBalance } from '../fmt'
+import { fmtTokens, fmtDateTime, fmtBalance, fmtRemainder } from '../fmt'
 import { toast, confirmBox } from '../ui'
 import { checkPasswordStrength } from '../password'
 import AppModal from '../components/AppModal.vue'
+import ModelPicker from '../components/ModelPicker.vue'
+
+/** 页签。顺序按「先看人、再看规则」—— 定分组的前提是知道要给谁定。 */
+const TABS = [
+  { key: 'users', label: '用户' },
+  { key: 'groups', label: '分组' },
+] as const
+type TabKey = (typeof TABS)[number]['key']
+const tab = ref<TabKey>('users')
 
 const users = ref<User[]>([])
 /** 分组清单，用于把 group_id 渲染成名字、以及在表单里选择。 */
 const groups = ref<Group[]>([])
+/** 可选模型名，来自 /admin/api/model-names —— 与后端白名单校验**同一个数据源**。
+ *
+ *  刻意不用 /admin/api/routes：那是另一个来源，两处一旦漂移就会出现
+ *  「界面能勾、但保存时被后端拒」的错位。 */
+const modelOptions = ref<string[]>([])
 const loading = ref(false)
 const err = ref('')
 
@@ -52,24 +90,31 @@ const eRemark = ref('')
 const eErr = ref('')
 const eBusy = ref(false)
 
-// ---- 余额充值弹窗 ----
+// 余额充值弹窗的状态与逻辑（balFor / balAmount / balErr / balBusy /
+// openBalance / yuanToCents / submitBalance）已于 2026-10-11 随入口一起
+// 移到「钱包与充值」页的管理员形态（web/src/views/Wallet.vue）。
 //
-// 独立于「编辑用户」弹窗：余额是**高频**操作（充值与改角色/分组完全不是一类
-// 动作），混进编辑弹窗会让每次改备注都要面对一屏无关字段，且两者共用一个
-// 保存按钮时，误触的代价从「改个备注」升级成「动钱」。
-const balFor = ref<User | null>(null)
-/** 输入的是**元**（浮点），提交前换算成分。整数分才是账目单位。 */
-const balAmount = ref<string>('')
-const balErr = ref('')
-const balBusy = ref(false)
+// 整块删掉而不是留成不可达代码：本文件里它们唯一的调用点就是那一行的
+// 「充值」按钮与它自己的 AppModal，按钮一删就全是死代码 —— 而死代码会让
+// 下一个改这一页的人以为「本页也能充值」，重新接回一个已被产品取消的入口。
+//
+// **没有**一起删的：pending / isPending / setPending。那三个是**共用**的防连点
+// 机制，禁用（toggleStatus）与删除（askDelete）都还在用（见各自调用点）。
+// 只删充值专属状态，共享机制原样保留 —— 拆掉共享部分会让剩下两个写操作
+// 失去连点保护。
 
 async function load() {
   loading.value = true
   err.value = ''
   try {
-    const [u, g] = await Promise.all([api.users(), api.groups()])
+    // 三份数据一次取完：用户与分组互相引用（用户的 group_name、分组的
+    // member_count 都来自对方），分开请求会让「改了谁的分组」之后两个表
+    // 的新鲜度对不上 —— 而 member_count 是**服务端算好的字段**，
+    // 不重新拉分组表就还是旧数字。
+    const [u, g, names] = await Promise.all([api.users(), api.groups(), api.modelNames()])
     users.value = u
     groups.value = g
+    modelOptions.value = names.models
   } catch (e) {
     if (e instanceof ApiFail && e.status === 401) return
     err.value = e instanceof Error ? e.message : String(e)
@@ -332,83 +377,203 @@ function openReset(u: User) {
 }
 
 // ---- 余额充值 ----
-
-function openBalance(u: User) {
-  balErr.value = ''
-  balAmount.value = ''
-  balFor.value = u
-}
-
-/**
- * 元 → 整数分。四舍五入，与后端 store.YuanToCents 同一口径。
- *
- * 刻意在这里换算而不是把浮点元发给后端：余额是反复累加的账目，
- * 浮点的二进制表示无法精确表达十进制小数，而「发什么」必须在**界面这一侧**
- * 就定死，否则后端换一个换算函数，同一笔充值在对账时就会差一分钱。
- */
-function yuanToCents(input: string): number | null {
-  const n = Number(input)
-  if (!Number.isFinite(n)) return null
-  return Math.round(n * 100)
-}
-
-async function submitBalance() {
-  const u = balFor.value
-  if (!u) return
-  balErr.value = ''
-  if (balBusy.value) return
-  const cents = yuanToCents(balAmount.value)
-  if (cents === null || Number.isNaN(cents)) {
-    balErr.value = '请输入一个金额'
-    return
-  }
-  if (cents === 0) {
-    // 后端也拒 0，但这里先说清：空输入框提交上来就是空串 → 0 分，
-    // 而「调平」几乎一定是手滑而不是意图。
-    balErr.value = '金额不能为 0'
-    return
-  }
-  balBusy.value = true
-  // 余额变更**也要挂 pending Map**：它是会动钱的写操作，连点两下就是双倍充值。
-  // 复用本文件已有的那一套（见上方 setPending 的说明），不另起一个标志位 ——
-  // 两个标志位各自置灰各自的按钮，却挡不住「充值点着的时候余额列表正在刷新」
-  // 这种跨按钮的竞态。
-  if (isPending(u.id)) {
-    balBusy.value = false
-    balErr.value = '该用户还有操作正在进行，请稍候'
-    return
-  }
-  setPending(u.id, '充值中…')
-  try {
-    const updated = await api.adjustUserBalance(u.id, cents)
-    const verb = cents > 0 ? '充值' : '扣减'
-    toast(`${verb}成功，当前余额 ${fmtBalance(updated.balance_cents, updated.balance_unlimited)}`, 'ok')
-    balFor.value = null
-    await load()
-  } catch (e) {
-    balErr.value = e instanceof ApiFail ? e.message : '操作失败'
-  } finally {
-    setPending(u.id, null)
-    balBusy.value = false
-  }
-}
+//
+// openBalance / yuanToCents / submitBalance 已随入口一起移到 Wallet.vue
+// （2026-10-11）。yuanToCents 那个「界面侧就把元→分定死」的理由随代码一起
+// 搬走了，Wallet.vue 里有一份逐字相同的实现 —— 两处都留一份会让「换一个换算
+// 口径」的修改只改到其中一处，于是同一笔充值在两个界面上差一分钱。
 
 onMounted(load)
+
+// ---- 分组管理（2026-10-10 从 Groups.vue 并入）----
+//
+// 状态与 Groups.vue 逐字保持一致，逻辑也照搬 —— 那边每一条都带着「为什么」
+// 的说明，合并时最忌讳的是「顺手简化」，因为那些判断依据在这个页面上
+// 依然全部成立（空白名单=不限制、有绑定不可删、白名单精确匹配）。
+
+const showForm = ref(false)
+const editingGroup = ref<Group | null>(null)
+const fName = ref('')
+const fDesc = ref('')
+const fErr = ref('')
+const fBusy = ref(false)
+
+/** 正在编辑白名单的组；null = 未打开。 */
+const modelsFor = ref<Group | null>(null)
+const picked = ref<string[]>([])
+const mErr = ref('')
+const mBusy = ref(false)
+
+/** 删除请求在飞行中。防连点：确认框结算前按钮仍可点，
+ *  连点会给同一行发两次 DELETE，第二次必然 404。 */
+const deleting = ref(false)
+
+function openCreateGroup() {
+  editingGroup.value = null
+  fName.value = ''
+  fDesc.value = ''
+  fErr.value = ''
+  showForm.value = true
+}
+
+function openEditGroup(g: Group) {
+  editingGroup.value = g
+  fName.value = g.name
+  fDesc.value = g.description
+  fErr.value = ''
+  showForm.value = true
+}
+
+async function submitGroupForm() {
+  if (fBusy.value) return
+  fErr.value = ''
+  if (!fName.value.trim()) {
+    fErr.value = '组名必填'
+    return
+  }
+  fBusy.value = true
+  try {
+    if (editingGroup.value) {
+      await api.updateGroup(editingGroup.value.id, {
+        name: fName.value.trim(),
+        description: fDesc.value.trim(),
+      })
+      toast('已保存', 'ok')
+    } else {
+      await api.createGroup({ name: fName.value.trim(), description: fDesc.value.trim() })
+      toast('已创建。注意：新组未配模型白名单，此时该组不限制模型可见范围。', 'ok')
+    }
+    showForm.value = false
+    await load()
+  } catch (e) {
+    fErr.value = e instanceof ApiFail ? e.message : '保存失败'
+  } finally {
+    fBusy.value = false
+  }
+}
+
+function openModels(g: Group) {
+  modelsFor.value = g
+  picked.value = [...g.models]
+  mErr.value = ''
+}
+
+async function submitModels() {
+  const g = modelsFor.value
+  if (!g || mBusy.value) return
+  mErr.value = ''
+  mBusy.value = true
+  try {
+    await api.setGroupModels(g.id, [...picked.value])
+    toast(picked.value.length === 0 ? '已清空白名单（该组不再限制模型）' : '白名单已保存', 'ok')
+    modelsFor.value = null
+    await load()
+  } catch (e) {
+    mErr.value = e instanceof ApiFail ? e.message : '保存失败'
+  } finally {
+    mBusy.value = false
+  }
+}
+
+/** 删除被后端拒绝的两种绑定。
+ *
+ * users.group_id 与 access_keys.group_id 都是 ON DELETE SET NULL，
+ * 两类引用**各自**都能让 DeleteGroup 回 ErrGroupNotEmpty ——
+ * 只统计账号数会漏掉「组里没人、但有一把密钥指定了分组覆盖」的情形，
+ * 那时界面显示「可删」，点下去却必然 409。 */
+function boundCounts(g: Group): { users: number; keys: number } {
+  return { users: g.member_count ?? 0, keys: g.key_count ?? 0 }
+}
+
+/** 该组现在能不能删。任一绑定 > 0 时被后端拒绝，界面因此不给入口。 */
+function canDeleteGroup(g: Group): boolean {
+  const c = boundCounts(g)
+  return c.users === 0 && c.keys === 0
+}
+
+/** 删除按钮的 title：被挡住时必须说清是**哪一类**绑定挡的、以及怎么解。
+ *
+ * 只写「不能删除」会让人去翻后端文档；而真正该做的动作取决于类型：
+ * 账号要迁走（**本页的用户页签**就能改），密钥要解除「分组覆盖」
+ * （Keys 页的那一个字段）。 */
+function deleteBlockedTitle(g: Group): string {
+  const c = boundCounts(g)
+  if (c.users > 0 && c.keys > 0) {
+    return `该组下还有 ${c.users} 个账号和 ${c.keys} 把访问密钥。请先把账号移到别的组，并解除这些密钥的分组覆盖。`
+  }
+  if (c.users > 0) {
+    return `该组下还有 ${c.users} 个账号。请先在「用户」页签把他们移到别的组或移出分组，否则删除会被后端拒绝。`
+  }
+  if (c.keys > 0) {
+    return `该组下还有 ${c.keys} 把访问密钥指定了分组覆盖。请先到「访问密钥」解除这些密钥的分组覆盖。`
+  }
+  return ''
+}
+
+async function askDeleteGroup(g: Group) {
+  // 前置拦截，而不是「先确认再等一个 409」：后端一定会拒绝，
+  // 让管理员为一个注定失败的操作多按一次确认毫无意义。
+  const c = boundCounts(g)
+  if (c.users > 0 || c.keys > 0) {
+    toast(deleteBlockedTitle(g), 'err')
+    return
+  }
+  if (deleting.value) return
+  const ok = await confirmBox({
+    title: '删除分组',
+    body: `将删除「${g.name}」及其模型白名单。当前没有账号或访问密钥绑定在该组上。`,
+    danger: true,
+    confirmLabel: '删除',
+  })
+  if (!ok) return
+  deleting.value = true
+  try {
+    await api.deleteGroup(g.id)
+    toast('已删除', 'ok')
+    await load()
+  } catch (e) {
+    // 409 的文案是后端给的（含人数、密钥数与处置办法），原样展示比
+    // 「删除失败」有用得多。走到这里只可能是并发：别人在我们这次 load()
+    // 之后刚把账号或密钥绑了进来。
+    toast(e instanceof ApiFail ? e.message : '删除失败', 'err')
+  } finally {
+    deleting.value = false
+  }
+}
 </script>
 
 <template>
   <main class="page">
     <div class="page-head">
       <div>
-        <h1>用户</h1>
-        <div class="sub">账号、配额与登录状态</div>
+        <h1>用户与分组</h1>
+        <div class="sub">账号、配额、登录状态与模型可见范围</div>
       </div>
       <div class="head-actions">
         <button class="btn" :disabled="loading" @click="load">刷新</button>
-        <button class="btn btn-primary" @click="showCreate = true">新建用户</button>
+        <button v-if="tab === 'users'" class="btn btn-primary" @click="showCreate = true">新建用户</button>
+        <button v-else class="btn btn-primary" @click="openCreateGroup">新建分组</button>
       </div>
     </div>
 
+    <!-- 页签：形态对齐 Settings.vue 的 .set-tabs（胶囊分段），
+         不新造一套控件 —— 同一个交互在同一个应用里长得不一样时，
+         用户会以为它们行为也不同。 -->
+    <div class="ug-tabs">
+      <button
+        v-for="t in TABS"
+        :key="t.key"
+        class="ug-tab"
+        :class="{ active: tab === t.key }"
+        type="button"
+        @click="tab = t.key"
+      >
+        {{ t.label }}
+      </button>
+    </div>
+
+    <!-- ============ 页签一：用户 ============ -->
+    <template v-if="tab === 'users'">
     <div class="panel">
       <div v-if="loading && users.length === 0" class="loading">加载中…</div>
       <div v-else-if="err" class="empty"><div class="big">⚠</div>{{ err }}</div>
@@ -457,6 +622,11 @@ onMounted(load)
                 <span :class="{ dim: u.balance_unlimited }">
                   {{ fmtBalance(u.balance_cents, u.balance_unlimited) }}
                 </span>
+                <!-- 待结算余数：余额按分扣减，低单价时一次调用不足一分，
+                     于是余额长时间不动。管理员不看到这个就会以为扣费坏了。 -->
+                <span v-if="fmtRemainder(u.balance_remainder ?? 0)" class="dim num-h">
+                  +{{ fmtRemainder(u.balance_remainder ?? 0) }}
+                </span>
                 <span v-if="!u.balance_unlimited && u.balance_cents === 0" class="badge badge-err">
                   已用尽
                 </span>
@@ -464,7 +634,6 @@ onMounted(load)
               <td class="c-act">
                 <div class="row-actions">
                   <button class="btn btn-sm" :disabled="isPending(u.id)" @click="openEdit(u)">编辑</button>
-                  <button class="btn btn-sm" :disabled="isPending(u.id)" @click="openBalance(u)">充值</button>
                   <button class="btn btn-sm" :disabled="isPending(u.id)" @click="openReset(u)">重置密码</button>
                   <button class="btn btn-sm" :disabled="u.is_self || isPending(u.id)" :title="u.is_self ? '不能禁用自己的账号' : '禁用后该用户的所有登录状态立即失效'" @click="toggleStatus(u)">
                     {{ isPending(u.id) ? '处理中…' : u.status === 'active' ? '禁用' : '启用' }}
@@ -479,6 +648,64 @@ onMounted(load)
         </table>
       </div>
     </div>
+    </template>
+
+    <!-- ============ 页签二：分组 ============ -->
+    <template v-else>
+    <div class="panel note">
+      未分组、或所在组未配白名单 → <strong>不限制</strong>模型可见范围。
+      白名单与账号自己的密钥白名单<b>取交集</b>，密钥那一层只会更紧。
+    </div>
+
+    <div class="panel">
+      <div v-if="loading && groups.length === 0" class="loading">加载中…</div>
+      <div v-else-if="err" class="empty"><div class="big">⚠</div>{{ err }}</div>
+      <div v-else-if="groups.length === 0" class="empty">
+        <div class="big">◇</div>还没有分组 —— 当前所有密钥都能看到全部模型
+      </div>
+      <div v-else class="tbl-wrap">
+        <table class="tbl">
+          <thead>
+            <tr>
+              <th>分组</th>
+              <th>说明</th>
+              <th>模型白名单</th>
+              <th class="c-act">操作</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr v-for="g in groups" :key="g.id">
+              <td>
+                <div class="cell-group">
+                  <span class="name">{{ g.name }}</span>
+                  <!-- 账号与密钥**分开显示**：两者都会阻止删除，但处置办法不同
+                       （前者要迁组 —— 就在本页「用户」页签；后者要解除「分组覆盖」），
+                       合成一个数字就没法告诉管理员该去哪改。 -->
+                  <span class="badge badge-off">{{ g.member_count }} 个账号</span>
+                  <span class="badge" :class="g.key_count > 0 ? 'badge-off' : 'badge-off dim-badge'">
+                    {{ g.key_count }} 把密钥
+                  </span>
+                  <span v-if="g.models.length === 0" class="badge badge-warn">未限制模型</span>
+                  <span v-else class="badge badge-live">{{ g.models.length }} 个模型</span>
+                </div>
+              </td>
+              <td class="dim">{{ g.description || '—' }}</td>
+              <td class="cell-models mono">
+                {{ g.models.length === 0 ? '（未配置白名单 = 不限制）' : g.models.join('、') }}
+              </td>
+              <td class="c-act">
+                <div class="row-actions">
+                  <button class="btn btn-sm" @click="openModels(g)">配置模型</button>
+                  <button class="btn btn-sm" @click="openEditGroup(g)">改名</button>
+                  <button class="btn btn-sm btn-danger" :disabled="!canDeleteGroup(g) || deleting" :title="deleteBlockedTitle(g)" @click="askDeleteGroup(g)">删除</button>
+                </div>
+              </td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+    </template>
 
     <!-- 新建用户：横版弹窗（≈16:9），字段两列排布。
          dismissable=false：表单填到一半误点遮罩就全丢，
@@ -601,37 +828,45 @@ onMounted(load)
         </div>
     </AppModal>
 
-    <!-- 充值：会动钱，所以两件事必须写在界面上而不是靠后端 400 兜底 ——
-         ①「相对调整」的语义（填 100 是充 100，不是把余额设成 100）；
-         ② 给**不限额**用户充值会把「不限」切成有限额。后者最容易被忽略：
-         管理员以为在「送钱」，实际把对方从无限额度切成了一个具体的数额。 -->
-    <AppModal :open="!!balFor" :title="balFor ? `充值 · ${balFor.username}` : '充值'" max-width="460px" :dismissable="false">
-        <div class="msub">
-          当前余额
-          <b>{{ balFor ? fmtBalance(balFor.balance_cents, balFor.balance_unlimited) : '—' }}</b>
-        </div>
+    <!-- 充值弹窗已移走（2026-10-11）：充值入口收敛到「钱包与充值」页的
+         管理员形态（web/src/views/Wallet.vue）。原先这里是每个用户行一个
+         「充值」按钮，入口散在整张表的每一行里，而这张表的主要用途是看
+         「谁是谁 / 谁归哪个组」，动钱的操作混在里面容易被误点。
 
-        <div v-if="balFor?.balance_unlimited" class="fhint warn">
-          该用户当前<strong>不限额</strong>。充值会把它切换成有限额 —— 充值后他只能使用填入的金额。
-        </div>
+         这里保留的是**余额只读展示**（上面表格里的「余额」列）—— 那是管理员
+         想知道「这个人还有多少钱」时唯一要看的数字，与充值入口在不在无关。 -->
 
-        <label class="flabel" for="ba">金额（元）</label>
-        <input id="ba" v-model="balAmount" class="input" type="number" step="0.01" placeholder="例如 100" />
-        <div class="fhint">
-          填<strong>正数</strong>充值，填<strong>负数</strong>扣减。这是**相对调整**：填 100 是「加 100 元」，
-          不是「把余额设成 100 元」—— 误操作不会清零。
+    <!-- 新建 / 改名分组：与本页另外三个弹窗同一套 AppModal；
+         表单不可点外关闭（误点遮罩会丢掉刚输入的组名）。 -->
+    <AppModal :open="showForm" :title="editingGroup ? '编辑分组' : '新建分组'" max-width="460px" :dismissable="false">
+        <label class="flabel" for="gn">组名</label>
+        <input id="gn" v-model="fName" class="input" placeholder="研发 / 外包 / 试用" />
+        <label class="flabel" for="gd">说明</label>
+        <input id="gd" v-model="fDesc" class="input" placeholder="可选" />
+        <div v-if="!editingGroup" class="fhint warn">
+          新建的组默认<b>不限制</b>模型。建好后请到「配置模型」里勾选允许的模型。
         </div>
-        <!-- 预览：把即将发生的变化说清楚，而不是让管理员在提交后才在
-             列表里数位数。 -->
-        <div v-if="yuanToCents(balAmount)" class="fhint">
-          调整后约为
-          <b>{{ fmtBalance((balFor?.balance_cents ?? 0) + (yuanToCents(balAmount) ?? 0), false) }}</b>
-        </div>
-        <div v-if="balErr" class="fhint err">{{ balErr }}</div>
+        <div v-if="fErr" class="fhint err">{{ fErr }}</div>
         <div class="form-actions">
-          <button class="btn" @click="balFor = null">取消</button>
-          <button class="btn btn-primary" :disabled="balBusy" @click="submitBalance">
-            {{ balBusy ? '处理中…' : '确定' }}
+          <button class="btn" @click="showForm = false">取消</button>
+          <button class="btn btn-primary" :disabled="fBusy" @click="submitGroupForm">
+            {{ fBusy ? '保存中…' : '保存' }}
+          </button>
+        </div>
+    </AppModal>
+
+    <!-- 配置模型白名单：勾选状态同样不该被误点遮罩清空。 -->
+    <AppModal :open="!!modelsFor" :title="modelsFor ? `模型白名单 · ${modelsFor.name}` : '模型白名单'" max-width="560px" :dismissable="false">
+        <div v-if="modelOptions.length === 0" class="fhint warn">
+          还没有任何路由（公开模型名）。请先到「上游与模型 / 路由」里建好。
+        </div>
+        <ModelPicker v-else v-model="picked" :options="modelOptions" />
+
+        <div v-if="mErr" class="fhint err">{{ mErr }}</div>
+        <div class="form-actions">
+          <button class="btn" @click="modelsFor = null">取消</button>
+          <button class="btn btn-primary" :disabled="mBusy" @click="submitModels">
+            {{ mBusy ? '保存中…' : `保存（已选 ${picked.length}）` }}
           </button>
         </div>
     </AppModal>
@@ -652,5 +887,47 @@ onMounted(load)
 .msub { font-size: 12px; color: var(--muted); margin: -8px 0 10px; }
 /* 字段两列一行挤一挤：五个字段三行，弹窗整体约 16:9，不用竖着滚一屏。 */
 .fgrid { display: grid; grid-template-columns: 1fr 1fr; gap: 2px 18px; margin-top: 6px; }
+
+/* ---- 页签 ---- */
+/* 形态逐字对齐 Settings.vue 的 .set-tabs：同一个交互在同一个应用里
+   长得不一样时，用户会以为它们的行为也不同。 */
+.ug-tabs {
+  display: flex;
+  gap: 2px;
+  width: max-content;
+  padding: 3px;
+  margin-bottom: 14px;
+  border-radius: var(--r-pill);
+  background: var(--default);
+}
+.ug-tab {
+  padding: 6px 16px;
+  border: none;
+  border-radius: var(--r-pill);
+  background: transparent;
+  font-size: 13px;
+  font-weight: 500;
+  color: var(--muted);
+  cursor: pointer;
+  white-space: nowrap;
+  transition:
+    color 0.2s var(--ease-out-quart),
+    background 0.25s var(--ease-spring);
+}
+.ug-tab.active {
+  background: var(--surface);
+  color: var(--foreground);
+}
+
+/* ---- 分组页签 ---- */
+.note { font-size: 12px; color: var(--muted); line-height: 1.7; }
+.note strong { color: var(--foreground); }
+.badge-warn { background: var(--accent-soft); color: var(--accent-soft-foreground); }
+/* 0 把密钥不是「值得注意的状态」—— 弱化它，免得每行都挂两个同色徽章。 */
+.dim-badge { opacity: 0.55; }
+.cell-group { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+.cell-group .name { font-weight: 500; }
+/* 白名单列表可能很长：主战场是这张表的宽度，宁可让 tbl-wrap 出横向滚动。 */
+.cell-models { max-width: 480px; }
 
 </style>

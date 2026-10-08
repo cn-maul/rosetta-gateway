@@ -2,7 +2,7 @@
 import { computed, onMounted, ref } from 'vue'
 import { api } from '../api'
 import { toast } from '../ui'
-import { fmtNum, fmtTokens, fmtTimeMs, fmtSec, statusLabel, statusBadge } from '../fmt'
+import { fmtNum, fmtTokens, fmtTimeMs, fmtSec, fmtSpeed, fmtMoney, statusLabel, statusBadge } from '../fmt'
 import type { AccessKey, UsageHistoryEntry, UsageHistoryPage } from '../types'
 
 const err = ref('')
@@ -51,6 +51,48 @@ const ranges = [
 const pageSizes = [20, 50, 100]
 
 const totalPages = computed(() => Math.max(1, Math.ceil(total.value / pageSize.value)))
+
+/**
+ * 「速度(t/s)」格的文本。
+ *
+ * tps 由**后端**算好下发（理由见 types.ts 的 UsageHistoryEntry.tps 注释：
+ * 公式必须与总览页的 store.GetRecentThroughput 逐字一致）。
+ *
+ * tps === 0 表示**没有可算的样本** —— 上游未报 usage（output_tokens=0）、
+ * 非流式短请求、或 latency_ms=0 的错误请求 —— 而不是「速度为零」。
+ * 所以必须显示 '—'：可算样本的 tps 恒 > 0（分子分母都 > 0 的商不可能为 0），
+ * 印成 0 会被读成「这次生成极慢」，与真相相反。
+ *
+ * 这层判断不能省掉交给 fmtSpeed：它自身对 <=0 返回的是 '0' 而不是 '—'。
+ */
+function fmtTps(tps: number): string {
+  return tps > 0 ? fmtSpeed(tps) : '—'
+}
+
+/**
+ * 「首字/总耗时」合并格的文本，形如 `3.6s/45.1s`。
+ *
+ * # 单位 s 为什么在这里显式拼
+ *
+ * fmtSec 返回的是**裸数字**：它只做 ms→s 换算与精度收敛，不带单位
+ * （原「首字(s)」「总耗时(s)」两列是把单位写在**表头**里的）。合并成一格后
+ * 表头变成「首字/总耗时」、不再含单位，两个数就必须各自带 s ——
+ * 否则一格里的两个数字看不出量纲（是秒？毫秒？）。
+ *
+ * # ttfb_ms <= 0 时只让首字那半边是 '—'
+ *
+ * 不整格显示 '—'：总耗时是真实存在的，丢掉它等于这一格白占一列位置。
+ * 而「非流式请求没有独立首字时间」是常态（非流式的 ttfb 与总耗时同源，
+ * 落库常为 0），运维真正要看的正是总耗时。所以显示 `—/45.1s`。
+ *
+ * 两侧都无值时（latency_ms=0 的错误请求）会得到 `—/—`，如实反映
+ * 「这条记录没有任何计时数据」。
+ */
+function fmtTtfbOverLatency(ttfbMs: number, latencyMs: number): string {
+  const first = ttfbMs > 0 ? fmtSec(ttfbMs) + 's' : '—'
+  const total = latencyMs > 0 ? fmtSec(latencyMs) + 's' : '—'
+  return `${first}/${total}`
+}
 
 // 请求序号守卫：快速翻页 / 切时间范围会并发多个 fetch，晚到的旧响应若直接
 // 写回 rows/page/total，会把新结果覆盖成过期数据（表内容与页码自相矛盾）。
@@ -183,15 +225,21 @@ const exportNotice = ref('')
 // 导出与列表同参数（时间范围 + 三个过滤器），口径由 api.ts 的 usageHistoryQuery 统一保证。
 async function exportCSV() {
   if (exporting.value) return
-  // 输入框里还有没提交的模型名时先落盘再导出：否则表格显示「全部模型」而 CSV
-  // 只含那个尚未应用的值 —— 用户拿文件对不上屏幕，只会以为导出丢了数据。
-  if (fModel.value.trim() !== appliedModel.value.trim()) {
-    page.value = 1
-    await load()
-  }
+  // 忙碌标记必须在**第一个 await 之前**置位（2026-10-10 修复的 P1）。
+  // 原实现先 `await load()` 再置位，而 load() 是一次完整的
+  // GET /usage/history（客户端超时 30s）—— 那段窗口里 exporting 仍是
+  // false，再点一次「导出 CSV」就会并发跑两轮下载：两次 blob 下载与两次
+  // <a download> 触发，而先返回的 finally 会把 exporting 清掉，
+  // 于是按钮显示「可点」时其实还有一轮在跑，截断提示也会互相覆盖。
   exporting.value = true
   exportNotice.value = ''
   try {
+    // 输入框里还有没提交的模型名时先落盘再导出：否则表格显示「全部模型」而 CSV
+    // 只含那个尚未应用的值 —— 用户拿文件对不上屏幕，只会以为导出丢了数据。
+    if (fModel.value.trim() !== appliedModel.value.trim()) {
+      page.value = 1
+      await load()
+    }
     const r = await api.exportUsageCSV(days.value, filters())
     if (r.truncated) {
       // 「已导出多少、总共多少」都要说出来：只说「被截断了」的话，用户既
@@ -297,8 +345,9 @@ onMounted(() => {
                 <th>实际模型</th>
                 <th>调用密钥</th>
                 <th class="num-h">Tokens</th>
-                <th class="num-h">首字(s)</th>
-                <th class="num-h">总耗时(s)</th>
+                <th class="num-h">速度(t/s)</th>
+                <th class="num-h">首字/总耗时</th>
+                <th class="num-h">费用</th>
                 <th class="c-st">状态</th>
               </tr>
             </thead>
@@ -307,10 +356,27 @@ onMounted(() => {
                 <td class="mono c-time">{{ fmtTimeMs(h.ts) }}</td>
                 <td class="mono">{{ h.public_model || '—' }}</td>
                 <td class="mono dim">{{ h.upstream_model || '—' }}</td>
-                <td>{{ h.key_name || h.key_id || '—' }}</td>
+                <td>
+                  {{ h.key_name || h.key_id || '—' }}
+                  <!-- 流式/非流式标注：首字时间的含义随它而变（见 types 的注释） -->
+                  <span class="badge badge-off" :title="h.stream
+                    ? '流式：首字时间是「多久吐出第一个字」'
+                    : '非流式：响应一次性返回，首字时间≈总耗时'">
+                    {{ h.stream ? '流式' : '非流式' }}
+                  </span>
+                </td>
                 <td class="num-h">{{ fmtTokens(h.total_tokens) }}</td>
-                <td class="num-h">{{ h.ttfb_ms > 0 ? fmtSec(h.ttfb_ms) : '—' }}</td>
-                <td class="num-h">{{ h.latency_ms > 0 ? fmtSec(h.latency_ms) : '—' }}</td>
+                <!-- 速度：0 = 没有可算的样本（上游未报 usage / 错误请求），
+                     显示 — 而不是 0（见 fmtTps 的注释）。 -->
+                <td class="num-h">{{ fmtTps(h.tps) }}</td>
+                <!-- 首字与总耗时合并成一格，形如 3.6s/45.1s。
+                     非流式请求没有独立首字时间（ttfb_ms=0）时只让前半格变 —，
+                     保留总耗时（见 fmtTtfbOverLatency 的注释）。 -->
+                <td class="num-h">{{ fmtTtfbOverLatency(h.ttfb_ms, h.latency_ms) }}</td>
+                <!-- 单次费用可能远低于一分（单价低时），所以用 fmtMoney 的
+                     高精度档而不是两位小数 —— 否则整列会显示成「0.00 元」，
+                     恰恰掩盖了「确实花了钱」这个事实。 -->
+                <td class="num-h">{{ h.cost > 0 ? fmtMoney(h.cost) : '—' }}</td>
                 <td class="c-st">
                   <span class="badge" :class="statusBadge(h.status)">
                     {{ statusLabel(h.status) }}

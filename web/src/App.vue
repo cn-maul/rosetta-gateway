@@ -216,7 +216,13 @@ watch(
       </div>
 
       <!-- admin-only 页签对普通用户隐藏。真正的拦截在路由守卫与后端，
-           这里只是不让用户看到点进去才发现没权限的入口。 -->
+           这里只是不让用户看到点进去才发现没权限的入口。
+
+           顺序按「从常看到配置」排（2026-10-10 调整）：
+           总览 → 访问密钥 → 钱包与充值 → 上游与模型 → 路由 → 用户与分组 → 调用历史 → 设置。
+           admin 部分的动线是「看概况 → 配上游 → 配路由 → 管人 → 查账 → 改设置」，
+           每一步都建立在前面步骤的产物上。个人功能（密钥 / 钱包）放在 admin 区
+           之外，因为普通用户只有它们。 -->
       <nav class="side-nav" aria-label="管理后台导航">
         <RouterLink class="side-item" to="/" :title="railCollapsed ? '总览' : undefined">
           <svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
@@ -234,46 +240,23 @@ watch(
           </svg>
           <span v-if="!railCollapsed">访问密钥</span>
         </RouterLink>
-        <RouterLink class="side-item" to="/history" :title="railCollapsed ? '调用历史' : undefined">
-          <svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-            <path d="M3 12a9 9 0 1 0 9-9 9.75 9.75 0 0 0-6.74 2.74L3 8" />
-            <path d="M3 3v5h5" />
-            <path d="M12 7v5l4 2" />
-          </svg>
-          <span v-if="!railCollapsed">调用历史</span>
-        </RouterLink>
-        <RouterLink class="side-item" to="/models" :title="railCollapsed ? '可用模型' : undefined">
-          <svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-            <path d="m12 2 2.4 6.9L21 12l-6.6 3.1L12 22l-2.4-6.9L3 12l6.6-3.1L12 2Z" />
-          </svg>
-          <span v-if="!railCollapsed">可用模型</span>
-        </RouterLink>
-        <RouterLink class="side-item" to="/profile" :title="railCollapsed ? '我的账号' : undefined">
+        <!-- 调用历史移进 admin 区（2026-10-10）：用户给的侧边栏顺序里它是第 5 项，
+             排在「用户与分组」之后，属于管理员查账的动线。普通用户看自己的
+             消费记录走「钱包与充值」页，不必进这个完整台账。 -->
+        <!-- 「可用模型」页已删除（2026-10-10）：它是「我能用哪些模型」的只读清单，
+             而管理员不再调用 API，也就用不上这份清单。普通用户仍可在
+             「访问密钥」页的可用模型选择器里看到自己被授权的模型
+             （ModelPicker，数据源同一个 /model-names 端点）。
+             路由 /models 与 Models.vue 一并删除。 -->
+        <RouterLink class="side-item" to="/profile" :title="railCollapsed ? '钱包与充值' : undefined">
           <svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
             <path d="M18 20a6 6 0 0 0-12 0" />
             <circle cx="12" cy="10" r="4" />
             <circle cx="12" cy="12" r="10" />
           </svg>
-          <span v-if="!railCollapsed">我的账号</span>
+          <span v-if="!railCollapsed">钱包与充值</span>
         </RouterLink>
         <template v-if="isAdmin()">
-          <RouterLink class="side-item" to="/users" :title="railCollapsed ? '用户' : undefined">
-            <svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-              <path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2" />
-              <circle cx="9" cy="7" r="4" />
-              <path d="M22 21v-2a4 4 0 0 0-3-3.87" />
-              <path d="M16 3.13a4 4 0 0 1 0 7.75" />
-            </svg>
-            <span v-if="!railCollapsed">用户</span>
-          </RouterLink>
-          <RouterLink class="side-item" to="/groups" :title="railCollapsed ? '分组' : undefined">
-            <svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-              <path d="m12.83 2.18a2 2 0 0 0-1.66 0L2.6 6.08a1 1 0 0 0 0 1.83l8.58 3.91a2 2 0 0 0 1.66 0l8.58-3.9a1 1 0 0 0 0-1.83Z" />
-              <path d="m22 17.65-9.17 4.16a2 2 0 0 1-1.66 0L2 17.65" />
-              <path d="m22 12.65-9.17 4.16a2 2 0 0 1-1.66 0L2 12.65" />
-            </svg>
-            <span v-if="!railCollapsed">分组</span>
-          </RouterLink>
           <RouterLink class="side-item" to="/providers" :title="railCollapsed ? '上游与模型' : undefined">
             <svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
               <rect width="20" height="8" x="2" y="2" rx="2" ry="2" />
@@ -290,6 +273,26 @@ watch(
               <circle cx="18" cy="5" r="3" />
             </svg>
             <span v-if="!railCollapsed">路由</span>
+          </RouterLink>
+          <!-- 「用户」与「分组」合并（2026-10-10）：分组是用户的属性
+               （users.group_id），拆成两个页面得在「这个人在哪个组」与
+               「这个组有哪些人」之间来回跳。页内两个 tab 解决。 -->
+          <RouterLink class="side-item" to="/users" :title="railCollapsed ? '用户与分组' : undefined">
+            <svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2" />
+              <circle cx="9" cy="7" r="4" />
+              <path d="M22 21v-2a4 4 0 0 0-3-3.87" />
+              <path d="M16 3.13a4 4 0 0 1 0 7.75" />
+            </svg>
+            <span v-if="!railCollapsed">用户与分组</span>
+          </RouterLink>
+          <RouterLink class="side-item" to="/history" :title="railCollapsed ? '调用历史' : undefined">
+            <svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <path d="M3 12a9 9 0 1 0 9-9 9.75 9.75 0 0 0-6.74 2.74L3 8" />
+              <path d="M3 3v5h5" />
+              <path d="M12 7v5l4 2" />
+            </svg>
+            <span v-if="!railCollapsed">调用历史</span>
           </RouterLink>
           <RouterLink class="side-item" to="/settings" :title="railCollapsed ? '设置' : undefined">
             <svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
@@ -363,7 +366,19 @@ watch(
       </main>
     </div>
   </div>
-  <RouterView v-else />
+  <!-- 探测未完成时**什么都不挂**（2026-10-10 修复的 P2）。
+       原实现这里是裸的 v-else：session.checked 还是 false 时，
+       v-else 会把 hash 指向的那个页面（硬刷新 /#/ 就是总览）挂上去，
+       而此时守卫必然放行（router.ts 的 guardDecision 第一行）、
+       后端身份又还没查到 —— 于是受保护页自己发起了请求：
+         - 有有效令牌：5 个请求白跑一次（探测完成后组件重建，会再发 5 个）；
+         - 无/过期令牌：5 个 401 打出去，api.ts 顺手清掉本地令牌，
+           而某些限速器会把这些计入失败。
+       现在探测完成前不挂载任何页面：之后要么进外壳，要么被 reapplyGuard
+       送去登录页，两条路都不会让受保护页先跑一轮注定失败的请求。 -->
+  <div v-else-if="session.checked" class="boot">
+    <RouterView />
+  </div>
 
   <!-- Toast -->
   <div

@@ -9,17 +9,18 @@ const router = createRouter({
     { path: '/', name: 'overview', component: () => import('./views/Overview.vue'), meta: { title: '总览' } },
     { path: '/keys', name: 'keys', component: () => import('./views/Keys.vue'), meta: { title: '访问密钥' } },
     { path: '/history', name: 'history', component: () => import('./views/History.vue'), meta: { title: '调用历史' } },
-    { path: '/profile', name: 'profile', component: () => import('./views/Profile.vue'), meta: { title: '我的账号' } },
-    // 「我能用哪些模型」的只读清单。刻意**不加** adminOnly：后端
-    // /admin/api/model-names 本就按身份收窄后才对普通用户开放
-    // （见 server/user_auth.go 的非 admin 白名单），普通用户看不到这份
-    // 清单就只能猜模型名。管理员也能进，看到的是全集，无害。
-    { path: '/models', name: 'models', component: () => import('./views/Models.vue'), meta: { title: '可用模型' } },
+    // 「钱包与充值」。**刻意保留 name/path 为 profile**：路由名已经进了
+    // 若干跳转（守卫把非 admin 踢回这里、登出后 push 回这里），改路径会让
+    // 老书签 404。展示标题改成「钱包与充值」，见下方 meta.title。
+    { path: '/profile', name: 'profile', component: () => import('./views/Wallet.vue'), meta: { title: '钱包与充值' } },
     // 以下 admin-only：普通用户既看不到入口，也会被守卫踢走。
     // meta.adminOnly 让导航栏能按 isAdmin() 隐藏它们，守卫负责兜底——
     // 只做前者的话，手输 URL 就能打开。
-    { path: '/users', name: 'users', component: () => import('./views/Users.vue'), meta: { title: '用户', adminOnly: true } },
-    { path: '/groups', name: 'groups', component: () => import('./views/Groups.vue'), meta: { title: '分组', adminOnly: true } },
+    //
+    // 「用户与分组」合并成一个页面（2026-10-10）：分组是用户的属性
+    //（users.group_id），拆成两个页面让人得在「这个人在哪个组」和
+    // 「这个组有哪些人」之间来回跳。页内两个 tab 解决。
+    { path: '/users', name: 'users', component: () => import('./views/UsersGroups.vue'), meta: { title: '用户与分组', adminOnly: true } },
     { path: '/providers', name: 'providers', component: () => import('./views/Providers.vue'), meta: { title: '上游与模型', adminOnly: true } },
     { path: '/routes', name: 'routes', component: () => import('./views/Routes.vue'), meta: { title: '路由', adminOnly: true } },
     { path: '/settings', name: 'settings', component: () => import('./views/Settings.vue'), meta: { title: '设置', adminOnly: true } },
@@ -65,7 +66,18 @@ function guardDecision(to: RouteLocationNormalized): true | RouteLocationRaw {
   // 用来在单密码模式下跳过登录；那条通道已删除，现在只有一种部署形态，
   // 再留开关就等于凭空多出一条不登录就能用的分支。
   if (!session.me) {
-    return { name: 'login' }
+    // 带上来源页（2026-10-10 修复的 P2）：原先一律裸跳登录页，
+    // 于是「后端短暂不可达 → 被送去登录页 → 用户恢复后重登」这条路上，
+    // 原本要去的那一页被静默丢弃，只能落到默认首页。App.vue 那条
+    // 「运行中掉登录」的 watch 一直会带 redirect，只有启动期的
+    // reapplyGuard 这条不带 —— 两处口径不一致，补齐即可。
+    //
+    // to.meta.public 为真时**不**带：那时已经在登录页上，
+    // 把 /login 自己塞进 redirect 会让登录后跳回登录页。
+    //
+    // 无开放重定向风险：Login.vue 的 leaveToBack 与上面那段
+    // 公开页回跳用的是同一套校验（单斜杠开头且排除 //）。
+    return { name: 'login', query: to.meta.public ? {} : { redirect: to.fullPath } }
   }
   if (to.meta.adminOnly && !isAdmin()) {
     return { name: 'profile' }

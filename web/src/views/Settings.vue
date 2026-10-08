@@ -2,19 +2,22 @@
 import { computed, onMounted, reactive, ref, watch } from 'vue'
 import { api } from '../api'
 import { toast, confirmBox } from '../ui'
-import { fmtMoney, fmtDateTime, fmtNum } from '../fmt'
+import { fmtMoney, fmtNum } from '../fmt'
 import AppModal from '../components/AppModal.vue'
 import type {
   Provider,
   UpstreamModel,
-  AuditEntry,
   ConfigExportFile,
   ConfigImportResult,
   PruneResult,
 } from '../types'
 
 // ---------- 分类页：设置项按分类分页展示，一次只看一类 ----------
-type TabKey = 'model' | 'runtime' | 'price' | 'audit' | 'transfer'
+//
+// 「审计日志」页签已移除（用户要求）。后端 GET /admin/api/audit 端点与
+// api.ts 的 api.audit() 一并保留 —— 它们是运维取证的正路，删掉的是
+// 界面上的那一块，不是能力本身（见 task 报告里「api.audit 去留」一节）。
+type TabKey = 'model' | 'runtime' | 'price' | 'transfer'
 
 const TABS: { key: TabKey; label: string; sub: string }[] = [
   { key: 'model', label: '模型默认', sub: '全局默认值；模型容量探测不到时回落到这里' },
@@ -25,7 +28,6 @@ const TABS: { key: TabKey; label: string; sub: string }[] = [
   // 改价只影响**此后**的用量：历史费用在落库时已按当时的价固化，
   // 所以这里改的是「往后怎么算」，不是「重算历史」。
   { key: 'price', label: '模型价格', sub: '按供应商 × 模型配置单价；改价只对之后的用量生效，不改写历史费用' },
-  { key: 'audit', label: '审计日志', sub: '管理后台的写操作留痕（谁/何时/动了哪些字段）' },
   {
     key: 'transfer',
     label: '导入导出',
@@ -35,29 +37,6 @@ const TABS: { key: TabKey; label: string; sub: string }[] = [
 const tab = ref<TabKey>('model')
 
 const tabSub = computed(() => TABS.find((t) => t.key === tab.value)?.sub ?? '')
-
-// ---------- 审计日志 ----------
-// 只在第一次切到该页签时拉取（后续手动刷新），避免每次进设置页都打一次库。
-const auditLoading = ref(false)
-const auditLoadedOnce = ref(false)
-const auditEntries = ref<AuditEntry[]>([])
-
-async function loadAudit() {
-  auditLoading.value = true
-  try {
-    const res = await api.audit(100)
-    auditEntries.value = res.entries
-    auditLoadedOnce.value = true
-  } catch (e) {
-    if ((e as { status?: number }).status !== 401) toast('审计日志加载失败：' + (e as Error).message, 'err')
-  } finally {
-    auditLoading.value = false
-  }
-}
-
-watch(tab, (t) => {
-  if (t === 'audit' && !auditLoadedOnce.value && !auditLoading.value) loadAudit()
-})
 
 // ---------- 导入 / 导出 ----------
 //
@@ -138,9 +117,9 @@ async function runImport(dryRun: boolean) {
     if (!dryRun) {
       toast(`导入完成：新增 ${res.providers_created} 个供应商、${res.models_created} 个模型`, 'ok')
       resetImport()
-      // 导入改的是供应商与模型，审计里会多一条记录 —— 重取一次，
-      // 让用户切回审计页时看到的是最新状态而不是缓存的旧列表。
-      loadAudit()
+      // 原本这里还会 loadAudit()，好让用户切回「审计日志」页签时看到最新记录。
+      // 该页签已删除，这个刷新就成了纯浪费的请求（一次 /admin/api/audit
+      // + 一次全量解包），没有任何消费方 —— 一并去掉，别留死代码。
     }
   } catch (e) {
     if ((e as { status?: number }).status !== 401) {
@@ -174,6 +153,18 @@ async function confirmImport() {
 
 const loading = ref(true)
 const saving = ref(false)
+// err 是**持久**的读取错误（2026-10-10 修复的 P2），不是 toast。
+//
+// 为什么必须是持久状态：本页面的表单是**可写**的，且保存走全量
+// PUT /settings。GET 失败时 form.* 仍是上面那组兜底常量，于是界面呈现
+// 一份「看起来完整、可以编辑」的配置，实际上全是写死的默认值 —— 运维
+// 看不到任何异常提示（只有一个转瞬即逝的 toast），很自然会点「保存」，
+// 于是真实的生产配置被这组默认值整体覆盖。
+//
+// 其它列表页（Keys/Users/Groups/History/Overview/Models/Routes/Providers）
+// 都保留 err 状态正是为此：「请求失败」必须与「没有数据」在界面上可区分。
+// 这一页原先是唯一的例外，而它恰好是错值后果最重的一页。
+const err = ref('')
 const form = reactive({
   // 与后端 internal/store/settings_dao.go 的兜底常量保持一致：
   // GET 失败时界面也不该回落到明显偏小的早期值（会被误当成真实生效值）。
@@ -187,8 +178,30 @@ const form = reactive({
   failover_failure_threshold: 3,
 })
 
+// derivedTotalBudgetText 把「整请求总预算」换算成可读文本，供设置页展示。
+//
+// 必须与后端 totalRequestBudget（cmd/gateway/main.go）的公式**逐项一致** ——
+// 界面上写一个数、实际跑另一个数，比不写更糟：那会让运维以为总预算可以按
+// 界面显示来推理。改后端公式时这里要一起改。
+//
+// 公式：((max(非流式超时, 首字超时 + 等响应头 60s)) + 5s) × (目标数 + 1)，
+// 再夹在 [30s, 30min]。
+const derivedTotalBudgetText = computed(() => {
+  const nonStream = Number(form.upstream_timeout_ms)
+  const ttft = Number(form.stream_first_token_timeout_ms)
+  const targets = Number(form.failover_max_targets)
+  if (![nonStream, ttft, targets].every((v) => Number.isFinite(v) && v > 0)) return '—'
+  // 等响应头 60s 与 5s 余量是后端的常量，同步自 totalRequestBudget。
+  const headerWaitMs = 60_000
+  const slackMs = 5_000
+  const perAttempt = Math.max(nonStream, ttft + headerWaitMs) + slackMs
+  const total = Math.min(Math.max(perAttempt * (targets + 1), 30_000), 30 * 60_000)
+  return `${Math.round(total / 1000)} 秒`
+})
+
 async function load() {
   loading.value = true
+  err.value = ''
   try {
     const s = await api.settings()
     form.default_context_window = s.default_context_window
@@ -199,7 +212,10 @@ async function load() {
     form.failover_max_targets = s.failover_max_targets
     form.failover_failure_threshold = s.failover_failure_threshold
   } catch (e) {
-    if ((e as { status?: number }).status !== 401) toast('加载设置失败：' + (e as Error).message, 'err')
+    if ((e as { status?: number }).status === 401) return
+    // 记入 err 并保持：表单在此状态下**不可保存**（见 save 的守卫与模板）。
+    err.value = (e as Error).message
+    toast('加载设置失败：' + err.value, 'err')
   } finally {
     loading.value = false
   }
@@ -209,6 +225,12 @@ async function load() {
 // 所以只校验**当前分类**的字段：另一个分类的值是载入时后端校验过的原值，
 // 不该在保存这一分类时把用户挡下来。
 async function save(target: 'model' | 'runtime') {
+  // 读取失败时 form 里是兜底常量，保存就是拿默认值覆盖生产配置 —— 直接拒绝。
+  // 提示要指向「重新加载」，因为这是唯一能解开的状态。
+  if (err.value) {
+    toast('设置未能加载，保存已阻止（否则会用默认值覆盖当前配置）。请先重新加载。', 'err')
+    return
+  }
   if (target === 'model') {
     const ctx = Number(form.default_context_window)
     const out = Number(form.default_max_output_tokens)
@@ -556,6 +578,15 @@ onMounted(() => {
     <!-- 分类 1：模型默认 -->
     <div v-if="tab === 'model'" class="panel">
       <div v-if="loading" class="loading">加载中…</div>
+      <!-- 读取失败：显示持久错误态而不是那组兜底常量。
+           必须让「没读到」与「读到了」在界面上明确区分 —— 这里的表单可写，
+           拿着默认值点保存会覆盖真实配置（见 err 的注释）。 -->
+      <div v-else-if="err" class="empty">
+        <div class="big">⚠</div>
+        设置加载失败：{{ err }}
+        <div style="margin-top: 10px">表单中的数值是默认值而非当前配置，已阻止保存以免覆盖。</div>
+        <button class="btn btn-primary" type="button" style="margin-top: 10px" @click="load">重新加载</button>
+      </div>
       <form v-else class="form-grid" style="max-width: 560px" @submit.prevent="save('model')">
         <div class="field span2">
           <label>默认上下文窗口（tokens）</label>
@@ -578,6 +609,12 @@ onMounted(() => {
     <!-- 分类 2：运行时（超时 + 故障转移） -->
     <div v-else-if="tab === 'runtime'" class="panel">
       <div v-if="loading" class="loading">加载中…</div>
+      <div v-else-if="err" class="empty">
+        <div class="big">⚠</div>
+        设置加载失败：{{ err }}
+        <div style="margin-top: 10px">表单中的数值是默认值而非当前配置，已阻止保存以免覆盖。</div>
+        <button class="btn btn-primary" type="button" style="margin-top: 10px" @click="load">重新加载</button>
+      </div>
       <form v-else class="form-grid" style="max-width: 560px" @submit.prevent="save('runtime')">
         <h2 class="section-h span2">超时（毫秒）</h2>
         <div class="field span2">
@@ -588,7 +625,7 @@ onMounted(() => {
         <div class="field span2">
           <label>流式首字超时（TTFT）</label>
           <input v-model.number="form.stream_first_token_timeout_ms" class="input num" type="number" min="1" step="1" />
-          <span class="tip">首字迟迟不来即掐流并切换下一个上游；仅在尚未写出任何字节时生效</span>
+          <span class="tip">已建立连接后，首个事件迟迟不来即掐流并切换下一个上游；仅在尚未写出任何字节时生效</span>
         </div>
         <div class="field span2">
           <label>流式空闲超时</label>
@@ -606,6 +643,23 @@ onMounted(() => {
           <label>失败熔断阈值</label>
           <input v-model.number="form.failover_failure_threshold" class="input num" type="number" min="1" step="1" />
           <span class="tip">某目标连续失败几次后临时摘除（60 秒冷却），期间请求自动让位给链上下一个目标</span>
+        </div>
+
+        <!-- 整请求总预算不是可配项（2026-10-10 新增），所以在这里说明它怎么来的。
+             不说明的后果是运维把「非流式整体超时」当成整请求上限，
+             调小它却发现流式请求照样能挂很久 —— 那正是修复前「设置旋钮管不到
+             流式」造成的误解。 -->
+        <div class="field span2">
+          <label>整请求总预算（自动推导，不可配）</label>
+          <span class="tip">
+            一次请求跨所有故障转移尝试的总时长上限，由上面的「非流式整体超时」「流式首字超时」
+            与「最多尝试目标数」自动推导（约
+            <b>{{ derivedTotalBudgetText }}</b>
+            ），并夹在 30 秒 ~ 30 分钟之间。<br />
+            没有它，一串半死的上游可以把一个客户端挂住数分钟（每个目标约 100 秒 × 目标数），
+            期间持续占用连接、配额预占和故障转移名额。<br />
+            <b>注意</b>：上面三个值都是<b>单次尝试</b>的预算，不是整请求的。
+          </span>
         </div>
 
         <div class="field span2 form-actions" style="padding: 0">
@@ -637,49 +691,7 @@ onMounted(() => {
       </div>
     </div>
 
-    <!-- 分类 4：审计日志（页签顺序见 TABS） -->
-    <div v-else-if="tab === 'audit'" class="panel">
-      <div style="display: flex; align-items: center; justify-content: space-between; margin-bottom: 12px">
-        <div class="tip">
-          管理后台所有写操作（含来自脚本/API 的调用）在此留痕：来源、动作、涉及的资源与字段名。
-          字段值不入审计 —— 请求体里可能有上游密钥与密码明文。
-        </div>
-        <button class="btn" :disabled="auditLoading" @click="loadAudit">刷新</button>
-      </div>
-      <div v-if="auditLoading && auditEntries.length === 0" class="loading">加载中…</div>
-      <div v-else-if="auditEntries.length === 0" class="empty">
-        <div class="big">◇</div>
-        还没有审计记录（执行一次任意后台写操作后出现）
-      </div>
-      <div v-else class="tbl-wrap">
-        <table class="tbl">
-          <thead>
-            <tr>
-              <th>时间</th>
-              <th>方法</th>
-              <th>状态</th>
-              <th>路径</th>
-              <th>来源</th>
-              <th>字段</th>
-            </tr>
-          </thead>
-          <tbody>
-            <tr v-for="e in auditEntries" :key="e.id">
-              <td class="mono">{{ fmtDateTime(e.ts) }}</td>
-              <td>{{ e.method }}</td>
-              <td>
-                <span class="badge" :class="e.status < 400 ? 'badge-live' : 'badge-off'">{{ e.status }}</span>
-              </td>
-              <td class="mono">{{ e.path }}</td>
-              <td>{{ e.remote }} · {{ e.actor }}</td>
-              <td class="dim">{{ e.fields || '—' }}</td>
-            </tr>
-          </tbody>
-        </table>
-      </div>
-    </div>
-
-    <!-- 分类 5：导入 / 导出（页签顺序见 TABS） -->
+    <!-- 分类 3：导入 / 导出（页签顺序见 TABS） -->
     <div v-else-if="tab === 'transfer'" class="panel">
       <div class="xfer-grid">
         <!-- 导出 -->
@@ -815,7 +827,7 @@ onMounted(() => {
       </div>
     </div>
 
-    <!-- 分类 4：模型价格（页签顺序见 TABS） -->
+    <!-- 分类 4：模型价格（兜底分支 v-else，页签顺序见 TABS） -->
     <div v-else class="panel">
       <div class="price-head">
         <div>

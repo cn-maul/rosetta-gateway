@@ -2,8 +2,8 @@
 import { computed, onMounted, reactive, ref } from 'vue'
 import { api } from '../api'
 import { toast, confirmBox } from '../ui'
-import { fmtDate, fmtSpeed, fmtSec, fmtPercent } from '../fmt'
-import type { Provider, Credential, UpstreamModel, DiscoveredModel } from '../types'
+import { fmtSpeed, fmtSec, fmtPercent } from '../fmt'
+import type { Provider, Credential, UpstreamModel, DiscoveredModel, ModelTestResult } from '../types'
 import AppModal from '../components/AppModal.vue'
 
 const err = ref('')
@@ -12,7 +12,7 @@ const providers = ref<Provider[]>([])
 const expandedId = ref('')
 const credsMap = reactive<Record<string, Credential[]>>({})
 const modelsMap = reactive<Record<string, UpstreamModel[]>>({})
-const testing = ref('')
+// testing / modelTestResults（在 testModel 附近定义）见那里的说明。
 
 /**
  * shortEndpoint 把过长的 Endpoint 压成「头 … 尾」。
@@ -163,28 +163,98 @@ async function removeProvider(p: Provider) {
 // 而不是被浏览器端掐成一句「请求超时」。设置读取失败时退回 150s 保守值。
 const testTimeoutMs = ref(150_000 + 5_000)
 
-async function testProvider(p: Provider) {
-  testing.value = p.id
+// 正在飞行中的探测：**按行 id 的集合**，不是单个字符串（2026-10-10 修复的 P1）。
+//
+// 单一字符串装不下两个并行的测试：一次探测最长可达 upstream_timeout + 余量
+// （真实打上游），期间点第二行的「测试」会把标记冲成后者，于是
+//   - 前一行的按钮立刻解禁（判定是 testing === id），可以再点一次，
+//     对同一个正在挣扎的上游并发两个探测；
+//   - 先结束的那轮在 finally 里清空**同一个**标记，把仍在跑的那行也解锁。
+// 结果是「测试中…」显示错误，且对病态上游的探测次数失去上限。
+//
+// 集合 + 按 id 清除后，每一行只受自己的测试约束。
+//
+// 现在只服务上游模型行的「测试」：provider 行上的那个按钮已按需求移除
+// （api.testProvider 与后端 /providers/{id}/test 都保留，见 AUDIT 报告）。
+const testing = ref(new Set<string>())
+
+function isTesting(id: string): boolean {
+  return testing.value.has(id)
+}
+function setTesting(id: string, on: boolean): void {
+  // 整体替换而不是 add/delete：Vue 的 ref 对 Set 的深层响应式需要
+  // 重新赋值才必然触发（Proxy 的就地修改在部分场景下漏更新）。
+  const next = new Set(testing.value)
+  if (on) next.add(id)
+  else next.delete(id)
+  testing.value = next
+}
+
+// 每行的探测结果，按 upstream_models.id 索引。
+//
+// 为什么留住结果而不是只弹 toast：探测会**真实计费**，且失败原因是管理员
+// 唯一能据以行动的信息（404 改模型名、403 开权限、401 换 key）。
+// toast 5.2 秒后消失，用户来不及照着改配置；而且并发点几行时单例 toast
+// 会被后来的顶掉，只剩最后一条。
+const modelTestResults = reactive<Record<string, ModelTestResult>>({})
+
+async function testModel(m: UpstreamModel) {
+  if (isTesting(m.id)) return // 防连点：同一行已有探测在跑
+  setTesting(m.id, true)
+  delete modelTestResults[m.id] // 先清旧结果，避免把上一轮的绿/红留在屏幕上
   try {
-    const r = await api.testProvider(p.id, testTimeoutMs.value)
-    toast(r.message || (r.status === 'ok' ? '连接正常' : '测试失败'), r.status === 'ok' ? 'ok' : 'err')
+    modelTestResults[m.id] = await api.testModel(m.id, testTimeoutMs.value)
   } catch (e) {
-    if ((e as { status?: number }).status !== 401) toast('测试失败：' + (e as Error).message, 'err')
+    if ((e as { status?: number }).status === 401) return
+    // 走到这里说明**管理接口本身**失败了（网络/超时/5xx），与「模型不可用」
+    // 不是一回事 —— 后者是 200 + status=error，由上面的分支处理。
+    // 分开显示，否则会把网关自己的问题读成上游模型的问题。
+    modelTestResults[m.id] = {
+      status: 'error',
+      model_id: m.model_id,
+      provider_id: m.provider_id,
+      message: '管理接口调用失败：' + (e as Error).message,
+      latency_ms: 0,
+    }
   } finally {
-    testing.value = ''
+    setTesting(m.id, false) // 只清自己这一行
   }
+}
+
+// testResultLine 把探测结果压成界面上那一行。
+//
+// 成功：`可用 · 1234ms · 输出 1 tok`。耗时与用量都带出来，因为探测的
+// 成本与体感全在这两个数上 —— 只说「可用」就没法区分「可用但很慢」。
+// 失败：原样给出上游原因；InBand 的错误额外加一句说明，否则
+// 「HTTP 是成功的却报错」会看起来像网关自己坏了。
+function testResultLine(r: ModelTestResult): string {
+  if (r.status === 'ok') {
+    const parts = [`可用`, `${r.latency_ms}ms`]
+    if (r.output_tokens) parts.push(`输出 ${r.output_tokens} tok`)
+    return parts.join(' · ')
+  }
+  return r.in_band ? `${r.message}（上游以 HTTP 200 返回错误）` : r.message
 }
 
 // ---------- 凭据表单 ----------
 
-const cForm = reactive({ open: false, provider: '' as string, editing: '' as string, label: '', api_key: '', weight: 1 })
+// 表单里**没有 weight**：需求明确要求凭据区域去掉权重。
+//
+// 权重没有被删除 —— `provider_credentials.weight` 列还在，负载均衡
+// （upstream.Pool.selectWeighted）照常按它轮询，后端也照常接受
+// PATCH weight。这里只是不再提供输入口，于是：
+//   - 新建凭据由后端兜底为权重 1（credential_handler.go 的 `weight <= 0 → 1`）；
+//   - 已有凭据的权重**保持原值**（PATCH 不传 weight = nil = 不改），
+//     不会被静默重置成 1。
+// 副作用是界面上再也改不了权重（多凭据配额分配只能靠后端/API），
+// 这是用户明确要求的结果，已在 AUDIT/task-provider-ui.md 里记明。
+const cForm = reactive({ open: false, provider: '' as string, editing: '' as string, label: '', api_key: '' })
 
 function openCred(providerId: string, c?: Credential) {
   cForm.provider = providerId
   cForm.editing = c?.id ?? ''
   cForm.label = c?.label ?? ''
   cForm.api_key = ''
-  cForm.weight = c?.weight || 1
   cForm.open = true
 }
 
@@ -195,9 +265,10 @@ async function submitCred() {
   }
   try {
     if (cForm.editing) {
-      await api.updateCredential(cForm.editing, { label: cForm.label.trim(), weight: Number(cForm.weight) || 1, ...(cForm.api_key ? { api_key: cForm.api_key } : {}) })
+      // 刻意不带 weight：nil 语义是「保持原值」，正是这里要的。
+      await api.updateCredential(cForm.editing, { label: cForm.label.trim(), ...(cForm.api_key ? { api_key: cForm.api_key } : {}) })
     } else {
-      await api.createCredential(cForm.provider, { label: cForm.label.trim(), api_key: cForm.api_key, weight: Number(cForm.weight) || 1 })
+      await api.createCredential(cForm.provider, { label: cForm.label.trim(), api_key: cForm.api_key })
     }
     cForm.open = false
     toast(cForm.editing ? '凭据已更新' : '凭据已创建')
@@ -446,9 +517,13 @@ onMounted(() => {
               </td>
               <td class="c-act">
                 <div class="row-actions">
-                  <button class="btn btn-sm btn-ghost" :disabled="testing === p.id" @click="testProvider(p)">
-                    {{ testing === p.id ? '测试中…' : '测试' }}
-                  </button>
+                  <!-- provider 级的「测试」按钮已按需求移除。
+                       它拉的是 /models，只能证明「endpoint + 凭据通」，
+                       证明不了任何具体模型能推理 —— 而模型行现在各有自己的
+                       「测试」（发一次最小真实推理）。留着它反而提供一个
+                       比模型级测试更弱的绿色信号，容易被当成「都正常」。
+                       后端 POST /providers/{id}/test 与 api.testProvider
+                       都保留（见 AUDIT/task-provider-ui.md 的理由）。 -->
                   <button class="btn btn-sm btn-ghost" @click="openExpand(p.id)">
                     {{ expandedId === p.id ? '收起' : '展开' }}
                   </button>
@@ -474,13 +549,19 @@ onMounted(() => {
                       <thead>
                         <tr>
                           <th>凭据</th>
-                          <th class="num-h">权重</th>
-                          <th>状态</th>
-                          <th>创建</th>
                           <th class="c-act">操作</th>
                         </tr>
                       </thead>
                       <tbody>
+                        <!-- 权重 / 状态 / 创建时间三列已按需求移除。
+                             注意 weight 在后端仍然生效（负载均衡按它轮询），
+                             这里去掉的只是展示；见 AUDIT/task-provider-ui.md
+                             里记的副作用：界面上不再能调整权重。
+                             「状态」列显示的是 provider_credentials.status
+                             （healthy / cooling，随冷却态变化），创建时间来自
+                             created_at —— 两列都是只读展示，去掉不影响任何逻辑。
+                             「凭据」单元格的内容**未改动**（标签 + 启停徽标），
+                             这次只做需求要求的删除，不额外添加展示。 -->
                         <tr v-for="c in credsMap[p.id] ?? []" :key="c.id">
                           <td>
                             <div class="cell-key">
@@ -490,9 +571,6 @@ onMounted(() => {
                               </span>
                             </div>
                           </td>
-                          <td class="num-h">{{ c.weight }}</td>
-                          <td><span class="badge">{{ c.status }}</span></td>
-                          <td class="mono dim">{{ fmtDate(c.created_at) }}</td>
                           <td class="c-act">
                             <div class="row-actions">
                               <button class="btn btn-sm btn-ghost" @click="openCred(p.id, c)">换钥</button>
@@ -531,6 +609,16 @@ onMounted(() => {
                                 {{ m.enabled ? '启用' : '停用' }}
                               </span>
                             </div>
+                            <!-- 探测结果留在行内而不是只弹 toast：探测会真实计费，
+                                 失败原因是管理员唯一能据以行动的信息，而 toast
+                                 5.2 秒后消失、并发时还会互相顶掉。 -->
+                            <div
+                              v-if="modelTestResults[m.id]"
+                              class="sub-line"
+                              :class="modelTestResults[m.id].status === 'ok' ? 'test-ok' : 'test-err'"
+                            >
+                              {{ testResultLine(modelTestResults[m.id]) }}
+                            </div>
                           </td>
                           <td class="num-h dim">{{ m.tokens_per_sec ? fmtSpeed(m.tokens_per_sec) : '—' }}</td>
                           <td class="num-h dim">{{ m.ttfb_ms ? fmtSec(m.ttfb_ms) : '—' }}</td>
@@ -542,6 +630,18 @@ onMounted(() => {
                           </td>
                           <td class="c-act">
                             <div class="row-actions">
+                              <!-- 快速测试该模型是否可用：真实发一次 max_tokens=1
+                                   的推理请求。与已移除的 provider 级测试不同，
+                                   这个能证明「这个 model_id 现在真的能推理」
+                                   （模型下架/无权限/名字写错都会红）。 -->
+                              <button
+                                class="btn btn-sm btn-ghost"
+                                :disabled="isTesting(m.id)"
+                                :title="'真实调用一次（max_tokens=1）验证该模型可用'"
+                                @click="testModel(m)"
+                              >
+                                {{ isTesting(m.id) ? '测试中…' : '测试' }}
+                              </button>
                               <button class="btn btn-sm btn-ghost" @click="openModel(p.id, m)">编辑</button>
                               <button class="btn btn-sm btn-danger" @click="removeModel(m)">删除</button>
                             </div>
@@ -641,11 +741,8 @@ onMounted(() => {
             <input v-model="cForm.api_key" class="input mono" type="password" placeholder="sk-..." autocomplete="new-password" />
             <span class="tip">保存后加密入库，仅显示掩码，不再可见明文</span>
           </div>
-          <div class="field">
-            <label>权重</label>
-            <input v-model.number="cForm.weight" class="input num" type="number" min="1" max="100" />
-            <span class="tip">多凭据按权重轮询</span>
-          </div>
+          <!-- 权重输入框已按需求移除。weight 列与负载均衡逻辑都还在，
+               只是界面上不再提供入口；已有凭据的权重保持原值不被改写。 -->
         </div>
         <div class="form-actions">
           <button type="button" class="btn btn-ghost" @click="cForm.open = false">取消</button>
@@ -763,6 +860,10 @@ onMounted(() => {
 /* 表格末线的去留见 styles.css 的共享块（多 tbody 结构的理由记在那里）。 */
 /* 单元格骨架（.cell-key）用全局的（styles.css），这里只留页面私有部分。 */
 .sub-line.err { color: var(--danger); }
+/* 单模型探测结果。成功/失败用与全局错误态一致的语义色，
+   且允许换行：上游的失败原因是整句话，nowrap 会把它截断成看不全的半截。 */
+.test-ok { color: var(--success); }
+.test-err { color: var(--danger); white-space: normal; }
 /* Endpoint 的兜底宽度：shortEndpoint 已经把绝大多数地址掐到 44 字符内，
    这条 max-width 只兜极端情况（超长自定义路径），真正的主战场是 JS 截断，
    因为 CSS 的尾部省略会把路径尾巴吃掉。 */

@@ -63,9 +63,22 @@ function toggle(name: string) {
   emit('update:modelValue', next)
 }
 
-/** 全选：按 options 的顺序给出确定性结果，避免出现「顺序取决于勾选顺序」的集合。 */
+/**
+ * 全选：按 options 的顺序给出确定性结果，避免出现「顺序取决于勾选顺序」的集合。
+ *
+ * 有搜索词时只全选**当前可见**的那些（2026-10-10 修复的 P2）。
+ *
+ * 原实现无条件发整个 sortedOptions，于是「打了搜索词 → 点全选」这个完全
+ * 自然的操作，实际效果是勾中**所有**模型。对「配置模型」这个用例（给
+ * 分组配白名单）后果是反的：用户是在**收紧**范围，而「全选所有」恰好
+ * 等于取消这个组的限制（一个都不选与全都选，在后端都是「不限制」），
+ * 而界面上看不出任何差别。
+ *
+ * 根因是按钮与搜索框并排，位置暗示了「作用于当前看到的这些」。
+ */
 function selectAll() {
-  emit('update:modelValue', [...sortedOptions.value])
+  const q = query.value.trim()
+  emit('update:modelValue', q ? [...visible.value] : [...sortedOptions.value])
 }
 
 function clearAll() {
@@ -81,8 +94,13 @@ function clearAll() {
         <template v-else>已选 {{ modelValue.length }} / {{ options.length }}</template>
       </span>
       <span class="mp-btns">
-        <button type="button" class="btn btn-sm btn-ghost" :disabled="options.length === 0" @click="selectAll">
-          全选
+        <button
+          type="button"
+          class="btn btn-sm btn-ghost"
+          :disabled="options.length === 0 || (query.trim() !== '' && visible.length === 0)"
+          @click="selectAll"
+        >
+          {{ query.trim() ? '全选当前' : '全选' }}
         </button>
         <button type="button" class="btn btn-sm btn-ghost" :disabled="modelValue.length === 0" @click="clearAll">
           清空

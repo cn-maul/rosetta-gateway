@@ -351,7 +351,13 @@ onMounted(load)
     </div>
 
     <!-- 表单填一半别丢：遮罩/Esc 都不关（:dismissable=false），只能走取消/保存 -->
-    <AppModal :open="form.open" :title="form.editing ? '编辑路由' : '新建路由'" :dismissable="false">
+    <AppModal
+      :open="form.open"
+      :title="form.editing ? '编辑路由' : '新建路由'"
+      max-width="760px"
+      max-height="920px"
+      :dismissable="false"
+    >
       <form @submit.prevent="submitRoute">
         <div class="form-grid">
           <div class="field span2">
@@ -405,15 +411,15 @@ onMounted(load)
           </p>
         </div>
 
-        <div class="form-grid">
-          <div class="field span2">
-            <label class="check-line">
-              <input v-model="form.enabled" type="checkbox" />
-              启用该路由
-            </label>
-          </div>
-        </div>
-
+        <!-- 「启用该路由」勾选框已去掉（2026-10-10 用户要求）。
+             改为**默认创建即启用**：新建的路由本来就是拿来用的，
+             先建出一个停用状态、再让管理员去列表里点一次开关，
+             等于把一个必然动作拆成两步 —— 而漏掉第二步的症状是
+             「路由建好了但请求全 404」，且列表上那个小小的「停用」徽章
+             很容易被忽略。
+             启停能力**没有消失**：列表行的开关（toggleRoute）仍然在，
+             要停用随时可以停 —— 那里才是「运行中改状态」的正确位置，
+             而创建表单里问「要不要启用」本质上是在问一个还没发生的事。 -->
         <p v-if="chainError" class="chain-error" role="alert">{{ chainError }}</p>
 
         <div class="form-actions">

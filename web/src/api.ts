@@ -12,8 +12,10 @@
 //    注意：故障转移的策略参数（尝试预算 / 熔断阈值 / 各类超时）**不是**按路由的
 //    部分更新字段，它们在「设置」页统一配置（见 saveSettings）。
 //
-// 2. 任何写操作（create/update/delete）成功后都必须 POST /admin/api/reload，
-//    否则内存快照不刷新，新资源对 /v1 不可见。用 mutate() 统一封装。
+// 2. 写操作（create/update/delete）成功后**不需要**再调 POST /admin/api/reload：
+//    服务端的 server.AutoReload 会对每个通过鉴权的写操作自动重建内存快照
+//    （普通用户同样覆盖）。前端重复调用不但多余，还会在普通用户身上必然
+//    403 并把成功的保存误报成失败 —— 详见 mutate() 的注释。
 // 3. 错误响应统一为 {"error":{"message":...,"type":...}}。
 // 4. 鉴权头：Authorization: Bearer <会话令牌>。401 只有一个含义——会话无效，
 //    清本地令牌并把人送回登录页。
@@ -338,25 +340,34 @@ export const patch = <T>(path: string, body: unknown) => request<T>('PATCH', pat
 export const del = <T>(path: string) => request<T>('DELETE', path)
 
 /**
- * 写操作统一入口：成功后自动 reload 内存快照。
- * reload 失败不静默 —— 明确提示「已保存但需手动刷新快照」。
+ * 写操作统一入口。
+ *
+ * # 不再调 POST /admin/api/reload（2026-10-10 修复）
+ *
+ * 旧实现在写操作成功后主动调一次 `/reload` 刷新内存快照，失败就把整次操作
+ * 报成「资源已保存，但刷新内存快照失败」。两个问题：
+ *
+ *  1. **对普通用户必然失败。** `/admin/api/reload` 不在普通用户白名单里
+ *     （见 internal/server/user_auth.go 的 userAccessiblePrefixes），
+ *     于是 POST /keys 成功（key 已建好）→ 紧接着 reload 403 →
+ *     界面上却显示「创建失败：需要管理员权限」。用户会以为 key 没建，
+ *     反复点，攒出一堆同名 key。
+ *  2. **纯属多余。** 服务端的 server.AutoReload（挂在鉴权链**外侧**，
+ *     见 cmd/gateway/main.go）已经对**每个**通过鉴权的写操作自动重建快照，
+ *     管理员与普通用户一视同仁。所以这次调用从不产生任何实际效果 ——
+ *     它唯一的作用是在权限不足时制造一条假失败。
+ *
+ * 保留它唯一的价值是「万一服务端重建失败再试一次」，但那个兜底已经由
+ * 服务端的 MarkDirty + 后台重试循环接管（internal/server 的 autoreload
+ * 注释与 cmd/gateway 的 watchReloadRetry），比前端再发一次请求可靠得多：
+ * 前端一关掉页面，兜底就失效了。
+ *
+ * 现在写完就是写完。失败只可能是**这次写本身**失败 —— 那种情况下
+ * 直接把原始错误抛出去，不加任何前缀，避免把「服务端重建的问题」
+ * 与「保存的问题」混为一谈（后者才是用户真正需要动手处理的）。
  */
 export async function mutate<T>(fn: () => Promise<T>): Promise<T> {
-  const result = await fn()
-  try {
-    await post('/reload')
-  } catch (e) {
-    // 401 必须原样上抛。旧实现把它包成 status 0，于是所有 view 的
-    // `status !== 401` 守卫全部失效 —— 令牌过期时会在「请重新登录」的弹窗之上
-    // 再叠一条错误 toast，真正的原因（令牌失效）被淹没在噪音里。
-    if (e instanceof ApiFail && e.status === 401) throw e
-    throw new ApiFail(
-      0,
-      '资源已保存，但刷新内存快照失败：' + (e instanceof Error ? e.message : String(e)) +
-        '。请稍后在页面上手动触发一次写操作或重启网关。',
-    )
-  }
-  return result
+  return await fn()
 }
 
 // ---------- 业务端点封装 ----------
@@ -369,6 +380,7 @@ import type {
   UpstreamModel,
   DiscoveredModel,
   ModelImportItem,
+  ModelTestResult,
   Route,
   RouteTarget,
   RouteTargetInput,
@@ -378,10 +390,12 @@ import type {
   Settings,
   Stats,
   UsageGroupEntry,
+  UsageByUserPage,
   UsageHistoryPage,
   HistoryFilters,
   PruneResult,
   RecomputeUsageResult,
+  TopupPage,
   User,
   UserRole,
   UserStatus,
@@ -438,6 +452,20 @@ export const api = {
     post<{ status: string; message?: string; models?: DiscoveredModel[] }>(`/providers/${providerId}/models/discover`),
   importModels: (providerId: string, models: ModelImportItem[]) =>
     mutate(() => post<{ status: string; imported: number }>(`/providers/${providerId}/models/import`, { models })),
+  /**
+   * 单模型可用性探测：真实发一次最小推理（max_tokens=1），回答
+   * 「这个 model_id 现在能不能用」。
+   *
+   * 与 testProvider 的区别是本质的：那个拉 /models 只证明「endpoint + 凭据通」，
+   * 模型下架 / 无权限 / 名字写错时它照样绿。见 internal/upstream/upstream.go 的
+   * TestUpstreamModel。
+   *
+   * timeoutMs 必须由调用方传「运行时非流式超时 + 余量」：这是真的打上游，
+   * 慢模型可能吃满 upstream_timeout_ms，不能沿用管理 API 的默认 30s
+   * （否则后端还在等、浏览器先掐断，报出来的是假超时）。
+   */
+  testModel: (id: string, timeoutMs?: number) =>
+    post<ModelTestResult>(`/models/${id}/test`, undefined, timeoutMs),
 
   // routes
   routes: () => get<Route[]>('/routes'),
@@ -560,6 +588,23 @@ export const api = {
    */
   adjustUserBalance: (id: string, deltaCents: number) =>
     put<User>(`/users/${id}/balance`, { delta_cents: deltaCents }),
+  /**
+   * 充值流水（`{ records, total }`，分页，与调用历史同口径）。
+   *
+   * `limit` / `offset` 与 /usage/history 同一套语义（limit 是每页条数，total
+   * 是**过滤后**的总数、不受 limit 影响），所以两个列表的「共 N 条」读起来是
+   * 同一件事。后端对 limit 做了钳制（默认 50、上限 200），这里不重复钳。
+   *
+   * 作用域由服务端按会话身份决定，不接受查询参数指定查谁（普通用户传
+   * ?user_id= 会被忽略）。
+   *
+   * ⚠️ **作用域待 Lead 决策**：服务端 ListTopups 当前对**管理员也**按自己
+   * 的 id 收窄，而管理员不能被充值，所以管理员调它恒为空数组；用户需求是
+   * 管理员看**全站**流水。这是服务端改动，本任务不自行修改，详见
+   * AUDIT/task-admin-wallet.md。
+   */
+  topups: (limit = 50, offset = 0) =>
+    get<TopupPage>(`/topups?limit=${limit}&offset=${offset}`),
   /** 管理员重置他人密码。会递增该用户的 auth_version，其所有会话立即失效。 */
   resetUserPassword: (id: string, password: string) =>
     post(`/users/${id}/password`, { password }),
@@ -645,6 +690,24 @@ export const api = {
   usageByKey: (from = 0, to = Date.now()) => get<UsageGroupEntry[]>(`/usage/by-key?from=${from}&to=${to}&limit=10`),
   usageByProvider: (from = 0, to = Date.now()) =>
     get<UsageGroupEntry[]>(`/usage/by-provider?from=${from}&to=${to}&limit=10`),
+  /**
+   * 按用户汇总消费（钱包页「消费汇总」一表一行一个用户）。
+   *
+   * from=0 是「全部历史」（显式传 0，后端用 queryRangeExplicit 区分
+   * 「显式 0」与「没传」—— 后者才回落到近 7 天）。钱包页要的正是全部历史。
+   *
+   * 返回 { records, total } 而**不是裸数组**（与上面四个 by-* 不同）：
+   * total 是有消费的用户总数、不受 limit 影响，前端要靠它说出
+   * 「显示前 N / 共 M 位用户」。没有它，一张被 limit 截断的表与一张完整的表
+   * 在界面上完全同形 —— 而这张表是按金额读账的，把「前 N 名」读成全量
+   * 会直接得出错误结论（「合计怎么对不上上面那张汇总卡」）。
+   *
+   * 该端点 **admin-only**（handler 内 requireAdmin）。路径在普通用户可访问的
+   * /admin/api/usage 前缀下，前缀白名单管不到它 —— 所以前端**不能**把它
+   * 当普通用户可用的接口来调：普通用户打它会拿到 403。
+   */
+  usageByUser: (from = 0, to = Date.now(), limit = 100) =>
+    get<UsageByUserPage>(`/usage/by-user?from=${from}&to=${to}&limit=${limit}`),
   /**
    * 手动触发用量归档剪枝（明细 → 按天累计）。
    *

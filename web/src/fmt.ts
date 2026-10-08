@@ -145,6 +145,46 @@ export function fmtBalance(cents: number, unlimited: boolean): string {
   return fmtMoney(cents / 100)
 }
 
+/** 1 分对应的微元数（1 元 = 1e6 微元）。与 store.MicrosPerCent 保持一致。 */
+export const MICROS_PER_CENT = 10_000
+
+/**
+ * 「不足一分」的待结算余数（微元）→ 展示字符串。
+ *
+ * 为什么需要单独格式化：余额按**分**扣减，而单价可能远低于一分
+ * （实测 3 元/百万 token 时，一次一万 token 的调用只有 5 厘），于是会有
+ * 相当长一段时间里余额纹丝不动。若界面上只有余额，用户会以为「没扣钱」——
+ * 而实际上钱已经消费，只是还没攒够一分。
+ *
+ * 返回空串表示「没有待结算」，让调用方能直接 `v-if` 隐藏它 ——
+ * 绝大多数时候（单价较高、或调用量很大）余数都是 0，一直显示「待结算 0」
+ * 只会制造噪音并让人误以为余额有问题。
+ *
+ * 阈值：小于 1 微元按无处理（四舍五入到分是 0，显示出来没意义）。
+ */
+export function fmtRemainder(micros: number): string {
+  if (!micros || micros < 1) return ''
+  // 转成分再交给 fmtMoney：与 fmtBalance 的单位口径一致，
+  // 免得「余数」这一列出现与余额不同的精度习惯。
+  return fmtMoney(micros / MICROS_PER_CENT / 100)
+}
+
+/**
+ * 余额 + 待结算余数的合并展示（余额一行、余数跟在后面）。
+ *
+ * 为什么合并成一行而不是两个独立字段：它们回答的是同一个问题
+ * 「我还有多少钱能用」，拆成两行会被读成两个不相干的数。
+ */
+export function fmtBalanceWithRemainder(
+  cents: number,
+  unlimited: boolean,
+  micros: number,
+): string {
+  const base = fmtBalance(cents, unlimited)
+  const rem = fmtRemainder(micros)
+  return rem ? `${base}（另有 ${rem} 待结算）` : base
+}
+
 // 毫秒时间戳 → 「MM-DD HH:MM:SS」（调用历史表格用）
 export function fmtTimeMs(tsMs: number): string {
   if (!tsMs) return '—'
@@ -213,15 +253,25 @@ export async function copyText(text: string): Promise<boolean> {
     await navigator.clipboard.writeText(text)
     return true
   } catch {
-    // 非安全上下文（http://）下 clipboard API 不可用，退回 execCommand
+    // 非安全上下文（http://）下 clipboard API 不可用，退回 execCommand。
+    //
+    // 注意这条路径在本项目的部署形态下是**常用路径**（局域网 HTTP，
+    // clipboard 要求安全上下文），而它的唯一用途之一是复制那把
+    // 一次性展示的明文网关密钥 —— 所以明文会短暂进入 DOM。
+    // 清除 value 再移除节点：能让明文在 DOM 里停留的时间尽量短，
+    // 且不依赖节点被 GC 才消失（devtools / 扩展仍可读到节点的话，
+    // 读到的是空值而不是密钥）。
     try {
       const ta = document.createElement('textarea')
       ta.value = text
+      ta.readOnly = true
+      ta.setAttribute('aria-hidden', 'true')
       ta.style.position = 'fixed'
       ta.style.opacity = '0'
       document.body.appendChild(ta)
       ta.select()
       const ok = document.execCommand('copy')
+      ta.value = '' // 先抹掉 DOM 里的明文，再移除节点
       document.body.removeChild(ta)
       return ok
     } catch {

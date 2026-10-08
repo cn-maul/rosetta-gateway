@@ -2,7 +2,7 @@
 import { computed, onMounted, onUnmounted, ref } from 'vue'
 import { api } from '../api'
 import { toast } from '../ui'
-import { fmtNum, fmtTokens, fmtSpeed, fmtSec, fmtPercent, fmtMoney } from '../fmt'
+import { fmtNum, fmtTokens, fmtSpeed, fmtSec, fmtPercent, fmtMoney, fmtBalance, fmtRemainder } from '../fmt'
 // 命名空间导入并改名：下面有一个组件本地的 `const range = ref<RangeKey>(...)`
 //（当前选中的档位），同名会把这里的 range 遮住，导致 range.rangeBounds 被当成
 // 那个 ref。改用 timeRange 既避开冲突，也顺带说明它管的是「时间区间」不是「档位」。
@@ -297,6 +297,23 @@ onUnmounted(() => {
           <div class="k">费用</div>
           <div class="v num">¥{{ fmtMoney(stats.cost) }}</div>
         </div>
+        <!-- 余额：与「费用」放在一起是刻意的 —— 它们是同一件事的两面
+             （花了多少 / 还剩多少），分开看总有一半说不清。
+             待结算余数指「已消费但不足一分、还没从余额扣掉」的部分：
+             余额按分扣减，单价低时一次调用不足一分，不显示它就会出现
+             「费用在涨、余额不动」。 -->
+        <div
+          class="stat-card"
+          title="账户余额（元）。不足一分的消费先攒着，攒够一分后扣除"
+        >
+          <div class="k">余额</div>
+          <div class="v num">
+            {{ fmtBalance(stats.balance_cents ?? 0, stats.balance_unlimited ?? false) }}
+          </div>
+          <div v-if="fmtRemainder(stats.balance_remainder ?? 0)" class="k sub">
+            含 {{ fmtRemainder(stats.balance_remainder ?? 0) }} 待结算
+          </div>
+        </div>
         <div class="stat-card">
           <div class="k">输入 Tokens</div>
           <div class="v num">{{ fmtTokens(stats.input_tokens) }}</div>
@@ -484,6 +501,27 @@ onUnmounted(() => {
    所以窄屏降级必须在这里重写一遍。 */
 .expand-grid.is-3col {
   grid-template-columns: 1fr 1fr 1fr;
+}
+/* 指标卡一行五个（2026-10-10 用户要求：一行三个太占地方）。
+   共 10 张卡 → 5×2 正好铺满，没有落单的空位。
+   覆盖写在页面内而不是改全局 styles.css 的 .stat-grid：那个类目前只有本页
+   在用，但它是全局文件、可能被别处复用；而这一页的卡片数量（10）是这里的
+   事实，列数应与它配套，不该让全局样式替某一页的卡片数做决定。 */
+.stat-grid {
+  grid-template-columns: repeat(5, minmax(0, 1fr));
+}
+/* 窄屏降级要自己重写：上面的选择器特异性与 styles.css 媒体查询里的
+   .stat-grid 相同（都是单类），后加载的页面样式会赢 —— 不写这段的话
+   手机上也会挤成五列，卡片里的数字直接溢出。 */
+@media (max-width: 1100px) {
+  .stat-grid {
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+  }
+}
+@media (max-width: 640px) {
+  .stat-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
 }
 @media (max-width: 900px) {
   .expand-grid.is-3col {

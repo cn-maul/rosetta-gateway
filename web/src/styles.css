@@ -580,6 +580,13 @@ textarea {
   color: var(--muted);
   margin-bottom: 4px;
 }
+/* 卡片内的第二行说明（如余额卡下方的「含 x 待结算」）。
+   复用 .k 的样式但压小一号：它不是又一个指标标题，
+   而是主指标数字的补充说明 —— 视觉权重必须低于上面那个数字。 */
+.stat-card .k.sub {
+  font-size: 11px;
+  margin: 4px 0 0;
+}
 .stat-card .v {
   font-size: 24px;
   font-weight: 700;
