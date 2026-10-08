@@ -120,7 +120,19 @@ jobs:
         working-directory: .
         run: |
           set -euo pipefail
-          if ! git diff --exit-code -- internal/webui/dist; then
+          # 先把诊断打出来再判失败。只给一句「不一致」是不够的：
+          # 跨平台构建的差异往往只有行尾符或某个哈希后缀，常规 diff 一眼看不出来，
+          # 而看不到差异就只能在本地反复重跑 build 碰运气。列出具体文件与差异统计，
+          # 失败日志就能直接指出「哪几个文件、差多少行」。
+          if ! git diff --exit-code --stat -- internal/webui/dist; then
+            echo "::group::产物差异明细"
+            git diff --numstat -- internal/webui/dist || true
+            # 二进制/whitespace-only 差异用普通 diff 看不出来，显式给出忽略空白后的结果：
+            # 若下面这行无输出，说明差异**只是空白/行尾符**，而不是真的内容不同。
+            echo "--- 忽略空白后的差异（无输出 = 仅行尾符差异）---"
+            git diff --ignore-all-space --exit-code --stat -- internal/webui/dist \
+              && echo "忽略空白后无差异：问题是行尾符（CRLF/LF）"
+            echo "::endgroup::"
             echo "::error::internal/webui/dist 与 web/src 的最新构建不一致。"
             echo "请在本地执行：cd web && npm run build && node sync-embed.mjs，再把同步后的产物一并提交。"
             exit 1
