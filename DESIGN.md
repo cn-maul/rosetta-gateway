@@ -6,7 +6,7 @@
 | 项目性质 | 独立项目，不在 Rosetta 上改造（2026-09-15 定，理由见 §2.1） |
 | module path | `github.com/cn-maul/rosetta-gateway` |
 | 运行时依赖 | `github.com/cn-maul/rosetta` v1.0.1（上游 SDK）、`modernc.org/sqlite`（纯 Go SQLite）、`github.com/golang-jwt/jwt/v5`（管理会话） |
-| 版本 | 与 `web/package.json` 同源（当前 1.5.1），镜像与二进制共用 |
+| 版本 | 与 `web/package.json` 同源（当前 1.5.2），镜像与二进制共用 |
 | 状态 | **已实现**（P0–P3 全部落地，多用户、用量归档、配置导入导出均已上线） |
 | 更新 | 2026-10-10 |
 
@@ -1367,3 +1367,4 @@ rosetta-gateway/
 | 配额预占 est 是预估值 | 预占含 `max_tokens` 全额，请求收尾按真实 usage 退预占；上游不回 usage 时退预占、漏账以 `usage_state="missing"` 显形（§11.1/§11.2） | 在途瞬间不精确，终态正确；漏账可从界面察觉 |
 | 归档明细的可见性边界 | 明细只保留 30 天，更老区间的分组统计从日归档表取，按「宁可少算」口径（§4） | 极老日期的部分维度不可查；30 天内可按 `request_id` 查明细 |
 | `-race` 本机不可用 | Windows 开发机无 gcc | 并发修复靠人工审查 + 反向验证测试，CI 环境兜底 |
+
