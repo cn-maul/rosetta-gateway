@@ -169,8 +169,10 @@ func billingUsage(db *store.Store) http.HandlerFunc {
 //
 // 返回空串 = 不限制（仅限管理员）。
 func orgCostsScope(authCtx *auth.Context) string {
-	u := snapshot.Get().UsersByID[authCtx.UserID]
-	if u != nil && u.Role == store.RoleAdmin {
+	// 复用 auth.Context.IsAdminOwner：管理员判定在数据面有两处（鉴权拦截
+	// 与这里的 org-wide 可见范围），同一判据必须只有一份实现，否则将来
+	// 「谁能调模型」与「谁看得到全量费用」很容易各改各的、悄悄漂移。
+	if authCtx.IsAdminOwner() {
 		return ""
 	}
 	return authCtx.UserID
@@ -389,18 +391,41 @@ func isLoopbackListen(listen string) bool {
 // 与 token 配额的 ReserveQuota/ReleaseQuota 机制不同），预扣少了则拦不住
 // 超支。**先按上界准入、后按实收**把「估不准」这件事消掉，且不需要找零。
 //
-// # 管理员完全跳过（Lead 与用户确认）
+// # 管理员完全跳过（纵深防御，见 balanceExempt）
 //
-// 管理员的余额**不参与任何判定**。刻意不做「给管理员算一个无限余额」：
-// 那样会把管理员塞进「余额够不够」这条判定路径，等于让他依赖一次数据库读 ——
-// 而他的调用恰恰最不该被余额查询的抖动影响。直接 early-return，热路径上
-// 管理员的余额开销是**零**（不读库、不估算）。
-// 与 orgCostsScope 同源：那里也是判 admin 后直接返回空作用域。
+// 这段注释描述的是**余额豁免**这一层。2026-10 控制面/数据面分离之后，
+// 管理员**根本进不了 /v1**（internal/auth 的 ErrAdminCannotCallModel 已拦），
+// 于是下面两处 balanceExempt 短路在数据面上都是**不可达**的：
+//   - precheckBalance 的管理员 early-return（见该函数说明）；
+//   - usageRecorder.charge 的管理员短路（见该函数说明）。
+//
+// 它们保留作纵深防御：余额是「钱」，多一道零成本的判 admin 短路，将来若
+// 某个入口绕过 auth.Authenticate 直达扣费/预检（重构、新的数据面端点、
+// 内部复用），这条短路能立刻把管理员挡在「不读库、不计费」之外，而不依赖
+// 「上游那一层一定会先拦住」这个跨文件假设。详见 balanceExempt 的注释。
 
 // balanceExempt 报告该用户是否**不受余额约束**（管理员）。
 //
-// 判据用快照里的 Role（与 orgCostsScope 同一口径、同一处字面量），
+// 判据用快照里的 Role，与 auth.Context.IsAdminOwner 同一口径、同一处字面量，
 // 零查库 —— 这条判定在每个普通用户请求上都要跑，管理员更不能因此多一次读。
+//
+// # 2026-10 起这是**纵深防御**，数据面上不可达
+//
+// 控制面/数据面分离后，管理员在 auth.Authenticate 就被拒（ErrAdminCannot-
+// CallModel），压根到不了预检与扣费。所以这里判 admin 的两处短路在数据面
+// 上都是死代码。但**刻意保留**：
+//
+//   - 余额是「钱」。多保留一道零成本的短路，等于「即使上游拦截被绕过（重构、
+//     新数据面端点、内部复用），管理员也永远不会被读库判定挡掉、或被扣费」。
+//     删掉它换来的只是一点点「整洁」，却让资金正确性依赖一个跨文件的假设
+//     「auth 那一层一定会先拦住」。纵深防御的代价只有几行，收益是失败模式
+//     从「静默超支/扣错钱」变成「被短路挡住」。
+//   - 它同样是纯内存判定，不给数据面每个普通请求加任何开销（只在命中 admin
+//     时才 early-return；普通用户走原路径）。
+//
+// 与 orgCostsScope 的关系：那里也判 admin（看全量费用），但那是**控制面**
+// 语义（管理员在管理端看全局账），不走 Authenticate，所以那条路径仍是可达
+// 的 —— 别因为数据面管理员被拦就把那条也一起关掉。
 func balanceExempt(userID string) bool {
 	u := snapshot.Get().UsersByID[userID]
 	return u != nil && u.Role == store.RoleAdmin
@@ -517,6 +542,32 @@ const (
 	balanceReject
 )
 
+// minSubcentSpendableCents 是「计费模型上，本次估算不足 1 分」时，
+// 用户余额至少要有的分数（2026-10-10 修复的 P2）。
+//
+// # 为什么不是原来的 > 0
+//
+// 原判定是「余额 > 0 即放行」，而扣费侧 ChargeBalance 对 amountCents<=0
+// 直接 no-op。于是 1 分钱的余额可以发出**无限多个**四舍五入成 0 分的请求：
+// 每次都白嫖，却每次都真的消耗上游 token、也每次都写一条 usage/cost_total。
+// 单价越便宜的模型越容易触发（单价 0.1 元/百万 token 时，几百个 token 的
+// 普通请求都不到半分）—— 而「低价模型 + 多租户」正是余额计费的目标场景。
+// 也就是说这道预检在**最该生效的部署形态**里被绕开了。
+//
+// # 为什么取 100 分（1 元）而不是 1 分
+//
+// 修复前想要的是「零余额不得白嫖」；现在这一条已经由 balanceCents >= 1
+// 覆盖（估 0 分时余额为 0 仍拒）。100 分这条**只针对仍有余额**的用户，
+// 目的是把「持续白嫖」与「偶发一次小请求」分开：
+//
+//   - 偶发小请求（余额充足、只是这次请求太小）→ 放行，不打扰；
+//   - 余额已经低到 1 元以下 → 不允许再靠 0 分请求继续消耗上游，
+//     直到充值。
+//
+// 也就是说它是一条**地板线**，不是新的计费口径：正常计费的请求（estCents>0）
+// 完全不经过它，仍按「余额 >= 本次估算」判定。
+const minSubcentSpendableCents = 100 // 1 元
+
 // balancePreflight 在触碰上游**之前**判断「这次调用该不该被余额拦住」。
 //
 // 纯函数：不碰 DB、不碰全局。判定逻辑单独抽出来是为了能直接单测边界
@@ -532,11 +583,12 @@ func balancePreflight(estCents, balanceCents int64, unlimited, exempt bool, pric
 		//   - priced=false：整条链都没配价，本次真的不计费 → 放行。
 		//   - priced=true ：模型配了价，只是这次请求太小，四舍五入成 0 分。
 		//     放行等于「欠费用户靠发足够小的请求就能一直用」——预检形同虚设。
-		//     这种一律按「余额必须 > 0」判定：不够 1 分钱就等于没有余额。
+		//     这种一律按「余额必须 >= minSubcentSpendableCents」判定：
+		//     欠费用户连白嫖都不行。
 		if !priced {
 			return balanceAllow
 		}
-		if balanceCents > 0 {
+		if balanceCents >= minSubcentSpendableCents {
 			return balanceAllow
 		}
 		return balanceReject
@@ -587,16 +639,18 @@ func chainHasPricedModel(cands []routing.Candidate) bool {
 // 代价与缓解：读库失败会误拒正常流量，所以这一路必须**记 ERROR**（fail-open
 // 的教训是"记日志才看得见"；这里同理，只是反过来——记录是为了发现抖动）。
 //
-// # 管理员的短路在最前面
+// # 管理员的短路在最前面（纵深防御，见 balanceExempt）
 //
-// balanceExempt 为真时立刻返回 true，**一次库都不查**。这是口径要求
-// （管理员完全不受余额约束），也顺带让管理员的调用不受余额查询抖动影响。
+// balanceExempt 为真时立刻返回 true，**一次库都不查**。口径要求是管理员
+// 完全不受余额约束；2026-10 后管理员在数据面已被 auth 拦截，这条短路实际
+// 不可达，**保留**是为了纵深防御（万一某个入口绕过 auth 直达预检，管理员
+// 也不会因余额查询被误拒或读库抖动而受影响）。详见 balanceExempt 的注释。
 func precheckBalance(w http.ResponseWriter, r *http.Request, db *store.Store, logger *slog.Logger,
 	authCtx *auth.Context, ing *ingressRequest, cands []routing.Candidate,
 	codec ingressCodec) bool {
 
 	if balanceExempt(authCtx.UserID) {
-		return true // 管理员：不读库、不估算、不判定
+		return true // 纵深防御：管理员不读库、不估算、不判定（数据面上不可达，见 balanceExempt）
 	}
 
 	// 先估算，再决定要不要读库。顺序有讲究：未配价模型估算恒 0，而未配价
@@ -610,9 +664,10 @@ func precheckBalance(w http.ResponseWriter, r *http.Request, db *store.Store, lo
 	//     余额不变。这种才允许直接放行、不读库。
 	//  2. 模型配了价，但这次请求小到四舍五入算成 0 分（输入两三个字、
 	//     客户端没传 max_tokens、模型又没配 MaxOutputTokens）—— 扣费几乎
-	//     为零，但**不能据此放行**：那等于「余额已欠费的用户只要发足够小的
+	//     为零，但**不能据此放行**：那等于「余额已经欠费的用户只要发足够小的
 	//     请求就能一直用下去」，预检形同虚设。所以这种情况**照样读余额**，
-	//     只是判定时按「余额是否为 0」而不是「够不够付本次」来做。
+	//     判定时按「余额是否达到地板线」而不是「够不够付本次」——
+	//     地板线见 minSubcentSpendableCents 的说明。
 	//
 	// 区分方式：链上是否存在**已配价**的模型（而不是估算值是否大于 0）。
 	est := estimateBalanceCostChain(ing.buildRosetta(), cands)

@@ -334,6 +334,11 @@ func main() {
 	adminMux.HandleFunc("POST /admin/api/providers/{id}/models/import", func(w http.ResponseWriter, r *http.Request) { modelHandler.ImportModels(w, r, r.PathValue("id")) })
 	adminMux.HandleFunc("PATCH /admin/api/models/{id}", func(w http.ResponseWriter, r *http.Request) { modelHandler.Update(w, r, r.PathValue("id")) })
 	adminMux.HandleFunc("DELETE /admin/api/models/{id}", func(w http.ResponseWriter, r *http.Request) { modelHandler.Delete(w, r, r.PathValue("id")) })
+	// 单模型可用性探测。与 provider 的 /providers/{id}/test 是两件事：
+	// 那个拉 /models 证明「endpoint + 凭据通」，这个发一次最小真实推理
+	// （max_tokens=1）证明「这个 model_id 现在真的能推理」—— 模型下架、
+	// 账号无权限、名字写错时前者照样绿。见 upstream.TestUpstreamModel。
+	adminMux.HandleFunc("POST /admin/api/models/{id}/test", func(w http.ResponseWriter, r *http.Request) { modelHandler.Test(w, r, r.PathValue("id")) })
 	adminMux.HandleFunc("GET /admin/api/upstream-models", modelHandler.ListAll)
 
 	adminMux.HandleFunc("GET /admin/api/routes", routeHandler.List)
@@ -344,7 +349,11 @@ func main() {
 	adminMux.HandleFunc("PUT /admin/api/routes/{id}/targets", func(w http.ResponseWriter, r *http.Request) { routeTargetHandler.Replace(w, r, r.PathValue("id")) })
 
 	adminMux.HandleFunc("GET /admin/api/keys", keyHandler.List)
-	adminMux.HandleFunc("POST /admin/api/keys", keyHandler.Create)
+	// 管理员不能建 key（2026-10 控制面/数据面分离）：普通用户自助建，
+	// 管理员要去建普通用户、由那个用户自己发 key。策略在路由层拦，
+	// internal/admin/key_handler.go 的 Create 保持「普通用户自助」原样。
+	// **若将来另有代码直接用 keyHandler.Create 组路由，必须同样套本包装。**
+	adminMux.HandleFunc("POST /admin/api/keys", denyAdminKeyCreate(keyHandler.Create))
 	adminMux.HandleFunc("PATCH /admin/api/keys/{id}", func(w http.ResponseWriter, r *http.Request) { keyHandler.Update(w, r, r.PathValue("id")) })
 	adminMux.HandleFunc("DELETE /admin/api/keys/{id}", func(w http.ResponseWriter, r *http.Request) { keyHandler.Delete(w, r, r.PathValue("id")) })
 	// 重算 used_tokens：触发器维护的派生值没有自愈路径，偏高后 key 会变成死 key。
@@ -358,6 +367,12 @@ func main() {
 	adminMux.HandleFunc("GET /admin/api/usage/by-model", usageHandler.GroupByModel)
 	adminMux.HandleFunc("GET /admin/api/usage/by-provider", usageHandler.GroupByProvider)
 	adminMux.HandleFunc("GET /admin/api/usage/by-day", usageHandler.GroupByDay)
+	// 按用户汇总消费（钱包页「消费汇总」一表一行一个用户）。
+	// **admin-only 由 handler 内的 requireAdmin 把关** —— 路径在普通用户可
+	// 访问的 /admin/api/usage 前缀下，AdminGateGuard 的前缀白名单会整体放行，
+	// 管不到名单内部的单个端点。而这是全站口径（每个用户的消费金额 + 用户名），
+	// 普通用户拿到就等于看到同事的账单。与上面的 prune 是同一个坑。
+	adminMux.HandleFunc("GET /admin/api/usage/by-user", usageHandler.GroupByUser)
 	// 手动触发用量归档。admin-only 由 handler 内的 requireAdmin 把关 ——
 	// 路径在普通用户可访问的 /admin/api/usage 前缀下，白名单管不到这里。
 	adminMux.HandleFunc("POST /admin/api/usage/prune", usageHandler.Prune)
@@ -381,6 +396,16 @@ func main() {
 	// 审计记的是**字段名**（delta_cents）而非数值 —— 这是既有审计的粒度，
 	// 不在本端点内改变。余额变更不需要重建快照：预检与扣费直接读库。
 	adminMux.HandleFunc("PUT /admin/api/users/{id}/balance", func(w http.ResponseWriter, r *http.Request) { userHandler.AdjustBalance(w, r, r.PathValue("id")) })
+	// 充值流水查询。**唯一一个**端点，作用域由会话身份决定（不接受参数指定
+	// 查谁）：普通用户只看到自己的，管理员也只看自己的那一份 —— 钱包页是
+	// 个人账本页，不存在「看全站充值」的用例。
+	//
+	// 路径 /admin/api/topups **不在** userAccessiblePrefixes 白名单里，所以
+	// AdminGateGuard 会要求管理员 —— 而普通用户需要看自己的充值记录。所以
+	// 必须把这个前缀加进白名单，作用域收窄由 handler 自己做
+	// （与 key_handler / usage_handler 的 callerScope 同一责任分配：
+	// 白名单只管「谁能进这个端点」，进来之后看谁由 handler 判）。
+	adminMux.HandleFunc("GET /admin/api/topups", userHandler.ListTopups)
 	adminMux.HandleFunc("POST /admin/api/me/password", userHandler.ChangePassword)
 	// 分组与模型白名单（多用户改造 P1）。全部 admin-only ——
 	// server.AdminGateGuard 是**前缀白名单**，/groups 不在其中即自动要求管理员。
@@ -408,7 +433,11 @@ func main() {
 	// 忘记密码由管理员在「用户管理」里重置。留着一个绕过 users 表的
 	// 管理入口，等于留一条「不产生会话、不受 auth_version 约束」的旁路。
 	adminGuarded := server.NewUserAuth(sessionMgr, db).
-		Guard(server.AdminGateGuard(adminMux))
+		// adminMux 传了两次，这是刻意的：AdminGateGuard 用**同一个 mux**
+		// 去查「这个请求会被哪个路由模式处理」，再拿那个模式比对普通用户
+		// 白名单（见 server.userAccessibleRoutes）。复用真实路由表而不是
+		// 手抄一份路径清单，是为了让白名单与真实路由**不可能漂移**。
+		Guard(server.AdminGateGuard(adminMux, adminMux))
 
 	// 管理写操作审计（DESIGN §13.3）：谁、何时、动了哪个资源、动了哪些字段
 	// （只记字段名不记值 —— body 里有 api_key 与密码明文）。
@@ -604,7 +633,19 @@ func main() {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	if err := srv.Shutdown(ctx); err != nil {
-		logger.Error("shutdown error", "error", err)
+		// Shutdown 到点只是**返回错误**，并不会终止仍在跑的 handler
+		// （流请求 WriteTimeout 为 0、生命周期只看 TTFT/空闲看门狗，
+		//  完全可能超过这 10s）。必须显式 Close 把在途连接掐掉：
+		// 它返回时所有 handler 都已被中断，之后不会再有人调 usage.record。
+		//
+		// 顺序不能反 —— 先 close 队列再掐 handler 的话，那条 handler 收尾时
+		// 恰好撞上「队列已关」。现在 record 侧也有 mu 兜底（双保险），
+		// 但把顺序修正过来才是它本来的意图。
+		logger.Error("graceful shutdown incomplete; forcing close of in-flight connections",
+			"error", err, "note", "streams longer than the shutdown budget are terminated")
+		if cerr := srv.Close(); cerr != nil {
+			logger.Error("forced close failed", "error", cerr)
+		}
 	}
 
 	// handler 都返回了，但在途的用量记录还在异步落库。不等它们，
@@ -977,6 +1018,59 @@ func cfgModelID(providerSlug, modelID string) string { return providerSlug + "/"
 // errorWriter 是「按下游协议写出错误响应」的统一签名。
 type errorWriter func(w http.ResponseWriter, status int, code, message string)
 
+// denyAdminKeyCreate 拦截**管理员**调用 POST /admin/api/keys（建 key）。
+//
+// # 需求（2026-10 控制面/数据面分离）
+//
+// 「普通用户自助建 key，管理员不能建」。管理员只做控制面管理；要调模型，
+// 需先建普通用户、由普通用户自己发 key（与管理员不能调 /v1 配套）。
+//
+// # 为什么在**路由/中间件层**拦，而不改 internal/admin/key_handler.go 的 Create
+//
+//  1. 改动面最小、边界最清晰：这是一条**路由级策略**，只针对「POST /admin/api/keys」
+//     这一个端点。写在 handler 里会与 Create 内部那一大段「自助建 key 的额度封顶」
+//     逻辑缠在一起，而那段的语义（谁能建、建出来多少额度）与本策略（谁**不允许**
+//     建）其实是两件事，混在一起反而更难读。
+//  2. 依赖的鉴权上下文本来就在这一层可用：AdminGateGuard / UserAuth 已把登录用户
+//     注入 context（server.UserFromContext），路由层读它即可，无需再查库。
+//  3. Create 仍保持「普通用户自助」的原逻辑不动，回归风险最低。
+//
+// 换来的约束：这条策略绑定在「main.go 注册的这条路由」上。若将来另有代码用
+// KeyHandler.Create 组新路由，必须记得同样套上本包装（或改到 handler 层）。
+// 已在下方注册处留下注释标注，避免后人漏掉。
+//
+// # 为什么管理员仍能**管理别人的** key（PATCH/DELETE/列表）
+//
+// 本策略只拦「新建」这一个动作。管理员照旧可以：列出全部 key、把已有的 key
+// 认领给某个用户（Update 的 user_id 路径）、禁用/启用/改配额/改分组覆盖等。
+// 也就是说管理员握有对存量 key 的**完整治理权**，只是不再亲手铸造新的数据面凭据。
+// 这正是需求要的「管理员只负责管理网关」。
+//
+// 身份缺失一律 401（fail-closed）：拿不到登录身份绝不等于「当作普通用户放行」，
+// 那会让匿名请求绕过本策略。与 key_handler.Create 的同一处口径一致。
+func denyAdminKeyCreate(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		u := server.UserFromContext(r.Context())
+		if u == nil || u.ID == "" {
+			// 空 ID 一律拒绝：绝不能让「拿不到身份」被当成「非管理员」而放行。
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusUnauthorized)
+			_, _ = w.Write([]byte(`{"error":{"message":"需要登录","type":"auth_error"}}`))
+			return
+		}
+		if u.IsAdmin() {
+			// 403（不是 401）：管理员身份是**已确认**的，不允许只是策略限制，
+			// 与数据面拦截管理员调 /v1 的口径一致。消息明确指向正确出路
+			// （建普通用户），避免管理员以为 key 创建坏了而去排查无关配置。
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusForbidden)
+			_, _ = w.Write([]byte(`{"error":{"message":"管理员账号不能创建 API key：请新建一个普通用户账户，由该用户自行创建 key 后用于调用模型","type":"auth_error"}}`))
+			return
+		}
+		next(w, r)
+	}
+}
+
 // writeAuthError 把鉴权失败映射成下游协议对应的错误响应。
 // /v1 下的每个端点都走这一处，免得口径漂移（例如某个端点把「密钥被禁用」
 // 也当成 401 而非 403）。状态码与 code 是协议无关的语义，形状由各协议渲染。
@@ -998,6 +1092,35 @@ func writeAuthError(w http.ResponseWriter, err error, writeErr errorWriter) {
 		//「你的网络位置不允许用这把 key」，后者往往指向防火墙/代理配置问题。
 		writeErr(w, http.StatusForbidden, "ip_not_allowed",
 			"source IP is not allowed for this API key")
+	case errors.Is(err, auth.ErrAdminCannotCallModel):
+		// 管理员账号不得调用模型（控制面/数据面分离，2026-10 需求确认）。
+		//
+		// # 为什么是 403 而不是 401
+		//
+		// 401 的语义是「凭据无效，请换一把 key」。而这里**key 和账号都是好的**，
+		// 只是角色不允许 —— 换多少把管理员的 key 都没用。回 401 会让 SDK 与
+		// 运维走错方向：SDK 按认证失败提示「重新配置 key」（甚至自动重试
+		// 新 key），运维则会以为 key 损坏/过期而白查一圈。
+		//
+		// 403 =「明确知道你是谁，但不允许」，与本文件既有的 key_disabled /
+		// key_expired / ip_not_allowed / model_not_allowed 口径一致。
+		//
+		// # 为什么**不**用 404 藏起来
+		//
+		// 隐藏存在性能减少信息泄露，但代价是管理员看到「key 不存在」，
+		// 完全不知道发生了角色策略变更 —— 与「给清晰消息、让他知道要去建
+		// 普通用户」的需求正相反。而且这里没有可枚举的攻击面：调用方本来
+		// 就持有这把 key 的明文，404 藏不住任何东西。
+		//
+		// # 为什么 code 要独立于 invalid_api_key
+		//
+		// SDK 按 error.type 分流重试：invalid_api_key 归 authentication_error，
+		// 客户端可能反复换 key 重试。本条的 type 映射见 outwire 的
+		// errorTypeFromCode（→ permission_error），是**终态**错误，
+		// 重试无意义，必须由人去建普通用户。
+		writeErr(w, http.StatusForbidden, "admin_cannot_call_model",
+			"administrator accounts cannot call models: create a regular user account "+
+				"and use the API key issued to that user")
 	default:
 		writeErr(w, http.StatusUnauthorized, "invalid_api_key", "authentication failed")
 	}
@@ -1425,6 +1548,31 @@ func handleIngress(pool *upstream.Pool, cfg *config.Config, usage *usageRecorder
 			return
 		}
 
+		// 整请求总预算（2026-10-10 修复的 P2）。
+		//
+		// 放在这里是因为：此刻配额已经预占、路由与白名单都已判定，再往后就是
+		// 真正开始打上游了 —— 而「打上游」是唯一会长时间挂住的阶段。放在
+		// 更早会让纯本地的判定（解码、限速）也背上这个 deadline，白白消耗预算。
+		//
+		// 绑到 r 上而不是局部 ctx：故障转移循环、配额收尾（rate.commit）、
+		// 用量落库都从 r 派生 context，让整条请求共享同一个预算。
+		//
+		// 为什么不能靠 WriteTimeout 兜底：它是**每个写操作**的间隔上限，
+		// 不是请求总时长；而流式响应天生长时间不写，套上去会掐死正常长流
+		// （main 里 WriteTimeout 为 0 的注释解释的正是这件事）。
+		//
+		// 到期后表现：由上游 ctx 传播为 error，各 attempt 的错误映射会把它
+		// 归类为传输层失败（可转移），链耗尽后回 504。已提交的流此时靠
+		// idle 看门狗收尾，不会出现「写了头却没有终止信号」。
+		budget := totalRequestBudget(snap, cfg)
+		ctx, cancelBudget := context.WithTimeout(r.Context(), budget)
+		defer cancelBudget()
+		r = r.WithContext(ctx)
+		logger.Debug("request total budget armed",
+			"budget_ms", budget.Milliseconds(),
+			"model", ing.model,
+			"request_id", server.RequestIDFromContext(r.Context()))
+
 		// 余额预检（Lead 与用户确认的口径：预检拒绝，不做预占/退款）。
 		//
 		// 位置：白名单之后、触碰上游之前。理由与上面的白名单同级 —— 白名单
@@ -1658,7 +1806,17 @@ func handleIngress(pool *upstream.Pool, cfg *config.Config, usage *usageRecorder
 		clientGone := r.Context().Err() != nil
 
 		statusCode, code, message := out.statusCode, out.code, out.message
-		if statusCode == 0 {
+		// 兜底：不许把 200 或 0 当作「失败结果」发出去。
+		//
+		// statusCode==0 是「没有候选目标」的哨兵，一直有 502 兜底。
+		// statusCode==200 则是**本该不可能**的状态：这条路径只在链已耗尽、
+		// 响应尚未提交时到达，任何失败都必须用 >=400 表达。修复前它真的发生过
+		// （见 outcomeFromErr 的注释：流式哨兵被映射成 200），客户端于是拿到
+		// 一个「成功但内容为空」的响应。把这一并归入 502，是为了让这条不变量
+		// 在**写出响应**这个最后一关口上也有牙齿 —— 将来谁再引入一个返回 200
+		// 的失败分支，症状会是「这里莫名其妙变成 502」，而不是「客户端拿到
+		// 假成功且无人察觉」。
+		if statusCode == 0 || statusCode == http.StatusOK {
 			statusCode, code, message = http.StatusBadGateway, "upstream_error", "no available upstream provider"
 		}
 		if !clientGone {
@@ -1722,7 +1880,37 @@ type attemptOutcome struct {
 }
 
 // outcomeFromErr 把一次上游 err 归类成「未提交」的结果。
+//
+// # 流式哨兵必须在**这里**单独处理（2026-10-10 修复的 P1）
+//
+// outwire.MapUpstreamError 把 ErrStreamTruncated / ErrStreamOverflow 映射成
+// (200, "", "")，理由是「内容已经写到线上去了，没什么可补的」。这个前提
+// **只在已提交时成立**，而本函数的每一个调用点都是**未提交**路径
+// （见 attemptStream 的 !gotFirst 分支：SSE 头要等到第一个事件到达才写）。
+//
+// 于是修复前：上游在首个事件前硬失败 → 拿到 (200,"","") → statusCode 非 0
+// 所以 main 的 502 兜底不生效 → 客户端收到
+// `{"error":{"message":"","type":"api_error"}}` 且 **HTTP 200**。
+// 两个后果叠加：
+//   - OpenAI/Anthropic SDK 只在 >=400 时抛错，于是调用方拿到一个空字符串和
+//     「成功」；按状态码记账的监控把它记成一条成功调用。
+//   - FailoverEligible 对这两个哨兵返回 false，故障转移链直接 break ——
+//     一个本该被链吸收的失败，反而被伪造成成功返回。
+//
+// 所以在这里改判：既给出真实的状态码，也让链继续尝试下一个目标。
+// MapUpstreamError 本身**保持原样** —— 它服务的已提交路径（「如实 truncated
+// 收尾，不追加错误体」）那个语义是对的，不该为迁就未提交路径而改掉。
 func outcomeFromErr(err error) attemptOutcome {
+	if errors.Is(err, rosetta.ErrStreamTruncated) || errors.Is(err, rosetta.ErrStreamOverflow) {
+		return attemptOutcome{
+			// 首批事件之前就断流 = 这次尝试什么也没产出，值得换目标再试。
+			eligible:     true,
+			credCooldown: 60 * time.Second,
+			statusCode:   http.StatusBadGateway,
+			code:         "upstream_error",
+			message:      "upstream stream failed before the first event",
+		}
+	}
 	eligible := outwire.FailoverEligible(err)
 	statusCode, code, message := outwire.MapUpstreamError(err)
 	return attemptOutcome{
@@ -1800,6 +1988,80 @@ func streamIdleTimeout(snap *snapshot.Snapshot, cfg *config.Config) time.Duratio
 	return cfg.StreamIdleTimeout()
 }
 
+// totalRequestBudget 是**整个 /v1 请求**（跨所有故障转移尝试）的总上限。
+//
+// # 为什么需要它（2026-10-10 修复的 P2）
+//
+// 此前没有任何东西限制一次请求的总时长，而每个环节的超时都是**逐跳**的：
+//
+//	拨号/TLS 10s + 等响应头 60s + 首字 30s  ≈ 100s / 次尝试
+//	× (failover_max_targets 默认 3)        ≈ 300s
+//
+// 于是「一串半死的上游」可以把客户端挂住约 5 分钟。期间它一直占着：一个
+// 下游连接、一个上游连接、一条配额预占行、一个故障转移槽位。攒够几个，
+// 网关对新请求而言已经不可用，而监控上看它「还活着」——
+// 病在上游，症状却在网关自己身上。
+//
+// # 为什么由现有配置推导，而不是新增一个「总超时」开关
+//
+// 总预算必须**大于**任何单跳预算（故障转移会逐次复用单跳预算），
+// 又必须**有限**。直接推导的好处是：运维调过的 upstream_timeout_ms、
+// stream_first_token_timeout_ms、failover_max_targets 立刻反映到总预算上，
+// 不需要「调完设置还要记得同步另一个总开关」这种跨字段的隐性依赖；
+// 也不存在「总超时配得比单跳还短」这种自相矛盾的配置。
+//
+// # 公式与余量的来历
+//
+// 每次尝试的最坏上界取「非流式超时」与「首字 + 响应头等待」中较大的一个 ——
+// 二者是不同路径，取 max 才不会把流式或非流式其中一条判短了。
+// 再乘 (目标数+1)：+1 是给「最后一个目标失败后写错误响应」留的额度
+// （failover_max_targets 限制的是尝试的**成功**目标数）。
+// 每跳再加 perAttemptSlack：给「取流、解析、写头、落库」这些不计入任何
+// 看门狗的开销留余量 —— 余量不足的表现是总预算先把健康请求掐掉，
+// 那是比「慢」严重得多的事故。
+//
+// 非流式请求同样套用：它们的单跳预算就是 upstream_timeout_ms，
+// 逐跳累加的后果完全一样。
+func totalRequestBudget(snap *snapshot.Snapshot, cfg *config.Config) time.Duration {
+	// 逐跳上界：两条路径取较大者。responseHeaderWait 是等上游响应头的上限，
+	// 它在**首字看门狗启动之前**发生，所以首字预算管不到它，必须单独算。
+	perAttempt := nonStreamTimeout(snap, cfg)
+	if first := firstTokenTimeout(snap, cfg) + responseHeaderWait; first > perAttempt {
+		perAttempt = first
+	}
+	perAttempt += perAttemptSlack
+
+	attempts := failoverMaxTargets(snap, cfg) + 1
+	budget := time.Duration(attempts) * perAttempt
+
+	// 下限保护：即便所有配置都被设成极小值，也要留出一个不至于让正常请求
+	// 必然失败的地板。上限保护同理：配置被设得极大时，总预算不应该大到
+	// 「等于没有」——那正是本函数要消灭的状态。
+	const (
+		minTotalBudget = 30 * time.Second
+		maxTotalBudget = 30 * time.Minute
+	)
+	if budget < minTotalBudget {
+		return minTotalBudget
+	}
+	if budget > maxTotalBudget {
+		return maxTotalBudget
+	}
+	return budget
+}
+
+const (
+	// responseHeaderWait 镜像 internal/upstream 里 ResponseHeaderTimeout 的
+	// 60s。它出现在这里是因为总预算必须算上「拿到响应头之前」的那段 ——
+	// 而首字看门狗是在 ChatStream 返回**之后**才启动的，覆盖不到这里。
+	//
+	// 两处必须同步改：改 upstream 的同时改这里，否则总预算会算少一段。
+	responseHeaderWait = 60 * time.Second
+	// perAttemptSlack 是每跳的固定余量，覆盖不计入任何看门狗的开销：
+	// 取流、心跳、协议转换、落库。给小了会让总预算提前掐掉健康请求。
+	perAttemptSlack = 5 * time.Second
+)
+
 // wantsStreamUsage reports whether the caller asked for a trailing usage
 // chunk, i.e. OpenAI's {"stream_options":{"include_usage":true}}. The flag
 // only controls what the gateway forwards downstream: the SDK already asks
@@ -1831,6 +2093,36 @@ func attemptStream(w http.ResponseWriter, r *http.Request, client *rosetta.Clien
 	upstreamReq.Model = cand.UpstreamModel.ModelID
 	ing.applyUpstreamExtras(upstreamReq, cand.Provider.Protocol)
 
+	// 首字预算只覆盖「等首个事件」这一段；建立连接那段交给 ResponseHeaderTimeout
+	// 与下面的总请求预算（2026-10-10 修复的 P2）。
+	//
+	// # 为什么**不**给 ChatStream 套一个带超时的子 context
+	//
+	// 直觉上「连接也该算进首字预算」，做法是
+	//
+	//	preCtx, cancel := context.WithTimeout(ctx, ttftTimeout)
+	//	stream, err := client.ChatStream(preCtx, req)
+	//	defer cancel()   // ← 危险，见下
+	//
+	// 但这个做法**会掐断正在正常输出的长流**，已实测确认：
+	// rosetta 的 ChatStream 内部是 `WithCancel(ctx)` 后把 ctx 直接交给
+	// provider.StreamChat，最终 `http.Do(ctx, call)`（SDK 内没有
+	// WithoutCancel / detach），所以 ctx 一被取消，net/http 立刻关闭响应体。
+	// 首字到达后再 cancel，等于在流输出到一半时把它掐了 ——
+	// 客户端拿到半截回答，且 status 无法表达（头已经写出去了）。
+	// 实测：发 4 个事件、首个之后取消 → 只读到 2 个，err=context canceled；
+	// 不取消的对照组 4 个全读完。`defer cancel()` 更糟，它要等整个
+	// attemptStream 返回才执行，等于把流的后半程一起掐掉。
+	//
+	// 所以首字预算**只**由下面的 ttftTimer 承担，它的作用范围天然是
+	// 「拿到流对象之后、首个事件之前」—— 这一段是安全的：此时尚未写出任何
+	// 字节，取消/关流都属于「未提交」，外层仍可转移。
+	//
+	// 「拨号 + 等响应头」这段仍由 internal/upstream 的
+	// ResponseHeaderTimeout（60s，镜像为 responseHeaderWait）兜底，
+	// 并计入 totalRequestBudget —— 它不会无限，只是比首字预算宽。
+	ttftTimeout := firstTokenTimeout(snap, cfg)
+
 	stream, err := client.ChatStream(ctx, upstreamReq)
 	if err != nil {
 		return outcomeFromErr(err)
@@ -1839,7 +2131,6 @@ func attemptStream(w http.ResponseWriter, r *http.Request, client *rosetta.Clien
 
 	// 首字（TTFT）看门狗：只掐「一个事件都没等到」的慢上游，触发即关流，
 	// 尚未写头 → 未提交 → 外层可转移。与下面的 idle 看门狗是两回事。
-	ttftTimeout := firstTokenTimeout(snap, cfg)
 	var ttftTimedOut atomic.Bool
 	// ttftDone 让「定时器已触发」这件事变成可等待的：Stop() 返回 false 只说明
 	// 回调已经**开始**跑（或跑完），不保证 stream.Close() 已落地。这个 channel
@@ -2183,6 +2474,23 @@ type usageRecorder struct {
 	logger *slog.Logger
 	queue  chan *store.UsageRecord
 	wg     sync.WaitGroup
+
+	// mu 保护 closed，且**把「发送」纳入临界区**（2026-10-10 修复的 P1）。
+	//
+	// 为什么需要它：`record` 里的 `select { case ch <- rec: default: }`
+	// 对**已关闭**的 channel 并不安全 —— 向关闭的 channel 发送是运行时
+	// panic，而不是「default 分支」那种「暂时不可写」。只写 `default` 挡不住。
+	//
+	// 触发顺序：Shutdown 的 10s 预算到期后它只是**返回错误**，并不会杀掉
+	// 仍在跑的 handler（http.Server.Shutdown 到点即返回）；紧接着 wait 关闭
+	// 队列；此时那条还活着的流收尾调用 record → send on closed channel →
+	// panic。流请求的存活时间本来就可能超过 10s（WriteTimeout 为 0，
+	// 生命周期只看 TTFT/空闲看门狗），所以这是正常时序，不是边角。
+	//
+	// 用锁把「判 closed + 发送」变成原子操作：要么在关闭前成功入队，
+	// 要么看见 closed 后走同步写，**永远不会 panic**。
+	mu     sync.Mutex
+	closed bool
 }
 
 const (
@@ -2191,7 +2499,29 @@ const (
 	// usageWorkers 是并发落库的 worker 数。SQLite 单写锁下并发写没有收益，
 	// 1 个 worker 足够，队列本身负责吸收突发。
 	usageWorkers = 1
+
+	// usageBatchSize 是一批最多攒多少条 usage 记录（2026-11 P1 性能修复）。
+	//
+	// 取 50 是**实测**出来的（AUDIT/fix-p1-perf.md 的 batch 探针，
+	// 同机同方法）：每行耗时随批大小的曲线是
+	//   bs=1 → 305µs   bs=10 → 77µs   bs=50 → 39µs   bs=200 → 45µs
+	// 收益在 50 附近饱和，再往上反而略升（大 VALUES 文本变大，
+	// 解析与 B-tree 插入都更贵）。
+	//
+	// 上限的意义不只是吞吐，还有**延迟上界**：一批攒到 50 才发，
+	// 最坏情况下每条记录要等 49 个同伴都到齐才落库。高负载下 50 条
+	// 形成只需要几十微秒（实测 39µs/行 × 50），可以忽略；
+	// 而**低负载下队列根本攒不满**，靠 `default` 分支立刻发出，
+	// 所以延迟不受批大小影响 —— 这是选「非阻塞攒批」而非「定时批量」的原因。
+	usageBatchSize = 50
 )
+
+// ctxBackground 是 context.Background 的短别名。
+//
+// 落库是异步的、与请求无关，用 Background 而不是请求的 ctx：
+// 客户端断开**不该**取消用量落库（那次调用真的发生了、真的要记账）。
+// 抽成常量只是为了不重复 import context 后到处敲长名字。
+func ctxBackground() context.Context { return context.Background() }
 
 func newUsageRecorder(db *store.Store, logger *slog.Logger) *usageRecorder {
 	u := &usageRecorder{
@@ -2214,16 +2544,96 @@ func newUsageRecorder(db *store.Store, logger *slog.Logger) *usageRecorder {
 // 「报表显示花了 X、余额少了 Y」且无人能发现。所以这里用
 // CreateUsageRecordWithCost —— 它返回的**就是写进 cost_total 列的那个变量**
 // （不是重算一次），换句话说「扣的 = 报表的」在结构上就不可能漂移。
+//
+// # 批量落库（2026-10-11，P1 性能修复）
+//
+// 原来是 `for rec := range u.queue` 一次一条，每条一个**独立事务**。
+// 实测单条落库 **296µs/行**；把 N 行并进一个事务后，批大小 50 时只需
+// **39µs/行（7.6×）**。差的是每次独立事务的固定开销（commit）。
+//
+// 写池是单连接（SetMaxOpenConns(1)），于是每个成功请求都要付一次那个
+// 固定开销 —— 这就是 AUDIT/test-perf.md 那条 P1 的直接成因：
+// 吞吐被钉在落库速率上（实测仅 INSERT 时 3693 req/s）。
+//
+// 现在改成：**攒够一批（或队列已排空）就一个事务写入**。
+// 计价仍**逐条**由 store 的 freezeUsageCost 算（批量只省提交开销，
+// **不改计价语义**），所以「扣的 = 报表的」这条不变量逐字不变。
+//
+// # 改后的事务边界
+//
+// 一批 N 条 = **一个事务**（一条 N 行多值 INSERT）。
+// 失败时**整批回滚**，store 返回**全 0 费用**，调用方据此**整批不扣费**。
+// 这与单条路径的「落库失败 → 不扣费」口径完全一致：账记不下来时不收钱。
+//
+// 扣费**不跟着批量**，仍是逐条一个事务 —— 理由见 AUDIT/fix-p1-perf.md 第 4 节：
+// 幂等键 (request_id, user_id) 是逐条的，聚合扣费会让「哪几笔算已扣过」
+// 变成需要额外状态才能回答的问题，错一次就是漏收或重复收费。
 func (u *usageRecorder) worker() {
 	defer u.wg.Done()
-	for rec := range u.queue {
-		cost, err := u.db.CreateUsageRecordWithCost(context.Background(), rec)
-		if err != nil {
-			u.logger.Error("failed to record usage", "error", err, "key_id", rec.AccessKeyID)
-			// 落库失败**不扣费**：账都记不下来时扣钱，等于凭空收了一笔
-			// 无据可查的费用。宁可漏扣（cost_total 侧有 RecomputeCost 事后
-			// 补救）也不做无据收费。
-			continue
+
+	// batch 是复用缓冲区：高负载下每秒数千批，每批都 make 一次会直接
+	// 变成 GC 压力（而 GC 压力正是我们想减掉的东西）。
+	batch := make([]*store.UsageRecord, 0, usageBatchSize)
+
+	for {
+		// 取第一条：**阻塞**读。关闭时 channel 被 close，这里返回 !ok，
+		// 冲掉手上这批再退出（关停 drain 的全部意义就是别弄丢已发生的调用）。
+		rec, ok := <-u.queue
+		if !ok {
+			u.flush(ctxBackground(), batch)
+			return
+		}
+		batch = append(batch, rec)
+
+		// 尽力多攒：把**当前已就绪**的记录挪进这批。
+		//
+		// 用 `default` 而不是阻塞读：阻塞会把「攒批」变成「每个请求等一批」，
+		// 尾延迟会变成 N×批间隔，低负载时尤其难看。这里要的是
+		// 「能攒就攒，攒不到就立刻发」—— 低负载时批自然很小（退化成单条），
+		// 而低负载本来就不需要吞吐优化，**低延迟更重要**。
+	drain:
+		for len(batch) < usageBatchSize {
+			select {
+			case r2, ok2 := <-u.queue:
+				if !ok2 {
+					break drain
+				}
+				batch = append(batch, r2)
+			default:
+				break drain
+			}
+		}
+
+		u.flush(ctxBackground(), batch)
+		batch = batch[:0]
+	}
+}
+
+// flush 把一批记录落库，然后**逐条**扣费。
+//
+// 落库是批量的（省提交开销），扣费保持逐条（幂等键逐条不同，聚合风险高
+// —— 见 worker 的注释）。
+//
+// 失败语义：整批落库失败 → store 返回全 0 费用 → **一条都不扣**。
+// 这与单条路径一致，且比「部分扣费」更好：部分扣费会让「报表与余额」
+// 在这一批里出现无法解释的偏差，而用量是**计费依据**，宁缺勿滥。
+func (u *usageRecorder) flush(ctx context.Context, batch []*store.UsageRecord) {
+	if len(batch) == 0 {
+		return
+	}
+	costs, err := u.db.CreateUsageRecordsBatched(ctx, batch)
+	if err != nil {
+		u.logger.Error("failed to record usage (batched)", "error", err,
+			"count", len(batch), "key_id", batch[0].AccessKeyID)
+		// 落库失败**不扣费**：账都记不下来时扣钱，等于凭空收了一笔
+		// 无据可查的费用。宁可漏扣（cost_total 侧有 RecomputeCost 事后
+		// 补救）也不做无据收费。
+		return
+	}
+	for i, rec := range batch {
+		var cost float64
+		if i < len(costs) {
+			cost = costs[i]
 		}
 		u.charge(rec, cost)
 	}
@@ -2261,7 +2671,13 @@ func (u *usageRecorder) worker() {
 // 预占"的既有决策不冲突：后者是终身累计不退就永久泄漏，前者随窗口翻转自愈，
 // 而我们收 0 元本来就是正确结果（不知道实际花了多少，就不该收钱）。
 func (u *usageRecorder) charge(rec *store.UsageRecord, costYuan float64) {
-	// 管理员短路（纵深防御：预检已短路，这里再判一次不依赖任何 DB 状态）。
+	// 管理员短路（纵深防御：数据面上不可达，见 billing.go 的 balanceExempt）。
+	//
+	// 2026-10 控制面/数据面分离后，管理员在 auth.Authenticate 就被拒
+	// （ErrAdminCannotCallModel），压根不会有管理员的 usage 落到这里。保留
+	// 这道短路是纵深防御：余额是「钱」，万一某条路径绕过 auth 送来一条管理员
+	// 的 usage 记录，这里立刻 no-op，不去碰他的余额。判据不依赖任何 DB 状态、
+	// 只读快照，代价为零。
 	if balanceExempt(rec.UserID) {
 		return
 	}
@@ -2284,8 +2700,13 @@ func (u *usageRecorder) charge(rec *store.UsageRecord, costYuan float64) {
 	}
 	// 元 → 分走 store 的 YuanToCents（唯一实现）：预检侧估的与这里扣的
 	// 必须用同一个换算，否则「预检以为够、实际差一分钱」会成为常态。
-	err := u.db.ChargeBalance(context.Background(), rec.UserID,
-		store.YuanToCents(costYuan), rec.RequestID)
+	//
+	// 传给 ChargeBalance 的是**元**而不是分（2026-10-10）：单价可能远低于
+	// 一分（实测 price_input=3.0 元/百万时，一次 8000 token 的调用只有
+	// 0.004 元），按分取整就是 0，而 0 分在扣费侧是 no-op —— 一次都扣不到钱。
+	// 余数的累计与折算都由 store 内部完成，这里只负责把「这一次实际花了
+	// 多少元」这个已经固化在 cost_total 里的数字送过去。
+	err := u.db.ChargeBalance(context.Background(), rec.UserID, costYuan, rec.RequestID)
 	switch {
 	case err == nil:
 	case errors.Is(err, store.ErrInsufficientBalance):
@@ -2314,23 +2735,42 @@ func (u *usageRecorder) charge(rec *store.UsageRecord, costYuan float64) {
 // 地方」。这里刻意不抽公共函数：两条路径的收尾已经足够短，抽出去反而让
 // 「它们是同一件事」这件事看不出来。
 func (u *usageRecorder) record(rec *store.UsageRecord) {
-	select {
-	case u.queue <- rec:
-	default:
-		// 队列已满 —— 背压：同步写。
-		cost, err := u.db.CreateUsageRecordWithCost(context.Background(), rec)
-		if err != nil {
-			u.logger.Error("failed to record usage (sync fallback)", "error", err, "key_id", rec.AccessKeyID)
+	// 「判关闭 + 入队」必须在同一把锁里完成，否则会与 wait 的 close 竞争，
+	// 产生 send on closed channel（见 mu 的注释）。锁外的同步写只碰 DB。
+	u.mu.Lock()
+	if !u.closed {
+		select {
+		case u.queue <- rec:
+			u.mu.Unlock()
 			return
+		default:
+			// 队列已满 —— 落到下面同步写（背压）。
 		}
-		u.charge(rec, cost)
 	}
+	u.mu.Unlock()
+
+	// 到这里有两种可能：队列满（背压），或队列已关闭（关停收尾）。
+	// 后者仍走同步写而不是丢弃：这条记录对应的是一次**已经发生的调用**，
+	// 而关停 drain 的全部意义就是别把它弄丢。
+	cost, err := u.db.CreateUsageRecordWithCost(context.Background(), rec)
+	if err != nil {
+		u.logger.Error("failed to record usage (sync fallback)", "error", err, "key_id", rec.AccessKeyID)
+		return
+	}
+	u.charge(rec, cost)
 }
 
 // wait 关闭队列、等 worker 把在途写入全部完成，或 ctx 到期（到期即放弃，
 // 不让一个卡住的 SQLite 写把进程关停拖成无限期）。
+//
+// closed 标志与 close **同处一把锁**：这是 record 判据与 close 动作的配对点。
+// 两者分开就又出现「record 已判完未关闭、close 恰好插进来」的窗口。
 func (u *usageRecorder) wait(ctx context.Context) {
+	u.mu.Lock()
+	u.closed = true
 	close(u.queue)
+	u.mu.Unlock()
+
 	done := make(chan struct{})
 	go func() {
 		u.wg.Wait()

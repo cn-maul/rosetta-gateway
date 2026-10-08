@@ -136,6 +136,137 @@ func (s *Store) CreateUsageRecordWithCost(ctx context.Context, r *UsageRecord) (
 	return cost, nil
 }
 
+// CreateUsageRecordsBatched 批量落库：**一个事务内一条多值 INSERT**，返回每条固化的费用。
+//
+// # 为什么需要它（性能）
+//
+// 单条落库的实测成本是 **296µs/行**（AUDIT/fix-p1-perf.md 的 batch 探针）。
+// 拆开看，这 296µs 里绝大部分是**每次独立事务的固定开销**：
+// 把 N 行并进一个事务后，bs=50 时降到 **39µs/行（7.6×）**。
+// 单写连接（SetMaxOpenConns(1)）下每个成功请求都要付一次这个固定开销，
+// 于是网关吞吐被钉在落库速率上（实测 3693 req/s，仅 INSERT）。
+//
+// # 关键约束：**每条的费用仍然由 freezeUsageCost 单独算**
+//
+// 不是「先插入再统一计价」，也不是「算一次总价」—— 定价依赖每条记录的
+// provider_id / upstream_model / token 数，必须逐条算。批量只省掉
+// 事务与语句的**提交**开销，不改变任何计价语义。
+//
+// 这保证「扣的 = 报表的」这条不变量**在批量下逐字不变**：返回的第 i 个
+// 费用就是第 i 条写进 cost_total 列的那个值，与单条路径同源。
+//
+// # 返回值与失败语义（调用方必须照此处理）
+//
+// 返回 costs[i] 是第 i 条固化的费用（失败则为 0）。
+// 事务是**全有或全无**：任一行 INSERT 失败（主键冲突等）整个事务回滚，
+// 此时**所有** costs 都返回 0，调用方必须把整批当作「全部未落库」处理
+// —— 包括**不要**为任何一条扣费。这与单条路径的
+// 「落库失败 → 返回 (0, err) → 不扣费」完全一致。
+func (s *Store) CreateUsageRecordsBatched(ctx context.Context, recs []*UsageRecord) ([]float64, error) {
+	if len(recs) == 0 {
+		return nil, nil
+	}
+	// 单条直接走原路径：批量构造（拼 VALUES、分配 args）反而比一次
+	// Exec 慢，且引入一条需要单独维护的代码路径毫无收益。
+	if len(recs) == 1 {
+		cost, err := s.CreateUsageRecordWithCost(ctx, recs[0])
+		if err != nil {
+			return []float64{0}, err
+		}
+		return []float64{cost}, nil
+	}
+
+	costs := make([]float64, len(recs))
+
+	// 计价在事务外做：freezeUsageCost 只读数据库（查价），
+	// 放到事务内会延长持写锁时间，而查价走的是读池（WAL 下不阻塞）。
+	costs = s.batchComputeCosts(recs)
+
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return make([]float64, len(recs)), err
+	}
+	defer func() { _ = tx.Rollback() }() //nolint:errcheck // 已提交时是 no-op
+
+	var (
+		sb   strings.Builder
+		args = make([]any, 0, len(recs)*usageInsertColumns)
+	)
+	sb.WriteString(`INSERT INTO usage_records
+		(id, ts, access_key_id, user_id, public_model, provider_id, upstream_model,
+		 ingress_protocol, stream, input_tokens, output_tokens, total_tokens,
+		 reasoning_tokens, cached_tokens, usage_state, status, http_status,
+		 error_code, latency_ms, ttfb_ms, request_id, cost_total) VALUES `)
+
+	for i, r := range recs {
+		if i > 0 {
+			sb.WriteByte(',')
+		}
+		sb.WriteString("(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)")
+		args = append(args, usageInsertArgs(r, costs[i])...)
+	}
+
+	if _, err := tx.ExecContext(ctx, sb.String(), args...); err != nil {
+		// 全批回滚：返回全 0，调用方不得为任何一条扣费。
+		return make([]float64, len(recs)), err
+	}
+	if err := tx.Commit(); err != nil {
+		return make([]float64, len(recs)), err
+	}
+	return costs, nil
+}
+
+// usageInsertColumns 是 usage_records 写入路径的列数（仅用于容量预估）。
+const usageInsertColumns = 22
+
+// batchComputeCosts 逐条算固化费用，并顺带完成 token 负值归一与 ts 兜底。
+//
+// 归一必须在这里做（而不能只在单条路径做）：批量路径也是写入口，
+// 绕过归一会让负 token 经触发器永久拉低终身累计（见
+// CreateUsageRecordWithCost 的注释）。
+func (s *Store) batchComputeCosts(recs []*UsageRecord) []float64 {
+	now := time.Now().UnixMilli()
+	costs := make([]float64, len(recs))
+	for i, r := range recs {
+		if r.InputTokens < 0 {
+			r.InputTokens = 0
+		}
+		if r.OutputTokens < 0 {
+			r.OutputTokens = 0
+		}
+		if r.TotalTokens < 0 {
+			r.TotalTokens = 0
+		}
+		if r.ReasoningTokens < 0 {
+			r.ReasoningTokens = 0
+		}
+		if r.CachedTokens < 0 {
+			r.CachedTokens = 0
+		}
+		if r.Ts == 0 {
+			r.Ts = now
+		}
+		costs[i] = s.freezeUsageCost(context.Background(), r)
+	}
+	return costs
+}
+
+// usageInsertArgs 把一条记录摊成 INSERT 的绑定参数（顺序与列清单一致）。
+func usageInsertArgs(r *UsageRecord, cost float64) []any {
+	stream := 0
+	if r.Stream {
+		stream = 1
+	}
+	return []any{
+		r.ID, r.Ts, r.AccessKeyID, nullIfEmpty(r.UserID), r.PublicModel,
+		r.ProviderID, r.UpstreamModel, r.IngressProtocol, stream,
+		r.InputTokens, r.OutputTokens, r.TotalTokens,
+		r.ReasoningTokens, r.CachedTokens, r.UsageState, r.Status,
+		r.HTTPStatus, nullIfEmpty(r.ErrorCode), r.LatencyMs, r.TTFBMs,
+		nullIfEmpty(r.RequestID), cost,
+	}
+}
+
 // priceUsage 是**全仓唯一的单价公式**：把一次调用的 token 数换算成费用（元）。
 //
 // # 为什么必须只有这一份

@@ -60,6 +60,16 @@ type User struct {
 	// 一个**永远能用的欠费账户**。判定一律走 Unlimited 标志，不要看数值。
 	BalanceCents int64
 	Unlimited    bool
+	// BalanceRemainder 是**不足一分**的累计余数（微元，1e-6 元）。
+	//
+	// 为什么用户对象需要带它：管理面必须把「已扣」与「待结算」都显示出来。
+	// 余额只按分扣减，而单价可能远低于一分（实测 3 元/百万 token 时，一次
+	// 一万 token 的调用只有 5 厘），于是相当长一段时间里余额纹丝不动 ——
+	// 用户会以为没扣钱。只有把余数一起显示，「钱去哪了」才是自洽的。
+	//
+	// 单位微元、不是分的小数：与 balance_cents 用 INTEGER 而非 REAL 同一
+	// 理由（浮点累加留长尾误差），见 store.go 的建表注释。
+	BalanceRemainder int64
 	// UsedTokens 不由本包维护 —— 见 §4.3 决策：用户级已用量
 	// 走实时 SUM 查询，不用触发器（触发器无法感知 key 被删除，
 	// 会永久留下偏高的计数）。此字段仅供管理面展示导入用。
@@ -113,7 +123,8 @@ const userColumns = `id, username, COALESCE(display_name,''), COALESCE(password_
 		        role, status, COALESCE(group_id,''), quota_tokens, used_tokens, auth_version,
 		        COALESCE(remark,''), created_at, updated_at, last_login_at,
 		        COALESCE(balance_cents, 0) AS balance_cents,
-		        (balance_cents IS NULL) AS balance_unlimited`
+		        (balance_cents IS NULL) AS balance_unlimited,
+		        COALESCE(balance_remainder, 0) AS balance_remainder`
 
 // ListUsers 返回全部用户，按创建时间排序。
 func (s *Store) ListUsers(ctx context.Context) ([]User, error) {
@@ -207,11 +218,15 @@ func (s *Store) CreateUser(ctx context.Context, u *User) error {
 	_, err := s.db.ExecContext(ctx,
 		`INSERT INTO users (id, username, display_name, password_hash, role, status,
 		                    group_id, quota_tokens, used_tokens, auth_version, remark,
-		                    created_at, updated_at, last_login_at, balance_cents)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		                    created_at, updated_at, last_login_at, balance_cents, balance_remainder)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		u.ID, u.Username, u.DisplayName, u.PasswordHash, u.Role, u.Status,
 		nullIfEmpty(u.GroupID), u.QuotaTokens, u.UsedTokens, u.AuthVersion, u.Remark,
-		u.CreatedAt, u.UpdatedAt, u.LastLoginAt, balanceValue(u.BalanceCents, u.Unlimited))
+		u.CreatedAt, u.UpdatedAt, u.LastLoginAt, balanceValue(u.BalanceCents, u.Unlimited),
+		// 余数建号时恒为 0（新建账号不可能有历史消费）。显式写出而不是让它
+		// 走 DEFAULT，是为了让「这一列存在且为 0」与「忘了这一列」在代码里
+		// 区分得开 —— 后者会静默丢钱。
+		u.BalanceRemainder)
 	if err == nil {
 		// 回写归一化后的值：落库用的是局部 now，结构体可能仍是零值，
 		// 会让创建响应里的 created_at 是 0（与随后 GET 到的同一条不一致）。
@@ -420,7 +435,7 @@ func scanUser(sc scanner) (*User, error) {
 	if err := sc.Scan(&u.ID, &u.Username, &u.DisplayName, &u.PasswordHash,
 		&u.Role, &u.Status, &u.GroupID, &u.QuotaTokens, &u.UsedTokens, &u.AuthVersion,
 		&u.Remark, &u.CreatedAt, &u.UpdatedAt, &u.LastLoginAt,
-		&u.BalanceCents, &unlimited); err != nil {
+		&u.BalanceCents, &unlimited, &u.BalanceRemainder); err != nil {
 		return nil, err
 	}
 	u.Unlimited = unlimited == 1

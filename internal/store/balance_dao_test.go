@@ -131,6 +131,24 @@ func TestBalanceOf_UnknownUserIsErrorNotUnlimited(t *testing.T) {
 
 // ---- 2. 扣费与 cost_total 口径完全一致 ----
 
+// centsYuan 把「分」写成 ChargeBalance 的入参（元）。
+//
+// 2026-10-10 起 ChargeBalance 收**元**而不是分：单次费用可能远小于一分，
+// 按分取整会直接变 0 而一次都扣不到（见 ChargeBalance 的「余数」一节）。
+// 测试里绝大多数场景都是整数分，用这个助手保持可读。
+func centsYuan(c int64) float64 { return float64(c) / 100 }
+
+// readRemainder 读某用户当前攒下的不足一分余数（微元）。
+func readRemainder(t *testing.T, st *Store, userID string) int64 {
+	t.Helper()
+	var v int64
+	if err := st.read.QueryRowContext(context.Background(),
+		`SELECT balance_remainder FROM users WHERE id = ?`, userID).Scan(&v); err != nil {
+		t.Fatalf("read remainder: %v", err)
+	}
+	return v
+}
+
 // 本用例是整个模块的核心：**扣掉的分必须等于 cost_total 换算的分**。
 //
 // 计价口径（priceUsage）：未命中输入 = MAX(input-cached,0)×price_input，
@@ -157,14 +175,20 @@ func TestCharge_CostMatchesUsageRecordCostTotal(t *testing.T) {
 	if diff := cost - 0.208; diff > 1e-9 || diff < -1e-9 {
 		t.Fatalf("cost_total = %v, want 0.208", cost)
 	}
-	want := YuanToCents(cost)
-	if want != 21 {
-		t.Fatalf("YuanToCents(0.208) = %d, want 21 (四舍五入，不是截断)", want)
-	}
-	if err := st.ChargeBalance(ctx, "u1", want, "req-1"); err != nil {
+	// 0.208 元 = 20.8 分。余数机制下**取整方向变成向下取整**（20 分），
+	// 零头 0.8 分留在 balance_remainder 里继续攒。
+	//
+	// 为什么不再四舍五入成 21：余数已经保证「余额减少总量 == 报表费用总量」
+	// ——每一分钱最终都会被扣掉，只是可能分几次。若这里再 round 一次向上取整，
+	// 就等于凭空多扣用户 0.2 分，而那 0.2 分没有任何消费支撑。
+	// （对比：修复前没有余数，取整误差是**永久丢失**的那一种。）
+	if err := st.ChargeBalance(ctx, "u1", cost, "req-1"); err != nil {
 		t.Fatalf("charge: %v", err)
 	}
-	assertBalance(t, st, "u1", 100_00-21, true)
+	assertBalance(t, st, "u1", 100_00-20, true)
+	if got := readRemainder(t, st, "u1"); got != 8_000 {
+		t.Errorf("余数 = %d 微元, want 8000（0.208 元 = 20.8 分，零头 0.8 分留着）", got)
+	}
 }
 
 // 幂等：同一 requestID 扣两次只扣一次，且第二次**不是错误**。
@@ -175,7 +199,7 @@ func TestCharge_IdempotentOnSameRequestID(t *testing.T) {
 	mustUser(t, st, "u1", 1000, false)
 
 	for i := 0; i < 5; i++ {
-		if err := st.ChargeBalance(ctx, "u1", 30, "same-req"); err != nil {
+		if err := st.ChargeBalance(ctx, "u1", centsYuan(30), "same-req"); err != nil {
 			t.Fatalf("charge #%d must be a no-op nil, got %v", i, err)
 		}
 	}
@@ -194,7 +218,7 @@ func TestCharge_IdempotentOnSameRequestID(t *testing.T) {
 	}
 
 	// 换一个 requestID 就是**新的一次消费**，必须真的再扣一次。
-	if err := st.ChargeBalance(ctx, "u1", 30, "other-req"); err != nil {
+	if err := st.ChargeBalance(ctx, "u1", centsYuan(30), "other-req"); err != nil {
 		t.Fatalf("charge other: %v", err)
 	}
 	assertBalance(t, st, "u1", 1000-60, true)
@@ -209,7 +233,7 @@ func TestCharge_ZeroAmountIsCompleteNoOp(t *testing.T) {
 
 	// 负数也当 0（费用没有负的概念，负费用流进来会变成「扣费即充值」）。
 	for _, amt := range []int64{0, -1, -100} {
-		if err := st.ChargeBalance(ctx, "u1", amt, fmt.Sprintf("zero-%d", amt)); err != nil {
+		if err := st.ChargeBalance(ctx, "u1", float64(amt), fmt.Sprintf("zero-%d", amt)); err != nil {
 			t.Fatalf("charge(%d) must be no-op nil, got %v", amt, err)
 		}
 	}
@@ -249,7 +273,7 @@ func TestCharge_ZeroAmountIsCompleteNoOp(t *testing.T) {
 	if cost != 0 {
 		t.Fatalf("unpriced model cost = %v, want 0", cost)
 	}
-	if err := st.ChargeBalance(ctx, "u1", YuanToCents(cost), "req-free"); err != nil {
+	if err := st.ChargeBalance(ctx, "u1", cost, "req-free"); err != nil {
 		t.Fatalf("charge unpriced: %v", err)
 	}
 	assertBalance(t, st, "u1", 500, true)
@@ -267,20 +291,20 @@ func TestCharge_InsufficientLeavesBalanceUntouched(t *testing.T) {
 	st := testStore(t, t.TempDir()+"/gw.db")
 	mustUser(t, st, "u1", 50, false) // 0.5 元
 
-	err := st.ChargeBalance(ctx, "u1", 300, "req-big")
+	err := st.ChargeBalance(ctx, "u1", centsYuan(300), "req-big")
 	if !errors.Is(err, ErrInsufficientBalance) {
 		t.Fatalf("err = %v, want ErrInsufficientBalance", err)
 	}
 	assertBalance(t, st, "u1", 50, true) // 一分没扣，且绝不为负
 
 	// 恰好够时正常扣，扣完归零 —— 归零是**正常终态**，不是欠费。
-	if err := st.ChargeBalance(ctx, "u1", 50, "req-exact"); err != nil {
+	if err := st.ChargeBalance(ctx, "u1", centsYuan(50), "req-exact"); err != nil {
 		t.Fatalf("exact charge must succeed: %v", err)
 	}
 	assertBalance(t, st, "u1", 0, true)
 
 	// 归零后再扣必须报欠费，且余额仍为 0（不会变负）。
-	if err := st.ChargeBalance(ctx, "u1", 1, "req-after"); !errors.Is(err, ErrInsufficientBalance) {
+	if err := st.ChargeBalance(ctx, "u1", centsYuan(1), "req-after"); !errors.Is(err, ErrInsufficientBalance) {
 		t.Fatalf("err = %v, want ErrInsufficientBalance", err)
 	}
 	assertBalance(t, st, "u1", 0, true)
@@ -294,7 +318,7 @@ func TestCharge_UnlimitedUserIsNeverDebited(t *testing.T) {
 	mustUser(t, st, "vip", 0, true)
 
 	for i := 0; i < 3; i++ {
-		if err := st.ChargeBalance(ctx, "vip", 10_000, fmt.Sprintf("vip-%d", i)); err != nil {
+		if err := st.ChargeBalance(ctx, "vip", centsYuan(10_000), fmt.Sprintf("vip-%d", i)); err != nil {
 			t.Fatalf("unlimited charge must be nil no-op, got %v", err)
 		}
 	}
@@ -332,7 +356,7 @@ func TestCharge_ConcurrentNeverGoesNegative(t *testing.T) {
 		go func(i int) {
 			defer wg.Done()
 			<-start // 最大化并发重叠，让竞态真的有机会发生
-			err := st.ChargeBalance(ctx, "u1", 30, fmt.Sprintf("conc-%d", i))
+			err := st.ChargeBalance(ctx, "u1", centsYuan(30), fmt.Sprintf("conc-%d", i))
 			mu.Lock()
 			defer mu.Unlock()
 			switch {
@@ -384,7 +408,7 @@ func TestCharge_ConcurrentSameRequestIDChargesOnce(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			<-start
-			if err := st.ChargeBalance(ctx, "u1", 100, "retry-key"); err != nil {
+			if err := st.ChargeBalance(ctx, "u1", centsYuan(100), "retry-key"); err != nil {
 				t.Errorf("idempotent charge must be nil, got %v", err)
 			}
 		}()

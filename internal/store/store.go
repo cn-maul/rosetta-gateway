@@ -209,6 +209,25 @@ func (s *Store) migrate() error {
 			-- 天然的「此处无值」载体，且 COALESCE 后可安全落进 int64 扫描，
 			-- 不会触发 "converting NULL to string/int is unsupported"。
 			balance_cents INTEGER,
+			-- balance_remainder 是**不足一分**的累计余数（2026-10-10 新增）。
+			--
+			-- 为什么需要它：单价可能远低于「一分」。实测一个 price_input=3.0
+			-- 元/百万 tokens 的模型，一次 8000 token 的调用只有 0.004 元 ——
+			-- 而扣费单位是分，math.Round(0.4) = 0，于是 ChargeBalance 对
+			-- 0 分直接 no-op。结果是**一次都扣不到钱**，无论余额多少，
+			-- 报表却在正常累计费用（实测 6 次调用消费 3.33 分、实扣 2 分）。
+			-- 这不是「漏了一次」，是低价模型下**根本不存在能收上钱的单次调用**。
+			--
+			-- 单位选 **1e-6 元（微元）**而不是「分的小数」：浮点累加会留下
+			-- 长尾误差（与 balance_cents 用 INTEGER 而非 REAL 的理由相同），
+			-- 而 int64 的微元可以精确表示到百万分之一元，远细于一分。
+			-- 满 MicrosPerCent 个微元（= 1 分，见 balance_dao 的常量定义）
+			-- 时才折算成 1 分真正扣减余额，零头继续留在本列攒着。
+			--
+			-- 语义与 balance_cents **刻意不同**：余数对不限额用户无意义
+			-- （余额无限，不需要「攒够再扣」），故用 NOT NULL DEFAULT 0
+			-- 而不是 NULL —— NULL 在这一列没有第三种语义可表达。
+			balance_remainder INTEGER NOT NULL DEFAULT 0,
 			auth_version  INTEGER NOT NULL DEFAULT 1,
 			remark        TEXT,
 			created_at    INTEGER NOT NULL,
@@ -333,27 +352,73 @@ func (s *Store) migrate() error {
 			pruned_through_day TEXT NOT NULL DEFAULT ''
 		)`,
 		`INSERT OR IGNORE INTO usage_totals (id) VALUES (1)`,
-		// balance_charges：扣费流水，按 request_id 幂等去重。
+		// balance_charges：扣费流水，按 (request_id, user_id) 幂等去重。
 		//
 		// 为什么需要它：网络重试与流式中断重连会让**同一次调用**的收尾
 		// 走两遍（客户端重试、上游重试后的重放）。若直接 `UPDATE ... SET
 		// balance = balance - ?` 幂等性就无从谈起 —— 每次调用都扣一遍，
 		// 余额被重复扣减且没有任何提示。
 		//
-		// 用 PRIMARY KEY (request_id) 让「去重」这件事由数据库原子保证：
-		// 同一 request_id 第二次 INSERT 撞唯一约束 → INSERT OR IGNORE 静默
-		// 跳过 → 只扣一次。**在事务内先占位再扣费**，保证「占位成功但扣费
-		// 失败」不会留下重复扣费的窗口（见 balance_dao.ChargeBalance）。
+		// 主键是 **(request_id, user_id) 复合键**，不是单独的 request_id
+		// （2026-10-10 修复的 P0）。只按 request_id 去重时，两个不同用户
+		// 碰巧撞上同一个 request_id，第二个人会被**静默跳过** —— 一次
+		// 真正的扣费就这样凭空消失，且没有任何报错。request_id 来源于
+		// 客户端可控的请求头，碰撞并不遥远；更要紧的是这条不变量本身就是
+		// 错的，「去重」的定义必须是「同一次调用」，而调用属于某个用户。
+		// 见 balance_dao.ChargeBalance 的说明与 fixBalanceChargesPK。
+		//
+		// 在**事务内先占位再扣费**，保证「占位成功但扣费失败」不会留下
+		// 重复扣费的窗口（见 balance_dao.ChargeBalance）。
 		//
 		// amount_cents 记录实际扣掉的金额（含被夹到 0 的情况），便于
 		// 事后排查「报表显示花了 X、余额少了 Y」这类漂移。ts 是毫秒时间戳。
 		`CREATE TABLE IF NOT EXISTS balance_charges (
-			request_id   TEXT PRIMARY KEY,
+			request_id   TEXT NOT NULL,
 			user_id      TEXT NOT NULL,
 			amount_cents INTEGER NOT NULL,
-			ts           INTEGER NOT NULL
+			ts           INTEGER NOT NULL,
+			PRIMARY KEY (request_id, user_id)
 		)`,
 		`CREATE INDEX IF NOT EXISTS idx_balance_charges_user ON balance_charges(user_id, ts)`,
+		// balance_topups：充值流水（管理员给钱），balance_charges 的**反向**一侧。
+		//
+		// 为什么必须有它：充值此前完全没有留痕 —— AdjustBalance 只做一句
+		// UPDATE users SET balance_cents = … 就返回，而 balance_charges 记的
+		// 是方向相反的扣费，audit_log 刻意只存字段名不存值（「充了多少」根本
+		// 没有被记下来）。于是余额可以凭空增加，而事后没有任何东西能与它
+		// 对账。余额是钱，这条流水是「钱进来」这一侧的对账依据。
+		//
+		// **刻意不写数据迁移**：存量充值已经丢失，补记等于凭空造账 ——
+		// 那比「查不到历史充值」糟得多（查不到是已知缺口，造账是假数据）。
+		// 本表从启用之日起才可信。
+		//
+		// 金额一律整数分（与 users.balance_cents 同口径）：对账要求
+		// 「流水求和 == 余额变化」严格成立，掺浮点就永远不成立。
+		`CREATE TABLE IF NOT EXISTS balance_topups (
+			id                TEXT PRIMARY KEY,
+			user_id           TEXT NOT NULL,
+			delta_cents       INTEGER NOT NULL,
+			balance_after     INTEGER NOT NULL,
+			-- was_unlimited：本次是否把「不限额」（balance_cents IS NULL）
+			-- 切成了有限额。AdjustBalance 对 NULL 用 COALESCE 起算，于是
+			-- 「给不限额用户充值 100 元」会把无限变成 100 元 —— 那是**语义
+			-- 突变**（对用户是实打实的收紧），不是普通加钱。不记这一列，
+			-- 对账时无法区分「充值」与「把无限额度降级成有限额度」。
+			was_unlimited      INTEGER NOT NULL DEFAULT 0,
+			-- 操作者：余额是钱，「谁给的」必须可追溯到具体账号。用户名冗余
+			-- 存一份 —— 账号可能被改名或删除，流水不该因主体消失而失去署名
+			-- （与 usage_records 冗余固化 user_id 同一理由）。
+			--
+			-- operator_id NOT NULL：**没有操作者就��是一次无法追责的改动**，
+			-- 不该被允许落库。operator_username 可空（引导态合成管理员没有
+			-- 真实用户名，见 user_admin_handler.requireAdmin），读回时 COALESCE
+			-- 成空串。
+			operator_id        TEXT NOT NULL,
+			operator_username  TEXT,
+			ts                 INTEGER NOT NULL,
+			remark             TEXT
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_balance_topups_user ON balance_topups(user_id, ts)`,
 	}
 
 	for i, m := range migrations {
@@ -363,6 +428,12 @@ func (s *Store) migrate() error {
 	}
 
 	if err := s.ensureColumns(); err != nil {
+		return err
+	}
+	// 扣费幂等表的主键修复（2026-10-10 P0）：单列 request_id 主键会让两个用户
+	// 撞同一个 request_id 时第二个人的扣费被静默跳过 —— 一次真正的扣费凭空消失。
+	// 必须排在任何扣费写入之前，且要逐行搬运老数据（那里面是已发生的账目）。
+	if err := s.fixBalanceChargesPK(); err != nil {
 		return err
 	}
 	// P1.5 归档流水线。顺序是**刻意的**，别重排：
@@ -563,6 +634,10 @@ func (s *Store) ensureColumns() error {
 		// 「以前没有余额概念，现在也没有 ⇒ 不限额」。因此这里刻意**不带
 		// DEFAULT**，存量行迁移后为 NULL。
 		{"users", "balance_cents", "INTEGER"},
+		// 不足一分的余数（2026-10-10）。DEFAULT 0：存量用户的余数从 0 起算，
+		// 这是唯一正确的初值 —— 他们历史上那些「不足一分」的调用已经
+		// 永久丢失了，无法也不该凭空补记（那等于凭空多扣用户的钱）。
+		{"users", "balance_remainder", "INTEGER NOT NULL DEFAULT 0"},
 	}
 
 	for _, a := range additions {

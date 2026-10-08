@@ -60,6 +60,56 @@ func YuanToCents(yuan float64) int64 {
 	return int64(math.Round(yuan * 100))
 }
 
+// MicrosPerCent 是「一分」对应的微元数（1 元 = 1e6 微元，1 分 = 1e4 微元）。
+//
+// 换算：1 元 / 100 分 = 1e6 / 1e2 = 1e4。写成 100_000 是错的（那是 0.1 元）。
+const MicrosPerCent = 10_000
+
+// YuanToMicros 把「元」换算成「微元」（1e-6 元）的整数。
+//
+// 存在意义见 balance_remainder 列的注释：单次调用可能只有几毫元
+// （0.004 元），按分取整直接变 0；而余额扣减仍以**分**为单位，
+// 所以中间需要一个比「分」细、比浮点稳的粒度来攒。
+//
+// 用 int64 而非 REAL：浮点累加会留长尾误差（与 balance_cents 用 INTEGER
+// 是同一个理由，见 store.go 的建表注释）。
+//
+// 负数与 0 返回 0，与 YuanToCents 同口径：费用没有负的概念。
+func YuanToMicros(yuan float64) int64 {
+	if yuan <= 0 {
+		return 0
+	}
+	// 先四舍五入到微元，再转 int64。直接 int64(yuan*1e6) 是**截断**：
+	// 一次 0.0000019 元的调用会变 0，而它确实是发生的费用。
+	micros := math.Round(yuan * 1e6)
+	if micros < 1 {
+		// 极端小的正费用（低于 0.5 微元）也至少记 1 微元 ——
+		// 记 0 等于把这次消费丢掉，而余数机制的意义正是「不丢」。
+		//
+		// # 这是一处**故意的单边偏差**，要知道它的方向（2026-10-10 实测）
+		//
+		// 与 YuanToCents 的四舍五入不同：后者的误差零均值（有时多、有时少，
+		// 大数下互相抵消），而这里**永远向上取整**，所以偏差是单向的、
+		// 随调用次数**线性累积**，不会自愈。
+		//
+		// 实测：10000 次 × 0.0000001 元（每次真实费用 0.1 微元），
+		// 真实合计 0.1 分，实扣 1 分 —— 放大约 10 倍。
+		//
+		// 为什么仍然选向上取整：两种偏差里，这一种更小也更可控。
+		//   - 向上取整：每次最多多收 1 微元（1e-6 元），要累积到 1 分钱
+		//     需要一万次「费用低于半微元」的调用 —— 而这种量级的单价
+		//     （< 0.5 元/百万 token）在本项目的定价里不现实。
+		//   - 记 0：那笔消费**永久消失**，且与「未配价模型记 0」在账上
+		//     完全同形，事后无法区分「本来免费」与「漏收」。
+		//
+		// 若将来出现真正低于 1 微元/次的定价，正确做法是**下沉记账单位**
+		// （如微元的千分之一），而不是在这里继续放大 —— 那会把线性偏差
+		// 变成不可接受的数量级。
+		return 1
+	}
+	return int64(micros)
+}
+
 // BalanceOf 读某用户的余额（单位：分）。
 //
 // 返回的 unlimited=false 表示**不限额**（列值 NULL）：此时 cents 无意义
@@ -128,6 +178,27 @@ func (s *Store) BalanceOf(ctx context.Context, userID string) (cents int64, limi
 // 热路径请改用 BalanceOf 自己比：那样能把「读失败」与「余额不够」两种
 // 完全不同的响应分开（本方法把两者都压成 false + err，够用但不如分开精确）。
 // 本方法保留给不需要区分错误来源的调用方（管理面、报表、测试）。
+// BalanceRemainderOf 读某用户当前攒下的不足一分余数（微元）。
+//
+// 单独一个方法而不是并进 BalanceOf：热路径（余额预检）只需要余额本身，
+// 多扫一列是白付的成本；而展示层（总览、/me）要的恰恰是这个值。
+//
+// 与 BalanceOf 同一口径：用户不存在返回 ErrNotFound，读失败原样上抛。
+// **不降级成 0** —— 余数显示成 0 等于告诉用户「钱没被扣」，而真实情况
+// 可能是「查不出来」，那正是需要有人看一眼的情况。
+func (s *Store) BalanceRemainderOf(ctx context.Context, userID string) (int64, error) {
+	var v int64
+	err := s.read.QueryRowContext(ctx,
+		`SELECT COALESCE(balance_remainder, 0) FROM users WHERE id = ?`, userID).Scan(&v)
+	if errors.Is(err, sql.ErrNoRows) {
+		return 0, ErrNotFound
+	}
+	if err != nil {
+		return 0, err
+	}
+	return v, nil
+}
+
 func (s *Store) HasSufficientBalance(ctx context.Context, userID string, amountCents int64) (bool, error) {
 	cents, limited, err := s.BalanceOf(ctx, userID)
 	if err != nil {
@@ -139,24 +210,51 @@ func (s *Store) HasSufficientBalance(ctx context.Context, userID string, amountC
 	return cents >= amountCents, nil
 }
 
-// ChargeBalance 扣一次费。amountCents **必须**等于该次调用的 cost_total
-// 换算成的分（用 YuanToCents 换算），否则余额与报表对不上。
+// ChargeBalance 扣一次费。amountYuan **必须**等于该次调用的 cost_total
+// （元）。扣减余额的单位仍是**整数分**，但入参改成元 —— 因为单次费用可能
+// 远小于一分（见下方「余数」一节），用整数分当入参会在函数入口就把
+// 这笔费用抹成 0。
+//
+// # 余数：不足一分的费用怎么收（2026-10-10 修复）
+//
+// 实测一个 price_input=3.0 元/百万 tokens 的模型，一次 8000 token 的调用
+// 只有 0.004 元。旧实现按 `YuanToCents(cost)` = math.Round(0.4) = **0**
+// 入参，而 0 分直接 no-op —— 于是**一次都扣不到钱**，无论余额多少。
+// 报表却在正常累计费用：实测 6 次调用真实消费 3.33 分、实扣 2 分。
+// 这不是「偶尔漏一次」，而是低价模型下**不存在能收上钱的单次调用**，
+// 计费对该部署形态整体失效。
+//
+// 做法：函数内部把费用累进 users.balance_remainder（单位：微元，1e-6 元），
+// 每满 MicrosPerCent 个微元（= 1 分，见该常量的定义）才真正扣减余额，
+// 并把零头留在余数里继续攒。
+// 于是「每次不足一分」变成「延迟到凑够一分时一次性收」：
+//   - 账目仍然对齐：余额减少的总量 == 报表费用总量（余数留在余数列里，
+//     它同样是可对账的）；
+//   - 幂等语义不变：占位行仍然只写一次，重试不会重复累加。
 //
 // # 幂等：同一 requestID 只扣一次
 //
 // 网络重试、流式中断重连、上游重试后的重放，都会让**同一次调用**的收尾
 // 走两遍。扣费是「减余额」这种不可逆操作，重复执行等于重复扣钱。
 //
-// 做法是 balance_charges 表以 request_id 为主键（见 store.go 的建表），
-// 在**同一事务内**先 INSERT OR IGNORE 占位、再执行扣费：
-//   - 占位命中（影响 0 行）说明这个 requestID 已扣过 → 直接返回 nil
+// 做法是 balance_charges 表以 (request_id, user_id) 为主键（见 store.go 的建表），
+// 在**同一事务内**先 INSERT OR IGNORE 占位、再累加余数与扣费：
+//   - 占位命中（影响 0 行）说明这个 requestID 对这个用户已扣过 → 直接返回 nil
 //     （幂等命中**不是错误**：重试方要的正是「别再扣一次」，回错误只会
 //     让调用方把它当成扣费失败而重试更多次），不碰余额；
-//   - 占位成功 → 执行 UPDATE 扣费 → 提交。
+//   - 占位成功 → 累加余数 → 够一分则扣余额 → 提交。
 //
-// 「先占位再扣、且在同一事务」是不可颠倒的：反过来（先扣后占位）时两个
+// 主键里带上 user_id 不是冗余：只按 request_id 去重时，**两个不同用户**撞上
+// 同一个 request_id，第二个人会被静默跳过 —— 一次真正的扣费凭空消失且无任何
+// 报错（2026-10-10 修复的 P0，见 store.fixBalanceChargesPK）。
+//
+// 「先占位再累加、且在同一事务」是不可颠倒的：反过来（先扣后占位）时两个
 // 并发重试会各自扣一次、再各占一次位（第二次占位被主键拒绝，但**余额已经
 // 扣过了**）—— 主键只挡住了流水重复，没挡住钱重复。
+//
+// 扣费失败时占位行必须随事务一起回滚：它证明的是「已扣过」，而失败的
+// 那次并没有扣。把它提交下去会让此后**每一次**重试都走幂等快速路径、
+// 一分钱都不扣（见下方 ErrInsufficientBalance 分支的注释）。
 //
 // requestID 为空时不做幂等（每次调用都扣）。真实请求都有 request_id
 // （网关从请求头取），空串只在手工/测试路径出现。
@@ -179,7 +277,22 @@ func (s *Store) HasSufficientBalance(ctx context.Context, userID string, amountC
 //   - 余额守在原处，两种做法下都停在同一个可观察状态（余额为 0 或接近 0），
 //     区别只在流水金额是否与报表一致。
 //
-// # amountCents == 0 时完全 no-op
+// # 余额不足时余数会**被回滚丢弃**（2026-10-10 实测确认的已知缺口）
+//
+// 此处原先写着「余数照留，不因扣费失败而丢弃」—— 那与实现**矛盾**：
+// 失败分支走 tx.Rollback()，同一事务内先累加的 balance_remainder
+// 会被一并撤销。下面那条分支的注释记了实测结论（调用方拿到
+// ErrInsufficientBalance 后只记日志、**不重试**，所以「靠重试重新累加」
+// 的说法不成立）。
+//
+// 实际后果：已欠费用户每次不足一分的零头静默漏收（不扣款、无流水、
+// 对账查不出）。严重度有限 —— ≥1 分的部分本就按设计不扣（欠费不硬扣），
+// 丢的只是零头。
+//
+// 正确的修法是让**调用方在欠费时也保留零头**（例如记进一条独立的待结算
+// 流水），那是口径变更，未做。要改这里之前先读下面那条分支的完整说明。
+//
+// # amountYuan <= 0 时完全 no-op
 //
 // 未配价模型、usage missing（上游没报 token 数）的记录，cost_total 恒 0。
 // 此时**不占位、不 UPDATE**：反复往 balance_charges 塞 0 行只会让表无意义
@@ -191,12 +304,13 @@ func (s *Store) HasSufficientBalance(ctx context.Context, userID string, amountC
 // balance_cents 为 NULL（不限额）的用户，扣费直接返回 nil 且不动余额。
 // 余额无限、减一个数没有意义；更不能把它 COALESCE 成 0 去「扣 0 元」——
 // 那会凭空造出一条流水，让对账凭空多出一笔「消费 0 元」。
-func (s *Store) ChargeBalance(ctx context.Context, userID string, amountCents int64, requestID string) error {
+// 余数同理不清：不限额用户不需要「攒够再扣」。
+func (s *Store) ChargeBalance(ctx context.Context, userID string, amountYuan float64, requestID string) error {
 	if userID == "" {
 		return ErrNotFound
 	}
-	// 0 元 = 完全 no-op：见上方「amountCents == 0 时完全 no-op」。
-	if amountCents <= 0 {
+	// 0 元 = 完全 no-op：见上方「amountYuan <= 0 时完全 no-op」。
+	if amountYuan <= 0 {
 		return nil
 	}
 
@@ -208,16 +322,92 @@ func (s *Store) ChargeBalance(ctx context.Context, userID string, amountCents in
 
 	if requestID != "" {
 		// 先占位：主键冲突 = 已扣过，幂等返回。
+		//
+		// amount_cents 的初值写死 0，且**它就是最终值**（除非本次费用够一分，
+		// 那时下面的分支会把它 UPDATE 成实扣分数）。这不是随手写的默认值：
+		// 「不足一分」那条分支依赖它保持 0，所以**不要再补一条把它写成 0 的
+		// UPDATE** —— 那是纯冗余的写（2026-10-10 已删除过一次，见下方注释）。
 		res, err := tx.ExecContext(ctx,
 			`INSERT OR IGNORE INTO balance_charges (request_id, user_id, amount_cents, ts)
-			 VALUES (?, ?, ?, ?)`,
-			requestID, userID, amountCents, time.Now().UnixMilli())
+			 VALUES (?, ?, 0, ?)`,
+			requestID, userID, time.Now().UnixMilli())
 		if err != nil {
 			return err
 		}
 		if n, aerr := res.RowsAffected(); aerr == nil && n == 0 {
 			return tx.Commit()
 		}
+	}
+
+	// 累加余数（微元），并**读回**累加后的新值。
+	//
+	// 必须用一条 UPDATE 的 RETURNING 读法而不是「SELECT 再 UPDATE」：
+	// 后者是 check-then-act，两个并发请求都读到同一份余数、各自认为
+	// 「还没凑够一分」，于是这一分永远收不上（或者反过来重复收）。
+	// balance_remainder 的累加与读回放在同一条语句里，SQLite 写锁保证串行。
+	//
+	// `balance_cents IS NOT NULL` 把不限额用户挡在外面：余额无限，
+	// 不需要「攒够再扣」，余数对他也没有意义（见文件末的说明）。
+	var remainder int64
+	err = tx.QueryRowContext(ctx,
+		`UPDATE users SET balance_remainder = balance_remainder + ?
+		  WHERE id = ? AND balance_cents IS NOT NULL
+		  RETURNING balance_remainder`,
+		YuanToMicros(amountYuan), userID).Scan(&remainder)
+	if errors.Is(err, sql.ErrNoRows) {
+		// UPDATE 没命中：要么用户不存在，要么是不限额用户。两者语义相反，
+		// 必须区分 —— 把「不限额」报成 ErrNotFound 会让上层以为账号有问题。
+		var probe sql.NullInt64
+		if perr := tx.QueryRowContext(ctx,
+			`SELECT balance_cents FROM users WHERE id = ?`, userID).Scan(&probe); perr != nil {
+			if errors.Is(perr, sql.ErrNoRows) {
+				return ErrNotFound
+			}
+			return perr
+		}
+		// 行存在但 balance_cents 为 NULL = 不限额：正常 no-op。
+		return tx.Commit()
+	}
+	if err != nil {
+		return err
+	}
+	// 未够一分：余数已攒下，余额不动，流水行的 amount_cents **保持占位时的 0**。
+	// 这是正常状态而不是「没扣到钱」——下次凑够时一起收。
+	//
+	// 2026-10-10（性能）：此处原有一条
+	//	UPDATE balance_charges SET amount_cents = 0 WHERE request_id=? AND user_id=?
+	// 已删除。它是**纯冗余的写** —— 占位 INSERT 时 amount_cents 写死的就是 0
+	// （见上面的 INSERT，第三个参数是字面量 0），这条 UPDATE 只是把已经是 0
+	// 的列再写成 0。
+	//
+	// 为什么值得删：低价模型下单次费用普遍不足一分，**这条语句几乎每笔都
+	// 执行**，是纯写放大。实测（Windows，本机）单笔 ChargeBalance 约 171µs，
+	// 其中单条 UPDATE...RETURNING 约 50µs —— 删掉一条语句是能测出来的收益。
+	//
+	// 为什么安全：一笔扣费只走「不足一分」或「够扣的钱」**其中一个**分支，
+	// 而唯一会写非 0 的地方是后者（下面的 UPDATE）。两条路径互斥，所以
+	// 不足一分时该列恒为占位时的 0。行为完全不变，只是少一次写。
+	if remainder < MicrosPerCent {
+		return tx.Commit()
+	}
+
+	// 够扣的钱：整分部分从余额扣掉，零头留在余数里继续攒。
+	//
+	// 取**整除**而不是四舍五入：余数已经保证累积总额是准的，这里若再
+	// round 一次就等于把余数的精度优势抵消掉。零头留在余数列，下一轮
+	// 继续攒 —— 这正是「不丢一分钱」的关键。
+	cents := remainder / MicrosPerCent
+	newRemainder := remainder % MicrosPerCent
+	if _, err := tx.ExecContext(ctx,
+		`UPDATE users SET balance_remainder = ?, updated_at = ? WHERE id = ?`,
+		newRemainder, time.Now().UnixMilli(), userID); err != nil {
+		return err
+	}
+	// 流水行记**本次实际从余额扣掉的分数**，让对账有据可依。
+	if _, err := tx.ExecContext(ctx,
+		`UPDATE balance_charges SET amount_cents = ? WHERE request_id = ? AND user_id = ?`,
+		cents, requestID, userID); err != nil {
+		return err
 	}
 
 	// 扣费：**一条 UPDATE 原子完成「判余额 + 扣减」**。
@@ -241,7 +431,7 @@ func (s *Store) ChargeBalance(ctx context.Context, userID string, amountCents in
 		`UPDATE users
 		    SET balance_cents = MAX(0, balance_cents - ?), updated_at = ?
 		  WHERE id = ? AND balance_cents IS NOT NULL AND balance_cents >= ?`,
-		amountCents, now, userID, amountCents)
+		cents, now, userID, cents)
 	if err != nil {
 		return err
 	}
@@ -256,24 +446,52 @@ func (s *Store) ChargeBalance(ctx context.Context, userID string, amountCents in
 	//   - 行不存在         → ErrNoRows。不是欠费，也不该报错让调用方
 	//     重试（重试同样打不中任何行）。按 no-op 收尾。
 	//   - balance 为 NULL  → 不限额。正常返回 nil。
-	//   - balance < amount  → **余额真的不够**（守卫拦下的那一种）。
+	//   - balance < cents  → **余额真的不够**（守卫拦下的那一种）。
+	// 失败路径必须**回滚**，不能提交（2026-10-10 修复的 P0）。
+	//
+	// 占位行是「这次已经扣过了」的证据，与扣费结果必须同生共死。
+	// 这两条分支一旦提交，就把「其实没扣钱」的占位永久写进了
+	// balance_charges：此后**每一次**重试都命中上面的 RowsAffected()==0
+	// 快速路径（见 ChargeBalance 开头的幂等说明），直接 return，什么都不扣。
+	// 现象是静默的：请求正常返回、报表照常出账，余额却一直不动 ——
+	// 而这恰恰是重试路径存在的全部意义被悄悄废掉。
+	//
+	// 可达性不是理论问题：ErrInsufficientBalance 在余额刚好被并发透支时
+	// 就会走到（balance_dao_test.go 的 TestChargeBalance_* 系列也直接覆盖），
+	// 随后用户充值重试 —— 钱没扣。
+	//
+	// 交给 defer 的 Rollback 即可：已提交的分支在 Rollback 里是 no-op。
+	//
+	// # 回滚会一并撤销余数累加 —— 那笔零头就此丢失（2026-10-10 实测确认）
+	//
+	// 这个失败分支里，同一事务内先累加的 balance_remainder 会随回滚一起被
+	// 撤销。原注释写着「余数照留，由调用方重试时重新累加实现」—— 但实测读了
+	// 真实调用方（cmd/gateway/main.go 的 usageRecorder.charge）：它拿到
+	// ErrInsufficientBalance 只记一条 ERROR 日志就返回，**没有任何重试**。
+	// 那条「调用方会重试」的路径并不存在。
+	//
+	// 后果：已欠费用户每次不足一分的零头静默漏收（不扣款、无流水、对账查不出）。
+	// 严重度有限 —— ≥1 分的部分本就按设计不扣（欠费不硬扣是既定口径），
+	// 真正丢的只是零头；但**注释与实现不一致**必须纠正，否则后来人会继续
+	// 相信一条不存在的重试路径。
+	//
+	// 为什么不在这里单独提交余数：那要么让「本次费用」在调用方重试时被
+	// 累加两次（若真有重试），要么需要把余数累加挪到事务外 —— 后者会让并发
+	// 累加失去原子性（余数用 UPDATE...RETURNING 保证不丢，见上文）。
+	// 正确的修法是**调用方在欠费时也保留零头**（例如把余数记在一条独立的
+	// 待结算流水里），那是口径变更，不在本次范围内。
 	var balance sql.NullInt64
 	err = tx.QueryRowContext(ctx,
 		`SELECT balance_cents FROM users WHERE id = ?`, userID).Scan(&balance)
 	switch {
 	case errors.Is(err, sql.ErrNoRows):
-		if err := tx.Commit(); err != nil {
-			return err
-		}
 		return ErrNotFound
 	case err != nil:
 		return err
-	case balance.Valid && balance.Int64 < amountCents && charged == 0:
+	case balance.Valid && balance.Int64 < cents && charged == 0:
 		// 余额确实不够。结算已经发生（上游已被调用、费用已固化进
 		// cost_total），钱收不回 —— 报欠费比悄悄放过更诚实。
-		if err := tx.Commit(); err != nil {
-			return err
-		}
+		// 同样回滚占位：这次没扣成，充值后的重试必须还能扣。
 		return ErrInsufficientBalance
 	}
 	return tx.Commit()
