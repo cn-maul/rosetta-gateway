@@ -6,7 +6,6 @@ import (
 	"errors"
 	"log/slog"
 	"net/http"
-	"strings"
 	"time"
 
 	"github.com/cn-maul/rosetta-gateway/internal/store"
@@ -89,7 +88,11 @@ type UserAuthMiddleware struct {
 func NewUserAuth(mgr *userauth.Manager, st SessionStore) *UserAuthMiddleware {
 	return &UserAuthMiddleware{
 		mgr: mgr, store: st,
-		throttle: NewFailureThrottle(loginFailLimit, loginCooldown),
+		// 刻意去掉并发上限（WithoutConcurrencyCap）：会话鉴权一次 KDF 都不跑，
+		// 并发上限在这里没有任何防护收益，只有误伤 —— 总览页并发 5 个请求、
+		// 上限是 4，于是每个登录用户打开总览都吃一个 429
+		// （2026-10-10 修复）。失败次数与冷却照常生效，撞无效令牌的防护没削弱。
+		throttle: NewFailureThrottle(loginFailLimit, loginCooldown).WithoutConcurrencyCap(),
 	}
 }
 
@@ -113,52 +116,118 @@ func (a *UserAuthMiddleware) Guard(next http.Handler) http.Handler {
 	})
 }
 
-// userAccessiblePrefixes 是**普通用户**可访问的管理端点前缀（白名单）。
+// userAccessibleRoutes 是**普通用户**可访问的管理端点，按
+// 「方法 + 路由模式」**精确**列出（不再是前缀）。
 //
-// # 为什么用白名单而不是逐个标 admin-only
+// # 为什么从「前缀白名单」改成「精确路由」（2026-10-10）
 //
-// 黑名单（逐个给 admin 端点套 requireAdmin）漏标一条 = 越权，
-// 而且是静默的：接口照常 200，没人发现。51 个路由靠人手标，
-// 漏标的概率不低 —— 实测第一版就漏了 stats / settings / providers /
-// routes 四个，普通用户全部能读。
+// 原来是一串前缀，用 strings.HasPrefix 判定。安全性靠「该放行的路径在列表里」，
+// 但前缀匹配有个**结构性缺陷**：它会自动放行该子树下**未来新增的一切端点**。
 //
-// 白名单反过来：漏标一条 = 普通用户访问自己的功能被 403，
-// 立刻会被发现并修掉。**把「静默越权」换成「显式不可用」**，
-// 这是安全默认值该有的方向。
+// 实测踩到过：新增 /admin/api/usage/by-user（全站账单）时，它因为以
+// /admin/api/usage 开头而被网关层**静默放行**，唯一防线只剩 handler 里的
+// requireAdmin。当时是安全的（那个 handler 写了 requireAdmin），但：
+//   - 网关层不拦、**也不报错**，表现为端点照常 200；
+//   - 将来有人在这前缀下加端点忘了写 requireAdmin → 静默越权；
+//   - 现有测试只能覆盖**已存在**的端点，覆盖不了「将来会加的」。
 //
-// 每条白名单端点内部都必须自己做作用域收窄（见
-// internal/admin/key_handler.go 与 usage_handler.go 的 callerScope），
-// 否则白名单本身就成了泄露入口。
-var userAccessiblePrefixes = []string{
-	"/admin/api/keys",  // 作用域收窄：只看自己的
-	"/admin/api/usage", // 含 by-* 与 history，均按 user_id 收窄
-	"/admin/api/stats", // 同上；费用对普通用户归零（见 stats_handler）
-	"/admin/api/me",
-	"/admin/api/logout",
+// 改成精确模式后，新增端点**默认 fail-closed**：它的模式不在本表里，
+// 普通用户直接被网关层 403。要放行必须显式加一行 —— 漏洞从「静默」变成
+// 「显式且立刻可见」。
+//
+// # 为什么用路由模式而不是裸路径
+//
+// 表里的键是 `mux.Handler(r)` 返回的**注册模式**（如
+// `PATCH /admin/api/keys/{id}`），不是请求的原始路径。这样做的好处：
+//   - 与真实路由用**同一个匹配引擎**，零漂移（手抄路径迟早对不上）；
+//   - 路径参数天然支持（`{id}` 由 mux 负责匹配，不必自己解析）；
+//   - 方法也是键的一部分，所以 `DELETE /admin/api/keys/{id}` 与
+//     `GET /admin/api/keys` 是两个独立授权项 —— 不能靠「路径在表里」
+//     就放行所有方法。
+//
+// # 每条都必须自己做作用域收窄
+//
+// 放行只意味着「能进这个端点」，**进来之后能看谁的数据**由 handler 判
+// （见 internal/admin/key_handler.go 与 usage_handler.go 的 callerScope）。
+// 否则本表本身就成了泄露入口。
+//
+// # 刻意**不在**表里的
+//
+//   - `/admin/api/usage/by-user`：全站账单，纯 admin-only。
+//   - `/admin/api/usage/prune`：不可逆删除，纯 admin-only。
+//
+// 两者仍保留 handler 内的 requireAdmin 作为第二道防线（纵深防御）。
+// 网关层现在也拦了 —— 这正是本次加固的目的。
+var userAccessibleRoutes = map[string]bool{
+	// 访问密钥：普通用户自助管理自己的 key（handler 按 user_id 收窄）。
+	"GET /admin/api/keys":                       true,
+	"POST /admin/api/keys":                      true,
+	"PATCH /admin/api/keys/{id}":                true,
+	"DELETE /admin/api/keys/{id}":               true,
+	"POST /admin/api/keys/{id}/recompute-usage": true,
+
+	// 用量与统计：均按 user_id 收窄。
+	"GET /admin/api/usage":             true,
+	"GET /admin/api/usage/by-key":      true,
+	"GET /admin/api/usage/by-model":    true,
+	"GET /admin/api/usage/by-provider": true,
+	"GET /admin/api/usage/by-day":      true,
+	"GET /admin/api/usage/history":     true,
+	"GET /admin/api/usage/history.csv": true,
+	"GET /admin/api/stats":             true,
+
+	// 身份与自助改密。
+	"GET /admin/api/me":           true,
+	"POST /admin/api/me/password": true,
+
+	// 充值流水：普通用户**要能看自己的**充值记录 —— 那正是钱包页的意义
+	// （有权知道自己什么时候被充过钱、充了多少）。作用域完全由会话身份决定，
+	// 该端点不接受任何参数指定查谁（见 admin.UserHandler.ListTopups）。
+	"GET /admin/api/topups": true,
+
+	"POST /admin/api/logout": true,
+
 	// 模型名清单：key 级白名单要能「用户自助收紧」，就得让普通用户读到
-	// 可选模型。返回内容已按身份收窄（普通用户只拿到自己组内的），
-	// 且只是一串公开模型名 —— 不含上游、凭据、路由拓扑。
-	"/admin/api/model-names",
+	// 可选模型。返回内容已按身份收窄（只拿到自己组内的），且只是一串公开
+	// 模型名 —— 不含上游、凭据、路由拓扑。
+	"GET /admin/api/model-names": true,
 }
 
 // AdminGateGuard 在会话鉴权之后再做一次「非白名单即要求管理员」的判定。
 //
 // 必须套在 UserAuth 之后 —— 它依赖 context 里的用户身份。
-func AdminGateGuard(next http.Handler) http.Handler {
+//
+// # routes 参数的作用
+//
+// 它只用来说明「这个请求会被哪个路由模式处理」，**不负责转发**（转发交给
+// next）。生产里两者是同一个 adminMux（见 cmd/gateway/main.go）——
+// 传两次看着冗余，但这正是「查路由表」与「执行路由」解耦的代价：
+// 本函数可以拿真实的注册模式去比对白名单，而不必手抄一份路径清单。
+//
+// 若 routes 为 nil（测试里可能），判定退化为「一律要求管理员」——
+// fail-closed，不会因为漏传参数而放行任何人。
+func AdminGateGuard(routes *http.ServeMux, next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		p := r.URL.Path
-		for _, pre := range userAccessiblePrefixes {
-			if strings.HasPrefix(p, pre) {
+		u := UserFromContext(r.Context())
+		// 管理员（含引导态合成 admin）直接放行，连路由表都不必查。
+		if u != nil && u.IsAdmin() {
+			next.ServeHTTP(w, r)
+			return
+		}
+
+		// 普通用户：拿真实路由模式去比对白名单。
+		//
+		// 未注册的路径 pattern 为空 → 不在表里 → 403（fail-closed）。
+		// 这一点由 TestProbeServeMuxHandlerSemantics 的实测固定：
+		// mux.Handler() 对未注册子路径返回空 pattern，且不匹配尾斜杠。
+		if routes != nil {
+			if _, pattern := routes.Handler(r); userAccessibleRoutes[pattern] {
 				next.ServeHTTP(w, r)
 				return
 			}
 		}
-		u := UserFromContext(r.Context())
-		if u == nil || !u.IsAdmin() {
-			writeAdminErr(w, http.StatusForbidden, "需要管理员权限")
-			return
-		}
-		next.ServeHTTP(w, r)
+
+		writeAdminErr(w, http.StatusForbidden, "需要管理员权限")
 	})
 }
 

@@ -229,6 +229,19 @@ type FailureThrottle struct {
 	limit    int
 	cooldown time.Duration
 	fails    map[string]*failEntry
+	// capConcurrent 为假时不施加并发上限，只统计失败次数。
+	//
+	// 并发上限的**唯一**目的（见 inflight 的注释）是防止同一 IP 用 N 个并发
+	// 请求把 PBKDF2 的 CPU 消耗放大 N 倍 —— 只有真的要跑 KDF 的路径才需要它。
+	// 会话鉴权路径（UserAuthMiddleware）一次 KDF 都不跑，却曾被连带套上这个
+	// 上限，后果是普通页面加载直接失败（2026-10-10 修复的 bug）：
+	// 总览页一进来就并发 5 个请求（统计/按天/按模型/按 key/按厂商），
+	// 而上限是 4 —— 于是第 5 个必然 429，页面报「密码尝试过于频繁」，
+	// 而这个用户密码完全正确、根本没在尝试登录。
+	//
+	// 失败计数（limit/cooldown）仍照常生效，所以「拿无效令牌撞门」的防护没变，
+	// 去掉的只是那条与 KDF 无关、只会误伤正常页面的并发限制。
+	capConcurrent bool
 }
 
 type failEntry struct {
@@ -247,7 +260,21 @@ func NewFailureThrottle(limit int, cooldown time.Duration) *FailureThrottle {
 	if cooldown <= 0 {
 		cooldown = loginCooldown
 	}
-	return &FailureThrottle{limit: limit, cooldown: cooldown, fails: make(map[string]*failEntry)}
+	return &FailureThrottle{
+		limit: limit, cooldown: cooldown,
+		fails: make(map[string]*failEntry),
+		// 默认施加上限：登录 / 引导 / 改密三条路径都要跑 KDF。
+		capConcurrent: true,
+	}
+}
+
+// WithoutConcurrencyCap 造一个只统计失败次数、不限并发的限速器。
+//
+// 用于**不跑 KDF** 的路径（会话鉴权）。那里保留并发上限没有任何防护收益，
+// 只会把正常页面的并发读请求判成限速（见 capConcurrent 的注释）。
+func (t *FailureThrottle) WithoutConcurrencyCap() *FailureThrottle {
+	t.capConcurrent = false
+	return t
 }
 
 // Allow 报告该 IP 当前是否允许尝试。返回 true 时同时**占用一个并发额度**，
@@ -265,7 +292,8 @@ func (t *FailureThrottle) Allow(ip string) bool {
 		return false
 	}
 	// 并发上限：同一个 IP 最多同时有 maxConcurrent 个请求在跑 KDF。
-	if e.inflight >= maxConcurrentAttempts {
+	// 仅对 capConcurrent 的限速器生效（见该字段的注释）。
+	if t.capConcurrent && e.inflight >= maxConcurrentAttempts {
 		return false
 	}
 	e.inflight++

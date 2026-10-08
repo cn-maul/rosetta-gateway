@@ -42,6 +42,23 @@ func MapUpstreamError(err error) (int, string, string) {
 		// whatever was produced is already delivered, nothing to append.
 		return http.StatusOK, "", ""
 	}
+	// 上游返回了 HTTP 成功但响应体解不开（rosetta v1.0.1 新增的哨兵）。
+	//
+	// 2026-10-10 修复：此前 SDK 用裸 fmt.Errorf 包装解码失败，没有哨兵也没有
+	// 类型，于是这一档全部落到下面的兜底 → 500 internal_error，且
+	// FailoverEligible 同样不命中 → **故障转移链不会换到健康上游**。
+	// 实测（真实进程 + 假上游）：链首返回 `200 + 半截 JSON` 时，健康上游被
+	// 调用 0 次，客户端收到 500 —— 一个「接受请求但返回垃圾」的上游
+	// （中转网关挂了、返回 HTML 错误页）永远不会被换掉，且 500 把排障方向
+	// 指向网关自己，而坏的是上游。
+	//
+	// 归 502 upstream_error：故障转移与断路器把目标级故障算在**上游**账上，
+	// 客户端 SDK 也能据此重试到别处。日志里记原始错误便于定位，但不回显给客户端
+	// （响应文案是固定串，不含上游原文）。
+	if errors.Is(err, rosetta.ErrUpstreamMalformed) {
+		logUpstreamMalformed(err)
+		return http.StatusBadGateway, "upstream_error", "upstream provider returned an unreadable response"
+	}
 
 	var apiErr *rosetta.APIError
 	if errors.As(err, &apiErr) {
@@ -93,6 +110,15 @@ func MapUpstreamError(err error) (int, string, string) {
 func logAPIError(e *rosetta.APIError) {
 	slog.Warn("upstream returned an error",
 		"status", e.StatusCode, "type", e.Type, "message", e.Message)
+}
+
+// logUpstreamMalformed 记录「上游响应解不开」的原始错误。
+//
+// 刻意只记日志、**不回显**：响应文案是固定串，不含上游原文。
+// 原始错误里带解码偏移（json.SyntaxError 的 Offset），排障时很有用。
+func logUpstreamMalformed(err error) {
+	slog.Warn("upstream response could not be decoded",
+		"error", err, "hint", "upstream accepted the request but returned an unreadable body")
 }
 
 func WriteOpenAIError(w http.ResponseWriter, statusCode int, code, message string) {
@@ -155,6 +181,20 @@ func errorTypeFromCode(code string) string {
 	case "upstream_error":
 		// 上游 5xx。多为过载/暂时不可用，可重试。
 		return "api_error"
+	case "admin_cannot_call_model":
+		// 管理员账号调用模型（2026-10 控制面/数据面分离）。
+		//
+		// # 为什么必须是 permission_error 而不是 authentication_error
+		//
+		// 这正是本文件整张表的**核心诉求**（见函数头注释：让客户端能按类型
+		// 决策重试/退避）。authentication_error 的标准处置是「换一把 key /
+		// 重新认证」，而这里 key 和账号**都是好的**、只是角色不允许 ——
+		// 客户端换一万把管理员的 key 也一样不通，只会无限重试并刷满日志。
+		//
+		// permission_error 表达的是「终态的权限边界，不要重试，请改权限」。
+		// 正确动作是人去新建一个普通用户、用那个账号的 key 调模型 —— 恰好
+		// 就是本条错误消息告诉他的那句话。
+		return "permission_error"
 	default:
 		return "api_error"
 	}
@@ -178,6 +218,21 @@ func errorTypeFromCode(code string) string {
 func FailoverEligible(err error) bool {
 	if err == nil {
 		return false
+	}
+	// 上游响应体解不开（rosetta v1.0.1 新增）→ **可转移**。
+	//
+	// 与上面注释的同一个理由：这是目标级故障，上游「接受请求却返回垃圾」
+	// （中转网关挂了、返回 HTML 错误页、body 被截断），链正是为吸收这类
+	// 故障而存在的。修复前它落到文件末尾的 `return false`，于是链直接 break，
+	// 健康目标一个都不试。
+	//
+	// 注意这个哨兵**只在一元响应上出现**——SDK 侧刻意没给流式事件解析打这个
+	// 哨兵（见 rosetta 的 upstream_malformed_test.go 注释）：流式解不开时先前
+	// 事件可能已交付，此时重试会重放已交付的输出并可能重复计费。
+	// 所以「流式解不开」走的是流哨兵（ErrStreamTruncated/Overflow）那条路，
+	// 那条路按设计也不可转移。两者不冲突。
+	if errors.Is(err, rosetta.ErrUpstreamMalformed) {
+		return true
 	}
 	var transportErr *rosetta.TransportError
 	if errors.As(err, &transportErr) {

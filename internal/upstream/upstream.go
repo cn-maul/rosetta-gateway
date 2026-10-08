@@ -3,6 +3,7 @@ package upstream
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -691,6 +692,110 @@ func NewProviderClient(ctx context.Context, st *store.Store, providerID string, 
 		MaxRetries: p.MaxRetries,
 	}
 	return buildClient(entry, apiKey, cfg)
+}
+
+// probeMaxTokens 是单模型可用性探测的 max_tokens。
+//
+// 取 1：探测的目的是回答「这个名字现在能不能真的推理」，而判断这一点只需
+// 上游接受请求并产出一个 token —— 生成 1 个 token 与生成 1000 个对
+// 「模型是否存在 / 账号有没有权限 / 名字有没有写错」给出的答案完全相同，
+// 成本却相差三个数量级。这也是本函数相对「跑一次真实对话」的全部成本优势。
+//
+// 取 1 而不是 0：0 在 OpenAI 协议里含义是「由上游决定」，某些上游会因此
+// 生成到 stop 或 max_output，把一次探测变成一次完整（且计费可观）的推理。
+const probeMaxTokens = 1
+
+// probeInput 是探测请求的提示词。
+//
+// 单字符 "hi" 而不是空串：空 messages 会被 rosetta 的 validate 直接拒绝
+// （Messages must not be empty），而空 content 又被部分上游当成非法输入。
+// "hi" 是最短的、所有协议都接受的输入，输入 token 数约 1~2 个。
+const probeInput = "hi"
+
+// ModelProbeResult 是一次单模型可用性探测的结果。
+//
+// 分三层信息，因为三者的可操作性完全不同：
+//   - OK：这个模型现在能推理（唯一可信的「可用」证据）；
+//   - LatencyMs：观测到的往返耗时，用于区分「可用但很慢」与「可用」；
+//   - Err / InBand：失败原因。InBand 表示上游用 HTTP 200 + 错误体回绝
+//     （部分中转站如此），此时 OK=false 但 HTTP 是成功的 —— 只看状态码
+//     会把这种「200 但没推理」误判成可用。
+type ModelProbeResult struct {
+	OK        bool
+	LatencyMs int64
+	// OutputTokens / InputTokens 是上游回报的真实用量。探测的计费依据在这里 ——
+	// 数值小（通常 output=1）是这个设计成立的前提，所以把它带出来让调用方
+	// 有机会显示「这次探测花了多少」，而不是让成本隐形成事实。
+	InputTokens  int64
+	OutputTokens int64
+	// Err 为 nil 表示请求在协议层成功；与 OK 的区别见 InBand。
+	Err error
+	// InBand 为真表示上游以 2xx 返回了错误体（InBand=true 的 APIError）。
+	InBand bool
+}
+
+// TestUpstreamModel 对**单个上游模型**做一次最小真实推理，验证它现在可用。
+//
+// # 为什么不能用 ListModels 代替（本函数存在的全部理由）
+//
+// provider 级的连通性测试调的是 client.ListModels，它证明的是
+// 「这个 endpoint + 这把凭据能拉到模型列表」。这与「某个具体 model_id
+// 能推理」是两件不同的事，而且差别恰好落在管理员最需要答案的几种情形上：
+//   - 模型已下架 / 改名：仍在 /models 里缓存着，或干脆不在列表里而配置还留着；
+//   - 账号对该模型无权限：列表里看得见，调用返回 403/404；
+//   - 名字写错 / 大小写不符：列表能通，调用报 model_not_found；
+//   - 模型需要特定参数（如 reasoning 模型拒绝某些字段）：列表完全测不出来。
+//
+// 所以「测试模型是否可用」必须真的发一次推理请求。代价是真的花钱 —— 见
+// probeMaxTokens 的取值理由，以及本函数只做**非流式**单次调用的原因：
+// 流式会在同一件事上多引入 SSE 解析、首字看门狗与断流判定三条失败路径，
+// 而探测要回答的问题不需要其中任何一条。buildClient 已用
+// WithQuirks{NoIdempotencyKey: true} 关掉了 SDK 的对话 POST 重试，
+// 因此一次探测最多对上游产生一次计费调用（不会因重试翻倍）。
+//
+// 注意：这里的开销走的是 **provider 自带凭据**（resolveCredential 取的那把），
+// 与请求它的管理员账号余额无关，因此不经 usage_recorder、不扣任何网关用户的钱。
+func TestUpstreamModel(ctx context.Context, st *store.Store, m *store.UpstreamModel, masterKey []byte, cfg *config.Config) ModelProbeResult {
+	start := time.Now()
+
+	client, err := NewProviderClient(ctx, st, m.ProviderID, masterKey, cfg)
+	if err != nil {
+		// 建不出客户端 = 没有可用凭据 / provider 配置非法。这不是「模型不可用」，
+		// 但探测结果里它同样是「现在打不通」，所以照实返回原因。
+		return ModelProbeResult{Err: err}
+	}
+
+	req := &rosetta.ChatRequest{
+		Model:           m.ModelID,
+		Messages:        []rosetta.Message{rosetta.User(probeInput)},
+		MaxOutputTokens: probeMaxTokens,
+		// 显式不请求思考：推理模型的思考预算会绕过 max_tokens 下限
+		// （Anthropic 侧 budget >= max_tokens 时会把 max_tokens 顶到
+		// budget+4096），一次「最小」探测会因此变成几千 token。探测要的是
+		// 「能不能推理」，不是「思考得对不对」。
+		Thinking: nil,
+	}
+
+	resp, err := client.Chat(ctx, req)
+	latency := time.Since(start).Milliseconds()
+	if err != nil {
+		// 把上游错误原样带出：那是管理员唯一能据以行动的信息（401 换 key、
+		// 404 改模型名、403 开权限）。rosetta 的 APIError.Error() 已对凭据
+		// 做掩码（httpx.MaskSecrets），不会把 key 回显出来。
+		var apiErr *rosetta.APIError
+		return ModelProbeResult{
+			LatencyMs: latency,
+			Err:       err,
+			InBand:    errors.As(err, &apiErr) && apiErr.InBand,
+		}
+	}
+
+	return ModelProbeResult{
+		OK:           true,
+		LatencyMs:    latency,
+		InputTokens:  resp.Usage.InputTokens,
+		OutputTokens: resp.Usage.OutputTokens,
+	}
 }
 
 // ModelCandidate 是模型发现返回的原始条目；容量字段为 0 表示上游未暴露。

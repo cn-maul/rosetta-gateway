@@ -84,14 +84,30 @@ func TestRegression_CooldownPersistsOwnValueNotSharedField(t *testing.T) {
 	const shortD = 1 * time.Second
 	const longD = 1 * time.Hour
 
-	var mu sync.Mutex
 	st := &concurrencyStore{cred: cred}
 	st.interleave = func(n int) {
 		// 干扰：把共享字段改成一个**不属于任何合法时长**的值。
 		// 若落库值落在这里，说明读到的是别人的值。
-		mu.Lock()
+		//
+		// **必须走 p.mu**（2026-10-10 修）：原先这里只用了一个测试私有的
+		// mu 去写 cred.CooldownUntil，而生产代码在 p.mu 下写同一字段 ——
+		// 两个不同的锁保护同一个字段，`-race` 必然报 DATA RACE。
+		// 实测（本会话首次跑通 -race 后）：
+		//   WARNING: DATA RACE
+		//     Write at ... by goroutine 410: cooldown_race_test.go:93 (本干扰)
+		//     Previous write at ...: upstream.go:425 (MarkCredentialCooldown)
+		//
+		// 那不是生产缺陷（生产对该字段的**每一处**读写都在 p.mu 内，
+		// 已逐处核对），而是**测试自己制造的**竞争。但后果一样严重：
+		// 它让 `go test -race ./...` 永久变红，于是真正的竞争会被淹没在
+		// 这条噪音里 —— 一个永远红的检测器等于没有检测器。
+		//
+		// 用 p.mu 不影响本测试的判据：干扰要发生的时间窗是「生产已解锁、
+		// 正把快照交给 store」那一段，此时生产**不持有** p.mu，所以这里
+		// 仍能拿锁写入，依旧能把毒值种进去。
+		p.mu.Lock()
 		cred.CooldownUntil = time.Unix(1, 0).UTC()
-		mu.Unlock()
+		p.mu.Unlock()
 		_ = n
 	}
 	p.cooldownSto = st
@@ -156,13 +172,18 @@ func TestRegression_RecoveryNotMisjudgedUnderConcurrentCooldown(t *testing.T) {
 	var statuses []string
 	p.cooldownSto = recorder(func(_ context.Context, _, status string, _ time.Time) error {
 		// 窗口内另一个 goroutine 立刻把它重新冷却 —— 干扰恢复路径的判定。
+		//
+		// 与上面那条同一个纪律：写共享的 cred 必须走 **p.mu**，否则
+		// `-race` 会报「测试私有的 mu 与生产 p.mu 保护同一字段」。
+		// 详见 TestRegression_CooldownPersistsOwnValueNotSharedField 里
+		// st.interleave 的注释（那里是实测报过 DATA RACE 的地方）。
 		done := make(chan struct{})
 		go func() {
 			defer close(done)
-			mu.Lock()
+			p.mu.Lock()
 			cred.CooldownUntil = time.Now().Add(time.Hour)
 			cred.Status = "cooling"
-			mu.Unlock()
+			p.mu.Unlock()
 		}()
 		<-done
 		mu.Lock()

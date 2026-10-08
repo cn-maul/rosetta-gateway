@@ -253,8 +253,9 @@ func GenerateKey() string {
 }
 
 // WeakMaterial 报告一段密钥材料的熵是否低到值得告警。
-// 阈值 32 字符：自动生成的 master.key 是 64 hex；手填的短口令（"123456"、
-// 公司名拼音）落库加密的是上游付费 API Key，值得被离线字典爆破。
+// 阈值 32 字符：自动生成的 master.key 是 44 字符 base64url（熵充足）；
+// 手填的短口令（"123456"、公司名拼音）落库加密的是上游付费 API Key，
+// 值得被离线字典爆破。
 // 只作告警依据，不改变推导 —— 见 AUDIT 2026-10-04：改推导（KDF）会让
 // 存量密文全部解不开，锁死代价高于收益。
 func WeakMaterial(raw string) bool {

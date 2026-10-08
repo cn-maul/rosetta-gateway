@@ -34,12 +34,28 @@ type Context struct {
 	GroupModelAllow snapshot.ModelAllow
 }
 
+// userRoleAdmin 与 store.RoleAdmin 保持字面量一致。
+//
+// 与 UserStatusActive 同理：复制常量而不 import store，是为了让鉴权热路径
+// 不依赖 store 包（那个包会把数据库驱动、事务、全部 DAO 拖进 auth 的依赖图）。
+// 两处字面量必须同步修改（值都是 "admin"）。
+const userRoleAdmin = "admin"
+
 // AllowsModel 报告本请求是否有权使用某个公开模型名。
 //
 // 两个维度独立判定而不是先求交再查：求交要为每个请求分配一个新切片，
 // 而这里白名单只有个位数，两次线性扫描的代价更低、且零分配。
 func (c *Context) AllowsModel(model string) bool {
 	return c.KeyModelAllow.Allows(model) && c.GroupModelAllow.Allows(model)
+}
+
+// IsAdminOwner 报告这把 key 的归属用户是不是管理员。
+//
+// 数据面据此把管理员彻底挡在门外（ErrAdminCannotCallModel）：管理员只做
+// 控制面管理，调用模型必须用**普通用户**的 key。
+func (c *Context) IsAdminOwner() bool {
+	u := snapshot.Get().UsersByID[c.UserID]
+	return u != nil && u.Role == userRoleAdmin
 }
 
 func Authenticate(r *http.Request) (*Context, error) {
@@ -102,6 +118,37 @@ func Authenticate(r *http.Request) (*Context, error) {
 	}
 	if !u.IsActive() {
 		return nil, ErrUserDisabled
+	}
+
+	// 管理员彻底退出数据面（2026-10 需求确认：「管理员账号只负责管理网关」）。
+	//
+	// # 为什么放在**鉴权层**而不是 handleIngress 里加一道检查
+	//
+	// 数据面有**多条**入口都只做 auth.Authenticate：/v1 三个推理端点、
+	// /v1/models、/dashboard/billing/*、/v1/organization/*。在 handleIngress
+	// 里加检查只能覆盖推理端点，其余入口会各自漂移 —— 而漂移的方向恰恰是
+	// 最危险的：管理员旧 key 在 /v1/models 或 billing 查询上照常通过
+	// （billing 本来也用 admin 看全量，那是控制面语义），只有推理端点被挡，
+	// 口径就不再一致。收敛到 Authenticate 这一处，**所有**数据面入口同时生效。
+	//
+	// # 为什么排在「用户存在」「用户启用」之后
+	//
+	// 一个「无归属 / 已禁用」的 key 应当先报它自己的错，管理员判定排在其后：
+	// 前两者是数据不一致/运维操作，与角色无关；而且这样管理员账号被禁用时
+	// 报的是「用户已禁用」而不是「管理员不能调模型」—— 处置动作完全不同。
+	//
+	// # 为什么不判定「key 是否属于管理员」而是「**归属用户**是不是管理员」
+	//
+	// 判的是归属用户的角色（u.Role），不是 key 上某个可写的标记。角色是
+	// users 表的权威事实，经快照下发、热路径零查库。管理员改自己的角色为
+	// user 后，下一次快照重建就自动恢复可调用，无需手工清理任何 key 标记。
+	//
+	// # 存量管理员 key 的行为：立即失效（fail-fast）
+	//
+	// 见 ErrAdminCannotCallModel 的注释：不保留、给清晰错误，让管理员知道
+	// 「要去建普通用户」而不是以为 key 坏了而反复重试。
+	if u.Role == userRoleAdmin {
+		return nil, ErrAdminCannotCallModel
 	}
 
 	return &Context{
