@@ -25,6 +25,37 @@ jobs:
         # actions/checkout v4.4.0
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
 
+      # 发布前的门禁（2026-10-10 新增）。
+      #
+      # 原先这个 workflow 只校验 tag 与 package.json 一致就直接 build+push，
+      # 与验证代码的 ci workflow **毫无关联** —— 于是「测试红着打 tag」
+      # 完全可以把镜像发到 GHCR 并盖上 :latest。运维真正部署的就是这个镜像，
+      # 所以它必须与测试之间有这道闸。
+      #
+      # 这里不能写 needs: ci（两个 workflow 在不同文件，彼此不可见），
+      # 所以把最小门禁就地复跑一遍。ci.yml 里的 webui-sync
+      # （「入库产物 == 最新构建」）同样重要，但它依赖 npm 与前端构建，
+      # 放在发布路径上会让 tag 流程慢很多；那条防的是「忘 sync」，
+      # 由 main 分支上的 ci 拦住足够 —— 真要在这里也拦，就把 npm ci &&
+      # npm run build && node sync-embed.mjs && git diff --exit-code 一并加上。
+      - name: Set up Go
+        uses: actions/setup-go@7b8cf10d4e4a01d4992d18a89f4d7dc5a3e6d6f4
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: 发布前门禁（gofmt / build / vet / 全量测试）
+        run: |
+          set -euo pipefail
+          unformatted=$(gofmt -l cmd/ internal/)
+          if [ -n "$unformatted" ]; then
+            echo "::error::以下文件未过 gofmt：$unformatted"
+            exit 1
+          fi
+          go build ./...
+          go vet ./...
+          go test -count=1 -timeout 300s ./...
+
       - name: 解析版本号（唯一来源：web/package.json）
         id: ver
         run: |

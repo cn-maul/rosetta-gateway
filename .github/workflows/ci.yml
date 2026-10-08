@@ -54,7 +54,37 @@ jobs:
       - name: 全量测试
         # -count=1 禁用缓存：改契约后只跑 -run TestXxx 的老坑（cmd/gateway
         # 整包红一轮）就是这么漏进主干的。
-        run: go test -count=1 -timeout 300s ./internal/... ./cmd/gateway/
+        # ./... 而非手列 ./internal/... ./cmd/gateway/：手列的清单每次新增
+        # 命令目录都要记得改这里，漏改就是「整包不进测试范围」且无人察觉
+        # （cmd/migrate-legacy 就曾不在清单里）。
+        run: go test -count=1 -timeout 300s ./...
+
+      # 竞态检测单独一轮（2026-10-10 新增）。
+      #
+      # 为什么值得单列：本仓库的并发密度相对体量偏高 —— 上游凭据冷却、
+      # statusResponseWriter 的 statusCode、runtimeReloader 的脏标志，
+      # 都是请求 goroutine 与后台 goroutine 共享可变状态。而历史上确实
+      # 栽过同类问题（be18edd 上游冷却数据竞争；cooldown_race_test.go
+      # 就是那次留下的）。那份测试是**手工构造**的交错，只能证明作者想到的
+      # 那一种；没有 -race，就发现不了下一个。
+      #
+      # 单独一轮而不是并进上面：-race 显著拖慢且需要 CGO 与外部链接器。
+      #
+      # # 本机（Windows）跑 -race 的正确姿势（2026-10-10 实测）
+      #
+      # 默认 PATH 上的 MinGW 装在 `C:\Program Files\mingw64`，路径含空格，
+      # ld.exe 解析不了（`cannot find C:/Program: No such file or directory`），
+      # 于是 `go test -race` 在**链接阶段**就失败。这**不等于本机跑不了** ——
+      # 机器上还有一份无空格的 `C:\mingw64\bin\gcc.exe`，显式指定即可：
+      #
+      #     CC=C:/mingw64/bin/gcc.exe go test -race -count=1 ./...
+      #
+      # 这个姿势是本轮审计发现的，并且**确实抓出过一条 DATA RACE**
+      # （internal/upstream 的冷却测试：测试用私有 mu 写 cred，而生产在
+      #  p.mu 下写同一字段 —— 测试侧的竞争，已修）。
+      # 所以本机不要因为默认报错就跳过竞态检测；那是环境问题，有解。
+      - name: 竞态检测（-race）
+        run: go test -race -count=1 -timeout 900s ./...
 
   webui-sync:
     runs-on: ubuntu-latest

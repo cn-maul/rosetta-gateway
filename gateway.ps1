@@ -1,4 +1,4 @@
-﻿#Requires -Version 5.1
+#Requires -Version 5.1
 <#
 gateway.ps1 — rosetta-gateway 一键脚本：编译 + 启动 + 停止
 
@@ -9,9 +9,10 @@ gateway.ps1 — rosetta-gateway 一键脚本：编译 + 启动 + 停止
   .\gateway.ps1 -NoWeb           # 跳过前端构建（仍编译 Go），用现有 internal\webui\dist
   .\gateway.ps1 -Stop            # 停止后台网关（按镜像名+路径精确匹配，端口兜底）
 
-密钥来源（优先级：命令行参数 > 环境变量 > bin\master.key > 自动生成并保存）：
-  -MasterKey     网关主密钥。缺省时自动生成并保存到 bin\master.key，后续启动自动复用
-                 （库里凭据用建库时的主密钥加密，key 变了会解密失败——所以必须固定）
+密钥来源（优先级：命令行参数 > 环境变量 > 网关自动生成 bin\master.key 并复用）：
+  -MasterKey     网关主密钥。缺省时由网关首次启动自动生成到 bin\master.key，后续复用
+                 （库里凭据用建库时的主密钥加密，key 变了会解密失败——所以必须固定；
+                   本脚本不代为生成，因为网关校验该文件的格式，见下方注释）
   -DeepseekKey   DEEPSEEK_API_KEY。缺省留空：网关能启动，转发请求会报上游鉴权失败
   -AnthropicKey  ANTHROPIC_API_KEY。同上
 
@@ -163,24 +164,29 @@ if (-not $NoBuild) {
 if (-not (Test-Path $Bin)) { Die "二进制不存在：$Bin（去掉 -NoBuild 先编译一次）" }
 
 # ---------- 密钥 ----------
-# 主密钥优先级：参数 > 环境变量 > bin\master.key（本地密钥文件）> 自动生成并保存。
-# 落盘复用很关键：库里凭据是用建库时的主密钥加密的，每次换 key 都会解密失败。
-$KeyFile = Join-Path $Root 'bin\master.key'
+# 主密钥优先级：参数 > 环境变量 > 网关自己的 bin\master.key（自动生成并落盘复用）。
+#
+# 刻意**不在这里生成**：原实现用 Get-Random 造 64 个 hex 字符写进 bin\master.key，
+# 但网关读该文件时要求 44 字符 base64url（crypto.validKeyFormat，配套
+# crypto.GenerateKey），格式不符直接判「文件已损坏」并拒绝启动。
+# 而脚本自己启动时又碰巧没事 —— 它把密钥塞进环境变量，而网关读环境变量时
+# **不做格式校验**。于是这个坏文件被安静地留下，直到换一种启动方式
+# （双击 bin\gateway.exe、docker run 挂载同一个 home、另一个人的 shell）才炸。
+#
+# 现在交给 Go 侧生成：它用的就是 CSPRNG，写出的格式与校验口径天然一致，
+# 且同样是原子落盘 + 复用。状态根目录默认就是 exe 所在目录（resolveHome），
+# 也就是本脚本的 $Root\bin，两边读写的仍是同一个文件。
 if (-not $MasterKey)    { $MasterKey    = $env:ROSETTA_GW_MASTER_KEY }
 if (-not $DeepseekKey)  { $DeepseekKey  = $env:DEEPSEEK_API_KEY }
 if (-not $AnthropicKey) { $AnthropicKey = $env:ANTHROPIC_API_KEY }
 
 if (-not $MasterKey) {
+  # 不预先生成：留空让网关自己建。已存在则原样复用（换密钥 = 全部上游凭据解不开）。
+  $KeyFile = Join-Path $Root 'bin\master.key'
   if (Test-Path $KeyFile) {
-    $MasterKey = (Get-Content $KeyFile -Raw -ErrorAction SilentlyContinue) -join ''
-    $MasterKey = $MasterKey.Trim()
-  }
-  if (-not $MasterKey) {
-    $MasterKey = -join ((1..32) | ForEach-Object { '{0:x2}' -f (Get-Random -Maximum 256) })
-    New-Item -ItemType Directory -Force -Path (Join-Path $Root 'bin') | Out-Null
-    Set-Content -Path $KeyFile -Value $MasterKey -Encoding ASCII
-    Write-Host "[i] 主密钥已自动生成并保存到 $KeyFile（后续启动自动复用）" -ForegroundColor Yellow
-    Write-Host "    显式传 -MasterKey 或设 ROSETTA_GW_MASTER_KEY 可覆盖" -ForegroundColor Yellow
+    Write-Host "[i] 主密钥复用 $KeyFile" -ForegroundColor DarkGray
+  } else {
+    Write-Host "[i] 未提供主密钥，网关首次启动会自动生成并保存到 bin\master.key" -ForegroundColor Yellow
   }
 }
 if (-not $DeepseekKey -or -not $AnthropicKey) {

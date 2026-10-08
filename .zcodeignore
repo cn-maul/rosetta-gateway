@@ -1,37 +1,42 @@
 # 构建产物与本地运行时
-bin/
+#
+# 所有目录型规则都以 / 开头锚定根目录，与 .gitignore 保持同一口径。
+# 裸写的目录名会匹配**任意层级**的同名目录 —— `gateway/` 曾把
+# `cmd/gateway/`（源码目录）整个排除在外，这个坑已经踩过一次。
+/bin/
 *.log
 
 # Go 本地缓存（GOMODCACHE / GOCACHE，本轮开发产生的巨型目录）
-.gobuild/
-.gocache/
+/.gobuild/
+/.gocache/
 
 # 前端工程
-web/node_modules/
-web/dist/
+/web/node_modules/
+/web/dist/
 
 # 工作区数据（配置、数据库、截图、备份等，含敏感凭据）
-.workbuddy/
+/.workbuddy/
 
 # 根目录测试遗留二进制
-gateway.exe
-
-# 管理后台密码（含盐哈希，不应入库）
-admin_auth.json
+/gateway.exe
 
 # 旧版运行目录（库 / 配置 / 主密钥，含敏感凭据，绝不入库）
-gateway/
+/gateway/
 
 # 主密钥（44字符 base64url）。入库即等于把全部上游凭据的加密材料公开——
 # 拿到它就能解出 providers 里所有 api_key。运行时自动生成，每台机器各不相同。
-master.key
+/master.key
 
-# 本地实际配置（含 admin_token / providers api_key / routes）。
+# 本地实际配置（含上游 providers 的 api_key / routes 等敏感项）。
 # config.example.json 才是应该入库的那份。
-config.json
+/config.json
 
 # SQLite 数据库目录（用户 / 用量 / 凭据 / 审计日志等真实运行数据）
-data/
+/data/
 *.db
 *.db-shm
 *.db-wal
+
+# 注：原此处列过 admin_auth.json 与 admin_token 的忽略规则，
+# 那两条对应的认证通道已在统一认证改造中删除（只剩 users 表 + 会话），
+# 文件不会再被生成。留着会让后来人以为它们仍是活的配置项。
