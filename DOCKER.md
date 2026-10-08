@@ -148,7 +148,7 @@ services:
 | `ROSETTA_GW_HOME` | 状态根目录（配置 / 密钥 / 数据库） | 镜像内已设为 `/data` |
 | `ROSETTA_GW_MASTER_KEY` | 覆盖主密钥。**设了就不用 `master.key` 文件** | 空（走 `/data/master.key`） |
 | `ROSETTA_GW_SESSION_SECRET` | 覆盖会话签名密钥。**设了就不用 `session_secret` 文件** | 空（走 `/data/session_secret`，没有就自动生成） |
-| `TZ` | 容器时区，影响日志时间戳 | `UTC` |
+| `TZ` | 容器时区。**影响日志时间戳，也决定用量按天统计的日界** | `Asia/Shanghai` |
 
 `ROSETTA_GW_MASTER_KEY` 只在应急时用：它优先于 `master.key`，**两边取值不同会导致
 已加密的上游凭据全部解不开**。平时不要设。
@@ -201,6 +201,47 @@ docker logs rosetta-gateway 2>&1 | jq -r '"\(.time) \(.level) \(.msg)"'
 ```
 
 `TZ` 环境变量只影响时间戳的读法，不影响日志去向。
+
+## 时区：决定「按天统计」的日界
+
+用量按天分桶（总览日趋势、钱包页的按天消耗记录、以及用量归档）用的是 SQLite 的
+`'localtime'`，它跟随进程的本地时区 —— 也就是容器里的 `TZ`。
+
+**配错了的症状**：过了 0 点，按天数据不切到新的一天；本地时间 0:00 之后的调用
+被算进「昨天」。调用历史里的时间戳始终是对的（那是原始时刻，由浏览器按你的时区
+渲染），错的是**按天聚合**。
+
+东八区用户在 UTC 容器里的典型表现：0:00–8:00 的调用全被算进前一天。
+
+设置方式（三种，任选，优先级从高到低）：
+
+```bash
+# 1. 容器级（推荐）—— 同时影响日志时间戳
+docker run -e TZ=Asia/Shanghai ...
+
+# 2. config.json 里配 —— 只影响按天统计的日界，不依赖容器环境
+{ "timezone": "Asia/Shanghai" }
+
+# 3. 裸机部署 —— 设进程环境即可，无需改配置
+TZ=Asia/Shanghai ./gateway
+```
+
+镜像默认已是 `Asia/Shanghai`（`ENV TZ` + entrypoint 兜底）。换成别的时区：
+
+```bash
+docker run -e TZ=Asia/Tokyo ...
+```
+
+启动时日志会打印生效的时区，可用于核对：
+
+```
+{"level":"INFO","msg":"daily-bucket timezone applied","timezone":"Asia/Shanghai"}
+```
+
+**改时区不会损坏数据**：按天的 `day` 是查询时由 `usage_records.ts` 现算的
+（`strftime`），`ts` 是绝对时刻、与时区无关。改完重启，历史的按天数字会按新
+日界重新分桶。唯一例外是**已经归档**的行（明细保留 30 天后转入日聚合表），
+它们的 `day` 是归档那一刻固化的值 —— 那部分历史不会跟着变。
 
 ## 数据与升级
 

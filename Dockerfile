@@ -53,6 +53,18 @@ RUN chmod 0755 /app/gateway /usr/local/bin/docker-entrypoint.sh
 # 镜像层因此完全无状态：升级镜像不会碰配置与数据。
 # session_secret 必须随卷持久化：丢了它所有登录会话立即失效（用户需重新登录）。
 ENV ROSETTA_GW_HOME=/data
+
+# 默认时区（2026-10-09 修复「过了 0 点按天数据不切日」的线上缺陷）。
+#
+# SQLite 的 'localtime'（store.dayExpr，按天分桶的日界）跟 Go 的 time.Local
+# 走；容器里没设 TZ 时它是 UTC，于是北京时间 0~8 点的调用全被算进
+# 「昨天」。默认东八区（本项目当前用户所在时区），要改用 -e TZ=Asia/Tokyo
+# 覆盖。tzdata 已在上方装上，IANA 名都能解析。
+#
+# entrypoint 里还有一道 :${TZ:=Asia/Shanghai} 兜底（覆盖「直接 exec 二进制」
+# 而不经 entrypoint 的用法），两处必须保持同一个默认值。
+ENV TZ=Asia/Shanghai
+
 VOLUME ["/data"]
 
 # 端口用 8666，**不能用 6666** —— 6666 在 Chromium 的保留端口表

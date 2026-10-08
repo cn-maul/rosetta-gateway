@@ -3,6 +3,7 @@
   "db_path": "./data/gateway.db",
   "log_level": "info",
   "master_key_env": "ROSETTA_GW_MASTER_KEY",
+  "timezone": "Asia/Shanghai",
   "defaults": {
     "upstream_timeout_ms": 120000,
     "stream_idle_timeout_ms": 60000,

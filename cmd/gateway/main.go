@@ -131,6 +131,23 @@ func main() {
 	logLevel.Set(slogLevel(cfg.LogLevel))
 	logger.Info("config loaded", "listen", cfg.Listen, "db_path", cfg.DBPath, "log_level", cfg.LogLevel)
 
+	// 时区必须在**打开数据库之前**应用（2026-10-09 修复的线上缺陷）。
+	//
+	// 按天分桶的日界是 SQLite 的 'localtime'（store.dayExpr），它读的是
+	// Go 的 time.Local；容器里没设 TZ 时那是 UTC，北京时间 0~8 点的调用
+	// 全被算进「昨天」。改写 time.Local 必须早于 store.Open —— 归档水位
+	// 与每日剪枝都拿「今天是哪天」当切分点，晚了它们已经用旧口径算过一轮。
+	//
+	// 顺带打印生效时区：这个值决定所有按天数字的日界，必须让运维一眼
+	// 可查（看到 UTC 而用户都在东八区，就知道该配 timezone / TZ 了）。
+	appliedTZ, err := config.ApplyTimezone(cfg.Timezone)
+	if err != nil {
+		logger.Error("invalid timezone in config", "error", err)
+		os.Exit(1)
+	}
+	logger.Info("daily-bucket timezone applied", "timezone", appliedTZ,
+		"note", "按天统计的日界由此时区决定；容器部署若与用户所在时区不符，请在 config.json 配 timezone 或设 TZ 环境变量")
+
 	// 端口自检：落在浏览器保留端口（6666 / 6000 / 10080 …）上时，
 	// 浏览器根本不会发出请求，服务端**没有任何日志**，前端只显示 ERR_UNSAFE_PORT。
 	// 这种「完全静默」的失败模式排查成本极高，所以在启动这一步就喊出来。

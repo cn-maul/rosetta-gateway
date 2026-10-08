@@ -12,12 +12,28 @@ import (
 )
 
 type Config struct {
-	Listen       string    `json:"listen"`
-	DBPath       string    `json:"db_path"`
-	LogLevel     string    `json:"log_level"`
-	MasterKeyEnv string    `json:"master_key_env"`
-	Defaults     Defaults  `json:"defaults"`
-	Bootstrap    Bootstrap `json:"bootstrap"`
+	Listen       string `json:"listen"`
+	DBPath       string `json:"db_path"`
+	LogLevel     string `json:"log_level"`
+	MasterKeyEnv string `json:"master_key_env"`
+	// Timezone 是按天统计的日界时区（IANA 名，如 "Asia/Shanghai"）。
+	//
+	// # 为什么必须有这个字段（2026-10-09 修复的线上缺陷）
+	//
+	// 用量按天分桶用的是 SQLite 的 strftime(..., 'localtime')（store.dayExpr），
+	// 而 'localtime' 取的是**进程的本地时区**。容器里没设 TZ、镜像里也没有
+	// /etc/localtime 链接时，Go 的 time.Local 解析为 UTC —— 于是北京时间
+	// 0 点到 8 点的调用全部被算进「昨天」（实测：用户的 909 条清晨调用
+	// 全部落进前一天的桶）。
+	//
+	// 修复：启动时（main 里最早期）根据这个字段改写 time.Local，
+	// 'localtime' 会跟着走（modernc SQLite 的实测行为，见下方
+	// ApplyTimezone 的注释）。空串 = 沿用进程现有时区（TZ 环境变量或
+	// 宿主机的 /etc/localtime），不强制覆盖 —— 裸机部署在东八区机器上
+	// 的用户什么都不用改。
+	Timezone  string    `json:"timezone"`
+	Defaults  Defaults  `json:"defaults"`
+	Bootstrap Bootstrap `json:"bootstrap"`
 }
 
 type Defaults struct {
@@ -231,6 +247,19 @@ func (c *Config) validate() error {
 	case "debug", "info", "warn", "error":
 	default:
 		return fmt.Errorf("log_level: must be one of debug|info|warn|error, got %q", c.LogLevel)
+	}
+
+	// timezone 在启动早期被 ApplyTimezone 消费，但校验仍放这里：
+	// Load 之后到 main 应用它之间若隔着一段「别的初始化」，一个拼错的
+	// 时区名会静默落到 UTC（LoadLocation 失败的常见处理），而按天分桶
+	// 会**全部**落到错误的日界 —— 与本次修复的缺陷同一个症状。
+	if c.Timezone != "" {
+		if _, err := time.LoadLocation(strings.TrimSpace(c.Timezone)); err != nil {
+			// fixed zone 形式（"UTC+8" 这类）不是 IANA 名，LoadLocation 不认；
+			// 单独支持它会让「东八区」有三种写法（Asia/Shanghai / UTC+8 / +08:00），
+			// 每种的解析路径都不同。只认 IANA，一种写法。
+			return fmt.Errorf("timezone: invalid IANA name %q (%v)", c.Timezone, err)
+		}
 	}
 
 	for i, p := range c.Bootstrap.Providers {

@@ -17,6 +17,26 @@ CONFIG="${STATE_DIR}/config.json"
 RUN_UID="${ROSETTA_GW_UID:-1000}"
 RUN_GID="${ROSETTA_GW_GID:-1000}"
 
+# 默认时区（2026-10-09 修复「过了 0 点按天数据不切日」的线上缺陷）。
+#
+# SQLite 的 'localtime'（store.dayExpr，按天分桶的日界）跟 Go 的 time.Local
+# 走；容器里没设 TZ、镜像里也没有 /etc/localtime 链接时它是 UTC，于是
+# 北京时间 0~8 点的调用全被算进「昨天」（实测：用户 909 条清晨调用
+# 全落进前一天的桶）。
+#
+# 为什么在这里设 TZ 而不是只依赖 config.json 的 timezone 字段：
+#   - 已有部署的 config.json 在持久化卷里，升级镜像**不会**自动长出
+#     timezone 字段；而 entrypoint 每次启动都跑，TZ 一定生效 ——
+#     这是把修复带给存量部署的唯一路径；
+#   - TZ 同时影响日志时间戳等一切 Go time 输出；
+#   - 用户可用 -e TZ=xxx 覆盖（docker run -e 的优先级高于 ENV/此处默认）。
+#
+# 注意：config.json 的 timezone 非空时，main 里的 ApplyTimezone 会再次
+# 显式改写 time.Local —— 那是最终口径，优先级高于这里的 TZ。
+: "${TZ:=Asia/Shanghai}"
+export TZ
+echo "[entrypoint] TZ=${TZ}（按天统计的日界跟着此时区走）"
+
 seed_config() {
 	if [ ! -f "${CONFIG}" ]; then
 		cp /app/config.default.json "${CONFIG}"
