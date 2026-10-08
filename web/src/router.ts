@@ -8,7 +8,28 @@ const router = createRouter({
     { path: '/login', name: 'login', component: () => import('./views/Login.vue'), meta: { title: '登录', public: true } },
     { path: '/', name: 'overview', component: () => import('./views/Overview.vue'), meta: { title: '总览' } },
     { path: '/keys', name: 'keys', component: () => import('./views/Keys.vue'), meta: { title: '访问密钥' } },
+    // 「调用历史」恢复给普通用户（2026-10-10）。上一轮按用户给的侧边栏顺序
+    // 把它划进了 admin 区，理由是「普通用户看自己的消费记录走钱包页」——
+    // 但那是**聚合数**，不是明细。排查「我刚才那次调用为什么报错/为什么这么慢/
+    // 为什么花了 0.4 分」需要逐条记录，钱包页的汇总答不了这个问题。
+    //
+    // 刻意**不带 adminOnly**：后端按会话身份强制收窄作用域
+    // （usage_handler.scopeUserID：普通用户只见自己的，管理员空串=全量），
+    // 且 history / history.csv 早已在 userAccessibleRoutes 白名单里
+    // （internal/server/user_auth.go），并有 authz_matrix 测试钉住。
+    // 页内无任何 admin-only 数据源：密钥下拉走 /keys（同样按身份收窄）。
     { path: '/history', name: 'history', component: () => import('./views/History.vue'), meta: { title: '调用历史' } },
+    // 「可用模型」恢复（2026-10-10）：它一度随管理员退出数据面一起被删，
+    // 理由是「管理员用不上这份清单」。这个理由只对管理员成立，却让**普通
+    // 用户**也跟着没了入口 —— 而这页恰恰是普通用户最需要的：它回答
+    // 「我实际能调哪些模型、单价多少」，ModelPicker 只在打开建 key 表单时
+    // 顺带露一眼，且那是「写白名单」的控件、语义完全不同（见 Models.vue
+    // 的文件头注释）。
+    //
+    // 刻意**不带 adminOnly**：普通用户查自己的可用模型与用量同权，
+    // 后端 GET /admin/api/model-names 早已在 userAccessibleRoutes 白名单里
+    // （见 internal/server/user_auth.go），并按身份收窄返回。
+    { path: '/models', name: 'models', component: () => import('./views/Models.vue'), meta: { title: '可用模型' } },
     // 「钱包与充值」。**刻意保留 name/path 为 profile**：路由名已经进了
     // 若干跳转（守卫把非 admin 踢回这里、登出后 push 回这里），改路径会让
     // 老书签 404。展示标题改成「钱包与充值」，见下方 meta.title。

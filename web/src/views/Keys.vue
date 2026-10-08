@@ -493,11 +493,19 @@ async function recomputeUsage(k: AccessKey) {
       </div>
       <div class="head-actions">
         <button class="btn" :disabled="loading" @click="load">刷新</button>
-        <!-- 自助发 key 对所有登录用户开放。归属恒为创建者自己（后端忽略
+        <!-- 自助发 key 对**普通用户**开放。归属恒为创建者自己（后端忽略
              请求里的 user_id），额度被封顶到用户级配额、限速被清零 ——
              所以「重建一把绕开限制」这条路不成立，管理员仍可对具体某把
-             key 施加收紧策略（见 key_handler.Create）。 -->
-        <button class="btn btn-primary" @click="openCreate">新建密钥</button>
+             key 施加收紧策略（见 key_handler.Create）。
+
+             管理员**看不到这个按钮**：控制面/数据面分离后管理员不再铸造
+             数据面凭据，后端 denyAdminKeyCreate（cmd/gateway/main.go）对
+             管理员一律 403。若按钮还留着，管理员点下去必然吃一个 403，
+             而错误消息只有一句「请新建一个普通用户账户」—— 用户会以为
+             key 功能坏了，转而去排查无关的配置。
+             隐藏而非禁用：管理员在这里没有任何可提交的内容，一个点下去
+             必然失败的按钮没有存在价值。 -->
+        <button v-if="!isAdmin()" class="btn btn-primary" @click="openCreate">新建密钥</button>
       </div>
     </div>
 

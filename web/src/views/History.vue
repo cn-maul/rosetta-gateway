@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { computed, onMounted, ref } from 'vue'
-import { api } from '../api'
+import { api, isAdmin } from '../api'
 import { toast } from '../ui'
 import { fmtNum, fmtTokens, fmtTimeMs, fmtSec, fmtSpeed, fmtMoney, statusLabel, statusBadge } from '../fmt'
 import type { AccessKey, UsageHistoryEntry, UsageHistoryPage } from '../types'
@@ -280,7 +280,14 @@ onMounted(() => {
     <div class="page-head">
       <div>
         <h1>调用历史</h1>
-        <div class="sub">请求明细（按时间倒序，可分页）</div>
+        <!-- 口径随身份变化，必须写在界面上（2026-10-10 对普通用户开放本页后）：
+             管理员看到全站，普通用户只看到自己的。后端按会话身份强制收窄
+             （usage_handler.scopeUserID），不是前端过滤。不写明的话，
+             普通用户会以为「网关没记录到我的调用」—— 而实际是他只能看到
+             自己的那部分，两种情况的排查方向完全不同。 -->
+        <div class="sub">
+          请求明细（按时间倒序，可分页）· {{ isAdmin() ? '全站' : '仅你自己' }}的调用记录
+        </div>
       </div>
       <div class="head-actions">
         <select v-model.number="days" class="select w-auto" @change="changeDays">

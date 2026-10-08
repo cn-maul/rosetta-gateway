@@ -218,11 +218,16 @@ watch(
       <!-- admin-only 页签对普通用户隐藏。真正的拦截在路由守卫与后端，
            这里只是不让用户看到点进去才发现没权限的入口。
 
-           顺序按「从常看到配置」排（2026-10-10 调整）：
-           总览 → 访问密钥 → 钱包与充值 → 上游与模型 → 路由 → 用户与分组 → 调用历史 → 设置。
-           admin 部分的动线是「看概况 → 配上游 → 配路由 → 管人 → 查账 → 改设置」，
-           每一步都建立在前面步骤的产物上。个人功能（密钥 / 钱包）放在 admin 区
-           之外，因为普通用户只有它们。 -->
+           顺序按「从常看到配置」排（2026-10-10 调整，同日二次修正）：
+           总览 → 访问密钥 → 可用模型 → 钱包与充值 → 调用历史
+                → 上游与模型 → 路由 → 用户与分组 → 设置。
+           admin 部分的动线是「看概况 → 配上游 → 配路由 → 管人 → 改设置」，
+           每一步都建立在前面步骤的产物上。
+           个人功能（密钥 / 模型 / 钱包 / 调用历史）放在 admin 区之外，
+           因为它们是**普通用户仅有的**四个页面，而管理员看这些页面时
+           拿到的仍是自己的那一份（后端按身份收窄），不存在只有管理员
+           才需要的内容。删减个人区会直接让普通用户无处可去，
+           所以这几个入口不再随管理员动线调整而增删。 -->
       <nav class="side-nav" aria-label="管理后台导航">
         <RouterLink class="side-item" to="/" :title="railCollapsed ? '总览' : undefined">
           <svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
@@ -240,14 +245,21 @@ watch(
           </svg>
           <span v-if="!railCollapsed">访问密钥</span>
         </RouterLink>
-        <!-- 调用历史移进 admin 区（2026-10-10）：用户给的侧边栏顺序里它是第 5 项，
-             排在「用户与分组」之后，属于管理员查账的动线。普通用户看自己的
-             消费记录走「钱包与充值」页，不必进这个完整台账。 -->
-        <!-- 「可用模型」页已删除（2026-10-10）：它是「我能用哪些模型」的只读清单，
-             而管理员不再调用 API，也就用不上这份清单。普通用户仍可在
-             「访问密钥」页的可用模型选择器里看到自己被授权的模型
-             （ModelPicker，数据源同一个 /model-names 端点）。
-             路由 /models 与 Models.vue 一并删除。 -->
+        <!-- 「可用模型」重新出现在个人功能区（2026-10-10）。
+             上一轮它被整体删掉了，理由是「管理员不再调用 API，也就用不上这份
+             清单」—— 这个前提只对管理员成立，但删除是无差别的，普通用户
+             因此失去了唯一能回答「我实际能调哪些模型、单价多少」的页面。
+             ModelPicker 不能替代它：那只是建 key 表单里的一个控件，
+             「一个都不选 = 不限制」的配置态语义与本页的「我实际能用哪些」
+             正好相反（见 Models.vue 文件头注释）。
+             它不在 admin 区，因为查自己的可用模型与查自己的用量同权。 -->
+        <RouterLink class="side-item" to="/models" :title="railCollapsed ? '可用模型' : undefined">
+          <svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <path d="M12 2a3 3 0 0 0-3 3v1a3 3 0 0 0-3 3v1a3 3 0 0 0 0 6v1a3 3 0 0 0 3 3v1a3 3 0 0 0 6 0v-1a3 3 0 0 0 3-3v-1a3 3 0 0 0 0-6V9a3 3 0 0 0-3-3V5a3 3 0 0 0-3-3Z" />
+            <path d="M12 8v8M8 12h8" />
+          </svg>
+          <span v-if="!railCollapsed">可用模型</span>
+        </RouterLink>
         <RouterLink class="side-item" to="/profile" :title="railCollapsed ? '钱包与充值' : undefined">
           <svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
             <path d="M18 20a6 6 0 0 0-12 0" />
@@ -255,6 +267,20 @@ watch(
             <circle cx="12" cy="12" r="10" />
           </svg>
           <span v-if="!railCollapsed">钱包与充值</span>
+        </RouterLink>
+        <!-- 「调用历史」移回个人功能区（2026-10-10）。上一轮按用户给的侧边栏顺序
+             把它划进 admin 区，理由是「普通用户看消费记录走钱包页」—— 但钱包页
+             给的是**聚合数**，而排障要的是**逐条明细**：「我刚才那次为什么报错 /
+             为什么这么慢 / 为什么花了 0.4 分」这三个问题，钱包页一个都答不了。
+             后端早已按会话身份收窄作用域（普通用户只见自己），把它对普通用户
+             开放不产生越权，只是把已存在的入口还回去。 -->
+        <RouterLink class="side-item" to="/history" :title="railCollapsed ? '调用历史' : undefined">
+          <svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <path d="M3 12a9 9 0 1 0 9-9 9.75 9.75 0 0 0-6.74 2.74L3 8" />
+            <path d="M3 3v5h5" />
+            <path d="M12 7v5l4 2" />
+          </svg>
+          <span v-if="!railCollapsed">调用历史</span>
         </RouterLink>
         <template v-if="isAdmin()">
           <RouterLink class="side-item" to="/providers" :title="railCollapsed ? '上游与模型' : undefined">
@@ -285,14 +311,6 @@ watch(
               <path d="M16 3.13a4 4 0 0 1 0 7.75" />
             </svg>
             <span v-if="!railCollapsed">用户与分组</span>
-          </RouterLink>
-          <RouterLink class="side-item" to="/history" :title="railCollapsed ? '调用历史' : undefined">
-            <svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-              <path d="M3 12a9 9 0 1 0 9-9 9.75 9.75 0 0 0-6.74 2.74L3 8" />
-              <path d="M3 3v5h5" />
-              <path d="M12 7v5l4 2" />
-            </svg>
-            <span v-if="!railCollapsed">调用历史</span>
           </RouterLink>
           <RouterLink class="side-item" to="/settings" :title="railCollapsed ? '设置' : undefined">
             <svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
