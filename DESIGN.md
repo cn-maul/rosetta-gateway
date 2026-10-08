@@ -5,10 +5,10 @@
 | 项目名 | **rosetta-gateway** |
 | 项目性质 | 独立项目，不在 Rosetta 上改造（2026-09-15 定，理由见 §2.1） |
 | module path | `github.com/cn-maul/rosetta-gateway` |
-| 运行时依赖 | `github.com/cn-maul/rosetta` v1.0.0（上游 SDK）、`modernc.org/sqlite`（纯 Go SQLite）、`github.com/golang-jwt/jwt/v5`（管理会话） |
-| 版本 | 与 `web/package.json` 同源（当前 1.4.3），镜像与二进制共用 |
+| 运行时依赖 | `github.com/cn-maul/rosetta` v1.0.1（上游 SDK）、`modernc.org/sqlite`（纯 Go SQLite）、`github.com/golang-jwt/jwt/v5`（管理会话） |
+| 版本 | 与 `web/package.json` 同源（当前 1.5.0），镜像与二进制共用 |
 | 状态 | **已实现**（P0–P3 全部落地，多用户、用量归档、配置导入导出均已上线） |
-| 更新 | 2026-10-07 |
+| 更新 | 2026-10-10 |
 
 ---
 
