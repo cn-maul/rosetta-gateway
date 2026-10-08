@@ -468,6 +468,20 @@ export interface UsageGroupEntry {
   count: number // 请求次数
   tokens: number // total_tokens 之和
   name?: string // by-key：密钥名称（缺失时前端回退显示 key）
+  /**
+   * 固化费用合计（元），SUM(cost_total)。
+   *
+   * 2026-10-10 新增，四个维度都有（后端 groupBy 是共用实现）。
+   * 钱包页的「消耗记录」按天列总额就靠它；此前 by-day 只给 count/tokens，
+   * 前端拿不到钱，只能显示 token 而显示不出「这一天花了多少」。
+   *
+   * 口径与 Stats.cost 逐字一致：都读落库当时固化的金额，改价不回溯历史。
+   * 所以「按天求和 == 区间合计」在构造上成立，不靠两边对齐。
+   *
+   * 未配价模型的记录 cost 恒 0 —— 与「未配置 ≠ 免费」是同一件事，
+   * 显示层要靠别的信息（调用历史里逐条的费用）解释，不能在这里猜。
+   */
+  cost: number
 }
 
 /**

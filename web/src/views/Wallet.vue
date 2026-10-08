@@ -9,9 +9,18 @@
  * 而是看**别人**的钱：全站的用户消费汇总 + 所有充值流水 + 一个充值入口。
  *
  *   - 管理员：用户消费金额（全站汇总）、充值记录、充值按钮；
- *     **没有**消耗明细（用户明确说「不要放消费记录」—— 明细在「调用历史」页，
+ *     **没有**消耗记录（用户明确说「不要放消费记录」—— 明细在「调用历史」页，
  *     那里才有时间范围、状态/模型/密钥过滤与 CSV 导出）。
- *   - 普通用户：我的余额、我的消耗、我的充值记录。与改造前一致。
+ *   - 普通用户：我的余额、我的消耗（**按天一行**，2026-10-10 由逐条明细改来）、
+ *     我的充值记录。
+ *
+ * # 为什么普通用户的消耗改成「按天」（2026-10-10）
+ *
+ * 用户要回答的是「10-08 那天花了多少钱」，不是「那天第 37 次调用花了多少」。
+ * 逐条明细在钱包页里有两个问题：一是 15 条上限让用户对不上账，
+ * 而「对不上账」的第一反应是「网关没扣我钱」；二是它与「调用历史」页
+ * 逐条明细功能重叠却少了全部排障控件，两份列表各自演化后必然对不上。
+ * 逐条的诉求没有被取消，只是搬到了它该在的地方。
  *
  * 两形态共用一个组件而不是写两个页面：它们的「加载 → 错误 → 三段内容」骨架
  * 完全相同，分开写意味着骨架改一次要改两处，而两处迟早只改一处。
@@ -26,11 +35,19 @@
 import { computed, onMounted, ref } from 'vue'
 import { useRouter } from 'vue-router'
 import { api, ApiFail, isAdmin, saveToken, session } from '../api'
-import { fmtNum, fmtTokens, fmtBalance, fmtRemainder, fmtMoney, fmtTimeMs, statusLabel, statusBadge } from '../fmt'
+// fmtTimeMs 仍被「充值记录」表使用（那里要的是完整时刻，不是按天）。
+// 消耗记录改成按天之后**不再**用它 —— 按天表的第一列是后端给的 day 字符串，
+// 用 fmtTimeMs 去格式化一个 day 会得到无意义的「NaN」，而且那个串必须
+// 与后端 dayExpr 逐字相同才查得对，自己格式化等于自己造一个可能的偏差。
+// statusLabel / statusBadge 随「状态」列一起移除了：按天汇总没有「这一次
+// 成功/失败」可言 —— 一天里 100 次调用可能有 3 次失败，按天行只能显示请求
+// 次数与费用。失败率要看得逐条，去「调用历史」页按状态筛。
+import { fmtNum, fmtTokens, fmtBalance, fmtRemainder, fmtMoney, fmtTimeMs } from '../fmt'
 import { toast } from '../ui'
+import { rangeStart } from '../range'
 import { checkPasswordStrength } from '../password'
 import AppModal from '../components/AppModal.vue'
-import type { Stats, TopupRecord, UsageByUserEntry, UsageHistoryEntry, User } from '../types'
+import type { Stats, TopupRecord, UsageByUserEntry, UsageGroupEntry, User } from '../types'
 
 // ---------- 加载状态 ----------
 //
@@ -43,7 +60,17 @@ import type { Stats, TopupRecord, UsageByUserEntry, UsageHistoryEntry, User } fr
 const loading = ref(true)
 const err = ref('')
 const stats = ref<Stats | null>(null)
-const rows = ref<UsageHistoryEntry[]>([])
+/**
+ * 普通用户的「消耗记录」：**按天**一行（2026-10-10 由逐条明细改成按天汇总）。
+ *
+ * 数据源是 by-day 端点，与总览页的日趋势图**同一个端点** —— 同一份数字在两处
+ * 出现，口径天然一致（都是 SUM(cost_total)）。逐条明细改由「调用历史」页承担：
+ * 那里才有时间范围、状态/模型/密钥过滤与 CSV 导出，钱包页复制一套筛选器只会
+ * 让两份结论对不上。
+ */
+const byDay = ref<UsageGroupEntry[]>([])
+/** 按天消耗是否加载失败。与整页 err 分开：它只影响那一张表。 */
+const byDayErr = ref('')
 /** 充值流水。两种身份都要，但内容不同（管理员=全部，普通用户=自己）。 */
 const topups = ref<TopupRecord[]>([])
 /** 充值流水条数，用于「共 N 条」。 */
@@ -75,33 +102,20 @@ const byUserErr = ref('')
  */
 const BY_USER_LIMIT = 100
 
-// 最近消耗记录取多少条。
+// 消耗记录覆盖多少天。
 //
-// 不复用调用历史页的分页/过滤：那是排障工具，要时间范围、过滤器和 CSV；
-// 这一页是「我最近花了多少钱」的速览，给 10~15 条 + 跳转即可。
-// 一次取 15 而不取 20/50：再往前的记录对「我今天为什么少了钱」这个问题
-// 没有增量信息量，而每一行都要花一次请求带宽。
-const RECENT_LIMIT = 15
-
-// 最近消耗记录覆盖多少天。
+// # 按天汇总之后为什么反而**拉长**了（2026-10-10）
 //
-// # 口径更新（2026-10-10，Lead 已修后端）
+// 此前这里限制 30 天 + 最多 15 条，取的是逐条明细 —— 那时「15 条」才是实际
+// 上限，30 天只是名义窗口，翻两页就没了。改成按天之后一行就是一天，
+// 15 天的行数恰好是一屏多几行，仍然好读；而 30 天以前的钱如果完全不出现，
+// 用户对不上账时会以为「没扣钱」。所以窗口取 90 天、按天列出 ——
+// 每天一行，90 行是可以往下滑着看完的量，而钱必须能对得上。
 //
-// 此前 /usage/history 用的是 queryRange，它把显式 `from=0` 当成「请求里没带
-// from」并回落到近 7 天 —— 于是 `days=0`（range.ts 的「全部历史」档）在这条
-// 端点上会静默变成「最近一周」，一张标着「最近消耗」的表里混进 7 天前的记录。
-//
-// 那个 queryRange 现在**已被删除**，history / CSV / by-* 全部收敛到
-// queryRangeExplicit（它与 /stats 同口径，能区分「显式 0」与「没传」）。
-// 所以 `days=0` 现在确实等于「全部历史」了。
-//
-// # 那为什么还是取 30 天而不是 0
-//
-// 这是一个**产品选择**，不是兼容性妥协：这一格是「我最近花了多少钱」的速览，
-// 取全部历史会让它退化成一张没有边界的表（用户看不到「这些是最近的」，
-// 而真要翻旧账有「调用历史」页，那里才有时间范围与过滤）。
-// 30 天够覆盖「我看看这个月花了多少」这个最常见的使用节奏。
-const RECENT_DAYS = 30
+// 口径用的是 range.ts 的 rangeStart（**本地自然日 0 点**起算），
+// 与后端按天分桶的 dayExpr（localtime）逐字一致 —— 差一个时区偏移会让
+// 「今天」这一格与后端的「今天」不是同一天，数字与图就对不上。
+const USAGE_DAYS = 90
 
 // 充值流水取多少条。
 //
@@ -123,6 +137,7 @@ async function load() {
   err.value = ''
   topupLoadErr.value = ''
   byUserErr.value = ''
+  byDayErr.value = ''
   // isAdmin() 读 session.me；本页在有 me 的前提下才渲染（路由守卫），所以拿得到。
   const isAdm = isAdmin()
   try {
@@ -136,10 +151,10 @@ async function load() {
     // queryRangeExplicit），与 history 端点同口径 —— 上一轮那个
     // 「history 把 0 当没传、回落到 7 天」的分叉已被移除，两边现在一致。
     //
-    // usageHistory 用 RECENT_DAYS（不是 0），理由见该常量的注释。
+    // 按天消耗用 USAGE_DAYS（不是 0），理由见该常量的注释。
     //
-    // **管理员不请求 usageHistory**：钱包页不放消耗明细（用户明确要求），
-    // 而这是一次实打实的扫描。给不用的东西发请求没有收益。
+    // **管理员不请求 by-day**：这一格只对普通用户渲染，而 by-day 要扫归一化
+    // 来源的整月数据。给不用的东西发请求没有收益。
     //
     // ⚠️ **「用户消费金额」（顶部大卡）复用 stats 而不是新增端点** ——
     // 这是本任务的设计决策（a），理由：
@@ -162,9 +177,19 @@ async function load() {
     // 数字对不上，而那是**我自己造出来的**假不一致，管理员会照着那条提示去
     // 排查一个不存在的问题。取一个共享的 now，两者在构造上就可比。
     const now = Date.now()
-    const [s, h, t, bu] = await Promise.all([
+    // 消耗记录的区间：rangeStart 走本地自然日 0 点，与后端 dayExpr 同口径。
+    // 共享同一个 now（理由见下方注释）：顶部汇总卡与这张表必须可比。
+    const dayFrom = rangeStart(USAGE_DAYS, now)
+    const [s, d, t, bu] = await Promise.all([
       api.stats(0, now),
-      isAdm ? Promise.resolve(null) : api.usageHistory(RECENT_DAYS, RECENT_LIMIT, 0),
+      // 管理员不需要按天表（这一格只对普通用户渲染）—— 不给不用的东西发请求。
+      // 降级：by-day 挂了不该让余额整块消失，那才是用户真正要看的数字。
+      isAdm
+        ? Promise.resolve(null)
+        : api.usageByDay(dayFrom, now).then(
+            (r) => ({ ok: true as const, r }),
+            (e: unknown) => ({ ok: false as const, e }),
+          ),
       api.topups(TOPUP_LIMIT, 0).then(
         (r) => ({ ok: true as const, r }),
         (e: unknown) => ({ ok: false as const, e }),
@@ -180,7 +205,16 @@ async function load() {
     ])
     if (seq !== reqSeq) return // 期间又发起了新请求，本响应已过时，丢弃
     stats.value = s
-    rows.value = h?.records ?? []
+    // 按天消耗单独降级（理由同充值流水：它挂了不该让余额整块消失）。
+    if (d === null) {
+      byDay.value = []
+    } else if (d.ok) {
+      byDay.value = d.r
+    } else {
+      byDay.value = []
+      byDayErr.value =
+        d.e instanceof Error ? '消耗记录加载失败：' + d.e.message : '消耗记录加载失败'
+    }
     // 充值流水**单独降级**：它挂了不该让余额/消费区整块消失（那两块可能
     // 已经渲染出来了），也不该被上面那个 catch 吞成一个整页错误。
     if (t.ok) {
@@ -739,70 +773,66 @@ onMounted(load)
           </template>
         </template>
 
-        <!-- 普通用户：最近消耗明细 -->
+        <!-- 普通用户：消耗记录（按天一行）
+             2026-10-10 由「逐条明细」改成「按天总额」。用户要的是
+             「10-08 那天花了多少」，而不是那一天的第 37 次调用花了多少 ——
+             逐条的排障诉求由「调用历史」页承担（那里才有过滤与 CSV 导出）。
+             两个页的数据同源（都是 cost_total），所以「按天求和 == 调用历史逐条相加」
+             在构造上成立，不会出现两页对不上账。 -->
         <template v-else>
         <div class="panel-title">
-          最近消耗
-          <!-- 窗口写进标题：这张表只覆盖近 30 天。不说的话，用户会把它读成
-               「我的全部调用」，而翻到第 15 条以下就没有了 —— 那是「查看全部」
-               按钮的职责。 -->
-          <span class="hint">近 {{ RECENT_DAYS }} 天，最多 {{ RECENT_LIMIT }} 条</span>
+          消耗记录
+          <!-- 窗口写进标题：不说的话，用户会把它读成「我的全部消费」，
+               而 90 天以前的不在表里。 -->
+          <span class="hint">近 {{ USAGE_DAYS }} 天，按天列出</span>
         </div>
 
         <div v-if="loading" class="loading">加载中…</div>
-        <!-- 余额区已经加载成功、只是这张列表失败：走横幅而不是整块替换，
-             否则用户会以为「我没花过钱」而那只是拉取失败。 -->
+        <!-- 余额区已经加载成功、只是这张表失败：走横幅而不是整块替换，
+             否则用户会以为「我没花过钱」而那只是拉取失败。
+             这一格必须用 byDayErr 而不是整页 err：整页 err 覆盖的是余额，
+             余额比消耗更该被看见。 -->
         <p v-else-if="err" class="notice-warn" role="alert">{{ err }}</p>
-        <div v-else-if="rows.length === 0" class="empty">
+        <p v-else-if="byDayErr" class="notice-warn" role="alert">{{ byDayErr }}</p>
+        <div v-else-if="byDay.length === 0" class="empty">
           <div class="big">⌗</div>
-          暂无调用记录
+          近 {{ USAGE_DAYS }} 天没有消耗记录
         </div>
         <template v-else>
           <div class="tbl-wrap">
             <table class="tbl">
               <thead>
                 <tr>
-                  <th class="c-time">时间</th>
-                  <th>调用模型</th>
+                  <th>日期</th>
+                  <th class="num-h">调用次数</th>
                   <th class="num-h">Tokens</th>
-                  <th class="c-st">状态</th>
-                  <th class="num-h">费用</th>
+                  <th class="num-h">当日费用</th>
                 </tr>
               </thead>
               <tbody>
-                <tr v-for="(h, i) in rows" :key="i">
-                  <td class="mono c-time">{{ fmtTimeMs(h.ts) }}</td>
-                  <td class="mono">
-                    {{ h.public_model || '—' }}
-                    <!-- 流式标注：非流式的首字时间≈总耗时、两者含义不同，
-                         不标注的话这张表上的耗时数字无法解读。 -->
-                    <span
-                      class="badge badge-off"
-                      :title="h.stream ? '流式调用' : '非流式：响应一次性返回'"
-                    >
-                      {{ h.stream ? '流式' : '非流式' }}
-                    </span>
-                  </td>
-                  <td class="num-h">{{ fmtTokens(h.total_tokens) }}</td>
-                  <td class="c-st">
-                    <span class="badge" :class="statusBadge(h.status)">
-                      {{ statusLabel(h.status) }}
-                    </span>
-                  </td>
-                  <!-- 单次费用可能远低于一分（单价低时），所以用 fmtMoney 的
+                <!-- 后端 by-day 已按日期**升序**返回（groupBy 对 day 用
+                     ORDER BY key ASC），所以这里不再排序：
+                     再排一次既是多余的计算，也可能与后端的排序规则漂移。 -->
+                <tr v-for="d in byDay" :key="d.key">
+                  <td class="mono">{{ d.key }}</td>
+                  <td class="num-h">{{ fmtNum(d.count) }}</td>
+                  <td class="num-h">{{ fmtTokens(d.tokens) }}</td>
+                  <!-- 单日费用可能远低于一分（单价低时），所以用 fmtMoney 的
                        高精度档而不是两位小数 —— 否则整列会显示成「0.00 元」，
-                       恰恰掩盖了「确实花了钱」这个事实，也解释不了余额为何没动。 -->
-                  <td class="num-h">{{ h.cost > 0 ? '¥' + fmtMoney(h.cost) : '—' }}</td>
+                       恰恰掩盖了「确实花了钱」这个事实，也解释不了余额为何没动。
+                       cost=0 显示「—」而不是 ¥0.00：那通常是**未配价**，
+                       而「未配置」不等于「免费」（见 types.ts 的 UsageGroupEntry.cost）。 -->
+                  <td class="num-h">{{ d.cost > 0 ? '¥' + fmtMoney(d.cost) : '—' }}</td>
                 </tr>
               </tbody>
             </table>
           </div>
 
-          <!-- 完整表格在「调用历史」页：那里有时间范围、状态/模型/密钥过滤与
+          <!-- 逐条明细在「调用历史」页：那里有时间范围、状态/模型/密钥过滤与
                CSV 导出。这一页刻意不复制那套控件 —— 两份筛选器各自演化，
                用户会拿本页的结论去调用历史页核对而对不上。 -->
           <div class="list-foot">
-            <button class="btn btn-sm" @click="gotoHistory">查看全部调用记录 →</button>
+            <button class="btn btn-sm" @click="gotoHistory">查看逐条调用明细 →</button>
           </div>
         </template>
 

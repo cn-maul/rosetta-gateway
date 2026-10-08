@@ -677,6 +677,21 @@ type usageGroupEntry struct {
 	Key    string `json:"key"`
 	Count  int64  `json:"count"`
 	Tokens int64  `json:"tokens"`
+	// Cost 是固化费用合计（元），即 SUM(cost_total)。
+	//
+	// 2026-10-10 新增：钱包页的「消耗记录」改成按天列总额（逐条明细在
+	// 「调用历史」页），而 by-day 此前只给 count/tokens，前端拿不到钱。
+	//
+	// 四个维度共用这一份实现，所以 by-model / by-key / by-provider 也一并
+	// 带上了 cost。刻意**不加 if column == "day" 分支**：那会让 SELECT 列
+	// 与 Scan 的元数随维度变化，而 Scan 的顺序错位在编译期与测试期都很难
+	// 察觉（多扫/少扫一列的报错信息指向 Scan，而不是真正出错的那一行）。
+	// 多带一个字段对现有调用方是无害的（老前端不读就是忽略），
+	// 而「按天有钱、按模型没钱」这种不对称才是真正会咬人的形状。
+	//
+	// 口径与 /stats 的 cost 逐字一致：都读落库当时固化的 cost_total，
+	// 改价不回溯历史。所以「按天求和 == 总览的区间合计」在构造上就成立。
+	Cost float64 `json:"cost"`
 	// Name：按密钥分组时下发的密钥名称（JOIN access_keys）；其余维度为空。
 	Name string `json:"name,omitempty"`
 }
@@ -746,7 +761,8 @@ func (h *UsageHandler) groupBy(w http.ResponseWriter, r *http.Request, column, n
 
 	withName := nameExpr != ""
 	query := `SELECT u.` + column + ` AS key, COALESCE(SUM(u.n), 0) AS count, ` +
-		store.UsageSumExpr("total_tokens", "u") + ` AS tokens`
+		store.UsageSumExpr("total_tokens", "u") + ` AS tokens, ` +
+		store.UsageSumExpr("cost_total", "u") + ` AS cost`
 	if withName {
 		// JOIN 放在归一化来源之外：密钥名是展示属性，不参与聚合，
 		// 放里面会因一条密钥对应多行来源而把计数复制多份。
@@ -818,10 +834,14 @@ func writeGroupEntries(w http.ResponseWriter, rows *sql.Rows, withName bool) {
 		var e usageGroupEntry
 		var key, name string
 		var err error
+		// 扫描顺序必须与 groupBy 里 SELECT 的列顺序**逐字对应**：
+		// key, count, tokens, cost[, name]。加 cost 时漏改这里的表现是
+		// Scan 报「期望 N 列、实际 M 列」—— 报错点在 Scan，读代码的人会先
+		// 去查 Scan 本身，而不是想到「上面那条 SELECT 加了一列」。
 		if withName {
-			err = rows.Scan(&key, &e.Count, &e.Tokens, &name)
+			err = rows.Scan(&key, &e.Count, &e.Tokens, &e.Cost, &name)
 		} else {
-			err = rows.Scan(&key, &e.Count, &e.Tokens)
+			err = rows.Scan(&key, &e.Count, &e.Tokens, &e.Cost)
 		}
 		if err != nil {
 			writeServerError(w, "usage group scan", err)
