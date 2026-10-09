@@ -173,6 +173,30 @@ func (sw *SSEWriter) WriteThinkingDelta(delta string) error {
 	return sw.writeChunk(map[string]any{"reasoning_content": delta}, nil)
 }
 
+// WriteToolCallDelta 发一个工具调用增量分片。
+//
+// # function 必须始终存在（2026-10 修复的 opencode 兼容性缺陷）
+//
+// OpenAI 的流式协议里 delta.tool_calls[] 的每一项都**必须**带 function
+// （首片给 name、续片只给 arguments 增量；两者都空时给空串）。
+//
+// 原实现是「name 与 arguments 都为空就整个省略 function」：
+//
+//	if len(fn) > 0 { td["function"] = fn }
+//
+// 于是上游吐一个「只带 index 的空拍」时，网关发出的是
+// `{"index":0}` —— 严格按 schema 校验的客户端（opencode 的 AI SDK）
+// 直接报：
+//
+//	invalid_type at choices[0].delta.tool_calls[0].function
+//	Invalid input: expected object, received undefined
+//
+// 实测复现（Hy4 / OpenRouter 会吐这种空拍）：网关产出的分片与报错里的
+// 那一条逐字节一致。
+//
+// 省略字段的初衷是「不发明数据」，但空对象 {} 并不发明任何东西 ——
+// 它只是把「这一拍没有新增的 name/arguments」表达成协议要求的形状。
+// 客户端把 arguments 增量拼起来时，空串增量本来就是无操作。
 func (sw *SSEWriter) WriteToolCallDelta(index int, id, name, argsDelta string) error {
 	if err := sw.ensureRole(); err != nil {
 		return err
@@ -182,15 +206,12 @@ func (sw *SSEWriter) WriteToolCallDelta(index int, id, name, argsDelta string) e
 		td["id"] = id
 		td["type"] = "function"
 	}
-	fn := map[string]any{}
-	if name != "" {
-		fn["name"] = name
-	}
-	if argsDelta != "" {
-		fn["arguments"] = argsDelta
-	}
-	if len(fn) > 0 {
-		td["function"] = fn
+	// function 恒存在：缺失即违反协议，严格客户端会整条响应判为非法。
+	// name/arguments 为空时给空串而不是省略键 —— 空串增量在客户端侧
+	// 是「本次没有新增内容」，语义正确且符合 schema。
+	td["function"] = map[string]any{
+		"name":      name,
+		"arguments": argsDelta,
 	}
 	return sw.writeChunk(map[string]any{"tool_calls": []map[string]any{td}}, nil)
 }
