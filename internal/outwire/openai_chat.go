@@ -196,6 +196,18 @@ func (sw *SSEWriter) WriteThinkingDelta(delta string) error {
 // schema。修正后恒发 function 对**两种**客户端都成立（可选字段给了值，
 // 合法；严格 schema 也满足），所以这个方向没有副作用。
 //
+// # 为什么「恒发 function」对其它客户端也无副作用（已实测）
+//
+// 用 AI SDK 的**原样 zod schema**（vercel/ai 的 openaiChatChunkSchema，
+// 逐字取自 packages/openai/src/chat/openai-chat-api.ts）实测四种产出：
+//
+//	OpenAI 原生流 / 本修复的产出   → 全部通过
+//	修复前（无 function）          → 拒绝，报 expected object, received undefined
+//
+// 对「存在判断」式合并的影响也一并量化过（三种策略 × 四种产出）：
+// 本修复的产出与 OpenAI 原生基准**结果完全一致**（name 与 arguments
+// 逐字同构），即对第三方客户端是零行为差异。
+//
 // 内部字段的填法见下方实现处的注释，那里有个真实的覆盖隐患。
 func (sw *SSEWriter) WriteToolCallDelta(index int, id, name, argsDelta string) error {
 	if err := sw.ensureRole(); err != nil {
