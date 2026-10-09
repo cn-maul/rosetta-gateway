@@ -175,28 +175,28 @@ func (sw *SSEWriter) WriteThinkingDelta(delta string) error {
 
 // WriteToolCallDelta 发一个工具调用增量分片。
 //
-// # function 必须始终存在（2026-10 修复的 opencode 兼容性缺陷）
-//
-// OpenAI 的流式协议里 delta.tool_calls[] 的每一项都**必须**带 function
-// （首片给 name、续片只给 arguments 增量；两者都空时给空串）。
+// # 关于 function 字段（2026-10 修复的 opencode 兼容性缺陷）
 //
 // 原实现是「name 与 arguments 都为空就整个省略 function」：
 //
 //	if len(fn) > 0 { td["function"] = fn }
 //
-// 于是上游吐一个「只带 index 的空拍」时，网关发出的是
-// `{"index":0}` —— 严格按 schema 校验的客户端（opencode 的 AI SDK）
-// 直接报：
+// 于是上游吐一个「只带 index 的空拍」时，网关发出 `{"index":0}`，
+// opencode（其 AI SDK 的 zod schema 比 OpenAI 官方规范更严格）整条判非法：
 //
 //	invalid_type at choices[0].delta.tool_calls[0].function
 //	Invalid input: expected object, received undefined
 //
-// 实测复现（Hy4 / OpenRouter 会吐这种空拍）：网关产出的分片与报错里的
-// 那一条逐字节一致。
+// 实测复现（Hy4 / OpenRouter 会吐这种空拍）：网关产出的分片与报错里那一条
+// 逐字节一致。
 //
-// 省略字段的初衷是「不发明数据」，但空对象 {} 并不发明任何东西 ——
-// 它只是把「这一拍没有新增的 name/arguments」表达成协议要求的形状。
-// 客户端把 arguments 增量拼起来时，空串增量本来就是无操作。
+// ⚠️ 一处必须纠正的认知：OpenAI 官方规范里 function 其实是**可选**的。
+// 官方 SDK 类型（由 openai-openapi 生成）写的是 `function?: ToolCall.Function`，
+// 所以原实现并不「违反 OpenAI 规范」—— 它只是过不了 AI SDK 那套更严格的
+// schema。修正后恒发 function 对**两种**客户端都成立（可选字段给了值，
+// 合法；严格 schema 也满足），所以这个方向没有副作用。
+//
+// 内部字段的填法见下方实现处的注释，那里有个真实的覆盖隐患。
 func (sw *SSEWriter) WriteToolCallDelta(index int, id, name, argsDelta string) error {
 	if err := sw.ensureRole(); err != nil {
 		return err
@@ -206,13 +206,26 @@ func (sw *SSEWriter) WriteToolCallDelta(index int, id, name, argsDelta string) e
 		td["id"] = id
 		td["type"] = "function"
 	}
-	// function 恒存在：缺失即违反协议，严格客户端会整条响应判为非法。
-	// name/arguments 为空时给空串而不是省略键 —— 空串增量在客户端侧
-	// 是「本次没有新增内容」，语义正确且符合 schema。
-	td["function"] = map[string]any{
-		"name":      name,
-		"arguments": argsDelta,
+	// function 恒存在：缺失即触发严格客户端的 schema 校验失败（见函数注释）。
+	//
+	// 但**内部字段**要严格照 OpenAI 自己的线格式来，不能图省事填空串：
+	//   - name      ：只在非空时出现。真实 OpenAI 的续片根本不带这个键。
+	//   - arguments ：恒出现（空串表示「这一拍没有新增参数」）。
+	//
+	// 为什么不能把 name 也恒填成 ""：下游合并增量的常见写法有两种
+	//
+	//	if (fn.name) { ... }               // 真值判断 → 空串安全
+	//	if (fn.name !== undefined) { ... } // 存在判断 → 空串会被当成新值覆盖进去
+	//
+	// 第二种写法在真实 OpenAI 流上是安全的（续片压根没有 name 键），
+	// 但 name:"" 是「有定义的空串」，会被它覆盖到已收到的真实工具名上 ——
+	// 于是工具名丢失、工具调用失效。这个隐患是填空串**引入**的，
+	// 照 OpenAI 的格式省略该键则两种写法都安全。
+	fn := map[string]any{"arguments": argsDelta}
+	if name != "" {
+		fn["name"] = name
 	}
+	td["function"] = fn
 	return sw.writeChunk(map[string]any{"tool_calls": []map[string]any{td}}, nil)
 }
 
