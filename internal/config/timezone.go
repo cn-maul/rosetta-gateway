@@ -2,6 +2,7 @@ package config
 
 import (
 	"fmt"
+	"os"
 	"strings"
 	"time"
 )
@@ -19,13 +20,28 @@ import (
 // 在每一处拼进同一个偏移量 —— 而偏移量对夏令时地区不是常数（一年变两次），
 // 拼常数会把夏令时期间的所有天界切错一小时。
 //
-// 改写 time.Local 一处生效：
-//   - modernc.org/sqlite 的 'localtime' 实测跟随 Go 的 time.Local
-//     （scripts 下的探针验证：TZ env 与运行期改写 time.Local 都能改变
-//     'localtime' 的输出，后者正是本函数做的事）；
-//   - Go 标准库里所有 time.Now().Format / time.Date 默认走 time.Local，
-//     日志时间戳、有效期天数计算（Keys 的 daysLeft）随之统一；
-//   - 不需要动任何 SQL。
+// # 必须同时设 TZ 环境变量与 time.Local —— 只设一个在另一个平台上失效
+//
+// 这是第一版修复踩过的坑（CI 在 ubuntu 上直接红，而本地 Windows 全绿）：
+//
+//	┌──────────┬────────────────────┬────────────────────────┐
+//	│          │ 只改 time.Local    │ 运行期 os.Setenv("TZ") │
+//	├──────────┼────────────────────┼────────────────────────┤
+//	│ Windows  │ 'localtime' 跟随 ✓ │ 'localtime' 跟随 ✓     │
+//	│ Linux    │ 'localtime' 不跟随 ✗ │ 'localtime' 跟随 ✓   │
+//	└──────────┴────────────────────┴────────────────────────┘
+//
+// 原因：modernc.org/sqlite 在 Linux 上走 C 的 tzset —— 它读 TZ 环境变量
+// 与 /etc/localtime 并缓存结果，**不看 Go 的 time.Local**。Windows 上
+// 没有那套 C 运行时语义，才表现为跟随 time.Local。
+//
+// 所以本函数两个都设：
+//   - os.Setenv("TZ", ...)  → 决定 SQLite 'localtime'（两个平台都有效）
+//   - time.Local = loc      → 决定日志时间戳等 Go 侧输出
+//     （os.Setenv 不会改变已初始化的 time.Local，它只在包初始化时读一次）
+//
+// 顺序上 Setenv 必须**早于**任何 SQLite 查询：tzset 的结果会被缓存，
+// 晚设的生效时机不可控。
 //
 // # 时区在什么时候被「读走」
 //
@@ -52,6 +68,26 @@ func ApplyTimezone(name string) (string, error) {
 	loc, err := time.LoadLocation(name)
 	if err != nil {
 		return "", fmt.Errorf("load timezone %q: %w", name, err)
+	}
+
+	// 两处都要设，且顺序不能反。
+	//
+	// 1) os.Setenv("TZ", ...)：SQLite 侧。
+	//    modernc.org/sqlite 在 Linux 上走 C 的 tzset —— 它读 TZ 环境变量
+	//    与 /etc/localtime，**不看 Go 的 time.Local**。
+	//    实测（本修复的第一版只改了 time.Local，CI 在 ubuntu 上直接红）：
+	//      - Windows：改 time.Local → 'localtime' 跟随
+	//      - Linux  ：改 time.Local → 'localtime' 不跟随（仍是 TZ 决定）
+	//    所以这一行才是 Linux 上真正生效的那个动作，缺了它 dayExpr 的日界
+	//    不会变。必须在打开数据库（store.Open）之前调用：tzset 的结果会被
+	//    缓存，晚设的生效时机不可控。
+	//
+	// 2) time.Local = loc：Go 侧。
+	//    日志时间戳、有效期天数等一切走 Go time 包默认位置的输出。
+	//    os.Setenv 不会改变已经初始化的 time.Local（它只在包初始化时读
+	//    一次），所以这行也必须显式写。
+	if err := os.Setenv("TZ", name); err != nil {
+		return "", fmt.Errorf("set TZ env %q: %w", name, err)
 	}
 	time.Local = loc
 	return loc.String(), nil

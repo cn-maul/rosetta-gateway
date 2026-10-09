@@ -1,6 +1,7 @@
 package config
 
 import (
+	"os"
 	"testing"
 	"time"
 )
@@ -25,11 +26,20 @@ import (
 //     用户什么都不用改，这个语义必须钉住 —— 否则「升级后时区被
 //     悄悄重置」会造出新一轮的按天错位。
 //
-// ⚠️ time.Local 是包级全局：测试改写它会污染同包其它测试。所以每个
-// 用例**先保存再还原**，并用 t.Cleanup 兜底 —— 中途 Fatal 也能还原。
+// ⚠️ time.Local 是包级全局、TZ 是进程级环境变量，两者都会污染同包其它
+// 测试。所以每个用例**先保存再还原**，并用 t.Cleanup 兜底 ——
+// 中途 Fatal 也能还原。
 func TestApplyTimezone_SetsLocal(t *testing.T) {
 	saved := time.Local
-	t.Cleanup(func() { time.Local = saved })
+	savedTZ, hadTZ := os.LookupEnv("TZ")
+	t.Cleanup(func() {
+		time.Local = saved
+		if hadTZ {
+			_ = os.Setenv("TZ", savedTZ)
+		} else {
+			_ = os.Unsetenv("TZ")
+		}
+	})
 
 	// 2006-01-02 20:04:05 UTC：
 	//   - 东八区 → 2006-01-03 04:04:05（跨过午夜，日期进一天）
@@ -49,6 +59,12 @@ func TestApplyTimezone_SetsLocal(t *testing.T) {
 	// 东八区的本地日历日必须是 01-03（tsUTC + 8h 已过午夜）。
 	if d := time.Unix(tsUTC, 0).Format("2006-01-02"); d != "2006-01-03" {
 		t.Fatalf("东八区下该时刻应为 2006-01-03，实际 %s —— 清晨调用仍被算进昨天", d)
+	}
+	// TZ 环境变量必须一并设上 —— 只改 time.Local 在 Linux 上对 SQLite
+	// 无效（CI 实测），那正是第一版修复失败的原因。这里断言这个副作用，
+	// 否则将来有人「顺手删掉多余的 Setenv」会让按天分桶静默退回 UTC。
+	if got := os.Getenv("TZ"); got != "Asia/Shanghai" {
+		t.Fatalf("ApplyTimezone 必须同时设置 TZ 环境变量，实际 %q", got)
 	}
 
 	// 换一个时区验证「不是硬编码 +8」：纽约下同一时刻是 01-02。
