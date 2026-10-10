@@ -364,6 +364,38 @@ func (h *ProviderHandler) Test(w http.ResponseWriter, r *http.Request, id string
 	})
 }
 
+// Balance 逐条查询该 provider 的凭据在上游侧的余额。
+//
+// # 为什么状态码恒为 200
+//
+// 与 Test / modelHandler.Test 同一口径：余额查不到（401、超时、上游没有这个
+// 端点）是**查询的结论**，不是管理接口调用失败。用 5xx 表达它会让前端只拿到
+// 一句统一文案，把「该换 key」「该充值」「这个上游压根不支持余额查询」三种
+// 完全不同的后续动作压成同一个错误 —— 而它们的处理方式互不相干。
+//
+// 只有「provider id 不存在」才 404：那是调用方用错了接口。
+func (h *ProviderHandler) Balance(w http.ResponseWriter, r *http.Request, id string) {
+	p, err := h.store.GetProvider(r.Context(), id)
+	if err != nil {
+		writeServerError(w, "get provider", err)
+		return
+	}
+	if p == nil {
+		writeError(w, http.StatusNotFound, "provider not found")
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(r.Context(), 60*time.Second)
+	defer cancel()
+
+	res, err := upstream.QueryProviderBalance(ctx, h.store, id, h.masterKey)
+	if err != nil {
+		writeServerError(w, "query provider balance", err)
+		return
+	}
+	writeJSON(w, http.StatusOK, res)
+}
+
 // maxSlugLen 与 config 侧 bootstrap 的 slug 正则 `^[a-z0-9]{2,32}$` 一致。
 // 超过就截断 —— slug 会进 /v1/models/{model} 路径解析、日志、以及
 // routing.RouteIndex.providers 的键，无界增长没有任何收益。

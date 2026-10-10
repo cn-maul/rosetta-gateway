@@ -3,6 +3,8 @@ package store
 import (
 	"context"
 	"database/sql"
+
+	"github.com/cn-maul/rosetta-gateway/internal/effort"
 )
 
 type UpstreamModel struct {
@@ -15,6 +17,15 @@ type UpstreamModel struct {
 	MaxOutputTokens  int
 	SupportsThinking *bool
 
+	// EffortLevels 是该模型**真实支持**的思考挡位，按强度升序。
+	// nil = 未配置（网关不干预思考强度，完全沿用本功能落地前的行为）。
+	//
+	// UnknownLevels 是配置里出现但本网关不认识的原样值（厂商私有写法）。
+	// 它必须与 EffortLevels 分开：网关夹不了它们，但也不能丢 —— 丢掉的配置在
+	// 界面上会表现为「配了不生效」且无从排查。
+	EffortLevels  []effort.Level
+	UnknownLevels []string
+
 	// 价格：单位为「元 / 百万 tokens」，0 = 未配置（费用统计按 0 计）。
 	// PriceInput 对应缓存未命中的输入，PriceCacheHit 对应缓存命中的输入，
 	// PriceOutput 对应输出。
@@ -24,7 +35,7 @@ type UpstreamModel struct {
 }
 
 // modelColumns 是 upstream_models 三处读路径共用的列清单。
-const modelColumns = `id, provider_id, model_id, display_name, enabled, context_window, max_output_tokens, supports_thinking, price_input, price_cache_hit, price_output`
+const modelColumns = `id, provider_id, model_id, display_name, enabled, context_window, max_output_tokens, supports_thinking, effort_levels, price_input, price_cache_hit, price_output`
 
 // nullIfZeroInt 把 0 写回 NULL。
 // context_window / max_output_tokens 是可空列，0 与"未知"语义不同，
@@ -45,6 +56,19 @@ func nullIfZeroFloat(v float64) any {
 	return v
 }
 
+// effortColumnValue 把结构体里的挡位切片拼回 CSV 列值。
+//
+// 空切片落 **nil**（= NULL = 未配置）而不是空串：这两个状态在数据面语义上
+// 不同（前者不干预思考强度），必须可区分地存。unknown 原样附在后面，
+// 所以「配了一个网关不认识的厂商私有档」不会在保存时被抹掉。
+func effortColumnValue(m *UpstreamModel) any {
+	csv := effort.FormatLevels(m.EffortLevels, m.UnknownLevels)
+	if csv == "" {
+		return nil
+	}
+	return csv
+}
+
 // scanner 覆盖 *sql.Row 与 *sql.Rows，便于复用同一段 scan 逻辑。
 type scanner interface {
 	Scan(dest ...any) error
@@ -59,10 +83,11 @@ func scanModel(sc scanner) (UpstreamModel, error) {
 	var displayName sql.NullString
 	var ctxWindow, maxOut sql.NullInt64
 	var thinking sql.NullBool
+	var effortCSV sql.NullString
 	var priceIn, priceHit, priceOut sql.NullFloat64
 
 	err := sc.Scan(&m.ID, &m.ProviderID, &m.ModelID, &displayName, &enabled,
-		&ctxWindow, &maxOut, &thinking, &priceIn, &priceHit, &priceOut)
+		&ctxWindow, &maxOut, &thinking, &effortCSV, &priceIn, &priceHit, &priceOut)
 	if err != nil {
 		return m, err
 	}
@@ -77,6 +102,11 @@ func scanModel(sc scanner) (UpstreamModel, error) {
 	if thinking.Valid {
 		v := thinking.Bool
 		m.SupportsThinking = &v
+	}
+	// NULL 与空串都表示「未配置」——两种都得到空 EffortLevels，数据面据此
+	// 不干预思考强度。解析在读取时做一次，快照侧拿到的是已就绪的切片。
+	if effortCSV.Valid && effortCSV.String != "" {
+		m.EffortLevels, m.UnknownLevels = effort.ParseLevels(effortCSV.String)
 	}
 	return m, nil
 }
@@ -137,9 +167,10 @@ func (s *Store) CreateUpstreamModel(ctx context.Context, m *UpstreamModel) error
 		enabled = 1
 	}
 	_, err := s.db.ExecContext(ctx,
-		`INSERT INTO upstream_models (id, provider_id, model_id, display_name, enabled, context_window, max_output_tokens, supports_thinking, price_input, price_cache_hit, price_output) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		`INSERT INTO upstream_models (id, provider_id, model_id, display_name, enabled, context_window, max_output_tokens, supports_thinking, effort_levels, price_input, price_cache_hit, price_output) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		m.ID, m.ProviderID, m.ModelID, nullIfEmpty(m.DisplayName), enabled,
 		nullIfZeroInt(m.ContextWindow), nullIfZeroInt(m.MaxOutputTokens), m.SupportsThinking,
+		effortColumnValue(m),
 		nullIfZeroFloat(m.PriceInput), nullIfZeroFloat(m.PriceCacheHit), nullIfZeroFloat(m.PriceOutput))
 	return err
 }
@@ -150,9 +181,10 @@ func (s *Store) UpdateUpstreamModel(ctx context.Context, id string, m *UpstreamM
 		enabled = 1
 	}
 	res, err := s.db.ExecContext(ctx,
-		`UPDATE upstream_models SET model_id = ?, display_name = ?, enabled = ?, context_window = ?, max_output_tokens = ?, supports_thinking = ?, price_input = ?, price_cache_hit = ?, price_output = ? WHERE id = ?`,
+		`UPDATE upstream_models SET model_id = ?, display_name = ?, enabled = ?, context_window = ?, max_output_tokens = ?, supports_thinking = ?, effort_levels = ?, price_input = ?, price_cache_hit = ?, price_output = ? WHERE id = ?`,
 		m.ModelID, nullIfEmpty(m.DisplayName), enabled,
 		nullIfZeroInt(m.ContextWindow), nullIfZeroInt(m.MaxOutputTokens), m.SupportsThinking,
+		effortColumnValue(m),
 		nullIfZeroFloat(m.PriceInput), nullIfZeroFloat(m.PriceCacheHit), nullIfZeroFloat(m.PriceOutput), id)
 	return checkAffected(res, err)
 }
@@ -167,6 +199,9 @@ func (s *Store) DeleteUpstreamModel(ctx context.Context, id string) error {
 // 冲突时**不覆盖价格列**：价格是运维手工填的配置，而本方法的调用方是
 // 「探测 / 批量导入模型列表」—— 上游返回的模型列表永远不带价格，
 // 若把价格也写进 DO UPDATE SET，一次重新导入就会把配好的单价悄悄清零。
+//
+// effort_levels 同理不覆盖：它也是手工按模型文档填的，而导入侧拿不到这个
+// 信息（各家 /models 不返回挡位集合）。覆盖它等于「重新导入 = 抹掉挡位配置」。
 func (s *Store) UpsertUpstreamModel(ctx context.Context, m *UpstreamModel) error {
 	return upsertUpstreamModel(ctx, s.db, m)
 }
@@ -177,11 +212,12 @@ func upsertUpstreamModel(ctx context.Context, ex execer, m *UpstreamModel) error
 		enabled = 1
 	}
 	_, err := ex.ExecContext(ctx,
-		`INSERT INTO upstream_models (id, provider_id, model_id, display_name, enabled, context_window, max_output_tokens, supports_thinking, price_input, price_cache_hit, price_output)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		`INSERT INTO upstream_models (id, provider_id, model_id, display_name, enabled, context_window, max_output_tokens, supports_thinking, effort_levels, price_input, price_cache_hit, price_output)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		 ON CONFLICT(provider_id, model_id) DO UPDATE SET display_name = excluded.display_name, enabled = excluded.enabled, context_window = excluded.context_window, max_output_tokens = excluded.max_output_tokens, supports_thinking = excluded.supports_thinking`,
 		m.ID, m.ProviderID, m.ModelID, nullIfEmpty(m.DisplayName), enabled,
 		nullIfZeroInt(m.ContextWindow), nullIfZeroInt(m.MaxOutputTokens), m.SupportsThinking,
+		effortColumnValue(m),
 		nullIfZeroFloat(m.PriceInput), nullIfZeroFloat(m.PriceCacheHit), nullIfZeroFloat(m.PriceOutput))
 	return err
 }

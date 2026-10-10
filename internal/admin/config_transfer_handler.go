@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/cn-maul/rosetta-gateway/internal/config"
+	"github.com/cn-maul/rosetta-gateway/internal/effort"
 	"github.com/cn-maul/rosetta-gateway/internal/store"
 )
 
@@ -127,9 +128,13 @@ func (h *ConfigTransferHandler) buildExport(ctx context.Context) (configExport, 
 				ContextWindow:    m.ContextWindow,
 				MaxOutputTokens:  m.MaxOutputTokens,
 				SupportsThinking: m.SupportsThinking,
-				PriceInput:       m.PriceInput,
-				PriceCacheHit:    m.PriceCacheHit,
-				PriceOutput:      m.PriceOutput,
+				// 挡位也要导出：它是手工按模型文档配出来的运维知识，
+				// 一次「换台机器重新部署」就配一遍是纯粹的重复劳动。
+				// 形态与库里那列一致（CSV），未知档位附在后面不被丢。
+				EffortLevels:  effort.FormatLevels(m.EffortLevels, m.UnknownLevels),
+				PriceInput:    m.PriceInput,
+				PriceCacheHit: m.PriceCacheHit,
+				PriceOutput:   m.PriceOutput,
 			})
 		}
 		creds, err := h.store.ListCredentials(ctx, p.ID)
@@ -419,6 +424,20 @@ func (h *ConfigTransferHandler) attach(
 			Enabled: me.Enabled, ContextWindow: me.ContextWindow,
 			MaxOutputTokens: me.MaxOutputTokens, SupportsThinking: me.SupportsThinking,
 			PriceInput: me.PriceInput, PriceCacheHit: me.PriceCacheHit, PriceOutput: me.PriceOutput,
+		}
+		// 挡位：一个都识别不出来但原文非空 = 文件里写的是无效值。
+		// 照实跳过并告警，而不是静默导成「未配置」—— 后者会让运维以为
+		// 挡位已经配好，而实际数据面上完全没有生效。
+		if me.EffortLevels != "" {
+			known, unknown := effort.ParseLevels(me.EffortLevels)
+			if len(known) == 0 {
+				resp.ModelsSkipped++
+				resp.Warnings = append(resp.Warnings,
+					fmt.Sprintf("模型 %s / %s 的 effort_levels 无任何可识别档位（%q），已跳过",
+						slug, modelID, me.EffortLevels))
+				continue
+			}
+			m.EffortLevels, m.UnknownLevels = known, unknown
 		}
 		if dry {
 			out.models++

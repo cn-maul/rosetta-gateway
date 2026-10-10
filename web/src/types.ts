@@ -98,6 +98,30 @@ export interface UpstreamModel {
   price_input: number
   price_cache_hit: number
   price_output: number
+  /**
+   * 该模型**真实支持**的思考挡位（强度升序）。
+   *
+   * **空数组 = 未配置**，不是「不支持思考」—— 未配置时数据面不干预思考
+   * 强度，客户端发什么就按 rosetta 的三档归一处理。界面必须据此区分
+   * 「没填」与「填了空」。
+   */
+  effort_levels: string[]
+  /**
+   * 配置里出现但网关不认识的原样值（厂商私有写法）。
+   * 必须显示出来：丢掉它就等于让「配了但不生效」变成无从排查的静默失败。
+   */
+  unknown_effort_levels?: string[]
+  /**
+   * 该模型能否思考，**三态**：
+   *
+   * - `undefined`（字段缺席）= 未配置，网关不干预，客户端维持既有行为；
+   * - `true` = 支持；
+   * - `false` = 确定不支持，数据面会剥掉请求上的思考配置。
+   *
+   * 界面必须能表达第三种状态（清除）。把「不知道」显示成「不支持」会让
+   * 所有未配置的模型凭空失去思考能力 —— 那是一次静默的能力回退。
+   */
+  supports_thinking?: boolean
   tokens_per_sec?: number // 近 5 次真实调用的平均输出速度；未调用过则不下发
   ttfb_ms?: number // 近 5 次流式调用的平均首字延迟（毫秒）；非流式/未测得则不下发
   success_rate?: number // 近 100 次调用成功率（0~1）
@@ -130,6 +154,68 @@ export interface ModelTestResult {
    * 为真时需向用户说明「HTTP 成功却报错」，否则看起来像网关自己坏了。
    */
   in_band?: boolean
+}
+
+/** 单条凭据在上游侧的余额查询结果（对应 internal/upstream.CredentialBalance）。 */
+export interface CredentialBalance {
+  credential_id: string
+  label: string
+  /** ok=查到；error=查了但失败（凭据/网络）；unsupported=这个上游没有余额查询方式。 */
+  status: 'ok' | 'error' | 'unsupported'
+  message?: string
+  /**
+   * 上游报告的可用额度，**未换算成元**（上游可能报 USD，汇率随时在动，
+   * 网关编一个换算值等于撒谎）。单位见 currency。
+   */
+  amount?: number
+  currency?: string
+  /** 上游附带的补充说明（总额度/已用/额度不足…），原样显示。 */
+  detail?: string
+  /** 取数时刻（毫秒时间戳）。余额是点按查询、不是后台轮询，界面要能说清它有多旧。 */
+  fetched_at?: number
+}
+
+/** GET /admin/api/providers/{id}/balance 的响应。 */
+export interface ProviderBalance {
+  provider_id: string
+  provider: string
+  /** ok=全部查到；partial=部分失败；error=全部失败；unsupported=该上游不支持。 */
+  status: 'ok' | 'partial' | 'error' | 'unsupported'
+  message?: string
+  results: CredentialBalance[]
+}
+
+/**
+ * PATCH /models/{id} 的载荷。
+ *
+ * 刻意**不是** Partial<UpstreamModel>：响应里的 effort_levels 是数组（读回来
+ * 方便渲染），而写入用的是逗号分隔字符串（与库里那一列、导出文件同形）。
+ * 两者共用一个类型会逼得调用方在两种形状间来回转换 —— 而转换点一旦分散到
+ * 各调用方，就一定有人会传错的那一种，且编译器不再拦。
+ *
+ * 其余字段是 Partial：未出现的字段保持原值，空串 / 0 是合法的显式值。
+ */
+export interface UpstreamModelUpdate {
+  model_id?: string
+  display_name?: string
+  enabled?: boolean
+  context_window?: number
+  max_output_tokens?: number
+  /** 逗号分隔的挡位原文；空串 = 清除（回到「未配置」）。 */
+  effort_levels?: string
+  /**
+   * 「能否思考」开关的三态：字段缺席 = 不改；true/false = 显式声明；
+   * **null = 清除**（回到「未配置」）。
+   *
+   * 清除必须能表达 —— 界面上「把勾去掉并保存」就是一个明确动作，而把它
+   * 映射成 false 在语义上完全相反。
+   */
+  supports_thinking?: boolean | null
+  // 单价（元 / 百万 tokens）也走这一个 PATCH：Settings 页「模型价格」正是
+  // 按 provider_id + model_id 直接改这三列，与模型编辑共用同一个端点。
+  price_input?: number
+  price_cache_hit?: number
+  price_output?: number
 }
 
 export interface Route {
@@ -687,6 +773,8 @@ export interface ConfigExportModel {
   context_window?: number
   max_output_tokens?: number
   supports_thinking?: boolean
+  /** 逗号分隔的挡位原文（与库里那列同形）；空 = 未配置。 */
+  effort_levels?: string
   price_input?: number
   price_cache_hit?: number
   price_output?: number

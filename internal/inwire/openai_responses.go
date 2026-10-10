@@ -48,6 +48,11 @@ type ResponsesRequest struct {
 	PreviousResponseID string          `json:"previous_response_id,omitempty"`
 	Text               json.RawMessage `json:"text,omitempty"` // {"format": {...}}
 
+	// RawEffort 是 reasoning.effort 的原样取值（与 OpenAIChatRequest.RawEffort
+	// 同义）：数据面要在 ToRosetta 之后按目标模型支持的档位做夹取，需要的是
+	// 归一到三档**之前**的那一档。空串 = 请求没提 effort。
+	RawEffort string `json:"-"`
+
 	// metadata / service_tier / safety_identifier 等未建模字段由 encoding/json 忽略。
 }
 
@@ -100,6 +105,9 @@ func DecodeResponsesRequest(r *http.Request, maxBytes int64) (*ResponsesRequest,
 	}
 	if len(req.Input) == 0 {
 		return nil, fmt.Errorf("input is required")
+	}
+	if req.Reasoning != nil {
+		req.RawEffort = strings.TrimSpace(req.Reasoning.Effort)
 	}
 	if req.MaxOutputTokens != nil && *req.MaxOutputTokens <= 0 {
 		return nil, fmt.Errorf("max_output_tokens: must be a positive integer")

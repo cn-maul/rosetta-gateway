@@ -281,6 +281,13 @@ func (p *Pool) PrepareFromStore(ctx context.Context, st *store.Store, masterKey 
 			continue
 		}
 
+		// 该 provider 下各模型的思考能力，注入给 SDK 的模型档案（见
+		// buildClient 的说明）。读失败不阻断建池：模型档案只影响「SDK 要不要
+		// 拦一次思考请求」，而客户端、能力档案这些都已经配好了 —— 因为档案
+		// 读不出来就把整个上游踢出池子，代价远大于收益，且症状会指向「凭据
+		// 有问题」这个完全错误的方向。
+		modelInfos := modelInfosForProvider(ctx, st, sp.ID, p.logger)
+
 		for _, sc := range creds {
 			if !sc.Enabled {
 				continue
@@ -301,7 +308,7 @@ func (p *Pool) PrepareFromStore(ctx context.Context, st *store.Store, masterKey 
 				continue
 			}
 
-			client, err := buildClient(prov, apiKey, cfg)
+			client, err := buildClient(prov, apiKey, cfg, modelInfos...)
 			if err != nil {
 				p.logger.Error("failed to build client", "provider", sp.Slug, "credential", sc.Label, "error", err)
 				credErrs++
@@ -691,7 +698,13 @@ func NewProviderClient(ctx context.Context, st *store.Store, providerID string, 
 		Timeout:    timeout,
 		MaxRetries: p.MaxRetries,
 	}
-	return buildClient(entry, apiKey, cfg)
+	// 探测路径同样注入模型档案（理由同 buildClient）。整份档案都带上是
+	// 安全的：SDK 的思考闸门按 req.Model 逐条查，其余模型的条目对本次请求
+	// 没有任何影响；而连通性测试走 ListModels，根本不经过闸门。
+	//
+	// 单模型探测之所以不受影响，还有 TestUpstreamModel 显式置
+	// Thinking=nil 那一条（闸门对 nil 直接放行）—— 见那里的成本分析。
+	return buildClient(entry, apiKey, cfg, modelInfosForProvider(ctx, st, p.ID, slog.Default())...)
 }
 
 // probeMaxTokens 是单模型可用性探测的 max_tokens。
@@ -981,7 +994,7 @@ var upstreamHTTPClient = &http.Client{
 	},
 }
 
-func buildClient(prov *ProviderEntry, apiKey string, cfg *config.Config) (*rosetta.Client, error) {
+func buildClient(prov *ProviderEntry, apiKey string, cfg *config.Config, modelInfos ...rosetta.ModelInfo) (*rosetta.Client, error) {
 	opts := []rosetta.Option{
 		rosetta.WithEndpoint(prov.Endpoint),
 		rosetta.WithAPIKey(apiKey),
@@ -1016,7 +1029,79 @@ func buildClient(prov *ProviderEntry, apiKey string, cfg *config.Config) (*roset
 		opts = append(opts, rosetta.WithTimeout(prov.Timeout))
 	}
 
+	// 把网关这一侧配好的模型能力注入 SDK 的模型档案。
+	//
+	// 为什么在这里而不是各自调用点：模型能力是**这个上游的**属性，而一个
+	// client 恰好就是「一个上游 + 一把凭据」—— 数据面、探测、连通性测试三条
+	// 路径都经过这里，注入一次就全覆盖，漏不掉。
+	//
+	// 为什么值得注入：这让 SDK 自己的 gateThinking 生效 —— 它会在「模型
+	// 明确声明不支持思考」时返回 ErrThinkingUnsupported，而不是把一个思考
+	// 请求发给一个根本不思考的模型、拿回一个 200 与一段不含推理的正文。
+	// 注入前这个机制对本网关**形同虚设**：SDK 只信「Known」的条目，而除了
+	// models 文件，网关从没告诉过它任何模型叫什么。
+	//
+	// 可变参数而非新参数：绝大多数调用点（bootstrap 配置、探测、连通性测试）
+	// 没有模型档案可注入，而为一个「通常没有」的参数改全部调用点的签名
+	// 只会制造噪音。
+	if len(modelInfos) > 0 {
+		opts = append(opts, rosetta.WithModelInfo(modelInfos...))
+	}
+
 	return rosetta.NewClient(opts...)
+}
+
+// modelInfosForProvider 把库里配好的模型思考能力转成 SDK 的 ModelInfo。
+//
+// 只转「思考能力」这一组字段：上下文窗口、价格这些网关自己在快照里用，
+// 不必再抄一份进 SDK —— 抄了就会出现两份可能分叉的真相，而这正是这次要
+// 消灭的东西。
+//
+// 三态的处理是这里最要紧的一处：`SupportsThinking` 是**可空**的（nil =
+// 未配置），而 SDK 的 ModelInfo.Known 语义是「这一条来自手工配置、可信」。
+// 因此：
+//   - 配了 true  → SupportsThinking=true，SDK 不拦（正常放行）；
+//   - 配了 false → SupportsThinking=false，SDK 对思考请求返回
+//     ErrThinkingUnsupported（这正是我们要的执行点）；
+//   - 没配（nil）→ **不产出条目**。产出一条 Known=true 且
+//     SupportsThinking=false 的条目，等于宣称「这个模型不思考」——
+//     而事实是「不知道」。那会把一个未配置的普通模型变成思考请求的
+//     拒绝源，比不做这个功能更糟。
+//
+// 不产出条目时 SDK 不认得这个模型，gateThinking 对它直接放行（`!ok`
+// 分支），即完全保持旧行为。
+func modelInfosForProvider(ctx context.Context, st *store.Store, providerID string, logger *slog.Logger) []rosetta.ModelInfo {
+	models, err := st.ListUpstreamModels(ctx, providerID)
+	if err != nil {
+		logger.Warn("failed to read model capabilities for provider (thinking gate disabled)",
+			"provider", providerID, "error", err)
+		return nil
+	}
+	infos := make([]rosetta.ModelInfo, 0, len(models))
+	for _, m := range models {
+		if m.SupportsThinking == nil && len(m.EffortLevels) == 0 {
+			continue
+		}
+		info := rosetta.ModelInfo{ID: m.ModelID}
+		if m.SupportsThinking != nil {
+			info.SupportsThinking = *m.SupportsThinking
+		}
+		if m.SupportsThinking != nil && !*m.SupportsThinking {
+			// 显式否认思考时必须同时设 DisableThinking：合并语义是 OR，
+			// 单靠 SupportsThinking=false 压不过任何低优先级层（见 SDK 的
+			// mergeInfo 注释）。设了它，「配了挡位」也不会把思考复活。
+			info.DisableThinking = true
+		}
+		if len(m.EffortLevels) > 0 {
+			levels := make([]string, 0, len(m.EffortLevels))
+			for _, l := range m.EffortLevels {
+				levels = append(levels, string(l))
+			}
+			info.EffortLevels = levels
+		}
+		infos = append(infos, info)
+	}
+	return infos
 }
 
 func resolveEnv(name string) string {

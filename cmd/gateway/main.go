@@ -27,6 +27,7 @@ import (
 	"github.com/cn-maul/rosetta-gateway/internal/auth"
 	"github.com/cn-maul/rosetta-gateway/internal/config"
 	"github.com/cn-maul/rosetta-gateway/internal/crypto"
+	"github.com/cn-maul/rosetta-gateway/internal/effort"
 	"github.com/cn-maul/rosetta-gateway/internal/inwire"
 	"github.com/cn-maul/rosetta-gateway/internal/outwire"
 	"github.com/cn-maul/rosetta-gateway/internal/ratelimit"
@@ -339,6 +340,10 @@ func main() {
 	adminMux.HandleFunc("PATCH /admin/api/providers/{id}", func(w http.ResponseWriter, r *http.Request) { providerHandler.Update(w, r, r.PathValue("id")) })
 	adminMux.HandleFunc("DELETE /admin/api/providers/{id}", func(w http.ResponseWriter, r *http.Request) { providerHandler.Delete(w, r, r.PathValue("id")) })
 	adminMux.HandleFunc("POST /admin/api/providers/{id}/test", func(w http.ResponseWriter, r *http.Request) { providerHandler.Test(w, r, r.PathValue("id")) })
+	// 上游余额查询：逐条凭据打上游的余额端点（见 internal/upstream/balance.go）。
+	// 纯读操作，不改任何配置，因此不触发 AutoReload（挂 reload 的写操作判据
+	// 看的是方法/路径白名单，这里是 POST 却明确不参与，理由见 handler 注释）。
+	adminMux.HandleFunc("POST /admin/api/providers/{id}/balance", func(w http.ResponseWriter, r *http.Request) { providerHandler.Balance(w, r, r.PathValue("id")) })
 
 	adminMux.HandleFunc("GET /admin/api/providers/{id}/credentials", func(w http.ResponseWriter, r *http.Request) { credentialHandler.List(w, r, r.PathValue("id")) })
 	adminMux.HandleFunc("POST /admin/api/providers/{id}/credentials", func(w http.ResponseWriter, r *http.Request) { credentialHandler.Create(w, r, r.PathValue("id")) })
@@ -1177,6 +1182,87 @@ type ingressRequest struct {
 	// handleIngress 据此把 anthropic 候选从链上滤掉，全被滤空则 400。
 	requiresStructuredOutput bool
 	applyUpstreamExtras      func(req *rosetta.ChatRequest, upstreamProtocol string)
+
+	// rawEffort 是客户端**原样**请求的思考挡位（归一到三档之前），空串 = 未指定。
+	//
+	// 为什么要单独带一路而不复用 buildRosetta 之后的 Thinking.Effort：三档归一
+	// 会把 minimal 合并进 low、xhigh 合并进 high，而模型档位配置可能恰好只支持
+	// xhigh 或 minimal —— 归一之后再夹取就会选错档，等于这个功能没做。
+	rawEffort string
+}
+
+// applyThinkingCapability 按**目标模型**配好的思考能力调整请求的思考设置。
+//
+// 每个 attempt 都要调一次（而不是解析后只调一次）：故障转移链上各目标的模型
+// 可能不同、能力也可能不同 —— 调整必须在「实际要发给谁」这个粒度上做。
+// 这与 applyUpstreamExtras 必须在 attempt 内部做的理由完全一致。
+//
+// 三件事，顺序不可换：
+//
+//  1. **不支持思考**（supports_thinking 显式为 false）：剥掉整个 Thinking。
+//     放在最前面，因为它是唯一会让「思考」这个动作**彻底消失**的分支，
+//     而下面两步都只在「还要思考」的前提下才有意义。
+//
+//  2. **夹紧挡位**（effort_levels 已配）：客户端要的那一档不在模型支持集里
+//     时，就近取一档，而不是丢弃整个意图。
+//
+//  3. **写回原值**（支持集内或未配置）：把客户端的原始档位原样交给 SDK。
+//     走 ThinkingConfig.EffortRaw 而不是 Effort —— 后者只认三档，会把
+//     xhigh 静默压成 high，那正是本功能要消灭的行为。
+//
+// 客户端没指定挡位（Unset）时不写 EffortRaw：那既可能来自未配置（网关不
+// 该干预），也可能来自「思考但不要档位」；两种都不该被网关替它选一档。
+func (ing *ingressRequest) applyThinkingCapability(req *rosetta.ChatRequest, m *routing.UpstreamModel, protocol string) {
+	if m == nil || req.Thinking == nil {
+		return
+	}
+
+	// 1. 模型明确不支持思考：剥掉，而不是让请求带着思考配置打过去。
+	//
+	// 为什么不留给 SDK 的闸门（它已经能报 ErrThinkingUnsupported）：故障转移
+	// 链上换一个目标可能就换成了支持思考的模型，而闸门的作用域只到单个
+	// client。在网关这一层处理，才能「剥掉思考」与「换个目标」同时成立。
+	// 剥而不是 400：思考强度是**请求偏好**，为一个偏好让整个请求失败，
+	// 比退化成不思考更糟 —— 客户端拿到的仍是完整答案。
+	//
+	// nil（未配置）不进来：那不是「不支持」，是「不知道」，而「不知道」
+	// 绝不能被当成「确定不支持」。
+	if m.SupportsThinking != nil && !*m.SupportsThinking {
+		req.Thinking = nil
+		return
+	}
+
+	if ing.rawEffort == "" {
+		return
+	}
+
+	// 2. 夹紧到模型支持的子集。
+	wanted := effort.Parse(ing.rawEffort)
+	if wanted == effort.Unset {
+		return
+	}
+	applied := wanted
+	if len(m.EffortLevels) > 0 && !effort.Supports(wanted, m.EffortLevels) {
+		applied = effort.Clamp(wanted, m.EffortLevels)
+		// 降级必须留痕：没有它，「实际强度和我要的不一样」这个现象与本
+		// 功能落地前完全同形（都是强度不对），没有人能分辨是客户端没配好、
+		// 还是网关夹的。
+		slog.Warn("clamped reasoning effort to the model's supported set",
+			"model", m.ModelID, "provider", m.ProviderID,
+			"requested", string(wanted), "applied", string(applied))
+	}
+
+	// 3. 原样写回。Anthropic 例外：那个协议没有 effort 字段，发上去会被
+	// 拒，而它的思考旋钮是 token 预算 —— 那条路径由 ingwire 在解码时就把
+	// budget_tokens 填好了（见 AnthropicMessagesRequest.RawEffort），这里
+	// 只需把档位还给 SDK 的三档映射，让它折回预算。
+	if protocol == "anthropic" {
+		req.Thinking.EffortRaw = ""
+		req.Thinking.Effort = rosetta.Effort(effort.ToRosettaLevel(applied))
+		return
+	}
+	req.Thinking.EffortRaw = string(applied)
+	req.Thinking.Effort = rosetta.EffortUnset
 }
 
 // rateCommit 把一次请求的两种预占（TPM 窗口 + 终身配额）在请求终结时收尾。
@@ -1288,6 +1374,7 @@ func (openaiChatCodec) Decode(r *http.Request, maxBytes int64) (*ingressRequest,
 		wantsStreamUsage:         wantsStreamUsage(req),
 		requiresStructuredOutput: req.RequiresStructuredOutput(),
 		applyUpstreamExtras:      req.ApplyProtocolPrivateExtra,
+		rawEffort:                req.RawEffort,
 	}, nil
 }
 
@@ -1325,6 +1412,7 @@ func (anthropicMessagesCodec) Decode(r *http.Request, maxBytes int64) (*ingressR
 		// 恒为 false —— 不参与硬约束过滤。
 		requiresStructuredOutput: false,
 		applyUpstreamExtras:      req.ApplyUpstreamExtras,
+		rawEffort:                req.RawEffort,
 	}, nil
 }
 
@@ -1360,6 +1448,7 @@ func (openaiResponsesCodec) Decode(r *http.Request, maxBytes int64) (*ingressReq
 		wantsStreamUsage:         false,
 		requiresStructuredOutput: req.RequiresStructuredOutput(),
 		applyUpstreamExtras:      req.ApplyUpstreamExtras,
+		rawEffort:                req.RawEffort,
 	}, nil
 }
 
@@ -2109,6 +2198,7 @@ func attemptStream(w http.ResponseWriter, r *http.Request, client *rosetta.Clien
 	upstreamReq := ing.buildRosetta()
 	upstreamReq.Model = cand.UpstreamModel.ModelID
 	ing.applyUpstreamExtras(upstreamReq, cand.Provider.Protocol)
+	ing.applyThinkingCapability(upstreamReq, cand.UpstreamModel, cand.Provider.Protocol)
 
 	// 首字预算只覆盖「等首个事件」这一段；建立连接那段交给 ResponseHeaderTimeout
 	// 与下面的总请求预算（2026-10-10 修复的 P2）。
@@ -2386,6 +2476,7 @@ func attemptNonStream(w http.ResponseWriter, r *http.Request, client *rosetta.Cl
 	upstreamReq := ing.buildRosetta()
 	upstreamReq.Model = cand.UpstreamModel.ModelID
 	ing.applyUpstreamExtras(upstreamReq, cand.Provider.Protocol)
+	ing.applyThinkingCapability(upstreamReq, cand.UpstreamModel, cand.Provider.Protocol)
 
 	// 绑定 r.Context() 而非 context.Background()：客户端断开时上游调用应随之取消，
 	// 否则断连请求会一直占用上游连接与配额直到超时（默认 120s）。
@@ -2906,6 +2997,38 @@ func appendModelMetadata(entry map[string]any, snap *snapshot.Snapshot, modelID 
 	if mo > 0 {
 		entry["max_output_tokens"] = mo
 	}
+	// 思考能力：这是工具侧「是否支持思考模式」那个开关的数据来源。
+	//
+	// 三态与数据面完全一致，且**只在确定为「不支持」时才下发 false**：
+	// 未配置（不知道）时缺席，客户端维持既有行为 —— 把「不知道」报成 false
+	// 会让所有未配置的模型都失去思考选择器，那是一次静默的能力回退。
+	if m := modelThinkingCapability(snap, modelID); m != nil {
+		if m.SupportsThinking != nil {
+			entry["supports_thinking"] = *m.SupportsThinking
+		}
+		if len(m.EffortLevels) > 0 {
+			// 键名取 OpenRouter 的 supported_reasoning —— 那是这条链路上已有的
+			// 既成约定，字段形状（字符串数组）也相同。
+			out := make([]string, 0, len(m.EffortLevels))
+			for _, l := range m.EffortLevels {
+				out = append(out, string(l))
+			}
+			entry["supported_reasoning"] = out
+		}
+	}
+}
+
+// modelThinkingCapability 取对外模型名解析后**链首**上游模型的思考能力。
+//
+// 只看链首：故障转移到别的目标时数据面会按那个目标的能力重新处理（见
+// ingressRequest.applyThinkingCapability），所以这里披露的是「默认会落到
+// 哪一档」，而不是「这条链所有可能的档位集合」—— 后者是个会误导客户端的并集。
+func modelThinkingCapability(snap *snapshot.Snapshot, modelID string) *routing.UpstreamModel {
+	res, err := snap.Routes.Resolve(modelID)
+	if err != nil || len(res.Candidates) == 0 {
+		return nil
+	}
+	return res.Candidates[0].UpstreamModel
 }
 
 // modelCapacity 解析一个对外模型名到链首上游模型的容量。

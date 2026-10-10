@@ -3,6 +3,8 @@ package routing
 import (
 	"errors"
 	"strings"
+
+	"github.com/cn-maul/rosetta-gateway/internal/effort"
 )
 
 var (
@@ -55,6 +57,24 @@ type UpstreamModel struct {
 	Enabled         bool
 	ContextWindow   int
 	MaxOutputTokens int
+
+	// SupportsThinking 显式声明该模型能否思考；nil = 未配置（网关不干预）。
+	//
+	// 三态不可塌成 bool：「未配置」与「确定不支持」必须分开 —— 前者是「不知道」
+	// （放行），后者是「知道不支持」（剥掉思考配置）。用 bool 会让所有未
+	// 配置的模型一夜之间变成不能思考。
+	SupportsThinking *bool
+
+	// EffortLevels 是本模型真实支持的思考挡位（强度升序），nil = 未配置。
+	//
+	// 数据面用它把客户端请求的挡位夹到模型真正支持的范围内；/v1/models 用它
+	// 向 agent 工具披露「这个模型有哪些档可选」—— 没有后者，客户端只能靠
+	// 硬编码猜，而猜错的后果是静默降级（inwire.parseEffort 会把 xhigh 压成
+	// high），谁也看不见。
+	//
+	// 与价格字段同理由放在这里：落库时静态、请求时只读，放进快照可以让热
+	// 路径零查库地拿到它（见上面价格字段的注释）。
+	EffortLevels []effort.Level
 
 	// 单价，单位「元 / 百万 tokens」，0 = 未配置（与 store.freezeUsageCost
 	// 的「未配价按 0 计」同义）。语义与上游_models 三列逐字对应：

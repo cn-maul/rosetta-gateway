@@ -119,6 +119,14 @@ func (s *Store) migrate() error {
 			context_window    INTEGER,
 			max_output_tokens INTEGER,
 			supports_thinking INTEGER,
+			-- effort_levels 是该模型支持的思考挡位清单，存**有序**的逗号分隔
+			-- 原文（如 "low,medium,high,xhigh"），NULL / 空串 = 未配置。
+			--
+			-- 为什么用有序 CSV 而不是 JSON 数组或关联表：它天然要被人手工编辑
+			--（照着模型文档抄一段），CSV 的可读性最好；顺序本身有语义 ——
+			-- 强度递增，夹取时靠它定位「最接近的一档」。量级是 2~5 个词，
+			-- 没有按挡位反查模型的需求，关联表只多一次 JOIN。
+			effort_levels    TEXT,
 			price_input       REAL,
 			price_cache_hit   REAL,
 			price_output      REAL,
@@ -638,6 +646,10 @@ func (s *Store) ensureColumns() error {
 		// 这是唯一正确的初值 —— 他们历史上那些「不足一分」的调用已经
 		// 永久丢失了，无法也不该凭空补记（那等于凭空多扣用户的钱）。
 		{"users", "balance_remainder", "INTEGER NOT NULL DEFAULT 0"},
+		// 模型支持的思考挡位（2026-10-12）。可空、刻意不带 DEFAULT：
+		// 语义是「未配置」，此时数据面**不夹取**、由 rosetta 归一到三档 ——
+		// 与「配成空串」必须可区分，所以落 NULL 而不是 DEFAULT ''。
+		{"upstream_models", "effort_levels", "TEXT"},
 	}
 
 	for _, a := range additions {

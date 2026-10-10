@@ -41,6 +41,15 @@ type AnthropicMessagesRequest struct {
 	ToolChoice    *AnthropicToolChoice `json:"tool_choice,omitempty"`
 	Thinking      *AnthropicThinking   `json:"thinking,omitempty"`
 
+	// RawEffort 是 thinking.budget_tokens 映射出的**档位**（原值，见
+	// OpenAIChatRequest.RawEffort）；空串 = 未请求思考。
+	//
+	// Anthropic 没有 effort 字段，客户端给的是 token 预算，而预算→档位的映射
+	// 不可逆（三个档位分别对应一段预算区间）。但映射方向是确定的，所以数据面
+	// 仍能按「目标模型支持的档位子集」把档位夹紧，再交回 rosetta 反算预算 ——
+	// 对 OpenAI 系上游而言，夹紧后的档位才是真正发出去的 reasoning_effort。
+	RawEffort string `json:"-"`
+
 	// Metadata / service_tier / 等未建模字段由 encoding/json 忽略。
 }
 
@@ -150,6 +159,18 @@ func DecodeAnthropicMessagesRequest(r *http.Request, maxBytes int64) (*Anthropic
 		case "disabled":
 		default:
 			return nil, fmt.Errorf("thinking.type: must be enabled|disabled, got %q", req.Thinking.Type)
+		}
+		// 预算 → 档位，与 rosetta 的 effortFromBudget 同一分界，
+		// 保证 ToRosetta 之后数据面拿到的档位与最终发出去的 budget 对得上。
+		if req.Thinking.Type == "enabled" {
+			switch {
+			case req.Thinking.BudgetTokens <= 4096:
+				req.RawEffort = "low"
+			case req.Thinking.BudgetTokens <= 16384:
+				req.RawEffort = "medium"
+			default:
+				req.RawEffort = "high"
+			}
 		}
 	}
 

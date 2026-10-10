@@ -378,9 +378,11 @@ import type {
   ProviderUpdatePayload,
   Credential,
   UpstreamModel,
+  UpstreamModelUpdate,
   DiscoveredModel,
   ModelImportItem,
   ModelTestResult,
+  ProviderBalance,
   Route,
   RouteTarget,
   RouteTargetInput,
@@ -430,6 +432,20 @@ export const api = {
   deleteProvider: (id: string) => mutate(() => del(`/providers/${id}`)),
   testProvider: (id: string, timeoutMs?: number) =>
     post<{ status?: string; message?: string }>(`/providers/${id}/test`, undefined, timeoutMs),
+  /**
+   * 逐条查询该 provider 的凭据在上游侧的余额。
+   *
+   * 走 POST 而非 GET 是为了与 test/discover 同一套「可能很慢的即时动作」惯例：
+   * 它要真打上游，且是**点按触发**的，不该被浏览器或中间层当成幂等的读缓存。
+   *
+   * 刻意不包 mutate：查余额不改任何配置，没有「改完要 reload」的语义。
+   *
+   * timeoutMs 要给足（前端传 60s）：后端逐条串行查询，且每条都可能等满
+   * 15s —— 多凭据的上游会超过管理 API 默认的 30s，沿用默认会把「后端还在查」
+   * 报成前端超时。
+   */
+  providerBalance: (id: string, timeoutMs = 60_000) =>
+    post<ProviderBalance>(`/providers/${id}/balance`, undefined, timeoutMs),
 
   // credentials（挂在 provider 下）
   credentials: (providerId: string) => get<Credential[]>(`/providers/${providerId}/credentials`),
@@ -446,7 +462,7 @@ export const api = {
   allModels: () => get<UpstreamModel[]>('/upstream-models'),
   createModel: (providerId: string, b: Partial<UpstreamModel>) =>
     mutate(() => post<UpstreamModel>(`/providers/${providerId}/models`, b)),
-  updateModel: (id: string, b: Partial<UpstreamModel>) => mutate(() => patch<UpstreamModel>(`/models/${id}`, b)),
+  updateModel: (id: string, b: UpstreamModelUpdate) => mutate(() => patch<UpstreamModel>(`/models/${id}`, b)),
   deleteModel: (id: string) => mutate(() => del(`/models/${id}`)),
   discoverModels: (providerId: string) =>
     post<{ status: string; message?: string; models?: DiscoveredModel[] }>(`/providers/${providerId}/models/discover`),

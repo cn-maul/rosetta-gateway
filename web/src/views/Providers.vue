@@ -3,7 +3,7 @@ import { computed, onMounted, reactive, ref } from 'vue'
 import { api } from '../api'
 import { toast, confirmBox } from '../ui'
 import { fmtSpeed, fmtSec, fmtPercent } from '../fmt'
-import type { Provider, Credential, UpstreamModel, DiscoveredModel, ModelTestResult } from '../types'
+import type { Provider, Credential, UpstreamModel, DiscoveredModel, ModelTestResult, ProviderBalance, CredentialBalance } from '../types'
 import AppModal from '../components/AppModal.vue'
 
 const err = ref('')
@@ -290,6 +290,72 @@ async function removeCred(c: Credential) {
   }
 }
 
+// ---------- 凭据余额 ----------
+
+// 余额是**点按查询**的结果，不是后台轮询的快照。
+//
+// 为什么不做自动刷新：那是一个会被据此做充值决策的数字。让它可能显示
+// 十分钟前的值，比不给这个功能更糟 —— 管理员看到「还剩 300 元」而实际已经
+// 见底，据此决定「不用充」，问题在第二天才暴露。所以这里只保留手动查询，
+// 并把取数时刻一并显示出来，让人知道这个数字有多旧。
+//
+// 每行一个独立标记（而不是全局单个）：多凭据可以并发点，否则点第二行会
+// 被第一行的「查询中…」挡住，而两者的等待时间是各自的。
+const balances = reactive<Record<string, ProviderBalance>>({})
+const balanceBusy = ref(new Set<string>())
+
+function isBalanceBusy(id: string): boolean {
+  return balanceBusy.value.has(id)
+}
+function setBalanceBusy(id: string, on: boolean): void {
+  const next = new Set(balanceBusy.value)
+  if (on) next.add(id)
+  else next.delete(id)
+  balanceBusy.value = next
+}
+
+async function queryBalance(providerId: string) {
+  if (isBalanceBusy(providerId)) return
+  setBalanceBusy(providerId, true)
+  try {
+    balances[providerId] = await api.providerBalance(providerId)
+  } catch (e) {
+    if ((e as { status?: number }).status === 401) return
+    // 管理接口本身失败与「上游余额查不到」是两件事：前者是网关的问题，
+    // 后者在响应里是 status=error。分开显示，否则管理员会去换 key 而真正
+    // 该做的是重试。
+    balances[providerId] = {
+      provider_id: providerId,
+      provider: '',
+      status: 'error',
+      message: '管理接口调用失败：' + (e as Error).message,
+      results: [],
+    }
+  } finally {
+    setBalanceBusy(providerId, false)
+  }
+}
+
+// balanceLine 把一条凭据的余额压成一行。
+//
+// 分三个状态措辞，因为三者的后续动作互不相干：
+//   - unsupported：这个上游压根没有余额查询方式 → 去它自己的后台看；
+//   - error：查了但失败 → 401 换 key、超时重试；
+//   - ok：拿到数 → 数字 + 时刻 + 上游附注。
+// 混成一句「查询失败」会让管理员在三种完全不同的排查方向之间瞎猜。
+function balanceLine(r: CredentialBalance): string {
+  if (r.status === 'unsupported') return r.message || '该上游不支持余额查询'
+  if (r.status === 'error') return r.message || '查询失败'
+  const at = r.fetched_at ? new Date(r.fetched_at).toLocaleTimeString() : ''
+  const head = `${(r.amount ?? 0).toFixed(2)} ${r.currency ?? ''}`.trim()
+  return [head, at, r.detail].filter(Boolean).join(' · ')
+}
+
+function balanceClass(r: CredentialBalance): string {
+  if (r.status === 'ok') return 'bal-ok'
+  return r.status === 'unsupported' ? 'bal-na' : 'test-err'
+}
+
 // ---------- 模型：编辑表单 ----------
 
 // 模型编辑表单。价格不在这里配 —— 单价属于「设置 → 模型价格」分类，
@@ -302,7 +368,30 @@ const mForm = reactive({
   context_window: 0,
   max_output_tokens: 0,
   enabled: true,
+  // effortCsv 是「思考挡位」的逗号分隔原文，与后端列、导出文件同形。
+  // 空串 = 未配置（网关不干预思考强度）。
+  effortCsv: '',
+  // thinking 是「能否思考」的三态。必须显式建模成三态而不是布尔加一个
+  // 「未配置」隐含态：checkbox 天然只有 on/off，而 on/off 与
+  // 「支持 / 不支持」都对应不上第三种状态（未配置）。用 string 三态
+  // ('unset' | 'yes' | 'no') 是唯一诚实的表示。
+  thinking: 'unset' as 'unset' | 'yes' | 'no',
 })
+
+// knownEffortLevels 是网关认识的挡位（强度升序），必须与后端
+// internal/effort.KnownLevels 一致。**刻意不放在后端下发**：这份清单是
+// 网关的常量而非某个部署的配置，多一次请求换一份常量不值得；而一旦写死在
+// 两处，后端加档时前端会静默少一个可选项 —— 那种故障没有任何症状。
+const knownEffortLevels = ['minimal', 'low', 'medium', 'high', 'xhigh'] as const
+
+// thinkingOptions 是「能否思考」的三态选项。措辞刻意用「未配置」而不是
+// 「自动」/「默认」—— 后两者暗示网关会替你决定，而「未配置」的含义是
+// 「网关不干预」，这是两件不同的事。
+const thinkingOptions = [
+  { v: 'unset' as const, label: '未配置' },
+  { v: 'yes' as const, label: '支持' },
+  { v: 'no' as const, label: '不支持' },
+]
 
 function openModel(providerId: string, m?: UpstreamModel) {
   mForm.provider = providerId
@@ -311,12 +400,52 @@ function openModel(providerId: string, m?: UpstreamModel) {
   mForm.context_window = m?.context_window ?? 0
   mForm.max_output_tokens = m?.max_output_tokens ?? 0
   mForm.enabled = m?.enabled ?? true
+  // unknown 档位附在后面：它们是网关不认、但可能是上游认得的厂商私有值，
+  // 编辑时必须原样带回去，否则点一次保存就把它们悄悄抹掉了。
+  mForm.effortCsv = [...(m?.effort_levels ?? []), ...(m?.unknown_effort_levels ?? [])].join(',')
+  mForm.thinking =
+    m?.supports_thinking === undefined ? 'unset' : m.supports_thinking ? 'yes' : 'no'
   // 重置「添加」流程状态
   discovered.value = []
   selected.value = []
   discoverMsg.value = ''
   filter.value = ''
   mForm.open = true
+}
+
+// toggleEffortLevel 勾/取消某个挡位。
+//
+// 用集合而不是字符串拼装来算勾选态：CSV 是有序文本，直接 includes 会把
+// 「xhigh」误判为含「high」（子串包含），那是会点错的。
+function hasEffortLevel(l: string): boolean {
+  return mForm.effortCsv.split(',').some((x) => x.trim() === l)
+}
+
+function toggleEffortLevel(l: string) {
+  const parts = mForm.effortCsv.split(',').map((x) => x.trim()).filter(Boolean)
+  const i = parts.indexOf(l)
+  if (i >= 0) parts.splice(i, 1)
+  else parts.push(l)
+  // 按强度升序写回：CSV 是人手抄的，同一组挡位的两种顺序在库里应当是同一个值。
+  const rank = (x: string) => {
+    const i = knownEffortLevels.indexOf(x as (typeof knownEffortLevels)[number])
+    return i < 0 ? knownEffortLevels.length : i
+  }
+  parts.sort((a, b) => rank(a) - rank(b))
+  mForm.effortCsv = parts.join(',')
+}
+
+// setThinking 设定「能否思考」三态，并把挡位与它保持自洽。
+//
+// 自洽规则只有一条，且方向是刻意的：**明确不支持思考时清空挡位**。
+// 反过来不成立 —— 「支持思考」不必配挡位（客户端可以用上游默认）。
+// 不这样收敛的话，界面上会出现「不支持思考，却配了 high/xhigh」这种
+// 自相矛盾的状态，而它的实际后果是：网关照常剥掉思考配置，档位却仍被
+// 当成有效能力披露给 /v1/models，于是客户端以为能选、选了没效果。
+// 这正是本次要消灭的那类沉默故障，所以宁可让配置保持自洽。
+function setThinking(v: 'unset' | 'yes' | 'no') {
+  mForm.thinking = v
+  if (v === 'no') mForm.effortCsv = ''
 }
 
 async function submitModel() {
@@ -330,6 +459,13 @@ async function submitModel() {
     context_window: Number(mForm.context_window) || 0,
     max_output_tokens: Number(mForm.max_output_tokens) || 0,
     enabled: mForm.enabled,
+    // 空串 = 清除（回到未配置），不是「保持原值」—— 与界面上的「一个都不
+    // 勾选」是同一个动作，后端据此落 NULL。
+    effort_levels: mForm.effortCsv,
+    // 三态映射：unset → null（后端解成「清除」，落 NULL = 未配置）。
+    // 不能省掉这个字段 —— 省略是「不改」，而界面上「切回未配置并保存」
+    // 必须真的写下去，否则这个动作在下次打开表单时会「弹回来」。
+    supports_thinking: mForm.thinking === 'unset' ? null : mForm.thinking === 'yes',
   }
   try {
     await api.updateModel(mForm.editing, body)
@@ -541,6 +677,14 @@ onMounted(() => {
                     <h4>
                       凭据（{{ (credsMap[p.id] ?? []).length }}）
                       <button class="btn btn-sm" @click="openCred(p.id)">添加凭据</button>
+                      <button
+                        class="btn btn-sm btn-ghost"
+                        :disabled="isBalanceBusy(p.id)"
+                        title="实时向该上游查询每把凭据的余额（不自动刷新）"
+                        @click="queryBalance(p.id)"
+                      >
+                        {{ isBalanceBusy(p.id) ? '查询中…' : '查余额' }}
+                      </button>
                     </h4>
                     <div v-if="(credsMap[p.id] ?? []).length === 0" class="empty sub-empty">
                       无凭据 —— 上游鉴权必需
@@ -549,6 +693,7 @@ onMounted(() => {
                       <thead>
                         <tr>
                           <th>凭据</th>
+                          <th>上游余额</th>
                           <th class="c-act">操作</th>
                         </tr>
                       </thead>
@@ -570,6 +715,26 @@ onMounted(() => {
                                 {{ c.enabled ? '启用' : '停用' }}
                               </span>
                             </div>
+                          </td>
+                          <!-- 余额显示在凭据行内而不是另起一表：余额挂在 key 上，
+                               放远了就失去「哪一把快没钱了」这个唯一有用的读法。
+                               没点过「查余额」时留白 —— 它不是 0，
+                               两者必须可区分：一个是「没查」，一个是「确实没钱」。 -->
+                          <td>
+                            <div v-if="balances[p.id]" class="bal-cell">
+                              <div
+                                v-for="r in balances[p.id].results.filter((x) => x.credential_id === c.id)"
+                                :key="r.credential_id"
+                                class="bal-line"
+                                :class="balanceClass(r)"
+                              >
+                                {{ balanceLine(r) }}
+                              </div>
+                              <span v-if="!balances[p.id].results.some((x) => x.credential_id === c.id)" class="dim">
+                                —（无结果）
+                              </span>
+                            </div>
+                            <span v-else class="dim">—</span>
                           </td>
                           <td class="c-act">
                             <div class="row-actions">
@@ -607,6 +772,23 @@ onMounted(() => {
                               <span class="name mono">{{ m.model_id }}</span>
                               <span class="badge" :class="m.enabled ? 'badge-live' : 'badge-off'">
                                 {{ m.enabled ? '启用' : '停用' }}
+                              </span>
+                            </div>
+                            <!-- 思考挡位。这不是可选的展示项：agent 工具靠
+                                 /v1/models 的 supported_reasoning 决定给用户开几档，
+                                 那份数据就来自这一列的配置。不显示的话，
+                                 「客户端以为支持、实际被网关静默降级」无从追查。 -->
+                            <!-- 思考能力。两者（能否思考 / 有哪几档）是同一个问题的
+                                 两面，必须一起显示：只显示挡位会让人以为「配了档位
+                                 就等于支持思考」，而数据面在「不支持思考」时是会
+                                 直接把思考配置剥掉的。 -->
+                            <div v-if="m.supports_thinking !== undefined" class="sub-line">
+                              思考：{{ m.supports_thinking ? '支持' : '不支持' }}
+                            </div>
+                            <div v-if="m.effort_levels?.length" class="sub-line">
+                              挡位：{{ m.effort_levels.join(' · ') }}
+                              <span v-if="m.unknown_effort_levels?.length" class="dim">
+                                （未识别：{{ m.unknown_effort_levels.join('、') }}）
                               </span>
                             </div>
                             <!-- 探测结果留在行内而不是只弹 toast：探测会真实计费，
@@ -777,6 +959,60 @@ onMounted(() => {
           <div class="field span2">
             <span class="tip">单价（元/1M tokens）在「设置 → 模型价格」里按供应商 × 模型配置</span>
           </div>
+          <!-- 「能否思考」用三态而不是 checkbox：这是不少工具侧的那个开关，
+               而它的第三态（未配置）有真实语义 —— 网关不干预。把未配置
+               显示成「不支持」会让所有没配过的模型凭空失去思考能力。 -->
+          <div class="field span2">
+            <label>思考模式</label>
+            <div class="tri-switch" role="radiogroup" aria-label="思考模式">
+              <button
+                v-for="opt in thinkingOptions"
+                :key="opt.v"
+                type="button"
+                class="btn btn-sm"
+                :class="mForm.thinking === opt.v ? 'btn-primary' : 'btn-ghost'"
+                role="radio"
+                :aria-checked="mForm.thinking === opt.v"
+                @click="setThinking(opt.v)"
+              >
+                {{ opt.label }}
+              </button>
+            </div>
+            <span class="tip">
+              「未配置」= 网关不干预，客户端要什么就发什么；「不支持」= 数据面会
+              剥掉请求上的思考配置（并随 /v1/models 下发该声明）。该声明同时注入
+              SDK 的模型档案。
+            </span>
+          </div>
+
+          <!-- 思考挡位。用勾选而不是自由文本：档位名拼错（"x-hig"）在库里
+               就成了一个网关不认、上游也未必认的值，而它的表现是「配了不生效」
+               —— 那正是这一行要消灭的失败。勾选保证写进去的每个值都有定义。
+
+               只在「明确支持思考」或「未配置」时出现：声明不支持思考却配着档位
+               是自相矛盾的（setThinking 会顺手清空它），没有可展示的余地。 -->
+          <div v-if="mForm.thinking !== 'no'" class="field span2">
+            <label>思考挡位</label>
+            <div class="effort-picker">
+              <button
+                v-for="l in knownEffortLevels"
+                :key="l"
+                type="button"
+                class="btn btn-sm"
+                :class="hasEffortLevel(l) ? 'btn-primary' : 'btn-ghost'"
+                :aria-pressed="hasEffortLevel(l)"
+                @click="toggleEffortLevel(l)"
+              >
+                {{ l }}
+              </button>
+            </div>
+            <span class="tip">
+              勾选该模型**真实支持**的思考强度档位。一个都不勾 = 未配置，网关不干预强度。
+              客户端选了不在此列表里的档位时，网关会就近夹取（例如要 xhigh 而模型只支持
+              high）并在日志留痕；档位**原样**发往上游（xhigh 不会被压成 high）。
+              这份列表也会随 /v1/models 下发给 agent 工具（supported_reasoning）。
+            </span>
+          </div>
           <div class="field span2">
             <label class="check-line">
               <input v-model="mForm.enabled" type="checkbox" />
@@ -864,6 +1100,28 @@ onMounted(() => {
    且允许换行：上游的失败原因是整句话，nowrap 会把它截断成看不全的半截。 */
 .test-ok { color: var(--success); }
 .test-err { color: var(--danger); white-space: normal; }
+/* 凭据余额行。ok 用成功色，unsupported 用中性灰（它是「不适用」而不是故障，
+   染成红色会让人以为要去修一个根本不存在的问题）。允许换行：余额附注常是
+   一整句上游文案（额度不足、下周重置），nowrap 会把它截成看不懂的半截。 */
+.bal-line { white-space: normal; }
+.bal-ok { color: var(--success); }
+.bal-na { color: var(--text-4); }
+.bal-cell { min-width: 0; }
+/* 挡位选择器：按钮按强度从弱到强排成一行，间距足够让「勾了哪几个」一眼可分。 */
+.effort-picker {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-bottom: 4px;
+}
+/* 三态选择器与挡位选择器同一套按钮，靠 tri-switch 的类名区分间距与语义；
+   独立成类是为了让「这是互斥的三选一」在 CSS 上也可读（radiogroup 的角色
+   由模板给出，这里只管视觉）。 */
+.tri-switch {
+  display: flex;
+  gap: 6px;
+  margin-bottom: 4px;
+}
 /* Endpoint 的兜底宽度：shortEndpoint 已经把绝大多数地址掐到 44 字符内，
    这条 max-width 只兜极端情况（超长自定义路径），真正的主战场是 JS 截断，
    因为 CSS 的尾部省略会把路径尾巴吃掉。 */

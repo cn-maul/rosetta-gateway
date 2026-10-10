@@ -81,6 +81,10 @@ func RebuildFromDB(ctx context.Context, st *store.Store, failures []ProviderFail
 			Enabled:         m.Enabled,
 			ContextWindow:   m.ContextWindow,
 			MaxOutputTokens: m.MaxOutputTokens,
+			// 思考能力随快照下发：数据面按它剥掉/夹紧思考设置，
+			// /v1/models 按它向 agent 工具披露，SDK 的模型档案也由它注入。
+			SupportsThinking: m.SupportsThinking,
+			EffortLevels:     m.EffortLevels,
 			// 价格随快照下发，供余额预检在热路径零查库地按单价估算
 			// 本次请求的费用（见 routing.UpstreamModel 的价格字段注释）。
 			PriceInput:    m.PriceInput,

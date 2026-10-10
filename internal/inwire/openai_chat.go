@@ -32,7 +32,18 @@ type OpenAIChatRequest struct {
 	// encoding/json 静默忽略 → 客户端设了 reasoning_effort:"high" 完全失效，
 	// 无日志、无报错，而 rosetta 与上游 OpenAI 侧都完整支持它。
 	// 这是最常用的入站协议，丢它的代价最大（用户以为在用推理模式，实际没有）。
-	ReasoningEffort   *string         `json:"reasoning_effort,omitempty"`
+	ReasoningEffort *string `json:"reasoning_effort,omitempty"`
+
+	// RawEffort 是 reasoning_effort 的**原样**取值（规范化前的空白/大小写/别名
+	// 都保留），解析失败时为空。
+	//
+	// 它与 reasoning_effort 分开存而不是每次重算，是因为 ToRosetta 里已经要解析
+	// 一次，而数据面在 ToRosetta **之后**还要用原始档位按「目标模型支持的档位
+	// 子集」做夹取（见 effort.Clamp）。在那一步若只剩三档的 Effort，minimal
+	// 与 low 已被合并，xhigh 与 high 已被合并 —— 夹取就退化成了「在 low/medium/
+	// high 里选」，模型只支持 xhigh 的那种配置会被夹到 high 去，也就是本功能
+	// 要消灭的那类静默降级。
+	RawEffort         string          `json:"-"`
 	PresencePenalty   *float64        `json:"presence_penalty,omitempty"`
 	FrequencyPenalty  *float64        `json:"frequency_penalty,omitempty"`
 	N                 *int            `json:"n,omitempty"`
@@ -157,6 +168,9 @@ func DecodeOpenAIChatRequest(r *http.Request, maxBytes int64) (*OpenAIChatReques
 		return nil, fmt.Errorf("messages is required")
 	}
 
+	if req.ReasoningEffort != nil {
+		req.RawEffort = strings.TrimSpace(*req.ReasoningEffort)
+	}
 	return &req, nil
 }
 

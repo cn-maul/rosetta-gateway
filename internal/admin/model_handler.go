@@ -2,6 +2,7 @@ package admin
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
@@ -9,6 +10,7 @@ import (
 	"time"
 
 	"github.com/cn-maul/rosetta-gateway/internal/config"
+	"github.com/cn-maul/rosetta-gateway/internal/effort"
 	"github.com/cn-maul/rosetta-gateway/internal/store"
 	"github.com/cn-maul/rosetta-gateway/internal/upstream"
 )
@@ -41,6 +43,86 @@ type modelRequest struct {
 	PriceInput    *float64 `json:"price_input"`
 	PriceCacheHit *float64 `json:"price_cache_hit"`
 	PriceOutput   *float64 `json:"price_output"`
+
+	// EffortLevels 是该模型支持的思考挡位（空串 = 清除，回到「未配置」）。
+	//
+	// 用逗号分隔的字符串而不是数组：这份配置天然要照着模型文档手工抄，
+	// 字符串形式与库里那列、以及导出的 CSV 完全同形，少一次转换就少一处
+	// 「界面能配但库里存不下」的环节。
+	EffortLevels *string `json:"effort_levels"`
+
+	// SupportsThinking 是「这个模型能不能思考」开关，三态：
+	// 字段缺席 = 不改；true = 支持；false = 确定不支持；**null = 清除**
+	// （回到「未配置」，网关不再干预）。
+	//
+	// 之所以要 null 这一档：库里那一列是可空的，而「清除」是界面上一个明确
+	// 的动作（把勾去掉并保存）。裸 *bool 只能表达前三种 —— 省略和 null 都
+	// 解不出来，于是「清除」永远做不到，只能从 true 翻到 false，而那在语义上
+	// 完全相反（一个是「不知道」，一个是「确定不支持」）。
+	//
+	// 此前这一列已在 schema 里存在却**既无接口字段也无界面入口**，于是
+	// 「配了不生效」—— 那正是这个字段要消灭的状态。
+	SupportsThinking *nullableBool `json:"supports_thinking"`
+}
+
+// nullableBool 解码 JSON 的三态布尔：true / false / null。
+//
+// 字段缺席由外层的 *nullableBool 表达（指针为 nil），而这里的 null 表示
+// 「显式清空」。两者必须分开 —— 缺席是「不改」，null 是「改成未配置」，
+// 而 JSON 默认无法区分 null 与缺席（除非解到 *bool 的指针再判）。
+type nullableBool struct {
+	Value bool
+	Valid bool // false = 显式 null，即清除
+}
+
+func (b *nullableBool) UnmarshalJSON(data []byte) error {
+	if string(data) == "null" {
+		b.Valid = false
+		return nil
+	}
+	var v bool
+	if err := json.Unmarshal(data, &v); err != nil {
+		return fmt.Errorf("must be true, false or null: %w", err)
+	}
+	b.Value, b.Valid = v, true
+	return nil
+}
+
+// asOpt 把已解码的三态转成落库用的可空指针：显式 null → nil（未配置）。
+func (b *nullableBool) asOpt() *bool {
+	if !b.Valid {
+		return nil
+	}
+	v := b.Value
+	return &v
+}
+
+// applyEffortLevels 把请求里的逗号分隔挡位解析进模型。
+//
+// 只做**语法**层面的一致化（大小写、别名、排序、重复），不替管理员判断
+// 「这个模型到底支持哪些」—— 那是要照着厂商文档填的事实，网关猜不得。
+// 解析不出任何已知档位时返回错误而不是静默忽略：忽略会让「填错了」表现为
+// 「配了但没生效」，正是这个功能要消灭的那类沉默故障。
+func applyEffortLevels(m *store.UpstreamModel, csv string) error {
+	known, unknown := effort.ParseLevels(csv)
+	if len(known) == 0 && len(unknown) == 0 {
+		return nil // 空串 = 清除
+	}
+	if len(known) == 0 {
+		return fmt.Errorf("effort_levels 里没有一个可识别的挡位（收到 %q），合法值：%s",
+			csv, levelListHint())
+	}
+	m.EffortLevels = known
+	m.UnknownLevels = unknown
+	return nil
+}
+
+func levelListHint() string {
+	names := make([]string, 0, len(effort.KnownLevels))
+	for _, l := range effort.KnownLevels {
+		names = append(names, string(l))
+	}
+	return strings.Join(names, " / ")
 }
 
 type modelResponse struct {
@@ -58,6 +140,16 @@ type modelResponse struct {
 	TtfbMs          float64 `json:"ttfb_ms,omitempty"`
 	SuccessRate     float64 `json:"success_rate"`
 	CallCount       int     `json:"call_count,omitempty"`
+
+	// EffortLevels 是该模型真实支持的思考挡位（强度升序）。
+	// 空切片 = 未配置，此时数据面不干预思考强度。
+	EffortLevels []effort.Level `json:"effort_levels"`
+	// UnknownLevels 是配置里出现但网关不认识的原样值：前端必须显示出来，
+	// 否则「配了不生效」会变成无从排查的静默失败。
+	UnknownLevels []string `json:"unknown_effort_levels,omitempty"`
+	// SupportsThinking 三态：nil = 未配置（不下发该字段），
+	// true/false 才是显式声明。
+	SupportsThinking *bool `json:"supports_thinking,omitempty"`
 }
 
 func (h *ModelHandler) List(w http.ResponseWriter, r *http.Request, providerID string) {
@@ -157,6 +249,17 @@ func (h *ModelHandler) Create(w http.ResponseWriter, r *http.Request, providerID
 		PriceCacheHit:   priceHit,
 		PriceOutput:     priceOut,
 	}
+	// 挡位：nil = 不设置（与 PATCH 的 nil 语义一致）。单条创建多用于「导入时
+	// 顺手补一条」，管理员此刻往往没有档位信息，所以只在显式传了才校验。
+	if req.EffortLevels != nil {
+		if err := applyEffortLevels(m, *req.EffortLevels); err != nil {
+			writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+	}
+	if req.SupportsThinking != nil {
+		m.SupportsThinking = req.SupportsThinking.asOpt()
+	}
 
 	if err := h.store.CreateUpstreamModel(r.Context(), m); err != nil {
 		if store.IsUniqueViolation(err) {
@@ -238,6 +341,18 @@ func (h *ModelHandler) Update(w http.ResponseWriter, r *http.Request, id string)
 			return
 		}
 		*p.dst = *p.req
+	}
+
+	// 挡位：nil = 不改；空串 = 清除（回到「未配置」，数据面不再干预强度）。
+	if req.EffortLevels != nil {
+		if err := applyEffortLevels(existing, *req.EffortLevels); err != nil {
+			writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+	}
+	// 支持思考：nil = 不改；null = 清除（回到未配置）；true/false = 显式声明。
+	if req.SupportsThinking != nil {
+		existing.SupportsThinking = req.SupportsThinking.asOpt()
 	}
 
 	if err := h.store.UpdateUpstreamModel(r.Context(), id, existing); err != nil {
@@ -466,16 +581,25 @@ func (h *ModelHandler) ImportModels(w http.ResponseWriter, r *http.Request, prov
 }
 
 func toModelResponse(m store.UpstreamModel) modelResponse {
+	// 挡位切片必须是**非 nil** 的：JSON 里 null 与 [] 对前端是两种状态，
+	// 而这里对外承诺的就是「空数组 = 未配置」，nil 会序列化成 null。
+	levels := m.EffortLevels
+	if levels == nil {
+		levels = []effort.Level{}
+	}
 	return modelResponse{
-		ID:              m.ID,
-		ProviderID:      m.ProviderID,
-		ModelID:         m.ModelID,
-		DisplayName:     m.DisplayName,
-		Enabled:         m.Enabled,
-		ContextWindow:   m.ContextWindow,
-		MaxOutputTokens: m.MaxOutputTokens,
-		PriceInput:      m.PriceInput,
-		PriceCacheHit:   m.PriceCacheHit,
-		PriceOutput:     m.PriceOutput,
+		ID:               m.ID,
+		ProviderID:       m.ProviderID,
+		ModelID:          m.ModelID,
+		DisplayName:      m.DisplayName,
+		Enabled:          m.Enabled,
+		ContextWindow:    m.ContextWindow,
+		MaxOutputTokens:  m.MaxOutputTokens,
+		PriceInput:       m.PriceInput,
+		PriceCacheHit:    m.PriceCacheHit,
+		PriceOutput:      m.PriceOutput,
+		EffortLevels:     levels,
+		UnknownLevels:    m.UnknownLevels,
+		SupportsThinking: m.SupportsThinking,
 	}
 }

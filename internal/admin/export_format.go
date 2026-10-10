@@ -84,16 +84,18 @@ type credentialExport struct {
 }
 
 type modelExport struct {
-	ProviderSlug     string  `json:"provider_slug"`
-	ModelID          string  `json:"model_id"`
-	DisplayName      string  `json:"display_name,omitempty"`
-	Enabled          bool    `json:"enabled"`
-	ContextWindow    int     `json:"context_window,omitempty"`
-	MaxOutputTokens  int     `json:"max_output_tokens,omitempty"`
-	SupportsThinking *bool   `json:"supports_thinking,omitempty"`
-	PriceInput       float64 `json:"price_input,omitempty"`
-	PriceCacheHit    float64 `json:"price_cache_hit,omitempty"`
-	PriceOutput      float64 `json:"price_output,omitempty"`
+	ProviderSlug     string `json:"provider_slug"`
+	ModelID          string `json:"model_id"`
+	DisplayName      string `json:"display_name,omitempty"`
+	Enabled          bool   `json:"enabled"`
+	ContextWindow    int    `json:"context_window,omitempty"`
+	MaxOutputTokens  int    `json:"max_output_tokens,omitempty"`
+	SupportsThinking *bool  `json:"supports_thinking,omitempty"`
+	// EffortLevels 是逗号分隔的挡位原文（与库里那列同形），空串 = 未配置。
+	EffortLevels  string  `json:"effort_levels,omitempty"`
+	PriceInput    float64 `json:"price_input,omitempty"`
+	PriceCacheHit float64 `json:"price_cache_hit,omitempty"`
+	PriceOutput   float64 `json:"price_output,omitempty"`
 }
 
 // 算法标识写进文件，是为了让「用错算法」变成一句明确的错误而不是

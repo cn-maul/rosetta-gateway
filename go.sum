@@ -2,6 +2,8 @@ github.com/cn-maul/rosetta v1.0.0 h1:XzeOli6WNTjfEHoL05C5pOwV8heuj1EBkONO3cjrnio
 github.com/cn-maul/rosetta v1.0.0/go.mod h1:L/Br0RylBF84fNmudwD+hyMZMpjYmVWsFxu9bVj+5BY=
 github.com/cn-maul/rosetta v1.0.1 h1:2K7veyO5bT1xORc4MhBwbwbRX10Fye6VEEYGzOWPgjU=
 github.com/cn-maul/rosetta v1.0.1/go.mod h1:L/Br0RylBF84fNmudwD+hyMZMpjYmVWsFxu9bVj+5BY=
+github.com/cn-maul/rosetta v1.1.0 h1:SS4P/raDOexYszTB5WYDIObUv/bFxwCZnWKiOUpQ0yE=
+github.com/cn-maul/rosetta v1.1.0/go.mod h1:L/Br0RylBF84fNmudwD+hyMZMpjYmVWsFxu9bVj+5BY=
 github.com/dustin/go-humanize v1.0.1 h1:GzkhY7T5VNhEkwH0PVJgjz+fX1rhBrR7pRT3mDkpeCY=
 github.com/dustin/go-humanize v1.0.1/go.mod h1:Mu1zIs6XwVuF/gI1OepvI0qD18qycQx+mFykh5fBlto=
 github.com/golang-jwt/jwt/v5 v5.3.1 h1:kYf81DTWFe7t+1VvL7eS+jKFVWaUnK9cB1qbwn63YCY=
