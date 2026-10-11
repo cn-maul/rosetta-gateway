@@ -608,7 +608,11 @@ func main() {
 	go func() {
 		defer close(pruneDone)
 		runPrune := func(reason string) {
-			res, err := db.PruneOldUsage(context.Background(), store.DefaultRetentionDays)
+			// 保留期来自配置（config.UsageRetentionDays），默认 30。
+			// 此前硬编码 store.DefaultRetentionDays，用量小的部署无法调短 ——
+			// 见 AUDIT/perf-2026-10-11.md §五：它直接决定用户级配额预检的
+			// 单次耗时（30 天 ≈ 63ms，7 天 ≈ 15ms）。
+			res, err := db.PruneOldUsage(context.Background(), cfg.UsageRetentionDays)
 			switch {
 			case err != nil:
 				// 单次失败不终止循环：下个周期重试即可，而退出循环等于
@@ -1253,12 +1257,21 @@ func (ing *ingressRequest) applyThinkingCapability(req *rosetta.ChatRequest, m *
 	}
 
 	// 3. 原样写回。Anthropic 例外：那个协议没有 effort 字段，发上去会被
-	// 拒，而它的思考旋钮是 token 预算 —— 那条路径由 ingwire 在解码时就把
-	// budget_tokens 填好了（见 AnthropicMessagesRequest.RawEffort），这里
-	// 只需把档位还给 SDK 的三档映射，让它折回预算。
+	// 拒，而它的思考旋钮是 token 预算 —— 走 SDK 的三档折算（细节见分支内注释）。
 	if protocol == "anthropic" {
 		req.Thinking.EffortRaw = ""
 		req.Thinking.Effort = rosetta.Effort(effort.ToRosettaLevel(applied))
+		// 必须清零，否则上面整段夹取是空转：rosetta 的 plan() 只认
+		// BudgetTokens（provider_anthropic.go「b := req.Thinking.BudgetTokens;
+		// if b <= 0 { b = anthropicBudget(...) }」），Effort 在那条路径上
+		// 完全不参与。而 Anthropic 入站时 BudgetTokens 已被 inwire 按客户端
+		// 的原始预算填好（见 inwire/anthropic.go ToRosetta）。不清零就会：
+		// 客户端发 budget_tokens=5000 → 夹到 high、日志打「clamped to high」
+		// → 上游实收 5000（medium 档）。强度与计费档位双双对不上，且无任何报错。
+		//
+		// 置 0 而不是自己算预算：折算表在 SDK 那边（low=2048 / medium=8192 /
+		// high=32768），网关再维护一份必然随 SDK 漂移。
+		req.Thinking.BudgetTokens = 0
 		return
 	}
 	req.Thinking.EffortRaw = string(applied)

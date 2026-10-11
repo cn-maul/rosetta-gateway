@@ -197,6 +197,111 @@ func TestApplyThinkingCapability_档位处理(t *testing.T) {
 	}
 }
 
+// TestApplyThinkingCapability_Anthropic预算与夹取一致 是这次修复的回归守卫。
+//
+// **旧测试为什么漏掉它**：TestApplyThinkingCapability_档位处理 只断言
+// EffortRaw 与 Effort 两个字段，而 Anthropic 分支把这两个都写对了 ——
+// 错的是第三个字段 BudgetTokens，而那恰恰是 rosetta plan() 唯一认的那个。
+// 于是「日志说已夹到 high、上游实收 medium」这个现象，
+// 在只断言 Effort 的测试里完全不可见。
+//
+// 本测试改为断言**最终发往上游的 budget_tokens**，即整条链路真正的落点：
+// 入站预算 → 折算档位（rawEffort）→ 网关夹取 → SDK 三档折算 → 实发预算。
+func TestApplyThinkingCapability_Anthropic预算与夹取一致(t *testing.T) {
+	cases := []struct {
+		name     string
+		budget   int64  // Anthropic 入站的原始预算（inwire 填进 BudgetTokens）
+		raw      string // inwire 由 budget 折算出的档位
+		levels   []effort.Level
+		wantEff  rosetta.Effort
+		wantZero bool // BudgetTokens 必须被清零，交回 SDK 折算
+	}{
+		{
+			name:   "超集被夹到 high 后，预算不再沿用客户端原值",
+			budget: 5000, // → inwire 折算为 medium
+			raw:    "medium",
+			// 模型只支持 high：medium 不在集合内，必须夹到 high。
+			levels:   []effort.Level{effort.High},
+			wantEff:  rosetta.EffortHigh,
+			wantZero: true,
+		},
+		{
+			name:   "档位本就在支持集内也要清零，保证落点唯一",
+			budget: 40000, // → high，模型支持 high，**不发生夹取**
+			raw:    "high",
+			levels: []effort.Level{effort.High},
+			// 即使没夹取也要清零：否则实发的是 40000 而不是 SDK 折算的 32768，
+			// 「档位→预算」的映射就永远存在两条并行的真相。
+			wantEff:  rosetta.EffortHigh,
+			wantZero: true,
+		},
+		{
+			name:    "夹到 low 时同样不能漏",
+			budget:  40000, // → high
+			raw:     "high",
+			levels:  []effort.Level{effort.Low},
+			wantEff: rosetta.EffortLow,
+			// 弱化方向同样要生效 —— 只测「变强」会漏掉反向的那一半。
+			wantZero: true,
+		},
+	}
+
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			req := &rosetta.ChatRequest{
+				Model: "public",
+				Thinking: &rosetta.ThinkingConfig{
+					BudgetTokens: int(c.budget),
+				},
+			}
+			ing := &ingressRequest{rawEffort: c.raw}
+			ing.applyThinkingCapability(req, &routing.UpstreamModel{
+				ModelID: "claude", EffortLevels: c.levels,
+			}, "anthropic")
+
+			if req.Thinking.BudgetTokens != 0 {
+				t.Fatalf(
+					"BudgetTokens = %d，仍是客户端原值 —— rosetta plan() 只认它，"+
+						"上面夹取出来的 %q 永远不会生效（上游实收客户端预算）",
+					req.Thinking.BudgetTokens, c.wantEff)
+			}
+			if req.Thinking.Effort != c.wantEff {
+				t.Fatalf("Effort = %q，期望 %q", req.Thinking.Effort, c.wantEff)
+			}
+			if req.Thinking.EffortRaw != "" {
+				t.Fatalf("EffortRaw = %q，Anthropic 无此字段，发上去会被拒", req.Thinking.EffortRaw)
+			}
+		})
+	}
+}
+
+// TestApplyThinkingCapability_OpenAI系不动预算 钉住修改的边界：
+// BudgetTokens 只有 Anthropic 协议在意，OpenAI 两条路径碰它就等于引入回归。
+func TestApplyThinkingCapability_OpenAI系不动预算(t *testing.T) {
+	for _, proto := range []string{"openai-chat", "openai-responses"} {
+		t.Run(proto, func(t *testing.T) {
+			req := &rosetta.ChatRequest{
+				Model: "public",
+				Thinking: &rosetta.ThinkingConfig{
+					BudgetTokens: 5000,
+				},
+			}
+			ing := &ingressRequest{rawEffort: "medium"}
+			ing.applyThinkingCapability(req, &routing.UpstreamModel{
+				ModelID: "gpt-5", EffortLevels: []effort.Level{effort.High},
+			}, proto)
+
+			if req.Thinking.BudgetTokens != 5000 {
+				t.Fatalf("%s 路径不该动 BudgetTokens，实际 %d", proto, req.Thinking.BudgetTokens)
+			}
+			if req.Thinking.EffortRaw != "high" {
+				t.Fatalf("%s 路径应把夹取结果原样发在 EffortRaw 上，实际 %q",
+					proto, req.Thinking.EffortRaw)
+			}
+		})
+	}
+}
+
 // TestApplyThinkingCapability_不支持思考时剥掉 钉住 supports_thinking 的
 // 执行点：显式声明不支持的模型不该收到思考配置。
 //
