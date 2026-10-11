@@ -374,10 +374,67 @@ func (s *Store) DeleteUser(ctx context.Context, id string) error {
 // 走覆盖扫描；归档那一支按 user_id 列（表 A 主键第二列）。
 func (s *Store) SumUserUsedTokens(ctx context.Context, userID string) (int64, error) {
 	var used int64
-	src, args := UsageSource(UsageFilter{UserID: userID})
 	err := s.read.QueryRowContext(ctx,
-		`SELECT `+UsageSumExpr("total_tokens", "u")+` FROM `+src, args...).Scan(&used)
-	return used, err
+		`SELECT total_tokens FROM user_usage_totals WHERE user_id = ?`, userID).Scan(&used)
+	if err == nil {
+		return used, nil
+	}
+	if !errors.Is(err, sql.ErrNoRows) {
+		return 0, err
+	}
+
+	// users 里没有这一行 —— 回退到实时 SUM，保持与旧实现逐字一致的语义。
+	//
+	// 什么时候会走到：usage_records 对 users **没有外键**（孤儿 key 的历史行
+	// 必须能存在，见 store.go 里 usage_records.user_id 的迁移注释），所以
+	// user_id 可以指向一个已被删除的用户。此时累加列无从累加，实时 SUM
+	// 反而是唯一正确的数据源。
+	//
+	// 数据面不会走到这里：调用方（main.go 的用户级配额检查）先查快照确认
+	// 用户存在才调用本函数。这条分支是为**直接调用方**与测试保底的 ——
+	// 代价是一次 O(明细行) 查询，发生在「用户已不存在」这种非热路径上。
+	var fallback int64
+	src, args := UsageSource(UsageFilter{UserID: userID})
+	if qerr := s.read.QueryRowContext(ctx,
+		`SELECT `+UsageSumExpr("total_tokens", "u")+` FROM `+src, args...).Scan(&fallback); qerr != nil {
+		if errors.Is(qerr, sql.ErrNoRows) {
+			return 0, nil // 真的没有任何用量，与旧实现一致
+		}
+		return 0, qerr
+	}
+	return fallback, nil
+}
+
+// UserQuotaAndUsed 一次取回「配额 + 已用」，供 /stats 顺带下发。
+//
+// 2026-10-11：前端的钱包页原先只能从 /me 拿这两个字段，而 /me 是**登录快照**，
+// 于是「已用量」在页面上长期停更（见 AUDIT/frontend-audit-2026-10-11.md H1）。
+// 把它们并入 /stats 后，界面每次刷新都能拿到当前值。
+//
+// 为什么单开这个方法而不是让调用方自己查两次：
+//   - quota 来自 users 表、used 来自累加列 user_usage_totals，**两张表**；
+//   - 已用量刻意复用 SumUserUsedTokens 的口径（那是配额**判定的**数据源），
+//     保证「界面显示的已用」与「后端判超额的已用」是同一个数字。
+//     若图省事改读 users.used_tokens（展示列），两者会分叉，用户会看到
+//     「明明还有额度却被拒」。
+//
+// 用户不存在时返回 (0, 0, nil)：quota=0 在前端恰好是「不限」的既有语义，
+// 与 meResponse 对未知用户的处理同口径。
+func (s *Store) UserQuotaAndUsed(ctx context.Context, userID string) (quota, used int64, err error) {
+	err = s.read.QueryRowContext(ctx,
+		`SELECT COALESCE(quota_tokens, 0) FROM users WHERE id = ?`, userID).Scan(&quota)
+	if errors.Is(err, sql.ErrNoRows) {
+		return 0, 0, nil
+	}
+	if err != nil {
+		return 0, 0, err
+	}
+
+	used, err = s.SumUserUsedTokens(ctx, userID)
+	if err != nil {
+		return 0, 0, err
+	}
+	return quota, used, nil
 }
 
 // RecomputeUserUsage 重算某用户的已用量并回写。

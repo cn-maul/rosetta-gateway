@@ -303,6 +303,22 @@ func (s *Store) migrate() error {
 		// （预占一次、触发器一次），2026-10-07 的 P0-2 缺陷正是这个成因。
 		// 预占走独立的 reserved_tokens 列（ReserveQuota / ReleaseQuota 维护，
 		// 见 key_dao.go），本触发器不需要、也不得感知它。
+		// user_usage_totals：用户级 token 累计的**唯一权威值**（2026-10-11 性能优化）。
+		//
+		// 为什么是独立窄表而不是 users.used_tokens 列：累加它的触发器必须引用
+		// 某张表，而 SQLite 在 ALTER TABLE ... RENAME 时会**校验并重写所有引用
+		// 该表的触发器**。引用 users 的触发器会把「重建 users 表」这个迁移操作
+		// 整体卡死（实测报 error in trigger: no such table: main.users）。
+		//
+		// 这张表窄、只被迁移创建、不参与任何 DROP TABLE/RENAME，因此不会成为
+		// 任何 schema 操作的绊脚石。
+		//
+		// users.used_tokens 保留为**展示字段**（由 RecomputeUserUsage 与回填维护），
+		// 配额判定改读本表 —— 展示值可以偶尔滞后，判定值不行。
+		`CREATE TABLE IF NOT EXISTS user_usage_totals (
+			user_id      TEXT PRIMARY KEY,
+			total_tokens INTEGER NOT NULL DEFAULT 0
+		)`,
 		`DROP TRIGGER IF EXISTS trg_update_used_tokens`,
 		`CREATE TRIGGER trg_update_used_tokens
 		 AFTER INSERT ON usage_records
@@ -465,6 +481,20 @@ func (s *Store) migrate() error {
 		return err
 	}
 	if err := s.reconcileUsageTotals(); err != nil {
+		return err
+	}
+	// 5. backfillUserUsedTokens 把 users.used_tokens 重算成真实累计值。
+	//
+	// 必须在上面那批 migrations（建 trg_update_user_used_tokens 触发器）之后：
+	// 回填用的是赋值 UPDATE，不会触发 INSERT 触发器，所以顺序上不严格
+	// 依赖，但把「先有触发器、再填历史」写死可以让后续读者不必再推一遍。
+	//
+	// 必须在 reconcileUsageTotals 之后：两者都依赖 UsageSource 的口径，
+	// 而口径由 migrations 里 ensureRollupDimensions 补齐的维度列决定。
+	if err := s.backfillUserUsedTokens(); err != nil {
+		return err
+	}
+	if err := s.ensureUserUsageTotalsTrigger(); err != nil {
 		return err
 	}
 	if err := s.dropDeadColumns(); err != nil {

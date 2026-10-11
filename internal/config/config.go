@@ -34,6 +34,27 @@ type Config struct {
 	Timezone  string    `json:"timezone"`
 	Defaults  Defaults  `json:"defaults"`
 	Bootstrap Bootstrap `json:"bootstrap"`
+
+	// UsageRetentionDays 是 usage_records 明细保留天数，超期由归档剪枝
+	// （store.PruneOldUsage）聚合进 usage_daily_rollups 后删除。
+	//
+	// # 为什么要做成配置（2026-10-11，性能审计 AUDIT/perf-2026-10-11.md）
+	//
+	// 此前是 store.DefaultRetentionDays 常量硬编码 30。实测增长曲线
+	// （0.5µs/行）显示这个值同时决定两件事，方向相反：
+	//
+	//   - **用户级配额预检**（store.SumUserUsedTokens）对明细做全量 SUM，
+	//     代价 O(保留期内该用户的行数)。4200 req/天 × 30 天 = 12.6 万行
+	//     ≈ **63ms/次**，落在每个启用用户级配额的请求上。
+	//   - **写放大**：每条明细要维护 5 个二级索引 + 2 个触发器。
+	//
+	// 用量小的部署把 30 改成 7，配额预检降到 ~15ms，且少留 23 天明细；
+	// 用量大的部署若 30 天不够（该用户累计超 150 万行 ≈ 770ms），也要能调。
+	// 硬编码 30 无法同时服务这两类部署 —— 这是本次改动的全部动机。
+	//
+	// **不下界的原因**：1 天是合法的（只要用量不大），此时配额预检仍走
+	// 实时 SUM、仍有界。上界 3650 天防止明显笔误。
+	UsageRetentionDays int `json:"usage_retention_days"`
 }
 
 type Defaults struct {
@@ -187,6 +208,10 @@ func (c *Config) setDefaults() {
 	if c.Defaults.FailoverFailureThreshold == 0 {
 		c.Defaults.FailoverFailureThreshold = 3
 	}
+	// 缺省沿用 store.DefaultRetentionDays 的值，避免两处默认值漂移。
+	if c.UsageRetentionDays == 0 {
+		c.UsageRetentionDays = 30
+	}
 }
 
 func (c *Config) validate() error {
@@ -239,6 +264,15 @@ func (c *Config) validate() error {
 		if f.max > 0 && f.val > f.max {
 			return fmt.Errorf("defaults.%s: must be <= %d, got %d", f.name, f.max, f.val)
 		}
+	}
+
+	// usage_retention_days 的下界是 1 而不是 0：setDefaults 已把 0 填成 30，
+	// 走到这里的 0 只能是显式写了负数被填过之后仍不合法的情况 —— 直接挡掉。
+	//
+	// 刻意**不设下界 7**：保留 1~6 天对低用量部署是合理诉求（配额预检
+	// 降到几毫秒），把它挡在门外会让本配置失去意义。上界 3650 防笔误。
+	if c.UsageRetentionDays < 1 || c.UsageRetentionDays > 3650 {
+		return fmt.Errorf("usage_retention_days: must be 1..3650, got %d", c.UsageRetentionDays)
 	}
 
 	// log_level 是启动日志的可见性开关。非法值会让 logger 静默退回 info
