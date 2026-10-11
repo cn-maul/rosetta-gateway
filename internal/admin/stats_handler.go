@@ -57,6 +57,19 @@ type statsResponse struct {
 	BalanceRemainder int64 `json:"balance_remainder"`
 	BalanceUnlimited bool  `json:"balance_unlimited"`
 
+	// QuotaTokens / UsedTokens 是当前登录者的用户级 Token 配额与已用量，
+	// 2026-10-11 新增（前端审计 H1 的收尾）。
+	//
+	// 为什么也放进 stats：此前前端只有 /me 有这两个字段，于是「已用量」是
+	// **登录那一刻**的快照 —— 用户开着页面不放，余额与用量早就变了，界面
+	// 却纹丝不动。余额那三个字段当时正是为此并入 stats 的，配额这两个
+	// 当时被漏下了。
+	//
+	// QuotaTokens = 0 表示**不限**（与 users.quota_tokens 的既有口径一致），
+	// 前端据此决定是否显示「额度已用尽」徽章。
+	QuotaTokens int64 `json:"quota_tokens"`
+	UsedTokens  int64 `json:"used_tokens"`
+
 	// Lifetime 是终身累计（表 B usage_totals），**仅管理员**、且仅当请求
 	// 显式带上 include_lifetime=true 时返回。
 	//
@@ -180,6 +193,27 @@ func (h *StatsHandler) Get(w http.ResponseWriter, r *http.Request) { // from/to 
 			}
 		}
 	}
+	// 配额与已用量同样回库读，不信 context 里的 user 快照 ——
+	// 与余额同一个理由（上面余数那段已详述）：快照不带会随调用变化的字段。
+	//
+	// 已用量走 store.SumUserUsedTokens：那是用户级配额**判定的同一个数据源**
+	// （累加列 user_usage_totals），所以界面上显示的「已用」与后端判「超额」
+	// 用的数字必然一致。若这里改读 users.used_tokens（展示列），两者会分叉，
+	// 用户会看到「明明还有额度却被拒」。
+	//
+	// 读失败按余额的同一口径处理：只记 WARN，字段留 0。quota_tokens=0 在前端
+	// 恰好是「不限」的既有语义，所以失败时表现为「不限」而不是一个错的配额数。
+	if me := server.UserFromContext(r.Context()); me != nil && me.ID != "" {
+		quota, used, qerr := h.store.UserQuotaAndUsed(r.Context(), me.ID)
+		if qerr == nil {
+			resp.QuotaTokens = quota
+			resp.UsedTokens = used
+		} else {
+			slog.Warn("admin stats: user quota lookup failed; showing unlimited",
+				"error", qerr, "user_id", me.ID)
+		}
+	}
+
 	// 终身累计（表 B）**只对管理员**开放，且必须显式要。
 	//
 	// 表 B 是不分用户的全局单行：普通用户拿到它就等于看到别人的数字

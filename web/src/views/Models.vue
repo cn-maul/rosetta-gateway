@@ -142,7 +142,13 @@ onMounted(load)
            「一个都不选」的规则，属于配置态，与本页无关（见文件头注释）。 -->
       <div v-else-if="sorted.length === 0" class="empty">
         <div class="big">⌗</div>
-        没有可用模型，请联系管理员为你的分组配置白名单
+        <!--
+          空清单有两种成因（2026-10-11 前端审计 M2）：管理员一个路由都没配，
+          或分组白名单与现有路由无交集。原文案只写了后者，未分组用户
+          （未分组 = 不受白名单限制）会拿到一条指向错误方向的建议 ——
+          去找管理员配白名单，而真正的原因是根本没配路由。
+        -->
+        目前没有可调用的模型。可能的原因：管理员尚未配置路由，或你的分组白名单与现有路由没有交集 —— 请联系管理员确认。
       </div>
 
       <template v-else>
@@ -161,9 +167,14 @@ onMounted(load)
             <thead>
               <tr>
                 <th>模型名</th>
-                <th class="num-h">输入</th>
-                <th class="num-h">输出</th>
-                <th class="num-h">缓存命中</th>
+                <!--
+                  单位写进表头（2026-10-11 前端审计）：原先只在表格**下方的**
+                  注释里写「元 / 百万 tokens」，读表头的人很容易把 3.00 当成
+                  任意单位。价格表最容易被误读的就是单位。
+                -->
+                <th class="num-h">输入<br /><span class="dim th-unit">元 / 百万 tokens</span></th>
+                <th class="num-h">输出<br /><span class="dim th-unit">元 / 百万 tokens</span></th>
+                <th class="num-h">缓存命中<br /><span class="dim th-unit">元 / 百万 tokens</span></th>
               </tr>
             </thead>
             <tbody>
@@ -224,6 +235,15 @@ onMounted(load)
 </template>
 
 <style scoped>
+/* 价格表表头下的单位标注（2026-10-11 前端审计）。
+   表头里塞单位是因为价格表最容易被误读 —— 「3.00」在不知道单位时
+   可以被当成任何东西。放在表格下方的注释里等于没写。 */
+.th-unit {
+  font-weight: 400;
+  font-size: 11px;
+  white-space: nowrap;
+}
+
 /* 提示条样式沿用 History.vue 的 .notice-warn 同款（该类写在它的 scoped
    样式里，本页用不了），这里只补一条本地定义：语义是「你看到的不是全集」，
    属提示而不是错误，用 warning-soft 而非 danger。 */

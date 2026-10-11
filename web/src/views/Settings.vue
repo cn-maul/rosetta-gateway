@@ -165,6 +165,16 @@ const saving = ref(false)
 // 都保留 err 状态正是为此：「请求失败」必须与「没有数据」在界面上可区分。
 // 这一页原先是唯一的例外，而它恰好是错值后果最重的一页。
 const err = ref('')
+// loadedOnce 记录「至少成功拉过一次真实值」。
+//
+// 为什么必须与 err 分开（2026-10-11 前端审计 P1）：err 只在非 401 的 catch
+// 里被赋值，而 load() 的 401 分支直接 return —— 那一瞬间 err 仍为空，
+// 于是 `if (err.value) return` 这道保存守卫放行，表单却停在下面这组
+// 兜底常量上，管理员一点保存就把默认值整体 PUT 覆盖到真实配置。
+//
+// 单靠 err 判断「能不能写」是不充分的：真正的判据是「当前表单里的值
+// 是不是真值」，而这件事只有成功加载过才知道。
+const loadedOnce = ref(false)
 const form = reactive({
   // 与后端 internal/store/settings_dao.go 的兜底常量保持一致：
   // GET 失败时界面也不该回落到明显偏小的早期值（会被误当成真实生效值）。
@@ -211,7 +221,10 @@ async function load() {
     form.stream_first_token_timeout_ms = s.stream_first_token_timeout_ms
     form.failover_max_targets = s.failover_max_targets
     form.failover_failure_threshold = s.failover_failure_threshold
+    loadedOnce.value = true
   } catch (e) {
+    // 401 不设 err，但同样必须让保存守卫失效 —— 否则表单停在兜底常量上
+    // 而守卫放行，等于把默认值 PUT 回生产配置。详见 loadedOnce 的注释。
     if ((e as { status?: number }).status === 401) return
     // 记入 err 并保持：表单在此状态下**不可保存**（见 save 的守卫与模板）。
     err.value = (e as Error).message
@@ -227,7 +240,10 @@ async function load() {
 async function save(target: 'model' | 'runtime') {
   // 读取失败时 form 里是兜底常量，保存就是拿默认值覆盖生产配置 —— 直接拒绝。
   // 提示要指向「重新加载」，因为这是唯一能解开的状态。
-  if (err.value) {
+  //
+  // 判据是 loadedOnce 而不是 err：401 分支不设 err，只看 err 会在会话失效
+  // 的窗口里放行一次「默认值覆盖真实配置」。详见 loadedOnce 的注释。
+  if (err.value || !loadedOnce.value) {
     toast('设置未能加载，保存已阻止（否则会用默认值覆盖当前配置）。请先重新加载。', 'err')
     return
   }
@@ -300,6 +316,9 @@ async function runPrune() {
   const ok = await confirmBox({
     title: '立即执行归档剪枝？',
     body: '保留窗口（默认 30 天）之前的调用明细将聚合进按天累计后删除。累计数据保留，但单次调用的明细不可恢复。',
+    // 不可恢复的操作必须标成危险操作（2026-10-11 前端审计）：
+    // 文案已说明后果，视觉却与普通按钮同色，两者矛盾会削弱文案本身的作用。
+    danger: true,
     confirmLabel: '执行',
   })
   if (!ok) return

@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { computed, onMounted, onUnmounted, ref } from 'vue'
+import { RouterLink } from 'vue-router'
 import { api } from '../api'
 import { toast } from '../ui'
 import { fmtNum, fmtTokens, fmtSpeed, fmtSec, fmtPercent, fmtMoney, fmtBalance, fmtRemainder } from '../fmt'
@@ -57,6 +58,22 @@ type Bucket = {
 
 // 把后端按日聚合的结果补齐成连续序列（缺的日期补 0），保证柱状图横轴连续。
 // 范围 ≤ 31 天按日展示；更大范围按周/月聚合，避免横轴过密。
+// lifetimeTruncated：普通用户选「全部」档时拿不到 stats.lifetime
+// （该字段 admin-only），起点只能退到 byDay 的最早一天；而 byDay 未传 limit
+// 时后端默认只返回 100 行，于是图上实际只有最近 100 天。
+//
+// 标记出来是为了让界面如实说明 —— 下拉写着「全部」而图不是全部时，
+// 用户无从分辨（2026-10-11 前端审计 M1）。这是**展示层的诚实**问题，
+// 不是数据错误：数字本身是对的，只是覆盖窗口比字面窄。
+//
+// 判据与 daySeries 里的起点推导共用同一组条件，避免两处各写一份漂移。
+const lifetimeTruncated = computed(() => {
+  if (range.value !== 'all') return false
+  const first = stats.value?.lifetime?.first_record_at
+  if (first && first > 0) return false
+  return byDay.value.length > 0
+})
+
 const daySeries = computed<Bucket[]>(() => {
   const map = new Map(byDay.value.map((e) => [e.key, e]))
   const days = RANGES.find((r) => r.key === range.value)?.days ?? 14
@@ -74,6 +91,7 @@ const daySeries = computed<Bucket[]>(() => {
     if (first && first > 0) {
       start = new Date(first)
     } else {
+      // 降级情形由 lifetimeTruncated 负责对外说明，此处只管算起点。
       const keys = byDay.value.map((e) => e.key).sort()
       const earliest = keys[0]
       // 兜底（连 byDay 都空）：同样用本地日历日，now 是毫秒时间戳。
@@ -253,14 +271,32 @@ onUnmounted(() => {
              注意 menu 上的 @click.stop：选项按钮的点击会冒泡到外层这个
              toggle 容器，导致 selectRange 里刚设好的 rangeOpen=false 又被翻回
              true —— 表现就是「选完不收起」。 -->
-        <div ref="rangeEl" class="range-select" @click="rangeOpen = !rangeOpen">
+        <!--
+          外层容器补可访问性（2026-10-11 前端审计）：
+          原来只有 @click，键盘用户无法打开这个下拉（div 不可聚焦、无 role）。
+          选项本身已是 <button>，所以只需让容器可聚焦 + 声明语义 +
+          支持 Enter/Space 打开。Escape 关闭交给 document 监听（见脚本）。
+        -->
+        <div
+          ref="rangeEl"
+          class="range-select"
+          role="button"
+          tabindex="0"
+          aria-haspopup="listbox"
+          :aria-expanded="rangeOpen"
+          @click="rangeOpen = !rangeOpen"
+          @keydown.enter.prevent="rangeOpen = !rangeOpen"
+          @keydown.space.prevent="rangeOpen = !rangeOpen"
+        >
           <span class="range-current">{{ rangeLabel(range) }}</span>
           <span class="range-caret">▾</span>
-          <div v-if="rangeOpen" class="range-menu" @click.stop>
+          <div v-if="rangeOpen" class="range-menu" @click.stop role="listbox">
             <button
               v-for="r in RANGES"
               :key="r.key"
               class="range-item"
+              role="option"
+              :aria-selected="r.key === range"
               :class="{ active: r.key === range }"
               @click="selectRange(r.key)"
             >
@@ -273,10 +309,46 @@ onUnmounted(() => {
     </div>
 
     <div v-if="loading && !stats" class="loading">加载中…</div>
-    <!-- 与 Users/Groups 同口径：加载失败与「确实没有数据」必须可区分。 -->
-    <div v-else-if="err" class="empty"><div class="big">⚠</div>{{ err }}</div>
+    <!--
+      stale：已经渲染过一次数据、之后刷新失败（2026-10-11 前端审计 H2）。
+      原先只有 `v-else-if="err"`，而 stats 非空时它被跳过、旧数字照常渲染
+      —— 用户看到的是一个「看起来完全正常」的过期页面，无法分辨数字已停更。
+
+      与 Keys（v-else-if="err" 整块替换）/ History（常驻横幅）的差别是：
+      本页的余额/费用/错误数是用户做判断的依据，静默保留旧值比直接报错更危险。
+      所以这里保留数据 + 加过期标记，而不是二选一。
+    -->
+    <div v-else-if="err && !stats" class="empty"><div class="big">⚠</div>{{ err }}</div>
+    <div v-else-if="err && stats" class="stale-bar">
+      <span>⚠ 数据已过期：{{ err }}</span>
+      <button class="btn btn-sm" :disabled="loading" @click="load">重试</button>
+    </div>
 
     <template v-if="stats">
+      <!--
+        首次使用引导（2026-10-11 前端审计）。
+        新账号第一次打开总览是一屏 0：没有密钥、没有用量、没有余额。
+        三条最该做的事都能在别处做得到，但没有一条被主动指出来 ——
+        用户只能自己在导航里猜「下一步该去哪」。
+        只在「从来没有过调用」时出现；有数据之后自动消失，不打扰老用户。
+      -->
+      <div v-if="stats.total_requests === 0" class="notice-warn first-use" role="status">
+        <div class="first-use-title">还没有任何调用记录。从这三步开始：</div>
+        <ol class="first-use-steps">
+          <li>
+            到 <RouterLink to="/keys" class="lnk">密钥</RouterLink> 建一把 API 密钥
+            <span class="dim">（明文只在创建时显示一次，请当场保存）</span>
+          </li>
+          <li>
+            到 <RouterLink to="/models" class="lnk">可用模型</RouterLink> 确认哪些模型对你开放
+            <span class="dim">（分组白名单会收窄这份清单）</span>
+          </li>
+          <li v-if="!stats.balance_unlimited && stats.balance_cents <= 0">
+            余额为 0，调用会被拒绝 —— 请 <RouterLink to="/profile" class="lnk">联系管理员充值</RouterLink>
+          </li>
+        </ol>
+      </div>
+
       <div class="stat-grid">
         <div class="stat-card">
           <div class="k">总请求</div>
@@ -353,6 +425,15 @@ onUnmounted(() => {
         <div class="panel-title">
           {{ rangeLabel(range) }}用量
           <span class="hint">{{ rangeLabel(range) === '全部' ? '按月聚合' : rangeLabel(range) === '近 1 年' ? '按周聚合' : '按日聚合' }} · 悬停查看详情</span>
+        </div>
+        <!--
+          「全部」档覆盖窗口不足时如实说明（2026-10-11 前端审计 M1）：
+          普通用户拿不到 stats.lifetime（admin-only），起点退到 byDay 最早一天，
+          而 byDay 后端默认只给 100 行。不说的话，下拉写着「全部」而图上只有
+          最近 100 天，用户会以为更早的数据不存在。
+        -->
+        <div v-if="lifetimeTruncated" class="hint-note">
+          仅显示最近 {{ daySeries.length }} 天的用量（更早的调用时间仅管理员可见）
         </div>
         <div class="bars">
           <div v-for="d in daySeries" :key="d.key" class="bar-col">

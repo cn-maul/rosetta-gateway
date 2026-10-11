@@ -111,11 +111,19 @@ export function fmtPercent(rate: number): string {
  * 大额（≥1 元）固定两位小数、带千分位；小额必须留住有效数字 ——
  * 一次几十万 token 的请求往往只值几分钱，一刀切成两位小数会显示成「0.00」，
  * 与同一屏「有流量」的指标自相矛盾，所以 <1 元时最多保留 4 位小数。
+ *
+ * 负数保留符号并如实渲染（2026-10-11 前端审计 M3）。原先判据是 `n <= 0`
+ * 一律返回 '0.00'，于是「管理员把余额扣成 -5 元」显示成「¥0.00」——
+ * 与「账户正好清零」在界面上完全同形，而两者的处置动作相反
+ * （一个要充值，一个要查是谁扣的）。
  */
 export function fmtMoney(n: number): string {
-  if (!Number.isFinite(n) || n <= 0) return '0.00'
+  if (!Number.isFinite(n)) return '0.00'
+  // 只把 0 归零；负数走同一套格式化，Intl 会自带减号。
+  if (n === 0) return '0.00'
+  const abs = Math.abs(n)
   const opts: Intl.NumberFormatOptions =
-    n >= 1
+    abs >= 1
       ? { minimumFractionDigits: 2, maximumFractionDigits: 2 }
       : { minimumFractionDigits: 2, maximumFractionDigits: 4 }
   return new Intl.NumberFormat('zh-CN', opts).format(n)

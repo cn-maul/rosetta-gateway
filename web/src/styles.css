@@ -1025,6 +1025,63 @@ textarea {
   font-size: 13px;
 }
 
+/* 数据过期横幅（2026-10-11 前端审计 H2）
+   用于「已经渲染过一次数据、之后刷新失败」：保留旧数字但明确标注它们
+   已停更。与 .empty 的区别是 .empty 表示没有数据可显示，这一栏表示
+   有数据但不是最新的 —— 两者混淆会让用户拿过期数字做决策。 */
+.stale-bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin: 10px 0;
+  padding: 10px 14px;
+  border: 1px solid var(--warning);
+  border-radius: 8px;
+  background: var(--warning-soft);
+  color: var(--warning-soft-foreground);
+  font-size: 13px;
+}
+.stale-bar .btn {
+  flex: none;
+}
+
+/* 首用引导（2026-10-11 前端审计 Overview）
+   新账号第一次打开总览是一屏 0，且三条最该做的事都没有被主动指出。
+   放在 .notice-warn 里复用既有的告警视觉 —— 它确实是一条「你需要注意的事」，
+   而不是一个新的组件类别。 */
+.first-use {
+  margin: 0 0 16px;
+}
+.first-use-title {
+  margin-bottom: 6px;
+  font-weight: 600;
+}
+.first-use-steps {
+  margin: 0;
+  padding-left: 20px;
+}
+.first-use-steps li {
+  margin: 2px 0;
+}
+/* 引导里的页面内链。
+   用 warning-soft-foreground 而不是 --accent：引导整块是 .notice-warn 底色，
+   而 --accent 是深蓝，落在暖色底上对比度明显不足 —— 链接会比正文还难读。
+   同容器同色系是这里唯一正确的选择。 */
+.lnk {
+  color: inherit;
+  font-weight: 600;
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+
+/* 说明性注记：陈述一个限制或降级，不打断操作（区别于 .stale-bar 的告警） */
+.hint-note {
+  margin: -4px 0 10px;
+  color: var(--text-4);
+  font-size: 12px;
+}
+
 /* 展开详情区（provider 凭据/模型） */
 .expand {
   width: 100%;

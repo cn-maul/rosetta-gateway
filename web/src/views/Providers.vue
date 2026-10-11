@@ -279,7 +279,16 @@ async function submitCred() {
 }
 
 async function removeCred(c: Credential) {
-  const ok = await confirmBox({ title: `删除凭据「${c.label || c.id}」？`, danger: true, confirmLabel: '删除' })
+  const ok = await confirmBox({
+    title: `删除凭据「${c.label || c.id}」？`,
+    // 补影响说明（2026-10-11 前端审计）：同页另外两处删除都写了后果，
+    // 只有这里只有标题。而凭据是路由池里 enabled 的成员，删掉最后一个
+    // 启用凭据会让该上游直接变成 ready=false —— 用户会看到「服务商不可用」
+    // 却完全不知道是自己刚才点的这个确认框造成的。
+    body: '删除后该上游可能变为不可用（若已无其他启用的凭据），指向它的路由会失败转移。',
+    danger: true,
+    confirmLabel: '删除',
+  })
   if (!ok) return
   try {
     await api.deleteCredential(c.id)

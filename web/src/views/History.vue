@@ -333,8 +333,14 @@ onMounted(() => {
       <div v-if="loading && rows.length === 0" class="loading">加载中…</div>
       <!--加载失败**必须**与「确实没有数据」在界面上可区分：把请求失败呈现成
            「暂无数据」会让运维误判为无流量，从而排除掉网关/上游故障这个方向。
-           与 Users/Groups 的错误态同口径。 -->
-      <div v-else-if="err && total === 0" class="empty"><div class="big">⚠</div>{{ err }}</div>
+           与 Users/Groups 的错误态同口径。
+           补重试按钮（2026-10-11 前端审计）：Models / Wallet 的错误态都有，
+           本页原先只能靠顶部「刷新」，而本页的失败往往只影响当前筛选条件下的
+           列表 —— 用户会以为刷新按钮指的是别的东西。 -->
+      <div v-else-if="err && total === 0" class="empty">
+        <div class="big">⚠</div>{{ err }}
+        <div style="margin-top: 12px"><button class="btn" :disabled="loading" @click="load">重试</button></div>
+      </div>
       <div v-else-if="total === 0" class="empty">
         <div class="big">⌗</div>
         当前条件下暂无调用记录
@@ -342,7 +348,10 @@ onMounted(() => {
       <template v-else>
         <!-- 翻页失败时表格里还有上一页的内容，所以错误走常驻横幅而不是整块替换：
              把已经读到的行藏起来，等于刚翻页失败就顺手没收了用户正在看的数据。 -->
-        <p v-if="err" class="notice-warn" role="alert">{{ err }}</p>
+        <p v-if="err" class="notice-warn" role="alert">
+          {{ err }}
+          <button class="btn btn-sm" :disabled="loading" @click="load">重试</button>
+        </p>
         <div class="tbl-wrap">
           <table class="tbl">
             <thead>
@@ -359,7 +368,11 @@ onMounted(() => {
               </tr>
             </thead>
             <tbody>
-              <tr v-for="(h, i) in rows" :key="i">
+              <!-- :key 用「ts + 下标」而不是纯下标（2026-10-11 前端审计）：
+                   UsageHistoryEntry 没有 id 字段，而同一毫秒内并发多条调用
+                   完全可能（tokens 恰为毫秒粒度）。纯下标会让 Vue 在翻页时
+                   复用旧 DOM；用 ts 前缀 + 下标既稳定又不会撞键。 -->
+              <tr v-for="(h, i) in rows" :key="h.ts + ':' + i">
                 <td class="mono c-time">{{ fmtTimeMs(h.ts) }}</td>
                 <td class="mono">{{ h.public_model || '—' }}</td>
                 <td class="mono dim">{{ h.upstream_model || '—' }}</td>

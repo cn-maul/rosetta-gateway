@@ -31,8 +31,11 @@ const meName = computed(() => session.me?.username ?? '')
  * 显示真实数字而不是一句「受限」：用户建完 key 后在列表里会看到
  * 「x / 5000」这样的额度，先在这里给出同一个数，界面才自洽。 */
 const quotaHint = computed(() => {
-  const q = session.me?.quota_tokens ?? 0
-  return q > 0 ? fmtTokens(q) : '不限（管理员未为你设置额度上限）'
+  // 本页不拉 /stats，拿不到会刷新的配额值（session.me 是登录快照）。
+  // 钱包页（/profile）读的是随 stats 下发的实时值 —— 两个页面给出的数字
+  // 可能不一致。与其在这里显示一个会停更的数字，不如只说明规则；
+  // 真正的「已用 / 配额」展示在钱包页，且那里的数据每次刷新都更新。
+  return '由管理员统一配置，详见「钱包与充值」页'
 })
 
 const DAY_MS = 86_400_000
@@ -52,7 +55,13 @@ function daysLeft(expiresAt: number): number {
 
 function expiresAtFromDays(days: number): number {
   const n = Number(days) || 0
-  return n > 0 ? Date.now() + n * DAY_MS : 0
+  // 输入框 min="0" 只拦得住点选，拦不住手输 -5。负数原样返回会被
+  // Date.now() + (-5 * DAY_MS) 算成一个**过去**的时间戳 → 密钥一建就过期。
+  // 更糟的是用户已有期限时会被 guardNoLoosening 判成「放宽限制」而 403，
+  // 报错信息与真实原因（输了个负数）完全无关。
+  // 钳到 0（永不过期）是与「留空」的既有语义一致的处理。
+  if (n <= 0) return 0
+  return Date.now() + n * DAY_MS
 }
 
 /** isExpired 是否已过期。
@@ -352,6 +361,22 @@ async function copyKey() {
   toast(ok ? '已复制到剪贴板' : '复制失败，请手动选择复制', ok ? 'ok' : 'err')
 }
 
+/**
+ * 关闭明文弹窗，并**抹掉明文**（2026-10-11 前端审计 M5）。
+ *
+ * 原先关闭只置 `open = false`，`plainKeyBox.key` 里的明文在整个组件生命周期
+ * 内一直留着：页面不刷新就一直能被 devtools、浏览器扩展或同源脚本读到。
+ * 「明文只在创建时显示一次」是**后端**的语义，前端却让它在关掉弹窗后继续
+ * 驻留，与该语义相悖。
+ *
+ * 抹值不破坏任何功能：后端不再保存明文，关掉就意味着用户已自行保存，
+ * 再次打开也拿不到（只能重新建一把）。
+ */
+function closePlainKeyBox() {
+  plainKeyBox.open = false
+  plainKeyBox.key = ''
+}
+
 // ---------- 编辑表单 ----------
 
 const eForm = reactive({
@@ -619,7 +644,13 @@ async function recomputeUsage(k: AccessKey) {
               </td>
               <td class="c-act">
                 <div class="row-actions">
-                  <button class="btn btn-sm btn-ghost" :disabled="recomputing === k.id" title="按调用明细重算已用 tokens（配额计数异常时使用）" @click="recomputeUsage(k)">
+                  <!--
+                    不按身份隐藏：端点在白名单内，普通用户有权自查。
+                    但要说清它修的是什么 —— 否则普通用户看到「配额计数异常」
+                    会以为是自己用错了（2026-10-11 前端审计）。计数异常通常是
+                    历史归档或迁移留下的，对普通用户而言点它多半看不到变化。
+                  -->
+                  <button class="btn btn-sm btn-ghost" :disabled="recomputing === k.id" title="按调用明细重算已用 tokens。通常无需操作：仅在配额计数与实际用量明显不符时使用（例如历史数据迁移后）" @click="recomputeUsage(k)">
                     {{ recomputing === k.id ? '重算中…' : '重算用量' }}
                   </button>
                   <button class="btn btn-sm btn-ghost" @click="openEdit(k)">编辑</button>
@@ -723,7 +754,7 @@ async function recomputeUsage(k: AccessKey) {
       </div>
       <div class="form-actions">
         <button class="btn" @click="copyKey">复制密钥</button>
-        <button class="btn btn-primary" @click="plainKeyBox.open = false">我已保存</button>
+        <button class="btn btn-primary" @click="closePlainKeyBox">我已保存</button>
       </div>
     </AppModal>
 

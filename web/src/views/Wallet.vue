@@ -265,10 +265,37 @@ const admin = computed(() => isAdmin())
 //   - 不限额：永远放行，**不消耗**用户的关注（不该和 0 元同屏等重）
 //   - 有限额且 > 0：正常
 //   - 有限额且 = 0：会被 402 拒绝，这是本页唯一必须显眼的红色状态
-const unlimited = computed(() => me.value?.balance_unlimited ?? false)
-const balanceCents = computed(() => me.value?.balance_cents ?? 0)
-const remainderText = computed(() => fmtRemainder(me.value?.balance_remainder ?? 0))
+// 余额三个字段读 **stats** 而不是 session.me（2026-10-11 前端审计 H1）。
+//
+// me 是**登录那一刻**的快照：api.ts 只在 loadSession/login/bootstrapSetup 里
+// 赋值，全仓没有别处刷新它。用户登录后开着页面不放，余额早已花完，
+// 界面却仍显示登录时的数字 —— 用户照着一个「还有余额」的界面继续调用，
+// 拿到 402 却完全不知道为什么。
+//
+// stats 的响应本身就带 balance_cents/balance_unlimited/balance_remainder
+// （types.ts:529-534），本页的 load() 每次都拉它，所以这是**零额外请求**的修复。
+//
+// me 保留为回退：stats 尚未返回的那一瞬间不至于显示成 0.00（那更糟 ——
+// 「0 元」会被误读成「真没钱」）。
+const unlimited = computed(() => stats.value?.balance_unlimited ?? me.value?.balance_unlimited ?? false)
+const balanceCents = computed(() => stats.value?.balance_cents ?? me.value?.balance_cents ?? 0)
+const remainderText = computed(() => fmtRemainder(stats.value?.balance_remainder ?? me.value?.balance_remainder ?? 0))
 const balanceEmpty = computed(() => !unlimited.value && balanceCents.value === 0)
+
+// quotaExhausted：用户级 token 配额是否已耗尽。
+//
+// 0 = 不限额，所以必须与 balanceEmpty 一样显式排除，否则未配额度的用户
+// 会看到「额度已用尽」的红色徽章。
+//
+// 数据源从 me（登录快照）换成 stats：此前「已用量」在页面上长期停更，
+// 用户拿着一个早已失效的数字去判断自己还能不能用。后端已把这两个字段
+// 并入 /stats（2026-10-11），且口径与配额**判定**完全一致 —— 界面上写的
+// 「已用」与后端判「超额」用的是同一个数字。
+//
+// stats 未返回时回退到 me：避免首帧闪一个 0 配额。
+const quotaTokens = computed(() => stats.value?.quota_tokens ?? me.value?.quota_tokens ?? 0)
+const usedTokens = computed(() => stats.value?.used_tokens ?? me.value?.used_tokens ?? 0)
+const quotaExhausted = computed(() => quotaTokens.value > 0 && usedTokens.value >= quotaTokens.value)
 
 // 总消费：全部历史的费用合计（元）。
 //
@@ -838,13 +865,21 @@ onMounted(load)
 
         <!-- 额度：弱化单行，明确它与余额无关（见上方注释）。 -->
         <div class="quota-line">
-          <span class="k">Token 额度</span>
+          <span class="k">Token 配额</span>
           <span class="num">
-            已用 {{ fmtTokens(me?.used_tokens ?? 0) }}
-            <template v-if="me && me.quota_tokens > 0">/ {{ fmtTokens(me.quota_tokens) }}</template>
+            已用 {{ fmtTokens(usedTokens) }}
+            <template v-if="quotaTokens > 0">/ {{ fmtTokens(quotaTokens) }}</template>
             <template v-else>（不限）</template>
           </span>
           <span class="dim">额度按 token 计量，耗尽后更换密钥即可；余额按人民币计量，耗尽需充值。</span>
+          <!--
+            额度耗尽告警态（2026-10-11 前端审计 M4）。
+            key 级配额用尽有红色徽章（Keys.vue 的 badge-err），用户级额度原先
+            只是一行弱化文字 —— 而用户实际收到的 429 常来自**用户级**配额
+            （后端封顶逻辑在 key_handler 的 quota check），界面上唯一的提示
+            却看不出任何异常，用户会以为「还有额度，是网络问题」。
+          -->
+          <span v-if="quotaExhausted" class="badge badge-err">额度已用尽</span>
         </div>
         </template>
       </div>
@@ -860,7 +895,14 @@ onMounted(load)
         <div class="panel-title">
           充值记录
           <span class="hint">
-            {{ admin ? '全部用户 · 最近 ' + topupTotal + ' 条' : '最近 ' + topupTotal + ' 条' }}
+            <!--
+              写 topups.length 而不是 topupTotal（2026-10-11 前端审计 H3）：
+              topupTotal 是后端过滤后的**总条数**，而表里只渲染 topups.length
+              条（上限 TOPUP_LIMIT=50）。有 120 条流水时标题写「最近 120 条」
+              而表里只有 50 行 —— 数字与事实不符，用户会以为漏了 70 条。
+              截断情况由下方 list-foot 显式承担。
+            -->
+            {{ admin ? '全部用户 · 最近 ' + topups.length + ' 条' : '最近 ' + topups.length + ' 条' }}
           </span>
         </div>
 
@@ -909,7 +951,11 @@ onMounted(load)
               </tbody>
             </table>
           </div>
-          <div v-if="admin && topupTotal > topups.length" class="list-foot">
+          <!-- 截断提示对两种身份都要显示（2026-10-11 前端审计 H3）：
+               原先带 admin && 条件，于是普通用户流水超过一页时**既没有
+               完整计数也没有截断提示**，只能看着 50 行以为那就是全部。
+               这与 api.ts / 本文件其它列表格反复强调的「截断必须可见」冲突。 -->
+          <div v-if="topupTotal > topups.length" class="list-foot">
             <span class="dim">仅显示最近 {{ topups.length }} / {{ topupTotal }} 条</span>
           </div>
         </template>

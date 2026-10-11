@@ -532,6 +532,20 @@ export interface Stats {
   balance_cents: number
   balance_remainder: number
   balance_unlimited: boolean
+  /**
+   * 当前登录者的用户级 Token 配额与已用量（2026-10-11 前端审计 H1 的收尾）。
+   *
+   * 此前前端只能从 /me 拿这两个字段，而 /me 是**登录快照** —— 页面开着不放时
+   * 「已用量」会长期停更。现在随 stats 一并下发，与余额同一套刷新时机。
+   *
+   * `quota_tokens = 0` 是**不限**（与 users.quota_tokens 的既有口径一致），
+   * 前端据此决定是否显示「额度已用尽」徽章。
+   *
+   * 已用量的口径与后端配额**判定**完全一致（同一个累加列），因此界面显示的
+   * 数字与「为什么我被拒了」不会互相矛盾。
+   */
+  quota_tokens: number
+  used_tokens: number
   // lifetime 为**终身累计**（表 B usage_totals）。仅管理员、且仅当请求带了
   // include_lifetime=true 时出现 —— 缺席 = 这次没要终身数据。
   // 普通用户拿不到：表 B 是不分用户的全局单行，给了就是别人的数字。
