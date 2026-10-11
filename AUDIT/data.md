@@ -11,6 +11,21 @@ the tree as of `d529b29`.
 Severity: **P0** money loss / corruption / auth bypass / crash · **P1** serious
 bug · **P2** real defect, limited impact · **P3** minor.
 
+> [!IMPORTANT]
+> **Historical snapshot — baseline tree \d529b29\. Read before acting.**
+>
+> All findings below were derived from the tree as of \d529b29\. **Three of them have
+> since been fixed and are NOT current open issues:**
+>
+> | Section | Finding | Current state |
+> |---|---|---|
+> | 1.2 | \alance_charges\ PK was equest_id\ alone | **Fixed** — now \PRIMARY KEY (request_id, user_id)\ (\store.go:383-389\, plus \ixBalanceChargesPK()\ migration) |
+> | 1.3 | Charge failure committed the placeholder row | **Fixed** — failure branch now relies on \defer tx.Rollback()\ (\alance_dao.go:450-476\) |
+> | 1.4 | 1-cent balance drainable by unlimited sub-cent requests | **Fixed** — \alance_remainder\ micro-unit mechanism (\alance_dao.go:390-411\) |
+>
+> The current, full audit of this package is \AUDIT/audit-2026-10-11.md\.
+> Do not treat the fixed rows above as outstanding work.
+
 ---
 
 ## Money correctness

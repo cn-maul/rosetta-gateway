@@ -93,8 +93,10 @@ OpenAI 系客户端；额度查询端点（`/dashboard/billing/*`、`/v1/organiz
 | 文档 | 内容 |
 |---|---|
 | [DESIGN.md](DESIGN.md) | 设计文档：架构、数据模型、路由、配额、故障转移、协议转换、配置 |
-| [MULTIUSER.md](MULTIUSER.md) | 多用户 / 分组 / 权限模型的设计与实现记录 |
+| [MULTIUSER.md](MULTIUSER.md) | ⚠️ **历史归档**（冻结于 2026-10-07）：多用户 / 分组 / 权限模型的设计记录。保留是因为代码中有 20+ 处注释以它的章节号为锚点 |
 | [DOCKER.md](DOCKER.md) | 容器化部署：镜像、挂载、日志、升级、健康检查 |
+| [AUDIT/](AUDIT/README.md) | 审计与测试留痕。**先读 [audit-2026-10-11.md](AUDIT/audit-2026-10-11.md)**（最新全量审计），索引见 [AUDIT/README.md](AUDIT/README.md) |
+| [HANDOFF.md](HANDOFF.md) | 项目状态交接：当前版本、已知缺口、环境事实、发布剩余步骤 |
 
 ## 开发
 

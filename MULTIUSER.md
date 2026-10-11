@@ -10,6 +10,20 @@
 | 参考   | new-api（`QuantumNous/new-api`，AGPLv3）、cc-switch（`farion1231/cc-switch`） |
 | 参考方式 | **源码通读**，非文档推测。关键结论均标注源文件                                               |
 
+
+> [!WARNING]
+> **本文件是历史归档，不是当前实现的事实来源。**
+>
+> - 内容冻结于 **2026-10-07**（版本约 1.4.x），此后多用户模块经历了大量改动：
+>   管理员改为会话体系（dmin_token / dmin_auth.json 已删除）、分组管理合并进
+>   /users 页、alance_remainder 机制、思考挡位 ffort_levels 等。
+> - **判断当前行为请以源码的 ile:line 与 DESIGN.md 为准。**
+> - 本文件 2026-10-11 从 git 历史取回并保留，原因：**代码与 DESIGN.md 中有 20+ 处
+>   注释以本文档的章节号为锚点**（如 internal/store/store.go:584 引用 §5.1、
+>   cmd/gateway/main.go:1497 引用 §4.3）。删除文档会让这些设计决策**失去解释来源**。
+> - 完整的当前实现审计见 AUDIT/audit-2026-10-11.md。
+
+
 ---
 
 ## 0. 结论先行

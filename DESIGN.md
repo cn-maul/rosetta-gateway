@@ -5,10 +5,10 @@
 | 项目名 | **rosetta-gateway** |
 | 项目性质 | 独立项目，不在 Rosetta 上改造（2026-09-15 定，理由见 §2.1） |
 | module path | `github.com/cn-maul/rosetta-gateway` |
-| 运行时依赖 | `github.com/cn-maul/rosetta` v1.0.1（上游 SDK）、`modernc.org/sqlite`（纯 Go SQLite）、`github.com/golang-jwt/jwt/v5`（管理会话） |
-| 版本 | 与 `web/package.json` 同源（当前 1.5.2），镜像与二进制共用 |
+| 运行时依赖 | `github.com/cn-maul/rosetta` v1.1.1（上游 SDK）、`modernc.org/sqlite`（纯 Go SQLite）、`github.com/golang-jwt/jwt/v5`（管理会话） |
+| 版本 | 与 `web/package.json` 同源（当前 1.5.3），镜像与二进制共用 |
 | 状态 | **已实现**（P0–P3 全部落地，多用户、用量归档、配置导入导出均已上线） |
-| 更新 | 2026-10-10 |
+| 更新 | 2026-10-11 |
 
 ---
 
@@ -182,6 +182,12 @@ CREATE TABLE upstream_models (
   context_window    INTEGER,                -- 覆盖 rosetta 注册表
   max_output_tokens INTEGER,
   supports_thinking INTEGER,                -- NULL = 不覆盖
+  effort_levels    TEXT,                     -- 思考挡位白名单（JSON 数组，如 ["high"]）
+                                            -- NULL = 不限制（沿用客户端请求值）
+                                            -- 2026-10-11 cbffbc4 新增，配合 internal/effort
+  price_input      REAL,                     -- 元 / 百万 token（NULL = 用 rosetta 注册表价）
+  price_cache_hit  REAL,
+  price_output     REAL,
   UNIQUE (provider_id, model_id)
   -- 曾有一个 default_extra_json 列，但没有任何地方拿它构造请求，2026-09-24 摘除。
   -- 要接线得先定清语义（链上各目标协议可能不同、路由级与模型级谁覆盖谁），
@@ -260,7 +266,13 @@ CREATE TABLE users (
   balance_cents INTEGER,                         -- 账户余额（分，人民币）。**NULL = 不限额**，
                    -- 0 = 真的一分钱都没有（触发 402）。与 quota_tokens 的「0 = 不限」
                    -- 刻意相反：0 在余额语义下是一个有意义的实数状态，必须能表达。
-  used_tokens   INTEGER NOT NULL DEFAULT 0,      -- 展示值；执行走实时 SUM（MULTIUSER.md §4.3）
+  used_tokens   INTEGER NOT NULL DEFAULT 0,      -- 展示值；执行走实时 SUM
+  balance_remainder INTEGER NOT NULL DEFAULT 0,  -- 亚分累积余数，单位 1e-6 元（微元，1 分 = 10000 微元）
+                  -- 扣费时整除扣分、余数留存，累积满一分才真正扣账 —— 避免
+                  -- 「1 分余额被无限次亚分请求消耗」。存 INTEGER 而非 REAL：
+                  -- 余额侧**不出现浮点**。2026-10-10 新增。
+                  -- ⚠️ 已知缺口：欠费时该余数随事务回滚一并丢弃，
+                  --    见 AUDIT/audit-2026-10-11.md P1-3
   auth_version  INTEGER NOT NULL DEFAULT 1,      -- 会话失效栅栏（改密/禁用/改角色 +1）
   remark        TEXT,
   created_at    INTEGER NOT NULL,
@@ -498,9 +510,10 @@ POST   /admin/api/users                         新建用户；role=admin 必须
 PATCH  /admin/api/users/{id}                    角色/状态/配额/分组/备注；改角色或状态
                                                  自动递增 auth_version 使旧会话失效
 DELETE /admin/api/users/{id}
-POST   /admin/api/users/{id}/reset-password     管理员重置密码
+POST   /admin/api/users/{id}/password           管理员重置该用户密码
 
 GET    /admin/api/groups                        分组与组级模型白名单（admin）
+PUT    /admin/api/groups/{id}/models            设置分组模型白名单（写入口，**仅管理员**）
 
 GET    /admin/api/keys                          列表（普通用户只看到自己的）
 POST   /admin/api/keys                          **所有登录用户**（2026-10-07 重开）：
@@ -521,6 +534,7 @@ GET    /admin/api/usage?from=&to=&group_by=key|model|provider|day
                                                  「全部历史」**（本端点与 by-* 系列语义统一，
                                                  未传 from 时 Query 默认近 24h）
 GET    /admin/api/usage/by-provider|by-day|by-model|by-key    分维度用量（按身份收窄）
+GET    /admin/api/usage/by-user                              **仅管理员**：按用户维度用量
 GET    /admin/api/usage/history.csv             调用明细 CSV 导出（与 history 同一套
                                                  status/model/key_id 过滤，无分页）
 POST   /admin/api/usage/prune                   手动触发归档剪枝（每日定时之外的人口）
@@ -531,6 +545,12 @@ GET    /admin/api/model-names                   公开模型名清单（按身�
                                                   `prices[]`（与 `models` **平行**的数组，prices[i]
                                                   对应 models[i]，三项单价元/百万 tokens，0 = 未配置）
 PUT    /admin/api/users/{id}/balance             管理员充值/扣减余额，body `{delta_cents}`（分，正充负扣）
+GET    /admin/api/topups                         充值流水（按身份收窄：管理员看全部、
+                                                 普通用户只看自己的）
+POST   /admin/api/me/password                    当前用户自助改密（校验旧密码；
+                                                 改密后递增 auth_version 使旧会话失效）
+POST   /admin/api/providers/{id}/balance         查询上游服务商余额（管理员；2026-10-11
+                                                 新增，透传 internal/upstream/balance.go）
 GET    /admin/api/me / POST /admin/api/logout   当前用户信息 / 登出（递增 auth_version）
 POST   /admin/api/reload                        从 DB 重建内存快照
 ```
@@ -960,7 +980,7 @@ per-model 配额、per-provider 配额仍不做，记入后续路线。
 | 配置类别 | 存放位置 | 可否运行时改 |
 |---|---|---|
 | Provider / 模型 / Route / Key / **用户与管理员账号** | **数据库** | 是（管理 API / Web 界面） |
-| 监听地址、DB 路径、日志级别、加密主密钥、全局默认超时与重试、body 大小上限 | **配置文件** | 否（改后重启） |
+| 监听地址、DB 路径、日志级别、加密主密钥、**日界时区（`timezone`）**、**用量保留天数（`usage_retention_days`）**、全局默认超时与重试、body 大小上限 | **配置文件** | 否（改后重启） |
 | 首次 bootstrap 的 provider/route | 配置文件（仅当 DB 为空时生效） | 否 |
 
 **关键纪律**：DB 非空时，配置文件里的 `providers` / `routes` 段落被**忽略并打印 warning**。这防止出现「界面改完、重启被配置文件覆盖」这类经典事故。
@@ -1036,6 +1056,8 @@ users 表 + 会话一条通道后，管理员只是一个 `role='admin'` 的普�
   "db_path": "./data/gateway.db",
   "log_level": "info",
   "master_key_env": "ROSETTA_GW_MASTER_KEY",
+  "timezone": "Asia/Shanghai",
+  "usage_retention_days": 30,
   "defaults": {
     "upstream_timeout_ms": 120000,
     "stream_idle_timeout_ms": 60000,
@@ -1064,6 +1086,17 @@ users 表 + 会话一条通道后，管理员只是一个 `role='admin'` 的普�
 ```
 
 `api_key_env` 支持从环境变量读，避免密钥落盘到配置文件。
+
+**`usage_retention_days`（2026-10-11 新增）**：
+`usage_records` 明细保留天数，超期由归档剪枝聚合进 `usage_daily_rollups` 后删除。
+此前是 `store.DefaultRetentionDays` 常量硬编码 30；实测表明它同时决定两件方向相反的事
+（详见 `AUDIT/perf-2026-10-11.md`）：
+
+1. **用户级配额的预检成本** —— `SumUserUsedTokens` 的代价是 O(保留期内该用户的行数)。
+   4200 req/天 × 30 天 ≈ 12.6 万行；用量小的部署调到 7 天即可降到 ~15ms。
+2. **写放大** —— 每条明细要维护 5 个二级索引 + 2 个触发器。
+
+硬编码 30 无法同时服务这两类部署。取值范围 1~3650，缺省 30，**改后需重启**。
 
 **故障转移相关默认**（`defaults` 下，全部可省略、缺省由 `setDefaults` 兜底）：
 `stream_first_token_timeout_ms` 是流式首字（TTFT）看门狗——区别于 `stream_idle_timeout_ms`（已出字后的空闲超时），掐的是「一个事件都没等到」的慢上游，触发即在写出 SSE 头前转移下一目标。
@@ -1127,7 +1160,7 @@ Docker 侧对齐，且避开浏览器的保留端口表（6666 是 IRC 段，浏
 
 ### 13.2 页面清单
 
-实际路由（`web/src/router.ts`，2026-10-06 核实）共 **11 页**，其中 5 页
+实际路由（`web/src/router.ts`，2026-10-11 核实）共 **10 页**，其中 4 页
 `adminOnly` —— 未登录或非 admin 看不到也进不去：
 
 | 路由 | 页签 | 可见 | 内容 |
@@ -1136,10 +1169,10 @@ Docker 侧对齐，且避开浏览器的保留端口表（6666 是 IRC 段，浏
 | `/` | 总览 | 全体 | 今日请求数 / token / 错误率 / 各 provider 健康灯 |
 | `/keys` | 访问密钥 | 全体 | 列表（按身份收窄）、启停、配额/有效期/IP/模型白名单编辑（普通用户只能收紧）、重算用量；**新建对全体开放**（明文只显示一次，归属恒为创建者自己；普通用户额度封顶到用户级配额、限速清零，分组覆盖仍限管理员） |
 | `/history` | 调用历史 | 全体 | 按时间倒序的调用明细，含 usage_state 与耗时 |
-| `/profile` | 我的账号 | 全体 | 自改密码、看自己的配额、**余额**（`balance_unlimited` 时显示「不限」而非 0.00 元）与用量；余额为 0 时显式提示「余额已用尽，请联系管理员充值」，对应数据面真实的 402 |
+| `/profile` | 钱包与充值 | 全体 | 自改密码、看自己的配额、**余额**（`balance_unlimited` 时显示「不限」而非 0.00 元）与用量；余额为 0 时显式提示「余额已用尽，请联系管理员充值」，对应数据面真实的 402 |
 | `/models` | 可用模型 | 全体 | **只读**清单：`GET /admin/api/model-names` 按身份收窄后的模型名（普通用户 = 所属组白名单 ∩ 全部路由名）+ 输入/输出/缓存命中三项单价；`restricted=true` 时显式提示「已被分组收窄」。刻意不给勾选控件 —— 白名单的写入口在 `/keys`（只能收紧）与 `/groups`（管理员按组收紧），且**空清单一律解释为「一个模型都调不了」而非 ModelPicker 的「一个都不选 = 不限制」**（后者只属于配置态）。未配置的单价显示「未配置」并弱化，**不显示 0.00**（会被读成「确认免费」） |
-| `/users` | 用户 | admin | 用户 CRUD、角色、启停、密码重置、**余额充值**（`delta_cents` 相对调整：填 100 是「加 100 元」而非「设为 100 元」，误操作不会清零；给不限额用户充值会把它切成有限额，界面上必须写明）；admin 账号必须带初始密码。余额列同样区分「不限」与「0.00 元」 |
-| `/groups` | 分组 | admin | 分组配额与模型白名单；key 级覆盖被 SET NULL 后白名单会静默放宽（P2-19） |
+| `/users` | 用户与分组 | admin | 用户 CRUD、角色、启停、密码重置、**余额充值**（`delta_cents` 相对调整：填 100 是「加 100 元」而非「设为 100 元」，误操作不会清零；给不限额用户充值会把它切成有限额，界面上必须写明）；admin 账号必须带初始密码。余额列同样区分「不限」与「0.00 元」 |<br>**分组管理也在本页**（tab 切换，`UsersGroups.vue`）：分组增删改、成员增删、**组级模型白名单**（`PUT /admin/api/groups/{id}/models`，仅管理员）
+| ~~`/groups`~~ | ~~分组~~ | ~~admin~~ | **已移除**（2026-10-10）：无独立分组路由。分组管理已合并进 `/users` 页的分组 tab（`UsersGroups.vue`）。删除原因见 `web/src/router.ts` 注释：普通用户的导航项与管理员的「删除后可见性」语义纠缠不清 |
 | `/providers` | 上游与模型 | admin | 列表（协议/端点/凭证健康）、新建/编辑、连通性测试、模型管理、导入导出 |
 | `/routes` | 路由 | admin | 虚拟名 ↔ (provider, model) 映射表、启停、故障转移链 |
 | `/settings` | 设置 | admin | 版本、DB 大小、重建快照、日志级别、审计日志、配置导入导出 |
