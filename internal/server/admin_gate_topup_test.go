@@ -170,12 +170,25 @@ func TestAdminGate_NoIdentityIsRejected(t *testing.T) {
 	}
 }
 
-// 引导态合成 user（ID 为空、role=admin）能过 —— 引导窗口需要它建第一个账号。
-func TestAdminGate_BootstrapSyntheticAdminPasses(t *testing.T) {
-	bootstrap := &store.User{Role: store.RoleAdmin, Status: store.UserStatusActive}
-	code, reached := gateAt(t, bootstrap, http.MethodGet, "/admin/api/users")
-	if !reached {
-		t.Errorf("引导态合成管理员被拦（code=%d）：首次引导会卡住", code)
+// 空 ID 的 admin 必须被拦（2026-10-12 由「放行」反转为「拦截」）。
+//
+// 原测试断言引导态合成 admin 能过，理由是「引导窗口需要它建第一个账号」。
+// 该前提不成立：引导端点（/admin/api/bootstrap）挂在 publicAdminMux 上、
+// **免鉴权**，根本不经过本闸门（见 user_auth.go 的 ServeHTTP 注释与
+// main.go 的路由装配），所以拦截空 ID 不会影响首次引导。
+//
+// 而放行它意味着：只要 context 里出现一个空 ID 的 admin，管理面全部端点
+// （含 config-transfer 的**上游明文凭据**导出）都会被越权访问。
+// 生产中该状态不可达（userKey 唯一注入点是 GetUser 的 SQL 查询，空 id
+// 查不到行会被拦成 401），但闸门不该依赖「不可达」来维持安全。
+func TestAdminGate_EmptyIDAdminRejected(t *testing.T) {
+	synthetic := &store.User{Role: store.RoleAdmin, Status: store.UserStatusActive}
+	code, reached := gateAt(t, synthetic, http.MethodGet, "/admin/api/users")
+	if reached {
+		t.Error("空 ID 的 admin 竟被放行进管理端点：fail-open，管理面失守")
+	}
+	if code != http.StatusForbidden {
+		t.Errorf("code = %d, want 403", code)
 	}
 }
 

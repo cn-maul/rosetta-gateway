@@ -182,6 +182,67 @@ const labelStride = computed(() => Math.max(1, Math.ceil(daySeries.value.length 
 
 const maxTokens = computed(() => Math.max(1, ...daySeries.value.map((d) => d.tokens)))
 
+/**
+ * readiness ——「我现在能调用吗」的聚合结论（2026-10-12）。
+ *
+ * 只回答**余额与额度**这两个维度，因为只有它们的判据在本页的 stats 里。
+ * 密钥启用状态、模型白名单不在此列（见模板里的说明），
+ * 所以标题一律带「就余额和额度而言」这个限定语 —— 不说满。
+ *
+ * 优先级：余额 > 额度。两者都不足时只报余额，因为处置动作不同
+ * （余额要充值，额度换个 key 就绕过了），同时给两条会让用户先做容易的那件、
+ * 然后发现还是被拒 —— 那正是余额独占一屏的理由。
+ *
+ * quotaTokens = 0 表示不限额，必须与 unlimited 一样显式排除，
+ * 否则未配额度的用户会看到「额度已用尽」的红色结论。
+ */
+const readiness = computed(() => {
+  const unlimited = stats.value?.balance_unlimited ?? false
+  const cents = stats.value?.balance_cents ?? 0
+  const quota = stats.value?.quota_tokens ?? 0
+  const used = stats.value?.used_tokens ?? 0
+
+  if (!unlimited && cents <= 0) {
+    return {
+      cls: 'is-blocked',
+      title: '现在发请求会被拒绝（余额已耗尽）',
+      detail: '调用会返回 402。就余额和额度而言，需先充值才能继续。',
+      linkTo: '/profile',
+      linkText: '去充值',
+    }
+  }
+  if (quota > 0 && used >= quota) {
+    return {
+      cls: 'is-blocked',
+      title: '现在发请求会被拒绝（额度已用尽）',
+      detail: `已用 ${fmtTokens(used)} / 额度 ${fmtTokens(quota)} tokens。换一把未耗尽的密钥即可继续。`,
+      linkTo: '/keys',
+      linkText: '查看密钥',
+    }
+  }
+  if (quota > 0 && used > 0) {
+    const pct = Math.round((used / quota) * 100)
+    if (pct >= 80) {
+      return {
+        cls: 'is-warn',
+        title: `额度即将用尽（已用 ${pct}%）`,
+        detail: `已用 ${fmtTokens(used)} / 额度 ${fmtTokens(quota)} tokens。`,
+        linkTo: '/keys',
+        linkText: '查看密钥',
+      }
+    }
+  }
+  return {
+    cls: 'is-ok',
+    // 「就余额和额度而言」这个限定语刻意保留：本页没有密钥启用状态
+    // 与模型白名单的数据，说「可以调用」是越权的结论。
+    title: '就余额和额度而言，现在可以调用',
+    detail: '密钥是否启用、模型是否在你的白名单内，请分别查看密钥页与可用模型页。',
+    linkTo: '',
+    linkText: '',
+  }
+})
+
 const topModelMax = computed(() => Math.max(1, ...byModel.value.map((e) => e.tokens)))
 const topKeyMax = computed(() => Math.max(1, ...byKey.value.map((e) => e.tokens)))
 const topProviderMax = computed(() => Math.max(1, ...byProvider.value.map((e) => e.tokens)))
@@ -326,6 +387,39 @@ onUnmounted(() => {
 
     <template v-if="stats">
       <!--
+        「我现在能调用吗」状态行（2026-10-12）。
+
+        这一屏有 10 个指标、别处有密钥清单和模型清单，但没有一处直接
+        回答用户真正要问的那句话：**现在发一个请求，会不会被拒？**
+        会拒的三种原因散落在三个页面：
+          - 余额耗尽 → 402（在钱包页）
+          - 配额耗尽 → 429（在钱包页的额度徽章）
+          - 密钥停用 → 401（在密钥页）
+        用户要自己把三处拼起来才能得出结论，而拼错（以为能调）代价是
+        一次失败的调试。
+
+        这里只做**聚合**，不新增判据逻辑：三个判据都来自 stats 已有的字段，
+        与钱包页、密钥页用的是同一个数字，不会两边说法不一致。
+
+        # 刻意不覆盖的部分
+
+        密钥是否启用、模型是否在白名单内，本页拿不到（Overview 不拉 /keys
+        与 /model-names，加两个请求只为这一行不划算）。所以状态行只回答
+        「**就余额和额度而言**」，并在文案里写明这个边界 —— 不说满，
+        比给一个看起来完整但漏了两项判据的结论更诚实。
+      -->
+      <div class="call-readiness" :class="readiness.cls" role="status">
+        <span class="cr-dot" aria-hidden="true"></span>
+        <div class="cr-body">
+          <div class="cr-title">{{ readiness.title }}</div>
+          <div v-if="readiness.detail" class="cr-detail">{{ readiness.detail }}</div>
+        </div>
+        <RouterLink v-if="readiness.linkTo" :to="readiness.linkTo" class="btn btn-sm btn-ghost">
+          {{ readiness.linkText }}
+        </RouterLink>
+      </div>
+
+      <!--
         首次使用引导（2026-10-11 前端审计）。
         新账号第一次打开总览是一屏 0：没有密钥、没有用量、没有余额。
         三条最该做的事都能在别处做得到，但没有一条被主动指出来 ——
@@ -350,24 +444,24 @@ onUnmounted(() => {
       </div>
 
       <div class="stat-grid">
-        <div class="stat-card">
-          <div class="k">总请求</div>
-          <div class="v num">{{ fmtNum(stats.total_requests) }}</div>
+        <div class="card stat-card">
+          <div class="card__title">总请求</div>
+          <div class="card__description stat-v num">{{ fmtNum(stats.total_requests) }}</div>
         </div>
-        <div class="stat-card">
-          <div class="k">总 Tokens</div>
-          <div class="v num">{{ fmtTokens(stats.total_tokens) }}</div>
+        <div class="card stat-card">
+          <div class="card__title">总 Tokens</div>
+          <div class="card__description stat-v num">{{ fmtTokens(stats.total_tokens) }}</div>
         </div>
         <!-- 费用：按每条用量**落库当时**的模型单价算好并固化（cost_total），再求和。
              所以改价不会回头改写已经发生的费用 —— 拿它和上游账单核对时，
              两边对不上的原因要去查当时的价格，而不是现在的价格。
              未配置价格的模型按 0 计，因此它不是账单，是「按各自当时的价算大概花多少」。 -->
         <div
-          class="stat-card"
+          class="card stat-card"
           title="按各次调用当时的单价固化计算（元）；之后改价不会改写历史费用，未配置价格的模型不计费"
         >
-          <div class="k">费用</div>
-          <div class="v num">¥{{ fmtMoney(stats.cost) }}</div>
+          <div class="card__title">费用</div>
+          <div class="card__description stat-v num">¥{{ fmtMoney(stats.cost) }}</div>
         </div>
         <!-- 余额：与「费用」放在一起是刻意的 —— 它们是同一件事的两面
              （花了多少 / 还剩多少），分开看总有一半说不清。
@@ -375,49 +469,49 @@ onUnmounted(() => {
              余额按分扣减，单价低时一次调用不足一分，不显示它就会出现
              「费用在涨、余额不动」。 -->
         <div
-          class="stat-card"
+          class="card stat-card"
           title="账户余额（元）。不足一分的消费先攒着，攒够一分后扣除"
         >
-          <div class="k">余额</div>
-          <div class="v num">
+          <div class="card__title">余额</div>
+          <div class="card__description stat-v num">
             {{ fmtBalance(stats.balance_cents ?? 0, stats.balance_unlimited ?? false) }}
           </div>
-          <div v-if="fmtRemainder(stats.balance_remainder ?? 0)" class="k sub">
+          <div v-if="fmtRemainder(stats.balance_remainder ?? 0)" class="card__description stat-sub">
             含 {{ fmtRemainder(stats.balance_remainder ?? 0) }} 待结算
           </div>
         </div>
-        <div class="stat-card">
-          <div class="k">输入 Tokens</div>
-          <div class="v num">{{ fmtTokens(stats.input_tokens) }}</div>
+        <div class="card stat-card">
+          <div class="card__title">输入 Tokens</div>
+          <div class="card__description stat-v num">{{ fmtTokens(stats.input_tokens) }}</div>
         </div>
-        <div class="stat-card">
-          <div class="k">输出 Tokens</div>
-          <div class="v num">{{ fmtTokens(stats.output_tokens) }}</div>
+        <div class="card stat-card">
+          <div class="card__title">输出 Tokens</div>
+          <div class="card__description stat-v num">{{ fmtTokens(stats.output_tokens) }}</div>
         </div>
         <div
-          class="stat-card"
+          class="card stat-card"
           :title="`缓存读取 ${fmtTokens(stats.cached_tokens)} / 输入 ${fmtTokens(stats.input_tokens)} tok`"
         >
-          <div class="k">缓存命中率</div>
-          <div class="v num">
+          <div class="card__title">缓存命中率</div>
+          <div class="card__description stat-v num">
             {{ fmtPercent(stats.cache_hit_rate) }}<span class="unit">%</span>
           </div>
         </div>
-        <div class="stat-card">
-          <div class="k">平均速度</div>
-          <div class="v num">
+        <div class="card stat-card">
+          <div class="card__title">平均速度</div>
+          <div class="card__description stat-v num">
             {{ fmtSpeed(stats.avg_tokens_per_sec) }}<span class="unit">tok/s</span>
           </div>
         </div>
-        <div class="stat-card">
-          <div class="k">首字用时</div>
-          <div class="v num">
+        <div class="card stat-card">
+          <div class="card__title">首字用时</div>
+          <div class="card__description stat-v num">
             {{ fmtSec(stats.avg_ttfb_ms) }}<span class="unit">s</span>
           </div>
         </div>
-        <div class="stat-card" :class="{ 'is-err': stats.error_count > 0 }">
-          <div class="k">错误数</div>
-          <div class="v num">{{ fmtNum(stats.error_count) }}</div>
+        <div class="card stat-card" :class="{ 'is-err': stats.error_count > 0 }">
+          <div class="card__title">错误数</div>
+          <div class="card__description stat-v num">{{ fmtNum(stats.error_count) }}</div>
         </div>
       </div>
 

@@ -141,7 +141,7 @@ onMounted(load)
       <!-- 空 = 你一把都调不了。注意这里**不写**「不限制」：那是 ModelPicker
            「一个都不选」的规则，属于配置态，与本页无关（见文件头注释）。 -->
       <div v-else-if="sorted.length === 0" class="empty">
-        <div class="big">⌗</div>
+        <div class="big">∅</div>
         <!--
           空清单有两种成因（2026-10-11 前端审计 M2）：管理员一个路由都没配，
           或分组白名单与现有路由无交集。原文案只写了后者，未分组用户
@@ -174,7 +174,13 @@ onMounted(load)
                 -->
                 <th class="num-h">输入<br /><span class="dim th-unit">元 / 百万 tokens</span></th>
                 <th class="num-h">输出<br /><span class="dim th-unit">元 / 百万 tokens</span></th>
-                <th class="num-h">缓存命中<br /><span class="dim th-unit">元 / 百万 tokens</span></th>
+                <!-- 「缓存命中」改成「其中:缓存命中」（2026-10-12）。
+                     三列并排会让人以为「三项相加 = 总输入成本」，
+                     而缓存命中其实是**输入的一部分**（两个上游协议里
+                     cached 都 ⊆ input，见 fmt.ts / types.ts 的说明）——
+                     它是命中时的**折扣价**，不是新增的一项。
+                     「其中:」这个前缀把包含关系直接写在表头里。 -->
+                <th class="num-h">其中:缓存命中<br /><span class="dim th-unit">元 / 百万 tokens</span></th>
               </tr>
             </thead>
             <tbody>

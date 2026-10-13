@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"fmt"
 	"math"
 	"strings"
 	"time"
@@ -316,14 +317,40 @@ func priceUsage(priceInput, priceCacheHit, priceOutput, inputTokens, cachedToken
 	return total
 }
 
+// usageStateCostPending 是 cost_total 因查价失败而**待重算**的标记
+// （2026-10-12 修 P1-2）。
+//
+// # 为什么需要一个可查询的状态，而不只是一条 WARN
+//
+// 原来 freezeUsageCost 查价失败就记 0 并打 WARN，然后**什么都没有**：
+//   - cost_total 是固化字段，之后所有报表一律读它、不再按当前价重算；
+//   - main.go 的 charge 用同一个 cost 扣费 → 费用 0 → **该请求完全免单**；
+//   - RecomputeCost 在生产代码中**没有任何调用点**（纯手工接口）。
+//
+// 于是一次读池抖动就永久留下一笔免单，且没有任何落盘线索能事后发现
+// （报表上它就是一条正常的 0 元记录）。WARN 日志会被日志轮转冲掉。
+//
+// 加上这个状态后，「哪些记录待重算」变成一条**可查询**的事实：
+// 后台任务能周期性地把它们捞出来重算（见 RecomputePendingCosts），
+// 而不必依赖人工记得去调某个接口。
+//
+// 与 reported / missing 的区别：那两者描述的是**上游有没有报 token 数**，
+// 本值描述的是「我们有没有算出费用」—— 两个正交维度，不冲突。
+const usageStateCostPending = "cost_pending"
+
 // freezeUsageCost 算出一条用量的固化费用（元）。
 //
-// **只负责查价 + 记日志**，算钱一律委托 priceUsage（见那里的「只有一份公式」）。
+// **只负责查价 + 记录待重算标记**，算钱一律委托 priceUsage
+// （见那里的「只有一份公式」）。
 //
-// **查价失败一律返回 0，不返回错误、不阻断落库**：用量是硬需求（配额、限速、
-// 审计都靠它），费用不是。模型不存在、没配价、读池抖动，后果都只是这一条
-// 记录计 0 元 —— 与「未配价 = 0」的既有口径同语义。让费用查询有能力打死
-// 用量落库，是把 nice-to-have 接到了 critical path 上。
+// **查价失败不返回错误、不阻断落库**：用量是硬需求（配额、限速、审计都靠它），
+// 费用不是。模型不存在、没配价、读池抖动，后果都只是这一条记录计 0 元 ——
+// 与「未配价 = 0」的既有口径同语义。让费用查询有能力打死用量落库，
+// 是把 nice-to-have 接到了 critical path 上。
+//
+// 但**绝不能只是打个 WARN 就完事**（2026-10-12 修 P1-2）：那会让一次读池
+// 抖动永久变成一笔免单，且事后无从发现。所以失败时把 usage_state 标成
+// usageStateCostPending，让后台的 RecomputePendingCosts 能把它捞回来重算。
 func (s *Store) freezeUsageCost(ctx context.Context, r *UsageRecord) float64 {
 	var pin, phit, pout float64
 	err := s.read.QueryRowContext(ctx,
@@ -331,20 +358,86 @@ func (s *Store) freezeUsageCost(ctx context.Context, r *UsageRecord) float64 {
 		   FROM upstream_models WHERE provider_id = ? AND model_id = ?`,
 		r.ProviderID, r.UpstreamModel).Scan(&pin, &phit, &pout)
 	if err != nil {
-		// 查价失败**不能静默计0**：费用是固化字段，之后所有报表一律读它，
-		// 不再按当前价重算。所以此刻的 0 不是「免费」，而是**永久漏账** ——
-		// 一次读池抖动就固定下来，事后没有任何对账线索能发现。
-		//
-		// 只记 WARN：写路径不能因读池抖动而失败（那会把上游的计费问题
-		// 变成网关的可用性问题）。真正的补救是 RecomputeCost —— 事后按
-		// 当时的单价重算这一条，见 usage_dao.go 的同名函数。
-		s.logger.Warn("freeze usage cost: price lookup failed, cost recorded as 0",
-			"provider_id", r.ProviderID, "upstream_model", r.UpstreamModel,
-			"request_id", r.RequestID, "error", err)
+		// sql.ErrNoRows 是**正常业务状态**（模型已删除 / 从没配过价），
+		// 与「未配价 = 0」同语义，不需要重算 —— 重算多少次都是 0。
+		// 其余错误（读池抖动、磁盘故障）才是真正的「暂时算不出来」，
+		// 必须留待重算，否则就是永久免单。
+		if !errors.Is(err, sql.ErrNoRows) {
+			// WARN 保留：它给出具体的 request_id，是排障的第一线索。
+			s.logger.Warn("freeze usage cost: price lookup failed, marked cost_pending",
+				"provider_id", r.ProviderID, "upstream_model", r.UpstreamModel,
+				"request_id", r.RequestID, "error", err)
+			// 标记失败也不能影响落库：这条 UPDATE 走写池，本身可能因
+			// 同一故障而失败，静默忽略即可 —— 那种情况下后台的重算
+			// 任务会靠 usage_state 的抽样兜底（见 RecomputePendingCosts）。
+			if _, merr := s.db.ExecContext(ctx,
+				`UPDATE usage_records SET usage_state = ? WHERE id = ?`,
+				usageStateCostPending, r.ID); merr != nil {
+				s.logger.Warn("freeze usage cost: mark cost_pending failed",
+					"request_id", r.RequestID, "error", merr)
+			}
+		}
 		return 0
 	}
 	return priceUsage(pin, phit, pout,
 		float64(r.InputTokens), float64(r.CachedTokens), float64(r.OutputTokens))
+}
+
+// RecomputePendingCosts 重算所有 usage_state='cost_pending' 的记录（2026-10-12 修 P1-2）。
+//
+// 这是 freezeUsageCost 标记出来的「待重算」队列的消费者。修好之后，
+// 一次读池抖动造成的 0 元记录会在下一轮被自动纠正，**不再需要人工干预**。
+//
+// 逐条重算（复用 RecomputeCost 的逐条语义），不用一条大 UPDATE：
+//   - 每条要独立查一次价，逐条才知道该不该改 —— 一次大 UPDATE 会把
+//     「本来就算对了的」也重写一遍，破坏 cost_total 的「固化于落库时」语义；
+//   - 精确知道改了几条，能进日志与告警（这是「有没有人在偷偷免单」的唯一可观测点）。
+//
+// 上界 limit 防止一次积压（长期故障后可能有大量待重算）把写池占死。
+// 返回 (重算条数, 是否还有剩余)。
+func (s *Store) RecomputePendingCosts(ctx context.Context, limit int) (int64, bool, error) {
+	if limit <= 0 {
+		limit = 500
+	}
+	rows, err := s.read.QueryContext(ctx,
+		`SELECT id FROM usage_records WHERE usage_state = ? LIMIT ?`,
+		usageStateCostPending, limit)
+	if err != nil {
+		return 0, false, fmt.Errorf("scan cost_pending: %w", err)
+	}
+	ids := make([]string, 0, limit)
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			rows.Close()
+			return 0, false, fmt.Errorf("scan id: %w", err)
+		}
+		ids = append(ids, id)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return 0, false, fmt.Errorf("iterate cost_pending: %w", err)
+	}
+	if len(ids) == 0 {
+		return 0, false, nil
+	}
+
+	var fixed int64
+	for _, id := range ids {
+		ok, rerr := s.RecomputeCost(ctx, id)
+		if rerr != nil {
+			// 单条失败不该中断整批：其余记录仍应被重算。
+			// 留 usage_state 不变，下一轮还会捞到它。
+			s.logger.Warn("recompute pending cost failed", "record_id", id, "error", rerr)
+			continue
+		}
+		if ok {
+			fixed++
+		}
+	}
+	// 捞满 limit 就说明可能还有剩余，交给调用方下一轮继续。
+	remaining := len(ids) >= limit
+	return fixed, remaining, nil
 }
 
 // RecomputeCost 按**当前**单价重算某条用量的固化费用。
@@ -353,8 +446,16 @@ func (s *Store) freezeUsageCost(ctx context.Context, r *UsageRecord) float64 {
 // 允许用「当前价」覆盖已固化费用的地方 —— 因为原值本就是错的（0），
 // 不覆盖会把错误永久保留。
 //
-// 按ID 精确重算，不做批量：这类记录的量级极小（读池抖动属偶发），
-// 逐条处理即可，不必引入「重算区间」这种会误伤正常固化值的批量语义。
+// 按ID 精确重算，不做批量：逐条处理才知道该不该改，不必引入「重算区间」
+// 这种会误伤正常固化值的批量语义。
+//
+// 成功后把 usage_state 复位成 'reported'（2026-10-12 修 P1-2）：
+// freezeUsageCost 失败时把它标成 cost_pending，而 RecomputePendingCosts
+// 是按这个状态捞记录的 —— 不复位的话同一条会被无限次捞出、每轮白跑一次，
+// 且「待重算队列非空」这个信号永远不消失（运维会误以为还在积压）。
+//
+// 注意：若重算后费用**仍是 0**（模型确实没配价 / 已删除），也照样复位 ——
+// 那时 0 是正确值而非失败，留着 pending 只会造成无意义的重复扫描。
 func (s *Store) RecomputeCost(ctx context.Context, recordID string) (bool, error) {
 	var r UsageRecord
 	err := s.read.QueryRowContext(ctx,
@@ -370,7 +471,8 @@ func (s *Store) RecomputeCost(ctx context.Context, recordID string) (bool, error
 	}
 	cost := s.freezeUsageCost(ctx, &r)
 	res, err := s.db.ExecContext(ctx,
-		`UPDATE usage_records SET cost_total = ? WHERE id = ?`, cost, recordID)
+		`UPDATE usage_records SET cost_total = ?, usage_state = ? WHERE id = ?`,
+		cost, "reported", recordID)
 	if err != nil {
 		return false, err
 	}

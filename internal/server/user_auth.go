@@ -209,8 +209,17 @@ var userAccessibleRoutes = map[string]bool{
 func AdminGateGuard(routes *http.ServeMux, next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		u := UserFromContext(r.Context())
-		// 管理员（含引导态合成 admin）直接放行，连路由表都不必查。
-		if u != nil && u.IsAdmin() {
+		// 管理员直接放行，连路由表都不必查。
+		//
+		// 必须同时校验 ID 非空：`IsAdmin()` 只看 Role，一个空 ID 的
+		// admin 会被它判为真。而空 ID 意味着「没有真实身份」——那正是
+		// 2026-10-12 统一改成 fail-closed 的状态（原 requireAdmin 在
+		// internal/admin/user_admin_handler.go 曾放行它，已修复）。
+		//
+		// 生产中该状态不可达（userKey 唯一注入点是本文件下方 ServeHTTP 的
+		// `:302`，身份来自 store.GetUser 的 SQL 查询，空 id 查不到行会被
+		// `u == nil` 拦成 401），但闸门不该依赖「不可达」来维持安全。
+		if u != nil && u.IsAdmin() && u.ID != "" {
 			next.ServeHTTP(w, r)
 			return
 		}

@@ -31,6 +31,7 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"fmt"
 	"math"
 	"time"
 )
@@ -462,7 +463,7 @@ func (s *Store) ChargeBalance(ctx context.Context, userID string, amountYuan flo
 	//
 	// 交给 defer 的 Rollback 即可：已提交的分支在 Rollback 里是 no-op。
 	//
-	// # 回滚会一并撤销余数累加 —— 那笔零头就此丢失（2026-10-10 实测确认）
+	// # 回滚会撤销余数累加 —— 那笔零头不能就这么丢了（2026-10-12 修 P1-3）
 	//
 	// 这个失败分支里，同一事务内先累加的 balance_remainder 会随回滚一起被
 	// 撤销。原注释写着「余数照留，由调用方重试时重新累加实现」—— 但实测读了
@@ -472,14 +473,19 @@ func (s *Store) ChargeBalance(ctx context.Context, userID string, amountYuan flo
 	//
 	// 后果：已欠费用户每次不足一分的零头静默漏收（不扣款、无流水、对账查不出）。
 	// 严重度有限 —— ≥1 分的部分本就按设计不扣（欠费不硬扣是既定口径），
-	// 真正丢的只是零头；但**注释与实现不一致**必须纠正，否则后来人会继续
-	// 相信一条不存在的重试路径。
+	// 真正丢的只是零头；但零头随调用次数线性累积，不能当它不存在。
 	//
-	// 为什么不在这里单独提交余数：那要么让「本次费用」在调用方重试时被
-	// 累加两次（若真有重试），要么需要把余数累加挪到事务外 —— 后者会让并发
-	// 累加失去原子性（余数用 UPDATE...RETURNING 保证不丢，见上文）。
-	// 正确的修法是**调用方在欠费时也保留零头**（例如把余数记在一条独立的
-	// 待结算流水里），那是口径变更，不在本次范围内。
+	// # 修法：把零头记进独立账本 balance_pending，并**单独提交**
+	//
+	// 为什么不在这里直接提交 balance_remainder：那要么让「本次费用」在调用方
+	// 重试时被累加两次（若真有重试），要么需要把余数累加挪到事务外 —— 后者
+	// 会让并发累加失去原子性（余数用 UPDATE...RETURNING 保证不丢，见上文）。
+	//
+	// 独立账本同时解决幂等：主键是 (request_id, user_id)，同一个 request_id
+	// 重复写入会被 INSERT OR IGNORE 挡掉。所以「调用方将来真的加重试」也不会
+	// 重复累积 —— 这正是在欠费这条不稳定路径上必须有的性质。
+	//
+	// 结转在 AdjustBalanceWithLedger（充值）里做：欠的钱充值后自然该收掉。
 	var balance sql.NullInt64
 	err = tx.QueryRowContext(ctx,
 		`SELECT balance_cents FROM users WHERE id = ?`, userID).Scan(&balance)
@@ -492,9 +498,100 @@ func (s *Store) ChargeBalance(ctx context.Context, userID string, amountYuan flo
 		// 余额确实不够。结算已经发生（上游已被调用、费用已固化进
 		// cost_total），钱收不回 —— 报欠费比悄悄放过更诚实。
 		// 同样回滚占位：这次没扣成，充值后的重试必须还能扣。
+		//
+		// ★ 必须**先显式回滚再记账**（2026-10-12 实测踩到的死锁）：
+		// 写池是 SetMaxOpenConns(1)，本事务此刻正**独占**那唯一一条连接。
+		// 若直接调 recordPendingRemainder（它走 s.db 取连接），就是自己
+		// 等自己 —— 连接永远等不到，测试表现为 ChargeBalance 挂死、
+		// go test 堆栈停在 `database/sql.(*DB).conn` 的 select 上。
+		//
+		// 这里的 tx.Rollback() 与函数尾部的 `defer tx.Rollback()` 是同一个
+		// no-op 语义的两次调用：已回滚后再 Rollback 是安全空操作（Tx 内部
+		// 状态机保证），所以这里提前调用不影响 defer 的兜底职责。
+		if err := tx.Rollback(); err != nil {
+			// 回滚失败属于异常（连接已坏）。仍然把欠费报出去 ——
+			// 用户确实欠费，这个事实不能因为记账失败而改变。
+			s.logger.Error("balance: rollback before recording pending failed",
+				"error", err, "request_id", requestID, "user_id", userID)
+		}
+		// 连接已释放，现在可以安全地用独立事务记待结算账本。
+		if requestID != "" {
+			if perr := s.recordPendingRemainder(context.Background(), requestID, userID,
+				YuanToMicros(amountYuan)); perr != nil {
+				// 记账失败不能盖住欠费这个主要事实：欠费是调用方要处理的
+				// （用户已用完额度），零头漏收只是账目瑕疵。
+				s.logger.Error("balance: record pending remainder failed",
+					"error", perr, "request_id", requestID, "user_id", userID)
+			}
+		}
 		return ErrInsufficientBalance
 	}
 	return tx.Commit()
+}
+
+// recordPendingRemainder 把一笔欠费金额记进 balance_pending 待结算账本。
+//
+// 独立于 ChargeBalance 的主事务：主事务在这条路径上必然回滚，所以这里
+// 用自己的短事务提交，写的行不受那次回滚影响。
+//
+// 幂等：主键 (request_id, user_id) + INSERT OR IGNORE，重复调用安全。
+// 这不是锦上添花 —— 欠费是「余额守卫拦下」这条不稳定路径，未来若给调用方
+// 加重试，没有幂等就会把零头累积两次（凭空多收用户钱）。
+//
+// recordID 为空时不做：没有幂等键就无法保证不重复，只能放弃这一笔
+// （与 ChargeBalance 里「空 request_id 不扣费」的口径一致）。
+func (s *Store) recordPendingRemainder(ctx context.Context, requestID, userID string, micros int64) error {
+	if requestID == "" || micros <= 0 {
+		return nil
+	}
+	_, err := s.db.ExecContext(ctx,
+		`INSERT OR IGNORE INTO balance_pending (request_id, user_id, amount_micros, ts)
+		 VALUES (?, ?, ?, ?)`,
+		requestID, userID, micros, time.Now().UnixMilli())
+	return err
+}
+
+// settlePendingForUser 在**充值**时把该用户的待结算零头并入余额。
+//
+// 零头本来就是他欠的钱，充值后收掉天经地义，不需要额外的对账流程。
+//
+// dbtx 刻意接受接口而非 *sql.Tx：调用方 AdjustBalanceWithLedger 刻意不绑
+// 事务（见那里「不为此把低频管理写绑进长事务」的论证），传 s.db 即可。
+//
+// amount_micros → 分的换算：1 分 = MicrosPerCent 微元，整除部分扣账。
+// **不足一分的部分直接核销、不留**：充值是结清时刻，与 balance_remainder 的
+// 「攒够才扣」不同 —— 留着它永远不足一分、永远扣不出去，那是纯粹的泄漏。
+func (s *Store) settlePendingForUser(ctx context.Context, dbtx dbtx, userID string) error {
+	var totalMicros sql.NullInt64
+	if err := dbtx.QueryRowContext(ctx,
+		`SELECT COALESCE(SUM(amount_micros), 0) FROM balance_pending WHERE user_id = ?`,
+		userID).Scan(&totalMicros); err != nil {
+		return fmt.Errorf("sum pending: %w", err)
+	}
+	if !totalMicros.Valid || totalMicros.Int64 <= 0 {
+		return nil
+	}
+
+	cents := totalMicros.Int64 / MicrosPerCent
+	if cents > 0 {
+		if _, err := dbtx.ExecContext(ctx,
+			`UPDATE users SET balance_cents = MAX(0, COALESCE(balance_cents,0) - ?), updated_at = ?
+			  WHERE id = ?`,
+			cents, time.Now().UnixMilli(), userID); err != nil {
+			return fmt.Errorf("settle pending: %w", err)
+		}
+	}
+	if _, err := dbtx.ExecContext(ctx,
+		`DELETE FROM balance_pending WHERE user_id = ?`, userID); err != nil {
+		return fmt.Errorf("clear pending: %w", err)
+	}
+	return nil
+}
+
+// dbtx 是 *sql.DB 与 *sql.Tx 的公共最小面（两者都有这三个方法）。
+type dbtx interface {
+	QueryRowContext(ctx context.Context, query string, args ...any) *sql.Row
+	ExecContext(ctx context.Context, query string, args ...any) (sql.Result, error)
 }
 
 // SetBalance 管理员设置某用户的余额（绝对值）。

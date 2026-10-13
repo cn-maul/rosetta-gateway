@@ -225,3 +225,86 @@ func TestDecodeAnthropicMessages_AssistantStringContent(t *testing.T) {
 		t.Fatalf("assistant string content: %+v", req.Messages[1].Blocks)
 	}
 }
+
+// decodeErr 解析一个**应当失败**的 body，返回错误。
+func decodeErr(t *testing.T, body string) error {
+	t.Helper()
+	req := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(body))
+	_, err := DecodeAnthropicMessagesRequest(req, 1<<20)
+	if err == nil {
+		t.Fatalf("body 解析竟成功：%s", body)
+	}
+	return err
+}
+
+// content 为**单个对象**时必须 400，不得静默变成空消息（2026-10-12 修复 P2-16）。
+//
+// Anthropic 官方协议里 content 只能是 string 或块**数组**。但客户端常会发
+// 单对象（尤其从 OpenAI 格式手改过来的脚本）：
+//
+//	{"role":"user","content":{"type":"text","text":"hi"}}
+//
+// 旧实现把它 Unmarshal 到 []anthropicBlock 上失败 → 返回 nil；调用方
+// convertUserMessage 见 blocks 为空，又试按纯字符串解析、也失败，最后落到
+// `rosetta.User("")` —— **用户输入被静默丢弃且请求照常 200**。
+// 客户端以为发成功了，上游却没收到任何内容，这是最难排查的一类问题。
+//
+// 现在在 DecodeAnthropicMessagesRequest 里挡掉，报明确的 400。
+func TestDecodeAnthropicMessages_SingleObjectContentRejected(t *testing.T) {
+	cases := []struct {
+		name string
+		body string
+	}{
+		{"user 单对象", `{"model":"m","max_tokens":8,"messages":[
+			{"role":"user","content":{"type":"text","text":"hi"}}]}`},
+		{"assistant 单对象", `{"model":"m","max_tokens":8,"messages":[
+			{"role":"assistant","content":{"type":"text","text":"之前"}}]}`},
+		{"多条中夹一条单对象", `{"model":"m","max_tokens":8,"messages":[
+			{"role":"user","content":"正常"},
+			{"role":"user","content":{"type":"text","text":"单对象"}}]}`},
+		{"system 单对象", `{"model":"m","max_tokens":8,
+			"system":{"type":"text","text":"指令"},
+			"messages":[{"role":"user","content":"hi"}]}`},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			err := decodeErr(t, c.body)
+			if !errors.Is(err, ErrContentSingleObject) {
+				t.Fatalf("错误不是 ErrContentSingleObject：%v", err)
+			}
+		})
+	}
+}
+
+// 合法形态不得被新校验误伤（2026-10-12）。
+//
+// P2-16 的修复加了一道 content 形态校验，这里守住它的边界：数组、纯字符串、
+// 空缺省、空数组都必须照常通过。误伤比漏报更危险 —— 会让合法客户端全线 400。
+func TestDecodeAnthropicMessages_LegalContentShapesStillPass(t *testing.T) {
+	bodies := []struct{ name, body string }{
+		{"纯字符串", `{"model":"m","max_tokens":8,"messages":[{"role":"user","content":"hi"}]}`},
+		{"块数组", `{"model":"m","max_tokens":8,"messages":[
+			{"role":"user","content":[{"type":"text","text":"hi"}]}]}`},
+		{"块数组含多种类型", `{"model":"m","max_tokens":8,"messages":[
+			{"role":"user","content":[
+				{"type":"text","text":"看这张图"},
+				{"type":"image","source":{"type":"url","url":"http://x/y.png"}},
+				{"type":"tool_result","tool_use_id":"t1","content":"结果"}]}]}`},
+		{"空 content 数组", `{"model":"m","max_tokens":8,"messages":[{"role":"user","content":[]}]}`},
+		{"缺省 content", `{"model":"m","max_tokens":8,"messages":[{"role":"user"}]}`},
+		{"system 为数组", `{"model":"m","max_tokens":8,
+			"system":[{"type":"text","text":"指令"}],
+			"messages":[{"role":"user","content":"hi"}]}`},
+		{"system 为字符串", `{"model":"m","max_tokens":8,
+			"system":"指令",
+			"messages":[{"role":"user","content":"hi"}]}`},
+	}
+	for _, b := range bodies {
+		t.Run(b.name, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(b.body))
+			if _, err := DecodeAnthropicMessagesRequest(req, 1<<20); err != nil {
+				t.Fatalf("合法形态被误拒：%v", err)
+			}
+		})
+	}
+}

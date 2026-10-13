@@ -212,6 +212,20 @@ func (s *Store) AdjustBalanceWithLedger(ctx context.Context, userID string, delt
 		return Topup{}, err
 	}
 
+	// 结转欠费期间累积的待结算零头（2026-10-12 修 P1-3）。
+	//
+	// 欠费时那些不足一分的零头被记进 balance_pending（见 ChargeBalance 的
+	// 欠费分支），原本会永远收不回来。充值是它们该被结清的时刻。
+	//
+	// 本函数刻意不绑事务（见上面「不为此把低频管理写绑进长事务」的论证），
+	// 所以结转是两条独立语句：先扣账再清账本。万一清账本失败，零头会被
+	// **下次充值再扣一次** —— 那是可恢复的、且下次会成功（余额仍不足一时
+	// MAX(0,…) 兜底）；反过来若先清账本再扣账，扣失败就永久漏收了。
+	// 方向的选择原则：宁可多扣一次（可发现、可纠正）也不漏收（无迹可寻）。
+	if err := s.settlePendingForUser(ctx, s.db, userID); err != nil {
+		return Topup{}, err
+	}
+
 	t := Topup{
 		ID:           generateTopupID(),
 		UserID:       userID,

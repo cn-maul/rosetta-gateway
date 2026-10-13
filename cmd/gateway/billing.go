@@ -62,8 +62,27 @@ func billingSubscription(db *store.Store) http.HandlerFunc {
 			writeAuthError(w, err, outwire.WriteOpenAIError)
 			return
 		}
+		// 查库失败必须上抛 500，不能与「key 已删除」混成一个分支
+		//（2026-10-12 修 P2-5）。
+		//
+		// 这两种情况语义完全相反，旧实现却都落到 `quota, used = 0, 0`：
+		//   - ok=false（key 确实不在库里，刚被删）→ 按未配置额度处理是**对的**；
+		//   - qerr != nil（读库抖动 / SQLITE_BUSY / 磁盘故障）→ 那是服务端故障，
+		//     此时 quota=0 会让下面的 `quota <= 0` 分支判定成「不限额」，
+		//     于是 hard_limit 被报成 unlimitedHardLimitUSD（10 亿）——
+		//     一次瞬时故障就让客户端看到一个根本不存在的巨额额度。
+		//
+		// 与同文件 billingUsage 的口径一致（那里注释已写明：丢弃错误等于把
+		// DB 故障报成「你什么都没用过」，而 ChatGPT-Next-Web / LobeChat
+		// 正是拿这个数画余额进度条）。判错返回 500，客户端会重试，
+		// 比显示一个错的额度诚实得多。
 		quota, used, ok, qerr := db.GetKeyQuota(r.Context(), authCtx.KeyID)
-		if qerr != nil || !ok {
+		if qerr != nil {
+			outwire.WriteOpenAIError(w, http.StatusInternalServerError,
+				"internal_error", "quota query failed")
+			return
+		}
+		if !ok {
 			// key 在快照里存在但库里已查不到（刚删）：按未配置额度处理。
 			quota, used = 0, 0
 		}

@@ -575,14 +575,30 @@ func (s *Store) PruneOldUsage(ctx context.Context, keepDays int) (*PruneResult, 
 		`CREATE TEMP TABLE prune_batch (rid INTEGER PRIMARY KEY)`); err != nil {
 		return nil, fmt.Errorf("create prune batch: %w", err)
 	}
-	// 圈批规则与旧实现 DELETE 子查询里的一致：取**最老**的 maxPruneDelete 行
-	//（按 id 排序，id 含时间前缀因而与 ts 单调），而不是「任意前 N 行」——
-	// 保证处理的是**连续的一段**，不会在明细里打散出许多时间碎片影响后续统计。
+	// 圈批：取**最老**的 maxPruneDelete 行，而不是「任意前 N 行」——
+	// 保证处理的是时间上连续的一段，不会在明细里打散出许多时间碎片。
+	//
+	// # 按 ts 而不是 id 排序（2026-10-12 修 P2-1）
+	//
+	// 本处原写 `ORDER BY id`，注释称「id 含时间前缀因而与 ts 单调」——
+	// 该前提**不成立**：usage_records.id 来自 cmd/gateway 的 generateID()，
+	// 是 16 字节 crypto/rand 的纯 hex（32 字符），不含任何时间成分，
+	// 与 ts 完全无关。也就是说旧写法圈出的是**随机散布**的 2 万行。
+	//
+	// 正确性不受影响：聚合与删除共用同一批 rowid、同事务、同谓词，
+	// 「进了表 A 的必然被删掉」这条不变式由圈批本身给出，与排序无关。
+	// 受影响的是**可观测性**：水位推进依赖「cutoff 之前已无残留」，
+	// 而随机圈批会把老行零散地留在明细里，导致 CutoffDay/PrunedThrough
+	// 与实际处理范围对不上，管理端展示的「已剪到哪天」会误导排障。
+	//
+	// 改按 ts 排序后，圈出的确实是时间最老的一段，水位语义与展示一致。
+	// ts 有 idx_usage_ts 索引，排序代价可接受。
+	//
 	// 圈批到删除之间没有写入竞争：rowid 只会因本事务自己的 DELETE 而消失，
 	// 而那发生在圈批的用途全部完成之后。
 	if _, err := tx.ExecContext(ctx,
 		`INSERT INTO prune_batch (rid)
-		     SELECT rowid FROM usage_records WHERE ts < ? ORDER BY id LIMIT ?`,
+		     SELECT rowid FROM usage_records WHERE ts < ? ORDER BY ts LIMIT ?`,
 		cutoffTs, maxPruneDelete); err != nil {
 		return nil, fmt.Errorf("select prune batch: %w", err)
 	}
@@ -641,44 +657,30 @@ func (s *Store) PruneOldUsage(ctx context.Context, keepDays int) (*PruneResult, 
 		res.DeletedRows = n
 	}
 
-	// 回收累加列。**必须与两个 AFTER INSERT 触发器配对**（store.go 的
-	// trg_update_used_tokens / trg_update_user_usage_totals）。
+	// **不回收累加列**（user_usage_totals.total_tokens /
+	// access_keys.used_tokens）—— 这是刻意的，别再加回来。
 	//
-	// 触发器只在 INSERT 时加，剪枝把明细删掉时不会减。若不回收，这两个列
-	// 就是**单向虚高**：剪掉的量永久留在计数里，越剪越多、永不减少。
-	// 后果：配额低估已用量 → 用户可以超额使用（看起来"还有余额"）。
+	// 这两列是**终身累计**，不是「保留期内用量」：
+	//   - DESIGN.md §4 数据模型：`quota_tokens ... 0 = 不限；终身累计 input+output 上限`；
+	//   - key_dao.go ReserveQuota 的注释：「配额限的是终身累计，没有『窗口结束』这回事」；
+	//   - RecomputeUsedTokens / RecomputeUserUsage 的数据源是 UsageSource
+	//     （明细 + 归档），也就是它们把归档量算进权威值。
 	//
-	// 为什么之前没人发现：users.used_tokens 当时只是**展示字段**（配额判定
-	// 走实时 SUM），虚高只影响界面数字。2026-10-11 性能优化把它接到了
-	// 配额判定路径上，配对回收从此成为**正确性前提**而非优化。
+	// 所以「明细被剪掉」不等于「用量消失」——那部分量已经进了表 A
+	// （usage_daily_rollups），仍然属于用户的终身累计。若在这里按被剪量
+	// 扣回，会与 Recompute* 的口径分叉，制造出真正的缺陷：**配额被剪枝
+	// 悄悄放宽**（用户 30 天前的用量一旦过期，凭空多出一份额度）。
+	// TestPrune_StatsUnchangedAcrossPrune 守的就是这条不变量，
+	// 它的断言「剪枝后 SumUserUsedTokens 不变」正是本注释的依据。
 	//
-	// 放在 DELETE 之后、同一事务内：要么两件事都成，要么都不成。放在事务外
-	// 会出现「明细已删但计数没减」的窗口，且此时没有任何途径能修复它
-	// （触发器只管 INSERT，RecomputeUserUsage 是手工接口，没人自动调）。
-	//
-	// MAX(0, ...) 兜底：历史数据可能已经虚高（本次修复之前跑过剪枝），
-	// 减到负数会让配额判定出现"已用量为负"这种更荒谬的状态。
-	if _, err := tx.ExecContext(ctx,
-		`UPDATE user_usage_totals SET total_tokens = MAX(0, total_tokens - COALESCE((
-		    SELECT SUM(u.total_tokens) FROM prune_batch p
-		    JOIN usage_records u ON u.rowid = p.rid
-		    WHERE u.user_id <> '' AND u.user_id = user_usage_totals.user_id
-		  ), 0))`+
-			` WHERE user_id IN (SELECT u.user_id FROM prune_batch p
-			   JOIN usage_records u ON u.rowid = p.rid
-			   WHERE u.user_id <> '')`); err != nil {
-		return nil, fmt.Errorf("reclaim user_usage_totals: %w", err)
-	}
-	if _, err := tx.ExecContext(ctx,
-		`UPDATE access_keys SET used_tokens = MAX(0, used_tokens - COALESCE((
-		    SELECT SUM(u.total_tokens) FROM prune_batch p
-		    JOIN usage_records u ON u.rowid = p.rid
-		    WHERE u.access_key_id = access_keys.id
-		  ), 0))`+
-			` WHERE id IN (SELECT u.access_key_id FROM prune_batch p
-			   JOIN usage_records u ON u.rowid = p.rid)`); err != nil {
-		return nil, fmt.Errorf("reclaim access_keys.used_tokens: %w", err)
-	}
+	// 历史：2026-10-11 曾加过两条「配对回收」UPDATE（意图是抵消
+	// trg_update_used_tokens / trg_update_user_usage_totals 的单向累加）。
+	// 那两条语句放在 DELETE 之后，靠 `prune_batch JOIN usage_records` 求被剪量
+	// —— 而 SQLite 在同事务内 DELETE 之后读不到已删行，JOIN 必然落空、
+	// COALESCE(...,0) 把差额兜底成 0，于是回收量恒为 0，是两条空跑语句
+	// （2026-10-12 用审计触发器实证：剪枝期间 user_usage_totals 零次 UPDATE）。
+	// 也就是说它从未生效过，而这恰好是无害的 —— 生效反而有害，见上。
+	// 2026-10-12 删除该死代码，并留下本说明防止后人「顺手修好」它。
 
 	// 用完即弃。DROP 放在 Commit **之前**，让它随本事务一起提交/回滚：若放到
 	// Commit 之后用 s.db.Exec，语句可能落到池中另一条连接上（TEMP 表是

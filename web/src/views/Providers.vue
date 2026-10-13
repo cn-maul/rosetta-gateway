@@ -5,6 +5,8 @@ import { toast, confirmBox } from '../ui'
 import { fmtSpeed, fmtSec, fmtPercent } from '../fmt'
 import type { Provider, Credential, UpstreamModel, DiscoveredModel, ModelTestResult, ProviderBalance, CredentialBalance } from '../types'
 import AppModal from '../components/AppModal.vue'
+import CredentialPanel from '../components/CredentialPanel.vue'
+import UpstreamModelPanel from '../components/UpstreamModelPanel.vue'
 
 const err = ref('')
 const loading = ref(true)
@@ -221,20 +223,9 @@ async function testModel(m: UpstreamModel) {
   }
 }
 
-// testResultLine 把探测结果压成界面上那一行。
-//
-// 成功：`可用 · 1234ms · 输出 1 tok`。耗时与用量都带出来，因为探测的
-// 成本与体感全在这两个数上 —— 只说「可用」就没法区分「可用但很慢」。
-// 失败：原样给出上游原因；InBand 的错误额外加一句说明，否则
-// 「HTTP 是成功的却报错」会看起来像网关自己坏了。
-function testResultLine(r: ModelTestResult): string {
-  if (r.status === 'ok') {
-    const parts = [`可用`, `${r.latency_ms}ms`]
-    if (r.output_tokens) parts.push(`输出 ${r.output_tokens} tok`)
-    return parts.join(' · ')
-  }
-  return r.in_band ? `${r.message}（上游以 HTTP 200 返回错误）` : r.message
-}
+// testResultLine 已随模型表一起搬进 UpstreamModelPanel.vue（2026-10-12）。
+// 这里的探测结果状态（modelTestResults / testing）仍留在本组件 ——
+// 它们是写路径的一部分（testModel 自己发请求），只把渲染搬走。
 
 // ---------- 凭据表单 ----------
 
@@ -345,25 +336,9 @@ async function queryBalance(providerId: string) {
   }
 }
 
-// balanceLine 把一条凭据的余额压成一行。
-//
-// 分三个状态措辞，因为三者的后续动作互不相干：
-//   - unsupported：这个上游压根没有余额查询方式 → 去它自己的后台看；
-//   - error：查了但失败 → 401 换 key、超时重试；
-//   - ok：拿到数 → 数字 + 时刻 + 上游附注。
-// 混成一句「查询失败」会让管理员在三种完全不同的排查方向之间瞎猜。
-function balanceLine(r: CredentialBalance): string {
-  if (r.status === 'unsupported') return r.message || '该上游不支持余额查询'
-  if (r.status === 'error') return r.message || '查询失败'
-  const at = r.fetched_at ? new Date(r.fetched_at).toLocaleTimeString() : ''
-  const head = `${(r.amount ?? 0).toFixed(2)} ${r.currency ?? ''}`.trim()
-  return [head, at, r.detail].filter(Boolean).join(' · ')
-}
-
-function balanceClass(r: CredentialBalance): string {
-  if (r.status === 'ok') return 'bal-ok'
-  return r.status === 'unsupported' ? 'bal-na' : 'test-err'
-}
+// balanceLine / balanceClass 已随凭据表搬进 CredentialPanel.vue（2026-10-12）。
+// balances / balanceBusy 仍留在本组件 —— 查余额是写路径（queryBalance 发请求），
+// 只把渲染搬走。
 
 // ---------- 模型：编辑表单 ----------
 
@@ -615,7 +590,7 @@ onMounted(() => {
            与 Users/Groups 的错误态同口径。 -->
       <div v-else-if="err" class="empty"><div class="big">⚠</div>{{ err }}</div>
       <div v-else-if="providers.length === 0" class="empty">
-        <div class="big">⌘</div>
+        <div class="big">∅</div>
         还没有上游服务，点击右上角「新建上游」开始
       </div>
       <div v-else class="tbl-wrap">
@@ -669,11 +644,11 @@ onMounted(() => {
                        比模型级测试更弱的绿色信号，容易被当成「都正常」。
                        后端 POST /providers/{id}/test 与 api.testProvider
                        都保留（见 AUDIT/task-provider-ui.md 的理由）。 -->
-                  <button class="btn btn-sm btn-ghost" @click="openExpand(p.id)">
+                  <button class="btn btn-act btn-ghost" @click="openExpand(p.id)">
                     {{ expandedId === p.id ? '收起' : '展开' }}
                   </button>
-                  <button class="btn btn-sm btn-ghost" @click="openProvider(p)">编辑</button>
-                  <button class="btn btn-sm btn-danger" @click="removeProvider(p)">删除</button>
+                  <button class="btn btn-act btn-ghost" @click="openProvider(p)">编辑</button>
+                  <button class="btn btn-act btn-danger" @click="removeProvider(p)">删除</button>
                   <button class="switch" :class="{ on: p.enabled }" :title="p.enabled ? '停用' : '启用'" @click="toggleProvider(p)"></button>
                 </div>
               </td>
@@ -682,165 +657,30 @@ onMounted(() => {
             <tr v-if="expandedId === p.id" class="expand-row">
               <td colspan="4">
                 <div class="expand-grid">
-                  <div class="expand-col">
-                    <h4>
-                      凭据（{{ (credsMap[p.id] ?? []).length }}）
-                      <button class="btn btn-sm" @click="openCred(p.id)">添加凭据</button>
-                      <button
-                        class="btn btn-sm btn-ghost"
-                        :disabled="isBalanceBusy(p.id)"
-                        title="实时向该上游查询每把凭据的余额（不自动刷新）"
-                        @click="queryBalance(p.id)"
-                      >
-                        {{ isBalanceBusy(p.id) ? '查询中…' : '查余额' }}
-                      </button>
-                    </h4>
-                    <div v-if="(credsMap[p.id] ?? []).length === 0" class="empty sub-empty">
-                      无凭据 —— 上游鉴权必需
-                    </div>
-                    <table v-else class="tbl sub-tbl">
-                      <thead>
-                        <tr>
-                          <th>凭据</th>
-                          <th>上游余额</th>
-                          <th class="c-act">操作</th>
-                        </tr>
-                      </thead>
-                      <tbody>
-                        <!-- 权重 / 状态 / 创建时间三列已按需求移除。
-                             注意 weight 在后端仍然生效（负载均衡按它轮询），
-                             这里去掉的只是展示；见 AUDIT/task-provider-ui.md
-                             里记的副作用：界面上不再能调整权重。
-                             「状态」列显示的是 provider_credentials.status
-                             （healthy / cooling，随冷却态变化），创建时间来自
-                             created_at —— 两列都是只读展示，去掉不影响任何逻辑。
-                             「凭据」单元格的内容**未改动**（标签 + 启停徽标），
-                             这次只做需求要求的删除，不额外添加展示。 -->
-                        <tr v-for="c in credsMap[p.id] ?? []" :key="c.id">
-                          <td>
-                            <div class="cell-key">
-                              <span class="name">{{ c.label || c.id }}</span>
-                              <span class="badge" :class="c.enabled ? 'badge-live' : 'badge-off'">
-                                {{ c.enabled ? '启用' : '停用' }}
-                              </span>
-                            </div>
-                          </td>
-                          <!-- 余额显示在凭据行内而不是另起一表：余额挂在 key 上，
-                               放远了就失去「哪一把快没钱了」这个唯一有用的读法。
-                               没点过「查余额」时留白 —— 它不是 0，
-                               两者必须可区分：一个是「没查」，一个是「确实没钱」。 -->
-                          <td>
-                            <div v-if="balances[p.id]" class="bal-cell">
-                              <div
-                                v-for="r in balances[p.id].results.filter((x) => x.credential_id === c.id)"
-                                :key="r.credential_id"
-                                class="bal-line"
-                                :class="balanceClass(r)"
-                              >
-                                {{ balanceLine(r) }}
-                              </div>
-                              <span v-if="!balances[p.id].results.some((x) => x.credential_id === c.id)" class="dim">
-                                —（无结果）
-                              </span>
-                            </div>
-                            <span v-else class="dim">—</span>
-                          </td>
-                          <td class="c-act">
-                            <div class="row-actions">
-                              <button class="btn btn-sm btn-ghost" @click="openCred(p.id, c)">换钥</button>
-                              <button class="btn btn-sm btn-danger" @click="removeCred(c)">删除</button>
-                            </div>
-                          </td>
-                        </tr>
-                      </tbody>
-                    </table>
-                  </div>
-
-                  <div class="expand-col">
-                    <h4>
-                      上游模型（{{ (modelsMap[p.id] ?? []).length }}）
-                      <button class="btn btn-sm" @click="openModel(p.id)">添加模型</button>
-                    </h4>
-                    <div v-if="(modelsMap[p.id] ?? []).length === 0" class="empty sub-empty">
-                      无模型 —— 路由必须指向一个上游模型
-                    </div>
-                    <table v-else class="tbl sub-tbl">
-                      <thead>
-                        <tr>
-                          <th>模型</th>
-                          <th class="num-h">速度(tok/s)</th>
-                          <th class="num-h">首字(s)</th>
-                          <th class="num-h">成功率</th>
-                          <th class="c-act">操作</th>
-                        </tr>
-                      </thead>
-                      <tbody>
-                        <tr v-for="m in modelsMap[p.id] ?? []" :key="m.id">
-                          <td>
-                            <div class="cell-key">
-                              <span class="name mono">{{ m.model_id }}</span>
-                              <span class="badge" :class="m.enabled ? 'badge-live' : 'badge-off'">
-                                {{ m.enabled ? '启用' : '停用' }}
-                              </span>
-                            </div>
-                            <!-- 思考挡位。这不是可选的展示项：agent 工具靠
-                                 /v1/models 的 supported_reasoning 决定给用户开几档，
-                                 那份数据就来自这一列的配置。不显示的话，
-                                 「客户端以为支持、实际被网关静默降级」无从追查。 -->
-                            <!-- 思考能力。两者（能否思考 / 有哪几档）是同一个问题的
-                                 两面，必须一起显示：只显示挡位会让人以为「配了档位
-                                 就等于支持思考」，而数据面在「不支持思考」时是会
-                                 直接把思考配置剥掉的。 -->
-                            <div v-if="m.supports_thinking !== undefined" class="sub-line">
-                              思考：{{ m.supports_thinking ? '支持' : '不支持' }}
-                            </div>
-                            <div v-if="m.effort_levels?.length" class="sub-line">
-                              挡位：{{ m.effort_levels.join(' · ') }}
-                              <span v-if="m.unknown_effort_levels?.length" class="dim">
-                                （未识别：{{ m.unknown_effort_levels.join('、') }}）
-                              </span>
-                            </div>
-                            <!-- 探测结果留在行内而不是只弹 toast：探测会真实计费，
-                                 失败原因是管理员唯一能据以行动的信息，而 toast
-                                 5.2 秒后消失、并发时还会互相顶掉。 -->
-                            <div
-                              v-if="modelTestResults[m.id]"
-                              class="sub-line"
-                              :class="modelTestResults[m.id].status === 'ok' ? 'test-ok' : 'test-err'"
-                            >
-                              {{ testResultLine(modelTestResults[m.id]) }}
-                            </div>
-                          </td>
-                          <td class="num-h dim">{{ m.tokens_per_sec ? fmtSpeed(m.tokens_per_sec) : '—' }}</td>
-                          <td class="num-h dim">{{ m.ttfb_ms ? fmtSec(m.ttfb_ms) : '—' }}</td>
-                          <td class="num-h">
-                            <span v-if="m.call_count" class="sr" :class="{ warn: (m.success_rate ?? 1) < 1 }">
-                              {{ fmtPercent(m.success_rate ?? 1) }}%
-                            </span>
-                            <span v-else class="dim">—</span>
-                          </td>
-                          <td class="c-act">
-                            <div class="row-actions">
-                              <!-- 快速测试该模型是否可用：真实发一次 max_tokens=1
-                                   的推理请求。与已移除的 provider 级测试不同，
-                                   这个能证明「这个 model_id 现在真的能推理」
-                                   （模型下架/无权限/名字写错都会红）。 -->
-                              <button
-                                class="btn btn-sm btn-ghost"
-                                :disabled="isTesting(m.id)"
-                                :title="'真实调用一次（max_tokens=1）验证该模型可用'"
-                                @click="testModel(m)"
-                              >
-                                {{ isTesting(m.id) ? '测试中…' : '测试' }}
-                              </button>
-                              <button class="btn btn-sm btn-ghost" @click="openModel(p.id, m)">编辑</button>
-                              <button class="btn btn-sm btn-danger" @click="removeModel(m)">删除</button>
-                            </div>
-                          </td>
-                        </tr>
-                      </tbody>
-                    </table>
-                  </div>
+                <!-- 展开区的两块内容已抽成子组件（2026-10-12）：
+                     本文件原本 1179 行，是整站最大的，而展开区叠着两张
+                     子表。抽出去后这里只剩「传数据 + 接事件」，
+                     写操作（换钥/删除/测试/查余额）仍全部留在本组件 ——
+                     没有第二处状态真相。 -->
+                <CredentialPanel
+                  :provider-id="p.id"
+                  :creds="credsMap[p.id] ?? []"
+                  :balance="balances[p.id]"
+                  :balance-busy="isBalanceBusy(p.id)"
+                  @add="openCred(p.id)"
+                  @query-balance="queryBalance(p.id)"
+                  @edit="(c) => openCred(p.id, c)"
+                  @remove="removeCred"
+                />
+                <UpstreamModelPanel
+                  :models="modelsMap[p.id] ?? []"
+                  :testing="testing"
+                  :test-results="modelTestResults"
+                  @add="openModel(p.id)"
+                  @test="testModel"
+                  @edit="(m) => openModel(p.id, m)"
+                  @remove="removeModel"
+                />
                 </div>
               </td>
             </tr>

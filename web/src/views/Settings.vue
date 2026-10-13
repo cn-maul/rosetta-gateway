@@ -1,9 +1,12 @@
 <script setup lang="ts">
 import { computed, onMounted, reactive, ref, watch } from 'vue'
-import { api } from '../api'
+import { useRouter } from 'vue-router'
+import { api, ApiFail, session, saveToken } from '../api'
 import { toast, confirmBox } from '../ui'
 import { fmtMoney, fmtNum } from '../fmt'
+import { checkPasswordStrength } from '../password'
 import AppModal from '../components/AppModal.vue'
+import Tabs from '../components/Tabs.vue'
 import type {
   Provider,
   UpstreamModel,
@@ -17,7 +20,7 @@ import type {
 // 「审计日志」页签已移除（用户要求）。后端 GET /admin/api/audit 端点与
 // api.ts 的 api.audit() 一并保留 —— 它们是运维取证的正路，删掉的是
 // 界面上的那一块，不是能力本身（见 task 报告里「api.audit 去留」一节）。
-type TabKey = 'model' | 'runtime' | 'price' | 'transfer'
+type TabKey = 'model' | 'runtime' | 'price' | 'password' | 'transfer'
 
 const TABS: { key: TabKey; label: string; sub: string }[] = [
   { key: 'model', label: '模型默认', sub: '全局默认值；模型容量探测不到时回落到这里' },
@@ -28,6 +31,13 @@ const TABS: { key: TabKey; label: string; sub: string }[] = [
   // 改价只影响**此后**的用量：历史费用在落库时已按当时的价固化，
   // 所以这里改的是「往后怎么算」，不是「重算历史」。
   { key: 'price', label: '模型价格', sub: '按供应商 × 模型配置单价；改价只对之后的用量生效，不改写历史费用' },
+  // 修改密码（2026-10-13 从「钱包与充值」页挪来）。
+  //
+  // 改密与钱无关，放在钱包页只是因为那里是普通用户唯一的自助页面 ——
+  // 于是用户要改密码得先"想起来"它在钱包里。设置页才是它该在的地方。
+  //
+  // 位置在导入导出**之前**：导入导出是低频的运维动作，改密比它常用。
+  { key: 'password', label: '修改密码', sub: '修改当前登录账号的密码；成功后需要重新登录' },
   {
     key: 'transfer',
     label: '导入导出',
@@ -37,6 +47,62 @@ const TABS: { key: TabKey; label: string; sub: string }[] = [
 const tab = ref<TabKey>('model')
 
 const tabSub = computed(() => TABS.find((t) => t.key === tab.value)?.sub ?? '')
+
+// ---------- 修改密码 ----------
+//
+// 2026-10-13 从「钱包与充值」页挪来。改密与钱无关，放在钱包页只是因为
+// 那里是普通用户唯一的自助页面 —— 于是用户要改密码得先"想起来"它在钱包里。
+//
+// 与 UsersGroups 里管理员「重置他人密码」是**两件事**：这里改的是
+// 当前登录者自己的密码，且需要旧密码；那边是管理员强制设置，不需要旧的。
+// 两者共用的只有强度校验（password.ts 的同一份实现）。
+const router = useRouter()
+const oldPwd = ref('')
+const newPwd = ref('')
+const confirmPwd = ref('')
+const pwdBusy = ref(false)
+const pwdErr = ref('')
+const newPwdErr = ref('')
+
+// 强度门槛与后端 userauth.ValidatePassword 同一套（见 password.ts）。
+// 刻意与后端保持一致但**不替代**它：前端只是提前告知，真正的强度判断
+// 必须在服务端做（绕过前端直接打接口是常态）。
+function checkStrength(p: string) {
+  return checkPasswordStrength(p)
+}
+
+async function submitPwd() {
+  if (pwdBusy.value) return
+  pwdErr.value = ''
+  newPwdErr.value = checkStrength(newPwd.value)
+  if (newPwdErr.value) return
+  if (newPwd.value !== confirmPwd.value) {
+    pwdErr.value = '两次输入的新密码不一致'
+    return
+  }
+  pwdBusy.value = true
+  try {
+    await api.changeMyPassword(oldPwd.value, newPwd.value)
+    // 后端在此递增了 auth_version，**当前这个会话已经失效**（ChangePassword
+    // 还顺手清了会话 cookie）。延迟跳转的那段时间里界面还在、任何点击都会打到
+    // 一个必然 401 的接口上；所以立刻清掉本地会话并跳登录页 ——
+    // 改密成功与「需要重新登录」是同一件事，不该拆成两步。
+    //
+    // 不调 logout()：那个端点也会（按用户）递增 auth_version 并清 cookie，
+    // 而我们已经处在「会话已失效」的状态下，再发一请求只会拿到 401，
+    // 还会在 api.ts 的 401 分支里再清一次令牌。本地 saveToken('') 就够了。
+    saveToken('')
+    session.me = null
+    toast('密码已更新，请用新密码重新登录', 'ok')
+    oldPwd.value = newPwd.value = confirmPwd.value = ''
+    // redirect 指回设置页：重新登录后回到这里，而不是被丢到总览再自己找回来。
+    await router.replace({ name: 'login', query: { redirect: '/settings' } })
+  } catch (e) {
+    pwdErr.value = e instanceof ApiFail ? e.message : '改密失败'
+  } finally {
+    pwdBusy.value = false
+  }
+}
 
 // ---------- 导入 / 导出 ----------
 //
@@ -581,18 +647,9 @@ onMounted(() => {
     </div>
 
     <!-- 分类页签：设置项按类别分页，避免一页塞满互不相干的表单 -->
-    <div class="set-tabs">
-      <button
-        v-for="t in TABS"
-        :key="t.key"
-        class="set-tab"
-        :class="{ active: tab === t.key }"
-        type="button"
-        @click="tab = t.key"
-      >
-        {{ t.label }}
-      </button>
-    </div>
+    <!-- 页签改用共享 Tabs（2026-10-12）：原先是 .set-tabs + 手写 v-for，
+         与 Wallet / UsersGroups 各写一份。 -->
+    <Tabs v-model="tab" :tabs="TABS" aria-label="设置分区" />
 
     <!-- 分类 1：模型默认 -->
     <div v-if="tab === 'model'" class="panel">
@@ -846,6 +903,35 @@ onMounted(() => {
       </div>
     </div>
 
+    <!-- 修改密码（2026-10-13 从「钱包与充值」页挪来）。
+         必须在模型价格那个「兜底 v-else」之前，否则永远轮不到它。 -->
+    <div v-else-if="tab === 'password'" class="panel">
+      <div class="panel-title">
+        修改密码
+        <span class="hint">修改后当前登录状态会立即失效，需要用新密码重新登录</span>
+      </div>
+      <form class="form" style="max-width: 420px" @submit.prevent="submitPwd">
+        <label class="flabel" for="op">当前密码</label>
+        <input id="op" v-model="oldPwd" type="password" class="input" autocomplete="current-password" />
+
+        <label class="flabel" for="np">新密码</label>
+        <input id="np" v-model="newPwd" type="password" class="input" autocomplete="new-password" />
+        <!-- 强度提示在提交前就给出：等后端 400 再说一次，用户已经白填了一遍。
+             但前端提示只作提前告知，真正的判定仍在服务端（见 checkStrength）。 -->
+        <div v-if="checkStrength(newPwd)" class="fhint warn">{{ checkStrength(newPwd) }}</div>
+        <div v-else-if="newPwd" class="fhint ok">强度符合要求</div>
+
+        <label class="flabel" for="cp">确认新密码</label>
+        <input id="cp" v-model="confirmPwd" type="password" class="input" autocomplete="new-password" />
+
+        <div v-if="pwdErr" class="fhint err">{{ pwdErr }}</div>
+
+        <button class="btn btn-primary" type="submit" :disabled="pwdBusy">
+          {{ pwdBusy ? '提交中…' : '修改密码' }}
+        </button>
+      </form>
+    </div>
+
     <!-- 分类 4：模型价格（兜底分支 v-else，页签顺序见 TABS） -->
     <div v-else class="panel">
       <div class="price-head">
@@ -1070,39 +1156,6 @@ onMounted(() => {
 }
 .prune-result b {
   font-variant-numeric: tabular-nums;
-}
-
-/* 分类页签：形态对齐顶栏 .tabs（胶囊分段），选中态用 segment 底色 */
-.set-tabs {
-  display: flex;
-  gap: 2px;
-  width: max-content;
-  padding: 3px;
-  margin-bottom: 14px;
-  border-radius: var(--r-pill);
-  background: var(--default);
-}
-.set-tab {
-  padding: 6px 16px;
-  border: none;
-  border-radius: var(--r-pill);
-  background: transparent;
-  font-size: 13px;
-  font-weight: 500;
-  color: var(--muted);
-  cursor: pointer;
-  white-space: nowrap;
-  transition:
-    color 0.2s var(--ease-out-quart),
-    background 0.25s var(--ease-spring);
-}
-.set-tab:hover {
-  color: var(--foreground);
-}
-.set-tab.active {
-  color: var(--segment-foreground);
-  background: var(--segment);
-  box-shadow: var(--field-shadow);
 }
 
 /* 价格分类：标题行 + 筛选行 */

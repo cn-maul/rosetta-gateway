@@ -582,6 +582,126 @@ func TestLogin_NoUserEnumeration(t *testing.T) {
 	}
 }
 
+// loginThrottled 用某个用户名连打若干次错密码，返回最后一次的 (code, msg)。
+func loginThrottled(t *testing.T, h *UserHandler, username string, times int, remoteAddr string) (int, string) {
+	t.Helper()
+	code, msg := 0, ""
+	for i := 0; i < times; i++ {
+		rec := httptest.NewRecorder()
+		req := jsonRequest(http.MethodPost, "/admin/api/login",
+			strings.NewReader(`{"username":"`+username+`","password":"wrong-password"}`))
+		// ClientIPOf 只读 RemoteAddr，所以换 IP 就是换这个值。
+		req.RemoteAddr = remoteAddr
+		h.Login(rec, req)
+		code, msg = rec.Code, ""
+		var r map[string]any
+		_ = json.Unmarshal(rec.Body.Bytes(), &r)
+		if e, _ := r["error"].(map[string]any); e != nil {
+			msg, _ = e["message"].(string)
+		}
+	}
+	return code, msg
+}
+
+// 登录限速必须有**账号维度**，否则换 IP 打同一账号就绕过了（2026-10-12，修 P1-5）。
+//
+// 旧实现只有 IP 维度（10 次/分钟/IP）。NAT 池、云主机、代理池都提供多出口 IP，
+// 攻击者每个 IP 有独立额度，爆破强度被放大成「10 × 出口 IP 数」次/分钟 ——
+// 而 PBKDF2 210k 迭代只能把单次尝试拖慢几十毫秒，撑不住这个量级的并行爆破。
+//
+// 本测试钉的就是那条绕过路径：**每个请求换一个 IP**，账号维度必须照样拦下。
+func TestLogin_AccountDimensionThrottle_BlocksCrossIPBruteforce(t *testing.T) {
+	st := newScopeStore(t)
+	seedTwoUsers(t, st)
+	mgr := newTestManager(t)
+	h := NewUserHandler(st, mgr)
+
+	// 打满账号维度阈值（5 次），每次都换 IP —— IP 维度形同虚设。
+	const attempts = loginAccountFailLimit + 2
+	for i := 0; i < attempts; i++ {
+		code, msg := loginThrottled(t, h, "alice", 1, fmt.Sprintf("10.0.0.%d:1234", i+1))
+		if i < loginAccountFailLimit {
+			if code != http.StatusUnauthorized {
+				t.Fatalf("第 %d 次错密码应是 401，得到 %d（%s）", i+1, code, msg)
+			}
+			continue
+		}
+		// 超过账号维度阈值：即使每个请求来自不同 IP，也必须 429。
+		if code != http.StatusTooManyRequests {
+			t.Fatalf("★ 换 IP 打同一账号（第 %d 次）应被账号维度限速拦下（429），得到 %d（%s）\n"+
+				"  这正是 P1-5：只有 IP 维度时限速会被多出口 IP 绕过", i+1, code, msg)
+		}
+	}
+}
+
+// 账号维度限速**不该**跨账号传染：打 A 账号打满，不得连累 B 账号。
+//
+// 这一格守住的是「限速键是用户名而不是全局计数」——后者会让一个账号被爆破
+// 时，所有其他账号一起吃 429，等于把防护变成自伤式 DoS。
+func TestLogin_AccountDimensionThrottle_DoesNotBleedAcrossAccounts(t *testing.T) {
+	st := newScopeStore(t)
+	seedTwoUsers(t, st)
+	mgr := newTestManager(t)
+	h := NewUserHandler(st, mgr)
+
+	// 把 alice 的账号维度打满。
+	_, _ = loginThrottled(t, h, "alice", loginAccountFailLimit+2, "10.0.0.1:1234")
+
+	// bob 必须还能正常尝试（错密码 → 401，而不是 429）。
+	code, msg := loginThrottled(t, h, "bob", 1, "10.0.0.2:1234")
+	if code != http.StatusUnauthorized {
+		t.Fatalf("打满 alice 不该连累 bob：得到 %d（%s），期望 401", code, msg)
+	}
+}
+
+// 正确登录必须清零账号维度额度，否则累积的偶发错输会把合法用户永久卡住。
+//
+// 账号维度不换 IP 就躲不掉（这正是它存在的理由），所以「成功即清零」不是
+// 锦上添花，而是这道闸能否上线的前提 —— 否则正常使用一天输错 5 次
+// 就会被锁一分钟，且每次解锁后又从头累计。
+//
+// 不能用 seedTwoUsers（它的 PasswordHash 是假值 "x"，永远登录不上），
+// 这里自建一个带真实哈希的用户。
+func TestLogin_AccountDimensionThrottle_ClearedBySuccess(t *testing.T) {
+	st := newScopeStore(t)
+	ctx := context.Background()
+	// 用户名与 seedTwoUsers 错开：账号维度的计数是按用户名归键的，
+	// 共用名字会让本测试的结果被其他测试的残留额度污染。
+	const user, pass = "carol", "correct-horse-battery"
+	hash, err := userauth.HashPassword(pass)
+	if err != nil {
+		t.Fatalf("hash: %v", err)
+	}
+	if err := st.CreateUser(ctx, &store.User{
+		ID: "u9", Username: user, PasswordHash: hash,
+		Role: store.RoleUser, Status: store.UserStatusActive, AuthVersion: 1,
+	}); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	mgr := newTestManager(t)
+	h := NewUserHandler(st, mgr)
+
+	// 先输错 4 次（差一次就进冷却）。
+	_, _ = loginThrottled(t, h, user, loginAccountFailLimit-1, "10.0.0.1:1234")
+
+	// 用正确密码登录 —— 应当成功并清零额度。
+	rec := httptest.NewRecorder()
+	req := jsonRequest(http.MethodPost, "/admin/api/login",
+		strings.NewReader(`{"username":"`+user+`","password":"`+pass+`"}`))
+	req.RemoteAddr = "10.0.0.1:1234"
+	h.Login(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("正确登录应成功，得到 %d：%s", rec.Code, rec.Body.String())
+	}
+
+	// 清零后再错 4 次，仍不该 429（额度已重置）。
+	code, msg := loginThrottled(t, h, user, loginAccountFailLimit-1, "10.0.0.1:1234")
+	if code == http.StatusTooManyRequests {
+		t.Fatalf("成功登录未清零账号维度额度：清零后再错 %d 次就 429（%s）\n"+
+			"  合法用户会被累积的偶发错输永久卡住", loginAccountFailLimit-1, msg)
+	}
+}
+
 func newTestManager(t *testing.T) *userauth.Manager {
 	t.Helper()
 	t.Setenv(userauth.SecretEnvName, "test-secret-that-is-at-least-32-characters-long")

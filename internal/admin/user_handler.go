@@ -42,7 +42,38 @@ type UserHandler struct {
 	// 不用另一个 mu：pwThr 只在 ChangePassword 里用，那是低频端点，
 	// 但仍可能并发（前端重复提交），故复用同一把mu 取惰性初始化。
 	pwThr *server.FailureThrottle
+	// loginThr 是登录的**账号维度**限速器，按「用户名」归键（2026-10-12，
+	// 修 P1-5）。
+	//
+	// 为什么 IP 维度不够：thr 只按 ClientIPOf 归键，而 NAT 池、云主机、
+	// 代理池都提供**多出口 IP**。攻击者换着 IP 打同一个 admin 账号，
+	// 每个 IP 都有独立的 10 次/分钟额度，等于把爆破强度放大成
+	// 「10 × 出口 IP 数」次/分钟 —— 远超 PBKDF2 210k 迭代所能拖延的量级。
+	// 账号维度的计数对换 IP 免疫：无论从哪个 IP 打，同一个用户名共享额度。
+	//
+	// 为什么按**用户名**而不是用户 ID：限速必须在查库**之前**生效（见 Login
+	// 里 `th.Allow(ip)` 的位置 —— 那时还没有 u，也就没有 ID）。用户名是
+	// 攻击者唯一能控制的输入，正适合当键。
+	//
+	// 阈值刻意**低于** IP 维度（见 loginAccountFailLimit）：这一维的误伤面
+	// 比 IP 维度大 —— 同事共用一个账号、或有人手滑反复输错，都会命中它。
+	// 给低阈值是为了让它只拦「明显在爆破」的模式，而把日常的偶发错输
+	// 留给 IP 维度去宽容。
+	//
+	// 成功登录才清零（Success 而非仅 Fail 计数）：这样合法用户输错几次后
+	// 仍能靠一次正确登录把额度还回来，不会因为累积的错输被永久卡住。
+	loginThr *server.FailureThrottle
 }
+
+// loginAccountFailLimit / loginAccountCooldown 是账号维度限速的阈值。
+//
+// 刻意比 IP 维度（server.LoginFailLimit = 10）严：这一维直接锁「某一个
+// 账号」，是挡住「换 IP 打同一账号」的最后一道闸，宽松就失去意义。
+// 5 次足以拦下脚本化爆破，同时给「连续手滑」留了余量。
+const (
+	loginAccountFailLimit = 5
+	loginAccountCooldown  = time.Minute
+)
 
 // passwordChangeThrottleLimit / Cooldown：改密的失败阈值与冷却。
 //
@@ -153,14 +184,44 @@ func (h *UserHandler) Login(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// 限速：连续失败进冷却。这是拖慢暴力破解，不替代它。
+	//
+	// 两道闸，各自独立判定、独立计数（2026-10-12，修 P1-5）：
+	//   - IP 维度（thr）：挡住「一个 IP 撞很多账号」的枚举与爆破；
+	//   - 账号维度（loginThr）：挡住「很多 IP 打同一个账号」——NAT 池 /
+	//     云主机 / 代理池下，IP 维度的额度会被放大成 10 × 出口 IP 数，
+	//     远超 PBKDF2 能拖延的量级。详见 UserHandler.loginThr 的注释。
+	//
+	// 任一不过即 429。两边都 Allow 才继续，且两边都要 Release 归还并发额度。
 	th := h.throttle()
+	accThr := h.accountThrottle()
+	ip := server.ClientIPOf(r)
+	if th != nil && !th.Allow(ip) {
+		writeTooMany(w, th.RetryAfter(ip))
+		return
+	}
 	if th != nil {
-		ip := server.ClientIPOf(r)
-		if !th.Allow(ip) {
-			writeTooMany(w, th.RetryAfter(ip))
-			return
-		}
 		defer th.Release(ip)
+	}
+	// 用户名已 trim，与下面查库用的是同一个值 —— 两处必须一致，
+	// 否则「限速键」与「实际登录的账号」会分叉（带空格的用户名
+	// 限速算在 A 头上、登录却落到 B）。
+	if accThr != nil && !accThr.Allow(username) {
+		writeTooMany(w, accThr.RetryAfter(username))
+		return
+	}
+	if accThr != nil {
+		defer accThr.Release(username)
+	}
+
+	// failBoth 同时记两道闸的失败。所有「没登进去」的分支都必须走它 ——
+	// 只记 IP 会让换 IP 爆破完全绕过账号维度。
+	failBoth := func() {
+		if th != nil {
+			th.Fail(ip)
+		}
+		if accThr != nil {
+			accThr.Fail(username)
+		}
 	}
 
 	u, err := h.store.GetUserByUsername(r.Context(), username)
@@ -188,9 +249,7 @@ func (h *UserHandler) Login(w http.ResponseWriter, r *http.Request) {
 	// 「密码错误」而非引导指引 —— 但那种账号本来就该由管理员重置密码，
 	// 不该让本人自助设密（否则绕过管理员）。
 	if u != nil && u.PasswordHash == "" && u.Role == store.RoleAdmin {
-		if th != nil {
-			th.Fail(server.ClientIPOf(r))
-		}
+		failBoth()
 		writeError(w, http.StatusBadRequest,
 			"该账号尚未设置密码。若是首次部署，请通过登录页的「首次设置密码」表单完成；"+
 				"若管理员已重置过密码，请用新密码登录")
@@ -208,16 +267,12 @@ func (h *UserHandler) Login(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if !ok {
-		if th != nil {
-			th.Fail(server.ClientIPOf(r))
-		}
+		failBoth()
 		writeError(w, http.StatusUnauthorized, "用户名或密码错误")
 		return
 	}
 	if !u.IsActive() {
-		if th != nil {
-			th.Fail(server.ClientIPOf(r))
-		}
+		failBoth()
 		writeError(w, http.StatusForbidden, "账号已被禁用，请联系管理员")
 		return
 	}
@@ -232,6 +287,11 @@ func (h *UserHandler) Login(w http.ResponseWriter, r *http.Request) {
 
 	if th != nil {
 		th.Success(server.ClientIPOf(r))
+	}
+	// 账号维度同样清零：合法用户输错几次后，靠一次正确登录把额度还回来。
+	// 不清零的话，累积的偶发错输会把他永久卡在冷却里（账号维度不换 IP 就躲不掉）。
+	if accThr != nil {
+		accThr.Success(username)
 	}
 	server.TouchLogin(h.store, r.Context(), u.ID)
 	server.SetSessionCookie(w, token, exp)
@@ -264,6 +324,26 @@ func (h *UserHandler) throttle() *server.FailureThrottle {
 		h.thr = server.NewFailureThrottle(server.LoginFailLimit, server.LoginCooldown)
 	}
 	return h.thr
+}
+
+// accountThrottle 返回登录的**账号维度**限速器（惰性建一次）。
+//
+// 与 throttle 分开建：两者阈值不同（这里更严）、归键不同（用户名 vs IP）、
+// 语义也不同（这里挡「换 IP 打同一账号」，见 loginThr 字段注释）。
+// 共用一个限速器会让「IP 维度被锁」与「账号被锁」混成一坨，
+// 排查时分不清是哪一维在拦。
+//
+// 为什么必须独立于 IP 维度（2026-10-12 修 P1-5）：多出口 IP 的部署下
+// （NAT 池 / 云主机 / 代理池），IP 维度的额度会被放大成
+// 10 × 出口 IP 数 次/分钟 —— 而 PBKDF2 210k 迭代只能把单次尝试拖慢
+// 几十毫秒，撑不住这个量级的并行爆破。账号维度对换 IP 免疫。
+func (h *UserHandler) accountThrottle() *server.FailureThrottle {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.loginThr == nil {
+		h.loginThr = server.NewFailureThrottle(loginAccountFailLimit, loginAccountCooldown)
+	}
+	return h.loginThr
 }
 
 func writeTooMany(w http.ResponseWriter, retryAfter time.Duration) {

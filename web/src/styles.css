@@ -27,6 +27,21 @@
   --ring-offset-width: 2px;
 
   --r-pill: 999px;
+  /* ---------- HeroUI radius 标准档位 ----------
+     2026-10-12：按 packages/styles/themes/shared/theme.css 的
+     --radius-xs … --radius-4xl 补齐（此前只有几个自造的 --r-* 名，
+     与上游对不上，照抄组件样式时每一步都要换算）。
+     全部由 --radius 派生，改一处即整体缩放。 */
+  --radius-xs: calc(var(--radius) * 0.25); /* 2px  */
+  --radius-sm: calc(var(--radius) * 0.5); /* 4px  */
+  --radius-md: calc(var(--radius) * 0.75); /* 6px  —— 徽章 */
+  --radius-lg: calc(var(--radius) * 1); /* 8px  */
+  --radius-xl: calc(var(--radius) * 1.5); /* 12px —— 表单字段 */
+  --radius-2xl: calc(var(--radius) * 2); /* 16px */
+  --radius-3xl: calc(var(--radius) * 3); /* 24px —— 按钮 */
+  --radius-4xl: calc(var(--radius) * 4); /* 32px */
+
+  /* 旧名保留为别名，避免逐个改类名（改的是观感，不是结构）。 */
   --r-chip: calc(var(--radius) * 0.75); /* 6px  —— 徽章 */
   --r-thumb: calc(var(--radius) * 1.5); /* 12px —— 表单字段（HeroUI field-radius） */
   --r-sheet: calc(var(--radius) * 2); /* 16px —— 弹窗 */
@@ -115,10 +130,32 @@
   --hairline: var(--border);
   --accent-link: color-mix(in oklab, var(--accent) 85%, var(--foreground) 15%);
 
-  /* ---------- 动效 ---------- */
-  --ease-spring: cubic-bezier(0.32, 0.72, 0, 1);
-  --ease-out-quart: cubic-bezier(0.165, 0.84, 0.44, 1);
+  /* ---------- 动效 ----------
+     2026-10-12：按 HeroUI 的缓动令牌命名补齐。
+     --ease-out-fluid 是 HeroUI 选中指示器/面板动画的指定曲线
+     （cubic-bezier(0.32, 0.72, 0, 1)）—— 此前这里的 --ease-spring
+     用的是同一个值，但名字是自造的，照抄上游样式时对不上。
+     ease-smooth 在 HeroUI 里就是 `ease`。 */
   --ease-smooth: ease;
+  --ease-out-fluid: cubic-bezier(0.32, 0.72, 0, 1);
+  --ease-out-quad: cubic-bezier(0.25, 0.46, 0.45, 0.94);
+  --ease-out-cubic: cubic-bezier(0.215, 0.61, 0.355, 1);
+  --ease-out-quart: cubic-bezier(0.165, 0.84, 0.44, 1);
+  --ease-in-out-quad: cubic-bezier(0.455, 0.03, 0.515, 0.955);
+  /* 旧名别名 */
+  --ease-spring: var(--ease-out-fluid);
+
+  /* ---------- 交互光标 ----------
+     HeroUI 用 --cursor-interactive / --cursor-disabled 两个令牌，
+     而不是在每条规则里写死 pointer / not-allowed。 */
+  --cursor-interactive: pointer;
+  --cursor-disabled: not-allowed;
+
+  /* ---------- 分隔线层级 ----------
+     HeroUI 分三级：separator / separator-secondary / separator-tertiary。
+     表格的列间线与行间线用的是 tertiary（最淡）那一级。 */
+  --separator-secondary: color-mix(in oklab, var(--surface) 85%, var(--surface-foreground) 15%);
+  --separator-tertiary: color-mix(in oklab, var(--surface) 81%, var(--surface-foreground) 19%);
 
   /* ---------- 字体与布局 ---------- */
   --sans:
@@ -295,6 +332,29 @@ textarea {
 .side-nav::-webkit-scrollbar {
   display: none;
 }
+
+/* 侧栏分组分隔（2026-10-12）：隔开「我的」与「管理」两组入口。
+   只是一条 hairline + 一段极小号标签 —— 分组的语义靠注释讲过，
+   但用户看不见注释，得在界面上真的分出来。
+   收起态（.sep-label 不带时）只剩线，不放文字。 */
+.side-sep {
+  margin: 8px 6px 4px;
+  border-top: 1px solid var(--border);
+  flex-shrink: 0;
+}
+.side-sep.sep-label {
+  padding-top: 8px;
+}
+.side-sep-text {
+  display: block;
+  padding: 0 6px;
+  font-size: 10.5px;
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  color: var(--text-4);
+  text-transform: uppercase;
+}
+
 .side-item {
   display: flex;
   align-items: center;
@@ -387,7 +447,10 @@ textarea {
   height: 56px;
   flex-shrink: 0;
   align-items: center;
-  justify-content: flex-end;
+  /* 标题居左、身份/主题/登出居右：加了 .topbar-title 之后不能再靠
+     flex-end 把整行推到右边，否则标题会和它们挤在一起。
+     margin-left:auto 只作用在第一个右侧元素（.who）上。 */
+  justify-content: flex-start;
   gap: 8px;
   padding: 0 var(--gutter);
   border-bottom: 1px solid transparent;
@@ -410,6 +473,143 @@ textarea {
 /* 导航栏右侧的当前用户标识（多用户模式）。
    用 --muted 而非 --foreground：它是上下文信息不是操作入口，
    不该跟页签抢注意力。窄屏下截断而不是换行，避免把页签挤掉。 */
+/* 顶栏当前页标题（2026-10-12）：页面自己的 h1 会随内容滚走，
+   这里留一个常驻锚点。用与 h1 接近但更小的字号 —— 它是「我在哪」，
+   不是页面主标题，不该和下面的 h1 抢层级。 */
+.topbar-title {
+  font-size: 14.5px;
+  font-weight: 650;
+  letter-spacing: -0.01em;
+  color: var(--foreground);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* ==========================================================================
+   Tabs —— 照 packages/styles/components/tabs.css 移植（2026-10-12）
+
+   上游的形态是「胶囊容器 + 独立滑动指示器」：容器灰底圆角，
+   tab 本身始终透明只改文字色，选中态由 .tabs__indicator 承担
+   （bg-segment + shadow-surface，250ms 过渡位移与宽度）。
+   上一版写成「选中项自己改背景」，做不出指示器滑动，已废弃。
+   ========================================================================== */
+
+/* 根：列表在上、面板在下 */
+.tabs {
+  display: flex;
+  gap: 8px;
+  /* 上下留白（2026-10-13）：页签夹在「上方内容」与「下方面板」之间，
+     没有外边距时三者会贴成一坨 —— 页签看起来像长在上一块里，
+     又和下面的卡片连在一起。
+     下方 14px 与 .panel + .panel 的间距（18px）接近但略小：
+     面板之间的间距表示「同级并列」，页签到它控制的面板是「从属」，
+     稍紧一点正合这个关系。 */
+  margin: 18px 0 14px;
+}
+.tabs[data-orientation='horizontal'] {
+  flex-direction: column;
+}
+
+/* 胶囊容器 —— HeroUI tabs 的识别特征 */
+.tabs__list-container {
+  position: relative;
+  isolation: isolate;
+  width: fit-content;
+  max-width: 100%;
+  background: var(--default);
+  border-radius: min(32px, calc(var(--radius) * 2.5));
+}
+
+/* 滑动指示器：绝对定位、沉在文字之下、250ms 过渡位移与宽度 */
+.tabs__indicator {
+  position: absolute;
+  top: 0;
+  left: 0;
+  height: 100%;
+  border-radius: var(--radius-3xl);
+  background: var(--segment);
+  box-shadow: var(--surface-shadow);
+  z-index: 0;
+  transition-duration: 250ms;
+  transition-property: transform, width;
+  transition-timing-function: var(--ease-out-fluid);
+}
+@media (prefers-reduced-motion: reduce) {
+  .tabs__indicator {
+    transition: none;
+  }
+}
+
+/* 列表 */
+.tabs__list {
+  position: relative;
+  z-index: 1;
+  display: inline-flex;
+  padding: 4px;
+}
+.tabs__list[data-orientation='horizontal'] {
+  flex-direction: row;
+}
+
+/* 单个 tab：始终透明，只改文字色。
+   选中态用 data-selected，与上游 CSS 的选择器写法一致。 */
+.tabs__tab {
+  position: relative;
+  display: flex;
+  height: 32px;
+  width: 100%;
+  align-items: center;
+  justify-content: center;
+  padding: 0 16px;
+  border: 0;
+  border-radius: var(--radius-3xl);
+  background: transparent;
+  color: var(--muted);
+  font-size: 14px;
+  font-weight: 500;
+  text-align: center;
+  white-space: nowrap;
+  cursor: var(--cursor-interactive);
+  outline: none;
+  transition:
+    color 150ms var(--ease-smooth),
+    opacity 150ms var(--ease-smooth);
+}
+@media (prefers-reduced-motion: reduce) {
+  .tabs__tab {
+    transition: none;
+  }
+}
+
+.tabs__tab[data-selected='true'] {
+  color: var(--segment-foreground);
+}
+
+@media (hover: hover) {
+  .tabs__tab:not([data-selected='true']):hover {
+    opacity: 0.7;
+  }
+}
+
+.tabs__tab:focus-visible {
+  box-shadow: inset 0 0 0 2px var(--focus);
+}
+
+/* 面板：选中内容区（上游是 p-2 + mt-4） */
+.tabs__panel {
+  margin-top: 12px;
+}
+
+/* 顶栏右侧第一个元素：把整组（身份/主题/登出）推到最右。 */
+.topbar .who,
+.topbar .topbar-title + .who {
+  margin-left: auto;
+}
+
+/* 当前登录者的用户名（顶栏右侧）。
+   从 --muted 改成 --foreground 之外的中性色：这是「我是谁」，属于常驻
+   信息而不是装饰，过淡会让用户在切换账号后认不出自己已切换。 */
 .who {
   font-size: 12.5px;
   color: var(--muted);
@@ -535,6 +735,36 @@ textarea {
   font-size: 12.5px;
 }
 
+/* 表内操作按钮（2026-10-13）。
+
+   比 .btn-sm 再紧一档：操作列常要放 3~4 个按钮（编辑/重置/启停/删除），
+   用 .btn-sm 的 11px 内边距时四个文字按钮会把列撑到放不下，
+   于是要么换行（行高暴涨）要么整表横滚 —— 两个都难看。
+
+   压到 8px 内边距 + 12px 字号后，四个两字按钮约 200px，
+   在正常桌面宽度下能和操作列共处一行。
+   高度 26px 仍大于最小点击区（24px），不影响可点性。 */
+.btn-act {
+  height: 26px;
+  padding: 0 8px;
+  font-size: 12px;
+  gap: 4px;
+}
+
+/* 图标按钮：只有图标、没有文字的操作（2026-10-13）。
+   用于按钮密集的行，把最次要的操作收成图标，给主要操作腾出宽度。
+   必须有 aria-label —— 没有文字便没有可读名称。 */
+.btn-icon {
+  width: 26px;
+  height: 26px;
+  padding: 0;
+  gap: 0;
+}
+.btn-icon svg {
+  width: 14px;
+  height: 14px;
+}
+
 /* ---------- 面板与卡片 ---------- */
 .panel {
   background: var(--surface);
@@ -542,6 +772,70 @@ textarea {
   box-shadow: var(--sh-panel);
   padding: 20px 22px;
 }
+
+/* ==========================================================================
+   Card —— 照 packages/styles/components/card.css 移植（2026-10-12）
+
+   上游的 card 是**带 slot 结构**的：header / title / description /
+   content / footer 各自是一个元素，而不是一个装一切的盒子。
+   圆角用 min(32px, --radius-3xl)，比 panel 更圆 —— 这是 HeroUI
+   card 与 surface 的视觉区分点。
+
+   .panel 继续保留（10 个页面在用），.card 用于需要「标题 + 描述 + 内容」
+   这种结构化表达的新位置，两者不互相替换。
+   ========================================================================== */
+.card {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  padding: 16px;
+  background: var(--surface);
+  box-shadow: var(--surface-shadow);
+  border-radius: min(32px, var(--radius-3xl));
+}
+.card__header {
+  display: flex;
+  flex-direction: column;
+}
+.card__title {
+  font-size: 14px;
+  line-height: 1.5;
+  font-weight: 500;
+  color: var(--foreground);
+}
+.card__description {
+  font-size: 14px;
+  line-height: 1.45;
+  color: var(--muted);
+}
+.card__content {
+  display: flex;
+  flex: 1;
+  flex-direction: column;
+  gap: 4px;
+}
+.card__footer {
+  display: flex;
+  flex-direction: row;
+  align-items: center;
+}
+/* 变体：与上游一致，四级表面 + transparent */
+.card--transparent {
+  border: 0;
+  background: transparent;
+  box-shadow: none;
+}
+.card--default {
+  background: var(--surface);
+}
+.card--secondary {
+  background: var(--surface-secondary);
+}
+.card--tertiary {
+  background: var(--surface-tertiary);
+}
+
 .panel + .panel {
   margin-top: 18px;
 }
@@ -562,44 +856,61 @@ textarea {
 }
 
 /* 总览 stat 卡网格 */
+/* ---------- 数据 stat 卡片网格 ----------
+
+   列数是**按卡片数量**定的，不是随手挑的（2026-10-12）。
+
+   总览有 10 张卡。5 列 → 正好 5×2 铺满，最后一行不剩孤儿。
+   此前是 3 列 → 10 = 3+3+3+1，「错误数」孤零零挂在第 4 行最左，
+   读起来像被单独强调，而它只是其中一项。
+
+   5 列还修好了一处「意图与实现错位」：Overview.vue 的注释写明
+   「费用与余额放在一起是刻意的 —— 它们是同一件事的两面（花了多少 /
+   还剩多少）」。3 列时费用是第 3 张（第 1 行最右）、余额是第 4 张
+   （第 2 行最左），落在**对角线上**根本没挨着 —— 那个意图只在
+   ≤640px（2 列）时才成立，桌面端恰恰失效。
+   5 列下费用居第 3、余额居第 4，同一行相邻，意图才真的落地。
+
+   卡片宽度也从 ~380px 降到 ~220px，密度更合理。 */
 .stat-grid {
   display: grid;
-  grid-template-columns: repeat(3, minmax(0, 1fr));
+  grid-template-columns: repeat(5, minmax(0, 1fr));
   gap: 14px;
   margin-bottom: 18px;
 }
-.stat-card {
-  background: var(--surface);
-  border-radius: var(--r-card);
-  box-shadow: var(--sh-card);
-  padding: 16px 18px;
-  min-width: 0;
-}
-.stat-card .k {
+/* 统计卡：结构已改用 HeroUI 的 .card（header/title/content/description），
+   这里只保留**数值排版**，其余交给 .card。
+
+   为什么数值要单独定义：HeroUI 的 card__title / card__description 都是
+   14px 正文级别，而统计卡的数值必须是 24px 大数字 —— 它是这一屏唯一
+   被读的东西，标题反而是配角。故用 .stat-v 覆盖字号。 */
+.stat-card .card__title {
   font-size: 12px;
   color: var(--muted);
-  margin-bottom: 4px;
+  font-weight: 500;
 }
-/* 卡片内的第二行说明（如余额卡下方的「含 x 待结算」）。
-   复用 .k 的样式但压小一号：它不是又一个指标标题，
-   而是主指标数字的补充说明 —— 视觉权重必须低于上面那个数字。 */
-.stat-card .k.sub {
-  font-size: 11px;
-  margin: 4px 0 0;
-}
-.stat-card .v {
+/* 数值：大字号 + tabular-nums（等宽数字，刷新时不跳动）。 */
+.stat-v {
   font-size: 24px;
   font-weight: 700;
   letter-spacing: -0.02em;
   line-height: 1.15;
+  color: var(--foreground);
 }
-.stat-card .v small {
+.stat-v small {
   font-size: 13px;
   font-weight: 550;
   color: var(--muted);
   margin-left: 3px;
 }
-.stat-card.is-err .v {
+/* 卡片下方的次级说明（如「含 x 待结算」）：比数值小一号，
+   视觉权重必须明显低于主数字。 */
+.stat-sub {
+  font-size: 11px;
+  margin-top: 4px;
+  color: var(--text-4);
+}
+.stat-card.is-err .stat-v {
   color: var(--warning-soft-foreground);
 }
 
@@ -677,6 +988,66 @@ textarea {
 .badge-accent {
   background: var(--accent-soft);
   color: var(--accent-soft-foreground);
+}
+
+/* ---------- 调用状态徽章（2026-10-13）----------
+
+   此前「截断 / 超限 / 失败」三种异常共用 badge-err（warning-soft），
+   而 warning-soft 是 15% 浓度的暖橙 —— 在浅色底上几乎看不出颜色，
+   实际观感就是灰的，于是「失败」和「已取消」长得一样，
+   用户得逐行读文字才知道出了什么事。
+
+   现在每种状态一个独立配色，且**浓度提到 22%**：soft 色的意义是
+   「不抢主内容」，但状态徽章本身就是这行最该被看到的信息，
+   淡到认不出颜色就失去作用了。
+
+   语义分层（与 fmt.statusBadge 的注释同一套判断）：
+     - 正常   绿  —— 无事
+     - 失败   红  —— 出错了，要看日志
+     - 超限   红（深）—— 请求超出模型上限，是配置问题而非故障
+     - 截断   橙  —— 生成被中断，结果不完整
+     - 已取消 灰  —— 客户端主动断开，既不是网关的错也不是上游的错，
+                     统计里同样不计入错误率；给它暖色会让
+                     「用户关了个页面」看起来像线上故障。 */
+.badge-st-ok {
+  background: color-mix(in oklab, var(--success) 22%, transparent);
+  color: color-mix(in oklab, var(--success) 78%, var(--foreground) 22%);
+}
+.badge-st-error {
+  background: color-mix(in oklab, var(--danger) 22%, transparent);
+  color: color-mix(in oklab, var(--danger) 78%, var(--foreground) 22%);
+}
+.badge-st-overflow {
+  background: color-mix(in oklab, var(--danger) 34%, transparent);
+  color: color-mix(in oklab, var(--danger) 82%, var(--foreground) 18%);
+}
+.badge-st-truncated {
+  background: color-mix(in oklab, var(--warning) 30%, transparent);
+  color: color-mix(in oklab, var(--warning) 76%, var(--foreground) 24%);
+}
+.badge-st-canceled {
+  background: var(--default);
+  color: var(--muted);
+}
+/* 暗色模式下 soft 底会偏暗，需提高文字色与底的对比 ——
+   否则「失败」和「已取消」在深色界面上又会糊成一片。 */
+[data-theme='dark'] .badge-st-ok,
+[data-theme='dark'] .badge-st-error,
+[data-theme='dark'] .badge-st-overflow,
+[data-theme='dark'] .badge-st-truncated {
+  font-weight: 600;
+}
+[data-theme='dark'] .badge-st-ok {
+  color: color-mix(in oklab, var(--success) 62%, var(--snow) 38%);
+}
+[data-theme='dark'] .badge-st-error {
+  color: color-mix(in oklab, var(--danger) 62%, var(--snow) 38%);
+}
+[data-theme='dark'] .badge-st-overflow {
+  color: color-mix(in oklab, var(--danger) 68%, var(--snow) 32%);
+}
+[data-theme='dark'] .badge-st-truncated {
+  color: color-mix(in oklab, var(--warning) 64%, var(--snow) 36%);
 }
 
 /* 开关（启停）：HeroUI 开关选中态用强调色 */
@@ -1050,6 +1421,61 @@ textarea {
    新账号第一次打开总览是一屏 0，且三条最该做的事都没有被主动指出。
    放在 .notice-warn 里复用既有的告警视觉 —— 它确实是一条「你需要注意的事」，
    而不是一个新的组件类别。 */
+/* 「现在能调用吗」状态行（2026-10-12）。
+
+   放在统计卡**之上**：它是这一屏的结论，卡片是支撑结论的细节。
+   先给结论再看数字，与「余额必须独占一屏」是同一个理由 ——
+   用户是带着「能不能用」这个问题进来的，不是来欣赏 10 个指标的。
+
+   三种态用 HeroUI 的 soft 色系（success / warning / danger），
+   不用实心色：这是一条常驻说明，实心块会压过下面的数据卡片。 */
+.call-readiness {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin: 0 0 16px;
+  padding: 12px 16px;
+  border: 1px solid var(--border);
+  border-radius: min(32px, calc(var(--radius) * 2.5));
+  background: var(--surface);
+}
+.call-readiness .cr-dot {
+  flex: none;
+  width: 8px;
+  height: 8px;
+  border-radius: var(--r-pill);
+  background: var(--success);
+}
+.call-readiness.is-warn .cr-dot {
+  background: var(--warning);
+}
+.call-readiness.is-blocked .cr-dot {
+  background: var(--danger);
+}
+.call-readiness.is-blocked {
+  background: var(--danger-soft);
+  border-color: color-mix(in oklab, var(--danger) 30%, transparent);
+}
+.call-readiness.is-warn {
+  background: var(--warning-soft);
+  border-color: color-mix(in oklab, var(--warning) 30%, transparent);
+}
+.call-readiness .cr-body {
+  flex: 1;
+  min-width: 0;
+}
+.call-readiness .cr-title {
+  font-size: 13.5px;
+  font-weight: 600;
+  color: var(--foreground);
+}
+.call-readiness .cr-detail {
+  margin-top: 2px;
+  font-size: 12px;
+  line-height: 1.5;
+  color: var(--muted);
+}
+
 .first-use {
   margin: 0 0 16px;
 }
@@ -1159,10 +1585,15 @@ textarea {
 }
 
 /* ---------- 响应式 ---------- */
-@media (max-width: 900px) {
+@media (max-width: 1100px) {
+  /* 5 列在窄屏会挤成 ~160px，数字（尤其 Tokens 那种长串）会折行。
+     降成 3 列：10 = 3+3+3+1 又会出现孤儿，但此时是「小屏优先读全」
+     的取舍 —— 且孤儿卡恰好是错误数，它在窄屏也确实值得单独一行。 */
   .stat-grid {
-    grid-template-columns: repeat(3, 1fr);
+    grid-template-columns: repeat(3, minmax(0, 1fr));
   }
+}
+@media (max-width: 900px) {
   .expand-grid {
     grid-template-columns: 1fr;
   }
@@ -1302,24 +1733,127 @@ textarea {
    （cell-user / cell-key / c-time 等）留在各自视图 —— 改表格观感只改这里。
    末行去边线用 tbody:last-of-type：Providers 是多 tbody（展开行）结构，
    简单的 tbody tr:last-child 会把分组之间的分隔线也一并吃掉。 */
-.tbl-wrap { overflow-x: auto; }
-.tbl { width: 100%; border-collapse: collapse; font-size: 13px; }
+/* ==========================================================================
+   Table —— 2026-10-12 按 packages/styles/components/table.css 的关键手法改写
+
+   三处与上游对齐的要点：
+
+   1. `border-separate` + `border-spacing-0`，而不是 `border-collapse`。
+      上游明确用 border-separate，因为**行首/行末单元格要各自带圆角**
+      —— border-collapse 下 <tr> 上的 border-radius 无效。
+
+   2. 背景画在**单元格**上（.table__cell { bg-surface }），不是画在行上。
+      上游注释点明原因：Firefox 会把行背景裁到圆角外，画在 td 才正确。
+      hover 同理作用于 cell（&:hover .table__cell）。
+
+   3. 列间用一条**短竖线**（th::after，h-4 居中），末列不画 —— 这是
+      HeroUI 表格的辨识细节，此前完全没有。
+
+   .tbl / .tbl-wrap 两个旧类名继续保留（10 个页面在用），
+   这里只把它们的**实现**换成上游手法，不改名以免大范围改动模板。
+   ========================================================================== */
+.tbl-wrap {
+  overflow-x: auto;
+  scrollbar-gutter: auto;
+}
+.tbl {
+  width: 100%;
+  border-collapse: separate;
+  border-spacing: 0;
+  font-size: 13px;
+}
+/* 列宽策略：`nowrap` 按列 opt-in（2026-10-12）。
+
+   原先 `.tbl td { white-space: nowrap }` 一刀切：ID、时间、金额这类
+   「必须整段读」的列确实需要，但描述性列（Endpoint、模型名、备注）被
+   一起锁死，于是整张表只能靠 .tbl-wrap 横向滚动 —— 窄屏上变成
+   「要么全不换行、要么整表横滚」的二选一， Providers 的操作列塞了
+   4 个按钮 + 一个 switch 时尤其明显。
+
+   现在：默认允许换行，需要整段读的列加 .c-nowrap（或已有的 .mono / .num-h）。 */
 .tbl th,
-.tbl td { text-align: left; padding: 9px 12px; white-space: nowrap; }
+.tbl td {
+  text-align: left;
+  padding: 9px 12px;
+}
+/* 必须整段读的内容：ID / 时间 / 金额 / 代码串。 */
+.c-nowrap,
+.tbl .mono,
+.tbl .num-h,
+.tbl th {
+  white-space: nowrap;
+}
+
+/* 表头：淡底 + 底部线。背景画在 th 上（Firefox 不吃 thead 背景）。 */
 .tbl thead th {
+  position: relative;
+  background: var(--surface-secondary);
   color: var(--text-3);
   font-weight: 500;
   font-size: 12px;
   border-bottom: 1px solid var(--separator);
 }
-.tbl tbody tr { border-bottom: 1px solid var(--separator); }
-.tbl > tbody:last-of-type > tr:last-child { border-bottom: none; }
-.tbl tbody tr:hover { background: var(--hover); }
+/* 列间短竖线：右边缘、垂直居中、高 16px。末列不画。 */
+.tbl thead th::after {
+  content: '';
+  position: absolute;
+  inset-inline-end: 0;
+  top: 50%;
+  transform: translateY(-50%);
+  width: 1px;
+  height: 16px;
+  border-radius: var(--radius-sm);
+  background: var(--separator);
+  pointer-events: none;
+}
+.tbl thead th:last-child:not(:only-child)::after {
+  content: none;
+}
+
+/* 单元格：背景画在 td 上（见上方要点 2），并用 tertiary 分隔线。 */
+.tbl td {
+  background: var(--surface);
+  border-bottom: 1px solid var(--separator-tertiary);
+}
+.tbl tbody tr:last-child td {
+  border-bottom: 0;
+}
+
+/* 行首/行末单元格带圆角（border-separate 下才生效）。 */
+.tbl tbody tr:first-child td:first-child {
+  border-start-start-radius: min(32px, var(--radius-2xl));
+}
+.tbl tbody tr:first-child td:last-child {
+  border-start-end-radius: min(32px, var(--radius-2xl));
+}
+.tbl tbody tr:last-child td:first-child {
+  border-end-start-radius: min(32px, var(--radius-2xl));
+}
+.tbl tbody tr:last-child td:last-child {
+  border-end-end-radius: min(32px, var(--radius-2xl));
+}
+
+/* hover 作用于 cell，与上游一致。 */
+@media (hover: hover) {
+  .tbl tbody tr:hover td {
+    background: color-mix(in oklab, var(--surface) 40%, var(--hover) 60%);
+  }
+}
 .num-h { text-align: right; }
 /* 操作列不参与等宽分配：按钮多，宽度随内容走。 */
-.c-act { width: 1%; }
+.c-act { width: 1%; text-align: right; white-space: nowrap; }
 .dim { color: var(--text-3); }
 .sub-line { color: var(--text-3); font-size: 12px; margin-top: 2px; }
+/* 行内按钮组：**不换行**（2026-10-13 修正）。
+
+   上一轮这里改成了 wrap，本意是「按钮折行比整表横滚好」，实际效果是
+   操作列一换行就竖着堆叠、行高暴涨、整表被拉长 —— 比横滚难看得多。
+   按钮必须始终成一行。
+
+   「放不下」不靠换行解决，靠两点：
+     1. 操作列 .c-act 用 width:1% + nowrap，尽量按内容收窄；
+     2. 按钮本身压到紧凑尺寸，按钮多的页面用图标按钮替代文字按钮。
+   极窄屏才由 .tbl-wrap 兜底横滚 —— 那是最后手段，不是常态。 */
 .row-actions { display: flex; gap: 6px; flex-wrap: nowrap; align-items: center; }
 /* 表内「名称 + 徽章」单元格：Keys / Providers 曾各抄一份（逐字相同），
    2026-10-07 收敛为这里的一份。名称加粗是因为它是这格的主信息，徽章只是注脚。 */

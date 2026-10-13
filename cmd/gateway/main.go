@@ -639,6 +639,54 @@ func main() {
 		}
 	}()
 
+	// 费用重算循环（2026-10-12 修 P1-2）。
+	//
+	// freezeUsageCost 在读池抖动时会把 usage_state 标成 cost_pending 并记 0 元，
+	// 那个 0 会同时让报表与扣费变成「完全免单」。本循环把它捞回来自动重算，
+	// 于是「一次抖动 = 一笔永久免单」降级为「一次抖动 = 最多 5 分钟的延迟」。
+	//
+	// 周期取 5 分钟而不是并进剪枝的 24 小时：抖动是偶发的，而免单是实时的
+	// —— 每笔待重算记录都在这段时间里被当成 0 元，少收的钱随时间累积。
+	//
+	// 单次上限 500 条 + 「还有剩余就再排一轮」：长期故障（读池持续不可用）
+	// 下待重算队列会增长，无界扫描会把写池占死，反而拖垮正常流量。
+	recomputeDone := make(chan struct{})
+	go func() {
+		defer close(recomputeDone)
+		runRecompute := func(reason string) {
+			// 单轮最多循环 10 批（5000 条），避免长期积压时一轮干太久
+			// 占住写连接。剩下的留给下一轮。
+			for round := 0; round < 10; round++ {
+				fixed, remaining, err := db.RecomputePendingCosts(context.Background(), 500)
+				if err != nil {
+					// 单次失败不终止循环：下个周期重试即可。
+					logger.Error("pending cost recompute failed", "error", err, "trigger", reason)
+					return
+				}
+				if fixed > 0 {
+					logger.Info("recomputed pending usage costs",
+						"trigger", reason, "fixed", fixed, "remaining", remaining)
+				}
+				if !remaining {
+					return
+				}
+			}
+			logger.Warn("pending cost recompute backlog still large after 10 rounds",
+				"trigger", reason, "batch_size", 500)
+		}
+		runRecompute("startup")
+		tk := time.NewTicker(5 * time.Minute)
+		defer tk.Stop()
+		for {
+			select {
+			case <-tk.C:
+				runRecompute("periodic")
+			case <-shutdown:
+				return
+			}
+		}
+	}()
+
 	quit := make(chan os.Signal, 1)
 	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
 	<-quit
@@ -653,6 +701,14 @@ func main() {
 	case <-pruneDone:
 	case <-time.After(5 * time.Second):
 		logger.Warn("usage prune still running at shutdown; exiting anyway")
+	}
+	// 费用重算循环同理：它会往写池写 UPDATE，与 db.Close() 并发同样会拿到
+	// "database is closed"。它的单批上限很小（500 条），正常情况下立刻返回，
+	// 所以给一个更短的上限（2s）—— 不该把关停时间主要花在这里。
+	select {
+	case <-recomputeDone:
+	case <-time.After(2 * time.Second):
+		logger.Warn("cost recompute still running at shutdown; exiting anyway")
 	}
 
 	logger.Info("shutting down...")
@@ -678,7 +734,14 @@ func main() {
 	// 进程一退这批记录就没了 —— 表现为「最后几次调用的用量查不到」。
 	drainCtx, drainCancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer drainCancel()
-	usage.wait(drainCtx)
+	// 返回 false 表示仍有记录没落库成功（flush 反复重试仍失败，
+	// 2026-10-12 修 P1-1）。此时必须**大声报出来**：那是真丢了计费记录，
+	// 而原实现是静默 return，日志上一片祥和、实际最多 50 条用量凭空消失，
+	// 用户因此免单且配额被放宽。
+	if !usage.wait(drainCtx) {
+		logger.Error("usage drain incomplete: records were lost during shutdown",
+			"hint", "check earlier 'usage record lost' errors for request_id")
+	}
 	logger.Info("server stopped")
 }
 
@@ -2612,6 +2675,27 @@ type usageRecorder struct {
 	// 要么看见 closed 后走同步写，**永远不会 panic**。
 	mu     sync.Mutex
 	closed bool
+
+	// flushFailed 记录「上一次整批落库失败」，供 worker 决定要不要回灌
+	//（2026-10-12 修 P1-1）。
+	//
+	// 为什么需要这个标志：flush 失败后要把整批保留下来重试，而不能
+	// 非阻塞地插回有界队列（usageQueueSize=1024）—— 队列满时插回会静默
+	// 丢弃，那正是本次要修的缺陷本身。所以这批留在 worker 手里，
+	// flushFailed 就是「手上还攥着一批待重试」的标记，让关停流程能识别出来。
+	flushFailed bool
+
+	// batchInsert 是批量落库的注入点（2026-10-12 修 P1-1 的配套）。
+	//
+	// 为什么需要：flush 的核心分支是「失败 → 重试 → 降级逐条 → 回灌」，
+	// 而失败的唯一来源是 DB。真实 SQLite 无法在测试里稳定制造 SQLITE_BUSY
+	// （它依赖真实的锁竞争时序），于是这条分支在没有注入点时**永远测不到** ——
+	// 而它恰恰是整个修复的核心。
+	//
+	// nil = 用默认实现（db.CreateUsageRecordsBatched）。仅测试设置。
+	// 单条路径不走这里：降级逐条调用 db.CreateUsageRecordWithCost，
+	// 测试要构造「批量失败但单条成功」的场景正是靠这个不对称。
+	batchInsert func(ctx context.Context, recs []*store.UsageRecord) ([]float64, error)
 }
 
 const (
@@ -2635,6 +2719,19 @@ const (
 	// 而**低负载下队列根本攒不满**，靠 `default` 分支立刻发出，
 	// 所以延迟不受批大小影响 —— 这是选「非阻塞攒批」而非「定时批量」的原因。
 	usageBatchSize = 50
+
+	// usageFlushMaxAttempts 是一批落库的**整批重试**次数（2026-10-12 修 P1-1）。
+	//
+	// 重试针对的是**瞬时**故障：SQLITE_BUSY（写池被剪枝/管理写短暂占住）、
+	// 磁盘瞬时抖动。这类错误重试一两次就能过。持久性故障（磁盘满、库损坏）
+	// 重试多少次都没用 —— 所以次数刻意给得很小，真正兜底的是整批失败后
+	// 的**降级逐条**（见 flush）：把爆炸半径从「整批 50 条」缩到「单条」。
+	//
+	// 退避用固定 20ms，不搞指数：SQLite 的 busy_timeout 已经是 5s，
+	// 走到返回错误说明那次等待已经用尽，再多等意义不大，快点降级更重要。
+	usageFlushMaxAttempts = 3
+	// usageFlushRetryDelay 是整批重试之间的间隔。
+	usageFlushRetryDelay = 20 * time.Millisecond
 )
 
 // ctxBackground 是 context.Background 的短别名。
@@ -2696,12 +2793,43 @@ func (u *usageRecorder) worker() {
 	// 变成 GC 压力（而 GC 压力正是我们想减掉的东西）。
 	batch := make([]*store.UsageRecord, 0, usageBatchSize)
 
+	// stillPending 是**上一轮落库失败、留待重试**的记录（2026-10-12 修 P1-1）。
+	//
+	// 为什么留在 worker 手里而不是插回队列：队列是有界的（usageQueueSize=1024）
+	// 且此刻可能已满，非阻塞插回会在 `default` 分支静默丢弃 —— 那正是本次
+	// 要修的缺陷本身。留在手上则保证「不丢」，代价是这批重试期间不再取新记录，
+	// 让入队端自然背压（record 里的 select 会走 default 同步写）。
+	//
+	// 顺序：上一批重试成功后才继续取新记录，保证「先失败的先落库」。
+	var stillPending []*store.UsageRecord
+
 	for {
+		// 上一轮失败的记录优先重试（仍在 stillPending 里）。
+		if len(stillPending) > 0 {
+			batch = append(batch[:0], stillPending...)
+			stillPending = stillPending[:0]
+			if u.flush(ctxBackground(), batch) {
+				// 全部落库成功，继续取新记录。
+			} else {
+				// 又失败：留到下一轮，且**不再从队列取新记录**，
+				// 免得失败批越攒越多、最终占满整个队列。
+				u.markFlushFailed()
+				time.Sleep(usageFlushRetryDelay)
+				continue
+			}
+		}
+
 		// 取第一条：**阻塞**读。关闭时 channel 被 close，这里返回 !ok，
 		// 冲掉手上这批再退出（关停 drain 的全部意义就是别弄丢已发生的调用）。
 		rec, ok := <-u.queue
 		if !ok {
-			u.flush(ctxBackground(), batch)
+			// 队列已关。仍要冲掉手上的 stillPending —— 那批已经出队过，
+			// 留在这里就真的丢了（关停 drain 的意义正在于此）。
+			if len(stillPending) > 0 {
+				batch = append(batch[:0], stillPending...)
+				stillPending = stillPending[:0]
+				u.flush(ctxBackground(), batch)
+			}
 			return
 		}
 		batch = append(batch, rec)
@@ -2725,7 +2853,15 @@ func (u *usageRecorder) worker() {
 			}
 		}
 
-		u.flush(ctxBackground(), batch)
+		if u.flush(ctxBackground(), batch) {
+			u.clearFlushFailed()
+		} else {
+			// 整批（含降级逐条）仍有失败 → 把整批留作下一轮重试。
+			// 已成功的部分下次会被幂等键挡掉，不会重复计费。
+			stillPending = append(stillPending[:0], batch...)
+			u.markFlushFailed()
+			time.Sleep(usageFlushRetryDelay)
+		}
 		batch = batch[:0]
 	}
 }
@@ -2735,22 +2871,61 @@ func (u *usageRecorder) worker() {
 // 落库是批量的（省提交开销），扣费保持逐条（幂等键逐条不同，聚合风险高
 // —— 见 worker 的注释）。
 //
-// 失败语义：整批落库失败 → store 返回全 0 费用 → **一条都不扣**。
-// 这与单条路径一致，且比「部分扣费」更好：部分扣费会让「报表与余额」
-// 在这一批里出现无法解释的偏差，而用量是**计费依据**，宁缺勿滥。
-func (u *usageRecorder) flush(ctx context.Context, batch []*store.UsageRecord) {
+// # 失败语义（2026-10-12 修 P1-1）
+//
+// 原实现遇错只打一条 ERROR 就 `return` —— 记录**已从队列出队**，不重试、
+// 不落补偿队列，整批最多 50 条用量与扣费静默丢失。后果：这些请求既不入报表、
+// 不计配额、也不扣余额，**用户实际消耗了上游 token 却完全免单**，
+// 且配额被永久放宽。触发只需一次写池故障（SQLITE_BUSY / 磁盘抖动），
+// **不需要攻击者**。
+//
+// 现在分两级处置：
+//
+//  1. **整批重试**（usageFlushMaxAttempts 次，固定退避）——针对瞬时故障；
+//  2. 仍失败则**降级逐条**，把爆炸半径从「整批 50 条」缩到「单条」。
+//
+// 逐条仍失败的那条才真正丢弃，且此时打的是带 request_id 的 ERROR，
+// 至少能在日志里追查到具体是哪次调用漏了账（原来只有一条不含 ID 的批级日志，
+// 事后根本无从对账）。
+//
+// 为什么不干脆永久回灌重试：持久性故障（磁盘满、库损坏）下无限重试会让
+// 队列只进不出、最终把 1024 的容量占满，反而堵死后续所有记录的入队 ——
+// 那是把「丢一批」换成「全丢」。降级逐条 + 单条计数告警是更稳的取舍。
+//
+// 返回值报告「是否全部落库成功」，供 worker 决定要不要把这批插回队头。
+func (u *usageRecorder) flush(ctx context.Context, batch []*store.UsageRecord) bool {
 	if len(batch) == 0 {
-		return
+		return true
 	}
-	costs, err := u.db.CreateUsageRecordsBatched(ctx, batch)
-	if err != nil {
-		u.logger.Error("failed to record usage (batched)", "error", err,
+
+	// 批量写入走注入点（测试可替换；生产为 nil 时用默认实现）。
+	insert := u.batchInsert
+	if insert == nil {
+		insert = u.db.CreateUsageRecordsBatched
+	}
+
+	costs, err := insert(ctx, batch)
+	for attempt := 1; err != nil && attempt < usageFlushMaxAttempts; attempt++ {
+		u.logger.Warn("usage batch flush failed, retrying",
+			"error", err, "attempt", attempt, "max", usageFlushMaxAttempts,
 			"count", len(batch), "key_id", batch[0].AccessKeyID)
-		// 落库失败**不扣费**：账都记不下来时扣钱，等于凭空收了一笔
-		// 无据可查的费用。宁可漏扣（cost_total 侧有 RecomputeCost 事后
-		// 补救）也不做无据收费。
-		return
+		select {
+		case <-ctx.Done():
+			// 关停路径上不该再等退避：直接走降级，把能落的落掉。
+			attempt = usageFlushMaxAttempts
+		case <-time.After(usageFlushRetryDelay):
+		}
+		costs, err = insert(ctx, batch)
 	}
+
+	if err != nil {
+		// 整批仍失败 → 降级逐条。写池是单连接，逐条本就是批量之前的老路径，
+		// 正确性早已被验证；这里只是把它当作**降级手段**而非常规路径。
+		u.logger.Error("usage batch flush failed after retries, degrading to per-record",
+			"error", err, "count", len(batch))
+		return u.flushOneByOne(ctx, batch)
+	}
+
 	for i, rec := range batch {
 		var cost float64
 		if i < len(costs) {
@@ -2758,6 +2933,33 @@ func (u *usageRecorder) flush(ctx context.Context, batch []*store.UsageRecord) {
 		}
 		u.charge(rec, cost)
 	}
+	return true
+}
+
+// flushOneByOne 逐条落库，作为整批失败后的降级路径（2026-10-12 修 P1-1）。
+//
+// 逐条各自独立事务，所以「一条失败」只影响那一条，不再连坐整批 ——
+// 这正是降级要买的保险。
+//
+// 返回值报告**是否全部成功**：有任何一条失败就返回 false，worker 据此
+// 把整批插回队头重试（宁可让已成功的那几条下次被幂等键挡掉，
+// 也不要让失败的那条无声消失）。幂等由 store 的
+// CreateUsageRecordWithCost 保证（request_id 唯一约束），重复落库不会重复计费。
+func (u *usageRecorder) flushOneByOne(ctx context.Context, batch []*store.UsageRecord) bool {
+	allOK := true
+	for _, rec := range batch {
+		cost, err := u.db.CreateUsageRecordWithCost(ctx, rec)
+		if err != nil {
+			allOK = false
+			// 带 request_id —— 原来的批级日志不含它，事后无从对账。
+			u.logger.Error("usage record lost (per-record write also failed)",
+				"error", err, "request_id", rec.RequestID,
+				"key_id", rec.AccessKeyID, "user_id", rec.UserID)
+			continue
+		}
+		u.charge(rec, cost)
+	}
+	return allOK
 }
 
 // charge 对一条**已落库**的用量记录扣余额。cost 是本次落库时固化的费用（元），
@@ -2881,12 +3083,43 @@ func (u *usageRecorder) record(rec *store.UsageRecord) {
 	u.charge(rec, cost)
 }
 
+// markFlushFailed / clearFlushFailed / HasPendingUsage 记录「是否还攥着
+// 一批没落库成功的记录」（2026-10-12 修 P1-1）。
+//
+// 用途有两个：
+//  1. worker 的重试循环据此决定要不要继续 sleep 重试；
+//  2. wait 的调用方（关停流程）据此判断「drain 是否真的干净了」——
+//     原来 flush 失败就静默 return，wait 永远以为排空了，
+//     于是日志上一片祥和、实际丢了最多 50 条计费记录。
+func (u *usageRecorder) markFlushFailed() {
+	u.mu.Lock()
+	u.flushFailed = true
+	u.mu.Unlock()
+}
+
+func (u *usageRecorder) clearFlushFailed() {
+	u.mu.Lock()
+	u.flushFailed = false
+	u.mu.Unlock()
+}
+
+// HasPendingUsage 报告是否还有未落库成功的记录。仅供关停流程与测试。
+func (u *usageRecorder) HasPendingUsage() bool {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	return u.flushFailed
+}
+
 // wait 关闭队列、等 worker 把在途写入全部完成，或 ctx 到期（到期即放弃，
 // 不让一个卡住的 SQLite 写把进程关停拖成无限期）。
 //
 // closed 标志与 close **同处一把锁**：这是 record 判据与 close 动作的配对点。
 // 两者分开就又出现「record 已判完未关闭、close 恰好插进来」的窗口。
-func (u *usageRecorder) wait(ctx context.Context) {
+//
+// 返回值报告「是否真的排空」：false 表示仍有记录未落库（flush 反复失败）。
+// 调用方（main 的关停流程）应当据此打一条 ERROR —— 那是**真丢了计费记录**，
+// 不能像原来那样无声无息。
+func (u *usageRecorder) wait(ctx context.Context) bool {
 	u.mu.Lock()
 	u.closed = true
 	close(u.queue)
@@ -2900,7 +3133,10 @@ func (u *usageRecorder) wait(ctx context.Context) {
 	select {
 	case <-done:
 	case <-ctx.Done():
+		// 超时放弃：可能 worker 还在重试循环里。此时 flushFailed 仍为 true，
+		// 返回 false 让调用方知道「这批没落干净」。
 	}
+	return !u.HasPendingUsage()
 }
 
 func handleListModels(forceShape string) http.HandlerFunc {

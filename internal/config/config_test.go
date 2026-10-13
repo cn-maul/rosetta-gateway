@@ -66,3 +66,39 @@ func itoa(n int) string {
 	}
 	return string(b)
 }
+
+// max_request_body_bytes 必须有上界（2026-10-12 修 P2-18）。
+//
+// 它此前是整张校验表里**唯一** max=0（无上界）的字段。而 inwire 的三条入口
+// （openai-chat / openai-responses / anthropic）都是 io.ReadAll 全量读进内存，
+// MaxBytesReader 是唯一闸门 —— 误配成天文数字（手滑多敲几个 0、把 GB 当 MB）
+// 后，局域网内任意客户端发一个超大 body 就能让单进程网关 OOM。
+//
+// 本测试钉住那道上界：边界内通过、越界被拒。
+func TestMaxRequestBodyBytes_有上界(t *testing.T) {
+	const maxBody = 512 * 1024 * 1024
+	for _, tc := range []struct {
+		name    string
+		bytes   int
+		wantErr bool
+	}{
+		{"默认值(32MiB)", 32 * 1024 * 1024, false},
+		{"恰好等于上界", maxBody, false},
+		{"零(走默认)", 0, false},
+		{"负数", -1, true},
+		{"超出上界一个字节", maxBody + 1, true},
+		{"误配成 1GiB", 1024 * 1024 * 1024, true},
+		{"手滑多敲几个 0(1TiB)", 1 << 40, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			body := []byte(`{"listen":"127.0.0.1:8666","defaults":{"max_request_body_bytes":` + itoa(tc.bytes) + `}}`)
+			_, err := Parse(body)
+			if tc.wantErr && err == nil {
+				t.Fatalf("bytes=%d 应被挡下：无上界时误配会让网关被超大 body 打成 OOM", tc.bytes)
+			}
+			if !tc.wantErr && err != nil {
+				t.Fatalf("bytes=%d 应合法：%v", tc.bytes, err)
+			}
+		})
+	}
+}

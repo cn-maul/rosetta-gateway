@@ -319,8 +319,7 @@ func (s *Store) migrate() error {
 			user_id      TEXT PRIMARY KEY,
 			total_tokens INTEGER NOT NULL DEFAULT 0
 		)`,
-		`DROP TRIGGER IF EXISTS trg_update_used_tokens`,
-		`CREATE TRIGGER trg_update_used_tokens
+		`DROP TRIGGER IF EXISTS trg_update_used_tokens`, `CREATE TRIGGER trg_update_used_tokens
 		 AFTER INSERT ON usage_records
 		 BEGIN
 		   UPDATE access_keys SET used_tokens = used_tokens + NEW.total_tokens WHERE id = NEW.access_key_id;
@@ -404,6 +403,36 @@ func (s *Store) migrate() error {
 			PRIMARY KEY (request_id, user_id)
 		)`,
 		`CREATE INDEX IF NOT EXISTS idx_balance_charges_user ON balance_charges(user_id, ts)`,
+		// balance_pending：欠费用户的**待结算零头**（2026-10-12，修 P1-3）。
+		//
+		// 问题：ChargeBalance 在「余额守卫拦下」时返回 ErrInsufficientBalance，
+		// defer 的 Rollback 会把同一事务里刚累加的 users.balance_remainder
+		// **一并撤销**。而调用方（cmd/gateway 的 usageRecorder.charge）拿到
+		// ErrInsufficientBalance 只记一条 ERROR 就返回、**没有任何重试**
+		// —— 那条「调用方会重试时重新累加」的注释描述的路径并不存在。
+		//
+		// 后果：已欠费用户每次不足一分的零头静默漏收（不扣款、无流水、
+		// 对账查不出）。≥1 分的部分按设计本就不扣，所以真正丢的只是零头，
+		// 但零头会随调用次数线性累积。
+		//
+		// 为什么不直接在欠费分支单独提交 balance_remainder：那样调用方
+		// 若真去重试，同一笔费用会被累加两次。改成独立账本后，零头**幂等**
+		// （主键是 request_id，重复写冲突即忽略），重试也安全。
+		//
+		// 结转：AdjustBalanceWithLedger（充值）时把该用户的待结算零头
+		// 合并进余额，并清空账本 —— 零头本来就是他欠的钱，充值后收掉
+		// 天经地义，且不需要额外的对账流程。
+		//
+		// amount_micros 单位是微元（1 分 = 10000 微元），与
+		// users.balance_remainder 同单位，避免换算歧义。
+		`CREATE TABLE IF NOT EXISTS balance_pending (
+			request_id   TEXT NOT NULL,
+			user_id      TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+			amount_micros INTEGER NOT NULL,
+			ts           INTEGER NOT NULL,
+			PRIMARY KEY (request_id, user_id)
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_balance_pending_user ON balance_pending(user_id)`,
 		// balance_topups：充值流水（管理员给钱），balance_charges 的**反向**一侧。
 		//
 		// 为什么必须有它：充值此前完全没有留痕 —— AdjustBalance 只做一句

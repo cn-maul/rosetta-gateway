@@ -282,6 +282,13 @@ watch(
           </svg>
           <span v-if="!railCollapsed">调用历史</span>
         </RouterLink>
+        <!-- 分组分隔（2026-10-12）：上面 5 项是「我的」，下面是「管全站的」。
+             分类此前只存在于这段注释里 —— 模板上 9 个图标项长得完全一样，
+             管理员看不出哪些是自己的、哪些影响所有人。
+             收起态只留一条 hairline：没有横向空间放文字，但分组边界仍在。 -->
+        <div v-if="isAdmin()" class="side-sep" :class="{ 'sep-label': !railCollapsed }">
+          <span v-if="!railCollapsed" class="side-sep-text">管理</span>
+        </div>
         <template v-if="isAdmin()">
           <RouterLink class="side-item" to="/providers" :title="railCollapsed ? '上游与模型' : undefined">
             <svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
@@ -340,6 +347,12 @@ watch(
 
     <div class="main-col">
       <header class="topbar" :class="{ scrolled }">
+        <!-- 当前页标题（2026-10-12）：页面自己的 <h1> 在 .content 里，
+             一滚就消失了；而 ≤900px 时侧栏收成图标栏，滚到长表格中段
+             既看不到标题也看不到文字导航，用户不知道自己在哪。
+             标题取路由 meta.title，与 router.afterEach 设 document.title
+             的是**同一个来源**，不会两处漂移。 -->
+        <span class="topbar-title">{{ route.meta.title }}</span>
         <span
           v-if="session.me"
           class="who"

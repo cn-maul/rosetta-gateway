@@ -34,6 +34,21 @@ const router = createRouter({
     // 若干跳转（守卫把非 admin 踢回这里、登出后 push 回这里），改路径会让
     // 老书签 404。展示标题改成「钱包与充值」，见下方 meta.title。
     { path: '/profile', name: 'profile', component: () => import('./views/Wallet.vue'), meta: { title: '钱包与充值' } },
+    // /wallet 别名（2026-10-12）：地址栏写着 profile、页面写着「钱包与充值」，
+    // 分享链接或做书签时会困惑。加一条语义正确的路径并让 profile 重定向过去，
+    // 老书签（/profile）与守卫里已有的 name: 'profile' 跳转都不受影响 ——
+    // 重定向是 profile → wallet，而跳转用的是**路由名**而非路径，
+    // 所以「踢回钱包」仍然落在 /wallet 上。
+    {
+      path: '/wallet',
+      name: 'wallet',
+      component: () => import('./views/Wallet.vue'),
+      meta: { title: '钱包与充值' },
+    },
+    {
+      path: '/profile',
+      redirect: { name: 'wallet' },
+    },
     // 以下 admin-only：普通用户既看不到入口，也会被守卫踢走。
     // meta.adminOnly 让导航栏能按 isAdmin() 隐藏它们，守卫负责兜底——
     // 只做前者的话，手输 URL 就能打开。

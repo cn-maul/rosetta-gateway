@@ -253,7 +253,18 @@ func (c *Config) validate() error {
 		{"stream_idle_timeout_ms", c.Defaults.StreamIdleTimeoutMs, 1, maxDurMillis},
 		{"stream_first_token_timeout_ms", c.Defaults.StreamFirstTokenTimeoutMs, 1, maxDurMillis},
 		{"max_retries", c.Defaults.MaxRetries, 0, 0},
-		{"max_request_body_bytes", c.Defaults.MaxRequestBodyBytes, 1, 0},
+		// 上界 512 MiB（2026-10-12 修 P2-18）：这一项此前是全表**唯一**没有
+		// 上界（max=0）的字段，其余时长字段都有 maxDurMillis 兜底。
+		//
+		// 没上界的后果不是「配大了浪费内存」这么轻：inwire 的三条入口
+		//（openai-chat / openai-responses / anthropic）都是 io.ReadAll 全量
+		// 读进内存，MaxBytesReader 是唯一的闸门。误配成 0 以外的巨大值
+		//（比如手滑多敲几个 0，或把 GB 当 MB 填）后，一个带超大 body 的
+		// 请求就能让单进程网关 OOM —— 而这是**局域网内任意客户端**都能触发的。
+		//
+		// 512 MiB 远超任何真实请求（含长上下文与多图 base64），同时把
+		// 「误配成天文数字」挡在门外。要再往上放得改这个常量，属于显式决策。
+		{"max_request_body_bytes", c.Defaults.MaxRequestBodyBytes, 1, 512 * 1024 * 1024},
 		// 熔断阈值过大等于永不熔断，故也加上界（1000 次连续失败足够）。
 		{"failover_max_targets", c.Defaults.FailoverMaxTargets, 1, 100},
 		{"failover_failure_threshold", c.Defaults.FailoverFailureThreshold, 1, 1000},

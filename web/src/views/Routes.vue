@@ -312,7 +312,7 @@ onMounted(load)
            与 Users/Groups 的错误态同口径。 -->
       <div v-else-if="err" class="empty"><div class="big">⚠</div>{{ err }}</div>
       <div v-else-if="routes.length === 0" class="empty">
-        <div class="big">⇢</div>
+        <div class="big">∅</div>
         还没有路由，客户端将无法调用任何模型
       </div>
       <div v-else class="tbl-wrap">
@@ -339,8 +339,8 @@ onMounted(load)
               </td>
               <td class="c-act">
                 <div class="row-actions">
-                  <button class="btn btn-sm btn-ghost" @click="openRoute(r)">编辑</button>
-                  <button class="btn btn-sm btn-danger" @click="removeRoute(r)">删除</button>
+                  <button class="btn btn-act btn-ghost" @click="openRoute(r)">编辑</button>
+                  <button class="btn btn-act btn-danger" @click="removeRoute(r)">删除</button>
                   <button class="switch" :class="{ on: r.enabled }" :title="r.enabled ? '停用' : '启用'" @click="toggleRoute(r)"></button>
                 </div>
               </td>

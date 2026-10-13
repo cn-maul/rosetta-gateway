@@ -2,6 +2,7 @@ package inwire
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -174,7 +175,41 @@ func DecodeAnthropicMessagesRequest(r *http.Request, maxBytes int64) (*Anthropic
 		}
 	}
 
+	// content 形态校验（2026-10-12 修复 P2-16）。
+	//
+	// 必须在 ToRosetta **之前**做：ToRosetta 内部走 convertUserMessage，
+	// 那条路径对单对象 content 的处置是「静默变成空消息」—— 用户输入凭空
+	// 消失而请求照常 200。在这里挡掉，客户端能拿到明确的 400。
+	//
+	// system 同理：它是 string | 块数组，单对象形态若放过，
+	// contentString 会静默拼出空串，指令整段丢失。
+	if err := validateContentShape("messages", req.Messages); err != nil {
+		return nil, err
+	}
+	if len(req.System) > 0 {
+		if _, ok := decodeContentBlocks(req.System); !ok {
+			return nil, fmt.Errorf("system: %w", ErrContentSingleObject)
+		}
+	}
+
 	return &req, nil
+}
+
+// validateContentShape 逐条校验消息 content 的形态（string | 块数组）。
+//
+// 只判形态，不判块内容 —— 后者交给 rosetta validate（未知块类型、空文本块
+// 等已有各自的处置，见 convertUserMessage）。这里要堵的只有一件事：
+// content 是**单个对象**时被静默丢弃。
+func validateContentShape(field string, msgs []AnthropicMessage) error {
+	for i, m := range msgs {
+		if len(m.Content) == 0 {
+			continue // 缺省 content，交由 rosetta validate 报错
+		}
+		if _, ok := decodeContentBlocks(m.Content); !ok {
+			return fmt.Errorf("%s[%d].content: %w", field, i, ErrContentSingleObject)
+		}
+	}
+	return nil
 }
 
 // ToRosetta 组装统一请求。RoleSystem 的 cache_control 断点只能活在消息块里
@@ -469,7 +504,65 @@ func convertUserMessage(raw json.RawMessage) []rosetta.Message {
 	return out
 }
 
+// decodeContentBlocks 把 content 解成块数组，**并区分三种形态**：
+//
+//   - 数组     → 正常，返回块；
+//   - 纯字符串 → 返回 nil（调用方按文本处理，最常见形态）；
+//   - 单个对象 → 返回 ErrContentSingleObject，由调用方映射 400。
+//
+// # 为什么要区分单对象（2026-10-12 修复 P2-16）
+//
+// Anthropic 官方协议里 content 只能是 string 或块**数组**。但部分客户端
+// （以及从 OpenAI 格式手改过来的脚本）会发单个对象，形如
+//
+//	{"role":"user","content":{"type":"text","text":"hi"}}
+//
+// 旧实现的 decodeBlocks 把它 Unmarshal 到 []anthropicBlock 上，失败即返回
+// nil；调用方 convertUserMessage 见 blocks 为空，又试着按纯字符串解析、
+// 也失败，最后落到 `return []rosetta.Message{rosetta.User("")}` ——
+// **用户输入被静默丢弃，且请求照常 200**。这正是本项目反复修过的
+// 「无声吞内容」类缺陷（同文件 :452-455 未知块类型那段注释也点了名）。
+//
+// 静默丢弃比报错更糟：客户端以为发成功了，上游却没收到任何内容。
+// 现在明确 400，让客户端立刻知道该改成数组。
+var ErrContentSingleObject = errors.New("messages[].content: must be a string or an array of content blocks, got a single object")
+
+// decodeContentBlocks 是 decodeBlocks 的判别版本（2026-10-12 新增）。
+//
+// 返回 ok=false 表示 content 既不是字符串也不是数组（即单个对象）。
+// 数组与纯字符串都返回 ok=true（后者 blocks 为 nil，交由调用方按文本处理）。
+//
+// 之所以另开一个函数而不是改 decodeBlocks 的签名：decodeBlocks 有 5 个调用点
+// （contentString / assistantBlocks / convertUserMessage / toolResultText 内层），
+// 其中多处处理的是**已知是数组**的内层 content（如 tool_result 的嵌套内容），
+// 给它们全部加错误分支只会让代码更绕。判别逻辑集中在真正的入口处。
+func decodeContentBlocks(raw json.RawMessage) (blocks []anthropicBlock, ok bool) {
+	if len(raw) == 0 {
+		return nil, true // 缺省，调用方按空处理
+	}
+	// 先看是不是数组：是就走正常路径。
+	if err := json.Unmarshal(raw, &blocks); err == nil {
+		return blocks, true
+	}
+	// 不是数组。纯字符串是合法形态（返回 nil + ok，调用方按文本处理）。
+	var s string
+	if err := json.Unmarshal(raw, &s); err == nil {
+		return nil, true
+	}
+	// 到这里既不是数组也不是字符串。再判一下是不是「对象」——
+	// 是对象就明确报单对象错；否则是畸形 JSON，交给调用方按既有逻辑处理
+	//（json.Unmarshal 顶层已校验过 body，正常到不了这里）。
+	if len(raw) > 0 && raw[0] == '{' {
+		return nil, false
+	}
+	return nil, true
+}
+
 // decodeBlocks 把 content 解成块数组；纯字符串形态返回 nil（调用方按文本处理）。
+//
+// 仅适用于**已知为数组或字符串**的 content（如 tool_result 的嵌套内容）。
+// 顶层消息的 content 请用 decodeContentBlocks —— 它能识别单对象并报错，
+// 而本函数对单对象会静默返回 nil（见 P2-16）。
 func decodeBlocks(raw json.RawMessage) []anthropicBlock {
 	if len(raw) == 0 {
 		return nil

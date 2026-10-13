@@ -243,17 +243,39 @@ export function statusLabel(status: string): string {
 /**
  * 状态徽章样式。
  *
- * 三类语义，别再退回「非 ok 即异常」的二元判断：
- *   - ok        → 绿色（正常）
- *   - canceled  → 中性灰。客户端主动断开既不是网关的错，也不是上游的错，
- *                 统计口径里同样不计入错误率；标成暖橙会让「用户关了个页面」
- *                 看起来像线上故障。
- *   - 其余      → 暖橙（截断 / 超限 / 失败，都是需要关注的异常）
+ * 2026-10-13：由「三类」改成**每种状态一个配色**。
+ * 此前截断 / 超限 / 失败共用 badge-err（warning-soft，15% 浓度的暖橙），
+ * 在浅色底上淡到认不出颜色，实际观感就是灰的 —— 于是「失败」与
+ * 「已取消」长得一样，用户必须逐行读文字才知道出了什么事。
+ *
+ * 语义分层（配色见 styles.css 的 .badge-st-* 一段）：
+ *   - ok        绿 —— 无事
+ *   - error     红 —— 出错了，要看日志
+ *   - overflow  深红 —— 请求超出模型上限，是配置问题而非故障，
+ *                        比 error 更"已知原因"，故用同色系更深一档而不是换色
+ *   - truncated 橙 —— 生成被中断，结果不完整
+ *   - canceled  灰 —— 客户端主动断开，既不是网关的错也不是上游的错，
+ *                 统计口径里同样不计入错误率；给它暖色会让
+ *                 「用户关了个页面」看起来像线上故障。
+ *
+ * 未知状态回落 badge-off（中性灰）：不认识的值不该被当成异常标红，
+ * 那会把「新增了状态但前端没跟上」误报成线上故障。
  */
 export function statusBadge(status: string): string {
-  if (status === 'ok') return 'badge-live'
-  if (status === 'canceled') return 'badge-off'
-  return 'badge-err'
+  switch (status) {
+    case 'ok':
+      return 'badge-st-ok'
+    case 'error':
+      return 'badge-st-error'
+    case 'overflow':
+      return 'badge-st-overflow'
+    case 'truncated':
+      return 'badge-st-truncated'
+    case 'canceled':
+      return 'badge-st-canceled'
+    default:
+      return 'badge-off'
+  }
 }
 
 export async function copyText(text: string): Promise<boolean> {

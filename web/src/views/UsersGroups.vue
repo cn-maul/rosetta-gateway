@@ -46,6 +46,7 @@ import { fmtTokens, fmtDateTime, fmtBalance, fmtRemainder } from '../fmt'
 import { toast, confirmBox } from '../ui'
 import { checkPasswordStrength } from '../password'
 import AppModal from '../components/AppModal.vue'
+import Tabs from '../components/Tabs.vue'
 import ModelPicker from '../components/ModelPicker.vue'
 
 /** 页签。顺序按「先看人、再看规则」—— 定分组的前提是知道要给谁定。 */
@@ -556,21 +557,10 @@ async function askDeleteGroup(g: Group) {
       </div>
     </div>
 
-    <!-- 页签：形态对齐 Settings.vue 的 .set-tabs（胶囊分段），
-         不新造一套控件 —— 同一个交互在同一个应用里长得不一样时，
-         用户会以为它们行为也不同。 -->
-    <div class="ug-tabs">
-      <button
-        v-for="t in TABS"
-        :key="t.key"
-        class="ug-tab"
-        :class="{ active: tab === t.key }"
-        type="button"
-        @click="tab = t.key"
-      >
-        {{ t.label }}
-      </button>
-    </div>
+    <!-- 页签改用共享 Tabs（2026-10-12）：原先是 .ug-tabs + 手写 v-for，
+         与 Settings / Wallet 各写一份 —— 正是那个注释里担心的
+         「同一套控件、同一个应用里长得不一样」。 -->
+    <Tabs v-model="tab" :tabs="TABS" aria-label="用户与分组" />
 
     <!-- ============ 页签一：用户 ============ -->
     <template v-if="tab === 'users'">
@@ -578,7 +568,7 @@ async function askDeleteGroup(g: Group) {
       <div v-if="loading && users.length === 0" class="loading">加载中…</div>
       <div v-else-if="err" class="empty"><div class="big">⚠</div>{{ err }}</div>
       <div v-else-if="users.length === 0" class="empty">
-        <div class="big">◇</div>还没有用户
+        <div class="big">∅</div>还没有用户
       </div>
       <div v-else class="tbl-wrap">
         <table class="tbl">
@@ -632,13 +622,34 @@ async function askDeleteGroup(g: Group) {
                 </span>
               </td>
               <td class="c-act">
+                <!-- 操作列共有 4 个按钮，用 .btn-act 紧凑尺寸（2026-10-13）：
+                     原先 .btn-sm 的 11px 内边距下这行会换行竖排、行高暴涨。
+                     「重置密码」压成「改密」—— 操作列放不下四字按钮，
+                     完整语义转由 title 承担（悬停可见「重置该用户的密码」）。 -->
                 <div class="row-actions">
-                  <button class="btn btn-sm" :disabled="isPending(u.id)" @click="openEdit(u)">编辑</button>
-                  <button class="btn btn-sm" :disabled="isPending(u.id)" @click="openReset(u)">重置密码</button>
-                  <button class="btn btn-sm" :disabled="u.is_self || isPending(u.id)" :title="u.is_self ? '不能禁用自己的账号' : '禁用后该用户的所有登录状态立即失效'" @click="toggleStatus(u)">
+                  <button class="btn btn-act" :disabled="isPending(u.id)" @click="openEdit(u)">编辑</button>
+                  <button
+                    class="btn btn-act"
+                    :disabled="isPending(u.id)"
+                    title="重置该用户的密码"
+                    @click="openReset(u)"
+                  >
+                    改密
+                  </button>
+                  <button
+                    class="btn btn-act"
+                    :disabled="u.is_self || isPending(u.id)"
+                    :title="u.is_self ? '不能禁用自己的账号' : '禁用后该用户的所有登录状态立即失效'"
+                    @click="toggleStatus(u)"
+                  >
                     {{ isPending(u.id) ? '处理中…' : u.status === 'active' ? '禁用' : '启用' }}
                   </button>
-                  <button class="btn btn-sm btn-danger" :disabled="u.is_self || isPending(u.id)" :title="u.is_self ? '不能删除自己' : ''" @click="askDelete(u)">
+                  <button
+                    class="btn btn-act btn-danger"
+                    :disabled="u.is_self || isPending(u.id)"
+                    :title="u.is_self ? '不能删除自己' : ''"
+                    @click="askDelete(u)"
+                  >
                     {{ isPending(u.id) ? '处理中…' : '删除' }}
                   </button>
                 </div>
@@ -661,7 +672,7 @@ async function askDeleteGroup(g: Group) {
       <div v-if="loading && groups.length === 0" class="loading">加载中…</div>
       <div v-else-if="err" class="empty"><div class="big">⚠</div>{{ err }}</div>
       <div v-else-if="groups.length === 0" class="empty">
-        <div class="big">◇</div>还没有分组 —— 当前所有密钥都能看到全部模型
+        <div class="big">∅</div>还没有分组 —— 当前所有密钥都能看到全部模型
       </div>
       <div v-else class="tbl-wrap">
         <table class="tbl">
@@ -695,9 +706,9 @@ async function askDeleteGroup(g: Group) {
               </td>
               <td class="c-act">
                 <div class="row-actions">
-                  <button class="btn btn-sm" @click="openModels(g)">配置模型</button>
-                  <button class="btn btn-sm" @click="openEditGroup(g)">改名</button>
-                  <button class="btn btn-sm btn-danger" :disabled="!canDeleteGroup(g) || deleting" :title="deleteBlockedTitle(g)" @click="askDeleteGroup(g)">删除</button>
+                  <button class="btn btn-act" @click="openModels(g)">配置模型</button>
+                  <button class="btn btn-act" @click="openEditGroup(g)">改名</button>
+                  <button class="btn btn-act btn-danger" :disabled="!canDeleteGroup(g) || deleting" :title="deleteBlockedTitle(g)" @click="askDeleteGroup(g)">删除</button>
                 </div>
               </td>
             </tr>
@@ -887,37 +898,6 @@ async function askDeleteGroup(g: Group) {
 .msub { font-size: 12px; color: var(--muted); margin: -8px 0 10px; }
 /* 字段两列一行挤一挤：五个字段三行，弹窗整体约 16:9，不用竖着滚一屏。 */
 .fgrid { display: grid; grid-template-columns: 1fr 1fr; gap: 2px 18px; margin-top: 6px; }
-
-/* ---- 页签 ---- */
-/* 形态逐字对齐 Settings.vue 的 .set-tabs：同一个交互在同一个应用里
-   长得不一样时，用户会以为它们的行为也不同。 */
-.ug-tabs {
-  display: flex;
-  gap: 2px;
-  width: max-content;
-  padding: 3px;
-  margin-bottom: 14px;
-  border-radius: var(--r-pill);
-  background: var(--default);
-}
-.ug-tab {
-  padding: 6px 16px;
-  border: none;
-  border-radius: var(--r-pill);
-  background: transparent;
-  font-size: 13px;
-  font-weight: 500;
-  color: var(--muted);
-  cursor: pointer;
-  white-space: nowrap;
-  transition:
-    color 0.2s var(--ease-out-quart),
-    background 0.25s var(--ease-spring);
-}
-.ug-tab.active {
-  background: var(--surface);
-  color: var(--foreground);
-}
 
 /* ---- 分组页签 ---- */
 .note { font-size: 12px; color: var(--muted); line-height: 1.7; }

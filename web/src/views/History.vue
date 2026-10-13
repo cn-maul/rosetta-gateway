@@ -342,7 +342,7 @@ onMounted(() => {
         <div style="margin-top: 12px"><button class="btn" :disabled="loading" @click="load">重试</button></div>
       </div>
       <div v-else-if="total === 0" class="empty">
-        <div class="big">⌗</div>
+        <div class="big">∅</div>
         当前条件下暂无调用记录
       </div>
       <template v-else>

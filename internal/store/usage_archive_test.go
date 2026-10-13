@@ -223,6 +223,79 @@ func TestPrune_StatsUnchangedAcrossPrune(t *testing.T) {
 	}
 }
 
+// TestPrune_KeyQuotaUnchangedAcrossPrune 是 key 级的对称守门
+// （2026-10-12 新增；用户侧由 TestPrune_StatsUnchangedAcrossPrune 的
+// SumUserUsedTokens 断言守着，key 级此前没有）。
+//
+// access_keys.used_tokens 是**终身累计**，与 users 那条同口径：
+// DESIGN.md §4「quota_tokens ... 终身累计 input+output 上限」、
+// ReserveQuota 的注释「配额限的是终身累计，没有『窗口结束』这回事」，
+// 且 RecomputeUsedTokens 的数据源是 UsageSource（明细 + 归档）。
+//
+// 所以剪枝（把老明细聚合进表 A 后删除）**不得**改动这一列。
+// 曾有一段「配对回收」UPDATE 想按被剪量扣回它，因放在 DELETE 之后而恒为空操作
+// （2026-10-12 实证后删除，见 usage_archive.go 里的说明）；若有人把它
+// 「修好」——即真的减掉被剪量——本测试会当场变红：key 的终身配额会被剪枝
+// 悄悄放宽，用户 30 天前的用量一过期就凭空多出一份额度。
+func TestPrune_KeyQuotaUnchangedAcrossPrune(t *testing.T) {
+	st := newArchiveStore(t)
+	ctx := context.Background()
+	base := time.Now()
+	freezeNow(t, base)
+
+	if err := st.CreateUser(ctx, &User{ID: "u1", Username: "u1", Role: "user", Status: "active"}); err != nil {
+		t.Fatalf("CreateUser: %v", err)
+	}
+	if err := st.CreateAccessKey(ctx, &AccessKey{
+		ID: "k1", KeyHash: "hash-k1", KeyPrefix: "sk-gw-1", Name: "k1",
+		UserID: "u1", Enabled: true}); err != nil {
+		t.Fatalf("CreateAccessKey: %v", err)
+	}
+	old, kept := archiveFixture(t, st, base, DefaultRetentionDays)
+	if old == 0 || kept == 0 {
+		t.Fatalf("fixture must span both sides of the cutoff, got old=%d kept=%d", old, kept)
+	}
+
+	beforeQuota, beforeUsed, ok, err := st.GetKeyQuota(ctx, "k1")
+	if err != nil || !ok {
+		t.Fatalf("GetKeyQuota before prune: ok=%v err=%v", ok, err)
+	}
+
+	if _, err := st.PruneOldUsage(ctx, DefaultRetentionDays); err != nil {
+		t.Fatalf("prune: %v", err)
+	}
+	// 明细确实少了老行，否则「不变」可能只是因为根本没剪。
+	var remaining int64
+	if err := st.read.QueryRow(`SELECT COUNT(*) FROM usage_records`).Scan(&remaining); err != nil {
+		t.Fatalf("count details: %v", err)
+	}
+	if remaining != int64(kept) {
+		t.Fatalf("details after prune = %d, want %d", remaining, kept)
+	}
+
+	afterQuota, afterUsed, ok, err := st.GetKeyQuota(ctx, "k1")
+	if err != nil || !ok {
+		t.Fatalf("GetKeyQuota after prune: ok=%v err=%v", ok, err)
+	}
+	if afterUsed != beforeUsed {
+		t.Fatalf("★ key 终身配额被剪枝放宽：used_tokens %d -> %d（差 %d）\n"+
+			"  这部分量已归档进表 A，仍属于该 key 的终身累计，不得回收",
+			beforeUsed, afterUsed, beforeUsed-afterUsed)
+	}
+	if afterQuota != beforeQuota {
+		t.Fatalf("quota_tokens 不该被剪枝改动：%d -> %d", beforeQuota, afterQuota)
+	}
+	// 与 RecomputeUsedTokens 对账：它走 UsageSource（明细+归档），是权威值。
+	// 两者必须一致 —— 不一致说明 used_tokens 与「明细+归档」分叉了。
+	recomputed, err := st.RecomputeUsedTokens(ctx, "k1")
+	if err != nil {
+		t.Fatalf("RecomputeUsedTokens: %v", err)
+	}
+	if recomputed != afterUsed {
+		t.Fatalf("★ used_tokens(%d) 与 RecomputeUsedTokens 的权威值(%d) 分叉", afterUsed, recomputed)
+	}
+}
+
 func assertStatsEqual(t *testing.T, before, after *UsageStats) {
 	t.Helper()
 	if before.TotalRequests != after.TotalRequests {

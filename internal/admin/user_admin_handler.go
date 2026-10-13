@@ -135,18 +135,36 @@ func toUserResponse(u *store.User, selfID string, keyCount int) userResponse {
 }
 
 // requireAdmin 返回当前用户，非管理员时已写出 403。
+//
+// # 空 ID 一律 403（2026-10-12 加固，原为 fail-open）
+//
+// 原实现在这里放行 `u.ID == ""`（注释称「引导态的合成 user：有 admin 权限
+// 但没有真实身份」）。这是**全仓唯一的「空 ID = admin」判定**，与其余各处
+// 的 fail-closed 口径相反：key_handler.go:525、usage_handler.go:178、
+// group_handler.go:311 都显式拒绝空 ID，ChangePassword（本文件）也显式拒绝。
+//
+// 放行的后果是整条管理面失守：本文件的 ListUsers/CreateUser/UpdateUser/
+// DeleteUser、以及 config-transfer（含**全部上游明文凭据**）都会被空 ID 越权。
+//
+// 当前生产不可达：userKey 唯一的注入点是 UserAuthMiddleware
+// （internal/server/user_auth.go:302），其身份来自 store.GetUser 的 SQL 查询
+// —— 空 id 必然查不到行返回 nil，在那里就被 `u == nil` 拦成 401 了。
+// 也就是说这个分支只有测试构造才能触发。
+//
+// 但「不可达」不等于「该留着」：它是一条纯靠调用方自律维持的闸门，
+// 任何后续改动（新增注入点、测试替身复用、缓存层提前返回）都可能让它
+// 变成真实的越权路径，而且方向恰好是最危险的那一种 —— 静默放行。
+// 统一为 403 后，闸门由本函数自己保证，与全仓口径一致。
 func requireAdmin(w http.ResponseWriter, r *http.Request) (*store.User, bool) {
 	u := server.UserFromContext(r.Context())
 	if u == nil {
 		writeError(w, http.StatusUnauthorized, "需要登录")
 		return nil, false
 	}
-	if u.ID == "" {
-		// 引导态的合成 user：有admin 权限但没有真实身份。
-		// 允许它建第一个账号 —— 这正是引导窗口存在的意义。
-		return u, true
-	}
-	if !u.IsAdmin() {
+	if !u.IsAdmin() || u.ID == "" {
+		// 合并成一条判定而不是先判空再判角色：两者的处置动作相同（403），
+		// 分开写只会让「空 ID」看起来像一种特殊的合法状态。
+		// 宁可拒掉一个没有真实身份的 admin，也不要留一条能静默放行的口子。
 		writeError(w, http.StatusForbidden, "需要管理员权限")
 		return nil, false
 	}

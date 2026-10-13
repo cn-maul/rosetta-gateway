@@ -551,8 +551,13 @@ async function recomputeUsage(k: AccessKey) {
           <option value="">全部用户</option>
           <option v-for="u in userFilterOptions" :key="u.id" :value="u.id">{{ u.username }}</option>
           <!-- 无归属的 key 不会被任何用户项覆盖，单独给一项，否则这批行
-               永远筛不出来（「看不见」会被读成「不存在」）。 -->
-          <option v-if="hasOrphanKeys" :value="ORPHAN_FILTER">无归属（不可用）</option>
+               永远筛不出来（「看不见」会被读成「不存在」）。
+
+               文案刻意不写「无归属」（2026-10-12）：那是数据层的内部术语
+               （usage_records.user_id 为空），管理员看到只会困惑它指什么。
+               对管理动作有意义的信息是两件事：**这批 key 已经不可用**，
+               以及**它们是迁移遗留**（所以不该去修，该直接删）。 -->
+          <option v-if="hasOrphanKeys" :value="ORPHAN_FILTER">已停用的历史密钥（迁移遗留）</option>
         </select>
         <button v-if="fUser" class="btn btn-sm btn-ghost" :disabled="loading" @click="resetFilter">
           重置筛选
@@ -568,13 +573,13 @@ async function recomputeUsage(k: AccessKey) {
            与 Users/Groups 的错误态同口径。 -->
       <div v-else-if="err" class="empty"><div class="big">⚠</div>{{ err }}</div>
       <div v-else-if="keys.length === 0" class="empty">
-        <div class="big">◇</div>
+        <div class="big">∅</div>
         还没有访问密钥
       </div>
       <!-- 筛选后为空 ≠ 本来就没有 key：两句话必须分开，否则用户会把
            「这个人的 key 都在别的用户名下」读成「他一把 key 都没有」。 -->
       <div v-else-if="filteredEmpty" class="empty">
-        <div class="big">⌗</div>
+        <div class="big">∅</div>
         没有匹配当前筛选条件的密钥
         <div class="err-retry">
           <button class="btn btn-sm" @click="resetFilter">清除筛选</button>
@@ -607,9 +612,16 @@ async function recomputeUsage(k: AccessKey) {
               </td>
               <td>
                 <!-- 无归属必须显式标注：这类 key 会被迁移退役、鉴权直接 401，
-                     不标注的话运维会以为它还能用。 -->
-                <span v-if="!k.user_id" class="badge badge-off" title="无归属的密钥会被退役，鉴权返回 401">
-                  无归属（不可用）
+                     不标注的话运维会以为它还能用。
+
+                     徽章文案同上（2026-10-12）：写「已停用」而不是「无归属」。
+                     徽章只放得下四个字，完整原因在 title 里。 -->
+                <span
+                  v-if="!k.user_id"
+                  class="badge badge-off"
+                  title="迁移遗留的无归属密钥已被停用，调用时鉴权直接返回 401，建议删除"
+                >
+                  已停用
                 </span>
                 <span v-else class="mono">{{ k.username || k.user_id }}</span>
               </td>
@@ -650,11 +662,11 @@ async function recomputeUsage(k: AccessKey) {
                     会以为是自己用错了（2026-10-11 前端审计）。计数异常通常是
                     历史归档或迁移留下的，对普通用户而言点它多半看不到变化。
                   -->
-                  <button class="btn btn-sm btn-ghost" :disabled="recomputing === k.id" title="按调用明细重算已用 tokens。通常无需操作：仅在配额计数与实际用量明显不符时使用（例如历史数据迁移后）" @click="recomputeUsage(k)">
+                  <button class="btn btn-act btn-ghost" :disabled="recomputing === k.id" title="按调用明细重算已用 tokens。通常无需操作：仅在配额计数与实际用量明显不符时使用（例如历史数据迁移后）" @click="recomputeUsage(k)">
                     {{ recomputing === k.id ? '重算中…' : '重算用量' }}
                   </button>
-                  <button class="btn btn-sm btn-ghost" @click="openEdit(k)">编辑</button>
-                  <button class="btn btn-sm btn-danger" @click="removeKey(k)">删除</button>
+                  <button class="btn btn-act btn-ghost" @click="openEdit(k)">编辑</button>
+                  <button class="btn btn-act btn-danger" @click="removeKey(k)">删除</button>
                   <button class="switch" :class="{ on: k.enabled }" :title="k.enabled ? '停用' : '启用'" @click="toggleKey(k)"></button>
                 </div>
               </td>

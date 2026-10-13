@@ -495,8 +495,12 @@ func (p *Pool) RecordCredentialSuccess(credID string) {
 // 主目标熔断期间明明有可用上游，却稳定返回 502，且必须人工调高预算或重启
 // 才能恢复（Install 沿用旧健康状态，reload 也救不回来）。
 func (p *Pool) TargetAvailable(targetID string) bool {
-	p.mu.Lock()
-	defer p.mu.Unlock()
+	// RLock 而非 Lock（2026-10-12 修 P2-17）：本函数只读 targets 与 h.until，
+	// 不改任何状态（上方注释也写明「纯查询，不占任何名额」）。取写锁会让它
+	// 与所有写路径（冷却 / 恢复记账）互相排队 —— 而它正跑在故障转移的候选
+	// 筛选里，一排队就把 credIndex 的 O(1) 收益抵消掉了。
+	p.mu.RLock()
+	defer p.mu.RUnlock()
 	h, ok := p.targets[targetID]
 	if !ok {
 		return true

@@ -34,7 +34,7 @@
  */
 import { computed, onMounted, ref } from 'vue'
 import { useRouter } from 'vue-router'
-import { api, ApiFail, isAdmin, saveToken, session } from '../api'
+import { api, ApiFail, isAdmin, session } from '../api'
 // fmtTimeMs 仍被「充值记录」表使用（那里要的是完整时刻，不是按天）。
 // 消耗记录改成按天之后**不再**用它 —— 按天表的第一列是后端给的 day 字符串，
 // 用 fmtTimeMs 去格式化一个 day 会得到无意义的「NaN」，而且那个串必须
@@ -45,8 +45,8 @@ import { api, ApiFail, isAdmin, saveToken, session } from '../api'
 import { fmtNum, fmtTokens, fmtBalance, fmtRemainder, fmtMoney, fmtTimeMs } from '../fmt'
 import { toast } from '../ui'
 import { rangeStart } from '../range'
-import { checkPasswordStrength } from '../password'
 import AppModal from '../components/AppModal.vue'
+import Tabs from '../components/Tabs.vue'
 import type { Stats, TopupRecord, UsageByUserEntry, UsageGroupEntry, User } from '../types'
 
 // ---------- 加载状态 ----------
@@ -466,21 +466,23 @@ async function submitTopup() {
 // 页签**按身份不同**，由 computed 决定而不是模板里 v-if 两套：页签数组本身
 // 就是数据，模板只负责渲染它；两套 v-if 会让「加一个页签」变成改两处。
 //
-// 管理员三格：消费汇总 / 充值记录 / 改密 —— 刻意**没有**「消耗记录」格，
-// 用户明确说钱包页不放消费明细（明细在「调用历史」页，那里有时间范围、
-// 状态/模型/密钥过滤与 CSV 导出）。
-type TabKey = 'usage' | 'topup' | 'password'
+// 管理员三格：消费汇总 / 充值记录；普通用户两格：消耗记录 / 充值记录。
+// 刻意**没有**「消耗记录」格（管理员形态）—— 用户明确说钱包页不放消费明细
+//（明细在「调用历史」页，那里有时间范围、状态/模型/密钥过滤与 CSV 导出）。
+//
+// 「修改密码」页签已于 2026-10-13 挪到「设置」页 —— 改密与钱无关，
+// 放这里只是因为本页是普通用户唯一的自助页面，于是用户得先"想起来"
+// 密码在钱包里改。本页自此只讲钱。
+type TabKey = 'usage' | 'topup'
 const TABS = computed<{ key: TabKey; label: string }[]>(() =>
   admin.value
     ? [
         { key: 'usage', label: '消费汇总' },
         { key: 'topup', label: '充值记录' },
-        { key: 'password', label: '修改密码' },
       ]
     : [
         { key: 'usage', label: '消耗记录' },
         { key: 'topup', label: '充值记录' },
-        { key: 'password', label: '修改密码' },
       ],
 )
 const tab = ref<TabKey>('usage')
@@ -490,54 +492,6 @@ function gotoHistory() {
   // 显式写 name 而不是 path：History 页的路由 path 不会变，但 name 变了他就
   // 少一个能跑的入口。router-link 同样是这个理由。
   void router.push({ name: 'history' })
-}
-
-// ---------- 修改密码 ----------
-const oldPwd = ref('')
-const newPwd = ref('')
-const confirmPwd = ref('')
-const pwdBusy = ref(false)
-const pwdErr = ref('')
-const newPwdErr = ref('')
-
-// 强度门槛与后端 userauth.ValidatePassword 同一套（见 password.ts）。
-// 刻意与后端保持一致但**不替代**它：前端只是提前告知，真正的强度判断
-// 必须在服务端做（绕过前端直接打接口是常态）。
-function checkStrength(p: string) {
-  return checkPasswordStrength(p)
-}
-
-async function submitPwd() {
-  if (pwdBusy.value) return
-  pwdErr.value = ''
-  newPwdErr.value = checkStrength(newPwd.value)
-  if (newPwdErr.value) return
-  if (newPwd.value !== confirmPwd.value) {
-    pwdErr.value = '两次输入的新密码不一致'
-    return
-  }
-  pwdBusy.value = true
-  try {
-    await api.changeMyPassword(oldPwd.value, newPwd.value)
-    // 后端在此递增了 auth_version，**当前这个会话已经失效**（ChangePassword
-    // 还顺手清了会话 cookie）。延迟跳转的那段时间里界面还在、任何点击都会打到
-    // 一个必然 401 的接口上；所以立刻清掉本地会话并跳登录页 ——
-    // 改密成功与「需要重新登录」是同一件事，不该拆成两步。
-    //
-    // 不调 logout()：那个端点也会（按用户）递增 auth_version 并清 cookie，
-    // 而我们已经处在「会话已失效」的状态下，再发一请求只会拿到 401，
-    // 还会在 api.ts 的 401 分支里再清一次令牌。本地 saveToken('') 就够了。
-    saveToken('')
-    session.me = null
-    toast('密码已更新，请用新密码重新登录', 'ok')
-    oldPwd.value = newPwd.value = confirmPwd.value = ''
-    // redirect 指回本页：重新登录后回到钱包页，而不是被丢到总览再自己找回来。
-    await router.replace({ name: 'login', query: { redirect: '/profile' } })
-  } catch (e) {
-    pwdErr.value = e instanceof ApiFail ? e.message : '改密失败'
-  } finally {
-    pwdBusy.value = false
-  }
 }
 
 onMounted(load)
@@ -679,18 +633,9 @@ onMounted(load)
            两种单位」。它在「消耗记录」页签底部以弱化的单行出现。 -->
 
       <!-- ---------- 页签 ---------- -->
-      <div class="wallet-tabs">
-        <button
-          v-for="t in TABS"
-          :key="t.key"
-          class="wallet-tab"
-          :class="{ active: tab === t.key }"
-          type="button"
-          @click="tab = t.key"
-        >
-          {{ t.label }}
-        </button>
-      </div>
+      <!-- 页签改用共享 Tabs（2026-10-12）：原先此处是 .wallet-tabs +
+           手写 v-for，与 Settings / UsersGroups 各写一份。 -->
+      <Tabs v-model="tab" :tabs="TABS" aria-label="钱包分区" />
 
       <!-- ---------- 消耗记录 / 消费汇总 ---------- -->
       <!--
@@ -718,7 +663,7 @@ onMounted(load)
                与充值记录同口径。 -->
           <p v-else-if="byUserErr" class="notice-warn" role="alert">{{ byUserErr }}</p>
           <div v-else-if="byUser.length === 0" class="empty">
-            <div class="big">⌗</div>
+            <div class="big">∅</div>
             暂无消费记录
             <div class="empty-detail">
               「全部历史」区间内还没有任何用户的用量记录。
@@ -822,7 +767,7 @@ onMounted(load)
         <p v-else-if="err" class="notice-warn" role="alert">{{ err }}</p>
         <p v-else-if="byDayErr" class="notice-warn" role="alert">{{ byDayErr }}</p>
         <div v-else-if="byDay.length === 0" class="empty">
-          <div class="big">⌗</div>
+          <div class="big">∅</div>
           近 {{ USAGE_DAYS }} 天没有消耗记录
         </div>
         <template v-else>
@@ -912,7 +857,7 @@ onMounted(load)
              空态同理必须区分「没拿到」与「真的是空」。 -->
         <p v-else-if="topupLoadErr" class="notice-warn" role="alert">{{ topupLoadErr }}</p>
         <div v-else-if="topups.length === 0" class="empty">
-          <div class="big">⌗</div>
+          <div class="big">∅</div>
           暂无充值记录
           <div class="empty-detail">
             {{ admin ? '还没有任何充值操作。' : '还没有人为你的账户充值。' }}
@@ -961,31 +906,6 @@ onMounted(load)
         </template>
       </div>
 
-      <!-- ---------- 修改密码 ---------- -->
-      <div v-else class="panel">
-        <div class="panel-title">
-          修改密码
-          <span class="hint">修改后当前登录状态会立即失效</span>
-        </div>
-        <form class="form" @submit.prevent="submitPwd">
-          <label class="flabel" for="op">当前密码</label>
-          <input id="op" v-model="oldPwd" type="password" class="input" autocomplete="current-password" />
-
-          <label class="flabel" for="np">新密码</label>
-          <input id="np" v-model="newPwd" type="password" class="input" autocomplete="new-password" />
-          <div v-if="checkStrength(newPwd)" class="fhint warn">{{ checkStrength(newPwd) }}</div>
-          <div v-else-if="newPwd" class="fhint ok">强度符合要求</div>
-
-          <label class="flabel" for="cp">确认新密码</label>
-          <input id="cp" v-model="confirmPwd" type="password" class="input" autocomplete="new-password" />
-
-          <div v-if="pwdErr" class="fhint err">{{ pwdErr }}</div>
-
-          <button class="btn btn-primary" type="submit" :disabled="pwdBusy">
-            {{ pwdBusy ? '提交中…' : '修改密码' }}
-          </button>
-        </form>
-      </div>
     </template>
 
     <!-- ---------- 充值弹窗（仅管理员） ----------
@@ -1107,40 +1027,9 @@ onMounted(load)
   color: var(--danger);
 }
 
-/* 页签：形态对齐 Settings.vue 的 .set-tabs（胶囊分段），
-   刻意不用下划线式 tab —— 那会被读成「可切换的页面」，
-   而这里三格同属钱包、共享同一个标题与刷新按钮。 */
-.wallet-tabs {
-  display: flex;
-  gap: 2px;
-  width: max-content;
-  padding: 3px;
-  margin: 18px 0 14px;
-  border-radius: var(--r-pill);
-  background: var(--default);
-}
-.wallet-tab {
-  padding: 6px 16px;
-  border: none;
-  border-radius: var(--r-pill);
-  background: transparent;
-  font-size: 13px;
-  font-weight: 500;
-  color: var(--muted);
-  cursor: pointer;
-  white-space: nowrap;
-  transition:
-    color 0.2s var(--ease-out-quart),
-    background 0.25s var(--ease-spring);
-}
-.wallet-tab:hover {
-  color: var(--foreground);
-}
-.wallet-tab.active {
-  color: var(--segment-foreground);
-  background: var(--segment);
-  box-shadow: var(--field-shadow);
-}
+/* 页签样式已随 Tabs 组件统一到全局 styles.css（2026-10-12）。
+   原 .wallet-tabs / .wallet-tab（pill 形）与 Settings、UsersGroups 各一份，
+   三处已合并成一个组件，本块删除。 */
 
 .c-time {
   color: var(--text-2);
