@@ -271,8 +271,9 @@ CREATE TABLE users (
                   -- 扣费时整除扣分、余数留存，累积满一分才真正扣账 —— 避免
                   -- 「1 分余额被无限次亚分请求消耗」。存 INTEGER 而非 REAL：
                   -- 余额侧**不出现浮点**。2026-10-10 新增。
-                  -- ⚠️ 已知缺口：欠费时该余数随事务回滚一并丢弃，
-                  --    见 AUDIT/audit-2026-10-11.md P1-3
+                  -- 欠费时该余数曾随事务回滚一并丢弃（audit-2026-10-11 P1-3），
+                  --    已由 balance_pending 待结算账本修复（2026-10-12），
+                  --    见 AUDIT/audit-2026-10-13.md 与 balance_dao.go 注释
   auth_version  INTEGER NOT NULL DEFAULT 1,      -- 会话失效栅栏（改密/禁用/改角色 +1）
   remark        TEXT,
   created_at    INTEGER NOT NULL,

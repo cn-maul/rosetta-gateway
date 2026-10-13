@@ -59,21 +59,30 @@
 
 ## 四、未修的已知缺口
 
+> **本清单已按 2026-10-13 全量审计更新。**
+> 2026-10-11 审计列出的 6 项中，**1/2/3/4/6 均已修复**（下方保留条目说明其修法），
+> 仅第 5 项仍是未确认的开放问题。
+> **当前待修项的权威清单见 `AUDIT/audit-2026-10-13.md`**（1 个 P0 + 4 个 P1 + 8 个 P2），
+> 本节的定位是「历史缺口的状态追踪」，不再作为排期依据。
+
 **来自 2026-10-11 全量审计（`AUDIT/audit-2026-10-11.md`，按处理优先级）**：
 
-1. **批量落库整批失败 → 最多 50 条用量与扣费静默丢失**（`main.go:2728-2748`）——
-   `flush` 遇错只打一条 ERROR 就 `return`，记录已出队、不重试。一次 SQLITE_BUSY /
-   磁盘抖动就让用户**消耗上游 token 却完全免单**，且配额被永久放宽。**无需攻击者**
-2. **查价失败即永久记 0，同样免单且无自动修复**（`usage_dao.go:327-348`）——
-   `RecomputeCost` 在生产代码中**无任何调用点**，补救纯靠人工
-3. **Anthropic `content` 写成单对象时静默变空消息**（`inwire/anthropic.go:473-482`）——
-   OpenAI 侧已有单块兜底可对齐（`openai_chat.go:530-541`）
-4. **`requireAdmin` 空 ID fail-open**（`user_admin_handler.go:138-154`）——
-   全仓唯一一处「空 ID = 管理员」，与全仓 fail-closed 口径相反。需人工确认可达性，
-   无论如何建议统一为 403
+1. ~~**批量落库整批失败 → 最多 50 条用量与扣费静默丢失**~~ **✅ 已修（2026-10-12 P1-1）**：
+   `flush` 改为「整批重试 3 次 → 降级逐条 → 残留留待下轮」，`wait()` 返回 bool，
+   未排空时打 ERROR。由 `cmd/gateway/usage_flush_retry_test.go` 钉住
+2. ~~**查价失败即永久记 0，无自动修复**~~ **✅ 已修（2026-10-12 P1-2）**：
+   新增可查询状态 `usage_state='cost_pending'` + 后台每 5 分钟 `RecomputePendingCosts` 重算。
+   由 `internal/store/cost_pending_test.go` 钉住
+3. ~~**Anthropic `content` 单对象静默变空消息**~~ **✅ 已修**：
+   改为显式报 `ErrContentSingleObject`（`inwire/anthropic.go:528`）
+4. ~~**`requireAdmin` 空 ID fail-open**~~ **✅ 已修**：
+   改为 `if !u.IsAdmin() || u.ID == ""` 的合并判定（`user_admin_handler.go:164`），
+   `AdminGateGuard` 同步加了 `u.ID != ""`
 5. **组白名单悬空回落 `AllowAll()`**（`snapshot/rebuild.go`）—— **唯一可能造成权限放宽的条目**，
-   需实测确认 `access_keys.group_id` 的 `ON DELETE SET NULL` 行为
-6. 登录限速只有 IP 维度、无账号维度
+   需实测确认 `access_keys.group_id` 的 `ON DELETE SET NULL` 行为。**仍未确认**
+6. ~~**登录限速只有 IP 维度**~~ **✅ 已修（2026-10-12 P1-5）**：
+   新增账号维度限速 `loginThr`（按用户名归键，`user_handler.go:65`），
+   与 IP 维度独立计数、任一不过即 429
 
 **本轮已修（2026-10-11）** —— 来自 ``AUDIT/frontend-audit-2026-10-11.md`` 的前端审计：
 
@@ -189,8 +198,8 @@ cd web
 
 `AUDIT/` 下 20+ 份，**先读 `AUDIT/README.md`（索引）**，重点：
 
-- **`audit-2026-10-11.md`** —— **最新全量审计（优先读这个）**：静态分模块审计 16 个包，
-  6 项 P1 + 18 项 P2 + 9 项需人工确认风险。结论：**无 P0**，无鉴权绕过/SQL 注入/密钥泄漏/重复扣费
+- **`audit-2026-10-13.md`** —— **最新全量审计（优先读这个）**：全量代码阅读 + 全量测试 + `-race` 竞态检测 + 关键假设实测探针。结论：**1 个 P0（管理面无 CSRF 令牌，`usage/prune` 等不解析 body 的写端点绕过 Content-Type 防线）、4 个 P1、8 个 P2**
+- `audit-2026-10-11.md` —— 上一轮静态审计（16 个包，6 项 P1 + 18 项 P2）。**其三条首要缺陷均已修复**（批量落库重试、cost_pending 自动重算、Anthropic content 单对象），读时须区分已修与未修
 - `test-summary.md` —— 历史动态测试的总审计结论
 - `test-datapath.md` / `test-billing.md` / `test-authz.md` / `test-perf.md` —— 四个方向的动态测试
 - `fix-p1-perf.md` —— 性能修复（含一条对我给的 38.8× 前提的纠正）
