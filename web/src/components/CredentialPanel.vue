@@ -18,6 +18,8 @@ const props = defineProps<{
   /** 该上游的余额查询结果；未点过「查余额」时为 undefined。 */
   balance?: ProviderBalance
   balanceBusy: boolean
+  /** 正在提交启停的凭据 id：只给那一行的开关上防连点。 */
+  toggling: string[]
 }>()
 
 const emit = defineEmits<{
@@ -25,7 +27,18 @@ const emit = defineEmits<{
   queryBalance: []
   edit: [cred: Credential]
   remove: [cred: Credential]
+  toggle: [cred: Credential]
 }>()
+
+// isPending 判某一行是否正在提交启停。
+//
+// 启停是「切换」语义（同一上游同时只启用一把），所以连点一次的后果是
+// **两次相反的切换**：第一次把 A 打开（同时关掉 B），第二次又把 A 关掉。
+// 用户想要的结果和最终状态完全相反，且期间请求池真的换了 key ——
+// 那种「我明明点了一下启用，怎么又没了」没有任何自我修复的余地。
+function isPending(id: string): boolean {
+  return props.toggling.includes(id)
+}
 
 // balanceLine 把一条凭据的余额压成一行。
 //
@@ -71,6 +84,12 @@ function balanceClass(r: CredentialBalance): string {
       <div v-if="creds.length === 0" class="empty sub-empty">
         无凭据 —— 上游鉴权必需
       </div>
+      <!-- 「同时只启用一把」是本面板的硬约束，必须写在开关旁边而不是藏进
+           文档：它是**跨行**的，打开一行会让另一行的徽章当场翻转。只在
+           多于一把时提示 —— 只有一把时这句话是废话。 -->
+      <p v-else-if="creds.length > 1" class="dim sub-line">
+        同一上游同时只启用一把 key：打开其中一把会自动停用其它。
+      </p>
       <table v-else class="tbl sub-tbl">
         <thead>
           <tr>
@@ -114,6 +133,21 @@ function balanceClass(r: CredentialBalance): string {
             </td>
             <td class="c-act">
               <div class="row-actions">
+                <!-- 启停开关。与 Keys/Routes 两页同一套 .switch 配方，
+                     放在操作列最前：它是这一行最高频的动作，而「换钥 /
+                     删除」是低频且有后果的 —— 位置靠内一层就少一次误点。 -->
+                <button
+                  class="switch"
+                  :class="{ on: c.enabled }"
+                  :disabled="isPending(c.id)"
+                  :title="
+                    c.enabled
+                      ? '停用这把 key'
+                      : '启用这把 key（同一上游同时只启用一把，启用它会自动停用其它）'
+                  "
+                  :aria-label="c.enabled ? '停用' : '启用'"
+                  @click="emit('toggle', c)"
+                ></button>
                 <button class="btn btn-sm btn-ghost" @click="emit('edit', c)">换钥</button>
                 <button class="btn btn-sm btn-danger" @click="emit('remove', c)">删除</button>
               </div>

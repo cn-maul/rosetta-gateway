@@ -24,7 +24,7 @@ type TabKey = 'model' | 'runtime' | 'price' | 'password' | 'transfer'
 
 const TABS: { key: TabKey; label: string; sub: string }[] = [
   { key: 'model', label: '模型默认', sub: '全局默认值；模型容量探测不到时回落到这里' },
-  { key: 'runtime', label: '运行时', sub: '各类超时与自动故障转移的全局默认' },
+  { key: 'runtime', label: '运行时', sub: '各类超时与自动故障转移的全局默认，按「谁在保护什么」分块' },
   // 这里曾有一个「安全」页，放的是独立于 users 表的管理密码（另有一份凭据文件兜底）。
   // 统一认证后管理密码就是 users 表里某个用户的密码，已由「我的账号」（自助改）
   // 与「用户管理」（管理员重置）各自承担，所以整块删除 —— 不要在这里加回跳转提示之类的残件。
@@ -241,18 +241,91 @@ const err = ref('')
 // 单靠 err 判断「能不能写」是不充分的：真正的判据是「当前表单里的值
 // 是不是真值」，而这件事只有成功加载过才知道。
 const loadedOnce = ref(false)
+
+// ---------- 运行时推荐默认值（本页唯一真源） ----------
+//
+// 这一组是「我们认为合适的值」，三处必须逐项一致：这里、后端
+// internal/config/config.go 的 setDefaults() 兜底、config.example.json。
+// 不是洁癖 —— 界面回显的必须是**正在生效的数**，而 DB 未配置时生效数
+// 就是 config 的兜底。界面写一个数、实际跑另一个数，运维会照着界面
+// 推理出错误的预期（与下面 derivedTotalBudgetText 同一条纪律）。
+//
+// 取值理由（2026-10-13）：
+//
+//	非流式 120s → 300s：非流式没有增量输出可看，只能干等。2 分钟连 8K
+//	  tokens 的回复都跑不完（按 ~40 tok/s），于是**正常的慢请求**被判成
+//	  超时并触发故障转移 —— 用户侧看到的是「无故变慢 + 结果不对」。
+//	  5 分钟覆盖绝大多数非流式生成；再往上派生的总预算会直接撞上
+//	  30 分钟上限，推导值就永远显示同一个数，失去意义。
+//	TTFT 30s → 60s：带思考/排队的上游（bootstrap 里的 deepseek-reasoner
+//	  就是这一类）首字本来就要几十秒，30s 会把正常响应判成超时并切目标。
+//	空闲 60s → 120s：已开始出字后，两个事件间隔超过 60s 在慢速流上并不罕见；
+//	  调大只影响「真卡死」的发现速度，不影响健康流。
+//	目标数 3 / 熔断阈值 3：维持原值。链上第 4 个目标几乎不提升成功率，
+//	  却把最坏耗时再乘一截；连续失败 3 次已足够判定目标有问题。
+//
+// 注意这只影响**兜底**：DB 里已保存过的值、config.json 里显式写过的值
+// 都不受它影响（老部署的行为因此完全不变），要换成新值在页面上点保存即可。
+const RUNTIME_DEFAULTS = {
+  upstream_timeout_ms: 300_000,
+  stream_first_token_timeout_ms: 60_000,
+  stream_idle_timeout_ms: 120_000,
+  failover_max_targets: 3,
+  failover_failure_threshold: 3,
+}
+type RuntimeKey = keyof typeof RUNTIME_DEFAULTS
+
+// 运行时各分类的成员：模板的分组渲染与「这一类是否已偏离推荐值」共用
+// 同一份声明。两处各写一遍字段名，迟早会漂移成「按钮恢复的是另一组的值」。
+const RUNTIME_GROUPS: Record<'nonstream' | 'streaming' | 'failover', RuntimeKey[]> = {
+  nonstream: ['upstream_timeout_ms'],
+  streaming: ['stream_first_token_timeout_ms', 'stream_idle_timeout_ms'],
+  failover: ['failover_max_targets', 'failover_failure_threshold'],
+}
+
 const form = reactive({
   // 与后端 internal/store/settings_dao.go 的兜底常量保持一致：
   // GET 失败时界面也不该回落到明显偏小的早期值（会被误当成真实生效值）。
   default_context_window: 131072,
   default_max_output_tokens: 65536,
   // 运行时全局默认（超时 + 故障转移策略）。原先散落在每条路由上，现统一在此配置。
-  upstream_timeout_ms: 120000,
-  stream_idle_timeout_ms: 60000,
-  stream_first_token_timeout_ms: 30000,
-  failover_max_targets: 3,
-  failover_failure_threshold: 3,
+  upstream_timeout_ms: RUNTIME_DEFAULTS.upstream_timeout_ms,
+  stream_idle_timeout_ms: RUNTIME_DEFAULTS.stream_idle_timeout_ms,
+  stream_first_token_timeout_ms: RUNTIME_DEFAULTS.stream_first_token_timeout_ms,
+  failover_max_targets: RUNTIME_DEFAULTS.failover_max_targets,
+  failover_failure_threshold: RUNTIME_DEFAULTS.failover_failure_threshold,
 })
+
+// fmtDur 把毫秒说成人话（「5 分钟」而不是「300000」）。
+// 超时是给人读量级的值，让管理员对着六位数心算本身就是一处摩擦。
+function fmtDur(ms: number): string {
+  if (!Number.isFinite(ms) || ms <= 0) return '—'
+  if (ms % 60_000 === 0) return `${ms / 60_000} 分钟`
+  if (ms % 1000 === 0) return `${ms / 1000} 秒`
+  return `${ms} 毫秒`
+}
+
+// recNote 给出该字段的推荐值，并在当前值已偏离时点明。
+//
+// 「当前已自定义」是有用的信息：这几个数一旦偏离推荐值，多半是当初为了
+// 某个具体故障调过的。界面上看不出偏离，运维很容易在别的故障里顺手改回去。
+function recNote(k: RuntimeKey): string {
+  const rec = RUNTIME_DEFAULTS[k]
+  const s = `推荐 ${fmtNum(rec)}（${fmtDur(rec)}）`
+  return Number(form[k]) === rec ? s : `${s} · 当前已自定义`
+}
+
+// groupAtDefaults：整类都等于推荐值时，「恢复推荐默认」按钮禁用。
+// 一个永远可点但什么都不会变的按钮，比没有更让人怀疑它是不是坏了。
+function groupAtDefaults(keys: RuntimeKey[]): boolean {
+  return keys.every((k) => Number(form[k]) === RUNTIME_DEFAULTS[k])
+}
+
+// resetRuntimeGroup 只改表单，不落库。
+// 恢复默认若顺手就写库，「先看看默认长什么样」与「把线上改成默认」就成了一件事。
+function resetRuntimeGroup(keys: RuntimeKey[]) {
+  for (const k of keys) form[k] = RUNTIME_DEFAULTS[k]
+}
 
 // derivedTotalBudgetText 把「整请求总预算」换算成可读文本，供设置页展示。
 //
@@ -691,54 +764,173 @@ onMounted(() => {
         <div style="margin-top: 10px">表单中的数值是默认值而非当前配置，已阻止保存以免覆盖。</div>
         <button class="btn btn-primary" type="button" style="margin-top: 10px" @click="load">重新加载</button>
       </div>
-      <form v-else class="form-grid" style="max-width: 560px" @submit.prevent="save('runtime')">
-        <h2 class="section-h span2">超时（毫秒）</h2>
-        <div class="field span2">
-          <label>非流式整体超时</label>
-          <input v-model.number="form.upstream_timeout_ms" class="input num" type="number" min="1" step="1" />
-          <span class="tip">一次非流式请求最多等多久；超时后按可转移错误处理（有机会切换下一个上游）</span>
-        </div>
-        <div class="field span2">
-          <label>流式首字超时（TTFT）</label>
-          <input v-model.number="form.stream_first_token_timeout_ms" class="input num" type="number" min="1" step="1" />
-          <span class="tip">已建立连接后，首个事件迟迟不来即掐流并切换下一个上游；仅在尚未写出任何字节时生效</span>
-        </div>
-        <div class="field span2">
-          <label>流式空闲超时</label>
-          <input v-model.number="form.stream_idle_timeout_ms" class="input num" type="number" min="1" step="1" />
-          <span class="tip">已开始出字后，多久没有任何新事件即判定卡死（按截断收尾）</span>
-        </div>
+      <!-- 运行时按「谁在保护什么」分块（2026-10-13）。
+           原来 5 个旋钮挤在一张表里，只靠两个小标题分隔；更要紧的是它们
+           **失效后果不同**：改错超时是「请求变慢/被切走」，改错故障转移是
+           「一直重试坏目标」。块与块之间的分隔必须能一眼看出这是两类东西，
+           所以用带边框的卡片而不是行内标题。 -->
+      <form v-else class="rt-form" @submit.prevent="save('runtime')">
+        <!-- 分类 1：非流式 -->
+        <section class="rt-card">
+          <div class="rt-card-h">
+            <div class="rt-card-t">
+              <h3>非流式请求超时</h3>
+              <p>不流式调用（stream=false）时，一次请求最多等多久。超时按可转移错误处理。</p>
+            </div>
+            <button
+              type="button"
+              class="btn btn-ghost btn-sm"
+              :disabled="groupAtDefaults(RUNTIME_GROUPS.nonstream)"
+              @click="resetRuntimeGroup(RUNTIME_GROUPS.nonstream)"
+            >
+              恢复推荐默认
+            </button>
+          </div>
+          <div class="field">
+            <label>整体超时（毫秒）</label>
+            <input
+              v-model.number="form.upstream_timeout_ms"
+              class="input num"
+              type="number"
+              min="1"
+              max="86400000"
+              step="1"
+            />
+            <span class="tip">
+              超时后按可转移错误处理 —— 有机会切到下一个上游，而不是直接失败。
+              这是<b>单次尝试</b>的预算，不是整请求的上限（见下方「派生上限」）。
+            </span>
+            <span class="tip rec">{{ recNote('upstream_timeout_ms') }}</span>
+          </div>
+        </section>
 
-        <h2 class="section-h span2">自动故障转移</h2>
-        <div class="field span2">
-          <label>最多尝试目标数</label>
-          <input v-model.number="form.failover_max_targets" class="input num" type="number" min="1" step="1" />
-          <span class="tip">一次请求最多打某条路由链上的几个目标。是否启用按路由单独开关（路由页）</span>
-        </div>
-        <div class="field span2">
-          <label>失败熔断阈值</label>
-          <input v-model.number="form.failover_failure_threshold" class="input num" type="number" min="1" step="1" />
-          <span class="tip">某目标连续失败几次后临时摘除（60 秒冷却），期间请求自动让位给链上下一个目标</span>
-        </div>
+        <!-- 分类 2：流式 -->
+        <section class="rt-card">
+          <div class="rt-card-h">
+            <div class="rt-card-t">
+              <h3>流式看门狗</h3>
+              <p>流式调用时盯住「迟迟不出字」与「出到一半卡死」，两个是不同的时间点。</p>
+            </div>
+            <button
+              type="button"
+              class="btn btn-ghost btn-sm"
+              :disabled="groupAtDefaults(RUNTIME_GROUPS.streaming)"
+              @click="resetRuntimeGroup(RUNTIME_GROUPS.streaming)"
+            >
+              恢复推荐默认
+            </button>
+          </div>
+          <div class="field">
+            <label>首字超时（TTFT，毫秒）</label>
+            <input
+              v-model.number="form.stream_first_token_timeout_ms"
+              class="input num"
+              type="number"
+              min="1"
+              max="86400000"
+              step="1"
+            />
+            <span class="tip">
+              已建立连接后，首个事件迟迟不来即掐流并切换下一个上游。
+              <b>仅在尚未写出任何字节时生效</b>；带思考的上游首字本来就慢，别调太紧。
+            </span>
+            <span class="tip rec">{{ recNote('stream_first_token_timeout_ms') }}</span>
+          </div>
+          <div class="field">
+            <label>流式空闲超时（毫秒）</label>
+            <input
+              v-model.number="form.stream_idle_timeout_ms"
+              class="input num"
+              type="number"
+              min="1"
+              max="86400000"
+              step="1"
+            />
+            <span class="tip">
+              已开始出字后，多久没有任何新事件即判定卡死（按截断收尾）。
+              流已经发给客户端了，此时不会切换上游，只会以截断结束。
+            </span>
+            <span class="tip rec">{{ recNote('stream_idle_timeout_ms') }}</span>
+          </div>
+        </section>
 
-        <!-- 整请求总预算不是可配项（2026-10-10 新增），所以在这里说明它怎么来的。
-             不说明的后果是运维把「非流式整体超时」当成整请求上限，
-             调小它却发现流式请求照样能挂很久 —— 那正是修复前「设置旋钮管不到
-             流式」造成的误解。 -->
-        <div class="field span2">
-          <label>整请求总预算（自动推导，不可配）</label>
-          <span class="tip">
-            一次请求跨所有故障转移尝试的总时长上限，由上面的「非流式整体超时」「流式首字超时」
-            与「最多尝试目标数」自动推导（约
-            <b>{{ derivedTotalBudgetText }}</b>
-            ），并夹在 30 秒 ~ 30 分钟之间。<br />
-            没有它，一串半死的上游可以把一个客户端挂住数分钟（每个目标约 100 秒 × 目标数），
-            期间持续占用连接、配额预占和故障转移名额。<br />
-            <b>注意</b>：上面三个值都是<b>单次尝试</b>的预算，不是整请求的。
-          </span>
-        </div>
+        <!-- 分类 3：故障转移 -->
+        <section class="rt-card">
+          <div class="rt-card-h">
+            <div class="rt-card-t">
+              <h3>自动故障转移</h3>
+              <p>一个目标不行时，最多换几个、什么情况下先摘掉它。</p>
+            </div>
+            <button
+              type="button"
+              class="btn btn-ghost btn-sm"
+              :disabled="groupAtDefaults(RUNTIME_GROUPS.failover)"
+              @click="resetRuntimeGroup(RUNTIME_GROUPS.failover)"
+            >
+              恢复推荐默认
+            </button>
+          </div>
+          <div class="field">
+            <label>最多尝试目标数</label>
+            <input
+              v-model.number="form.failover_max_targets"
+              class="input num"
+              type="number"
+              min="1"
+              max="100"
+              step="1"
+            />
+            <span class="tip">
+              一次请求最多打某条路由链上的几个目标。每多一个，最坏耗时就多乘一截
+              （见下方「派生上限」）。是否启用按路由单独开关（路由页）。
+            </span>
+            <span class="tip rec">{{ recNote('failover_max_targets') }}</span>
+          </div>
+          <div class="field">
+            <label>失败熔断阈值</label>
+            <input
+              v-model.number="form.failover_failure_threshold"
+              class="input num"
+              type="number"
+              min="1"
+              max="1000"
+              step="1"
+            />
+            <span class="tip">
+              某目标连续失败几次后临时摘除（60 秒冷却），期间请求自动让位给链上下一个目标。
+              调高等于继续把请求送给已经坏掉的目标。
+            </span>
+            <span class="tip rec">{{ recNote('failover_failure_threshold') }}</span>
+          </div>
+        </section>
 
-        <div class="field span2 form-actions" style="padding: 0">
+        <!-- 分类 4：派生值（只读） -->
+        <section class="rt-card ro">
+          <div class="rt-card-h">
+            <div class="rt-card-t">
+              <h3>
+                整请求总预算
+                <span class="badge badge-off">自动推导 · 不可配</span>
+              </h3>
+              <p>一次请求跨所有故障转移尝试的总时长上限，由上面三类值推导，不是独立旋钮。</p>
+            </div>
+          </div>
+          <!-- 不说明的后果是运维把「非流式整体超时」当成整请求上限，
+               调小它却发现流式请求照样能挂很久 —— 那正是修复前「设置旋钮管不到
+               流式」造成的误解。 -->
+          <div class="derived">
+            <span class="derived-k">当前生效</span>
+            <span class="derived-v">{{ derivedTotalBudgetText }}</span>
+            <span class="tip">
+              公式：（max(非流式整体超时, 首字超时 + 等响应头 60 秒) + 5 秒）×（最多尝试目标数 + 1），
+              再夹在 30 秒 ~ 30 分钟之间。
+              没有它，一串半死的上游可以把一个客户端挂住数分钟，期间持续占用连接、配额预占和故障转移名额。
+              <b>注意</b>：上面那些超时都是<b>单次尝试</b>的预算，不是整请求的。
+            </span>
+          </div>
+        </section>
+
+        <div class="rt-actions">
           <button type="submit" class="btn btn-primary" :disabled="saving">
             {{ saving ? '保存中…' : '保存设置' }}
           </button>
@@ -748,7 +940,7 @@ onMounted(() => {
       <!-- 用量归档维护：与上面的表单无关（不保存任何设置项，是立即执行的动作），
            单独成块放在运行时页签下，而不是让运维去 curl /usage/prune。 -->
       <div v-if="!loading" class="maint">
-        <h2 class="section-h">用量归档</h2>
+        <h3 class="maint-h">用量归档</h3>
         <p class="tip">
           调用明细默认保留 30 天，更早的记录由每日定时任务聚合进「按天累计」后删除
           （累计永久保留）。这里可以手动立即执行一次剪枝，结果实时回显。
@@ -1128,22 +1320,98 @@ onMounted(() => {
 </template>
 
 <style scoped>
-/* 分区小标题：把一个长表单切成「超时 / 故障转移」两块 */
-.section-h {
-  font-size: 13px;
+/* 运行时分类块（2026-10-13）
+   分隔用「卡片」而不是行内小标题：这几类的失效后果不同（改错超时 =
+   请求变慢/被切走，改错故障转移 = 一直重试坏目标），视觉上必须能一眼
+   分出这是两类东西，才不会在改一个值时顺手以为在调另一个。 */
+.rt-form {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  max-width: 680px;
+}
+.rt-card {
+  padding: 16px 18px;
+  border: 1px solid var(--border);
+  border-radius: var(--r-card);
+  background: var(--surface);
+}
+.rt-card-h {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 14px;
+  margin-bottom: 14px;
+}
+.rt-card-h h3 {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 0;
+  font-size: 14px;
+  font-weight: 600;
+}
+.rt-card-h p {
+  /* 说明文字限宽：铺满整行会把右侧的「恢复推荐默认」推到很远，
+     眼睛要在一条长行里来回找按钮。 */
+  max-width: 46ch;
+  margin: 5px 0 0;
+  font-size: 12px;
+  line-height: 1.55;
+  color: var(--text-3);
+}
+.rt-card-h .btn {
+  flex: none;
+}
+.rt-card .field + .field {
+  margin-top: 14px;
+}
+/* 推荐值单独一行：它是「参考」而不是「约束」，与描述文字同色系但更轻，
+   避免看起来像一条必须遵守的规则。 */
+.rt-card .rec {
+  color: var(--text-4);
+  font-variant-numeric: tabular-nums;
+}
+/* 只读派生块：没有输入框，用弱一档的底色与可配卡片区分。 */
+.rt-card.ro {
+  background: var(--field-background);
+}
+.derived {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.derived-k {
+  font-size: 12.5px;
+  font-weight: 550;
+  color: var(--muted);
+}
+.derived-v {
+  font-size: 20px;
   font-weight: 650;
-  color: var(--text-2);
-  margin: 6px 0 -2px;
-  padding-bottom: 6px;
-  border-bottom: 1px solid var(--hairline);
+  font-variant-numeric: tabular-nums;
+  letter-spacing: -0.01em;
+}
+.derived .tip {
+  margin-top: 4px;
+  line-height: 1.6;
+}
+.rt-actions {
+  display: flex;
+  justify-content: flex-end;
 }
 
-/* 用量归档维护块：与上方表单分隔，宽度对齐表单 */
+/* 用量归档维护块：与上方表单分隔，宽度对齐上面的卡片列 */
 .maint {
-  max-width: 560px;
+  max-width: 680px;
   margin-top: 18px;
   padding-top: 14px;
   border-top: 1px solid var(--hairline);
+}
+.maint-h {
+  margin: 0;
+  font-size: 14px;
+  font-weight: 600;
 }
 .maint .tip {
   margin: 8px 0 12px;
@@ -1156,6 +1424,20 @@ onMounted(() => {
 }
 .prune-result b {
   font-variant-numeric: tabular-nums;
+}
+
+/* 窄屏：卡片头部的按钮换到标题下方，别把说明文字挤成一条缝 */
+@media (max-width: 640px) {
+  .rt-card-h {
+    flex-direction: column;
+    gap: 10px;
+  }
+  .rt-card-h .btn {
+    align-self: flex-start;
+  }
+  .rt-actions {
+    justify-content: stretch;
+  }
 }
 
 /* 价格分类：标题行 + 筛选行 */

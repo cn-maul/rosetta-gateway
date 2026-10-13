@@ -187,11 +187,31 @@ func (c *Config) setDefaults() {
 	if c.LogLevel == "" {
 		c.LogLevel = "info"
 	}
+	// 超时类兜底值的口径（2026-10-13 复核）：
+	// 这三项原是 120s / 60s / 30s，是按「短对话、响应很快」调的；对
+	// 非流式长回复与带思考的上游偏紧，于是**正常请求**被判成超时并触发
+	// 故障转移（用户侧表现是无故变慢 + 结果不对，而不是明确的报错）。
+	//
+	//	upstream_timeout_ms 120s → 300s：非流式没有增量输出可看，只能干等；
+	//	  2 分钟连 8K tokens 的回复都跑不完（按 ~40 tok/s）。5 分钟覆盖绝大多数
+	//	  非流式生成；再往上会让派生的总预算（cmd/gateway 的 totalRequestBudget）
+	//	  直接撞上 30 分钟上限，推导值就永远显示同一个数，失去意义。
+	//	stream_first_token_timeout_ms 30s → 60s：bootstrap 里的 deepseek-reasoner
+	//	  这类带思考的上游，首字本来就要几十秒。
+	//	stream_idle_timeout_ms 60s → 120s：已出字后两个事件间隔超过 60s 在慢速流上
+	//	  并不罕见；调大只影响「真卡死」的发现速度，不影响健康流。
+	//
+	// 故障转移两项维持 3/3：链上第 4 个目标几乎不提升成功率却把最坏耗时再乘一截；
+	// 连续失败 3 次已足够判定目标有问题。
+	//
+	// 三处必须同步：这里、config.example.json、web 的设置页 RUNTIME_DEFAULTS。
+	// 界面回显的是生效值，DB 未配置时生效值就来自这里 ——
+	// 三处不一致会让运维照着界面推理出错误的预期。
 	if c.Defaults.UpstreamTimeoutMs == 0 {
-		c.Defaults.UpstreamTimeoutMs = 120000
+		c.Defaults.UpstreamTimeoutMs = 300000
 	}
 	if c.Defaults.StreamIdleTimeoutMs == 0 {
-		c.Defaults.StreamIdleTimeoutMs = 60000
+		c.Defaults.StreamIdleTimeoutMs = 120000
 	}
 	if c.Defaults.MaxRetries == 0 {
 		c.Defaults.MaxRetries = 2
@@ -200,7 +220,7 @@ func (c *Config) setDefaults() {
 		c.Defaults.MaxRequestBodyBytes = 32 * 1024 * 1024
 	}
 	if c.Defaults.StreamFirstTokenTimeoutMs == 0 {
-		c.Defaults.StreamFirstTokenTimeoutMs = 30000
+		c.Defaults.StreamFirstTokenTimeoutMs = 60000
 	}
 	if c.Defaults.FailoverMaxTargets == 0 {
 		c.Defaults.FailoverMaxTargets = 3

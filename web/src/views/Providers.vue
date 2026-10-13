@@ -290,6 +290,54 @@ async function removeCred(c: Credential) {
   }
 }
 
+// ---------- 凭据启停（同一上游同时只启用一把） ----------
+
+// 与 testing / balanceBusy 同款的按 id 防连点。
+//
+// 启停尤其需要它：它是「切换」语义，连点两次的结果与点一次完全相反
+// （开了又关），而期间请求池真的换过一次 key。
+const credToggling = ref(new Set<string>())
+
+// credTogglingIds 是给子组件的数组形态。Set 本身不能跨组件传（它是
+// ref 里的可变对象，就地改不保证触发更新），所以整体替换后展开成数组。
+const credTogglingIds = computed(() => [...credToggling.value])
+
+function isCredToggling(id: string): boolean {
+  return credToggling.value.has(id)
+}
+function setCredToggling(id: string, on: boolean): void {
+  const next = new Set(credToggling.value)
+  if (on) next.add(id)
+  else next.delete(id)
+  credToggling.value = next
+}
+
+async function toggleCred(c: Credential) {
+  if (isCredToggling(c.id)) return
+  const turningOn = !c.enabled
+  // 先记下「本来开着的是谁」：这次请求会把它们一并关掉，而响应只描述
+  // 这一把凭据。若不在这里数一遍，切换发生的事实就只剩列表里一个
+  // 悄悄翻转的徽章 —— 用户会以为流量没换过去。
+  const previouslyOn = (credsMap[c.provider_id] ?? []).filter((x) => x.enabled && x.id !== c.id)
+
+  setCredToggling(c.id, true)
+  try {
+    await api.updateCredential(c.id, { enabled: turningOn })
+    if (turningOn && previouslyOn.length > 0) {
+      toast(`已切到「${c.label || c.id}」，原启用的 ${previouslyOn.length} 把已停用`)
+    } else {
+      toast(turningOn ? '已启用' : '已停用')
+    }
+    // 必须整表重载：同 provider 的其它行状态也变了，而 PATCH 的响应
+    // 只带这一把。只更新这一行会让界面显示出两把都启用。
+    await openExpand(c.provider_id, true)
+  } catch (e) {
+    if ((e as { status?: number }).status !== 401) toast('操作失败：' + (e as Error).message, 'err')
+  } finally {
+    setCredToggling(c.id, false)
+  }
+}
+
 // ---------- 凭据余额 ----------
 
 // 余额是**点按查询**的结果，不是后台轮询的快照。
@@ -667,10 +715,12 @@ onMounted(() => {
                   :creds="credsMap[p.id] ?? []"
                   :balance="balances[p.id]"
                   :balance-busy="isBalanceBusy(p.id)"
+                  :toggling="credTogglingIds"
                   @add="openCred(p.id)"
                   @query-balance="queryBalance(p.id)"
                   @edit="(c) => openCred(p.id, c)"
                   @remove="removeCred"
+                  @toggle="toggleCred"
                 />
                 <UpstreamModelPanel
                   :models="modelsMap[p.id] ?? []"
@@ -771,6 +821,15 @@ onMounted(() => {
             <label>API Key {{ cForm.editing ? '（留空则不更换）' : '*' }}</label>
             <input v-model="cForm.api_key" class="input mono" type="password" placeholder="sk-..." autocomplete="new-password" />
             <span class="tip">保存后加密入库，仅显示掩码，不再可见明文</span>
+          </div>
+          <!-- 启停不在表单里问（同 Routes 页的理由：问的是还没发生的事）。
+               但「同时只启用一把」的默认规则必须提前讲清楚，否则用户
+               会把新 key 加进来就以为它已经在跑，实际是停用态。 -->
+          <div v-if="!cForm.editing" class="field span2">
+            <span class="tip">
+              同一上游同时只启用一把 key：若该上游已有启用的凭据，新建的这把会先以
+              <strong>停用</strong>状态保存 —— 确认可用后在凭据列表里打开它的开关即可切换。
+            </span>
           </div>
           <!-- 权重输入框已按需求移除。weight 列与负载均衡逻辑都还在，
                只是界面上不再提供入口；已有凭据的权重保持原值不被改写。 -->

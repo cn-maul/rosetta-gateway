@@ -23,6 +23,12 @@ func NewCredentialHandler(st *store.Store, masterKey []byte) *CredentialHandler 
 // PATCH 语义（2026-09-21 重构）：字段为指针，nil = 未提供（保持原值）。
 // APIKey 是「不提供即不更换」；显式传空串会被拒绝 —— 空密钥的凭据没有意义，
 // 要弃用请直接删除凭据或置 enabled=false，不该静默变成一条永远 401 的记录。
+//
+// Enabled 额外带一条**跨行**约束：同一个上游同时只允许一把凭据启用。
+// 把它设为 true 是「切到这一把」（同 provider 的其余凭据在同一事务里
+// 一并停用，见 store.EnableExclusiveCredential），设为 false 只是停用它自己。
+// 新建时该字段缺席则按「当前一把都没有 → 启用；已有 → 停用」处理，
+// 于是「加一把备用 key」不会顺手把正在跑的流量切走。
 type credentialRequest struct {
 	Label   *string `json:"label"`
 	APIKey  *string `json:"api_key"`
@@ -85,10 +91,22 @@ func (h *CredentialHandler) Create(w http.ResponseWriter, r *http.Request, provi
 		return
 	}
 
-	enabled := true
+	// 同一上游同时只允许一把启用（见 store.EnableExclusiveCredential），
+	// 所以新建时的默认值不是恒定的 true，而是「当前一把都没有才默认启用」：
+	// 「加一把备用 key」不该顺手把正在跑的流量切走，而「这个上游刚建好、
+	// 这是它的第一把 key」仍然要自动可用。
+	wantEnabled := false
 	if req.Enabled != nil {
-		enabled = *req.Enabled
+		wantEnabled = *req.Enabled
+	} else {
+		hasEnabled, err := h.store.HasEnabledCredential(r.Context(), providerID)
+		if err != nil {
+			writeServerError(w, "check enabled credentials", err)
+			return
+		}
+		wantEnabled = !hasEnabled
 	}
+
 	weight := derefInt(req.Weight)
 	if weight <= 0 {
 		weight = 1
@@ -99,14 +117,26 @@ func (h *CredentialHandler) Create(w http.ResponseWriter, r *http.Request, provi
 		ProviderID: providerID,
 		Label:      strings.TrimSpace(derefStr(req.Label)),
 		APIKeyEnc:  enc,
-		Enabled:    enabled,
-		Weight:     weight,
-		Status:     "healthy",
+		// 一律先以**停用态**落库，要启用再走 EnableExclusiveCredential：
+		// 那样「关掉同上游其它凭据」与「打开这一把」收在同一个事务里。
+		// 否则这里是 INSERT enabled=1、下一步才去关旧的，两步之间崩溃
+		// 就留下一把「两把都启用」的记录，而界面上完全看不出来。
+		Enabled: false,
+		Weight:  weight,
+		Status:  "healthy",
 	}
 
 	if err := h.store.CreateCredential(r.Context(), c); err != nil {
 		writeServerError(w, "create credential", err)
 		return
+	}
+
+	if wantEnabled {
+		if err := h.store.EnableExclusiveCredential(r.Context(), providerID, c.ID); err != nil {
+			writeNotFoundOrError(w, "enable credential", "凭据不存在（可能已被并发删除）", err)
+			return
+		}
+		c.Enabled = true
 	}
 
 	writeJSON(w, http.StatusCreated, h.toCredentialResponse(*c))
@@ -151,7 +181,12 @@ func (h *CredentialHandler) Update(w http.ResponseWriter, r *http.Request, id st
 		existing.APIKeyEnc = enc
 	}
 	if req.Enabled != nil {
-		existing.Enabled = *req.Enabled
+		// 启用的收尾交给 EnableExclusiveCredential（它会把同 provider 的
+		// 其余凭据一并停用）。所以在 UpdateCredential 之前一律把 enabled
+		// 压成 false，让这一步不去动启用态 —— 否则这里是「开新的」、
+		// 下一步是「关旧的」，两条独立写之间崩溃就留下两把都启用，
+		// 而请求池会照权重在两把 key 之间轮询，没人知道该只有一把在用。
+		existing.Enabled = false
 	}
 	if req.Weight != nil {
 		if *req.Weight < 1 {
@@ -164,6 +199,14 @@ func (h *CredentialHandler) Update(w http.ResponseWriter, r *http.Request, id st
 	if err := h.store.UpdateCredential(r.Context(), id, existing); err != nil {
 		writeNotFoundOrError(w, "update credential", "凭据不存在（可能已被并发删除）", err)
 		return
+	}
+
+	if req.Enabled != nil && *req.Enabled {
+		if err := h.store.EnableExclusiveCredential(r.Context(), existing.ProviderID, id); err != nil {
+			writeNotFoundOrError(w, "enable credential", "凭据不存在（可能已被并发删除）", err)
+			return
+		}
+		existing.Enabled = true
 	}
 
 	writeJSON(w, http.StatusOK, h.toCredentialResponse(*existing))
