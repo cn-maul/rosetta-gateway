@@ -159,48 +159,52 @@ onMounted(load)
           需要更多模型请联系管理员调整分组白名单。
         </p>
 
-        <!-- 只读清单：不用复选框（没有待保存的状态），也不给自由输入
-             （白名单是精确匹配）。单价单位「元 / 百万 tokens」，与设置页
-             的价格表同口径。 -->
-        <div class="tbl-wrap">
-          <table class="tbl">
-            <thead>
-              <tr>
-                <th>模型名</th>
-                <!--
-                  单位写进表头（2026-10-11 前端审计）：原先只在表格**下方的**
-                  注释里写「元 / 百万 tokens」，读表头的人很容易把 3.00 当成
-                  任意单位。价格表最容易被误读的就是单位。
-                -->
-                <th class="num-h">输入<br /><span class="dim th-unit">元 / 百万 tokens</span></th>
-                <th class="num-h">输出<br /><span class="dim th-unit">元 / 百万 tokens</span></th>
-                <!-- 「缓存命中」改成「其中:缓存命中」（2026-10-12）。
-                     三列并排会让人以为「三项相加 = 总输入成本」，
-                     而缓存命中其实是**输入的一部分**（两个上游协议里
-                     cached 都 ⊆ input，见 fmt.ts / types.ts 的说明）——
-                     它是命中时的**折扣价**，不是新增的一项。
-                     「其中:」这个前缀把包含关系直接写在表头里。 -->
-                <th class="num-h">其中:缓存命中<br /><span class="dim th-unit">元 / 百万 tokens</span></th>
-              </tr>
-            </thead>
-            <tbody>
-              <tr v-for="m in sorted" :key="m">
-                <td class="mono">{{ m }}</td>
-                <!-- 括号不能省：`!` 的优先级高于 `>`，写成 `!(x ?? 0) > 0` 会被解析成
-                 `!(x) > 0`（拿布尔比数字），且 vue-tsc 会当场报错 —— 这个错法
-                 编译期就挡住，正说明不该图省事。 -->
-                <td class="num-h" :class="{ unset: (priceOf(m)?.price_input ?? 0) <= 0 }">
+<!-- 卡片式清单（2026-10-14）：每个模型一张 HeroUI 风格的 card。
+
+           **只读语义不变**：不放复选框（没有待保存的状态），也不给自由输入
+           （白名单是精确匹配）。换的只是呈现方式 —— 表格适合「逐行比对数字」，
+           而这份清单的实际用法是「确认我有哪些模型可用、单价大概多少」，
+           卡片在窄屏与模型数多时都更好扫。
+
+           单价单位**写进每张卡**而不是只在表头：表头式的单位在卡片布局里
+           没有承载位置，而价格最容易被误读的就是单位（见上方 th-unit 注释）。 -->
+        <div class="model-grid">
+          <article v-for="m in sorted" :key="m" class="card model-card">
+            <div class="card__header">
+              <div class="card__title model-name mono">{{ m }}</div>
+              <!-- 描述位放「单价是否已配齐」：三档全未配置时给一句提示，
+                   避免一整片「未配置」被读成「这些模型都免费」。 -->
+              <div class="card__description model-sub">
+                <template v-if="priceOf(m)">单价（元 / 百万 tokens）</template>
+                <template v-else>未配置单价 · 按 0 元计</template>
+              </div>
+            </div>
+
+            <div class="card__content model-prices">
+              <div class="price-row">
+                <span class="price-lab">输入</span>
+                <span class="price-val mono" :class="{ unset: (priceOf(m)?.price_input ?? 0) <= 0 }">
                   {{ priceCell(priceOf(m)?.price_input) }}
-                </td>
-                <td class="num-h" :class="{ unset: (priceOf(m)?.price_output ?? 0) <= 0 }">
+                </span>
+              </div>
+              <div class="price-row">
+                <span class="price-lab">输出</span>
+                <span class="price-val mono" :class="{ unset: (priceOf(m)?.price_output ?? 0) <= 0 }">
                   {{ priceCell(priceOf(m)?.price_output) }}
-                </td>
-                <td class="num-h" :class="{ unset: (priceOf(m)?.price_cache_hit ?? 0) <= 0 }">
+                </span>
+              </div>
+              <!-- 「其中:缓存命中」这个前缀不能省：三档并排会让人以为
+                   「三项相加 = 总输入成本」，而缓存命中其实是**输入的一部分**
+                   （两个上游协议里 cached 都 ⊆ input），它是命中时的**折扣价**，
+                   不是新增的一项。 -->
+              <div class="price-row">
+                <span class="price-lab">其中:缓存命中</span>
+                <span class="price-val mono" :class="{ unset: (priceOf(m)?.price_cache_hit ?? 0) <= 0 }">
                   {{ priceCell(priceOf(m)?.price_cache_hit) }}
-                </td>
-              </tr>
-            </tbody>
-          </table>
+                </span>
+              </div>
+            </div>
+          </article>
         </div>
       </template>
     </div>
@@ -241,9 +245,66 @@ onMounted(load)
 </template>
 
 <style scoped>
+/* ---------- 卡片式模型清单（2026-10-14） ----------
+   从表格改成 HeroUI card 网格。复用全局 .card / .card__* 结构
+   （styles.css:787 起，与 CredentialPanel 同一套 HeroUI 移植）。 */
+
+/* auto-fill + minmax：卡片数随宽度自动换行，不写死列数 —— 模型从 3 个到
+   80 个都能用同一套布局（写死 3 列在窄屏会把卡片挤成一条）。
+   minmax 的下限 232px 是「模型名 + 三行价格」不折行的最小可用宽度。 */
+.model-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(232px, 1fr));
+  gap: 12px;
+}
+.model-card {
+  gap: 10px;
+  padding: 14px 16px;
+}
+/* 模型名可能很长（provider/model 形式），允许在连字符处折行而不是撑破卡片 */
+.model-name {
+  font-family: var(--mono, ui-monospace, monospace);
+  font-size: 13.5px;
+  line-height: 1.4;
+  overflow-wrap: anywhere;
+}
+.model-sub {
+  font-size: 12px;
+  margin-top: 2px;
+}
+.model-prices {
+  gap: 3px;
+}
+.price-row {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 10px;
+  font-size: 12.5px;
+}
+.price-lab {
+  color: var(--text-3);
+  white-space: nowrap;
+}
+.price-val {
+  font-weight: 600;
+  /* 数字右对齐在纵向列表里读起来更整齐（tabular 让小数点对齐） */
+  font-variant-numeric: tabular-nums;
+  text-align: right;
+}
+/* 「未配置」弱化：明确写「未配置」还不够 —— 它得读起来像一条**说明**
+   而不是一个价格，否则用户还是会把它当成数字。与 Settings.vue 的 .unset
+   同一套口径：价格在设置页、这里在只读清单，但说的是同一件事。 */
+.price-val.unset {
+  color: var(--text-4);
+  font-weight: 400;
+}
+
 /* 价格表表头下的单位标注（2026-10-11 前端审计）。
    表头里塞单位是因为价格表最容易被误读 —— 「3.00」在不知道单位时
-   可以被当成任何东西。放在表格下方的注释里等于没写。 */
+   可以被当成任何东西。放在表格下方的注释里等于没写。
+   卡片化后单位写进 card__description（.model-sub），此样式已无用，
+   保留是给「关于这份清单」等仍可能引用 th-unit 的位置兜底。 */
 .th-unit {
   font-weight: 400;
   font-size: 11px;
@@ -261,12 +322,6 @@ onMounted(load)
   color: var(--warning-soft-foreground);
   font-size: 12.5px;
   line-height: 1.55;
-}
-/* 「未配置」弱化：明确写「未配置」还不够 —— 它得读起来像一条**说明**
-   而不是一个价格，否则用户还是会把它当成数字。类名与颜色都与 Settings.vue
-   的 .unset 同款：价格在设置页、这里在只读清单，但说的是同一件事。 */
-.tbl td.unset {
-  color: var(--text-4);
 }
 .err-retry {
   margin-top: 10px;
