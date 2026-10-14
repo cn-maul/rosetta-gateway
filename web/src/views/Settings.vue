@@ -718,9 +718,86 @@ const selectedPriceRows = computed(() =>
   priceRows.value.filter((r) => priceSelected.value.has(r.model.id)),
 )
 
-// 打开批量弹窗：以勾选的第一行为初值。若没勾选任何行，则用「当前筛选下
-// 第一行」的价格做初值 —— 那正是「复制到其它模型」的入口（点某行复制，
-// 初值就是那行）。
+// ---------- 批量弹窗的模型选择器（2026-10-14 修复） ----------
+
+// # 为什么必须是「全部模型」而不是 priceRows
+//
+// 初版把选择器做在价格列表的行勾选上，而价格列表**只列已配价的模型**
+// （priceRows 的 isPriced 过滤）。于是形成死锁：想让一个没配过价的模型
+// 拿到价格，就必须先在列表里勾它 —— 但它不在列表里；想让它进列表，就得
+// 先给它配价 —— 而配价正是做不到的那一步。批量功能实际只对「已经配过价
+// 的模型」有效，正好把最需要它的场景（一次配好一批新模型）排除在外。
+//
+// 所以选择器搬进弹窗，数据源改成 allModels（含未配价的）。列表行的
+// 勾选仍然保留 —— 它在「批量改一批已有条目」时更顺手。
+
+// batchTargets 是弹窗里可选的全部模型（跨 provider 扁平）。
+const batchTargets = computed(() => {
+  const q = batchSearch.value.trim().toLowerCase()
+  const out: PriceRow[] = []
+  for (const p of providers.value) {
+    if (batchProvider.value && p.id !== batchProvider.value) continue
+    for (const m of modelsMap[p.id] ?? []) {
+      if (q && !m.model_id.toLowerCase().includes(q) && !(m.display_name ?? '').toLowerCase().includes(q))
+        continue
+      out.push({ providerId: p.id, providerName: p.name || p.slug, model: m })
+    }
+  }
+  return out
+})
+
+const batchProvider = ref('')
+const batchSearch = ref('')
+
+// 弹窗内的勾选集合（与列表的 priceSelected 分开：两处的选择语义不同，
+// 混用会导致「在列表勾了 3 个、打开弹窗发现勾的是另外 3 个」）。
+const batchSelected = ref(new Set<string>())
+
+function isBatchSelected(id: string): boolean {
+  return batchSelected.value.has(id)
+}
+function toggleBatchSelected(id: string): void {
+  const next = new Set(batchSelected.value)
+  if (next.has(id)) next.delete(id)
+  else next.add(id)
+  batchSelected.value = next
+}
+// 「全选」按**当前筛选**（供应商 + 搜索词），不是全库 —— 用户筛了供应商
+// 再点全选，期望的是「把这家全选上」，而不是无视筛选把别家也拉进来。
+function selectAllBatch(): void {
+  const next = new Set(batchSelected.value)
+  for (const r of batchTargets.value) next.add(r.model.id)
+  batchSelected.value = next
+}
+function clearBatchSelection(): void {
+  batchSelected.value = new Set()
+}
+
+// batchSelectedModels 按已勾 id 反查模型行（**不受筛选影响**）。
+//
+// 刻意不用 batchTargets 过滤已勾集合：筛选一变，已勾的行就凭空消失，
+// 用户切回原筛选才发现「我刚才勾的怎么没了」。按 id 反查保证勾选稳定。
+const batchSelectedModels = computed<PriceRow[]>(() => {
+  const byId = new Map<string, PriceRow>()
+  for (const p of providers.value) {
+    for (const m of modelsMap[p.id] ?? []) {
+      byId.set(m.id, { providerId: p.id, providerName: p.name || p.slug, model: m })
+    }
+  }
+  const out: PriceRow[] = []
+  for (const id of batchSelected.value) {
+    const row = byId.get(id)
+    if (row) out.push(row)
+  }
+  return out
+})
+
+// 打开批量弹窗。seedRow 是「复制到…」的来源行（用它的价格做初值）。
+//
+// 目标集合取 seedRow（点它就是为了复制到「别的模型」，所以默认**取消**
+// 它自己的勾选 —— 否则「复制」会把它自己也包含进去，覆盖是幂等的所以
+// 不出错，但用户看到「已选 1 个」会以为自己没选对）。没有 seedRow 时
+// （工具条入口）把列表里已勾的搬进来。
 function openBatchPrice(seedRow?: PriceRow) {
   const seed = seedRow ?? selectedPriceRows.value[0] ?? pricePageRows.value[0]
   if (!seed) {
@@ -730,13 +807,21 @@ function openBatchPrice(seedRow?: PriceRow) {
   batchForm.price_input = seed.model.price_input
   batchForm.price_cache_hit = seed.model.price_cache_hit
   batchForm.price_output = seed.model.price_output
+  // 筛选重置到「全部」：来源行可能来自某个供应商筛选下，直接沿用会让
+  // 用户在弹窗里看不到其它供应商的模型（而跨供应商复制正是主要用途）。
+  batchProvider.value = ''
+  batchSearch.value = ''
+  batchSelected.value = new Set()
+  if (!seedRow) {
+    // 工具条入口：把列表里已勾的搬进来（列表勾选的语义是「我要改这几条」）。
+    batchSelected.value = new Set(priceSelected.value)
+  }
   batchOpen.value = true
 }
 
-// 提交批量设置。目标 = 当前勾选的行；若一个都没勾，则把「当前页全部」当目标
-// （配合「复制到…」：点某行复制 → 该行被勾上 → 提交即应用到它）。
+// 提交批量设置。目标 = 弹窗内勾选的全部模型（含未配价的）。
 async function saveBatchPrice() {
-  const targets = selectedPriceRows.value
+  const targets = batchSelectedModels.value
   if (targets.length === 0) {
     toast('请先勾选要设置价格的模型', 'err')
     return
@@ -752,11 +837,18 @@ async function saveBatchPrice() {
   }
   // 三项全 0 = 清除价格。这里不拦（批量清除是合法动作），但确认文案要讲清。
   const clearing = body.price_input === 0 && body.price_cache_hit === 0 && body.price_output === 0
+  // 确认框里列出前几个模型名：跨供应商批量改价最容易勾错行，名字是唯一
+  // 能让用户在点确认前核对「到底要改谁」的信息。
+  const preview = targets
+    .slice(0, 3)
+    .map((r) => r.model.model_id)
+    .join('、')
+  const more = targets.length > 3 ? ` 等 ${targets.length} 个` : ''
   const ok = await confirmBox({
     title: clearing ? `清除 ${targets.length} 个模型的价格？` : `为 ${targets.length} 个模型设置价格？`,
     body: clearing
-      ? '清除后这些模型此后的用量按 0 元计；已经产生的费用按当时的价固化，不受影响。'
-      : `将把输入/缓存命中/输出单价应用到 ${targets.length} 个模型。只影响之后的调用，历史费用不回溯。`,
+      ? `涉及：${preview}${more}。清除后这些模型此后的用量按 0 元计；已经产生的费用按当时的价固化，不受影响。`
+      : `涉及：${preview}${more}。只影响之后的调用，历史费用不回溯。`,
     confirmLabel: clearing ? '清除' : '应用',
   })
   if (!ok) return
@@ -1246,21 +1338,11 @@ onMounted(() => {
           <option v-for="p in providers" :key="p.id" :value="p.id">{{ p.name || p.slug }}</option>
         </select>
         <input v-model="priceSearch" class="input" placeholder="搜索价格条目…" />
-        <!-- 批量操作区：勾选后出现。全选/清空作用于当前页。 -->
-        <template v-if="priceSelected.size > 0">
-          <span class="dim">已选 {{ priceSelected.size }} 个</span>
-          <button class="btn btn-sm btn-ghost" type="button" @click="clearPriceSelection">清空</button>
-          <button class="btn btn-sm" type="button" @click="openBatchPrice()">批量设置价格</button>
-        </template>
-        <button
-          v-else
-          class="btn btn-sm btn-ghost"
-          type="button"
-          title="把当前页全部模型的价格设为同一个值"
-          @click="selectPricePage"
-        >
-          全选本页
-        </button>
+        <!-- 批量入口。**不再要求先勾选**：弹窗内自带的模型选择器含未配价的模型，
+             而列表只列已配价的 —— 让人「先在这里勾」等于要求目标已经配过价，
+             恰好把批量配价最该解决的场景排除在外。 -->
+        <button class="btn btn-sm" type="button" @click="openBatchPrice()">批量设置价格</button>
+        <span v-if="priceSelected.size > 0" class="dim">已勾选 {{ priceSelected.size }} 个（将带入弹窗）</span>
       </div>
 
       <div v-if="pricesLoading" class="loading">加载中…</div>
@@ -1310,8 +1392,9 @@ onMounted(() => {
                 </td>
                 <td class="c-op">
                   <button class="btn btn-sm btn-ghost" type="button" @click="openEditPrice(r)">编辑</button>
-                  <!-- 复制到…：以这行的价格为初值打开批量弹窗，勾选目标模型后应用。
-                       这是「一个配好价，其他快速标上同样价格」的直接入口。 -->
+                  <!-- 复制到…：以这行的价格为初值打开批量弹窗，在弹窗里勾选
+                       目标模型（含未配价的）。这条路径不依赖列表勾选 —— 列表只列
+                       已配价的模型，而批量配价的意义正是把没配价的也配进来。 -->
                   <button
                     class="btn btn-sm btn-ghost"
                     type="button"
@@ -1445,27 +1528,51 @@ onMounted(() => {
       </form>
     </AppModal>
 
-    <!-- 批量设置价格：把同一组价格应用到勾选的多个模型 -->
+    <!-- 批量设置价格：把同一组价格应用到勾选的多个模型。
+
+         模型选择器在**弹窗内**（2026-10-14 修复）：初版做在价格列表的行勾选上，
+         而列表只列已配价的模型，于是「给没配过价的模型配价」永远做不到 ——
+         要勾它得先让它进列表，要让它进列表得先给它配价。 -->
     <AppModal
       :open="batchOpen"
       title="批量设置价格"
-      max-width="520px"
+      max-width="640px"
       :dismissable="false"
     >
       <form @submit.prevent="saveBatchPrice">
         <div class="form-grid">
           <div class="field span2">
-            <label>目标模型（{{ selectedPriceRows.length }} 个）</label>
-            <div class="batch-targets">
-              <span v-for="r in selectedPriceRows.slice(0, 12)" :key="r.model.id" class="badge">
-                {{ r.model.model_id }}
-              </span>
-              <span v-if="selectedPriceRows.length > 12" class="dim">
-                等 {{ selectedPriceRows.length }} 个
-              </span>
-              <span v-if="selectedPriceRows.length === 0" class="dim">尚未勾选模型</span>
+            <label>目标模型（已选 {{ batchSelectedModels.length }} 个）</label>
+            <div class="batch-picker">
+              <div class="batch-picker-filters">
+                <select v-model="batchProvider" class="select batch-sel">
+                  <option value="">全部供应商</option>
+                  <option v-for="p in providers" :key="p.id" :value="p.id">{{ p.name || p.slug }}</option>
+                </select>
+                <input v-model="batchSearch" class="input" placeholder="搜索模型…" />
+                <button class="btn btn-sm btn-ghost" type="button" @click="selectAllBatch">全选</button>
+                <button class="btn btn-sm btn-ghost" type="button" @click="clearBatchSelection">清空</button>
+              </div>
+              <div class="batch-list">
+                <label v-for="r in batchTargets" :key="r.model.id" class="batch-item">
+                  <input
+                    type="checkbox"
+                    :checked="isBatchSelected(r.model.id)"
+                    @change="toggleBatchSelected(r.model.id)"
+                  />
+                  <span class="mono batch-name">{{ r.model.model_id }}</span>
+                  <span class="dim batch-prov">{{ r.providerName }}</span>
+                  <!-- 已配价的标出来：批量覆盖它们是有意还是误勾，一眼可辨 -->
+                  <span v-if="isPriced(r.model)" class="batch-tag">已配价</span>
+                </label>
+                <div v-if="batchTargets.length === 0" class="dim batch-empty">
+                  没有匹配的模型
+                </div>
+              </div>
             </div>
-            <span class="tip">勾选列表中的模型后点「批量设置价格」；也可点某行的「复制到…」以那行的价格为初值</span>
+            <span class="tip">
+              含未配价的模型 —— 一次把同一批模型的价格配齐。三项全 0 = 清除价格。
+            </span>
           </div>
           <div class="field">
             <label>输入价格（元/1M）</label>
@@ -1505,8 +1612,8 @@ onMounted(() => {
         <div class="form-actions">
           <div class="actions-right">
             <button type="button" class="btn btn-ghost" @click="batchOpen = false">取消</button>
-            <button type="submit" class="btn btn-primary" :disabled="batchSaving || selectedPriceRows.length === 0">
-              {{ batchSaving ? '应用中…' : '应用' }}
+            <button type="submit" class="btn btn-primary" :disabled="batchSaving || batchSelectedModels.length === 0">
+              {{ batchSaving ? '应用中…' : `应用到 ${batchSelectedModels.length} 个模型` }}
             </button>
           </div>
         </div>
@@ -1681,22 +1788,68 @@ onMounted(() => {
 .c-sel input {
   accent-color: var(--accent);
 }
-/* 批量弹窗里的目标模型胶囊 */
-.batch-targets {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 6px;
-  min-height: 26px;
-  align-items: center;
-}
-.batch-targets .badge {
-  font-size: 12px;
-  padding: 2px 8px;
-  border-radius: 999px;
-  background: var(--surface-2);
+/* 批量弹窗里的模型选择器（2026-10-14）。
+   独立滚动区 + 上限高度：模型多时弹窗不能被撑成一屏，否则底部「应用」
+   按钮被推到视口外，用户勾完发现找不到提交键。 */
+.batch-picker {
   border: 1px solid var(--border);
-  color: var(--text-2);
+  border-radius: 8px;
+  overflow: hidden;
+}
+.batch-picker-filters {
+  display: flex;
+  gap: 6px;
+  align-items: center;
+  padding: 8px;
+  border-bottom: 1px solid var(--border);
+  background: var(--surface-2, transparent);
+}
+.batch-sel {
+  width: 150px;
+  flex: none;
+}
+.batch-list {
+  max-height: 240px;
+  overflow-y: auto;
+  padding: 4px 0;
+}
+.batch-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 4px 10px;
+  cursor: pointer;
+}
+.batch-item:hover {
+  background: var(--hover);
+}
+.batch-item input {
+  accent-color: var(--accent);
+  flex: none;
+}
+.batch-name {
+  font-size: 13px;
+  overflow: hidden;
+  text-overflow: ellipsis;
   white-space: nowrap;
+}
+.batch-prov {
+  font-size: 11px;
+  margin-left: auto;
+  flex: none;
+}
+/* 「已配价」标记：提醒这一行会被覆盖，且与未配价的行语义不同。 */
+.batch-tag {
+  font-size: 10px;
+  padding: 1px 6px;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  color: var(--text-3);
+  flex: none;
+}
+.batch-empty {
+  font-size: 12px;
+  padding: 8px 10px;
 }
 /* 弹窗底部：左侧「删除价格」，右侧取消/保存 */
 .form-actions.spread {
