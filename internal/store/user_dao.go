@@ -2,10 +2,19 @@ package store
 
 import (
 	"context"
+	"crypto/subtle"
 	"database/sql"
 	"errors"
 	"time"
 )
+
+// ErrBootstrapTokenMismatch 表示引导令牌比对不通过（给错了或没给）。
+//
+// 为什么用哨兵错误而不是一个额外的 bool 返回值：设密本身已经有一个
+// 「没写成」的布尔结果（窗口已关），令牌不匹配塞进同一个 bool 之后，
+// 调用方分不清「你输错令牌、窗口还开着、拿正确令牌还能继续」与
+// 「窗口已经关了、你怎么重试都没用」—— 这两种情况的处置完全相反。
+var ErrBootstrapTokenMismatch = errors.New("bootstrap token mismatch")
 
 // User 是访问密钥的归属主体（多用户改造 P0）。
 //
@@ -300,12 +309,88 @@ func (s *Store) SetUserPassword(ctx context.Context, id, passwordHash string) er
 // 设的那把；反过来「置标成功但设密失败」会把真正要引导的人锁在门外。
 // 只有真正设上密码（UPDATE 命中）才置标，重复初始化（0 行）不产生任何写入。
 func (s *Store) SetInitialAdminPassword(ctx context.Context, id, passwordHash string) (bool, error) {
+	return s.setInitialAdminPassword(ctx, id, passwordHash, false, "")
+}
+
+// setInitialAdminPassword 是上面那个方法的真实实现，多带一个引导令牌闸门。
+//
+// # 为什么需要令牌（2026-10-14 上线前审计加固）
+//
+// 引导窗口是**免鉴权**的，且容器默认监听 0.0.0.0 —— 于是「谁先连到端口，
+// 谁就是管理员」。SameOrigin 只能挡浏览器发起的跨站请求，挡不住任何能
+// 直接访问该端口的人：curl 没有 Origin，服务端无从分辨是运维还是攻击者。
+// 部署到公网/共享网络时这是一条真实的抢注路径。
+//
+// 令牌由启动流程生成并打印到日志（见 cmd/gateway 的引导令牌生成段），
+// 只有部署者拿得到。检查与写入在**同一事务**里：比对通过才写密码，
+// 比对不过则 0 行受影响、窗口照旧开着，运维拿正确令牌重试即可。
+//
+// 必须同事务的理由与「置 bootstrap_completed 标记」完全一致：分成两步，
+// 就会出现「密码设上了但令牌没清」的中间态 —— 那一态下攻击者仍持有效令牌，
+// 而管理员以为窗口已关。
+func (s *Store) setInitialAdminPassword(ctx context.Context, id, passwordHash string,
+	requireToken bool, token string) (bool, error) {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return false, err
 	}
 	defer tx.Rollback()
 
+	// 先读一次窗口状态，再比令牌。
+	//
+	// # 为什么必须这个顺序
+	//
+	// 顺序反过来（先比令牌）会稳定地给出**错误诊断**：窗口已关这一态在
+	// 库里的表现恰好是「令牌已被消费清空」，于是它落到
+	// ErrBootstrapTokenMismatch 上，HTTP 层回 403「令牌不正确」。运维看到
+	// 的是「我令牌明明是对的，怎么一直 403」—— 而真实原因是这扇门已经
+	// **永久**关上了、怎么重试都没用。两种诊断指向完全相反的处置：
+	// 一个让你去核对令牌，一个让你去确认部署状态。
+	//
+	// 那为什么不干脆把条件 UPDATE 提到最前？因为那等于每发一个**错令牌**
+	// 请求就发起一次真实写入（哪怕随后回滚），凭一个免鉴权端点就能反复
+	// 触发写事务、放大写锁竞争。只读 SELECT 先判一次，写只留在成功路径。
+	//
+	// # 它不是守卫，只是诊断
+	//
+	// 读与写是两个时刻，其间窗口可能被正常流程关掉。**权威判定始终是下面
+	// 那条带 AND password_hash = '' 的条件 UPDATE** —— 并发下的「只设一次」
+	// 由数据库原子保证。这一点不能因为多了一次读就放松。
+	var open int
+	err = tx.QueryRowContext(ctx,
+		`SELECT 1 FROM users WHERE id = ? AND password_hash = '' AND role = 'admin'`,
+		id).Scan(&open)
+	switch {
+	case errors.Is(err, sql.ErrNoRows):
+		// 窗口没开（已设过 / 非 admin / 不存在）：不写标记，交由调用方回 409。
+		return false, nil
+	case err != nil:
+		return false, err
+	}
+
+	// 令牌闸门：只在「本安装配置了令牌」时生效（老部署与本地直跑没有，
+	// 保持升级后行为不变）。比对用恒定时间函数，避免按前缀猜口令。
+	if requireToken {
+		var want string
+		tokErr := tx.QueryRowContext(ctx,
+			`SELECT value FROM app_settings WHERE key = ?`, settingBootstrapTokenKey).Scan(&want)
+		switch {
+		case tokErr != nil && !errors.Is(tokErr, sql.ErrNoRows):
+			return false, tokErr
+		case tokErr == nil && want == "":
+			// 记录存在但为空 = 令牌已被消费（设密成功的那个事务会把它清空）。
+			// 走到这里说明引导并未完成，窗口却已经没有令牌了 —— 只可能是
+			// 进程在「写密码」与「置 completed 标记」之间被打断，事务已回滚。
+			// 绝不能在这里放行：那一态下任何人都能无凭据完成引导。
+			return false, ErrBootstrapTokenMismatch
+		case tokErr == nil:
+			// 恒定时间比较，避免按前缀逐位试探。
+			if subtle.ConstantTimeCompare([]byte(want), []byte(token)) != 1 {
+				return false, ErrBootstrapTokenMismatch
+			}
+		}
+		// tokErr == ErrNoRows = 库里没有令牌记录 → 不要求令牌（老库兼容路径）。
+	}
 	res, err := tx.ExecContext(ctx,
 		`UPDATE users SET password_hash = ?, auth_version = auth_version + 1, updated_at = ?
 		 WHERE id = ? AND password_hash = '' AND role = 'admin'`,
@@ -318,17 +403,53 @@ func (s *Store) SetInitialAdminPassword(ctx context.Context, id, passwordHash st
 		return false, err
 	}
 	if n == 0 {
-		// 窗口没开（已设过 / 非 admin / 不存在）：不写标记，交由调用方回 409。
+		// 上面那次读通过了、这里却 0 行：两次读之间窗口被关掉了
+		// （并发请求先落地）。仍然按 409 走，且不产生任何写入。
 		return false, nil
 	}
 	if err := setSettingExec(ctx, tx, settingBootstrapCompletedKey, "1"); err != nil {
 		// 整个事务回滚，密码也没设上 —— 调用方按失败重试，窗口保持原状。
 		return false, err
 	}
+	// 令牌与密码、标记三者同进同退：设密成功即作废令牌，避免它长期留在
+	// app_settings 里成为一块过期但看起来很权威的凭据。
+	if err := setSettingExec(ctx, tx, settingBootstrapTokenKey, ""); err != nil {
+		return false, err
+	}
 	if err := tx.Commit(); err != nil {
 		return false, err
 	}
 	return true, nil
+}
+
+// SetInitialAdminPasswordWithToken 是带引导令牌闸门的设密入口，供 HTTP 层
+// 调用（admin.UserHandler.BootstrapSetup）。
+//
+// 三种结局必须能被调用方区分开，因为它们对应三种不同的 HTTP 响应：
+//   - (true, nil)              写入成功；
+//   - (false, ErrBootstrapTokenMismatch) 令牌不对 → 403；
+//   - (false, nil)             窗口已关（已设过密码 / 非 admin / 不存在）→ 409。
+//
+// 为什么不把令牌不匹配也塞进 false：那会让「你输错令牌」与「窗口已经关了」
+// 返回同一句话。前者运维需要知道要去日志里核对令牌、窗口其实还开着；
+// 后者再怎么重试都没用。同一个 bool 表达两种语义，调用方只能靠猜。
+func (s *Store) SetInitialAdminPasswordWithToken(ctx context.Context, id, passwordHash,
+	token string) (bool, error) {
+	return s.setInitialAdminPassword(ctx, id, passwordHash, true, token)
+}
+
+// BootstrapTokenRequired 报告本安装是否配置了引导令牌。
+// 为 false 时（老库、本地直跑）BootstrapSetup 放行不带令牌的请求。
+//
+// 用途只有一个：告诉前端「这个安装的引导窗口要凭令牌才能完成」。
+// **不要**用它来做放行/拒绝的判定 —— 那是事务内那次比对的事，
+// 拿这里的结果去判会开一个 TOCTOU 窗口（预判通过之后令牌才被消费掉）。
+func (s *Store) BootstrapTokenRequired(ctx context.Context) (bool, error) {
+	tok, err := s.BootstrapToken(ctx)
+	if err != nil {
+		return false, err
+	}
+	return tok != "", nil
 }
 
 // BumpAuthVersion 递增 auth_version，用于「禁用账号」「改角色」这类
@@ -403,6 +524,103 @@ func (s *Store) SumUserUsedTokens(ctx context.Context, userID string) (int64, er
 		return 0, qerr
 	}
 	return fallback, nil
+}
+
+// ReserveUserQuota 为一次请求**原子地**预占 est 个 token 的用户级配额。
+//
+// # 为什么需要它（与 key 级 ReserveQuota 同构）
+//
+// 修复前的用户级预检是裸读比较：SumUserUsedTokens → used >= quota 判定 → 放行。
+// used 只含**已落库**的真实用量，不含尚未终结的在途请求，而这条读-判-放行
+// 三步之间没有任何互斥：N 个并发请求会读到同一个 used 并**全部通过**。
+// 实测配额 1000、50 并发各估 200 token 时 50/50 全部放行（占用口径 10000），
+// 超发 10 倍 —— 用户的总额度上限形同虚设。
+//
+// 本函数把「检查」与「占用」合并进同一条写事务，并发请求被 SQLite 写锁
+// 串行化：第二个进来时读到的 used+reserved 已含第一个的预占。语义与
+// key 级 ReserveQuota 逐字一致，两级配额自此不再一个原子一个不原子。
+//
+// 列分离的必要性同 access_keys.reserved_tokens：used 来自累加列
+// user_usage_totals（由 usage_records 触发器维护），预占若混写进去就是双倍记账。
+func (s *Store) ReserveUserQuota(ctx context.Context, userID string, est int64) (reserved int64, ok bool, err error) {
+	if est <= 0 {
+		// 预估为 0（未知长度）时不能直接放行 —— 那等于没有预检；也不能因为
+		//「要花 0」就拒绝。折中：按 1 个 token 预占，至少能把并发请求数本身
+		// 变成约束。与 ReserveQuota 同处理。
+		est = 1
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return 0, false, err
+	}
+	defer func() { _ = tx.Rollback() }() //nolint:errcheck // 已提交时是 no-op
+
+	// 累加列可能缺行（孤儿 user_id：用户已删但用量行仍在，见 SumUserUsedTokens
+	// 的回退分支）。缺行按 used=0 处理，不因此让整次预检失败。
+	var quota int64
+	err = tx.QueryRowContext(ctx,
+		`SELECT quota_tokens FROM users WHERE id = ?`, userID).Scan(&quota)
+	if errors.Is(err, sql.ErrNoRows) {
+		return 0, false, nil
+	}
+	if err != nil {
+		return 0, false, err
+	}
+	// quota<=0 = 不限额，与 key 级判定一致；此时不预占也不受限。
+	if quota <= 0 {
+		return 0, true, tx.Commit()
+	}
+
+	var used int64
+	// 用**写池的 tx**而非 s.read：读池在 WAL 下可能读到本事务之前的状态，
+	// 与 RecomputeUsedTokens 的同一理由 —— 跨事务读会让判定在并发下不可复现。
+	// 缺行回退到 0（该用户还没有任何用量）。
+	uerr := tx.QueryRowContext(ctx,
+		`SELECT total_tokens FROM user_usage_totals WHERE user_id = ?`, userID).Scan(&used)
+	if errors.Is(uerr, sql.ErrNoRows) {
+		used = 0
+	} else if uerr != nil {
+		return 0, false, uerr
+	}
+
+	var reservedNow int64
+	if rerr := tx.QueryRowContext(ctx,
+		`SELECT reserved_tokens FROM users WHERE id = ?`, userID).Scan(&reservedNow); rerr != nil {
+		return 0, false, rerr
+	}
+
+	// 判定必须计入**在途预占**：漏掉 reservedNow，并发的第二个请求会在第一个
+	// 收尾前看到假性余量 —— 正是预占要堵住的 check-then-act 窗口。
+	if used+reservedNow+est > quota {
+		return 0, false, nil
+	}
+	// 同一事务内把预占推上去。刻意**不写** user_usage_totals：那列是触发器
+	// 维护的派生值，这里再写就是双倍记账。
+	if _, err := tx.ExecContext(ctx,
+		`UPDATE users SET reserved_tokens = reserved_tokens + ? WHERE id = ?`, est, userID); err != nil {
+		return 0, false, err
+	}
+	if err := tx.Commit(); err != nil {
+		return 0, false, err
+	}
+	return est, true, nil
+}
+
+// ReleaseUserQuota 原额退掉一次请求的用户级配额预占（按 reserved 全额退，不补差）。
+//
+// 真实用量**不在这里记账**：usage_records 落库时触发器已把 total_tokens 累进
+// user_usage_totals，这里再按 actual-est 补差就是双倍扣费。与 ReleaseQuota
+// 同语义。
+//
+// MAX(0, …) 夹住下界：重复释放或与其它路径的释放竞争时可能退过头，
+// reserved_tokens 变负等于凭空多出额度。
+func (s *Store) ReleaseUserQuota(ctx context.Context, userID string, reserved int64) error {
+	if reserved <= 0 {
+		return nil
+	}
+	_, err := s.db.ExecContext(ctx,
+		`UPDATE users SET reserved_tokens = MAX(0, reserved_tokens - ?) WHERE id = ?`, reserved, userID)
+	return err
 }
 
 // UserQuotaAndUsed 一次取回「配额 + 已用」，供 /stats 顺带下发。

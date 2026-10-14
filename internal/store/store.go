@@ -220,6 +220,13 @@ func (s *Store) migrate() error {
 			status        TEXT NOT NULL DEFAULT 'active',
 			quota_tokens  INTEGER NOT NULL DEFAULT 0,
 			used_tokens   INTEGER NOT NULL DEFAULT 0,
+			-- reserved_tokens 是**在途预占**（2026-10-14 上线前审计修复）。
+			-- 与 access_keys.reserved_tokens 同构：用户级配额预检此前是裸读比较
+			-- （SumUserUsedTokens → 比较 → 放行），并发下 N 个请求读到同一个 used
+			-- 并全部放行，实测超发 10 倍。预占必须与 used_tokens 分列 —— used 由
+			-- usage_records 触发器累加，预占混写进去就是双倍记账。判定用
+			-- used+reserved+est，释放只减 reserved_tokens。
+			reserved_tokens INTEGER NOT NULL DEFAULT 0,
 			-- balance_cents 是**可空**的账户余额（单位：分，即人民币 0.01 元）。
 			--
 			-- 为什么是 INTEGER 而不是 REAL：余额是**反复累加**的账目，浮点的
@@ -673,6 +680,12 @@ func (s *Store) ensureColumns() error {
 		// SELECT/UPDATE 直接报「无此列」，配额预检 fail-open，终身配额整体失效。
 		// NOT NULL DEFAULT 0：ALTER 加列时存量行自动填 0（无在途预占），语义正确。
 		{"access_keys", "reserved_tokens", "INTEGER NOT NULL DEFAULT 0"},
+		// 用户级在途预占列（2026-10-14 上线前审计修复）。与上一条同理由：
+		// `CREATE TABLE IF NOT EXISTS` 对已存在的表是空操作，老库升级必须靠
+		// 这里拿到该列 —— 缺了它 ReserveUserQuota 的 SELECT/UPDATE 直接报
+		// 「无此列」，用户级配额预检 fail-open，总额度上限整体失效。
+		// NOT NULL DEFAULT 0：ALTER 加列时存量行自动填 0（无在途预占），语义正确。
+		{"users", "reserved_tokens", "INTEGER NOT NULL DEFAULT 0"},
 		// 模型单价（元 / 百万 tokens），可空：NULL = 未配置价格，统计费用按 0 计。
 		// price_input 是「缓存未命中输入」单价；命中的输入另按 price_cache_hit 计
 		// （为 0 时回退到 price_input，见 usage_dao 的费用口径）。

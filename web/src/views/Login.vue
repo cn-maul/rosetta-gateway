@@ -45,6 +45,14 @@ const username = ref('')
 const password = ref('')
 const newPwd = ref('')
 const confirmPwd = ref('')
+/**
+ * 一次性引导令牌（仅当 /bootstrap 报 requires_token 时才需要填）。
+ *
+ * 刻意只活在组件状态里、不落 localStorage：它的全部作用就是打开那个
+ * **免鉴权**写接口，存进浏览器持久存储等于把凭据交给任何能读这台机器
+ * 浏览器数据的人。用户粘一次、提交一次，窗口随即永久关闭。
+ */
+const bootstrapToken = ref('')
 const submitting = ref(false)
 const error = ref('')
 
@@ -114,6 +122,12 @@ async function submitLogin() {
 async function submitSetup() {
   if (submitting.value) return
   error.value = ''
+  // 令牌为必填时先在前端拦一次：提交出去也只会拿到一句 403，
+  // 而 PBKDF2 已经白跑了一遍。让用户立刻看到「这里少了令牌」更有用。
+  if (session.requiresBootstrapToken && !bootstrapToken.value.trim()) {
+    error.value = '请填写引导令牌（见网关启动日志中的「首次引导令牌已生成」）'
+    return
+  }
   const weak = checkStrength(newPwd.value)
   if (weak) {
     error.value = weak
@@ -127,7 +141,10 @@ async function submitSetup() {
   }
   submitting.value = true
   try {
-    await bootstrapSetup(newPwd.value)
+    await bootstrapSetup(newPwd.value, bootstrapToken.value.trim())
+    // 令牌已消费（服务端同事务清空），立刻从内存里抹掉：
+    // 它已经没有用途，留着只会让人以为还能再用。
+    bootstrapToken.value = ''
     toast('密码已设置', 'ok')
     await leaveToBack()
   } catch (e) {
@@ -163,6 +180,19 @@ async function submitSetup() {
           <p>为第一个管理员账号 <code v-if="session.setupUsername">{{ session.setupUsername }}</code> 设置密码，设完直接进入后台。</p>
           <p><strong>只有这一次机会</strong>，提交后这个入口永久关闭。</p>
         </div>
+
+        <!-- 引导令牌：只在服务端说「这个安装配了令牌」时才出现。
+             老部署 / 本地直跑没有令牌，这一段完全不渲染，表单与
+             修复前完全一致。 -->
+        <template v-if="session.requiresBootstrapToken">
+          <label class="login-label" for="bt">引导令牌</label>
+          <input id="bt" v-model="bootstrapToken" class="login-input" autocomplete="off"
+                 autocapitalize="off" autocorrect="off" spellcheck="false" />
+          <div class="login-hint login-pw-hint">
+            <p>从网关<b>启动日志</b>里复制「首次引导令牌已生成」那一行中的 token 值。</p>
+            <p>设置成功后该令牌立即作废。</p>
+          </div>
+        </template>
 
         <!-- 「显示密码」只给这一处：引导设的密码是要记住的，且没有第二次机会。 -->
         <div class="login-pw-row">

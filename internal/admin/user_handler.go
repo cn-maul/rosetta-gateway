@@ -382,6 +382,12 @@ type bootstrapStatusResponse struct {
 	NeedsSetup bool `json:"needs_setup"`
 	// Username 是那个待初始化的账号名，供前端显示「为 admin 设置密码」。
 	Username string `json:"username,omitempty"`
+	// RequiresToken 为真表示本安装的引导窗口**必须**带一次性令牌才能完成。
+	//
+	// 只暴露「需不需要令牌」这个布尔，绝不暴露令牌本身：这个端点免鉴权，
+	// 任何能碰到端口的人都能调它。把它做成响应字段只会让引导窗口从
+	// 「需要知道部署日志」退化成「知道这个端点的存在就够」。
+	RequiresToken bool `json:"requires_token"`
 	// SessionEnabled 恒为 true（会话密钥现在自动生成），保留字段是为了
 	// 前端不必区分「没配 secret」这种已不存在的状态。
 	SessionEnabled bool `json:"session_enabled"`
@@ -413,6 +419,14 @@ func (h *UserHandler) BootstrapStatus(w http.ResponseWriter, r *http.Request) {
 		})
 		return
 	}
+	requiresToken, terr := h.store.BootstrapTokenRequired(r.Context())
+	if terr != nil {
+		// 读不到令牌状态时**不**默认「不需要」：那会让前端少显示一个输入框，
+		// 运维拿着正确令牌却因为界面没这个框而提交失败。宁可整页报 500，
+		// 也不要给出一个注定失败的表单。
+		writeServerError(w, "bootstrap status: read token state", terr)
+		return
+	}
 	u, err := h.store.FindUninitializedAdmin(r.Context())
 	if err != nil {
 		// 查不到状态不该让界面显示「不需要设密码」——那会把用户送去
@@ -423,6 +437,7 @@ func (h *UserHandler) BootstrapStatus(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, bootstrapStatusResponse{
 		NeedsSetup:     u != nil,
 		Username:       usernameOrEmpty(u),
+		RequiresToken:  requiresToken,
 		SessionEnabled: h.mgr.Enabled(),
 	})
 }
@@ -436,6 +451,11 @@ func usernameOrEmpty(u *store.User) string {
 
 type bootstrapSetupRequest struct {
 	Password string `json:"password"`
+	// Token 是首次引导的一次性令牌，只在本安装配置了引导令牌时才需要。
+	//
+	// 可选（`omitempty` 之外的零值语义）是为了兼容老部署：库里没有令牌
+	// 记录的安装仍然可以不带它完成引导。
+	Token string `json:"token"`
 }
 
 // BootstrapSetup 为待初始化的管理员设置密码并**直接签发会话**。
@@ -531,9 +551,20 @@ func (h *UserHandler) BootstrapSetup(w http.ResponseWriter, r *http.Request) {
 	// 后写者会静默覆盖先写者。条件 UPDATE 让「只设一次」由数据库原子保证，
 	// 0 行受影响即说明窗口已在两条指令之间关闭。
 	// 写入命中时**同一个事务**还会置 bootstrap_completed 标记：设密成功与
-	// 窗口关闭原子生效（见 store.SetInitialAdminPassword 的注释）。
-	ok, err := h.store.SetInitialAdminPassword(r.Context(), u.ID, hash)
+	// 窗口关闭原子生效，并把引导令牌清空（见 store 的同名方法注释）。
+	//
+	// 用带令牌的那一个：令牌比对必须在**写事务内**做，不能靠前面查一次
+	// 「需不需要令牌」来决定要不要验 —— 那是典型的 TOCTOU，验与写之间
+	// 令牌可能刚好被消费掉。
+	ok, err := h.store.SetInitialAdminPasswordWithToken(r.Context(), u.ID, hash, req.Token)
 	if err != nil {
+		if errors.Is(err, store.ErrBootstrapTokenMismatch) {
+			// 403 而不是 400：请求本身合法（JSON 没问题），是没有权限完成
+			// 这次写入。文案要说清「窗口还开着、拿正确令牌可重试」，
+			// 否则运维会以为整个引导链路坏了而去重建数据库。
+			writeError(w, http.StatusForbidden, "引导令牌不正确，请从网关启动日志中复制本次部署的令牌")
+			return
+		}
 		writeServerError(w, "bootstrap setup: set password", err)
 		return
 	}

@@ -28,6 +28,48 @@ const settingModelDefaultsKey = "model_defaults"
 // 设完即永久关闭。
 const settingBootstrapCompletedKey = "bootstrap_completed"
 
+// settingBootstrapTokenKey 存放首次引导窗口的**一次性令牌**（2026-10-14 加固）。
+//
+// # 为什么需要它
+//
+// 引导窗口挂在免鉴权的 publicAdminMux 上，容器默认 listen 0.0.0.0，
+// 于是「谁先打开页面谁就是管理员」—— 部署到公网或共享网络时这是真实的
+// 抢注窗口。SameOrigin 判定挡得住第三方网页，却挡不住**能直接访问该端口
+// 的任何人**：这不是浏览器发起的请求，没有 Origin 可校验。
+//
+// 令牌把「谁能完成引导」从「谁能连到端口」收紧成「谁知道这个一次性随机
+// 值」：它由**应用启动时**生成（或取自 ROSETTA_GW_BOOTSTRAP_TOKEN），
+// 只打印到启动日志，且在设密成功的同一个事务里被清掉，不存在
+// 「设过密但令牌还在」的中间态。
+//
+// 放在数据库里（而不是只留在内存）是为了跨重启存活：运维从**第一次**
+// 启动的日志里抄下令牌后，重启、滚动更新、崩溃自愈都不该让他手里的
+// 令牌失效。因此 SetBootstrapToken 的语义是「没有才写」，不是「每次启动
+// 覆写」。
+const settingBootstrapTokenKey = "bootstrap_token"
+
+// BootstrapToken 返回当前有效的引导令牌。
+//
+// 空串有两种含义，本函数**不**区分：库里没有该记录（老部署 / 本地直跑）
+// 与记录存在但已被消费（设密成功时清空）。区分它们是调用方的事 ——
+// setInitialAdminPassword 在事务内把「记录存在但为空」判为异常态并拒绝
+// 无凭据引导（fail-secure），而 BootstrapTokenRequired 对两者都回 false。
+func (s *Store) BootstrapToken(ctx context.Context) (string, error) {
+	v, ok, err := s.getSetting(ctx, settingBootstrapTokenKey)
+	if err != nil || !ok {
+		return "", err
+	}
+	return v, nil
+}
+
+// SetBootstrapToken 写入引导令牌（由 cmd/gateway 的 ensureBootstrapToken
+// 在「尚未完成引导」时调用）。
+//
+// 调用方负责「已有则不覆盖」：本方法是无条件覆写，没有幂等保护。
+func (s *Store) SetBootstrapToken(ctx context.Context, token string) error {
+	return s.setSetting(ctx, settingBootstrapTokenKey, token)
+}
+
 // BootstrapCompleted 报告本安装是否已完成过首次引导。
 // 未写过标记（含老库升级）返回 false —— 此时窗口是否开放仍由
 // FindUninitializedAdmin 的旧判定兜底。

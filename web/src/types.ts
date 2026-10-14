@@ -405,6 +405,13 @@ export interface BootstrapStatus {
   needs_setup: boolean
   /** 待初始化的账号名，供表单标题显示。needs_setup 为 false 时为空。 */
   username?: string
+  /**
+   * 本安装的引导窗口是否需要一次性令牌（needs_setup 为真时才有意义）。
+   *
+   * 为真时登录页要显示一个令牌输入框。这个端点**免鉴权**，所以服务端
+   * 只会告知「需不需要」而绝不会把令牌本身发下来 —— 令牌只在启动日志里。
+   */
+  requires_token?: boolean
   session_enabled: boolean
 }
 

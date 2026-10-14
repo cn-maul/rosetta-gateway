@@ -269,22 +269,25 @@ func main() {
 
 	// 启动期一次性操作，与任何请求无关，故用 Background 而非请求 ctx。
 	ensureBootstrapAdmin(context.Background(), db, logger)
+	ensureBootstrapToken(context.Background(), db, logger)
 
 	// 首次初始化窗口对所有能连到端口的人开放（POST /admin/api/bootstrap
 	// 免鉴权，直到管理员设完密码为止）。默认 listen 绑回环，只有本机能碰；
-	// 运维把它改成 0.0.0.0 是很常见的做法，那时整个局域网都能抢先
-	// 成为第一个管理员。这个告警不能省 —— 它是唯一提醒。
+	// 运维把它改成 0.0.0.0（Docker 的 `-p 8666:8666` 就会这么要求）是
+	// 很常见的做法，那时整个局域网都能**尝试**抢先成为第一个管理员 ——
+	// 但只有知道启动日志里那个一次性令牌的人才能真的完成它。
+	// 这个告警仍不能省：它提醒的是「尽快把这件事做掉」。
 	pending, err := db.FindUninitializedAdmin(context.Background())
 	if err != nil {
 		logger.Error("cannot read bootstrap state; admin UI may be unreachable", "error", err)
 	} else if pending != nil && !isLoopbackListen(cfg.Listen) {
 		logger.Error("SECURITY: admin password not yet set AND listening on a non-loopback address — "+
-			"anyone who can reach this port can become the first administrator",
+			"anyone who can reach this port can attempt to become the first administrator; "+
+			"only holders of the bootstrap token printed above can complete it",
 			"listen", cfg.Listen,
-			"immediate_action", "立即在浏览器打开 /admin/ 完成首次设置密码；"+
-				"在此之前把 listen 改回 127.0.0.1")
+			"immediate_action", "立即在浏览器打开 /admin/ 完成首次设置密码（需填上面打印的引导令牌）")
 	} else if pending != nil {
-		logger.Warn("admin password not set yet; open the admin UI to complete first-run setup",
+		logger.Warn("admin password not set yet; open the admin UI with the bootstrap token to complete first-run setup",
 			"note", "监听地址是回环，仅本机可访问；一旦改为 0.0.0.0 暴露到网络，请立即完成设置")
 	}
 
@@ -1411,6 +1414,17 @@ type rateCommit struct {
 	logger *slog.Logger
 	// quotaReserved 是本次请求预占的 token 数（0 = 未预占，或已释放）。
 	quotaReserved int64
+	// userQuotaReserved 是本次请求在**用户级**配额上预占的 token 数
+	// （0 = 未预占，或已释放）。
+	//
+	// 与 quotaReserved 分列而不是合并成一个计数：两级配额的判定口径不同
+	// （key 级是 access_keys.quota_tokens，用户级是 users.quota_tokens），
+	// 且**可能只命中一级** —— 只配了用户额度的用户，key 级预占恒为 0。
+	// 合并成一个数会在「用户配了额度、key 没配」时把用户级预占错记成
+	// key 级，退预占时去动一张不该动的表，或反之。
+	userQuotaReserved int64
+	// userID 是 userQuotaReserved 的归属用户；退预占时必须用它定位行。
+	userID string
 }
 
 // commit 用量已知时的**全量**收尾：TPM 按真实用量校正 + 退配额预占。
@@ -1435,19 +1449,30 @@ func (rc *rateCommit) commit(actual int64) {
 // 估算值随窗口翻转自然清零。但配额预占必须退掉：它是终身累计，预占按
 // max_tokens 全额计，不退就等于每次 missing 请求永久吃掉数万 token 额度
 // （2026-10-07 修复的 P1-3 —— 修复前 missing 时整个 commit 被跳过）。
-//
-// quotaReserved 先取后清零，让释放天然幂等：任何路径重复收尾（或未来重构
-// 引入第二次调用）时第二次是空操作，不会把别的请求刚立起来的预占退掉。
 func (rc *rateCommit) releaseQuota() {
-	if rc == nil || rc.store == nil || rc.quotaReserved <= 0 {
+	if rc == nil || rc.store == nil {
 		return
 	}
-	reserved := rc.quotaReserved
-	rc.quotaReserved = 0
-	if err := rc.store.ReleaseQuota(context.Background(), rc.keyID, reserved); err != nil {
-		if rc.logger != nil {
-			rc.logger.Warn("release quota reservation failed",
-				"key_id", rc.keyID, "reserved", reserved, "error", err)
+	// 两级预占各自「先取后清零」，让释放天然幂等：任何路径重复收尾（或未来
+	// 重构引入第二次调用）时第二次是空操作，不会把别的请求刚立起来的预占退掉。
+	if rc.quotaReserved > 0 {
+		reserved := rc.quotaReserved
+		rc.quotaReserved = 0
+		if err := rc.store.ReleaseQuota(context.Background(), rc.keyID, reserved); err != nil {
+			if rc.logger != nil {
+				rc.logger.Warn("release quota reservation failed",
+					"key_id", rc.keyID, "reserved", reserved, "error", err)
+			}
+		}
+	}
+	if rc.userQuotaReserved > 0 {
+		reserved := rc.userQuotaReserved
+		rc.userQuotaReserved = 0
+		if err := rc.store.ReleaseUserQuota(context.Background(), rc.userID, reserved); err != nil {
+			if rc.logger != nil {
+				rc.logger.Warn("release user quota reservation failed",
+					"user_id", rc.userID, "reserved", reserved, "error", err)
+			}
 		}
 	}
 }
@@ -1626,31 +1651,6 @@ func handleIngress(pool *upstream.Pool, cfg *config.Config, usage *usageRecorder
 			return
 		}
 
-		// 用户级配额预检（MULTIUSER.md §4.3：三级配额的最外层总闸）。
-		//
-		// **只在用户配了额度时才查库**：quota_tokens=0（不限额）是常态，
-		// 为常态付一次 SUM 查询成本不合理。这一点与 key 级预检不同 ——
-		// key 的额度就在即将读取的那一行里，查是顺带。
-		//
-		// 已用量走实时 SUM（§4.3 决策 B）而不是触发器累加：触发器按
-		// access_key_id 累加，**感知不到 key 被删除**，会永久留下偏高的
-		// 计数让用户再也撞不开上限。SUM 走 idx_usage_user_ts 索引。
-		if u := snapshot.Get().UsersByID[authCtx.UserID]; u != nil && u.QuotaTokens > 0 {
-			used, uerr := db.SumUserUsedTokens(r.Context(), authCtx.UserID)
-			if uerr != nil {
-				// 与 key 级同口径：查询抖动时 fail-open，不因一次读失败
-				// 拒绝正常流量。并发下容忍至多一个在途请求超发。
-				logger.Error("user quota lookup failed", "error", uerr, "user_id", authCtx.UserID)
-			} else if used >= u.QuotaTokens {
-				logger.Warn("user quota exceeded", "user_id", authCtx.UserID,
-					"used", used, "quota", u.QuotaTokens,
-					"request_id", server.RequestIDFromContext(r.Context()))
-				codec.WriteError(w, http.StatusTooManyRequests, "insufficient_quota",
-					"this account has exhausted its token quota")
-				return
-			}
-		}
-
 		ing, err := codec.Decode(r, int64(cfg.Defaults.MaxRequestBodyBytes))
 		if err != nil {
 			// 超限时中间件的 MaxBytesReader 会返回 *http.MaxBytesError。
@@ -1747,6 +1747,61 @@ func handleIngress(pool *upstream.Pool, cfg *config.Config, usage *usageRecorder
 					rate = &rateCommit{limiter: limiter, keyID: authCtx.KeyID, store: db, logger: logger}
 				}
 				rate.quotaReserved = reserved
+			}
+		}
+
+		// 用户级总额度**原子预占**（MULTIUSER.md §4.3：三级配额的最外层总闸）。
+		//
+		// # 为什么必须是预占而不是「查了再放」（2026-10-14 上线前审计修复）
+		//
+		// 修复前这里是裸读比较：SumUserUsedTokens → used >= quota 判定 → 放行。
+		// used 只含**已落库**的真实用量，不含尚未终结的在途请求，而读-判-放行
+		// 三步之间没有任何互斥。实测：配额 1000、50 并发各估 200 token，
+		// 50 个请求**全部通过**（占用口径 10000 token，超发 10 倍）。
+		// 原注释「并发下容忍至多一个在途请求超发」只在串行时成立。
+		//
+		// key 级早在 2026-10-07 就换成了 ReserveQuota 原子事务预占，用户级却
+		// 没跟上 —— 两级配额一个原子一个不原子，恰好是这种「一半修好了」的
+		// 形态最容易被当成「已经有限流」。
+		//
+		// ReserveUserQuota 把检查与占用合并进同一条写事务，并发请求被 SQLite
+		// 写锁串行化，第二个进来时读到的 used+reserved 已含第一个的预占。
+		//
+		// 位置在 key 级之后：两级额度独立配置，**任意一级满都要拒绝**，
+		// 谁先判不影响结果；放在一起共用同一个 est，少算一次估算。
+		//
+		// 只在用户配了额度时才走这一步：quota_tokens=0（不限额）是常态，
+		// 为常态付一次写事务不划算（与 key 级「quota>0 才预占」同口径）。
+		// 额度判断本身交给 ReserveUserQuota 事务内做，这里只借快照判「是否
+		// 配置了额度」—— 与 key 级用 GetKeyQuota 判 quota>0 完全对称。
+		if u := snapshot.Get().UsersByID[authCtx.UserID]; u != nil && u.QuotaTokens > 0 {
+			if !needEstimate {
+				est = estimateRequestTokens(ing.buildRosetta())
+			}
+			reserved, rok, rerr := db.ReserveUserQuota(r.Context(), authCtx.UserID, est)
+			switch {
+			case rerr != nil:
+				// 与 key 级同口径：查询抖动 fail-open，不因一次写失败拒绝正常
+				// 流量。但记 ERROR —— fail-open 的代价是真超发，无声无息就
+				// 查不到了。
+				logger.Error("user quota reserve failed (fail-open)",
+					"error", rerr, "user_id", authCtx.UserID)
+			case !rok:
+				logger.Warn("user quota exceeded", "user_id", authCtx.UserID,
+					"estimated_tokens", est,
+					"request_id", server.RequestIDFromContext(r.Context()))
+				// 拒绝前必须退回 key 级预占：它已经在同一请求里立起来了，
+				// 直接 return 会让这把 key 的额度被这次被拒的请求永久吃掉一块。
+				rate.commit(0)
+				codec.WriteError(w, http.StatusTooManyRequests, "insufficient_quota",
+					"this account has exhausted its token quota")
+				return
+			default:
+				if rate == nil {
+					rate = &rateCommit{limiter: limiter, keyID: authCtx.KeyID, store: db, logger: logger}
+				}
+				rate.userQuotaReserved = reserved
+				rate.userID = authCtx.UserID
 			}
 		}
 

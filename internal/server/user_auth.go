@@ -320,9 +320,58 @@ func (a *UserAuthMiddleware) ServeHTTP(w http.ResponseWriter, r *http.Request, n
 
 	a.throttle.Success(ip)
 
+	// 同源校验（2026-10-14 上线前审计加固）。
+	//
+	// # 为什么中间件这一层必须有，而不是继续依赖每个 handler
+	//
+	// 此前管理面的 CSRF 防线是**分散的**，靠两种手段凑齐：
+	//   - 会话 cookie 的 SameSite=Strict（挡住绝大多数跨站请求）；
+	//   - decodeJSON 强制 Content-Type: application/json（挡住 text/plain
+	//     这类 CORS safelisted 简单请求）。
+	//
+	// 两者都成立，但它们都是**逐 handler** 才生效的：凡是不走 decodeJSON 的
+	// 写端点就没有第二道门。实测 `POST /admin/api/usage/prune`、
+	// `POST /admin/api/logout`、`POST /admin/api/keys/{id}/recompute-usage`
+	// 这类无请求体端点带有效会话 + 跨站头即可触达 handler（返回 200）。
+	//
+	// # 为什么 SameSite=Strict 挡不住这一类
+	//
+	// Strict 只在**跨站**（registrable domain 不同）时不发 cookie。
+	// 「同站不同源」——例如 gw.corp.example.com 与攻击者拿到的
+	// evil.corp.example.com —— 属于 same-site，浏览器**照发 cookie**，
+	// 而 origin 又确实不同。企业内网里子域可被注册/接管是常见的，
+	// 所以这不是理论场景。中间件这一层补同源判定，把它彻底关掉。
+	//
+	// # 为什么只对 cookie 凭据生效
+	//
+	// Authorization: Bearer 不存在这个威胁：浏览器跨源发带该头的请求会触发
+	// CORS 预检，而 /admin 从不设 Access-Control-Allow-Origin
+	// （见 CORS 中间件），预检必然失败。非浏览器客户端（curl / SDK）同理
+	// 不受同源策略约束。所以只拦「凭 cookie 进来的跨站写请求」，
+	// 不影响脚本化运维这条通道。
+	// 读方法一律放过：GET/HEAD/OPTIONS 按语义必须无副作用，且管理面的
+	// 跨源读取本来就由「不设 CORS 头」在浏览器侧拦住。只有写方法需要这层。
+	if !safeMethods[r.Method] && cookieAuthed(r) && !sameOrigin(r) {
+		writeForbidden(w)
+		return
+	}
+
 	ctx := context.WithValue(r.Context(), sessionKey, sess)
 	ctx = context.WithValue(ctx, userKey, u)
 	next.ServeHTTP(w, r.WithContext(ctx))
+}
+
+// safeMethods 是 CSRF 不构成威胁的 HTTP 方法：它们按语义必须是「只读」。
+var safeMethods = map[string]bool{
+	http.MethodGet:     true,
+	http.MethodHead:    true,
+	http.MethodOptions: true,
+}
+
+// cookieAuthed 报告本次会话凭据是否来自 Cookie（而非 Authorization 头）。
+func cookieAuthed(r *http.Request) bool {
+	c, err := r.Cookie(SessionCookieName)
+	return err == nil && c.Value != ""
 }
 
 func sessionErrMessage(err error) string {

@@ -72,6 +72,15 @@ export const session = reactive({
   needsSetup: false,
   /** 待初始化的账号名，供表单标题显示（「为 admin 设置密码」）。 */
   setupUsername: '',
+  /**
+   * 本安装的引导窗口是否需要一次性令牌。
+   *
+   * 为真时 setup 表单要额外显示一个令牌输入框。**只存布尔，绝不存令牌
+   * 本身**：令牌只在启动日志里出现一次，用户粘进来就该只活在这一次的
+   * 提交里，落到 localStorage 会让任何能读浏览器存储的人拿到它
+   * （而它唯一的用途就是打开那个免鉴权写接口）。
+   */
+  requiresBootstrapToken: false,
   /** /session 探测是否成功。false 时界面显示「无法连接」而不是登录框。 */
   backendReady: false,
   checked: false,
@@ -123,11 +132,13 @@ export async function loadSession(): Promise<void> {
     const bs = await get<BootstrapStatus>('/bootstrap')
     session.needsSetup = bs.needs_setup
     session.setupUsername = bs.username ?? ''
+    session.requiresBootstrapToken = bs.requires_token ?? false
   } catch {
     // 拿不到引导状态不是致命问题：按「已初始化」处理，用户会看到登录表单。
     // 真实情况下（全新部署）它一定能拿到 —— 该端点免鉴权。
     session.needsSetup = false
     session.setupUsername = ''
+    session.requiresBootstrapToken = false
   }
 
   try {
@@ -165,12 +176,15 @@ export async function login(username: string, password: string) {
  * 成功后 needs_setup 立刻置 false：这个免鉴权窗口就此关闭，
  * 界面上不该再有任何「设密码」的入口。
  */
-export async function bootstrapSetup(password: string) {
-  const r = await post<LoginResult>('/bootstrap', { password })
+export async function bootstrapSetup(password: string, token?: string) {
+  // token 只在这一个请求体里出现：既不进 localStorage，也不进任何
+  // 全局状态。服务端对没配令牌的旧部署同样接受这个字段（空串 = 不校验）。
+  const r = await post<LoginResult>('/bootstrap', { password, token: token ?? '' })
   saveToken(r.token)
   session.me = await get<Me>('/me')
   session.needsSetup = false
   session.setupUsername = ''
+  session.requiresBootstrapToken = false
   return r
 }
 
