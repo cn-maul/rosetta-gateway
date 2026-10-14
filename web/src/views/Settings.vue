@@ -1802,7 +1802,7 @@ onMounted(() => {
   align-items: center;
   padding: 8px;
   border-bottom: 1px solid var(--border);
-  background: var(--surface-2, transparent);
+  background: var(--surface-secondary);
 }
 .batch-sel {
   width: 150px;

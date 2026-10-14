@@ -989,6 +989,19 @@ textarea {
   background: var(--accent-soft);
   color: var(--accent-soft-foreground);
 }
+/* 健康态徽章（2026-10-14，连通率页/总览健康卡用）。
+   对齐 HeroUI 的 soft 变体语义：warning-soft 表示「不稳定/降级」，
+   default 表示「未探测/未知」。与 badge-err 的区别：badge-err 是暖橙
+   （warning-soft），这里「不稳定」也用 warning-soft 是同一语义 ——
+   但「未探测」必须用 default（灰），不能和「失败」混。 */
+.badge-warn {
+  background: var(--warning-soft);
+  color: var(--warning-soft-foreground);
+}
+.badge-dim {
+  background: var(--default);
+  color: var(--muted);
+}
 
 /* ---------- 调用状态徽章（2026-10-13）----------
 

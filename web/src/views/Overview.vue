@@ -671,10 +671,10 @@ onUnmounted(() => {
   background: var(--hover);
 }
 .health-down {
-  border-left: 3px solid var(--danger, #ef4444);
+  border-left: 3px solid var(--danger);
 }
 .health-degraded {
-  border-left: 3px solid #eab308;
+  border-left: 3px solid var(--warning);
 }
 .health-err {
   font-size: 12px;

@@ -463,7 +463,7 @@ tr.sel td {
   fill: var(--accent);
 }
 .chart .dot.bad {
-  fill: #ef4444;
+  fill: var(--danger);
 }
 .chart .cross {
   stroke: var(--text-4);
