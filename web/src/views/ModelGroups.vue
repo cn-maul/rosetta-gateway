@@ -14,21 +14,24 @@ import { computed, onMounted, reactive, ref } from 'vue'
 import { api } from '../api'
 import { toast, confirmBox } from '../ui'
 import AppModal from '../components/AppModal.vue'
-import type { ModelGroup, UpstreamModel } from '../types'
+import type { ModelGroup, Provider, UpstreamModel } from '../types'
 
 const err = ref('')
 const loading = ref(true)
 const groups = ref<ModelGroup[]>([])
 // 全部上游模型（跨 provider 扁平列表）：指派时按 provider 分组供选择。
 const allModels = ref<UpstreamModel[]>([])
+// 上游列表：只为了把 provider_id 翻成人类可读的名字（见 providerName）。
+const providers = ref<Provider[]>([])
 
 async function load() {
   loading.value = true
   err.value = ''
   try {
-    const [g, m] = await Promise.all([api.modelGroups(), api.allModels()])
+    const [g, m, p] = await Promise.all([api.modelGroups(), api.allModels(), api.providers()])
     groups.value = g
     allModels.value = m
+    providers.value = p
   } catch (e) {
     if ((e as { status?: number }).status === 401) return
     err.value = '加载模型组失败：' + (e as Error).message
@@ -39,11 +42,19 @@ async function load() {
 }
 onMounted(load)
 
-// providerId → 显示名，指派列表里把 model 归到它所属 provider 名下。
+// providerId → 显示名。
+//
+// 必须来自 /providers（带真实 name/slug），不能拿 provider_id 顶上 ——
+// provider_id 是 generateID() 的 32 位哈希（「7f8572482cff128dfe8bb758db4dc32f」），
+// 直接显示就是用户看到的乱码。
+//
+// 回退顺序 name → slug → 短 id：provider 可能没填 name（表单允许留空，
+// 后端回落 endpoint），这时 slug 才是人类可读的；两者都没有才截 id 前 8 位，
+// 至少比 32 位哈希短。
 const providerName = computed(() => {
   const map: Record<string, string> = {}
-  for (const m of allModels.value) {
-    if (!map[m.provider_id]) map[m.provider_id] = m.provider_id
+  for (const p of providers.value) {
+    map[p.id] = p.name || p.slug || p.id.slice(0, 8)
   }
   return map
 })
@@ -174,7 +185,10 @@ async function removeMember(mm: UpstreamModel) {
 
 // labelFor 给候选/成员行一个「供应商 / 模型名」的可读标签。
 function labelFor(mm: UpstreamModel): string {
-  return `${providerName.value[mm.provider_id] ?? mm.provider_id} / ${mm.model_id}`
+  // 回退也截短 id：provider 没出现在 /providers 里时（刚删、或接口部分失败），
+  // 退回完整 32 位哈希就是用户看到的那串乱码 —— 截 8 位至少还能认。
+  const name = providerName.value[mm.provider_id] ?? mm.provider_id.slice(0, 8)
+  return `${name} / ${mm.model_id}`
 }
 </script>
 
