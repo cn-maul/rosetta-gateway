@@ -55,6 +55,29 @@ type Config struct {
 	// **不下界的原因**：1 天是合法的（只要用量不大），此时配额预检仍走
 	// 实时 SUM、仍有界。上界 3650 天防止明显笔误。
 	UsageRetentionDays int `json:"usage_retention_days"`
+
+	// Probes 是上游模型定时探测的配置（2026-10-14）。
+	//
+	// 探测请求复用 upstream.TestUpstreamModel（max_tokens=1、不经
+	// usage_recorder），**不扣任何网关用户的钱**，但确实产生上游侧计费
+	// （每个模型每天约 3 token 量级）。默认开 —— 用户明确要这个功能。
+	Probes ProbeConfig `json:"probes"`
+}
+
+// ProbeConfig 是定时探测的参数。
+//
+// 所有值都必须为正（interval/timeout/concurrency/down_threshold/window_size/
+// retention_days）：负值会让 time.NewTicker 当场 panic（config.go:242-253
+// 有一整段既往事故记录）。healthy_rate 是 0~1 的小数。
+type ProbeConfig struct {
+	Enabled       bool    `json:"enabled"`
+	IntervalSec   int     `json:"interval_sec"`
+	TimeoutMs     int     `json:"timeout_ms"`
+	Concurrency   int     `json:"concurrency"`
+	DownThreshold int     `json:"down_threshold"`
+	WindowSize    int     `json:"window_size"`
+	HealthyRate   float64 `json:"healthy_rate"`
+	RetentionDays int     `json:"retention_days"`
 }
 
 type Defaults struct {
@@ -232,6 +255,37 @@ func (c *Config) setDefaults() {
 	if c.UsageRetentionDays == 0 {
 		c.UsageRetentionDays = 30
 	}
+
+	// 探测配置默认值。Enabled 默认 true（用户明确要这个功能）。
+	// 间隔 10 分钟、超时 30s、并发 4、连续 3 次判 down、窗口 10 次、
+	// 成功率 80%、保留 30 天。
+	if !c.Probes.Enabled && c.Probes.IntervalSec == 0 {
+		// 全零 = 用户没配过 → 默认开。显式 enabled=false 且其它字段为 0
+		// 时这里会误开，但显式关探测的人通常也会顺手配间隔；更稳妥的
+		// 判断是「只要 IntervalSec 非 0 就认为配过」。
+		c.Probes.Enabled = true
+	}
+	if c.Probes.IntervalSec == 0 {
+		c.Probes.IntervalSec = 600
+	}
+	if c.Probes.TimeoutMs == 0 {
+		c.Probes.TimeoutMs = 30000
+	}
+	if c.Probes.Concurrency == 0 {
+		c.Probes.Concurrency = 4
+	}
+	if c.Probes.DownThreshold == 0 {
+		c.Probes.DownThreshold = 3
+	}
+	if c.Probes.WindowSize == 0 {
+		c.Probes.WindowSize = 10
+	}
+	if c.Probes.HealthyRate == 0 {
+		c.Probes.HealthyRate = 0.8
+	}
+	if c.Probes.RetentionDays == 0 {
+		c.Probes.RetentionDays = 30
+	}
 }
 
 func (c *Config) validate() error {
@@ -304,6 +358,33 @@ func (c *Config) validate() error {
 	// 降到几毫秒），把它挡在门外会让本配置失去意义。上界 3650 防笔误。
 	if c.UsageRetentionDays < 1 || c.UsageRetentionDays > 3650 {
 		return fmt.Errorf("usage_retention_days: must be 1..3650, got %d", c.UsageRetentionDays)
+	}
+
+	// 探测配置校验。这些值会喂给 time.NewTicker / context.WithTimeout /
+	// 并发信号量 —— 负值或零会让探测循环 panic 或整轮空转。
+	// 与 defaults 的区间校验同一理由（config.go:242-253 的既往事故记录）。
+	if c.Probes.Enabled {
+		if c.Probes.IntervalSec < 1 {
+			return fmt.Errorf("probes.interval_sec: must be >= 1, got %d", c.Probes.IntervalSec)
+		}
+		if c.Probes.TimeoutMs < 1 {
+			return fmt.Errorf("probes.timeout_ms: must be >= 1, got %d", c.Probes.TimeoutMs)
+		}
+		if c.Probes.Concurrency < 1 {
+			return fmt.Errorf("probes.concurrency: must be >= 1, got %d", c.Probes.Concurrency)
+		}
+		if c.Probes.DownThreshold < 1 {
+			return fmt.Errorf("probes.down_threshold: must be >= 1, got %d", c.Probes.DownThreshold)
+		}
+		if c.Probes.WindowSize < 1 {
+			return fmt.Errorf("probes.window_size: must be >= 1, got %d", c.Probes.WindowSize)
+		}
+		if c.Probes.HealthyRate <= 0 || c.Probes.HealthyRate > 1 {
+			return fmt.Errorf("probes.healthy_rate: must be in (0,1], got %v", c.Probes.HealthyRate)
+		}
+		if c.Probes.RetentionDays < 1 {
+			return fmt.Errorf("probes.retention_days: must be >= 1, got %d", c.Probes.RetentionDays)
+		}
 	}
 
 	// log_level 是启动日志的可见性开关。非法值会让 logger 静默退回 info

@@ -126,9 +126,55 @@ export interface UpstreamModel {
   ttfb_ms?: number // 近 5 次流式调用的平均首字延迟（毫秒）；非流式/未测得则不下发
   success_rate?: number // 近 100 次调用成功率（0~1）
   call_count?: number // 成功率样本量（≤100）；缺失/0 表示未调用过
+  /**
+   * 模型归组 id（跨上游的同一个模型合并统计）。空/缺席 = 未归组。
+   * 组名由前端用 modelGroups() 全量列表本地解析（组是小表）。
+   */
+  group_id?: string
   // 没有 created_at：upstream_models 表压根没有这一列，接口也不下发。
   // 曾在这里声明过一次，导致列表里永远渲染出一个「—」日期列。
   // 也没有 default_extra_json：存了但没有任何地方拿它构造请求，已随列一并摘除。
+}
+
+/**
+ * 模型归组：把不同上游的「同一个模型」（叫法往往不同）标成一组，
+ * 用量统计按组名合并显示。
+ *
+ * 与 `Group`（用户分组）是**完全不同的概念**，别混用：那个管的是
+ * 模型白名单与配额归属，这个纯粹是统计展示层的别名合并。
+ */
+export interface ModelGroup {
+  id: string
+  display_name: string
+  member_count: number
+  created_at?: number
+}
+
+/**
+ * 上游模型健康摘要（总览健康卡数据源）。
+ *
+ * health 四态：unknown（窗口内无探测）/ healthy / degraded / down。
+ * 判定口径与后端 probe.Classify 一致：连续失败 ≥3 判 down，最近成功且
+ * 窗口成功率 ≥80% 判 healthy，其余 degraded。
+ */
+export interface ProbeHealth {
+  model_id: string
+  provider_id: string
+  health: 'unknown' | 'healthy' | 'degraded' | 'down'
+  success_rate: number // 窗口内成功率（0~1）；从未探测为 0
+  window_count: number
+  window_ok: number
+  consecutive_fail: number
+  last_ts: number // 最近探测时间（毫秒）；0 = 从未探测
+  last_error?: string // 最近失败原因（最近成功则为空）
+}
+
+/** 连通率时间轴的一个分桶（某模型某时间窗）。桶内无探测记录的行不返回。 */
+export interface ProbeTimelineBucket {
+  ts: number // 桶起点（毫秒）
+  count: number
+  ok: number
+  latency: number // 平均延迟（毫秒）
 }
 
 /**
@@ -693,6 +739,16 @@ export interface UsageHistoryEntry {
    * 显示出来才能解释「报表在涨、余额按分扣减却不动」。
    */
   cost: number
+  /**
+   * 失败三件套（2026-10-14 新增）：成功记录三者皆空/0。
+   *
+   * http_status 给量级（429 限流 vs 401 换 key vs 5xx 上游坏了），
+   * error_code 是网关归一化短码，error_detail 是上游原文（脱敏 + 1KB 截断）。
+   * 详情只存在于明细层 —— 超出保留期（默认 30 天）的记录只有短码没有原文。
+   */
+  http_status: number
+  error_code?: string
+  error_detail?: string
 }
 
 // 调用历史的分页结果：当页明细 + 过滤后的总条数（用于计算总页数）

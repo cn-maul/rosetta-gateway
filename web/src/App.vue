@@ -299,6 +299,20 @@ watch(
             </svg>
             <span v-if="!railCollapsed">上游与模型</span>
           </RouterLink>
+          <RouterLink class="side-item" to="/model-groups" :title="railCollapsed ? '模型归组' : undefined">
+            <svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <path d="M12 2 2 7l10 5 10-5-10-5Z" />
+              <path d="m2 17 10 5 10-5" />
+              <path d="m2 12 10 5 10-5" />
+            </svg>
+            <span v-if="!railCollapsed">模型归组</span>
+          </RouterLink>
+          <RouterLink class="side-item" to="/health" :title="railCollapsed ? '连通率' : undefined">
+            <svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <path d="M22 12h-4l-3 9L9 3l-3 9H2" />
+            </svg>
+            <span v-if="!railCollapsed">连通率</span>
+          </RouterLink>
           <RouterLink class="side-item" to="/routes" :title="railCollapsed ? '路由' : undefined">
             <svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
               <circle cx="6" cy="19" r="3" />

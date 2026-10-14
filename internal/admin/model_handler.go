@@ -150,6 +150,12 @@ type modelResponse struct {
 	// SupportsThinking 三态：nil = 未配置（不下发该字段），
 	// true/false 才是显式声明。
 	SupportsThinking *bool `json:"supports_thinking,omitempty"`
+
+	// GroupID 是模型归组（跨上游同名合并统计）。空串 = 未归组。
+	// 只下发 id 不下发组名：组名要再查 model_groups，而前端本来就独立
+	// 加载全量组列表（组是小表），本地映射即可 —— 后端 JOIN 出来只是
+	// 把同一份数据搬运两次。
+	GroupID string `json:"group_id,omitempty"`
 }
 
 func (h *ModelHandler) List(w http.ResponseWriter, r *http.Request, providerID string) {
@@ -373,6 +379,110 @@ func (h *ModelHandler) Delete(w http.ResponseWriter, r *http.Request, id string)
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]string{"status": "deleted"})
+}
+
+// batchPriceRequest 是「批量设置价格」的输入。
+//
+// 刻意**不复用 modelRequest**：modelRequest 的 *float64 nil 语义是为单条
+// PATCH 设计的（nil = 保持原值），而批量改价是「整体替换」—— 三个价格
+// 必须同时显式给出，不存在「只改其中一档」的批量语义。用值类型 float64
+// 让「漏传」在解码时就是 0，而不是被当成「不改」。
+//
+// 0 的含义与单条路径一致（nullIfZeroFloat：0 = 清除价格），所以「批量
+// 清除价格」就是传三个 0。前端把「设置」和「清除」做成两个独立按钮，
+// 避免用户以为填 0 是「设为免费」。
+type batchPriceRequest struct {
+	ModelIDs       []string `json:"model_ids"`
+	PriceInput     float64  `json:"price_input"`
+	PriceCacheHit  float64  `json:"price_cache_hit"`
+	PriceOutput    float64  `json:"price_output"`
+}
+
+// BatchUpdatePrices 把同一组价格批量写到多个模型。
+//
+// 语义是**整体替换**：三个价格同时覆盖。校验与单条路径同口径（非负），
+// 但多一条「id 必须全部存在」—— 传了 10 个 id 只更新 8 个，说明有 2 个
+// 写错了。静默跳过会让运维以为全改好了、实则漏了 2 个，那正是本功能要
+// 消灭的「配了但没生效」类故障。所以这里照实报错并列出缺失的 id。
+func (h *ModelHandler) BatchUpdatePrices(w http.ResponseWriter, r *http.Request) {
+	var req batchPriceRequest
+	if err := decodeJSON(w, r, &req); err != nil {
+		if errors.Is(err, errUnsupportedMediaType) {
+			return
+		}
+		writeError(w, http.StatusBadRequest, "invalid JSON: "+err.Error())
+		return
+	}
+
+	// 去重 + 去空：前端多选可能带重复 id，重复的 WHERE id IN 无害但会
+	// 让「更新行数」对不上 ids 长度，干扰下面的缺失校验。
+	seen := make(map[string]bool, len(req.ModelIDs))
+	ids := make([]string, 0, len(req.ModelIDs))
+	for _, id := range req.ModelIDs {
+		id = strings.TrimSpace(id)
+		if id == "" || seen[id] {
+			continue
+		}
+		seen[id] = true
+		ids = append(ids, id)
+	}
+	if len(ids) == 0 {
+		writeError(w, http.StatusBadRequest, "model_ids 不能为空")
+		return
+	}
+	if len(ids) > 500 {
+		writeError(w, http.StatusBadRequest, "一次最多批量设置 500 个模型的价格")
+		return
+	}
+	for _, p := range []struct {
+		name string
+		val  float64
+	}{
+		{"price_input", req.PriceInput},
+		{"price_cache_hit", req.PriceCacheHit},
+		{"price_output", req.PriceOutput},
+	} {
+		if p.val < 0 {
+			writeError(w, http.StatusBadRequest, p.name+" cannot be negative")
+			return
+		}
+	}
+
+	// 先校验全部 id 存在，再执行 UPDATE —— 顺序不可换。
+	//
+	// 若先 UPDATE 再查缺失，部分失败的请求会把「存在的那些」也写进去，
+	// 而调用方收到 404 以为什么都没发生。批量改价是「要么全进、要么全不进」
+	// 的语义（与 ImportUpstreamModels 同理由），校验必须在写之前完成。
+	missing := make([]string, 0)
+	for _, id := range ids {
+		m, err := h.store.GetUpstreamModel(r.Context(), id)
+		if err != nil {
+			writeServerError(w, "verify model", err)
+			return
+		}
+		if m == nil {
+			missing = append(missing, id)
+		}
+	}
+	if len(missing) > 0 {
+		writeError(w, http.StatusNotFound,
+			fmt.Sprintf("部分模型不存在，价格未写入：%s", strings.Join(missing, ", ")))
+		return
+	}
+
+	updated, err := h.store.BatchUpdateModelPrices(r.Context(), ids, req.PriceInput, req.PriceCacheHit, req.PriceOutput)
+	if err != nil {
+		writeServerError(w, "batch update model prices", err)
+		return
+	}
+
+	writeJSON(w, http.StatusOK, map[string]any{
+		"updated": updated,
+		// 回显这次写进去的价格，让运维确认「我填的就是落库的」。
+		"price_input":     req.PriceInput,
+		"price_cache_hit": req.PriceCacheHit,
+		"price_output":    req.PriceOutput,
+	})
 }
 
 // modelTestResponse 是单模型可用性探测的响应体。
@@ -601,5 +711,6 @@ func toModelResponse(m store.UpstreamModel) modelResponse {
 		EffortLevels:     levels,
 		UnknownLevels:    m.UnknownLevels,
 		SupportsThinking: m.SupportsThinking,
+		GroupID:          m.GroupID,
 	}
 }

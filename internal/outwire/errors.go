@@ -5,7 +5,9 @@ import (
 	"errors"
 	"log/slog"
 	"net/http"
+	"regexp"
 	"time"
+	"unicode/utf8"
 
 	"github.com/cn-maul/rosetta"
 )
@@ -120,6 +122,73 @@ func logUpstreamMalformed(err error) {
 	slog.Warn("upstream response could not be decoded",
 		"error", err, "hint", "upstream accepted the request but returned an unreadable body")
 }
+
+// UpstreamErrorDetail 从一次上游错误里提取「落库用」的失败详情。
+//
+// 与 MapUpstreamError 的分工：后者决定「响应什么给客户端」（固定文案，
+// 不回显上游原文），本函数决定「把什么写进 usage_records.error_detail」
+// 供运维在调用历史里排查。两条职责分开 —— 客户端看到的和运维查到的
+// 不必是同一份文本，前者要克制，后者要够用。
+//
+// # 为什么用 apiErr.Message 而不是 apiErr.Raw
+//
+// Raw 是完整 JSON body（含 type/code/request_id 等），对「悬浮显示一句话」
+// 是过剩的；Message 是上游那句人话（「额度用完」「429 limit」），正是
+// 运维要的。Raw 只在 Message 为空时才退回去用。
+//
+// # 为什么必须自己脱敏
+//
+// SDK 只在 APIError.Error() 拼字符串时调 httpx.MaskSecrets（rosetta 内部
+// 包，网关 import 不到），Message 字段本身是**原文未脱敏** —— 上游可能
+// 把调用方的 key 回显在错误里。这里用与 SDK 同一份正则（secretRe 的
+// 复制）做掩码，保证落库的文本不含明文凭据。
+//
+// # 截断到 1KB
+//
+// 上游错误体理论上可到 4KB（SDK 的 safeTruncateBody 上限）。usage_records
+// 是明细表，失败率通常 <1%，但最坏情况（100% 失败）下 4KB × 日请求量
+// 会让库体积失控。1KB 足够承载「额度用完 / 429 / 模型不存在」这类
+// 一句话诊断，与项目里 balance.go 的 256B body_preview 同一量级惯例。
+func UpstreamErrorDetail(err error) string {
+	if err == nil {
+		return ""
+	}
+	var apiErr *rosetta.APIError
+	if !errors.As(err, &apiErr) {
+		// TransportError / ErrUpstreamMalformed 没有可用的上游正文，
+		// 返回空串 —— 调用历史里这类失败就没有详情，这是有意的。
+		return ""
+	}
+	detail := apiErr.Message
+	if detail == "" && len(apiErr.Raw) > 0 {
+		// Raw 是原始响应体（json.RawMessage）。SDK 的 body redaction 已对
+		// 凭据形状做过掩码，这里再过一次 maskSecrets 是纵深防御 ——
+		// 落库文本绝不能含明文凭据。
+		detail = string(apiErr.Raw)
+	}
+	detail = maskSecrets(detail)
+	if len(detail) > 1024 {
+		// 按 rune 边界截：上游（DeepSeek / 月之暗面等）的报错常是中文，
+		// 按字节截会把最后一个汉字劈成残字节 —— 存进库再经 JSON 编码时
+		// 会变成 replacement char，界面上是「乱码尾巴」。宁可少截一个字。
+		end := 1024
+		for end > 0 && !utf8.RuneStart(detail[end]) {
+			end--
+		}
+		detail = detail[:end]
+	}
+	return detail
+}
+
+// maskSecrets 是 rosetta 内部 httpx.MaskSecrets 的复制（同一份正则）。
+//
+// 为什么复制而不是 import：httpx 是 rosetta 的 internal 包，网关 import
+// 不到。正则必须与 SDK 保持一致 —— 若两边漂移，网关落库的文本可能
+// 漏掉 SDK 已经掩掉的某种凭据形状。这份正则覆盖 API key / JWT / AWS /
+// GitHub / Slack token 等常见形状。
+var secretRe = regexp.MustCompile(`sk-[A-Za-z0-9_-]{8,}|AIza[0-9A-Za-z_-]{20,}|AKIA[0-9A-Z]{16}|gh[pousr]_[A-Za-z0-9]{16,}|xox[baprs]-[A-Za-z0-9-]{10,}|eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{4,}\.[A-Za-z0-9_-]{4,}`)
+
+func maskSecrets(s string) string { return secretRe.ReplaceAllString(s, "***") }
 
 func WriteOpenAIError(w http.ResponseWriter, statusCode int, code, message string) {
 	w.Header().Set("Content-Type", "application/json")

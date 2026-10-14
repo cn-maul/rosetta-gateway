@@ -210,6 +210,27 @@ async function go(p: number) {
   await fetchPage(p)
 }
 
+// ---------- 失败详情 ----------
+
+// failureTitle 把一行的失败信息拼成徽章的悬浮文案。
+//
+// 用原生 title 而不是自定义 tooltip：与 Providers.vue 给就绪徽章挂
+// ready_reason 同一套做法，全站一致且零依赖。
+//
+// 三种形态要分开表达：
+//   - 成功（status='ok'）：返回 undefined，徽章不带 title —— 给成功行挂
+//     空 title 会在所有行上出现悬浮空白框；
+//   - 有详情：HTTP 状态 + 短码 + 上游原文；
+//   - 失败但无详情（超出保留期的老记录、TransportError 等无正文的失败）：
+//     明确说「无更多详情」。不能留白 —— 留白会让用户以为是界面坏了。
+function failureTitle(h: UsageHistoryEntry): string | undefined {
+  if (h.status === 'ok') return undefined
+  const head = h.http_status > 0 ? `HTTP ${h.http_status}` : '失败'
+  const code = h.error_code ? ` · ${h.error_code}` : ''
+  if (h.error_detail) return `${head}${code}\n${h.error_detail}`
+  return `${head}${code} · 无更多详情（上游未返回正文，或记录已超出保留期）`
+}
+
 // ---------- CSV 导出 ----------
 const exporting = ref(false)
 
@@ -398,7 +419,7 @@ onMounted(() => {
                      恰恰掩盖了「确实花了钱」这个事实。 -->
                 <td class="num-h">{{ h.cost > 0 ? fmtMoney(h.cost) : '—' }}</td>
                 <td class="c-st">
-                  <span class="badge" :class="statusBadge(h.status)">
+                  <span class="badge" :class="statusBadge(h.status)" :title="failureTitle(h)">
                     {{ statusLabel(h.status) }}
                   </span>
                 </td>

@@ -58,6 +58,12 @@ const router = createRouter({
     // 「这个组有哪些人」之间来回跳。页内两个 tab 解决。
     { path: '/users', name: 'users', component: () => import('./views/UsersGroups.vue'), meta: { title: '用户与分组', adminOnly: true } },
     { path: '/providers', name: 'providers', component: () => import('./views/Providers.vue'), meta: { title: '上游与模型', adminOnly: true } },
+    // 模型归组紧跟「上游与模型」：两者都在管模型的元数据，一个逐条配置、
+    // 一个跨上游合并展示身份。
+    { path: '/model-groups', name: 'model-groups', component: () => import('./views/ModelGroups.vue'), meta: { title: '模型归组', adminOnly: true } },
+    // 上游模型连通率：定时探测的时间轴。紧跟「上游与模型」/「模型归组」，
+    // 三者都在管上游模型 —— 一个配置、一个归组、一个看健康。
+    { path: '/health', name: 'health', component: () => import('./views/Health.vue'), meta: { title: '连通率', adminOnly: true } },
     { path: '/routes', name: 'routes', component: () => import('./views/Routes.vue'), meta: { title: '路由', adminOnly: true } },
     { path: '/settings', name: 'settings', component: () => import('./views/Settings.vue'), meta: { title: '设置', adminOnly: true } },
   ],

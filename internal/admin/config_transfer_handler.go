@@ -113,6 +113,18 @@ func (h *ConfigTransferHandler) buildExport(ctx context.Context) (configExport, 
 		byProvider[m.ProviderID] = append(byProvider[m.ProviderID], m)
 	}
 
+	// 归组先读出来建 id→name 映射：模型导出里用名字关联（跨库 id 无意义），
+	// 一次查询而不是每个模型现取，避免 N+1。
+	groups, err := h.store.ListModelGroups(ctx)
+	if err != nil {
+		return out, err
+	}
+	groupName := make(map[string]string, len(groups))
+	for _, g := range groups {
+		groupName[g.ID] = g.DisplayName
+		out.ModelGroups = append(out.ModelGroups, modelGroupExport{DisplayName: g.DisplayName})
+	}
+
 	for _, p := range providers {
 		out.Providers = append(out.Providers, providerExport{
 			Slug: p.Slug, Name: p.Name, Protocol: p.Protocol, Endpoint: p.Endpoint,
@@ -135,6 +147,9 @@ func (h *ConfigTransferHandler) buildExport(ctx context.Context) (configExport, 
 				PriceInput:    m.PriceInput,
 				PriceCacheHit: m.PriceCacheHit,
 				PriceOutput:   m.PriceOutput,
+				// 归组用显示名（跨库靠名字对齐，同 provider 靠 slug）。
+				// m.GroupID 为空 → 查表得空串 → omitempty 不写出，向后兼容。
+				GroupName: groupName[m.GroupID],
 			})
 		}
 		creds, err := h.store.ListCredentials(ctx, p.ID)
@@ -367,6 +382,45 @@ func (h *ConfigTransferHandler) attach(
 ) attachOutcome {
 	var out attachOutcome
 
+	// 归组导入必须排在模型循环**之前**：模型靠 group_name 关联组，
+	// 组不存在就写不进 group_id。同名组复用现有组（导入是合并而不是
+	// 重置配置），v1 文件没有这个切片 → 循环空转 → 所有模型未归组，
+	// 与字段加入前的行为一致。
+	groupByName := make(map[string]bool) // 本库已有（含本次新建）的组名
+	for _, g := range in.ModelGroups {
+		name := strings.TrimSpace(g.DisplayName)
+		if name == "" || groupByName[name] {
+			continue
+		}
+		groupByName[name] = true
+		existing, err := h.store.GetModelGroupByName(ctx, name)
+		if err != nil {
+			resp.Warnings = append(resp.Warnings, fmt.Sprintf("查询模型组 %q 失败：%v", name, err))
+			continue
+		}
+		if existing != nil {
+			resp.Notes = append(resp.Notes, fmt.Sprintf("模型组 %q 已存在，复用", name))
+			continue
+		}
+		if dry {
+			continue
+		}
+		if err := h.store.CreateModelGroup(ctx, &store.ModelGroup{
+			ID: generateID(), DisplayName: name,
+		}); err != nil {
+			resp.Warnings = append(resp.Warnings, fmt.Sprintf("模型组 %q 创建失败：%v", name, err))
+		}
+	}
+	// 名字 → 库内组 id 的解析表。dry 路径不建组，这里按名字查一遍现状
+	// （干跑报出的模型归组数与实际一致才有意义）。
+	resolveGroup := make(map[string]string)
+	for name := range groupByName {
+		g, err := h.store.GetModelGroupByName(ctx, name)
+		if err == nil && g != nil {
+			resolveGroup[name] = g.ID
+		}
+	}
+
 	// 模型查重必须按 **provider_id**，不能按 slug。
 	//
 	// 反例很具体：目标库已有 alpha（含模型 alpha-1），导入文件里也有
@@ -424,6 +478,13 @@ func (h *ConfigTransferHandler) attach(
 			Enabled: me.Enabled, ContextWindow: me.ContextWindow,
 			MaxOutputTokens: me.MaxOutputTokens, SupportsThinking: me.SupportsThinking,
 			PriceInput: me.PriceInput, PriceCacheHit: me.PriceCacheHit, PriceOutput: me.PriceOutput,
+		}
+		// 归组：文件里的组名解析成库内组 id（组在循环前已确保存在）。
+		// 解析不到（如 dry 路径库里还没有这个组）→ 未归组，与 v1 一致。
+		if gname := strings.TrimSpace(me.GroupName); gname != "" {
+			if gid, ok := resolveGroup[gname]; ok {
+				m.GroupID = gid
+			}
 		}
 		// 挡位：一个都识别不出来但原文非空 = 文件里写的是无效值。
 		// 照实跳过并告警，而不是静默导成「未配置」—— 后者会让运维以为

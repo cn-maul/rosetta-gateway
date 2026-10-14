@@ -110,6 +110,27 @@ func (s *Store) migrate() error {
 			last_error    TEXT,
 			created_at    INTEGER NOT NULL
 		)`,
+		// model_groups 是「跨上游的同一个模型」归组表（2026-10-14）。
+		//
+		// 不同上游对同一模型的叫法常常不同（deepseek-chat / ds-chat /
+		// DeepSeek-V3），归组让用量统计能合并显示、并给一个统一展示名。
+		//
+		// 为什么建独立表而不是复用 routes.public_name：routes 的 public_name
+		// 是 UNIQUE 的路由名，一条 route 只挂一个目标模型，表达不了
+		// 「多个 upstream_models 行共享一个身份」；且 configExport 根本不含
+		// routes —— 归组拓扑在配置文件里无处存放（export_format.go:44-48）。
+		//
+		// display_name 全库唯一：归组靠名字对齐（导入导出也按名字匹配），
+		// 重名会让两组合并成一个而无人察觉。
+		//
+		// 必须建在 upstream_models 之前：group_id 列的 FK REFERENCES
+		// model_groups(id)，老库 ALTER TABLE ADD COLUMN 带 FK 时要求目标表
+		// 已存在（users 表的迁移顺序同理，见 ensureColumns 后的注释）。
+		`CREATE TABLE IF NOT EXISTS model_groups (
+			id           TEXT PRIMARY KEY,
+			display_name TEXT NOT NULL UNIQUE,
+			created_at   INTEGER NOT NULL
+		)`,
 		`CREATE TABLE IF NOT EXISTS upstream_models (
 			id                TEXT PRIMARY KEY,
 			provider_id       TEXT NOT NULL REFERENCES providers(id) ON DELETE CASCADE,
@@ -472,6 +493,37 @@ func (s *Store) migrate() error {
 			remark             TEXT
 		)`,
 		`CREATE INDEX IF NOT EXISTS idx_balance_topups_user ON balance_topups(user_id, ts)`,
+		// model_probes：上游模型的定时探测结果（2026-10-14）。
+		//
+		// 与 usage_records 的**隔离红线**（探测绝不能污染计费，见
+		// cmd/gateway 探测循环注释）：
+		//   - 本表**不进** UsageSource 的 UNION —— 那是所有统计页与配额预检
+		//     的公共数据源，混进去会把用户用量与配额全抬高；
+		//   - 不写 cost_total、不进任何配额/余额计算；
+		//   - 探测失败**不写** provider_credentials.cooldown_until —— 冷却是
+		//     业务流量的信号，用一把刚被判 401 的 key 去测会把「key 坏了」
+		//     误报成「模型坏了」。
+		//
+		// error_kind 是归一化的失败类别（timeout / rate_limited / auth /
+		// not_found / transport / malformed），error_detail 复用 outwire 的
+		// 脱敏 + 1KB 截断工具（与 usage_records.error_detail 同一套）。
+		//
+		// 保留期单独配置（默认 30 天），由探测循环自己剪枝 —— 不并入
+		// usage 的 PruneOldUsage，因为那是按 usage 口径算的、且本表不该
+		// 依赖 usage 的保留期配置。
+		`CREATE TABLE IF NOT EXISTS model_probes (
+			id           INTEGER PRIMARY KEY AUTOINCREMENT,
+			model_id     TEXT NOT NULL,
+			provider_id  TEXT NOT NULL,
+			ts           INTEGER NOT NULL,
+			ok           INTEGER NOT NULL,
+			in_band      INTEGER NOT NULL DEFAULT 0,
+			latency_ms   INTEGER NOT NULL DEFAULT 0,
+			error_kind   TEXT,
+			error_detail TEXT
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_probes_model_ts ON model_probes(model_id, ts)`,
+		`CREATE INDEX IF NOT EXISTS idx_probes_provider_ts ON model_probes(provider_id, ts)`,
 	}
 
 	for i, m := range migrations {
@@ -709,6 +761,22 @@ func (s *Store) ensureColumns() error {
 		// 语义是「未配置」，此时数据面**不夹取**、由 rosetta 归一到三档 ——
 		// 与「配成空串」必须可区分，所以落 NULL 而不是 DEFAULT ''。
 		{"upstream_models", "effort_levels", "TEXT"},
+		// 上游失败详情（2026-10-14）。可空、不带 DEFAULT：成功记录与
+		// TransportError 这类无正文的失败都是 NULL。只存在于明细层，
+		// 归档表 usage_daily_rollups 按 (day × 维度) 聚合、没有单次失败
+		// 的位置，所以**不加到归档表** —— 详情随明细 30 天一起消失。
+		{"usage_records", "error_detail", "TEXT"},
+		// 模型归组（2026-10-14）。把「不同上游的同一个模型」标成一组，
+		// 用量统计可按组显示统一名称。可空 = 未归组。
+		//
+		// **刻意不进 usage_daily_rollups 主键**：归组是展示/统计层的派生
+		// 维度，归属会变（改组、拆组、并组）。进主键要整表重建（历史上
+		// 加 upstream_model 维度就触发过，且老库有行时启动直接失败）；
+		// 放查询层 JOIN 派生则「改一次组名，全部历史统计立刻跟着变」，
+		// 零迁移、零回填 —— 这正是归组要的行为。
+		//
+		// ON DELETE SET NULL：删组不删模型，组内的模型回到「未归组」。
+		{"upstream_models", "group_id", "TEXT REFERENCES model_groups(id) ON DELETE SET NULL"},
 	}
 
 	for _, a := range additions {

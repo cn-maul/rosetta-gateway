@@ -35,9 +35,12 @@ type UsageRecord struct {
 	Status          string
 	HTTPStatus      int
 	ErrorCode       string
-	LatencyMs       int64
-	TTFBMs          int64
-	RequestID       string
+	// ErrorDetail 是上游返回的失败详情（脱敏 + 截断后），供调用历史排查。
+	// 空串 = 无详情（成功、预检失败、或 TransportError 这类没有上游正文的失败）。
+	ErrorDetail string
+	LatencyMs   int64
+	TTFBMs      int64
+	RequestID   string
 }
 
 // CreateUsageRecord 落一条用量记录。
@@ -126,8 +129,8 @@ func (s *Store) CreateUsageRecordWithCost(ctx context.Context, r *UsageRecord) (
 	// 可以各自忘记的地方，而忘了的表征是**费用静默偏低**，没人会发现。
 	cost := s.freezeUsageCost(ctx, r)
 	_, err := s.db.ExecContext(ctx,
-		`INSERT INTO usage_records (id, ts, access_key_id, user_id, public_model, provider_id, upstream_model, ingress_protocol, stream, input_tokens, output_tokens, total_tokens, reasoning_tokens, cached_tokens, usage_state, status, http_status, error_code, latency_ms, ttfb_ms, request_id, cost_total) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		r.ID, ts, r.AccessKeyID, nullIfEmpty(r.UserID), r.PublicModel, r.ProviderID, r.UpstreamModel, r.IngressProtocol, stream, r.InputTokens, r.OutputTokens, r.TotalTokens, r.ReasoningTokens, r.CachedTokens, r.UsageState, r.Status, r.HTTPStatus, nullIfEmpty(r.ErrorCode), r.LatencyMs, r.TTFBMs, nullIfEmpty(r.RequestID), cost)
+		`INSERT INTO usage_records (id, ts, access_key_id, user_id, public_model, provider_id, upstream_model, ingress_protocol, stream, input_tokens, output_tokens, total_tokens, reasoning_tokens, cached_tokens, usage_state, status, http_status, error_code, error_detail, latency_ms, ttfb_ms, request_id, cost_total) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		r.ID, ts, r.AccessKeyID, nullIfEmpty(r.UserID), r.PublicModel, r.ProviderID, r.UpstreamModel, r.IngressProtocol, stream, r.InputTokens, r.OutputTokens, r.TotalTokens, r.ReasoningTokens, r.CachedTokens, r.UsageState, r.Status, r.HTTPStatus, nullIfEmpty(r.ErrorCode), nullIfEmpty(r.ErrorDetail), r.LatencyMs, r.TTFBMs, nullIfEmpty(r.RequestID), cost)
 	if err != nil {
 		// 落库失败：费用随记录一起作废。返回 0 而不是 cost —— 调用方若误用
 		// 这个值去扣费，扣的金额必须与「库里真实存在的记录」对应，
@@ -197,13 +200,13 @@ func (s *Store) CreateUsageRecordsBatched(ctx context.Context, recs []*UsageReco
 		(id, ts, access_key_id, user_id, public_model, provider_id, upstream_model,
 		 ingress_protocol, stream, input_tokens, output_tokens, total_tokens,
 		 reasoning_tokens, cached_tokens, usage_state, status, http_status,
-		 error_code, latency_ms, ttfb_ms, request_id, cost_total) VALUES `)
+		 error_code, error_detail, latency_ms, ttfb_ms, request_id, cost_total) VALUES `)
 
 	for i, r := range recs {
 		if i > 0 {
 			sb.WriteByte(',')
 		}
-		sb.WriteString("(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)")
+		sb.WriteString("(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)")
 		args = append(args, usageInsertArgs(r, costs[i])...)
 	}
 
@@ -218,7 +221,7 @@ func (s *Store) CreateUsageRecordsBatched(ctx context.Context, recs []*UsageReco
 }
 
 // usageInsertColumns 是 usage_records 写入路径的列数（仅用于容量预估）。
-const usageInsertColumns = 22
+const usageInsertColumns = 23
 
 // batchComputeCosts 逐条算固化费用，并顺带完成 token 负值归一与 ts 兜底。
 //
@@ -263,8 +266,8 @@ func usageInsertArgs(r *UsageRecord, cost float64) []any {
 		r.ProviderID, r.UpstreamModel, r.IngressProtocol, stream,
 		r.InputTokens, r.OutputTokens, r.TotalTokens,
 		r.ReasoningTokens, r.CachedTokens, r.UsageState, r.Status,
-		r.HTTPStatus, nullIfEmpty(r.ErrorCode), r.LatencyMs, r.TTFBMs,
-		nullIfEmpty(r.RequestID), cost,
+		r.HTTPStatus, nullIfEmpty(r.ErrorCode), nullIfEmpty(r.ErrorDetail),
+		r.LatencyMs, r.TTFBMs, nullIfEmpty(r.RequestID), cost,
 	}
 }
 

@@ -379,6 +379,9 @@ import type {
   Credential,
   UpstreamModel,
   UpstreamModelUpdate,
+  ModelGroup,
+  ProbeHealth,
+  ProbeTimelineBucket,
   DiscoveredModel,
   ModelImportItem,
   ModelTestResult,
@@ -464,6 +467,25 @@ export const api = {
     mutate(() => post<UpstreamModel>(`/providers/${providerId}/models`, b)),
   updateModel: (id: string, b: UpstreamModelUpdate) => mutate(() => patch<UpstreamModel>(`/models/${id}`, b)),
   deleteModel: (id: string) => mutate(() => del(`/models/${id}`)),
+  // 批量设置价格：把同一组价格写到多个模型（整体替换，见后端 batchPriceRequest）。
+  batchUpdateModelPrices: (modelIds: string[], b: { price_input: number; price_cache_hit: number; price_output: number }) =>
+    mutate(() => post<{ updated: number; price_input: number; price_cache_hit: number; price_output: number }>('/models/batch-price', { model_ids: modelIds, ...b })),
+
+  // 模型归组（跨上游的同一个模型合并统计；纯展示层，不参与数据面路由）
+  modelGroups: () => get<ModelGroup[]>('/model-groups'),
+  createModelGroup: (display_name: string) => mutate(() => post<ModelGroup>('/model-groups', { display_name })),
+  updateModelGroup: (id: string, display_name: string) => mutate(() => patch<ModelGroup>(`/model-groups/${id}`, { display_name })),
+  deleteModelGroup: (id: string) => mutate(() => del(`/model-groups/${id}`)),
+  groupMembers: (id: string) => get<UpstreamModel[]>(`/model-groups/${id}/members`),
+  assignModelsToGroup: (groupId: string, modelIds: string[]) =>
+    mutate(() => post<{ assigned: number }>(`/model-groups/${groupId}/assign`, { model_ids: modelIds })),
+  unassignModelsFromGroup: (modelIds: string[]) =>
+    mutate(() => post<{ unassigned: number }>('/model-groups/unassign', { model_ids: modelIds })),
+
+  // 上游模型健康探测（读 model_probes 表；探测循环在后台跑）
+  probeModels: () => get<ProbeHealth[]>('/probes/models'),
+  probeTimeline: (modelId: string, days = 7, granularity: 'hour' | 'day' = 'hour') =>
+    get<ProbeTimelineBucket[]>(`/probes/timeline?model_id=${modelId}&days=${days}&granularity=${granularity}`),
   discoverModels: (providerId: string) =>
     post<{ status: string; message?: string; models?: DiscoveredModel[] }>(`/providers/${providerId}/models/discover`),
   importModels: (providerId: string, models: ModelImportItem[]) =>

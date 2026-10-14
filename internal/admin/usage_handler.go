@@ -438,6 +438,18 @@ type usageHistoryEntry struct {
 	// 于是「报表在涨、余额不动」。把每条的费用摆出来，用户才能对上账；
 	// 否则只能看到余额缓慢变化，无从判断钱花在哪。
 	Cost float64 `json:"cost"`
+	// HTTPStatus / ErrorCode / ErrorDetail 是失败三件套（2026-10-14 新增）。
+	//
+	// 为什么三个都下发：只有 status（ok/error/truncated…）回答不了
+	// 「为什么失败」。HTTPStatus 给量级（429 限流 vs 401 换 key vs 5xx 上游坏了），
+	// ErrorCode 给归一化短码，ErrorDetail 给上游原文（脱敏+截断后）。
+	// 前端把它们挂在失败徽章的 title 上 —— 成功记录三者皆空，不占显示。
+	//
+	// 注意 ErrorDetail 只存在于明细层（随保留期一起剪枝）：30 天前的
+	// 失败只有短码没有原文，UI 文案要能自洽。
+	HTTPStatus int    `json:"http_status"`
+	ErrorCode  string `json:"error_code,omitempty"`
+	ErrorDetail string `json:"error_detail,omitempty"`
 }
 
 // tpsFor 计算单条请求的平均输出速度（token/s）；无样本时返回 0。
@@ -644,7 +656,7 @@ func (h *UsageHandler) History(w http.ResponseWriter, r *http.Request) {
 	}
 
 	rows, err := h.store.Reader().Query(
-		`SELECT u.ts, u.public_model, u.upstream_model, COALESCE(a.name, ''), u.access_key_id, u.total_tokens, u.output_tokens, u.ttfb_ms, u.latency_ms, u.status, u.stream, COALESCE(u.cost_total, 0)
+		`SELECT u.ts, u.public_model, u.upstream_model, COALESCE(a.name, ''), u.access_key_id, u.total_tokens, u.output_tokens, u.ttfb_ms, u.latency_ms, u.status, u.stream, COALESCE(u.cost_total, 0), u.http_status, COALESCE(u.error_code, ''), COALESCE(u.error_detail, '')
 		   FROM usage_records u LEFT JOIN access_keys a ON a.id = u.access_key_id`+where+
 			` ORDER BY u.ts DESC, u.id DESC LIMIT ? OFFSET ?`, append(args, limit, offset)...)
 	if err != nil {
@@ -657,7 +669,8 @@ func (h *UsageHandler) History(w http.ResponseWriter, r *http.Request) {
 	for rows.Next() {
 		var e usageHistoryEntry
 		if err := rows.Scan(&e.Ts, &e.PublicModel, &e.UpstreamModel, &e.KeyName, &e.KeyID,
-			&e.TotalTokens, &e.OutputTokens, &e.TTFBMs, &e.LatencyMs, &e.Status, &e.Stream, &e.Cost); err != nil {
+			&e.TotalTokens, &e.OutputTokens, &e.TTFBMs, &e.LatencyMs, &e.Status, &e.Stream, &e.Cost,
+			&e.HTTPStatus, &e.ErrorCode, &e.ErrorDetail); err != nil {
 			writeServerError(w, "usage history scan", err)
 			return
 		}
@@ -707,10 +720,56 @@ func (h *UsageHandler) GroupByKey(w http.ResponseWriter, r *http.Request) {
 	h.groupBy(w, r, "access_key_id", `COALESCE(a.name, '')`)
 }
 
+// GroupByModel 按「模型归组」聚合用量；未归组的模型保持按 upstream_model 分组。
+//
+// # 分组键为什么是 COALESCE(组名, upstream_model)
+//
+// 归组要解决的是「不同上游的同一个模型叫法不同、用量裂成 N 桶」。
+// 分组键取 `COALESCE(g.display_name, u.upstream_model)`：
+//   - 归了组的行 → 按组名合并（这正是需求）；
+//   - 没归组的行 → 逐字保持旧行为（键 = upstream_model），历史统计不受影响；
+//   - 模型行被删（LEFT JOIN 落空）→ 同样落回 upstream_model，用量不丢。
+//
+// 组是**展示层派生**而不是落库维度：改一次组名，所有历史统计立刻跟着变,
+// 不需要回填几百万行明细（这正是把 group_id 固化进事实表做不到、
+// 也不该做的事 —— 见 store.go group_id 列的注释）。
+//
+// name 列回显组名（未归组为空串），前端据此能标出「这行是合并过的」。
 func (h *UsageHandler) GroupByModel(w http.ResponseWriter, r *http.Request) {
-	// 只统计底层上游模型用量（按 upstream_model 分组）。表 A 也有这一维
-	// （P1.5 补的），所以剪枝后这条分项统计依然完整。
-	h.groupBy(w, r, "upstream_model", "")
+	q := r.URL.Query()
+	from, to, explicit, err := queryRangeExplicit(q, 7*24*time.Hour)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	limit := clampLimit(q.Get("limit"), defaultUsageLimit, maxUsageLimit)
+
+	_, _, filter := groupFilter(from, to, explicit, callerScope(r))
+	src, args := store.UsageSource(filter)
+	args = append(args, limit)
+
+	// JOIN 在归一化来源之外、聚合之前：usage 两侧（明细/归档）都带
+	// (provider_id, upstream_model) 这对不可变定位符，足以在查询时找回组。
+	// GROUP BY 写原表达式而不是别名 —— 与 groupBy 的既有口径一致
+	//（别名在 GROUP BY 里的可用性本就不该依赖）。
+	query := `SELECT COALESCE(g.display_name, u.upstream_model) AS key, ` +
+		`COALESCE(SUM(u.n), 0) AS count, ` +
+		store.UsageSumExpr("total_tokens", "u") + ` AS tokens, ` +
+		store.UsageSumExpr("cost_total", "u") + ` AS cost, ` +
+		`COALESCE(g.display_name, '') AS name` +
+		` FROM ` + src +
+		` LEFT JOIN upstream_models um ON um.provider_id = u.provider_id AND um.model_id = u.upstream_model` +
+		` LEFT JOIN model_groups g ON g.id = um.group_id` +
+		` GROUP BY COALESCE(g.display_name, u.upstream_model)` +
+		` ORDER BY tokens DESC LIMIT ?`
+
+	rows, err := h.store.Reader().Query(query, args...)
+	if err != nil {
+		writeServerError(w, "usage group by model", err)
+		return
+	}
+	defer rows.Close()
+	writeGroupEntries(w, rows, true)
 }
 
 func (h *UsageHandler) GroupByProvider(w http.ResponseWriter, r *http.Request) {

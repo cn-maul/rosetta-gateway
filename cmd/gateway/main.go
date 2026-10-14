@@ -30,6 +30,7 @@ import (
 	"github.com/cn-maul/rosetta-gateway/internal/effort"
 	"github.com/cn-maul/rosetta-gateway/internal/inwire"
 	"github.com/cn-maul/rosetta-gateway/internal/outwire"
+	"github.com/cn-maul/rosetta-gateway/internal/probe"
 	"github.com/cn-maul/rosetta-gateway/internal/ratelimit"
 	"github.com/cn-maul/rosetta-gateway/internal/routing"
 	"github.com/cn-maul/rosetta-gateway/internal/server"
@@ -213,6 +214,11 @@ func main() {
 	// 下方原声明处改为复用（不重复 make）。
 	shutdown := make(chan struct{})
 
+	// 探测循环的上下文：随 shutdown 取消。探测是低频后台任务，用独立的
+	// context 而不是复用 reloadCtx（那是重建重试的，语义不同）。
+	probeCtx, stopProbe := context.WithCancel(context.Background())
+	defer stopProbe()
+
 	reloadCtx, stopReloadRetry := context.WithCancel(context.Background())
 	defer stopReloadRetry()
 	go reloader.watchReloadRetry(reloadCtx)
@@ -285,6 +291,8 @@ func main() {
 	providerHandler := admin.NewProviderHandler(db, masterKey, cfg)
 	credentialHandler := admin.NewCredentialHandler(db, masterKey)
 	modelHandler := admin.NewModelHandler(db, masterKey, cfg)
+	modelGroupHandler := admin.NewModelGroupHandler(db)
+	probeHandler := admin.NewProbeHandler(db)
 	routeHandler := admin.NewRouteHandler(db)
 	routeTargetHandler := admin.NewRouteTargetHandler(db)
 	keyHandler := admin.NewKeyHandler(db)
@@ -356,6 +364,26 @@ func main() {
 	adminMux.HandleFunc("POST /admin/api/providers/{id}/models/import", func(w http.ResponseWriter, r *http.Request) { modelHandler.ImportModels(w, r, r.PathValue("id")) })
 	adminMux.HandleFunc("PATCH /admin/api/models/{id}", func(w http.ResponseWriter, r *http.Request) { modelHandler.Update(w, r, r.PathValue("id")) })
 	adminMux.HandleFunc("DELETE /admin/api/models/{id}", func(w http.ResponseWriter, r *http.Request) { modelHandler.Delete(w, r, r.PathValue("id")) })
+	// 批量设置价格：把同一组价格写到多个模型。POST 语义是「整体替换」，
+	// 与单条 PATCH 的 nil=不改 不同 —— 见 model_handler.go 的 batchPriceRequest。
+	// AutoReload 对 POST 自动生效（审计 + 快照重建），无需额外白名单。
+	adminMux.HandleFunc("POST /admin/api/models/batch-price", modelHandler.BatchUpdatePrices)
+
+	// 模型归组：把不同上游的「同一个模型」标成一组，用量统计可按组显示。
+	// 纯统计/展示层概念，不参与数据面路由判定。
+	adminMux.HandleFunc("GET /admin/api/model-groups", modelGroupHandler.List)
+	adminMux.HandleFunc("POST /admin/api/model-groups", modelGroupHandler.Create)
+	adminMux.HandleFunc("PATCH /admin/api/model-groups/{id}", func(w http.ResponseWriter, r *http.Request) { modelGroupHandler.Update(w, r, r.PathValue("id")) })
+	adminMux.HandleFunc("DELETE /admin/api/model-groups/{id}", func(w http.ResponseWriter, r *http.Request) { modelGroupHandler.Delete(w, r, r.PathValue("id")) })
+	adminMux.HandleFunc("GET /admin/api/model-groups/{id}/members", func(w http.ResponseWriter, r *http.Request) { modelGroupHandler.GroupMembers(w, r, r.PathValue("id")) })
+	// 指派/取消指派：路径里的 {id} 是**组** id（对某个组的操作）；
+	// 移出组不属于任何组，所以单独一个 unassign 端点而不是带空 group_id 的指派。
+	adminMux.HandleFunc("POST /admin/api/model-groups/{id}/assign", func(w http.ResponseWriter, r *http.Request) { modelGroupHandler.AssignModels(w, r, r.PathValue("id")) })
+	adminMux.HandleFunc("POST /admin/api/model-groups/unassign", modelGroupHandler.UnassignModels)
+
+	// 上游模型健康探测（读 model_probes 表，不触发探测 —— 探测循环在后台跑）。
+	adminMux.HandleFunc("GET /admin/api/probes/models", probeHandler.Models)
+	adminMux.HandleFunc("GET /admin/api/probes/timeline", probeHandler.Timeline)
 	// 单模型可用性探测。与 provider 的 /providers/{id}/test 是两件事：
 	// 那个拉 /models 证明「endpoint + 凭据通」，这个发一次最小真实推理
 	// （max_tokens=1）证明「这个 model_id 现在真的能推理」—— 模型下架、
@@ -687,6 +715,26 @@ func main() {
 		}
 	}()
 
+	// 上游模型定时探测（2026-10-14）。照抄 runRecompute 的骨架：周期短、
+	// 需要并发上限、有 done 等待先例。探测请求复用 upstream.TestUpstreamModel
+	// （max_tokens=1、不经 usage_recorder），**不扣任何网关用户的钱**，
+	// 结果只进 model_probes 表 —— 绝不进 UsageSource / 配额 / 余额
+	// （见 store.go model_probes 建表注释的隔离红线）。
+	//
+	// 探测循环在 cfg.Probes.Enabled 时启动。探测失败**不写**凭据冷却，
+	// 不碰 pool 的熔断状态机 —— 那是业务流量的信号，探测要回答的是
+	// 「这个 model_id 现在能不能推理」。
+	probeDone := make(chan struct{})
+	if cfg.Probes.Enabled {
+		go func() {
+			defer close(probeDone)
+			probeRunner := probe.NewRunner(db, cfg, masterKey, logger)
+			probeRunner.Run(probeCtx)
+		}()
+	} else {
+		close(probeDone)
+	}
+
 	quit := make(chan os.Signal, 1)
 	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
 	<-quit
@@ -697,6 +745,7 @@ func main() {
 	// 而编排器的终止宽限期通常更短 —— 那就变成强杀，剪枝事务虽会整体回滚
 	// （聚合与删除同事务），但退出被拖长这件事本身已经不对。超时后照常退出。
 	close(shutdown)
+	stopProbe() // 让探测循环的 ctx 取消，它会在下一个 select 返回
 	select {
 	case <-pruneDone:
 	case <-time.After(5 * time.Second):
@@ -709,6 +758,13 @@ func main() {
 	case <-recomputeDone:
 	case <-time.After(2 * time.Second):
 		logger.Warn("cost recompute still running at shutdown; exiting anyway")
+	}
+	// 探测循环同理：它往写池写 model_probes，与 db.Close() 并发会拿到
+	// "database is closed"。探测是低频写，正常情况下立刻返回。
+	select {
+	case <-probeDone:
+	case <-time.After(2 * time.Second):
+		logger.Warn("probe runner still running at shutdown; exiting anyway")
 	}
 
 	logger.Info("shutting down...")
@@ -2020,8 +2076,10 @@ func handleIngress(pool *upstream.Pool, cfg *config.Config, usage *usageRecorder
 				"model", ing.model, "request_id", server.RequestIDFromContext(r.Context()))
 		}
 		errorCode := code
+		errorDetail := out.detail
 		if clientGone {
 			errorCode = ""
+			errorDetail = ""
 		}
 		usage.record(&store.UsageRecord{
 			ID:              generateID(),
@@ -2037,6 +2095,7 @@ func handleIngress(pool *upstream.Pool, cfg *config.Config, usage *usageRecorder
 			Status:          status,
 			HTTPStatus:      statusCode,
 			ErrorCode:       errorCode,
+			ErrorDetail:     errorDetail,
 			LatencyMs:       time.Since(start).Milliseconds(),
 		})
 	}
@@ -2059,6 +2118,10 @@ type attemptOutcome struct {
 	statusCode   int
 	code         string
 	message      string
+	// detail 是上游失败详情（脱敏 + 截断），落进 usage_records.error_detail
+	// 供调用历史排查。与 message 不同：message 是给客户端的固定文案，
+	// detail 是给运维的上游原文。空串 = 无正文可截（TransportError 等）。
+	detail string
 }
 
 // outcomeFromErr 把一次上游 err 归类成「未提交」的结果。
@@ -2101,6 +2164,7 @@ func outcomeFromErr(err error) attemptOutcome {
 		statusCode:   statusCode,
 		code:         code,
 		message:      message,
+		detail:       outwire.UpstreamErrorDetail(err),
 	}
 }
 
@@ -2435,6 +2499,10 @@ func attemptStream(w http.ResponseWriter, r *http.Request, client *rosetta.Clien
 	var stopReason rosetta.StopReason
 	status := "ok"
 	errorCode := ""
+	// errorDetail 只在 default 分支（上游真的返回了错误）填 —— truncated /
+	// overflow / idle_timeout 是「流断了」而不是「上游回了错误正文」，
+	// canceled 更是客户端自己的行为，都不该有详情。
+	errorDetail := ""
 	httpStatus := 200
 
 	// consume 消费一个上游事件（首个 + 后续走同一套逻辑）：看门狗续期与
@@ -2477,6 +2545,7 @@ func attemptStream(w http.ResponseWriter, r *http.Request, client *rosetta.Clien
 		default:
 			status = "error"
 			errorCode = "upstream_error"
+			errorDetail = outwire.UpstreamErrorDetail(err)
 			logger.Error("stream error", "error", err, "model", publicModel, "key_id", authCtx.KeyID)
 		}
 	} else if idleTimedOut.Load() && !sink.SawTerminal() {
@@ -2521,6 +2590,7 @@ func attemptStream(w http.ResponseWriter, r *http.Request, client *rosetta.Clien
 		Status:          status,
 		HTTPStatus:      httpStatus,
 		ErrorCode:       errorCode,
+		ErrorDetail:     errorDetail,
 		LatencyMs:       latency,
 		TTFBMs:          ttfbMs,
 	})

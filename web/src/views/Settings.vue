@@ -682,6 +682,101 @@ async function clearPrice(r: PriceRow) {
   }
 }
 
+// ---------- 批量设置价格 ----------
+
+// 批量改价的状态。选中集合按模型 id 存（Set），因为同一模型在筛选/翻页后
+// 仍要保留勾选 —— 用数组会在翻页时把已勾的丢在上一页。
+const priceSelected = ref(new Set<string>())
+const batchOpen = ref(false)
+const batchSaving = ref(false)
+// 批量弹窗里的三个价格输入。以「当前勾选的第一行」的价格为初值，方便
+// 「复制到其它模型」的流程 —— 用户点某行「复制到…」时，这里预填的就是那行的价。
+const batchForm = reactive({ price_input: 0, price_cache_hit: 0, price_output: 0 })
+
+function isPriceSelected(id: string): boolean {
+  return priceSelected.value.has(id)
+}
+function togglePriceSelected(id: string): void {
+  const next = new Set(priceSelected.value)
+  if (next.has(id)) next.delete(id)
+  else next.add(id)
+  priceSelected.value = next
+}
+// 全选当前页（不是全部）：批量操作要的是「我眼前这几行」，跨页全选容易
+// 误伤 —— 用户看不到被选中的行，也就无法核对。
+function selectPricePage(): void {
+  const next = new Set(priceSelected.value)
+  for (const r of pricePageRows.value) next.add(r.model.id)
+  priceSelected.value = next
+}
+function clearPriceSelection(): void {
+  priceSelected.value = new Set()
+}
+
+// 已勾选的模型行（跨页，用于确认弹窗计数）。
+const selectedPriceRows = computed(() =>
+  priceRows.value.filter((r) => priceSelected.value.has(r.model.id)),
+)
+
+// 打开批量弹窗：以勾选的第一行为初值。若没勾选任何行，则用「当前筛选下
+// 第一行」的价格做初值 —— 那正是「复制到其它模型」的入口（点某行复制，
+// 初值就是那行）。
+function openBatchPrice(seedRow?: PriceRow) {
+  const seed = seedRow ?? selectedPriceRows.value[0] ?? pricePageRows.value[0]
+  if (!seed) {
+    toast('没有可用的价格条目', 'err')
+    return
+  }
+  batchForm.price_input = seed.model.price_input
+  batchForm.price_cache_hit = seed.model.price_cache_hit
+  batchForm.price_output = seed.model.price_output
+  batchOpen.value = true
+}
+
+// 提交批量设置。目标 = 当前勾选的行；若一个都没勾，则把「当前页全部」当目标
+// （配合「复制到…」：点某行复制 → 该行被勾上 → 提交即应用到它）。
+async function saveBatchPrice() {
+  const targets = selectedPriceRows.value
+  if (targets.length === 0) {
+    toast('请先勾选要设置价格的模型', 'err')
+    return
+  }
+  const body = {
+    price_input: Number(batchForm.price_input) || 0,
+    price_cache_hit: Number(batchForm.price_cache_hit) || 0,
+    price_output: Number(batchForm.price_output) || 0,
+  }
+  if (body.price_input < 0 || body.price_cache_hit < 0 || body.price_output < 0) {
+    toast('单价不能为负数', 'err')
+    return
+  }
+  // 三项全 0 = 清除价格。这里不拦（批量清除是合法动作），但确认文案要讲清。
+  const clearing = body.price_input === 0 && body.price_cache_hit === 0 && body.price_output === 0
+  const ok = await confirmBox({
+    title: clearing ? `清除 ${targets.length} 个模型的价格？` : `为 ${targets.length} 个模型设置价格？`,
+    body: clearing
+      ? '清除后这些模型此后的用量按 0 元计；已经产生的费用按当时的价固化，不受影响。'
+      : `将把输入/缓存命中/输出单价应用到 ${targets.length} 个模型。只影响之后的调用，历史费用不回溯。`,
+    confirmLabel: clearing ? '清除' : '应用',
+  })
+  if (!ok) return
+  batchSaving.value = true
+  try {
+    await api.batchUpdateModelPrices(
+      targets.map((r) => r.model.id),
+      body,
+    )
+    toast(clearing ? `已清除 ${targets.length} 个模型的价格` : `已为 ${targets.length} 个模型设置价格`)
+    batchOpen.value = false
+    priceSelected.value = new Set()
+    await loadPrices()
+  } catch (e) {
+    if ((e as { status?: number }).status !== 401) toast('批量设置失败：' + (e as Error).message, 'err')
+  } finally {
+    batchSaving.value = false
+  }
+}
+
 // 编辑弹窗里的「删除价格」：以**库里已存**的价格为准（不是输入框里的草稿），
 // 否则把输入清空后按钮就消失了，恰恰是在最需要删除的时候。
 const modalModel = computed(() => modalModels.value.find((m) => m.id === pForm.modelId))
@@ -1151,6 +1246,21 @@ onMounted(() => {
           <option v-for="p in providers" :key="p.id" :value="p.id">{{ p.name || p.slug }}</option>
         </select>
         <input v-model="priceSearch" class="input" placeholder="搜索价格条目…" />
+        <!-- 批量操作区：勾选后出现。全选/清空作用于当前页。 -->
+        <template v-if="priceSelected.size > 0">
+          <span class="dim">已选 {{ priceSelected.size }} 个</span>
+          <button class="btn btn-sm btn-ghost" type="button" @click="clearPriceSelection">清空</button>
+          <button class="btn btn-sm" type="button" @click="openBatchPrice()">批量设置价格</button>
+        </template>
+        <button
+          v-else
+          class="btn btn-sm btn-ghost"
+          type="button"
+          title="把当前页全部模型的价格设为同一个值"
+          @click="selectPricePage"
+        >
+          全选本页
+        </button>
       </div>
 
       <div v-if="pricesLoading" class="loading">加载中…</div>
@@ -1166,6 +1276,7 @@ onMounted(() => {
           <table class="tbl">
             <thead>
               <tr>
+                <th class="c-sel"></th>
                 <th>供应商</th>
                 <th>模型</th>
                 <th class="num-h">输入（元/1M）</th>
@@ -1176,6 +1287,13 @@ onMounted(() => {
             </thead>
             <tbody>
               <tr v-for="r in pricePageRows" :key="r.model.id">
+                <td class="c-sel">
+                  <input
+                    type="checkbox"
+                    :checked="isPriceSelected(r.model.id)"
+                    @change="togglePriceSelected(r.model.id)"
+                  />
+                </td>
                 <td>{{ r.providerName }}</td>
                 <td class="mono">
                   {{ r.model.model_id }}
@@ -1192,6 +1310,16 @@ onMounted(() => {
                 </td>
                 <td class="c-op">
                   <button class="btn btn-sm btn-ghost" type="button" @click="openEditPrice(r)">编辑</button>
+                  <!-- 复制到…：以这行的价格为初值打开批量弹窗，勾选目标模型后应用。
+                       这是「一个配好价，其他快速标上同样价格」的直接入口。 -->
+                  <button
+                    class="btn btn-sm btn-ghost"
+                    type="button"
+                    title="以这行的价格为初值，批量应用到其它模型"
+                    @click="openBatchPrice(r)"
+                  >
+                    复制到…
+                  </button>
                   <!-- 列表里只有已配价的条目，删除始终可用；删完该行即从列表消失 -->
                   <button
                     class="btn btn-sm btn-danger"
@@ -1311,6 +1439,74 @@ onMounted(() => {
             <button type="button" class="btn btn-ghost" @click="pForm.open = false">取消</button>
             <button type="submit" class="btn btn-primary" :disabled="pForm.saving || !pForm.modelId">
               {{ pForm.saving ? '保存中…' : '保存' }}
+            </button>
+          </div>
+        </div>
+      </form>
+    </AppModal>
+
+    <!-- 批量设置价格：把同一组价格应用到勾选的多个模型 -->
+    <AppModal
+      :open="batchOpen"
+      title="批量设置价格"
+      max-width="520px"
+      :dismissable="false"
+    >
+      <form @submit.prevent="saveBatchPrice">
+        <div class="form-grid">
+          <div class="field span2">
+            <label>目标模型（{{ selectedPriceRows.length }} 个）</label>
+            <div class="batch-targets">
+              <span v-for="r in selectedPriceRows.slice(0, 12)" :key="r.model.id" class="badge">
+                {{ r.model.model_id }}
+              </span>
+              <span v-if="selectedPriceRows.length > 12" class="dim">
+                等 {{ selectedPriceRows.length }} 个
+              </span>
+              <span v-if="selectedPriceRows.length === 0" class="dim">尚未勾选模型</span>
+            </div>
+            <span class="tip">勾选列表中的模型后点「批量设置价格」；也可点某行的「复制到…」以那行的价格为初值</span>
+          </div>
+          <div class="field">
+            <label>输入价格（元/1M）</label>
+            <input
+              v-model.number="batchForm.price_input"
+              class="input num"
+              type="number"
+              min="0"
+              step="0.001"
+              placeholder="0 = 不计费"
+            />
+          </div>
+          <div class="field">
+            <label>缓存命中价格（元/1M）</label>
+            <input
+              v-model.number="batchForm.price_cache_hit"
+              class="input num"
+              type="number"
+              min="0"
+              step="0.001"
+              placeholder="0 = 同输入价"
+            />
+          </div>
+          <div class="field span2">
+            <label>输出价格（元/1M）</label>
+            <input
+              v-model.number="batchForm.price_output"
+              class="input num"
+              type="number"
+              min="0"
+              step="0.001"
+              placeholder="0 = 不计费"
+            />
+            <span class="tip">三项全填 0 = 清除这些模型的价格（不是设为免费）</span>
+          </div>
+        </div>
+        <div class="form-actions">
+          <div class="actions-right">
+            <button type="button" class="btn btn-ghost" @click="batchOpen = false">取消</button>
+            <button type="submit" class="btn btn-primary" :disabled="batchSaving || selectedPriceRows.length === 0">
+              {{ batchSaving ? '应用中…' : '应用' }}
             </button>
           </div>
         </div>
@@ -1476,6 +1672,31 @@ onMounted(() => {
 /* 价格表：与「调用历史」的表格同款 */
 .c-op {
   width: 186px;
+}
+/* 批量选择列：窄，只放一个复选框 */
+.c-sel {
+  width: 28px;
+  text-align: center;
+}
+.c-sel input {
+  accent-color: var(--accent);
+}
+/* 批量弹窗里的目标模型胶囊 */
+.batch-targets {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  min-height: 26px;
+  align-items: center;
+}
+.batch-targets .badge {
+  font-size: 12px;
+  padding: 2px 8px;
+  border-radius: 999px;
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  color: var(--text-2);
+  white-space: nowrap;
 }
 /* 弹窗底部：左侧「删除价格」，右侧取消/保存 */
 .form-actions.spread {

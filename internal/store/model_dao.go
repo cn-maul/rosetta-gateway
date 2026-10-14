@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"database/sql"
+	"strings"
 
 	"github.com/cn-maul/rosetta-gateway/internal/effort"
 )
@@ -32,10 +33,15 @@ type UpstreamModel struct {
 	PriceInput    float64
 	PriceCacheHit float64
 	PriceOutput   float64
+
+	// GroupID 是模型归组（跨上游的同一个模型标成一组，统计合并显示）。
+	// 空串 = 未归组。组的权威显示名在 model_groups.display_name，
+	// 本列只是归属指针 —— 改组名不需要动这里（见 model_group_dao.go）。
+	GroupID string
 }
 
 // modelColumns 是 upstream_models 三处读路径共用的列清单。
-const modelColumns = `id, provider_id, model_id, display_name, enabled, context_window, max_output_tokens, supports_thinking, effort_levels, price_input, price_cache_hit, price_output`
+const modelColumns = `id, provider_id, model_id, display_name, enabled, context_window, max_output_tokens, supports_thinking, effort_levels, price_input, price_cache_hit, price_output, group_id`
 
 // nullIfZeroInt 把 0 写回 NULL。
 // context_window / max_output_tokens 是可空列，0 与"未知"语义不同，
@@ -85,9 +91,10 @@ func scanModel(sc scanner) (UpstreamModel, error) {
 	var thinking sql.NullBool
 	var effortCSV sql.NullString
 	var priceIn, priceHit, priceOut sql.NullFloat64
+	var groupID sql.NullString
 
 	err := sc.Scan(&m.ID, &m.ProviderID, &m.ModelID, &displayName, &enabled,
-		&ctxWindow, &maxOut, &thinking, &effortCSV, &priceIn, &priceHit, &priceOut)
+		&ctxWindow, &maxOut, &thinking, &effortCSV, &priceIn, &priceHit, &priceOut, &groupID)
 	if err != nil {
 		return m, err
 	}
@@ -99,6 +106,7 @@ func scanModel(sc scanner) (UpstreamModel, error) {
 	m.PriceInput = priceIn.Float64
 	m.PriceCacheHit = priceHit.Float64
 	m.PriceOutput = priceOut.Float64
+	m.GroupID = groupID.String
 	if thinking.Valid {
 		v := thinking.Bool
 		m.SupportsThinking = &v
@@ -167,11 +175,12 @@ func (s *Store) CreateUpstreamModel(ctx context.Context, m *UpstreamModel) error
 		enabled = 1
 	}
 	_, err := s.db.ExecContext(ctx,
-		`INSERT INTO upstream_models (id, provider_id, model_id, display_name, enabled, context_window, max_output_tokens, supports_thinking, effort_levels, price_input, price_cache_hit, price_output) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		`INSERT INTO upstream_models (id, provider_id, model_id, display_name, enabled, context_window, max_output_tokens, supports_thinking, effort_levels, price_input, price_cache_hit, price_output, group_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		m.ID, m.ProviderID, m.ModelID, nullIfEmpty(m.DisplayName), enabled,
 		nullIfZeroInt(m.ContextWindow), nullIfZeroInt(m.MaxOutputTokens), m.SupportsThinking,
 		effortColumnValue(m),
-		nullIfZeroFloat(m.PriceInput), nullIfZeroFloat(m.PriceCacheHit), nullIfZeroFloat(m.PriceOutput))
+		nullIfZeroFloat(m.PriceInput), nullIfZeroFloat(m.PriceCacheHit), nullIfZeroFloat(m.PriceOutput),
+		nullIfEmpty(m.GroupID))
 	return err
 }
 
@@ -181,17 +190,55 @@ func (s *Store) UpdateUpstreamModel(ctx context.Context, id string, m *UpstreamM
 		enabled = 1
 	}
 	res, err := s.db.ExecContext(ctx,
-		`UPDATE upstream_models SET model_id = ?, display_name = ?, enabled = ?, context_window = ?, max_output_tokens = ?, supports_thinking = ?, effort_levels = ?, price_input = ?, price_cache_hit = ?, price_output = ? WHERE id = ?`,
+		`UPDATE upstream_models SET model_id = ?, display_name = ?, enabled = ?, context_window = ?, max_output_tokens = ?, supports_thinking = ?, effort_levels = ?, price_input = ?, price_cache_hit = ?, price_output = ?, group_id = ? WHERE id = ?`,
 		m.ModelID, nullIfEmpty(m.DisplayName), enabled,
 		nullIfZeroInt(m.ContextWindow), nullIfZeroInt(m.MaxOutputTokens), m.SupportsThinking,
 		effortColumnValue(m),
-		nullIfZeroFloat(m.PriceInput), nullIfZeroFloat(m.PriceCacheHit), nullIfZeroFloat(m.PriceOutput), id)
+		nullIfZeroFloat(m.PriceInput), nullIfZeroFloat(m.PriceCacheHit), nullIfZeroFloat(m.PriceOutput),
+		nullIfEmpty(m.GroupID), id)
 	return checkAffected(res, err)
 }
 
 // DeleteUpstreamModel 删除一个上游模型；id 不存在时返回 ErrNotFound。
 func (s *Store) DeleteUpstreamModel(ctx context.Context, id string) error {
 	return deleteByID(ctx, s.db, "upstream_models", id)
+}
+
+// BatchUpdateModelPrices 把同一组价格批量写到多个模型。
+//
+// 为什么单独一个方法而不是循环调 UpdateUpstreamModel：批量改价是「要么全进、
+// 要么全不进」的语义（与 ImportUpstreamModels 同理由），循环逐条自动提交会在
+// 第 N 条失败时把前 N-1 条永久落下，运维以为全改好了、实则改了一半。
+//
+// 价格必须复用 nullIfZeroFloat：0 与 NULL 同义（未配置价格），批量场景下
+// 传 0 等于「批量清除价格」，与单条 PATCH 的既有约定保持一致 —— 否则
+// 批量写 0 会落成字面 0 元，与单条路径语义分裂。
+//
+// 返回实际更新的行数。调用方（admin handler）用它核对「ids 里有多少真的
+// 存在」—— 传了 10 个 id 只更新 8 个，说明有 2 个 id 写错了，必须报错
+// 而不是静默跳过（沿用凭据「坏值必须让操作失败而不是部分生效」的立场）。
+func (s *Store) BatchUpdateModelPrices(ctx context.Context, ids []string, priceInput, priceCacheHit, priceOutput float64) (int64, error) {
+	if len(ids) == 0 {
+		return 0, nil
+	}
+	placeholders := strings.Repeat("?,", len(ids))
+	placeholders = placeholders[:len(placeholders)-1]
+	args := make([]any, 0, len(ids)+3)
+	args = append(args, nullIfZeroFloat(priceInput), nullIfZeroFloat(priceCacheHit), nullIfZeroFloat(priceOutput))
+	for _, id := range ids {
+		args = append(args, id)
+	}
+	res, err := s.db.ExecContext(ctx,
+		`UPDATE upstream_models SET price_input = ?, price_cache_hit = ?, price_output = ? WHERE id IN (`+placeholders+`)`,
+		args...)
+	if err != nil {
+		return 0, err
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return 0, err
+	}
+	return n, nil
 }
 
 // UpsertUpstreamModel 按 (provider_id, model_id) 幂等写入。

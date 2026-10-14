@@ -1,14 +1,14 @@
 <script setup lang="ts">
 import { computed, onMounted, onUnmounted, ref } from 'vue'
 import { RouterLink } from 'vue-router'
-import { api } from '../api'
+import { api, isAdmin } from '../api'
 import { toast } from '../ui'
 import { fmtNum, fmtTokens, fmtSpeed, fmtSec, fmtPercent, fmtMoney, fmtBalance, fmtRemainder } from '../fmt'
 // 命名空间导入并改名：下面有一个组件本地的 `const range = ref<RangeKey>(...)`
 //（当前选中的档位），同名会把这里的 range 遮住，导致 range.rangeBounds 被当成
 // 那个 ref。改用 timeRange 既避开冲突，也顺带说明它管的是「时间区间」不是「档位」。
 import * as timeRange from '../range'
-import type { Stats, UsageGroupEntry } from '../types'
+import type { Stats, UsageGroupEntry, ProbeHealth } from '../types'
 
 const err = ref('')
 const loading = ref(true)
@@ -17,6 +17,8 @@ const byDay = ref<UsageGroupEntry[]>([])
 const byModel = ref<UsageGroupEntry[]>([])
 const byKey = ref<UsageGroupEntry[]>([])
 const byProvider = ref<UsageGroupEntry[]>([])
+// 上游模型健康（仅管理员；独立加载，失败不影响主数据）。
+const probeHealth = ref<ProbeHealth[]>([])
 
 // ---------- 时间范围选择 ----------
 // key 传给后端换算 from/to；label 显示在下拉里。
@@ -274,6 +276,11 @@ async function load() {
     byModel.value = m
     byKey.value = k
     byProvider.value = p
+    // 上游健康（仅管理员）：独立加载，失败不影响主数据 —— 健康卡是
+    // 附加信息，探测接口挂了不该让整个总览报错。
+    if (isAdmin()) {
+      api.probeModels().then((h) => (probeHealth.value = h)).catch(() => {})
+    }
   } catch (e) {
     if (seq !== reqSeq) return
     if ((e as { status?: number }).status === 401) return
@@ -515,6 +522,35 @@ onUnmounted(() => {
         </div>
       </div>
 
+      <!-- 上游模型健康卡（仅管理员）。放在指标卡下方、用量图上方：
+           故障是「现在能不能干活」，比「今天花了多少钱」更该先看到。
+           数据来自后台定时探测，失败不影响主数据（load 里独立加载）。 -->
+      <div v-if="isAdmin() && probeHealth.length > 0" class="card health-card">
+        <div class="card__title">
+          上游模型健康
+          <RouterLink to="/health" class="lnk health-more">查看连通率 →</RouterLink>
+        </div>
+        <div class="health-list">
+          <RouterLink
+            v-for="h in probeHealth.filter((x) => x.health !== 'healthy' && x.health !== 'unknown')"
+            :key="h.model_id"
+            to="/health"
+            class="health-item"
+            :class="h.health === 'down' ? 'health-down' : 'health-degraded'"
+            :title="h.last_error || '最近探测失败'"
+          >
+            <span class="mono">{{ h.model_id }}</span>
+            <span class="badge" :class="h.health === 'down' ? 'badge-off' : 'badge-warn'">
+              {{ h.health === 'down' ? '不可用' : '不稳定' }}
+            </span>
+            <span class="dim health-err">{{ h.last_error || '—' }}</span>
+          </RouterLink>
+          <div v-if="!probeHealth.some((x) => x.health !== 'healthy' && x.health !== 'unknown')" class="dim health-all-ok">
+            全部模型健康
+          </div>
+        </div>
+      </div>
+
       <div class="panel">
         <div class="panel-title">
           {{ rangeLabel(range) }}用量
@@ -606,6 +642,50 @@ onUnmounted(() => {
   font-weight: 500;
   margin-left: 4px;
   color: var(--text-3);
+}
+/* 上游模型健康卡 */
+.health-card {
+  margin-top: 14px;
+  padding: 14px 18px;
+}
+.health-more {
+  font-size: 12px;
+  margin-left: 8px;
+}
+.health-list {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin-top: 8px;
+}
+.health-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 4px 6px;
+  border-radius: 6px;
+  text-decoration: none;
+  color: inherit;
+}
+.health-item:hover {
+  background: var(--hover);
+}
+.health-down {
+  border-left: 3px solid var(--danger, #ef4444);
+}
+.health-degraded {
+  border-left: 3px solid #eab308;
+}
+.health-err {
+  font-size: 12px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 60%;
+}
+.health-all-ok {
+  font-size: 12px;
+  padding: 4px 0;
 }
 /* 时间范围下拉 */
 .range-select {
