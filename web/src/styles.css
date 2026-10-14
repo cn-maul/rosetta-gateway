@@ -49,15 +49,22 @@
   --r-panel: calc(var(--radius) * 2); /* 16px —— 面板 */
   --r-btn: calc(var(--radius) * 3); /* 24px —— 按钮（HeroUI rounded-3xl） */
 
-  /* ---------- 语义色（HeroUI 默认主题，亮色） ---------- */
+  /* ---------- 语义色（HeroUI 默认主题，亮色） ----------
+     2026-10-14：surface 从纯白（--white）压到 99.2%，让卡片/面板底色带灰。
+     原来 surface=纯白 压在 97% 灰底上，对比过强显得刺眼，且卡片边界只能
+     靠 4%~6% 的淡投影撑（密集排列时糊成一片）。压灰后边界与 --border
+     的过渡更自然，不加描边也能读出层次 —— 这也是「更灰一点」的诉求。 */
   --background: oklch(0.9702 0 0);
   --foreground: var(--eclipse);
 
-  --surface: var(--white);
+  --surface: oklch(0.9921 0 0);
   --surface-secondary: oklch(0.9524 0.0013 286.37);
   --surface-tertiary: oklch(0.9373 0.0013 286.37);
 
-  --overlay: var(--white);
+  /* 弹窗 / 分段控件 / 输入框统一跟随 --surface（2026-10-14）：
+   与暗色区的同样处理。三者是「浮在卡片之上」的层，若留在纯白而卡片
+   已压灰，就会出现「卡片灰、弹窗白」的割裂感。 */
+  --overlay: var(--surface);
   --overlay-foreground: var(--foreground);
 
   --muted: oklch(0.5517 0.0138 285.94);
@@ -69,7 +76,7 @@
   --separator: oklch(92% 0.004 286.32);
   --backdrop: rgba(0, 0, 0, 0.5);
 
-  --segment: var(--white);
+  --segment: var(--surface);
   --segment-foreground: var(--eclipse);
 
   --accent: oklch(0.6204 0.195 253.83);
@@ -99,7 +106,7 @@
   --danger-soft-foreground: color-mix(in oklab, var(--danger) 70%, var(--foreground) 40%);
 
   /* ---------- 表单字段 ---------- */
-  --field-background: var(--white);
+  --field-background: var(--surface);
   --field-foreground: var(--eclipse);
   --field-placeholder: var(--muted);
   --field-hover: color-mix(in oklab, var(--field-background) 90%, var(--field-foreground) 2%);
@@ -184,11 +191,19 @@
   --background: oklch(12% 0.005 285.823);
   --foreground: var(--snow);
 
-  --surface: oklch(0.2103 0.0059 285.89);
+  /* surface 从 21% 压到 18.5%：与亮色那次同理由（surface 与 background
+     的明度差过大 → 边界只靠描边/投影硬撑）。暗色下 --surface-shadow 是
+     0 0 0 0 transparent（完全不用投影，见下方），层次全靠明度差，
+     所以这个差值要更克制。 */
+  --surface: oklch(0.185 0.0055 285.89);
   --surface-secondary: oklch(0.257 0.0037 286.14);
   --surface-tertiary: oklch(0.2721 0.0024 247.91);
 
-  --overlay: oklch(0.2103 0.0059 285.89);
+  /* overlay / field-background 跟随 --surface（不写死色值）：
+     弹窗与输入框是「浮在卡片之上」的东西，用与卡片同一底色时它们靠投影
+     分层；写死色值则会在调整 --surface 后与卡片脱节，出现「弹窗比卡片
+     亮一截」的不一致 —— 2026-10-14 调整 surface 层级时正是这里漏改。 */
+  --overlay: var(--surface);
   --overlay-foreground: var(--foreground);
 
   --muted: oklch(70.5% 0.015 286.067);
@@ -205,7 +220,7 @@
   --warning: oklch(0.8203 0.1388 76.34);
   --danger: oklch(0.594 0.1967 24.63);
 
-  --field-background: oklch(0.2103 0.0059 285.89);
+  --field-background: var(--surface);
   --field-foreground: var(--foreground);
 
   --surface-shadow: 0 0 0 0 transparent inset;
