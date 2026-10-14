@@ -106,12 +106,18 @@ func TestProbe_Timeline(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	buckets, err := st.ProbeTimeline(ctx, "m1", now-2*hour, now, hour)
+	buckets, err := st.ProbeTimeline(ctx, []string{"m1"}, now-2*hour, now, hour)
 	if err != nil {
 		t.Fatalf("timeline: %v", err)
 	}
 	if len(buckets) != 2 {
 		t.Fatalf("应 2 个桶，实际 %d: %+v", len(buckets), buckets)
+	}
+	// 每个桶都带回 model_id —— 多模型查询时前端靠它把桶分流到各自的卡片。
+	for _, b := range buckets {
+		if b.ModelID != "m1" {
+			t.Fatalf("桶应带 model_id=m1，实际 %q", b.ModelID)
+		}
 	}
 	// 最近的桶：2 次成功，平均延迟 200
 	latest := buckets[0]
@@ -137,7 +143,58 @@ func TestProbe_Timeline(t *testing.T) {
 	}
 }
 
-// TestProbe_Prune 剪枝只删超期记录。
+// TestProbe_TimelineMultiModel 多模型一次查询：两个模型的桶互不混淆，
+// 且各自带回 model_id（前端靠它把桶分流到对应卡片）。
+//
+// 这条守住「一次请求覆盖多模型」这个设计：退化成循环逐个查不会报错，
+// 只是慢 —— 而慢正是这个改动要消除的东西，所以必须用「返回里同时有
+// 两个模型的桶」来钉住单次查询确实发生了。
+func TestProbe_TimelineMultiModel(t *testing.T) {
+	st := testStore(t, t.TempDir()+"/p.db")
+	ctx := context.Background()
+	seedProvider(t, st, "p1")
+	for _, id := range []string{"m1", "m2"} {
+		if err := st.CreateUpstreamModel(ctx, &UpstreamModel{ID: id, ProviderID: "p1", ModelID: id, Enabled: true}); err != nil {
+			t.Fatalf("model %s: %v", id, err)
+		}
+	}
+
+	now := time.Now().UnixMilli()
+	hour := int64(3600 * 1000)
+	if err := st.RecordProbe(ctx, ProbeRecord{ModelID: "m1", ProviderID: "p1", Ts: now, OK: true, LatencyMs: 100}); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.RecordProbe(ctx, ProbeRecord{ModelID: "m2", ProviderID: "p1", Ts: now, OK: false, ErrorKind: "timeout"}); err != nil {
+		t.Fatal(err)
+	}
+
+	buckets, err := st.ProbeTimeline(ctx, []string{"m1", "m2"}, now-hour, now, hour)
+	if err != nil {
+		t.Fatalf("multi timeline: %v", err)
+	}
+	if len(buckets) != 2 {
+		t.Fatalf("应返回 2 个模型各 1 桶，实际 %d: %+v", len(buckets), buckets)
+	}
+	byModel := map[string]ProbeTimelineBucket{}
+	for _, b := range buckets {
+		byModel[b.ModelID] = b
+	}
+	if m1, ok := byModel["m1"]; !ok || m1.OK != 1 {
+		t.Fatalf("m1 应有 1 次成功: %+v", byModel)
+	}
+	if m2, ok := byModel["m2"]; !ok || m2.OK != 0 || m2.Count != 1 {
+		t.Fatalf("m2 应有 1 次失败: %+v", byModel)
+	}
+}
+
+// TestProbe_TimelineEmptyIDs 空 id 列表直接返回空，不打库。
+func TestProbe_TimelineEmptyIDs(t *testing.T) {
+	st := testStore(t, t.TempDir()+"/p.db")
+	buckets, err := st.ProbeTimeline(context.Background(), nil, 0, 1, 3600000)
+	if err != nil || len(buckets) != 0 {
+		t.Fatalf("空 ids 应返回空切片: buckets=%v err=%v", buckets, err)
+	}
+}
 func TestProbe_Prune(t *testing.T) {
 	st := testStore(t, t.TempDir()+"/p.db")
 	ctx := context.Background()

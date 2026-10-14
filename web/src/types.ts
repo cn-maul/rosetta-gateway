@@ -171,6 +171,8 @@ export interface ProbeHealth {
 
 /** 连通率时间轴的一个分桶（某模型某时间窗）。桶内无探测记录的行不返回。 */
 export interface ProbeTimelineBucket {
+  /** 模型 id —— 一次可查多个模型，前端靠它把桶分流到各自的卡片。 */
+  model_id: string
   ts: number // 桶起点（毫秒）
   count: number
   ok: number

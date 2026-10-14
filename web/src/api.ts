@@ -484,8 +484,11 @@ export const api = {
 
   // 上游模型健康探测（读 model_probes 表；探测循环在后台跑）
   probeModels: () => get<ProbeHealth[]>('/probes/models'),
-  probeTimeline: (modelId: string, days = 7, granularity: 'hour' | 'day' = 'hour') =>
-    get<ProbeTimelineBucket[]>(`/probes/timeline?model_id=${modelId}&days=${days}&granularity=${granularity}`),
+  // 多模型一次查：modelIds 以逗号分隔。返回的桶带 model_id，前端分流到各卡片。
+  probeTimeline: (modelIds: string[], days = 7, granularity: 'hour' | 'day' = 'hour') =>
+    get<ProbeTimelineBucket[]>(
+      `/probes/timeline?model_id=${encodeURIComponent(modelIds.join(','))}&days=${days}&granularity=${granularity}`,
+    ),
   discoverModels: (providerId: string) =>
     post<{ status: string; message?: string; models?: DiscoveredModel[] }>(`/providers/${providerId}/models/discover`),
   importModels: (providerId: string, models: ModelImportItem[]) =>

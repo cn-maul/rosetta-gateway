@@ -3,6 +3,7 @@ package admin
 import (
 	"net/http"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/cn-maul/rosetta-gateway/internal/store"
@@ -98,19 +99,36 @@ func classifyProbeHealth(h store.ProbeHealth) string {
 	return "degraded"
 }
 
-// Timeline 返回某模型在时间轴上的连通率分桶。
+// Timeline 返回若干模型在时间轴上的连通率分桶。
 //
-// 参数：model_id（必填）、days（默认 7）、granularity（hour|day，默认 hour）。
-// 前端据此画热力图 —— 桶内无探测记录的行不返回，前端画空白格。
+// 参数：model_id（必填，逗号分隔的**多个**）、days（默认 7）、
+// granularity（hour|day，默认 hour）。一次请求覆盖用户勾选的若干模型
+// —— 前端是一排卡片各画各的曲线，循环发 N 个请求既慢又难做加载态。
 func (h *ProbeHandler) Timeline(w http.ResponseWriter, r *http.Request) {
-	modelID := r.URL.Query().Get("model_id")
-	if modelID == "" {
+	raw := r.URL.Query().Get("model_id")
+	// 去重 + 去空：前端可能重复勾选同一模型，重复 id 会让同一桶被算两次。
+	seen := make(map[string]bool)
+	modelIDs := make([]string, 0, 4)
+	for _, id := range strings.Split(raw, ",") {
+		id = strings.TrimSpace(id)
+		if id == "" || seen[id] {
+			continue
+		}
+		seen[id] = true
+		modelIDs = append(modelIDs, id)
+	}
+	if len(modelIDs) == 0 {
 		writeError(w, http.StatusBadRequest, "model_id is required")
 		return
 	}
+	// 上限：一次画几百条曲线既没人看得懂，也让查询变重。
+	if len(modelIDs) > 24 {
+		writeError(w, http.StatusBadRequest, "一次最多查看 24 个模型")
+		return
+	}
 	days := 7
-	if raw := r.URL.Query().Get("days"); raw != "" {
-		n, err := strconv.Atoi(raw)
+	if v := r.URL.Query().Get("days"); v != "" {
+		n, err := strconv.Atoi(v)
 		if err != nil || n < 1 || n > 90 {
 			writeError(w, http.StatusBadRequest, "days must be 1..90")
 			return
@@ -124,7 +142,7 @@ func (h *ProbeHandler) Timeline(w http.ResponseWriter, r *http.Request) {
 
 	now := time.Now().UnixMilli()
 	from := now - int64(days)*24*3600*1000
-	buckets, err := h.store.ProbeTimeline(r.Context(), modelID, from, now, bucketMs)
+	buckets, err := h.store.ProbeTimeline(r.Context(), modelIDs, from, now, bucketMs)
 	if err != nil {
 		writeServerError(w, "probe timeline", err)
 		return

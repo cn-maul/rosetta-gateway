@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"database/sql"
+	"strings"
 	"time"
 )
 
@@ -124,23 +125,61 @@ func (s *Store) ProbeHealthSummary(ctx context.Context, windowMs int64) ([]Probe
 
 // ProbeTimelineBucket 是时间轴的一个分桶（某模型某时间窗的连通率）。
 type ProbeTimelineBucket struct {
-	Ts      int64 // 桶起点（毫秒）
-	Count   int64
-	OK      int64
-	Latency int64 // 平均延迟（毫秒）
+	ModelID  string // 模型 id（多模型查询时必需）
+	Ts       int64  // 桶起点（毫秒）
+	Count    int64
+	OK       int64
+	Latency  int64 // 平均延迟（毫秒）
 }
 
-// ProbeTimeline 返回某模型在 [from,to] 内按 bucketMs 分桶的连通率。
+// ProbeTimeline 返回给定模型在 [from,to] 内按 bucketMs 分桶的连通率。
 //
-// 时间轴页按小时/天画热力图用。桶内没有探测记录的行**不返回**（前端画空白
-// 格），而不是填 0 —— 没探测 ≠ 全失败，两者必须可区分。
-func (s *Store) ProbeTimeline(ctx context.Context, modelID string, from, to, bucketMs int64) ([]ProbeTimelineBucket, error) {
-	rows, err := s.read.QueryContext(ctx,
-		`SELECT (ts / ?) * ? AS bucket, COUNT(*), SUM(ok), AVG(latency_ms)
-		   FROM model_probes
-		  WHERE model_id = ? AND ts >= ? AND ts <= ?
-		  GROUP BY bucket ORDER BY bucket`,
-		bucketMs, bucketMs, modelID, from, to)
+// 时间轴页按小时/天画曲线用。桶内没有探测记录的行**不返回**（前端断开
+// 折线），而不是填 0 —— 没探测 ≠ 全失败，两者必须可区分。
+//
+// modelIDs 支持**多个**：一次查询覆盖用户勾选的若干模型，返回值带
+// ModelID 让前端分流。多模型时用 IN (...) 而不是循环逐个查 —— 前端
+// 一次勾 6 个模型不该发 6 个请求，而 model_probes 上有
+// (model_id, ts) 索引，IN 查询正是它擅长的形状。单个模型走等值分支，
+// 让 SQLite 用上索引的最左前缀（IN (x) 与 = x 的计划可能不同）。
+func (s *Store) ProbeTimeline(ctx context.Context, modelIDs []string, from, to, bucketMs int64) ([]ProbeTimelineBucket, error) {
+	if len(modelIDs) == 0 {
+		return nil, nil
+	}
+	var (
+		rows *sql.Rows
+		err  error
+	)
+	// 单个模型：等值比较（索引最左前缀）。
+	if len(modelIDs) == 1 {
+		rows, err = s.read.QueryContext(ctx,
+			`SELECT model_id, (ts / ?) * ? AS bucket, COUNT(*), SUM(ok), AVG(latency_ms)
+			   FROM model_probes
+			  WHERE model_id = ? AND ts >= ? AND ts <= ?
+			  GROUP BY model_id, bucket ORDER BY model_id, bucket`,
+			bucketMs, bucketMs, modelIDs[0], from, to)
+	} else {
+		// 多模型：IN 查询。占位符按 len(modelIDs) 拼，不能写成固定个数。
+		//
+		// 参数绑定顺序必须**逐字匹配占位符在 SQL 中出现的顺序**：
+		// SELECT 里的 bucketMs、bucketMs 先，然后 WHERE 里 model_id IN 的
+		// 各 id，最后才是 ts >= ? / ts <= ?。早先把 from,to 放在 id 前面，
+		// 导致时间值被绑给了 model_id 占位符，查询恒返回 0 行（且不报错，
+		// 因为「时间戳恰好等于某个模型 id」永远不成立，是静默的空结果）。
+		ph := strings.TrimSuffix(strings.Repeat("?,", len(modelIDs)), ",")
+		args := make([]any, 0, len(modelIDs)+4)
+		args = append(args, bucketMs, bucketMs)
+		for _, id := range modelIDs {
+			args = append(args, id)
+		}
+		args = append(args, from, to)
+		rows, err = s.read.QueryContext(ctx,
+			`SELECT model_id, (ts / ?) * ? AS bucket, COUNT(*), SUM(ok), AVG(latency_ms)
+			   FROM model_probes
+			  WHERE model_id IN (`+ph+`) AND ts >= ? AND ts <= ?
+			  GROUP BY model_id, bucket ORDER BY model_id, bucket`,
+			args...)
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -150,7 +189,7 @@ func (s *Store) ProbeTimeline(ctx context.Context, modelID string, from, to, buc
 	for rows.Next() {
 		var b ProbeTimelineBucket
 		var avg sql.NullFloat64
-		if err := rows.Scan(&b.Ts, &b.Count, &b.OK, &avg); err != nil {
+		if err := rows.Scan(&b.ModelID, &b.Ts, &b.Count, &b.OK, &avg); err != nil {
 			return nil, err
 		}
 		if avg.Valid {
