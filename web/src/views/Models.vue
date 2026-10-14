@@ -260,6 +260,11 @@ onMounted(load)
 .model-card {
   gap: 10px;
   padding: 14px 16px;
+  /* 描边 + 投影双层：卡片**密集并排**时,单张看投影够用,但几十张白卡
+     挤在一起,4%~6% 的淡投影在相邻卡片之间互相干扰,整片看边界就糊了。
+     描边是这里必需的 —— 表格用 separate + 分隔线分层,卡片没有分隔线可借,
+     只能自己加。颜色走 --border 变量,亮/暗自动跟随。 */
+  border: 1px solid var(--border);
 }
 /* 模型名可能很长（provider/model 形式），允许在连字符处折行而不是撑破卡片 */
 .model-name {
