@@ -435,9 +435,9 @@ func (h *ModelHandler) Delete(w http.ResponseWriter, r *http.Request, id string)
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
-		"status":                 "deleted",
-		"detached_from_routes":   affected,
-		"detached_route_count":   len(affected),
+		"status":               "deleted",
+		"detached_from_routes": affected,
+		"detached_route_count": len(affected),
 	})
 }
 
@@ -452,10 +452,10 @@ func (h *ModelHandler) Delete(w http.ResponseWriter, r *http.Request, id string)
 // 清除价格」就是传三个 0。前端把「设置」和「清除」做成两个独立按钮，
 // 避免用户以为填 0 是「设为免费」。
 type batchPriceRequest struct {
-	ModelIDs       []string `json:"model_ids"`
-	PriceInput     float64  `json:"price_input"`
-	PriceCacheHit  float64  `json:"price_cache_hit"`
-	PriceOutput    float64  `json:"price_output"`
+	ModelIDs      []string `json:"model_ids"`
+	PriceInput    float64  `json:"price_input"`
+	PriceCacheHit float64  `json:"price_cache_hit"`
+	PriceOutput   float64  `json:"price_output"`
 }
 
 // BatchUpdatePrices 把同一组价格批量写到多个模型。

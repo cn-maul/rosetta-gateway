@@ -447,8 +447,8 @@ type usageHistoryEntry struct {
 	//
 	// 注意 ErrorDetail 只存在于明细层（随保留期一起剪枝）：30 天前的
 	// 失败只有短码没有原文，UI 文案要能自洽。
-	HTTPStatus int    `json:"http_status"`
-	ErrorCode  string `json:"error_code,omitempty"`
+	HTTPStatus  int    `json:"http_status"`
+	ErrorCode   string `json:"error_code,omitempty"`
 	ErrorDetail string `json:"error_detail,omitempty"`
 }
 
