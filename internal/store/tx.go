@@ -12,8 +12,15 @@ import (
 //
 // 写操作统一写成「接受 execer 的内部函数 + 一个用 s.db 的公开方法」，
 // 这样同一份 SQL 既能在自动提交下跑，也能被包进事务，不会出现两套写法漂移。
+//
+// QueryContext 是为 2026-10-14 的删除模型摘链逻辑补的：那几段需要在事务里
+// 遍历多行（查链首、查受影响路由、按 position 顺序重排），只有
+// QueryRowContext 的子集不够。它与 dbtx 有重叠，保留两个接口是因为
+// dbtx 已被 balance_dao 大量使用、不宜改签名；而这里需要 QueryContext，
+// 两者并存的代价只是几个类型别名。
 type execer interface {
 	ExecContext(ctx context.Context, query string, args ...any) (sql.Result, error)
+	QueryContext(ctx context.Context, query string, args ...any) (*sql.Rows, error)
 	QueryRowContext(ctx context.Context, query string, args ...any) *sql.Row
 }
 

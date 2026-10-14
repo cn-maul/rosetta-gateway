@@ -156,6 +156,14 @@ type modelResponse struct {
 	// 加载全量组列表（组是小表），本地映射即可 —— 后端 JOIN 出来只是
 	// 把同一份数据搬运两次。
 	GroupID string `json:"group_id,omitempty"`
+
+	// RouteCount 是引用该模型的路由链数量；IsRouteHead 表示它是不是
+	// 某条链的**链首**（2026-10-14 随「可删除非链首模型」一起加）。
+	//
+	// 前端要靠这两个字段把删除按钮置灰并说清原因：链首删不掉（后端回 409），
+	// 让用户点下去撞一次再读错误消息，不如一开始就告诉他该去「路由」页改。
+	RouteCount  int  `json:"route_count,omitempty"`
+	IsRouteHead bool `json:"is_route_head"`
 }
 
 func (h *ModelHandler) List(w http.ResponseWriter, r *http.Request, providerID string) {
@@ -170,6 +178,21 @@ func (h *ModelHandler) List(w http.ResponseWriter, r *http.Request, providerID s
 	}
 	// 统计只来自历史真实调用，不做探测；未调用过的模型不在 map 中，速度/成功率留空。
 	stats, _ := h.store.ListModelThroughput(r.Context(), providerID)
+
+	// 路由引用关系：一次性拉全链再本地映射，不对每个模型各查一次（N+1）。
+	// 链首判定用 position=0；**不能只看它** —— routes 的兼容列在迁移期可能
+	// 指着某个不在链上的模型（与 store 层的链首判定同一口径）。
+	refs, err := h.store.RouteReferencesByModel(r.Context())
+	if err != nil {
+		writeServerError(w, "load route references", err)
+		return
+	}
+	compatHeads, err := h.store.RouteCompatHeadsByModel(r.Context())
+	if err != nil {
+		writeServerError(w, "load route compat heads", err)
+		return
+	}
+
 	result := make([]modelResponse, 0, len(models))
 	for _, m := range models {
 		resp := toModelResponse(m)
@@ -179,6 +202,8 @@ func (h *ModelHandler) List(w http.ResponseWriter, r *http.Request, providerID s
 			resp.SuccessRate = st.SuccessRate
 			resp.CallCount = st.SuccessSample
 		}
+		resp.RouteCount = refs.Count(m.ID)
+		resp.IsRouteHead = refs.IsHead(m.ID) || compatHeads[m.ID]
 		result = append(result, resp)
 	}
 	writeJSON(w, http.StatusOK, result)
@@ -196,9 +221,24 @@ func (h *ModelHandler) ListAll(w http.ResponseWriter, r *http.Request) {
 		writeServerError(w, "list all upstream models", err)
 		return
 	}
+	// 同样带上链首标记（2026-10-14）：「设置」页也有删除模型的入口，
+	// 那里若不知道链首，会出现「按钮亮着、点下去必然 409」。
+	refs, err := h.store.RouteReferencesByModel(r.Context())
+	if err != nil {
+		writeServerError(w, "load route references", err)
+		return
+	}
+	compatHeads, err := h.store.RouteCompatHeadsByModel(r.Context())
+	if err != nil {
+		writeServerError(w, "load route compat heads", err)
+		return
+	}
 	result := make([]modelResponse, 0, len(models))
 	for _, m := range models {
-		result = append(result, toModelResponse(m))
+		resp := toModelResponse(m)
+		resp.RouteCount = refs.Count(m.ID)
+		resp.IsRouteHead = refs.IsHead(m.ID) || compatHeads[m.ID]
+		result = append(result, resp)
 	}
 	writeJSON(w, http.StatusOK, result)
 }
@@ -373,12 +413,32 @@ func (h *ModelHandler) Update(w http.ResponseWriter, r *http.Request, id string)
 	writeJSON(w, http.StatusOK, toModelResponse(*existing))
 }
 
+// Delete 删除一个上游模型，并自动把它从故障转移链里摘掉（2026-10-14）。
+//
+// 与旧行为的差别有两处，都是往「让删除可用」的方向改的：
+//   - 摘链：链上的非链首成员可以被删掉，不必先去「路由」页手工移除。
+//     原来 route_targets.upstream_model_id 是 ON DELETE RESTRICT，删任何
+//     被引用的模型都会被数据库直接拒绝，界面上只是一句不明的错误。
+//   - 探测记录级联清理：model_probes 是纯派生数据，对已删模型没有意义。
+//
+// 链首仍然拒绝（409）：链的顺序是「先试谁」的显式配置，替管理员顺延等于
+// 悄悄改了他的流量分配。处置办法写进错误消息，让他知道去哪儿改。
 func (h *ModelHandler) Delete(w http.ResponseWriter, r *http.Request, id string) {
-	if err := h.store.DeleteUpstreamModel(r.Context(), id); err != nil {
+	affected, err := h.store.DeleteUpstreamModelDetaching(r.Context(), id)
+	if err != nil {
+		if errors.Is(err, store.ErrModelIsRouteHead) {
+			writeError(w, http.StatusConflict,
+				"该模型是某条路由的首选目标（链首），不能直接删除 —— 请先到「路由」页把该路由的首选目标换成别的模型")
+			return
+		}
 		writeDeleteError(w, "delete upstream model", err)
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]string{"status": "deleted"})
+	writeJSON(w, http.StatusOK, map[string]any{
+		"status":                 "deleted",
+		"detached_from_routes":   affected,
+		"detached_route_count":   len(affected),
+	})
 }
 
 // batchPriceRequest 是「批量设置价格」的输入。
@@ -579,6 +639,31 @@ type discoveredModel struct {
 	DisplayName     string `json:"display_name,omitempty"`
 	ContextWindow   int    `json:"context_window,omitempty"`
 	MaxOutputTokens int    `json:"max_output_tokens,omitempty"`
+	// EffortLevels 是从上游 /models 读到的挡位集合，**空串 = 上游没报**。
+	//
+	// 空串与「上游报了但一个都不认识」在响应里**刻意不可区分**：
+	// 前端据此把两者都呈现为「未预填、需手工勾选」。区分它们需要多带一个
+	// 字段与一层 UI，而处置动作完全相同（去勾选框看一眼），不值得。
+	// 真正会被保留的是 unknown（见 importEffortLevels 的注释）。
+	EffortLevels string `json:"effort_levels,omitempty"`
+	// SupportsThinking 三态：字段缺席 = 上游没报（不知道，网关不干预）；
+	// true/false = 上游明说。用 *bool 就是为了保住这个「不知道」。
+	SupportsThinking *bool `json:"supports_thinking,omitempty"`
+}
+
+// effortCSV 把上游报的挡位数组转成库里那一列的 CSV 形状。
+//
+// 走 effort.ParseLevels 是必须的：它做去重、按强度升序排序、把
+// UnknownLevels 原样留下。直接 strings.Join 的话，
+// 「high,low,low」会以这种形态落库，且厂商私有值会被丢掉 ——
+// 而那些值恰恰是**上游可能认得、网关不认识**的，扔掉等于配了不生效
+// 且无从查起（见 effort 包的说明）。
+func effortCSV(levels []string) string {
+	if len(levels) == 0 {
+		return ""
+	}
+	known, unknown := effort.ParseLevels(strings.Join(levels, ","))
+	return effort.FormatLevels(known, unknown)
 }
 
 // Discover 直接拉取上游原始 /models，带出各家扩展的上下文/最大输出容量；
@@ -618,10 +703,12 @@ func (h *ModelHandler) Discover(w http.ResponseWriter, r *http.Request, provider
 			maxOut = def.MaxOutputTokens
 		}
 		result = append(result, discoveredModel{
-			ModelID:         c.ID,
-			DisplayName:     name,
-			ContextWindow:   ctxWindow,
-			MaxOutputTokens: maxOut,
+			ModelID:          c.ID,
+			DisplayName:      name,
+			ContextWindow:    ctxWindow,
+			MaxOutputTokens:  maxOut,
+			EffortLevels:     effortCSV(c.EffortLevels),
+			SupportsThinking: c.SupportsThinking,
 		})
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"status": "ok", "models": result})
@@ -633,6 +720,10 @@ type modelImportItem struct {
 	DisplayName     string `json:"display_name"`
 	ContextWindow   int    `json:"context_window"`
 	MaxOutputTokens int    `json:"max_output_tokens"`
+	// EffortLevels / SupportsThinking 来自发现结果（2026-10-14）。
+	// 两者都是「**有值才写**」语义，理由见 importThinking 的注释。
+	EffortLevels     string `json:"effort_levels"`
+	SupportsThinking *bool  `json:"supports_thinking"`
 }
 
 // ImportModels 批量 upsert 模型（按 provider_id+model_id 幂等），一次写入避免逐条 reload。
@@ -680,6 +771,7 @@ func (h *ModelHandler) ImportModels(w http.ResponseWriter, r *http.Request, prov
 			ContextWindow:   ctxWindow,
 			MaxOutputTokens: maxOut,
 		})
+		importThinking(models[len(models)-1], it)
 	}
 
 	if err := h.store.ImportUpstreamModels(r.Context(), models); err != nil {
@@ -688,6 +780,34 @@ func (h *ModelHandler) ImportModels(w http.ResponseWriter, r *http.Request, prov
 	}
 
 	writeJSON(w, http.StatusOK, map[string]any{"status": "ok", "imported": len(models)})
+}
+
+// importThinking 把发现结果里的思考信息落进待导入的模型（2026-10-14）。
+//
+// # 三条规则，每条都对应一种「看起来能省事、实际会出事」的写法
+//
+//  1. **挡位解析失败要报错，不能静默跳过**。CSV 里一个都不认识时
+//     ParseLevels 返回空 known + 非空 unknown。unknown 非空而 known 为空，
+//     说明上游报的东西网关全不认 —— 原样存进 UnknownLevels，与手工填
+//     「厂商私有值」时的处置一致（存下来、看得见、不参与夹取）。
+//     真正解析不出来的（一个 known 都没有且没有 unknown，即空串）才跳过。
+//
+//  2. **SupportsThinking 只在上游明确表态时写**，nil 一律不写。
+//     把「上游没报」当成 false 会剥掉全部模型的思考，且没有任何提示。
+//
+//  3. **不覆盖已有配置**：见下面 upsert 那条注释。
+func importThinking(m *store.UpstreamModel, it modelImportItem) {
+	if csv := strings.TrimSpace(it.EffortLevels); csv != "" {
+		known, unknown := effort.ParseLevels(csv)
+		if len(known) > 0 || len(unknown) > 0 {
+			m.EffortLevels = known
+			m.UnknownLevels = unknown
+		}
+	}
+	if it.SupportsThinking != nil {
+		v := *it.SupportsThinking
+		m.SupportsThinking = &v
+	}
 }
 
 func toModelResponse(m store.UpstreamModel) modelResponse {

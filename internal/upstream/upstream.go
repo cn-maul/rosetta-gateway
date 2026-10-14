@@ -821,6 +821,20 @@ type ModelCandidate struct {
 	DisplayName     string
 	ContextWindow   int
 	MaxOutputTokens int
+	// EffortLevels 是上游自报的思考挡位集合，**空表示上游没报**（而不是
+	// 「不支持思考」—— 这两件事必须可区分，见 rawModelEntry 的注释）。
+	//
+	// 2026-10-14 新增：effort_levels 原本是纯手工填的列，但部分上游的
+	// /models 明明带着答案（实测某上游返回
+	// reasoning_supported_efforts=[low,medium,high,xhigh,max] 且
+	// reasoning_default_effort=max）。手工填意味着管理员要么不知道、
+	// 要么照着文档抄 —— 于是网关不披露、也不夹取，客户端发的档位裸奔。
+	// 让发现路径把它带上来，导入时就填好，配置与上游同源。
+	EffortLevels []string
+	// SupportsThinking 三态：nil = 上游没报（不知道），指针 = 上游明说。
+	// 用指针而不是 bool 是为了保住「不知道」—— 把「没报」当成 false 会让
+	// 全部模型的思考被剥掉。
+	SupportsThinking *bool
 }
 
 // rawModelEntry 宽松匹配各家 /models 的字段名；缺字段解析为 0，多余字段忽略。
@@ -837,6 +851,58 @@ type rawModelEntry struct {
 		ContextLength       int `json:"context_length"`
 		MaxCompletionTokens int `json:"max_completion_tokens"`
 	} `json:"top_provider"`
+
+	// 思考能力。**多个字段名都收**，因为各家写法不统一且没有约定：
+	//   - reasoning_supported_efforts：实测某国产上游用这个（值形如
+	//     ["low","medium","high","xhigh","max"]）
+	//   - supported_reasoning：OpenRouter 约定
+	//   - supported_efforts / effort_levels：另一些网关的写法
+	// 都收下是为了「上游报了就能用」，而不是猜哪个才是标准 ——
+	// 猜错的后果是配置永远为空，而空 = 网关不干预 = 静默。
+	ReasoningSupportedEfforts []string `json:"reasoning_supported_efforts"`
+	SupportedReasoning        []string `json:"supported_reasoning"`
+	SupportedEfforts          []string `json:"supported_efforts"`
+	EffortLevelsRaw           []string `json:"effort_levels"`
+
+	// supports_reasoning / supports_thinking：同样是多写法，且**必须用
+	// *bool** —— 缺席（nil）与显式 false 是两件事：前者是「不知道，交给
+	// 上游」，后者是「明确不支持，剥掉思考」。
+	SupportsReasoning *bool `json:"supports_reasoning"`
+	SupportsThinking  *bool `json:"supports_thinking"`
+	Reasoning         *bool `json:"reasoning"`
+}
+
+// effortLevelsFor 从各家字段名里取出第一个非空的挡位集合。
+//
+// 只取第一个**非空**的：某些上游会同时给多个（有的空、有的有值），
+// 取第一个非空比取第一个字段更稳 —— 后者可能正好落在那个空数组上。
+func (e *rawModelEntry) effortLevelsFor() []string {
+	for _, cand := range [][]string{
+		e.ReasoningSupportedEfforts,
+		e.SupportedReasoning,
+		e.SupportedEfforts,
+		e.EffortLevelsRaw,
+	} {
+		if len(cand) > 0 {
+			return cand
+		}
+	}
+	return nil
+}
+
+// supportsThinkingFor 同理取第一个**非 nil** 的布尔。
+//
+// 这里刻意不能用 `if e.SupportsThinking != nil` 优先，因为一个上游可能
+// 同时给 supports_reasoning=true 与 supports_thinking=false（自相矛盾的
+// 情况下不能猜），所以顺序固定为 reasoning → thinking → reasoning 别名。
+func (e *rawModelEntry) supportsThinkingFor() *bool {
+	if e.SupportsReasoning != nil {
+		return e.SupportsReasoning
+	}
+	if e.SupportsThinking != nil {
+		return e.SupportsThinking
+	}
+	return e.Reasoning
 }
 
 // DiscoverUpstreamModels 直接向 provider 拉一次原始 /models，
@@ -944,6 +1010,11 @@ func fetchModels(ctx context.Context, client *http.Client, url, protocol, apiKey
 			DisplayName:     name,
 			ContextWindow:   firstPositive(e.ContextLength, e.ContextWindow, e.MaxInputTokens, e.TopProvider.ContextLength),
 			MaxOutputTokens: firstPositive(e.MaxCompletionTokens, e.MaxOutputTokens, e.TopProvider.MaxCompletionTokens),
+			// 思考能力：原样带给 admin 层，由那边做「上游报了才填」的判定。
+			// 这里**不做**任何档位清洗 —— 网关的 effort 包是 admin 层的事，
+			// 在这一层归一会丢掉 UnknownLevels 机制（厂商私有值需要原样保留）。
+			EffortLevels:     e.effortLevelsFor(),
+			SupportsThinking: e.supportsThinkingFor(),
 		})
 	}
 	if len(result) == 0 {

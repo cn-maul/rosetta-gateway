@@ -18,7 +18,14 @@ func TestParse_别名与大小写(t *testing.T) {
 		{"minimal", Minimal},
 		{"min", Minimal},
 		{"default", Medium},
-		{"max", XHigh},
+		// max 是**独立档**，不是 xhigh 的别名（2026-10-14）。这条断言原来
+		// 钉的是旧行为（Parse("max") == XHigh）—— 它当时是有意的，但与
+		// 真实上游冲突：某个上游的 reasoning_supported_efforts 里 max
+		// 排在 xhigh **之后**，且 reasoning_default_effort 就是 max。
+		// 继续压成 xhigh 会让存库值与上游对不上账。
+		{"max", Max},
+		{"maximum", Max},
+		{"MAX", Max},
 		{"none", None},
 		// 拼错 / 完全不认识的写法必须落在 Unset —— 「退回默认」与
 		// 「夹到最接近的一档」是两种处置，混淆会把用户的显式选择丢掉。
@@ -152,8 +159,49 @@ func TestSupports(t *testing.T) {
 // 按钮，落库排序也依赖它。反转顺序会让「强度递增」的语义整个翻掉，且
 // 没有任何报错。
 func TestKnownLevels_有序(t *testing.T) {
-	want := []Level{Minimal, Low, Medium, High, XHigh}
+	// max 排在 xhigh **之后**（2026-10-14）：真实上游的
+	// reasoning_supported_efforts 就是这个顺序，且 max 是最高档。
+	want := []Level{Minimal, Low, Medium, High, XHigh, Max}
 	if !reflect.DeepEqual(KnownLevels, want) {
 		t.Fatalf("KnownLevels = %v，期望 %v", KnownLevels, want)
+	}
+}
+
+// TestToRosettaLevel_每个刻度档位都有归属 钉住「不得静默降一档」。
+//
+// 这条是加 Max 时真出过的 bug：把 case 写成 `case XHigh, Max:` 漏掉 High，
+// High 就掉进 default 拿到 "medium"，强度降一档且**没有任何错误**。
+//
+// switch 的完备性编译器管不了，所以这里逐档断言。
+func TestToRosettaLevel_每个刻度档位都有归属(t *testing.T) {
+	want := map[Level]string{
+		Minimal: "low",
+		Low:     "low",
+		Medium:  "medium",
+		High:    "high",
+		XHigh:   "high",
+		Max:     "high",
+	}
+	for _, lv := range KnownLevels {
+		got := ToRosettaLevel(lv)
+		if got != want[lv] {
+			t.Errorf("ToRosettaLevel(%q) = %q，期望 %q（漏进 default 会静默降一档）", lv, got, want[lv])
+		}
+	}
+}
+
+// TestClamp_相邻高保真 加 Max 后，夹取行为不该因新增刻度而变化。
+//
+// 要 max 而只配了 xhigh 时，仍夹到 xhigh（最接近的一档）—— Max 与 XHigh
+// 在刻度上相邻，新增 Max 不该改变任何既有的夹取结果。
+func TestClamp_相邻高保真(t *testing.T) {
+	if got := Clamp(Max, []Level{Low, Medium, High, XHigh}); got != XHigh {
+		t.Errorf("Clamp(max, [low,medium,high,xhigh]) = %q，期望 xhigh", got)
+	}
+	if got := Clamp(High, []Level{Low, Medium, High, XHigh}); got != High {
+		t.Errorf("Clamp(high, ...) = %q，期望 high（支持集内不该被改）", got)
+	}
+	if got := Clamp(XHigh, []Level{Minimal, Low, Medium, High, XHigh, Max}); got != XHigh {
+		t.Errorf("Clamp(xhigh, 含 max 的集合) = %q，期望 xhigh", got)
 	}
 }

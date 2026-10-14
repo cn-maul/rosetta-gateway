@@ -93,6 +93,42 @@ func TestListModels_未配置挡位不下发(t *testing.T) {
 	}
 }
 
+// TestListModels_下发max原样 钉住「上游报的第五档不会被压掉」。
+//
+// 用例形状取自实测的一个真实上游：它的
+// reasoning_supported_efforts 是 [low,medium,high,xhigh,max]，
+// 且 reasoning_default_effort = max。这条测试守的是披露这一环：
+// 客户端如果在下拉框里看不到 max，就永远选不到上游默认的那一档。
+func TestListModels_下发max原样(t *testing.T) {
+	newEffortSnapshot(t, "bunny", "cn:space-bunny",
+		[]effort.Level{effort.Low, effort.Medium, effort.High, effort.XHigh, effort.Max})
+
+	req := httptest.NewRequest(http.MethodGet, "/v1/models", nil)
+	req.Header.Set("Authorization", "Bearer "+testAccessKey)
+	rec := httptest.NewRecorder()
+	handleListModels("")(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("code = %d body = %s", rec.Code, rec.Body.String())
+	}
+	var out struct {
+		Data []map[string]any `json:"data"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if len(out.Data) != 1 {
+		t.Fatalf("期望 1 个模型，实际 %d", len(out.Data))
+	}
+	levels, _ := out.Data[0]["supported_reasoning"].([]any)
+	if len(levels) != 5 {
+		t.Fatalf("supported_reasoning = %v，期望 5 项（含 max）", out.Data[0]["supported_reasoning"])
+	}
+	if levels[4] != "max" {
+		t.Fatalf("最高档下发成了 %v，期望 \"max\"（压成 xhigh 会让客户端选不到上游默认档）", levels[4])
+	}
+}
+
 // TestApplyThinkingCapability_档位处理 覆盖「原样送达」这一新契约的全部分支。
 //
 // 关键判据是 EffortRaw 而非 Effort：收敛到 rosetta 之后，网关的职责是
@@ -363,23 +399,35 @@ func TestApplyThinkingCapability_未请求思考不新建Thinking(t *testing.T) 
 }
 
 // TestListModels_披露思考开关 是「工具侧那个是否支持思考模式的开关」的
-// 数据来源。三态各有各的下发方式，混了会让客户端误判：
+// 数据来源。三态各有各的下发方式（2026-10-14 起未配置也下发）：
 //
-//	true  → supports_thinking:true
-//	false → supports_thinking:false（客户端据此禁用思考选择器）
-//	未配置 → **字段缺席**（不是 false：那是「不知道」，报成 false 会让
-//	         所有没配过的模型凭空失去思考能力）
+//	true      → supports_thinking:true
+//	false     → supports_thinking:false（客户端据此禁用思考选择器）
+//	未配置(nil) → supports_thinking:true，但**不下发 supported_reasoning**
+//
+// # 为什么未配置改成发 true（原来是字段缺席）
+//
+// 缺席对客户端不是中立的：OpenRouter 约定下多数工具把缺席当「不支持」，
+// 于是「未配置」在下游等于「没有思考能力」，而网关的语义是「不干预」。
+// 两边对同一个 nil 的解释相反，用户看到的现象是「我明明能思考，工具却不给我开」。
+//
+// 发 true 不等于替上游承诺档位：supported_reasoning 缺席仍然表示「档位由
+// 上游定」，两个字段组合起来正好覆盖三种配置。
+//
+// 注意这条只管**披露**：数据面仍然只在显式 false 时才剥掉思考
+// （见 applyThinkingCapability 与 TestApplyThinkingCapability_显式不支持才剥）。
+// 若这里改成发 false 而数据面也照做，全部未配置模型会静默失去思考能力。
 func TestListModels_披露思考开关(t *testing.T) {
 	sup := func(b bool) *bool { return &b }
 	cases := []struct {
-		name   string
-		sup    *bool
-		want   string // 期望出现在响应里的片段
-		absent bool
+		name       string
+		sup        *bool
+		want       string // 期望出现在响应里的片段
+		wantNoLvls bool   // 不该出现 supported_reasoning
 	}{
-		{"支持", sup(true), `"supports_thinking":true`, false},
-		{"不支持", sup(false), `"supports_thinking":false`, false},
-		{"未配置则不下发", nil, "", true},
+		{"支持", sup(true), `"supports_thinking":true`, true},
+		{"不支持", sup(false), `"supports_thinking":false`, true},
+		{"未配置按支持下发", nil, `"supports_thinking":true`, true},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -407,14 +455,41 @@ func TestListModels_披露思考开关(t *testing.T) {
 			handleListModels("")(rec, req)
 
 			body := rec.Body.String()
-			if c.absent {
-				if strings.Contains(body, "supports_thinking") {
-					t.Fatalf("未配置时不该下发 supports_thinking：%s", body)
-				}
-				return
-			}
 			if !strings.Contains(body, c.want) {
 				t.Fatalf("缺少 %s：%s", c.want, body)
+			}
+			if c.wantNoLvls && strings.Contains(body, "supported_reasoning") {
+				t.Fatalf("没配挡位时不该下发 supported_reasoning：%s", body)
+			}
+		})
+	}
+}
+
+// TestApplyThinkingCapability_未配置仍然不干预 钉住披露与数据面的**边界**。
+//
+// 2026-10-14 把 /v1/models 的「未配置」从字段缺席改成下发 true 之后，
+// 极易顺手把数据面也改成「未配置 = 剥掉思考」—— 那会让全部未配置模型
+// （含 anthropic 协议的，它们的思考旋钮就是 budget_tokens，剥掉等于彻底关闭）
+// 静默失去思考能力，且请求照样成功返回，没有任何错误。
+//
+// 这里明确只测数据面那一半：未配置 = 网关不干预，原样透传。
+func TestApplyThinkingCapability_未配置仍然不干预(t *testing.T) {
+	for _, proto := range []string{"openai-chat", "openai-responses", "anthropic"} {
+		t.Run(proto, func(t *testing.T) {
+			ing := &ingressRequest{}
+			req := &rosetta.ChatRequest{}
+			req.Thinking = &rosetta.ThinkingConfig{}
+
+			// SupportsThinking 为 nil（未配置），且没有任何 effort_levels。
+			ing.applyThinkingCapability(req, &routing.UpstreamModel{
+				ModelID: "cn:space-bunny", // 未配置态
+			}, proto)
+
+			if req.Thinking == nil {
+				t.Fatalf("%s：未配置不应剥掉思考（那是「不知道」，不是「不支持」）", proto)
+			}
+			if req.Thinking.EffortRaw != "" {
+				t.Errorf("%s：未配置时不该替客户端选档位，got %q", proto, req.Thinking.EffortRaw)
 			}
 		})
 	}

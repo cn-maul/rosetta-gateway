@@ -193,23 +193,28 @@ function labelFor(mm: UpstreamModel): string {
 </script>
 
 <template>
-  <main class="page">
-    <div class="price-head">
-      <div>
-        <div class="price-title">模型归组</div>
-        <div class="tip">
-          把不同上游的「同一个模型」（叫法往往不同）编成一组，调用统计按组名合并显示。
-          归组只影响统计展示，<b>不改变路由与转发</b>。一个模型最多属于一组。
-        </div>
-      </div>
-      <button class="btn btn-primary" type="button" @click="openCreate">新建模型组</button>
+  <!-- 面板形态（2026-10-14 页面合并）：并进 Upstream.vue 的「模型归组」页签。
+       标题 / 刷新由宿主页统一提供。
+
+       这里的 .tip 说明**刻意保留**：它讲的是「归组只影响统计展示，不改变
+       路由与转发」—— 一条容易被误解为「改了会动线上流量」的边界，而页签
+       本身只有两个字「归组」，扛不住这句话。宿主页不重复它。 -->
+  <div class="panel-body">
+    <div class="panel-actions">
+      <button class="btn btn-primary btn-sm" type="button" @click="openCreate">新建模型组</button>
     </div>
 
-    <div v-if="loading" class="loading">加载中…</div>
-    <div v-else-if="err" class="empty">{{ err }}</div>
-    <div v-else-if="groups.length === 0" class="empty">
-      还没有模型组 —— 点右上「新建模型组」，再把各上游的同名模型并进来
-    </div>
+    <div class="panel">
+      <div class="panel-note">
+        把不同上游的「同一个模型」（叫法往往不同）编成一组，调用统计按组名合并显示。
+        归组只影响统计展示，<b>不改变路由与转发</b>。一个模型最多属于一组。
+      </div>
+
+      <div v-if="loading" class="loading">加载中…</div>
+      <div v-else-if="err" class="empty">{{ err }}</div>
+      <div v-else-if="groups.length === 0" class="empty">
+        还没有模型组 —— 点上方「新建模型组」，再把各上游的同名模型并进来
+      </div>
 
     <div v-else class="tbl-wrap">
       <table class="tbl">
@@ -234,6 +239,7 @@ function labelFor(mm: UpstreamModel): string {
           </tr>
         </tbody>
       </table>
+    </div>
     </div>
 
     <!-- 建组 / 改名 -->
@@ -300,7 +306,7 @@ function labelFor(mm: UpstreamModel): string {
         </div>
       </div>
     </AppModal>
-  </main>
+  </div>
 </template>
 
 <style scoped>

@@ -183,6 +183,19 @@ function moveTarget(i: number, dir: -1 | 1) {
   form.targets.splice(j, 0, row)
 }
 
+/**
+ * 一键把某项置顶到链首（2026-10-14）。
+ *
+ * 「未开故障转移」时请求**只打链首**，所以要换掉当前生效的上游，
+ * 本质就是「把另一个模型挪到 position 0」。链长的时候靠 ↑ 要连点好几次，
+ * 而这是个高频动作（上游挂了/换了供应商就切一次），值得一个专门的按钮。
+ */
+function pinTarget(i: number) {
+  if (i <= 0 || i >= form.targets.length) return
+  const [row] = form.targets.splice(i, 1)
+  form.targets.unshift(row)
+}
+
 function onTargetProviderChange(row: TargetRow) {
   // 切 provider 后原模型可能不属于它，清空让用户重选
   const m = mmap.value[row.upstream_model_id]
@@ -293,16 +306,11 @@ onMounted(load)
 </script>
 
 <template>
-  <main class="page">
-    <div class="page-head">
-      <div>
-        <h1>路由</h1>
-        <div class="sub">公开模型名 → 有序上游链，按 position 依次尝试，命中故障自动转移</div>
-      </div>
-      <div class="head-actions">
-        <button class="btn" :disabled="loading" @click="load">刷新</button>
-        <button class="btn btn-primary" @click="openRoute()">新建路由</button>
-      </div>
+  <!-- 面板形态（2026-10-14 页面合并）：并进 Upstream.vue 的「路由」页签。
+       标题 / 副标题 / 刷新由宿主页统一提供。 -->
+  <div class="panel-body">
+    <div class="panel-actions">
+      <button class="btn btn-primary btn-sm" @click="openRoute()">新建路由</button>
     </div>
 
     <div class="panel">
@@ -392,6 +400,17 @@ onMounted(load)
               <input v-model="t.enabled" type="checkbox" /> 启用
             </label>
             <div class="chain-ops">
+              <!-- 置顶：一键挪到链首（未开故障转移时 = 当前生效的上游）。
+                   链长时靠 ↑ 要连点好几次，而换上游是个高频动作。 -->
+              <button
+                type="button"
+                class="btn btn-sm btn-ghost"
+                :disabled="chainBlocked || i === 0"
+                :title="i === 0 ? '已在链首（未开故障转移时就是当前生效的上游）' : '置顶：设为链首'"
+                @click="pinTarget(i)"
+              >
+                置顶
+              </button>
               <button type="button" class="btn btn-sm btn-ghost" :disabled="chainBlocked || i === 0" @click="moveTarget(i, -1)">↑</button>
               <button type="button" class="btn btn-sm btn-ghost" :disabled="chainBlocked || i === form.targets.length - 1" @click="moveTarget(i, 1)">↓</button>
               <button type="button" class="btn btn-sm btn-danger" :disabled="chainBlocked" @click="removeTarget(i)">删</button>
@@ -430,7 +449,7 @@ onMounted(load)
         </div>
       </form>
     </AppModal>
-  </main>
+  </div>
 </template>
 
 <style scoped>

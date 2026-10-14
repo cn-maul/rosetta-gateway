@@ -238,21 +238,12 @@ watch(
           </svg>
           <span v-if="!railCollapsed">总览</span>
         </RouterLink>
-        <RouterLink class="side-item" to="/keys" :title="railCollapsed ? '访问密钥' : undefined">
-          <svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-            <path d="M2 18v3c0 .6.4 1 1 1h4v-3h3v-3h2l1.4-1.4a6.5 6.5 0 1 0-4-4Z" />
-            <circle cx="16.5" cy="7.5" r=".5" fill="currentColor" />
-          </svg>
-          <span v-if="!railCollapsed">访问密钥</span>
-        </RouterLink>
-        <!-- 「可用模型」重新出现在个人功能区（2026-10-10）。
-             上一轮它被整体删掉了，理由是「管理员不再调用 API，也就用不上这份
-             清单」—— 这个前提只对管理员成立，但删除是无差别的，普通用户
-             因此失去了唯一能回答「我实际能调哪些模型、单价多少」的页面。
+        <!-- 「可用模型」排在第二位（2026-10-14 按用户要求重排）：
+             它回答的是「我实际能调哪些模型、单价多少、此刻通不通」，
+             紧跟在总览之后 —— 前两页都是「我的现状」，第三页才是「钱」。
              ModelPicker 不能替代它：那只是建 key 表单里的一个控件，
              「一个都不选 = 不限制」的配置态语义与本页的「我实际能用哪些」
-             正好相反（见 Models.vue 文件头注释）。
-             它不在 admin 区，因为查自己的可用模型与查自己的用量同权。 -->
+             正好相反（见 Models.vue 文件头注释）。连通率也已并进它的卡片。 -->
         <RouterLink class="side-item" to="/models" :title="railCollapsed ? '可用模型' : undefined">
           <svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
             <path d="M12 2a3 3 0 0 0-3 3v1a3 3 0 0 0-3 3v1a3 3 0 0 0 0 6v1a3 3 0 0 0 3 3v1a3 3 0 0 0 6 0v-1a3 3 0 0 0 3-3v-1a3 3 0 0 0 0-6V9a3 3 0 0 0-3-3V5a3 3 0 0 0-3-3Z" />
@@ -268,13 +259,16 @@ watch(
           </svg>
           <span v-if="!railCollapsed">钱包与充值</span>
         </RouterLink>
-        <!-- 「调用历史」移回个人功能区（2026-10-10）。上一轮按用户给的侧边栏顺序
-             把它划进 admin 区，理由是「普通用户看消费记录走钱包页」—— 但钱包页
-             给的是**聚合数**，而排障要的是**逐条明细**：「我刚才那次为什么报错 /
-             为什么这么慢 / 为什么花了 0.4 分」这三个问题，钱包页一个都答不了。
-             后端早已按会话身份收窄作用域（普通用户只见自己），把它对普通用户
-             开放不产生越权，只是把已存在的入口还回去。 -->
-        <RouterLink class="side-item" to="/history" :title="railCollapsed ? '调用历史' : undefined">
+        <!-- 以下两项**只对普通用户显示**：它们在管理区已被同名的入口覆盖，
+             给管理员再放一份只会让侧栏出现两处指向同一页的项（点哪一处
+             都对，但人会怀疑自己看错了）。
+
+             1) 调用历史：管理区那一项按用户指定的顺序排进了「管理」段，
+                而本页对普通用户仍然开放（后端按身份收窄作用域），所以
+                普通用户的侧栏必须自己有一份 —— 否则他们将完全失去入口。
+             2) 用户与分组（= 访问密钥页签）：这是普通用户管理自己凭据的
+                唯一入口，删不得。管理员则从管理区那一项进（见上）。 -->
+        <RouterLink v-if="!isAdmin()" class="side-item" to="/history" :title="railCollapsed ? '调用历史' : undefined">
           <svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
             <path d="M3 12a9 9 0 1 0 9-9 9.75 9.75 0 0 0-6.74 2.74L3 8" />
             <path d="M3 3v5h5" />
@@ -282,14 +276,28 @@ watch(
           </svg>
           <span v-if="!railCollapsed">调用历史</span>
         </RouterLink>
-        <!-- 分组分隔（2026-10-12）：上面 5 项是「我的」，下面是「管全站的」。
-             分类此前只存在于这段注释里 —— 模板上 9 个图标项长得完全一样，
+        <RouterLink v-if="!isAdmin()" class="side-item" to="/users" :title="railCollapsed ? '用户与分组' : undefined">
+          <svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <path d="M2 18v3c0 .6.4 1 1 1h4v-3h3v-3h2l1.4-1.4a6.5 6.5 0 1 0-4-4Z" />
+            <circle cx="16.5" cy="7.5" r=".5" fill="currentColor" />
+          </svg>
+          <span v-if="!railCollapsed">用户与分组</span>
+        </RouterLink>
+        <!-- 分组分隔（2026-10-12）：上面是「我的」，下面是「管全站的」。
+             分类此前只存在于这段注释里 —— 模板上一串图标项长得完全一样，
              管理员看不出哪些是自己的、哪些影响所有人。
-             收起态只留一条 hairline：没有横向空间放文字，但分组边界仍在。 -->
+             收起态只留一条 hairline：没有横向空间放文字，但分组边界仍在。
+
+             顺序（2026-10-14 按用户指定）：总览 → 可用模型 → 钱包与充值
+             ‖ 上游与模型 → 用户与分组 → 调用历史 → 设置。 -->
         <div v-if="isAdmin()" class="side-sep" :class="{ 'sep-label': !railCollapsed }">
           <span v-if="!railCollapsed" class="side-sep-text">管理</span>
         </div>
         <template v-if="isAdmin()">
+          <!-- 「模型归组」「连通率」「路由」不再是独立侧栏项（2026-10-14）：
+               三个与「上游与模型」合成一页三个页签，连通率则并进了
+               「可用模型」的每张模型卡。老地址都留了重定向（见 router.ts），
+               所以旧书签不会 404。 -->
           <RouterLink class="side-item" to="/providers" :title="railCollapsed ? '上游与模型' : undefined">
             <svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
               <rect width="20" height="8" x="2" y="2" rx="2" ry="2" />
@@ -299,31 +307,12 @@ watch(
             </svg>
             <span v-if="!railCollapsed">上游与模型</span>
           </RouterLink>
-          <RouterLink class="side-item" to="/model-groups" :title="railCollapsed ? '模型归组' : undefined">
-            <svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-              <path d="M12 2 2 7l10 5 10-5-10-5Z" />
-              <path d="m2 17 10 5 10-5" />
-              <path d="m2 12 10 5 10-5" />
-            </svg>
-            <span v-if="!railCollapsed">模型归组</span>
-          </RouterLink>
-          <RouterLink class="side-item" to="/health" :title="railCollapsed ? '连通率' : undefined">
-            <svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-              <path d="M22 12h-4l-3 9L9 3l-3 9H2" />
-            </svg>
-            <span v-if="!railCollapsed">连通率</span>
-          </RouterLink>
-          <RouterLink class="side-item" to="/routes" :title="railCollapsed ? '路由' : undefined">
-            <svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-              <circle cx="6" cy="19" r="3" />
-              <path d="M9 19h8.5a3.5 3.5 0 0 0 0-7h-11a3.5 3.5 0 0 1 0-7H15" />
-              <circle cx="18" cy="5" r="3" />
-            </svg>
-            <span v-if="!railCollapsed">路由</span>
-          </RouterLink>
-          <!-- 「用户」与「分组」合并（2026-10-10）：分组是用户的属性
-               （users.group_id），拆成两个页面得在「这个人在哪个组」与
-               「这个组有哪些人」之间来回跳。页内两个 tab 解决。 -->
+          <!-- 「用户 / 分组 / 访问密钥」合并成一页三个页签（2026-10-14）：
+               分组是用户的属性（users.group_id），访问密钥又是用户自己的凭据
+               —— 排查「这把 key 为什么调不通这个模型」要同时看这三处。
+               位置与「访问密钥」在个人区时等价（用户与密钥同一条权限链），
+               只是这一项在 admin 模板内，因此普通用户的侧栏没有它 ——
+               他们改用自己的入口在下面。 -->
           <RouterLink class="side-item" to="/users" :title="railCollapsed ? '用户与分组' : undefined">
             <svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
               <path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2" />
@@ -332,6 +321,21 @@ watch(
               <path d="M16 3.13a4 4 0 0 1 0 7.75" />
             </svg>
             <span v-if="!railCollapsed">用户与分组</span>
+          </RouterLink>
+          <!-- 「调用历史」移进管理区（2026-10-14 按用户指定的顺序）。它仍对
+               普通用户开放 —— 钱包页给的是**聚合数**，而排障要的是**逐条明细**
+               （「我刚才那次为什么报错 / 为什么这么慢 / 为什么花了 0.4 分」，
+               钱包页一个都答不了），后端也早已按身份收窄作用域。
+
+               所以这里**不能**写成 meta.adminOnly 那种隐藏式归类：普通用户
+               仍需要这一页，只是侧栏上没有这一段。个人区那个等价入口见下。 -->
+          <RouterLink class="side-item" to="/history" :title="railCollapsed ? '调用历史' : undefined">
+            <svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <path d="M3 12a9 9 0 1 0 9-9 9.75 9.75 0 0 0-6.74 2.74L3 8" />
+              <path d="M3 3v5h5" />
+              <path d="M12 7v5l4 2" />
+            </svg>
+            <span v-if="!railCollapsed">调用历史</span>
           </RouterLink>
           <RouterLink class="side-item" to="/settings" :title="railCollapsed ? '设置' : undefined">
             <svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">

@@ -460,6 +460,9 @@ type modelNamesResponse struct {
 	Restricted bool     `json:"restricted"`
 	// Prices 与 Models **按公开名逐位对应**（见 handler 里的说明）。
 	Prices []modelPrice `json:"prices"`
+	// Meta 同样逐位对应，且**长度必须与 Models 一致** ——
+	// 前端按 models[i] 取 meta[i].upstream_model_id 去挂连通率。
+	Meta []modelMeta `json:"meta"`
 }
 
 // initPricedRouteSnapshot 装一份带单价的快照，供 prices 断言用。
@@ -495,6 +498,89 @@ func initPricedRouteSnapshot(t *testing.T, names map[string][3]float64, users ma
 		UsersByID:  users,
 	})
 	t.Cleanup(func() { snapshot.Init(&snapshot.Snapshot{}) })
+}
+
+// meta 必须与 models **逐位对齐**，且指向的是**同一个**上游模型行 ——
+// 这是「卡片上价格与连通率属于同一个模型」这件事的唯一保证。
+//
+// 两条各自会静默出错：
+//   - 长度不齐 → 前端按下标取到别人的 id，连通率挂错卡片；
+//   - 只排 prices 不排 meta → meta 留在 ListRoutes 的 map 遍历顺序上，
+//     每次刷新卡片上的曲线都可能换人（且不报错）。
+func TestModelNames_MetaAlignsWithModelsAndPointsAtSameUpstream(t *testing.T) {
+	initPricedRouteSnapshot(t, map[string][3]float64{
+		"alpha": {1.5, 0.15, 6},
+		"beta":  {2, 0.2, 8},
+		"gamma": {3, 0.3, 12},
+	}, nil)
+	h := NewGroupHandler(newScopeStore(t))
+
+	got := fetchModelNames(t, h, asAdmin(httptest.NewRequest(http.MethodGet, "/admin/api/model-names", nil)))
+	if len(got.Meta) != len(got.Models) {
+		t.Fatalf("len(meta) = %d, want %d（平行数组必须对齐，否则连通率会挂到别的模型上）",
+			len(got.Meta), len(got.Models))
+	}
+	for i, m := range got.Models {
+		if got.Meta[i].Name != m {
+			t.Errorf("meta[%d].name = %q, want %q", i, got.Meta[i].Name, m)
+		}
+		if got.Meta[i].UpstreamModelID == "" {
+			t.Errorf("meta[%d] (%s): upstream_model_id 为空，界面将无法挂上连通率", i, m)
+		}
+		if got.Meta[i].ProviderName == "" {
+			t.Errorf("meta[%d] (%s): provider_name 为空，卡片副标题会退化成 id 前缀", i, m)
+		}
+	}
+	// 同一份 fixtures 下每个公开名对应各自的上游模型行；错位会表现为
+	// 两个公开名拿到同一个 id。
+	ids := map[string]string{}
+	for i, m := range got.Models {
+		if prev, dup := ids[got.Meta[i].UpstreamModelID]; dup {
+			t.Errorf("meta 中 %q 与 %q 指向同一个上游模型 %q（映射错位）", prev, m, got.Meta[i].UpstreamModelID)
+		}
+		ids[got.Meta[i].UpstreamModelID] = m
+	}
+}
+
+// restricted 收窄时 meta 必须**一起**收窄，且长度与 models 一致。
+//
+// 长度不对齐的后果比「多看到一条」严重：前端按 models[i] 取 meta[i]，
+// 若 meta 比 models 长，收窄用户会拿到组外模型的上游 id；而探测端点虽然
+// 会再收窄一次，但那时 id 已经泄露给了浏览器端。
+func TestModelNames_MetaScopedWithRestrictedUser(t *testing.T) {
+	initPricedRouteSnapshot(t, map[string][3]float64{
+		"flash": {0.2, 0.02, 0.8},
+		"pro":   {2, 0.2, 8},
+		"opus":  {15, 1.5, 75},
+	}, map[string]*snapshot.UserSnapshot{
+		"u1": snapUser("u1", "g1", snapshot.AllowOnly([]string{"flash", "pro"})),
+	})
+	h := NewGroupHandler(newScopeStore(t))
+
+	got := fetchModelNames(t, h, asUser(httptest.NewRequest(http.MethodGet, "/admin/api/model-names", nil), "u1"))
+	if !got.Restricted {
+		t.Fatal("restricted 应为 true")
+	}
+	if len(got.Meta) != len(got.Models) || len(got.Models) != 2 {
+		t.Fatalf("models = %v, meta = %+v, want 2/2", got.Models, got.Meta)
+	}
+	for i, m := range got.Models {
+		if got.Meta[i].Name != m {
+			t.Errorf("meta[%d].name = %q, want %q（收窄后仍须逐位对齐）", i, got.Meta[i].Name, m)
+		}
+	}
+	// 交集为空 → meta 也必须是空数组，绝不能退回全集。
+	initPricedRouteSnapshot(t, map[string][3]float64{
+		"flash": {0.2, 0.02, 0.8},
+	}, map[string]*snapshot.UserSnapshot{
+		"u3": snapUser("u3", "g1", snapshot.AllowOnly([]string{"nonexistent"})),
+	})
+	h2 := NewGroupHandler(newScopeStore(t))
+	none := fetchModelNames(t, h2, asUser(httptest.NewRequest(http.MethodGet, "/admin/api/model-names", nil), "u3"))
+	if len(none.Models) != 0 || len(none.Meta) != 0 {
+		t.Errorf("empty intersection: %d models / %d meta, want 0 / 0（退回全集等于静默放宽）",
+			len(none.Models), len(none.Meta))
+	}
 }
 
 // ---- prices 的向后兼容契约 ----

@@ -55,7 +55,21 @@ const TABS = [
   { key: 'groups', label: '分组' },
 ] as const
 type TabKey = (typeof TABS)[number]['key']
-const tab = ref<TabKey>('users')
+
+/**
+ * tab 由宿主页（AccessControl.vue）持有并双向绑定（2026-10-14 页面合并）。
+ *
+ * 为什么用 v-model 而不是自己内部管：这一页现在只是宿主三页签里的前两个。
+ * 若本页自己存一份 tab，用户在宿主切到「访问密钥」再切回来时，本页还停在
+ * 离开时的页签上 —— 两处状态会漂移。
+ *
+ * 用 defineModel 而非 defineProps + emit：后者要手写两半，漏掉 emit 那半时
+ * TS 不报错、只在运行时表现为「点了不动」。defineModel 让编译器盯住配对。
+ *
+ * 没有默认值可省：宿主一定会传。写成可选再补一个内部兜底，只会让
+ * 「忘了传」这件事静默表现成「永远停在第一个页签」。
+ */
+const tab = defineModel<TabKey>('tab', { required: true })
 
 const users = ref<User[]>([])
 /** 分组清单，用于把 group_id 渲染成名字、以及在表单里选择。 */
@@ -544,23 +558,15 @@ async function askDeleteGroup(g: Group) {
 </script>
 
 <template>
-  <main class="page">
-    <div class="page-head">
-      <div>
-        <h1>用户与分组</h1>
-        <div class="sub">账号、配额、登录状态与模型可见范围</div>
-      </div>
-      <div class="head-actions">
-        <button class="btn" :disabled="loading" @click="load">刷新</button>
-        <button v-if="tab === 'users'" class="btn btn-primary" @click="showCreate = true">新建用户</button>
-        <button v-else class="btn btn-primary" @click="openCreateGroup">新建分组</button>
-      </div>
+  <!-- 面板形态（2026-10-14 页面合并）：并进 AccessControl.vue，成为
+       「用户 / 分组 / 访问密钥」里的前两个页签。页签条、标题与刷新按钮
+       全部由宿主页提供 —— 原来这里自己也有页签条，那正好是「同一套控件
+       在同一个应用里长得不一样」的来源，删掉比留着好。 -->
+  <div class="panel-body">
+    <div class="panel-actions">
+      <button v-if="tab === 'users'" class="btn btn-primary btn-sm" @click="showCreate = true">新建用户</button>
+      <button v-else class="btn btn-primary btn-sm" @click="openCreateGroup">新建分组</button>
     </div>
-
-    <!-- 页签改用共享 Tabs（2026-10-12）：原先是 .ug-tabs + 手写 v-for，
-         与 Settings / Wallet 各写一份 —— 正是那个注释里担心的
-         「同一套控件、同一个应用里长得不一样」。 -->
-    <Tabs v-model="tab" :tabs="TABS" aria-label="用户与分组" />
 
     <!-- ============ 页签一：用户 ============ -->
     <template v-if="tab === 'users'">
@@ -881,7 +887,7 @@ async function askDeleteGroup(g: Group) {
           </button>
         </div>
     </AppModal>
-  </main>
+  </div>
 </template>
 
 <style scoped>

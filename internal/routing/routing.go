@@ -297,6 +297,24 @@ func (ri *RouteIndex) ListRoutes() []*Route {
 	return routes
 }
 
+// ListPublicNames 返回全部**具名路由**的公开名（不含 provider/model 直连
+// 形式产生的合成路由）。
+//
+// 为什么需要它（2026-10-14 探测端点按身份收窄）：白名单是按**公开名**精确
+// 匹配的，而调用方要拿它去反查上游模型 id。没有这个方法的话每个调用方
+// 只能自己 for 一遍 ListRoutes 取 PublicName —— 而 ListRoutes 的返回值
+// 是 map 遍历出来的无序指针切片，写错一处顺序依赖就出静默 bug。
+//
+// 返回的是副本：调用方排序或改它都不会影响索引。刻意**不排序** ——
+// 这是索引快照的枚举，不是给人看的清单；要稳定顺序的调用方自己排。
+func (ri *RouteIndex) ListPublicNames() []string {
+	names := make([]string, 0, len(ri.byPublicName))
+	for name := range ri.byPublicName {
+		names = append(names, name)
+	}
+	return names
+}
+
 // UpstreamModelRef 是轨道二（slug/model 直连）的枚举项。
 type UpstreamModelRef struct {
 	ProviderID   string

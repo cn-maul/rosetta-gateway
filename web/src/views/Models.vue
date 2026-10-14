@@ -1,36 +1,57 @@
 <script setup lang="ts">
 /**
- * 可用模型（全体可见的只读清单）。
+ * 可用模型（全体可见的只读清单）。每个模型一张卡片，卡内同时显示
+ * **单价**与**连通率**。
  *
- * # 这页和 ModelPicker 讲的不是同一件事，别把两边的语义混过来
+ * # 为什么把连通率并进这张卡（2026-10-14 页面合并）
+ *
+ * 合之前是两个页面：「可用模型」按**公开路由名**列价格，「连通率」按
+ * **upstream_models.id** 画曲线。两者问的其实是同一个问题的两半 ——
+ * 「我要用的这个模型，此刻多少钱、此刻通不通」。拆开看的代价是：判断一个
+ * 故障该换档还是该降价，得先记下模型名、去另一页按 id 找、再回来对价格。
+ * 现在一张卡给全，且**价格与连通率指向同一个上游模型**（后端 meta 与
+ * prices 同取故障转移链的 position 0，见 group_handler.go）。
+ *
+ * # 连通率怎么对上号
+ *
+ * 探测数据按 upstream_models.id 组织，本页清单按公开名组织 —— 主键不同，
+ * 靠 model-names 的 meta[i].upstream_model_id 映射。
+ *
+ * 映射**可能缺**，三种情况与各自该显示什么都必须区分开：
+ *   - 该路由解析不出可用目标（provider/模型被禁用）→ 不画曲线，写明原因；
+ *     画一条空图等于把「没配好」呈现成「探测不出问题」。
+ *   - 探测端点按身份收窄后拿不到（交集为空、或未探测）→ 显示「未探测」。
+ *   - 拿得到 → 画曲线。
+ *
+ * # 曲线仍然只在勾选的模型上画
+ *
+ * 一次画几十条曲线既没人看得懂，也让后端单查询变重（24 个上限）。所以默认
+ * 只画**有探测记录的前 6 个**，其余模型的价格照常显示 —— 用户要看的通常是
+ * 价格，不是曲线。
+ *
+ * # 这页和 ModelPicker 讲的不是同一件事
  *
  * ModelPicker 是**写**白名单的地方，它承载一条反直觉但关键的规则：
- * 「一个都不选 = 不限制」。所以它在空清单时说「未限制」，是**故意**的 ——
- * 那是配置态下「没勾」的正确读法。
- *
- * 而本页回答的是另一个问题：**我实际能用哪些模型**。这里的清单是接口按身份
- * 收窄后的结果（管理员=全部路由名，普通用户=所属组白名单 ∩ 全部路由名，
- * 见 GroupHandler.ModelNames），不是任何人的待保存配置。于是：
+ * 「一个都不选 = 不限制」。本页回答的是另一个问题：**我实际能用哪些模型、
+ * 多少钱、此刻通不通**。这里的清单是接口按身份收窄后的结果，不是任何人的
+ * 待保存配置。
  *
  *   - 空清单**绝不能**写成「不限制」。空的可能只有两种：路由一个都没配，
- *     或组白名单与路由无交集。后者返回全集就会构成**静默放宽**（后端测试
- *     TestModelNames_NormalUserScopedByGroup 专门钉住了这一点），界面若把空
- *     说成「不限制」等于把那个失败方向又讲了一遍，用户会以为自己是全权限，
- *     实则一把模型都调不通。空 = 你一个模型都调不了，处置办法是找管理员。
- *   - 同样不能给勾选控件。这里没有待保存的状态，给了复选框只会让人以为
- *     勾一下就生效了；能改白名单的是「访问密钥」页，管理员改「分组」页。
+ *     或组白名单与路由无交集。返回全集就会构成**静默放宽**，界面若把空说成
+ *     「不限制」等于把那个失败方向又讲了一遍。
+ *   - 同样不能给勾选控件。这里没有待保存的状态。
  *
  * # restricted 是必答项
  *
  * 后端只在清单**真的被组白名单收窄过**时置 true。它回答的是「你看到的
- * 是不是全部」—— 收窄过就得说，否则用户会拿这一页当全集去排查
- * 「为什么某模型调不通」。
+ * 是不是全部」—— 收窄过就得说。
  */
 import { computed, onMounted, ref } from 'vue'
 import { api, ApiFail, isAdmin } from '../api'
-import type { ModelPrice } from '../types'
+import type { ModelMeta, ModelPrice, ProbeHealth, ProbeTimelineBucket } from '../types'
 import { fmtMoney } from '../fmt'
 import { toast } from '../ui'
+import AppModal from '../components/AppModal.vue'
 
 const models = ref<string[]>([])
 /** 清单是否已被所属分组的白名单收窄。false = 这是你此刻能看到的全部。 */
@@ -44,20 +65,46 @@ const err = ref('')
  * 后端给的是与 models **平行**的数组（models[i] 对应 prices[i]），这里转成
  * Map：排序 `sorted` 时名字与价格会一起动，用下标绑定就必须在每次排序后
  * 重新 zip，一次疏忽就是「A 模型显示着 B 模型的价格」—— 而价格只差几倍时
- * 没人会发现。转成 Map 后查找与排序彻底解耦。
- *
- * 找不到名字说明后端漏发了这一项（契约由后端测试钉住），此时 priceOf
- * 返回 undefined，界面显示「未配置」—— 那是个**可见的异常**，
- * 好过拿一个猜出来的价格让用户按错的数做预算。
+ * 没人会发现。
  */
 const priceMap = ref(new Map<string, ModelPrice>())
+
+/**
+ * 映射表：公开名 → 上游模型行 id（探测数据的外键）。
+ *
+ * 同样转 Map 而不用下标，理由与 priceMap 一致 —— 而且这里错位的后果是
+ * 「A 模型的健康曲线画在 B 模型卡片上」，比价格错位更难被察觉，因为两者的
+ * 数字看起来都合理。
+ */
+const metaMap = ref(new Map<string, ModelMeta>())
+
+// ---- 连通率 ----
+
+const healths = ref<ProbeHealth[]>([])
+/** 摘要按 upstream_models.id 组织；这里按公开名索引，卡片直接查。 */
+const healthByUpstream = computed(() => {
+  const m = new Map<string, ProbeHealth>()
+  for (const h of healths.value) m.set(h.model_id, h)
+  return m
+})
+
+/** 用户勾选要画曲线的公开模型名。空 = 一条都不画（界面给提示，不自动补）。 */
+const drawn = ref<string[]>([])
+const bucketsByUpstream = ref<Record<string, ProbeTimelineBucket[]>>({})
+const days = ref(7)
+const granularity = ref<'hour' | 'day'>('hour')
+const timelineLoading = ref(false)
+/** 探测数据是否失败。**与「探测不出问题」分开**：前者要提示，后者照常显示曲线。 */
+const probeErr = ref('')
+const probeLoading = ref(false)
+
+const configOpen = ref(false)
 
 /**
  * 展示顺序 = 字典序。
  *
  * 与 ModelPicker 同样的理由：同一份集合若每次渲染顺序不同，用户的心智模型
- * 「第 3 项是哪个模型」就会漂移。后端本来也按字典序给出，这里再排一次是为了
- * 不依赖那个实现细节（顺带滤掉任何意外的空串）。
+ * 「第 3 项是哪个模型」就会漂移。
  */
 const sorted = computed(() => [...models.value].filter(Boolean).sort())
 
@@ -68,17 +115,115 @@ function priceOf(name: string): ModelPrice | undefined {
   return priceMap.value.get(name)
 }
 
+function upstreamIdOf(name: string): string {
+  return metaMap.value.get(name)?.upstream_model_id ?? ''
+}
+
+function providerOf(name: string): string {
+  return metaMap.value.get(name)?.provider_name ?? ''
+}
+
 /**
  * 单价单元格：**0 显示「未配置」而不是 0.00**。
  *
- * 与 Settings.vue 的 priceCell 同一口径、同一理由：没填单价时实际计费按 0
- * （见 store.priceUsage），但「算过了，就是免费」与「还没人填」是两件
- * 不同的事 —— 显示 0.00 会让用户以为这一档确认免费，据此做预算就错了。
- * 「未配置」配弱化色，是为了让它读起来像一条**说明**而不是一个价格。
+ * 与 Settings.vue 的 priceCell 同一口径、同一理由：没填单价时实际计费按 0，
+ * 但「算过了，就是免费」与「还没人填」是两件不同的事。
  */
 function priceCell(v: number | undefined): string {
   if (v === undefined || !(v > 0)) return '未配置'
   return fmtMoney(v)
+}
+
+/** 有探测记录的公开名（按清单顺序），用于默认勾选与「全选」。 */
+const withProbe = computed(() =>
+  sorted.value.filter((n) => {
+    const id = upstreamIdOf(n)
+    return id && healthByUpstream.value.get(id)?.window_count
+  }),
+)
+
+/**
+ * curveFor 取某个公开模型对应的桶数组（按上游模型 id 索引）。
+ *
+ * 返回空数组而不是 undefined：调用点是 v-for，空数组是合法的「没有桶」，
+ * 走 buildCurve 渲染出「该时段没有探测记录」而不是崩在 .length 上。
+ */
+function curveFor(name: string): ProbeTimelineBucket[] {
+  const id = upstreamIdOf(name)
+  return id ? (bucketsByUpstream.value[id] ?? []) : []
+}
+
+/** 该模型这条曲线该画在哪个桶序列上：故障转移链的主目标。
+ *
+ *  与 priceOf / upstreamIdOf 同源（同取 Candidates[0]），三者在后端就已经
+ *  对齐，这里只是把它们指向同一条曲线。 */
+function drawnIds(): string[] {
+  return drawn.value.map(upstreamIdOf).filter(Boolean)
+}
+
+async function loadTimeline() {
+  const ids = drawnIds()
+  if (ids.length === 0) {
+    bucketsByUpstream.value = {}
+    return
+  }
+  timelineLoading.value = true
+  probeErr.value = ''
+  try {
+    const all = await api.probeTimeline(ids, days.value, granularity.value)
+    const grouped: Record<string, ProbeTimelineBucket[]> = {}
+    for (const b of all) (grouped[b.model_id] ??= []).push(b)
+    bucketsByUpstream.value = grouped
+  } catch (e) {
+    // 失败必须**可见**：曲线区会显示成「没有记录」，而那与「真的没记录」
+    // 含义完全相反 —— 用户会把一次网关故障读成模型停了。
+    probeErr.value = '加载连通率失败：' + (e instanceof Error ? e.message : String(e))
+  } finally {
+    timelineLoading.value = false
+  }
+}
+
+/** 默认画前 6 个有数据的模型：一次给一屏，不至于铺满整页。
+ *
+ *  上限 6 是有意的 —— 后端单查询上限是 24，而一屏 24 张曲线既看不清也
+ *  用不上（同一供应商的模型曲线往往同形）。 */
+function defaultDrawn(): void {
+  drawn.value = withProbe.value.slice(0, 6)
+}
+
+function toggleDrawn(name: string): void {
+  drawn.value = drawn.value.includes(name)
+    ? drawn.value.filter((x) => x !== name)
+    : [...drawn.value, name]
+  loadTimeline()
+}
+
+function drawAll(): void {
+  drawn.value = [...withProbe.value]
+  loadTimeline()
+}
+
+function clearDrawn(): void {
+  drawn.value = []
+  loadTimeline()
+}
+
+async function loadProbes() {
+  probeLoading.value = true
+  try {
+    // 探测摘要可能失败（后端老版本没这个端点、或权限收窄）。这不该让整页
+    // 进错误态 —— 价格仍然完全可用。所以失败只记 probeErr，卡片上的连通率
+    // 一行显示原因，其余照常。
+    healths.value = await api.probeModels()
+    probeErr.value = ''
+    if (drawn.value.length === 0) defaultDrawn()
+    await loadTimeline()
+  } catch (e) {
+    if (e instanceof ApiFail && e.status === 401) return
+    probeErr.value = '加载连通率失败：' + (e instanceof Error ? e.message : String(e))
+  } finally {
+    probeLoading.value = false
+  }
 }
 
 async function load() {
@@ -89,12 +234,14 @@ async function load() {
     models.value = r.models
     restricted.value = r.restricted
     priceMap.value = new Map(r.prices.map((p) => [p.name, p]))
+    metaMap.value = new Map(r.meta.map((m) => [m.name, m]))
+    // 清单变了就重算默认勾选：否则会拿着上一轮的模型名去查曲线。
+    defaultDrawn()
+    await loadProbes()
   } catch (e) {
     if (e instanceof ApiFail && e.status === 401) return
     // 失败必须留下可见错误态：只弹 toast 的话，页面会渲染成空清单，
-    // 而空清单在这页有明确含义（「你一个模型都调不了」）——
-    // 那会把一次网关故障呈现成一次权限收紧，用户会去联系管理员，
-    // 而真正该修的是网关。与 Users/Keys/History 的 v-else-if="err" 同口径。
+    // 而空清单在这页有明确含义（「你一个模型都调不了」）。
     err.value = '加载可用模型失败：' + (e instanceof Error ? e.message : String(e))
     toast('加载可用模型失败：' + (e instanceof Error ? e.message : String(e)), 'err')
   } finally {
@@ -103,6 +250,175 @@ async function load() {
 }
 
 onMounted(load)
+
+// ---------- 折线图（纯 SVG） ----------
+//
+// 与原「连通率」页逐字同一套算法，纯 SVG 不引图表库（NAS 自用部署不值得
+// 让单二进制多背几百 KB 依赖）。
+
+const CH_W = 320 // viewBox 宽；卡片小，用小一点的坐标系，CSS 再拉伸
+const CH_H = 96
+const PAD_L = 6
+const PAD_R = 6
+const PAD_T = 8
+const PAD_B = 8
+
+interface LinePoint {
+  ts: number
+  rate: number | null // null = 该桶无探测记录（缺口，不是 0%）
+  bucket: ProbeTimelineBucket | null
+}
+
+/**
+ * buildPoints 把稀疏桶补成连续时间轴。
+ *
+ * 后端对「该时间窗没有探测记录」的桶**不返回**（没探测 ≠ 全失败，两者必须
+ * 可区分）。而折线天然连接相邻点 —— 于是「上午正常 / 停机 5 小时 / 下午恢复」
+ * 会被画成一条从 100% 直通 100% 的斜线，**故障时段在图上彻底消失**。所以
+ * 缺口必须是 null，渲染成断线。
+ */
+function buildPoints(buckets: ProbeTimelineBucket[]): LinePoint[] {
+  const bucketMs = granularity.value === 'day' ? 86400000 : 3600000
+  const now = Date.now()
+  const from = now - days.value * 86400000
+  const byTs = new Map<number, ProbeTimelineBucket>()
+  for (const b of buckets) byTs.set(b.ts, b)
+
+  const out: LinePoint[] = []
+  const start = Math.floor(from / bucketMs) * bucketMs
+  for (let ts = start; ts <= now; ts += bucketMs) {
+    const b = byTs.get(ts)
+    out.push({ ts, rate: b && b.count > 0 ? b.ok / b.count : null, bucket: b ?? null })
+  }
+  return out
+}
+
+function pxFor(n: number, i: number): number {
+  const d = Math.max(n - 1, 1)
+  return PAD_L + (i / d) * (CH_W - PAD_L - PAD_R)
+}
+function pyFor(rate: number): number {
+  const h = CH_H - PAD_T - PAD_B
+  return PAD_T + (1 - rate) * h
+}
+
+/** 一条曲线的渲染结果：若干段折线（缺口断开）+ 有效点。 */
+interface Curve {
+  segments: { coords: string }[]
+  // dots 带原始 point：悬停要显示该桶的成功率/延迟，光有 x/y 不够。
+  dots: { x: number; y: number; rate: number; point: LinePoint }[]
+  hasData: boolean
+}
+
+function buildCurve(buckets: ProbeTimelineBucket[]): Curve {
+  const points = buildPoints(buckets)
+  const n = points.length
+  const segments: Curve['segments'] = []
+  const dots: Curve['dots'] = []
+  let cur: LinePoint[] = []
+  let curStart = 0
+
+  const flush = () => {
+    if (!cur.length) return
+    segments.push({
+      coords: cur
+        .map((p, k) => `${pxFor(n, curStart + k).toFixed(1)},${pyFor(p.rate!).toFixed(1)}`)
+        .join(' '),
+    })
+    cur = []
+  }
+
+  points.forEach((p, i) => {
+    if (p.rate === null) {
+      flush()
+      return
+    }
+    if (!cur.length) curStart = i
+    cur.push(p)
+    dots.push({ x: pxFor(n, i), y: pyFor(p.rate), rate: p.rate, point: p })
+  })
+  flush()
+
+  return { segments, dots, hasData: dots.length > 0 }
+}
+
+function fmtTs(ts: number): string {
+  const d = new Date(ts)
+  const hh = `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`
+  if (granularity.value === 'day') return `${d.getMonth() + 1}/${d.getDate()}`
+  return hh
+}
+
+function curveTitle(p: LinePoint): string {
+  if (!p.bucket) return `${fmtTs(p.ts)} · 没有探测记录`
+  const rate = Math.round((p.rate ?? 0) * 100)
+  return `${fmtTs(p.ts)} · 成功率 ${rate}% (${p.bucket.ok}/${p.bucket.count}) · 平均 ${p.bucket.latency}ms`
+}
+
+/** healthOf 这个公开模型对应的上游模型的健康摘要（可能 undefined）。 */
+function healthOf(name: string): ProbeHealth | undefined {
+  const id = upstreamIdOf(name)
+  return id ? healthByUpstream.value.get(id) : undefined
+}
+
+function healthClass(h: string): string {
+  switch (h) {
+    case 'healthy':
+      return 'badge-live'
+    case 'down':
+      return 'badge-off'
+    case 'degraded':
+      return 'badge-warn'
+    default:
+      return 'badge-dim'
+  }
+}
+function healthLabel(h: string): string {
+  switch (h) {
+    case 'healthy':
+      return '正常'
+    case 'down':
+      return '不可用'
+    case 'degraded':
+      return '不稳定'
+    default:
+      return '未探测'
+  }
+}
+
+/** 这条连通率该显示成什么 —— 三种状态必须可区分，不能都退化成「无数据」。
+ *
+ *  - 路由解析不出目标 → 「无可用上游」（配置问题，不是探测问题）
+ *  - 探测请求失败 → 「读取失败」（网关问题）
+ *  - 没勾选画这条 → 不画曲线
+ */
+type LineState = 'ok' | 'no-upstream' | 'probe-failed' | 'not-probed'
+function lineState(name: string): LineState {
+  if (!upstreamIdOf(name)) return 'no-upstream'
+  if (probeErr.value) return 'probe-failed'
+  if (!healthOf(name)?.window_count) return 'not-probed'
+  return 'ok'
+}
+
+/**
+ * lineNote 这条连通率的一句话说明。
+ *
+ * 刻意给四种状态**四种不同的话**，且每种都指明「该找谁 / 该修哪里」：
+ * 把它们统一成「暂无数据」会让管理员无法判断这是配置问题、网关问题，
+ * 还是真的刚重启还没探测。
+ */
+function lineNote(name: string): string {
+  switch (lineState(name)) {
+    case 'no-upstream':
+      return '无可用上游 · 该路由没有指向已启用的上游模型'
+    case 'probe-failed':
+      return '读取失败 · 探测数据暂时取不到（不影响单价）'
+    case 'not-probed':
+      return '未探测 · 后台探测尚未覆盖到这个模型'
+    default:
+      return ''
+  }
+}
 </script>
 
 <template>
@@ -110,9 +426,18 @@ onMounted(load)
     <div class="page-head">
       <div>
         <h1>可用模型</h1>
-        <div class="sub">你能调用的模型名清单（只读）</div>
+        <div class="sub">你能调用的模型清单 · 单价与连通率（只读）</div>
       </div>
       <div class="head-actions">
+        <select v-model="days" class="select sel" @change="loadTimeline">
+          <option :value="7">近 7 天</option>
+          <option :value="14">近 14 天</option>
+          <option :value="30">近 30 天</option>
+        </select>
+        <select v-model="granularity" class="select sel" @change="loadTimeline">
+          <option value="hour">按小时</option>
+          <option value="day">按天</option>
+        </select>
         <button class="btn" :disabled="loading" @click="load">刷新</button>
       </div>
     </div>
@@ -129,7 +454,7 @@ onMounted(load)
 
       <!--加载失败**必须**与「确实没有可用模型」可区分：后者有明确处置
            办法（联系管理员配白名单），把请求失败呈现成同一句话，会让用户
-           在网关故障时去催管理员 —— 与 Users/Keys/History 同口径。 -->
+           在网关故障时去催管理员。 -->
       <div v-else-if="err" class="empty">
         <div class="big">⚠</div>
         {{ err }}
@@ -139,15 +464,9 @@ onMounted(load)
       </div>
 
       <!-- 空 = 你一把都调不了。注意这里**不写**「不限制」：那是 ModelPicker
-           「一个都不选」的规则，属于配置态，与本页无关（见文件头注释）。 -->
+           「一个都不选」的规则，属于配置态，与本页无关。 -->
       <div v-else-if="sorted.length === 0" class="empty">
         <div class="big">∅</div>
-        <!--
-          空清单有两种成因（2026-10-11 前端审计 M2）：管理员一个路由都没配，
-          或分组白名单与现有路由无交集。原文案只写了后者，未分组用户
-          （未分组 = 不受白名单限制）会拿到一条指向错误方向的建议 ——
-          去找管理员配白名单，而真正的原因是根本没配路由。
-        -->
         目前没有可调用的模型。可能的原因：管理员尚未配置路由，或你的分组白名单与现有路由没有交集 —— 请联系管理员确认。
       </div>
 
@@ -159,24 +478,24 @@ onMounted(load)
           需要更多模型请联系管理员调整分组白名单。
         </p>
 
-<!-- 卡片式清单（2026-10-14）：每个模型一张 HeroUI 风格的 card。
+        <!-- 曲线配置入口：几十个模型全画既看不清也让查询变重，所以只画
+             勾选的几个（默认前 6 个有数据的）。价格不受影响，照常全列。 -->
+        <div class="config-bar">
+          <button class="btn btn-sm" type="button" @click="configOpen = true">
+            配置显示曲线（{{ drawn.length }}）
+          </button>
+          <span class="dim">其余模型只显示单价</span>
+        </div>
 
-           **只读语义不变**：不放复选框（没有待保存的状态），也不给自由输入
-           （白名单是精确匹配）。换的只是呈现方式 —— 表格适合「逐行比对数字」，
-           而这份清单的实际用法是「确认我有哪些模型可用、单价大概多少」，
-           卡片在窄屏与模型数多时都更好扫。
-
-           单价单位**写进每张卡**而不是只在表头：表头式的单位在卡片布局里
-           没有承载位置，而价格最容易被误读的就是单位（见上方 th-unit 注释）。 -->
         <div class="model-grid">
           <article v-for="m in sorted" :key="m" class="card model-card">
             <div class="card__header">
               <div class="card__title model-name mono">{{ m }}</div>
-              <!-- 描述位放「单价是否已配齐」：三档全未配置时给一句提示，
-                   避免一整片「未配置」被读成「这些模型都免费」。 -->
+              <!-- 副标题位优先放供应商名（有 meta 才有）；没有就退回单价单位。
+                   两者都不该写「未配置」式的说明 —— 那是下面每行的职责。 -->
               <div class="card__description model-sub">
-                <template v-if="priceOf(m)">单价（元 / 百万 tokens）</template>
-                <template v-else>未配置单价 · 按 0 元计</template>
+                <template v-if="providerOf(m)">{{ providerOf(m) }} · </template>
+                单价（元 / 百万 tokens）
               </div>
             </div>
 
@@ -195,14 +514,60 @@ onMounted(load)
               </div>
               <!-- 「其中:缓存命中」这个前缀不能省：三档并排会让人以为
                    「三项相加 = 总输入成本」，而缓存命中其实是**输入的一部分**
-                   （两个上游协议里 cached 都 ⊆ input），它是命中时的**折扣价**，
-                   不是新增的一项。 -->
+                   （两个上游协议里 cached 都 ⊆ input），它是命中时的**折扣价**。 -->
               <div class="price-row">
                 <span class="price-lab">其中:缓存命中</span>
                 <span class="price-val mono" :class="{ unset: (priceOf(m)?.price_cache_hit ?? 0) <= 0 }">
                   {{ priceCell(priceOf(m)?.price_cache_hit) }}
                 </span>
               </div>
+            </div>
+
+            <!-- 连通率：与价格同卡，但**状态必须逐个区分** ——
+                 「配置没指向上游」「网关读不到」「还没探测过」「正常」四件事
+                 全都显示成空白或「无数据」的话，管理员无法判断该修哪一处。 -->
+            <div class="card__footer model-health">
+              <div class="health-line">
+                <span class="badge" :class="healthClass(healthOf(m)?.health ?? 'unknown')">
+                  {{ healthLabel(healthOf(m)?.health ?? 'unknown') }}
+                </span>
+                <span v-if="healthOf(m)?.window_count" class="dim health-stat">
+                  近窗成功率 {{ Math.round((healthOf(m)?.success_rate ?? 0) * 100) }}%
+                </span>
+                <span v-else class="dim health-stat">{{ lineNote(m) }}</span>
+              </div>
+
+              <template v-if="lineState(m) === 'ok' && drawn.includes(m)">
+                <div v-if="timelineLoading" class="chart-empty dim">加载中…</div>
+                <template v-else>
+                  <svg class="chart" :viewBox="`0 0 ${CH_W} ${CH_H}`" preserveAspectRatio="none">
+                    <line class="grid" :x1="PAD_L" :x2="CH_W - PAD_R" :y1="pyFor(1)" :y2="pyFor(1)" />
+                    <line class="grid" :x1="PAD_L" :x2="CH_W - PAD_R" :y1="pyFor(0)" :y2="pyFor(0)" />
+                    <line class="thr" :x1="PAD_L" :x2="CH_W - PAD_R" :y1="pyFor(0.8)" :y2="pyFor(0.8)" />
+                    <polyline
+                      v-for="(seg, si) in buildCurve(curveFor(m)).segments"
+                      :key="si"
+                      class="line"
+                      :points="seg.coords"
+                    />
+                    <circle
+                      v-for="(d, di) in buildCurve(curveFor(m)).dots"
+                      :key="'d' + di"
+                      class="dot"
+                      :class="{ bad: d.rate < 0.5 }"
+                      :cx="d.x"
+                      :cy="d.y"
+                      r="1.6"
+                    >
+                      <title>{{ curveTitle(d.point) }}</title>
+                    </circle>
+                  </svg>
+                  <div v-if="!buildCurve(curveFor(m)).hasData" class="chart-empty dim">
+                    该时段没有探测记录
+                  </div>
+                </template>
+              </template>
+              <div v-else-if="drawn.includes(m)" class="chart-empty dim">{{ lineNote(m) }}</div>
             </div>
           </article>
         </div>
@@ -236,25 +601,78 @@ onMounted(load)
           标「<b>未配置</b>」表示这一档还没填单价，<b>不等于免费</b> —— 未配置时
           该项按 0 元计入，实际花费请以「调用历史」里的记录为准。
         </li>
+        <li>
+          连通率来自后台定时探测（<b>max_tokens=1</b>、不扣网关用户的钱），
+          每张卡的价格与曲线<b>指向同一个上游模型</b>。
+        </li>
         <li class="dim">
           看不到某个模型不一定是故障：路由被停用、或模型名拼错，都会让它不出现在这份清单里。
         </li>
       </ul>
     </div>
+
+    <AppModal
+      :open="configOpen"
+      title="配置显示曲线的模型"
+      max-width="620px"
+      :dismissable="false"
+    >
+      <div class="picker-list">
+        <label v-for="m in sorted" :key="m" class="picker-item">
+          <input type="checkbox" :checked="drawn.includes(m)" @change="toggleDrawn(m)" />
+          <span class="picker-name mono">{{ m }}</span>
+          <span class="badge" :class="healthClass(healthOf(m)?.health ?? 'unknown')">
+            {{ healthLabel(healthOf(m)?.health ?? 'unknown') }}
+          </span>
+        </label>
+      </div>
+      <div class="picker-hint dim">
+        勾选后会在卡片里画出这段时间的连通率曲线。没勾选的模型仍然显示单价，只是不画曲线。
+      </div>
+      <div class="form-actions">
+        <div class="actions-right">
+          <button type="button" class="btn btn-sm btn-ghost" @click="drawAll">全选有数据的</button>
+          <button type="button" class="btn btn-sm btn-ghost" @click="clearDrawn">清空</button>
+          <button type="button" class="btn btn-primary" @click="configOpen = false">完成</button>
+        </div>
+      </div>
+    </AppModal>
   </main>
 </template>
 
 <style scoped>
-/* ---------- 卡片式模型清单（2026-10-14） ----------
-   从表格改成 HeroUI card 网格。复用全局 .card / .card__* 结构
-   （styles.css:787 起，与 CredentialPanel 同一套 HeroUI 移植）。 */
+.page-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 14px;
+  margin-bottom: 14px;
+}
+.page-head h1 {
+  margin: 0 0 4px;
+  font-size: 17px;
+}
+.sub {
+  color: var(--text-3);
+  font-size: 12.5px;
+}
+.sel {
+  width: 110px;
+}
+.config-bar {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 12px;
+}
 
 /* auto-fill + minmax：卡片数随宽度自动换行，不写死列数 —— 模型从 3 个到
    80 个都能用同一套布局（写死 3 列在窄屏会把卡片挤成一条）。
-   minmax 的下限 232px 是「模型名 + 三行价格」不折行的最小可用宽度。 */
+   minmax 的下限放宽到 288px：现在卡内多了「三行价格 + 一段曲线」，
+   232px 会把曲线压成一条竖线。 */
 .model-grid {
   display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(232px, 1fr));
+  grid-template-columns: repeat(auto-fill, minmax(288px, 1fr));
   gap: 12px;
 }
 .model-card {
@@ -266,7 +684,6 @@ onMounted(load)
      只能自己加。颜色走 --border 变量,亮/暗自动跟随。 */
   border: 1px solid var(--border);
 }
-/* 模型名可能很长（provider/model 形式），允许在连字符处折行而不是撑破卡片 */
 .model-name {
   font-family: var(--mono, ui-monospace, monospace);
   font-size: 13.5px;
@@ -305,20 +722,108 @@ onMounted(load)
   font-weight: 400;
 }
 
-/* 价格表表头下的单位标注（2026-10-11 前端审计）。
-   表头里塞单位是因为价格表最容易被误读 —— 「3.00」在不知道单位时
-   可以被当成任何东西。放在表格下方的注释里等于没写。
-   卡片化后单位写进 card__description（.model-sub），此样式已无用，
-   保留是给「关于这份清单」等仍可能引用 th-unit 的位置兜底。 */
-.th-unit {
-  font-weight: 400;
-  font-size: 11px;
-  white-space: nowrap;
+/* 连通率区：与价格之间加一条分隔，让「这是两类信息」一眼可见。
+   卡片没有分隔线可借，只能自己加（与上面的描边同理）。 */
+.model-health {
+  padding-top: 9px;
+  border-top: 1px solid var(--border);
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.health-line {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+.health-stat {
+  font-size: 11.5px;
+}
+.chart {
+  width: 100%;
+  height: 96px;
+  display: block;
+}
+.chart .grid {
+  stroke: var(--border);
+  stroke-width: 1;
+  vector-effect: non-scaling-stroke;
+}
+.chart .thr {
+  stroke: var(--text-4);
+  stroke-dasharray: 3 3;
+  opacity: 0.6;
+  vector-effect: non-scaling-stroke;
+}
+.chart .line {
+  fill: none;
+  stroke: var(--accent);
+  stroke-width: 1.4;
+  vector-effect: non-scaling-stroke;
+  stroke-linejoin: round;
+  stroke-linecap: round;
+}
+.chart .dot {
+  fill: var(--accent);
+}
+.chart .dot.bad {
+  fill: var(--danger);
+}
+.chart-empty {
+  font-size: 11.5px;
+  padding: 4px 0;
 }
 
-/* 提示条样式沿用 History.vue 的 .notice-warn 同款（该类写在它的 scoped
-   样式里，本页用不了），这里只补一条本地定义：语义是「你看到的不是全集」，
-   属提示而不是错误，用 warning-soft 而非 danger。 */
+/* 配置弹窗 */
+.picker-list {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  max-height: 60vh;
+  overflow-y: auto;
+}
+.picker-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 5px 4px;
+  border-radius: 6px;
+  cursor: pointer;
+}
+.picker-item:hover {
+  background: var(--hover);
+}
+.picker-item input {
+  accent-color: var(--accent);
+  flex: none;
+}
+.picker-name {
+  font-size: 12.5px;
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.picker-hint {
+  font-size: 11.5px;
+  margin-top: 8px;
+  line-height: 1.55;
+}
+.form-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  margin-top: 14px;
+  padding-top: 12px;
+  border-top: 1px solid var(--border);
+}
+.actions-right {
+  display: flex;
+  gap: 8px;
+}
+
+/* 提示条：语义是「你看到的不是全集」，属提示而不是错误，用 warning-soft。 */
 .notice-warn {
   margin: 0 0 14px;
   padding: 8px 10px;

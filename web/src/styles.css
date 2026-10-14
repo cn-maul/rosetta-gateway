@@ -789,6 +789,43 @@ textarea {
 }
 
 /* ==========================================================================
+   可嵌入面板（2026-10-14 页面合并）
+
+   Keys / Providers / Routes / ModelGroups / UsersGroups 这几份原来各自是
+   完整页面（自带 <main class="page"> + page-head 标题区）。并进宿主页的页签
+   之后，标题与「刷新」由宿主统一提供 —— 否则同一个页面上会出现两个「刷新」，
+   人分不清刷的是谁。
+
+   三个类各管一段：
+     .panel-body    面板根容器：给标题区让位、限一下上下间距
+     .panel-actions 面板**特有**的主动作（新建用户 / 新建上游 / 新建路由…）
+     .panel-note    面板独有的说明段（模型归组那条「不改变转发」的边界）
+   ========================================================================== */
+.panel-body {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+/* 右对齐：面板动作与页面级动作都在右上角一列里，读起来是同一种东西。
+   用 margin-left:auto 而不是 flex-end，这样它在 .panel-body 的流里靠右，
+   而不会因为面板内容宽度不同而在不同面板里跑到不同位置。 */
+.panel-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+}
+.panel-note {
+  color: var(--text-3);
+  font-size: 12px;
+  line-height: 1.55;
+  margin-bottom: 12px;
+  max-width: 640px;
+}
+.panel-note b {
+  color: var(--text-2);
+}
+
+/* ==========================================================================
    Card —— 照 packages/styles/components/card.css 移植（2026-10-12）
 
    上游的 card 是**带 slot 结构**的：header / title / description /
@@ -1574,6 +1611,15 @@ textarea {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+/* 名字之外的三段一律不参与收缩：省略号是它们被挤掉时的**表现**，
+   而「这次调用了多少次 / 多少 token」是这行真正要读的数字。
+   （2026-10-14：窄列下三列布局里模型名很长，徽章与 token 数会被一起压扁，
+   结果是每行都显示着一个被截断的「12.3」—— 读不出量级。）
+   .bar-track 上限 34px，配合 flex:1 吸收剩余宽度。 */
+.mini-row > .badge,
+.mini-row > .num {
+  flex: none;
 }
 
 /* ---------- 降级媒体查询（三个必须齐备） ---------- */

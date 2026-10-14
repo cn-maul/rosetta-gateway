@@ -3318,13 +3318,38 @@ func appendModelMetadata(entry map[string]any, snap *snapshot.Snapshot, modelID 
 	}
 	// 思考能力：这是工具侧「是否支持思考模式」那个开关的数据来源。
 	//
-	// 三态与数据面完全一致，且**只在确定为「不支持」时才下发 false**：
-	// 未配置（不知道）时缺席，客户端维持既有行为 —— 把「不知道」报成 false
-	// 会让所有未配置的模型都失去思考选择器，那是一次静默的能力回退。
+	// # 披露口径（2026-10-14 改：nil 从「不发」改为「发 true」）
+	//
+	// 三种落点，每一种客户端都有明确答案：
+	//
+	//   - 配了 effort_levels → 下发 supported_reasoning，工具据此生成完整
+	//     的档位下拉框。
+	//   - supports_thinking 为 nil（未配置）→ **下发 true**。
+	//   - supports_thinking 显式 false → 下发 false，工具隐藏思考开关。
+	//
+	// 为什么 nil 要发 true 而不是不发（原来的做法）：
+	//
+	// 缺席对客户端不是中立的。OpenRouter 约定里这个字段缺席时，多数工具按
+	// 「不支持」处理，于是「未配置」在下游就等于「没有思考能力」—— 而网关
+	// 自己的语义明明是「不干预，交给上游」。两边对同一个 nil 的解释相反，
+	// 且用户看到的现象是「我明明能思考，工具却不给我开」。
+	//
+	// 发 true 也**不等于**替上游承诺档位：supported_reasoning 缺席仍然表示
+	// 「档位由上游定」，那正是未配置状态的准确描述。两字段组合起来正好
+	// 覆盖三种配置，无需第四种取值。
+	//
+	// 关键：这里**只影响披露**，数据面不动。数据面仍然只在
+	// supports_thinking 显式为 false 时才剥掉思考（见
+	// applyThinkingCapability）—— 把「不知道」当成「不支持」会让全部未配置
+	// 模型（包括 anthropic 协议的）静默失去思考能力，而那正是本函数
+	// 下面那段旧注释警告过的事。
 	if m := modelThinkingCapability(snap, modelID); m != nil {
+		// nil（未配置）→ true：向客户端表明「可以思考」，但不下发档位集合。
+		supports := true
 		if m.SupportsThinking != nil {
-			entry["supports_thinking"] = *m.SupportsThinking
+			supports = *m.SupportsThinking
 		}
+		entry["supports_thinking"] = supports
 		if len(m.EffortLevels) > 0 {
 			// 键名取 OpenRouter 的 supported_reasoning —— 那是这条链路上已有的
 			// 既成约定，字段形状（字符串数组）也相同。

@@ -414,7 +414,7 @@ const mForm = reactive({
 // internal/effort.KnownLevels 一致。**刻意不放在后端下发**：这份清单是
 // 网关的常量而非某个部署的配置，多一次请求换一份常量不值得；而一旦写死在
 // 两处，后端加档时前端会静默少一个可选项 —— 那种故障没有任何症状。
-const knownEffortLevels = ['minimal', 'low', 'medium', 'high', 'xhigh'] as const
+const knownEffortLevels = ['minimal', 'low', 'medium', 'high', 'xhigh', 'max'] as const
 
 // thinkingOptions 是「能否思考」的三态选项。措辞刻意用「未配置」而不是
 // 「自动」/「默认」—— 后两者暗示网关会替你决定，而「未配置」的含义是
@@ -574,6 +574,15 @@ async function confirmImport() {
         display_name: d.display_name ?? '',
         context_window: d.context_window ?? 0,
         max_output_tokens: d.max_output_tokens ?? 0,
+        // 上游自报的思考挡位随导入一起落库（2026-10-14）。刻意原样透传、
+        // 不在这里拼装：闸门在后端（空串 = 上游没报 = 留空给管理员手工配），
+        // 前端再判一次只会出现两套口径。
+        //
+        // supports_thinking 用 `?? undefined` 而不是 `|| undefined`：
+        // **false 是一个有意义的值**（「上游明确说不支持」），`||` 会把它
+        // 抹成 undefined，恰好丢掉最该保留的那一档信息。
+        effort_levels: d.effort_levels ?? '',
+        supports_thinking: d.supports_thinking ?? undefined,
       })),
     )
     toast(`已添加 ${r.imported} 个模型`)
@@ -587,9 +596,20 @@ async function confirmImport() {
 }
 
 async function removeModel(m: UpstreamModel) {
+  // 链首不能删：后端会回 409。界面提前拦住并说清该去哪儿改，
+  // 好过让人点下去撞一次再读错误消息。
+  if (m.is_route_head) {
+    toast('该模型是某条路由的首选目标，不能直接删除 —— 请先到「路由」页改掉那条路由的首选', 'err')
+    return
+  }
+  const refs = m.route_count ?? 0
   const ok = await confirmBox({
     title: `删除模型「${m.model_id}」？`,
-    body: '引用它的路由将无法解析，请先清理相关路由。',
+    // 后果必须写清：链首被拒是本次的规则，所以这里只可能提到「从链里摘掉」。
+    // 不说的话，管理员会以为「引用它的路由会失效」，实际只是少一个备选。
+    body: refs > 0
+      ? `它被 ${refs} 条路由链作为非首选目标引用 —— 删除后会自动从这些链中移除（其余成员顺序不变），该路由的首选目标不受影响。`
+      : '它没有被任何路由链引用，可以直接删除。',
     danger: true,
     confirmLabel: '删除',
   })
@@ -619,16 +639,12 @@ onMounted(() => {
 </script>
 
 <template>
-  <main class="page">
-    <div class="page-head">
-      <div>
-        <h1>上游与模型</h1>
-        <div class="sub">上游服务、凭据与上游模型管理</div>
-      </div>
-      <div class="head-actions">
-        <button class="btn" :disabled="loading" @click="load">刷新</button>
-        <button class="btn btn-primary" @click="openProvider()">新建上游</button>
-      </div>
+  <!-- 面板形态（2026-10-14 页面合并）：并进 Upstream.vue 的「上游与模型」页签。
+       标题 / 副标题 / 刷新由宿主页统一提供，这里只留本页**特有**的主动作
+       （新建上游）—— 宿主页的「刷新」已经覆盖本页的 load()。 -->
+  <div class="panel-body">
+    <div class="panel-actions">
+      <button class="btn btn-primary btn-sm" @click="openProvider()">新建上游</button>
     </div>
 
     <div class="panel">
@@ -978,6 +994,18 @@ onMounted(() => {
           >
             <span class="di-check">{{ isSelected(d.model_id) ? '✓' : '+' }}</span>
             <span class="mono">{{ d.model_id }}</span>
+            <!-- 挡位徽章（2026-10-14）：上游 /models 报了 reasoning 挡位时显示出来，
+                 让管理员在导入**之前**就知道这批模型会带上配置 ——
+                 否则「导入后挡位 mysteriously 已配好」反而让人怀疑自己
+                 误配过，而想复核还得逐个进编辑弹窗看。
+
+                 措辞区分两种情况（与后端 upsert 的 COALESCE 方向一致）：
+                 上游报了 → 「思考 xxx」将被回填（仅当库里还没配）；
+                 上游没报 → 「思考 待配置」，提醒需要手工勾。 -->
+            <span v-if="d.effort_levels" class="badge badge-accent di-lvls">
+              思考 {{ d.effort_levels }}
+            </span>
+            <span v-else class="badge di-lvls dim-lvls">思考 待配置</span>
             <span class="di-cap">{{ d.context_window ? d.context_window + ' ctx' : '' }}{{ d.context_window && d.max_output_tokens ? ' / ' : '' }}{{ d.max_output_tokens ? d.max_output_tokens + ' out' : '' }}</span>
           </button>
         </div>
@@ -997,7 +1025,7 @@ onMounted(() => {
         </button>
       </div>
     </AppModal>
-  </main>
+  </div>
 </template>
 
 <style scoped>
@@ -1129,6 +1157,26 @@ onMounted(() => {
   width: 16px;
   text-align: center;
   color: var(--accent);
+}
+/* 挡位徽章（2026-10-14）：紧跟模型名、在容量之前 —— 读序是「这是什么、
+   它能怎么思考、多大」。flex:none 防止长档位串把容量挤掉。
+   弱化底色：它是导入时的**附带信息**，不是选中状态的主要提示。 */
+.di-lvls {
+  flex: none;
+  font-weight: 500;
+  margin-right: 2px;
+  max-width: 220px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+/* 上游没报挡位时的弱化形态：它表达的是「这件事需要人工处理」，
+   不是「已配好」，所以不能与上面那个 accent 徽章同色 —— 同色会让人
+   以为已经生效了。 */
+.dim-lvls {
+  background: var(--default);
+  color: var(--text-3);
+  font-weight: 400;
 }
 .di-cap {
   margin-left: auto;

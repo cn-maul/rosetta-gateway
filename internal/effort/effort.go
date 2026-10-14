@@ -36,9 +36,25 @@ type Level string
 // 强度刻度。**顺序即强度**，递增；夹取与比较全部依赖这个顺序。
 //
 // 这里的取值范围覆盖了目前已知的所有写法：OpenAI 的 minimal（比 low 更弱）、
-// 常规 low/medium/high、GPT-5 系列的 xhigh（比 high 更强）。默认档 Default
+// 常规 low/medium/high、GPT-5 系列的 xhigh（比 high 更强），以及部分国产
+// 上游在 xhigh 之上再给一档 max（比 xhigh 更强）。默认档 Default
 // 对应 rosetta 的 EffortMedium —— rosetta 在「请求思考但没给档位」时也取它
 // （rosetta.ChatRequest.effort），保持同一口径。
+//
+// # 为什么 max 是独立档而不是 xhigh 的别名（2026-10-14）
+//
+// 原来 normalizeAlias 把 `max` 归到 XHigh。实测某个真实上游
+// （/v1/models 返回 reasoning_supported_efforts = [low,medium,high,xhigh,max]
+// 且 reasoning_default_effort = max）之后，这条别名有两个实际后果：
+//
+//  1. 配置写 `max` 存进库里会变成 `xhigh`，与上游的原始取值不再一致 ——
+//     往返一次就丢掉了「这其实是最高那一档」这层信息，也让导出的配置
+//     与上游对不上账。
+//  2. 上游默认档是 `max`，客户端不指定等级时上游按 max 跑；而网关披露的
+//     集合里只有 xhigh，工具以为最高就是 xhigh。
+//
+// 强度刻度上两者相邻，夹取行为几乎不变（要 max 而只有 xhigh 时仍夹到
+// xhigh），但**披露与存储**保真了 —— 而这正是 effort_levels 存在的意义。
 const (
 	Unset   Level = ""
 	None    Level = "none"
@@ -47,6 +63,7 @@ const (
 	Medium  Level = "medium"
 	High    Level = "high"
 	XHigh   Level = "xhigh"
+	Max     Level = "max"
 )
 
 // Default 是未指定时的默认档，与 rosetta 的 effort() 兜底一致。
@@ -57,7 +74,7 @@ const Default = Medium
 // 刻意**不含** Unset 与 None：它们表达的是「不思考」而不是「某档思考强度」，
 // 与本列的语义不同轴，混进来会让「这个模型不思考」和「这个模型思考很弱」在
 // 界面上长得一样。
-var KnownLevels = []Level{Minimal, Low, Medium, High, XHigh}
+var KnownLevels = []Level{Minimal, Low, Medium, High, XHigh, Max}
 
 // rankOf 返回档位在强度刻度上的位置；不在刻度上返回 -1。
 func rankOf(l Level) int {
@@ -85,8 +102,12 @@ func normalizeAlias(s string) Level {
 		return Medium
 	case "high":
 		return High
-	case "xhigh", "x-high", "x_high", "extra_high", "very_high", "max":
+	case "xhigh", "x-high", "x_high", "extra_high", "very_high":
 		return XHigh
+	case "max", "maximum":
+		// 曾经这里是 `return XHigh`（把 max 当 xhigh 的别名）。现在 Max 是
+		// 独立档，见 KnownLevels 上面的说明。
+		return Max
 	default:
 		return Unset
 	}
@@ -202,11 +223,25 @@ func Supports(wanted Level, supported []Level) bool {
 // 这是本包与 rosetta 的**唯一**接缝：rosetta 只认三档（其 validate 会拒其它值），
 // 所以无论客户端要的是 minimal 还是 xhigh，最终都落到这三档之一。三档之外的
 // 语义靠 Clamp 在**模型支持子集**这一层消化，而不是让 rosetta 去理解它。
+//
+// # High 必须显式列出（2026-10-14 修）
+//
+// 原来只写了 `case XHigh, High: return "high"`，High 是靠那一条命中的。
+// 把 Max 加进刻度后如果只补 `case XHigh, Max:` 而漏掉 High，
+// `High` 会掉进 default 分支拿到 "medium" —— 强度**静默降一档**，而且
+// 没有任何错误。这类「靠相邻 case 顺带覆盖」的写法很脆：
+// 每个刻度上的档位都必须有自己的 case，编译器管不了 switch 的完备性，
+// 所以下面用 default 兜成 high（刻度上 medium 之上只剩 high/xhigh/max）。
 func ToRosettaLevel(l Level) string {
 	switch Clamp(l, KnownLevels) {
 	case Minimal, Low:
 		return "low"
-	case XHigh, High:
+	// XHigh 与 Max 都落到 rosetta 的 high：rosetta 只认三档，这个接缝处
+	// 必然有损。真实档位靠 EffortRaw 原样透传（见 main.go 的
+	// applyThinkingCapability），所以「客户端要 max、上游收 max」这条
+	// 路径不受这里的折叠影响 —— 折叠只发生在 anthropic 那种没有 effort
+	// 字段、必须用 token 预算表达的协议上。
+	case High, XHigh, Max:
 		return "high"
 	default:
 		return "medium"

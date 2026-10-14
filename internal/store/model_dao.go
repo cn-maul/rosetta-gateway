@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"strings"
 
 	"github.com/cn-maul/rosetta-gateway/internal/effort"
@@ -200,8 +201,197 @@ func (s *Store) UpdateUpstreamModel(ctx context.Context, id string, m *UpstreamM
 }
 
 // DeleteUpstreamModel 删除一个上游模型；id 不存在时返回 ErrNotFound。
+//
+// 保留旧方法给不需要「自动摘链」的调用方；管理端点走
+// DeleteUpstreamModelDetaching（见下）。
 func (s *Store) DeleteUpstreamModel(ctx context.Context, id string) error {
 	return deleteByID(ctx, s.db, "upstream_models", id)
+}
+
+// ErrModelIsRouteHead 表示该模型是某条路由的**链首**，因此不能删。
+//
+// 单独一个错误类型而不是复用外键违规：处置动作完全不同 —���
+// 外键违规要先删引用，本错误要先把该路由换成别的链首。
+var ErrModelIsRouteHead = errors.New("upstream model is a route head")
+
+// DeleteUpstreamModelDetaching 删除一个上游模型，并自动把它从所有
+// 故障转移链里摘掉；若是某条路由的链首则**拒绝删除**（2026-10-14）。
+//
+// # 为什么链首拒绝而不是顺延
+//
+// 顺延（删掉 A 后 A→B→C 变 B→C）看起来更友好，但它是**替管理员做了一次
+// 决策**：链的顺序表达的是「先试谁、后试谁」的显式配置，删掉首选之后让
+// 次选顶上，等于悄悄改了这条路由的流量分配与优先级，而管理员以为自己
+// 只是删了一个模型。拒绝删除把这个决策还给人：界面上告诉他是链首、
+// 让他自己去「路由」页改顺序或换主目标。
+//
+// # 为什么摘链 + 重排要在一个事务里
+//
+// 中途状态会让快照读到断链：先删目标行、还没重排时，position 会出现空洞，
+// 而 Resolve 按 position 升序遍历 —— 空洞本身不致命，但配合「主目标列还没
+// 更新」就会让按名解析拿到已删除的模型。所以整个操作原子完成。
+//
+// # 探测记录级联清理
+//
+// model_probes 是纯派生数据（见 store.go 的建表注释），对已删模型没有意义，
+// 留着只会在 /probes/models 里变成一堆取不到模型行的孤儿。历史曲线断掉
+// 是可接受的：那个模型已经不存在了，「它以前通不通」不再有处置价值。
+func (s *Store) DeleteUpstreamModelDetaching(ctx context.Context, id string) ([]string, error) {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback()
+
+	// 链首判定：position = 0 的那一行。
+	//
+	// 只看 route_targets 是**不够**的：routes.provider_id/upstream_model_id
+	// 是「主目标」的向后兼容列，迁移期可能还指着某个已不在链上的模型。
+	// 两个来源都查，否则会出现「routes 说它是主目标、链上却没有」时
+	// 删掉它、留下一个指向空模型的路由。
+	//
+	// 用 dbtx（而非 execer）是因为它带 QueryContext —— 本函数需要遍历
+	// 多行，而 execer 只有 QueryRowContext。dbtx 是包里已有的
+	// *sql.DB / *sql.Tx 公共面，不另立一套同义接口。
+	heads, err := headRoutesOfModel(ctx, tx, id)
+	if err != nil {
+		return nil, err
+	}
+	if len(heads) > 0 {
+		return nil, ErrModelIsRouteHead
+	}
+
+	// 摘链：删掉引用该模型的全部目标行。
+	affected, err := affectedRoutesOfModel(ctx, tx, id)
+	if err != nil {
+		return nil, err
+	}
+	if _, err := tx.ExecContext(ctx,
+		`DELETE FROM route_targets WHERE upstream_model_id = ?`, id); err != nil {
+		return nil, err
+	}
+
+	// 重排：摘掉之后 position 会出现空洞，而 position 升序即尝试顺序。
+	// 不重排的话链路仍能工作（空洞不影响 ORDER BY），但界面上会显示
+	// 「0, 2, 3」这种跳号，看起来像数据坏了。
+	for _, routeID := range affected {
+		if err := compactTargetPositions(ctx, tx, routeID); err != nil {
+			return nil, err
+		}
+	}
+
+	// 探测记录级联清理（见函数注释）。
+	if _, err := tx.ExecContext(ctx, `DELETE FROM model_probes WHERE model_id = ?`, id); err != nil {
+		return nil, err
+	}
+
+	if err := deleteByID(ctx, tx, "upstream_models", id); err != nil {
+		return nil, err
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, err
+	}
+	return affected, nil
+}
+
+// headRoutesOfModel 返回把该模型当作**链首**的路由 id 列表。
+//
+// 查两个来源：route_targets 的 position 0，以及 routes 的兼容列。两者都查的
+// 理由见调用处的说明。
+func headRoutesOfModel(ctx context.Context, ex execer, modelID string) ([]string, error) {
+	rows, err := ex.QueryContext(ctx,
+		`SELECT route_id FROM route_targets WHERE upstream_model_id = ? AND position = 0`, modelID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var heads []string
+	for rows.Next() {
+		var routeID string
+		if err := rows.Scan(&routeID); err != nil {
+			return nil, err
+		}
+		heads = append(heads, routeID)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+
+	// 兼容列：即使 route_targets 里没有对应行，routes 仍可能指着它。
+	//
+	// 单行查询用 QueryRowContext 扫进一个 string —— 一开始写成 Scan(&[]string)，
+	// 编译能过（any 接一切）、运行才炸：driver.Value 是 string，塞不进
+	// *[]string。跨 SQL 边界的 Scan 目标必须显式给出正确类型。
+	seen := make(map[string]bool, len(heads))
+	for _, h := range heads {
+		seen[h] = true
+	}
+	var compat string
+	err = ex.QueryRowContext(ctx,
+		`SELECT id FROM routes WHERE upstream_model_id = ? LIMIT 1`, modelID).Scan(&compat)
+	switch {
+	case err == nil:
+		if !seen[compat] {
+			heads = append(heads, compat)
+		}
+	case errors.Is(err, sql.ErrNoRows):
+		// 没有兼容列引用它，正常。
+	default:
+		return nil, err
+	}
+	return heads, nil
+}
+
+// affectedRoutesOfModel 返回引用该模型的**所有**路由 id（不论 position）。
+func affectedRoutesOfModel(ctx context.Context, ex execer, modelID string) ([]string, error) {
+	rows, err := ex.QueryContext(ctx,
+		`SELECT DISTINCT route_id FROM route_targets WHERE upstream_model_id = ?`, modelID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var ids []string
+	for rows.Next() {
+		var routeID string
+		if err := rows.Scan(&routeID); err != nil {
+			return nil, err
+		}
+		ids = append(ids, routeID)
+	}
+	return ids, rows.Err()
+}
+
+// compactTargetPositions 把某条链的 position 重排为 0..n-1。
+//
+// 保持**相对顺序**：删掉中间成员后，剩下成员的先后关系不变（这正是
+// 「从故障转移链里拿掉一个备选」的语义）。所以按现有 position 升序重新
+// 编号，而不是按 id 或时间。
+func compactTargetPositions(ctx context.Context, ex execer, routeID string) error {
+	rows, err := ex.QueryContext(ctx,
+		`SELECT id FROM route_targets WHERE route_id = ? ORDER BY position`, routeID)
+	if err != nil {
+		return err
+	}
+	var ids []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			rows.Close()
+			return err
+		}
+		ids = append(ids, id)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	for i, tid := range ids {
+		if _, err := ex.ExecContext(ctx,
+			`UPDATE route_targets SET position = ? WHERE id = ?`, i, tid); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // BatchUpdateModelPrices 把同一组价格批量写到多个模型。
@@ -247,8 +437,48 @@ func (s *Store) BatchUpdateModelPrices(ctx context.Context, ids []string, priceI
 // 「探测 / 批量导入模型列表」—— 上游返回的模型列表永远不带价格，
 // 若把价格也写进 DO UPDATE SET，一次重新导入就会把配好的单价悄悄清零。
 //
-// effort_levels 同理不覆盖：它也是手工按模型文档填的，而导入侧拿不到这个
-// 信息（各家 /models 不返回挡位集合）。覆盖它等于「重新导入 = 抹掉挡位配置」。
+// effort_levels：**只在未配置时回填**（2026-10-14 改）。
+//
+// 原来是「一律不覆盖」，理由是导入侧拿不到这个信息 —— 那个前提已经不成立：
+// 部分上游的 /models 明明带着 reasoning_supported_efforts（一并带出见
+// upstream.rawModelEntry），导入路径现在能拿到真实档位了。于是「不覆盖」
+// 从一条保护措施变成一个缺陷：**已有模型永远填不上**，管理员只能逐个
+// 打开编辑弹窗手勾。
+//
+// 改成只在现有为空时写入（COALESCE(excluded, 现有)），是为了同时保住两件事：
+//   - 能自动填（上游报了就填，不必手工）；
+//   - 不覆盖手工配置（管理员手动挑过的档位组合、或按模型文档调整过的，
+//     一次重新发现不该被上游的原始值顶回去）。
+//
+// 代价要说清：上游**换**了档位集合时，已手工配过的模型不会跟着变 ——
+// 这是刻意的（自动跟随会让「我明明按文档配好了」在某次同步后被改掉，
+// 且无迹可寻）。想要更新的模型清空一次即可回填。
+//
+// # supports_thinking 必须用 COALESCE（2026-10-14）
+//
+// 导入侧现在会带上游 /models 报的这个字段，而它的三态里 **nil = 上游没报**
+// （不是「不支持」）。原来这一列是直接 `= excluded.supports_thinking`，
+// 于是一个**没报**的上游会把已有配置抹成 NULL —— 把「已明确支持」变成
+// 「不知道」。后果不只是配置丢失：SupportsThinking 一旦从 true 变 nil，
+// 数据面就不再据此做任何判断，但管理界面上「支持思考」与「未配置」长得
+// 一样，看起来像只是没填。
+//
+// COALESCE(excluded, 现有) 的语义正是想要的：
+//   - 上游明确表态（true/false）→ 覆盖，让上游的变更能被看见；
+//   - 上游没报（NULL）→ 保留原值，导入侧永远不破坏已有配置。
+//
+// effort_levels 用同样的 COALESCE，但**参数顺序是反的**：
+// `COALESCE(现有, excluded)` —— 现有配置优先，只有它为空时才用上游的值
+// 回填。supports_thinking 那边是 `COALESCE(excluded, 现有)`（上游优先）。
+//
+// 两个方向不同不是笔误，而是两个字段的性质不同：
+//   - supports_thinking 是**上游的能力声明**，上游是权威 → 上游优先；
+//   - effort_levels 是**经过人工判断的配置**（按模型文档挑的子集，可能
+//     故意只勾其中几档），管理员的意图优先 → 现有优先。
+//
+// 写成同向的话，另一侧必然错：挡位若上游优先，一次重新发现就会把管理员
+// 挑过的组合顶回上游原始集合；supports_thinking 若现有优先，则上游新增支持
+// 时网关看不见。
 func (s *Store) UpsertUpstreamModel(ctx context.Context, m *UpstreamModel) error {
 	return upsertUpstreamModel(ctx, s.db, m)
 }
@@ -261,7 +491,13 @@ func upsertUpstreamModel(ctx context.Context, ex execer, m *UpstreamModel) error
 	_, err := ex.ExecContext(ctx,
 		`INSERT INTO upstream_models (id, provider_id, model_id, display_name, enabled, context_window, max_output_tokens, supports_thinking, effort_levels, price_input, price_cache_hit, price_output)
 		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-		 ON CONFLICT(provider_id, model_id) DO UPDATE SET display_name = excluded.display_name, enabled = excluded.enabled, context_window = excluded.context_window, max_output_tokens = excluded.max_output_tokens, supports_thinking = excluded.supports_thinking`,
+		 ON CONFLICT(provider_id, model_id) DO UPDATE SET
+		   display_name = excluded.display_name,
+		   enabled = excluded.enabled,
+		   context_window = excluded.context_window,
+		   max_output_tokens = excluded.max_output_tokens,
+		   supports_thinking = COALESCE(excluded.supports_thinking, upstream_models.supports_thinking),
+		   effort_levels = COALESCE(upstream_models.effort_levels, excluded.effort_levels)`,
 		m.ID, m.ProviderID, m.ModelID, nullIfEmpty(m.DisplayName), enabled,
 		nullIfZeroInt(m.ContextWindow), nullIfZeroInt(m.MaxOutputTokens), m.SupportsThinking,
 		effortColumnValue(m),

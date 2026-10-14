@@ -8,7 +8,7 @@ import { fmtNum, fmtTokens, fmtSpeed, fmtSec, fmtPercent, fmtMoney, fmtBalance, 
 //（当前选中的档位），同名会把这里的 range 遮住，导致 range.rangeBounds 被当成
 // 那个 ref。改用 timeRange 既避开冲突，也顺带说明它管的是「时间区间」不是「档位」。
 import * as timeRange from '../range'
-import type { Stats, UsageGroupEntry, ProbeHealth } from '../types'
+import type { Stats, UsageGroupEntry, Provider } from '../types'
 
 const err = ref('')
 const loading = ref(true)
@@ -17,8 +17,21 @@ const byDay = ref<UsageGroupEntry[]>([])
 const byModel = ref<UsageGroupEntry[]>([])
 const byKey = ref<UsageGroupEntry[]>([])
 const byProvider = ref<UsageGroupEntry[]>([])
-// 上游模型健康（仅管理员；独立加载，失败不影响主数据）。
-const probeHealth = ref<ProbeHealth[]>([])
+// 上游与模型，只为把 id 翻成人类可读的名字。
+// 用量分组端点返回的 key 是 provider_id（32 位哈希），直接显示就是
+// 「一串 id」—— 建映射后才能显示供应商名。
+//
+// 连带说明：原先这里还建了 modelsById / modelLabel 给「上游模型健康」卡用，
+// 那个卡已在 2026-10-14 移除（连通率逐模型并进「可用模型」的卡片里），
+// 所以 modelsById / modelLabel 一并删除。全模型列表因此也不再需要 ——
+// 供应商名一张 providers 就够，少发一个 admin-only 请求。
+const providers = ref<Provider[]>([])
+
+const providerName = computed(() => {
+  const m: Record<string, string> = {}
+  for (const p of providers.value) m[p.id] = p.name || p.slug || p.id.slice(0, 8)
+  return m
+})
 
 // ---------- 时间范围选择 ----------
 // key 传给后端换算 from/to；label 显示在下拉里。
@@ -199,6 +212,25 @@ const maxTokens = computed(() => Math.max(1, ...daySeries.value.map((d) => d.tok
  * 否则未配额度的用户会看到「额度已用尽」的红色结论。
  */
 const readiness = computed(() => {
+  // # 管理员不参与「余额/额度」判定，也**不显示这条横幅**（2026-10-14）
+  //
+  // 管理员账户只做控制面管理，数据面明确拒绝其调用模型
+  //（auth.Authenticate 返回 ErrAdminCannotCallModel）。而 admin 的
+  // balance_cents 恒为 0 且非 NULL（= 有限额且没钱），所以下面那条
+  // `!unlimited && cents <= 0` 必然命中，会给管理员弹出
+  // 「现在发请求会被拒绝（余额已耗尽）」+「去充值」—— 既是假的
+  //（管理员压根调不了，与余额无关），又把人引向错误动作。
+  //
+  // 这里返回 **null** 而不是一条「说明性结论」横幅：
+  // 这条横幅原本是给管理员一句「去建普通用户并自行签发密钥」的指引，
+  // 但它常驻显示 —— 管理员每次打开总览都要先读到一句与当下无关的
+  // 状态说明，而真正的入口在侧栏「用户与分组」就在手边。常驻横幅的
+  // 成本高于收益，去掉后剩下的调用路径与普通用户完全一致。
+  //
+  // 关键在于**必须显式短路**：让管理员继续往下走那几个判断就是上面
+  // 描述的那个假警报。
+  if (isAdmin()) return null
+
   const unlimited = stats.value?.balance_unlimited ?? false
   const cents = stats.value?.balance_cents ?? 0
   const quota = stats.value?.quota_tokens ?? 0
@@ -270,17 +302,18 @@ async function load() {
       api.usageByKey(from, to),
       api.usageByProvider(from, to),
     ])
+    // 供应商名映射独立加载：它只用于把 provider_id 翻成名字，失败不该让
+    // 整页报错 —— 兜底成空映射，界面回退显示短 id 即可。
+    // 独立发而不是并进上面的 Promise.all：那边任一失败会走 catch 让整页
+    // 进错误态，而「名字取不到」远不值得让整屏数据消失。
+    providers.value = await api.providers().catch(() => [] as Provider[])
+
     if (seq !== reqSeq) return // 期间切换了新范围，本响应已过时
     stats.value = s
     byDay.value = d
     byModel.value = m
     byKey.value = k
     byProvider.value = p
-    // 上游健康（仅管理员）：独立加载，失败不影响主数据 —— 健康卡是
-    // 附加信息，探测接口挂了不该让整个总览报错。
-    if (isAdmin()) {
-      api.probeModels().then((h) => (probeHealth.value = h)).catch(() => {})
-    }
   } catch (e) {
     if (seq !== reqSeq) return
     if ((e as { status?: number }).status === 401) return
@@ -414,8 +447,16 @@ onUnmounted(() => {
         与 /model-names，加两个请求只为这一行不划算）。所以状态行只回答
         「**就余额和额度而言**」，并在文案里写明这个边界 —— 不说满，
         比给一个看起来完整但漏了两项判据的结论更诚实。
+
+        # v-if="readiness" 不能省
+
+        管理员的 readiness 是 **null**（见上面那个短路）。若这里直接读
+        readiness.cls，模板会在渲染期抛「读 null 的属性」—— Vue 只在
+        开发模式报这个错，生产构建下会静默渲染成一片空白，比原来更糟。
+        守卫放在这里而不是脚本里，是为了让「这一段可能整体不出现」
+        这件事在模板上一眼可见。
       -->
-      <div class="call-readiness" :class="readiness.cls" role="status">
+      <div v-if="readiness" class="call-readiness" :class="readiness.cls" role="status">
         <span class="cr-dot" aria-hidden="true"></span>
         <div class="cr-body">
           <div class="cr-title">{{ readiness.title }}</div>
@@ -436,15 +477,20 @@ onUnmounted(() => {
       <div v-if="stats.total_requests === 0" class="notice-warn first-use" role="status">
         <div class="first-use-title">还没有任何调用记录。从这三步开始：</div>
         <ol class="first-use-steps">
+          <!-- 「访问密钥」已并进「用户与分组」页的第三个页签（2026-10-14），
+               /keys 现在是重定向。链接直接指到那一页，避免多一跳。 -->
           <li>
-            到 <RouterLink to="/keys" class="lnk">密钥</RouterLink> 建一把 API 密钥
+            到 <RouterLink to="/users" class="lnk">用户与分组</RouterLink> 建一把 API 密钥
             <span class="dim">（明文只在创建时显示一次，请当场保存）</span>
           </li>
           <li>
             到 <RouterLink to="/models" class="lnk">可用模型</RouterLink> 确认哪些模型对你开放
             <span class="dim">（分组白名单会收窄这份清单）</span>
           </li>
-          <li v-if="!stats.balance_unlimited && stats.balance_cents <= 0">
+          <!-- admin 不显示余额告警：管理员账户不参与模型调用，其 balance_cents
+             恒为 0（见 readiness 里的同一判断），提示「余额为 0 去充值」既是
+             假的、也把人引向错误动作。 -->
+          <li v-if="!isAdmin() && !stats.balance_unlimited && stats.balance_cents <= 0">
             余额为 0，调用会被拒绝 —— 请 <RouterLink to="/profile" class="lnk">联系管理员充值</RouterLink>
           </li>
         </ol>
@@ -522,34 +568,16 @@ onUnmounted(() => {
         </div>
       </div>
 
-      <!-- 上游模型健康卡（仅管理员）。放在指标卡下方、用量图上方：
-           故障是「现在能不能干活」，比「今天花了多少钱」更该先看到。
-           数据来自后台定时探测，失败不影响主数据（load 里独立加载）。 -->
-      <div v-if="isAdmin() && probeHealth.length > 0" class="card health-card">
-        <div class="card__title">
-          上游模型健康
-          <RouterLink to="/health" class="lnk health-more">查看连通率 →</RouterLink>
-        </div>
-        <div class="health-list">
-          <RouterLink
-            v-for="h in probeHealth.filter((x) => x.health !== 'healthy' && x.health !== 'unknown')"
-            :key="h.model_id"
-            to="/health"
-            class="health-item"
-            :class="h.health === 'down' ? 'health-down' : 'health-degraded'"
-            :title="h.last_error || '最近探测失败'"
-          >
-            <span class="mono">{{ h.model_id }}</span>
-            <span class="badge" :class="h.health === 'down' ? 'badge-off' : 'badge-warn'">
-              {{ h.health === 'down' ? '不可用' : '不稳定' }}
-            </span>
-            <span class="dim health-err">{{ h.last_error || '—' }}</span>
-          </RouterLink>
-          <div v-if="!probeHealth.some((x) => x.health !== 'healthy' && x.health !== 'unknown')" class="dim health-all-ok">
-            全部模型健康
-          </div>
-        </div>
-      </div>
+      <!-- 上游模型健康卡已移除（2026-10-14）：连通率现在逐模型显示在
+           「可用模型」的每张卡片上（含价格与曲线），这一份摘要既重复、
+           又只列出异常项，管理员要判断「哪个模型坏了」得再点进另一页。
+           保留它会让同一份探测数据在两个地方呈现，且两处口径可能不同步。
+
+           随之删掉的还有它的数据源：probeHealth / modelLabelForProbe /
+           providers+modelsById 两个映射，以及 load 里的独立探测请求 ——
+           留着就是不可达代码，而不可达代码会让下一个改这一页的人以为
+           「总览也带健康信息」。modelLabelForProbe 依赖的 modelsById 只服务
+           于它，一并删除。 -->
 
       <div class="panel">
         <div class="panel-title">
@@ -619,7 +647,9 @@ onUnmounted(() => {
             <h4>供应商用量 Top 10</h4>
             <div v-if="byProvider.length === 0" class="empty">暂无用量记录</div>
             <div v-for="e in byProvider" :key="e.key" class="mini-row">
-              <span class="mini-main mono">{{ e.key }}</span>
+              <!-- e.key 是 provider_id（32 位哈希），经 providerName 翻成名字；
+                   取不到时回退短 id，至少不再是那串乱码。 -->
+              <span class="mini-main">{{ providerName[e.key] ?? e.key.slice(0, 8) }}</span>
               <span class="badge badge-accent num">{{ fmtNum(e.count) }} 次</span>
               <div
                 class="bar"
@@ -643,50 +673,9 @@ onUnmounted(() => {
   margin-left: 4px;
   color: var(--text-3);
 }
-/* 上游模型健康卡 */
-.health-card {
-  margin-top: 14px;
-  padding: 14px 18px;
-}
-.health-more {
-  font-size: 12px;
-  margin-left: 8px;
-}
-.health-list {
-  display: flex;
-  flex-direction: column;
-  gap: 6px;
-  margin-top: 8px;
-}
-.health-item {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  padding: 4px 6px;
-  border-radius: 6px;
-  text-decoration: none;
-  color: inherit;
-}
-.health-item:hover {
-  background: var(--hover);
-}
-.health-down {
-  border-left: 3px solid var(--danger);
-}
-.health-degraded {
-  border-left: 3px solid var(--warning);
-}
-.health-err {
-  font-size: 12px;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-  max-width: 60%;
-}
-.health-all-ok {
-  font-size: 12px;
-  padding: 4px 0;
-}
+/* 上游模型健康卡的样式（.health-*）已随该卡一并删除（2026-10-14）——
+   连通率现在逐模型显示在「可用模型」的卡片上。整块删掉而不是留着：
+   不可达样式会在下一次有人「借用一下这个左边框」时被接回不相干的元素。 */
 /* 时间范围下拉 */
 .range-select {
   position: relative;
@@ -756,6 +745,19 @@ onUnmounted(() => {
    所以窄屏降级必须在这里重写一遍。 */
 .expand-grid.is-3col {
   grid-template-columns: 1fr 1fr 1fr;
+}
+/* min-width: 0 是「长名字不再顶破右侧」的关键（2026-10-14）。
+   grid 子项默认 min-width:auto —— 也就是「不许小于内容的最小宽度」，
+   于是一个 40 字符的模型名（provider/model 形式）会把这一列撑到内容宽度，
+   把后面的「次数徽章 + 柱条 + token 数」整体挤出面板右缘。
+   而 .mini-main 的 text-overflow:ellipsis 只在**自己被约束住**时才生效，
+   约束来自这一行的 min-width:0 链；少了它，text-overflow 形同虚设。
+
+   刻意不用「在 JS 里把名字截成 22 个字 + …」：那会让 title 悬停提示、
+   复制、以及「两个只差后缀的模型到底哪两个」都失去完整名字 ——
+   省略号是纯视觉的，底层文本仍完整。 */
+.expand-grid.is-3col > .expand-col {
+  min-width: 0;
 }
 /* 指标卡一行五个（2026-10-10 用户要求：一行三个太占地方）。
    共 10 张卡 → 5×2 正好铺满，没有落单的空位。

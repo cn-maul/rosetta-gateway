@@ -49,6 +49,16 @@ export interface DiscoveredModel {
   display_name?: string
   context_window?: number
   max_output_tokens?: number
+  /**
+   * 上游 /models 自报的思考挡位，逗号分隔；**空 = 上游没报**
+   * （不是「不支持思考」，两者必须分开处理）。
+   *
+   * 上游报了就随导入一起落库，省掉每次手工勾；没报则留空，
+   * 由管理员按模型文档自行配置。
+   */
+  effort_levels?: string
+  /** 三态：undefined = 上游没报（网关不干预）；true/false = 上游明确表态。 */
+  supports_thinking?: boolean
 }
 
 // 批量导入的单条模型
@@ -57,6 +67,10 @@ export interface ModelImportItem {
   display_name?: string
   context_window?: number
   max_output_tokens?: number
+  /** 见 DiscoveredModel.effort_levels。 */
+  effort_levels?: string
+  /** 见 DiscoveredModel.supports_thinking。 */
+  supports_thinking?: boolean
 }
 
 // 全局设置（与 internal/admin/settings_handler.go 对应）。
@@ -131,6 +145,16 @@ export interface UpstreamModel {
    * 组名由前端用 modelGroups() 全量列表本地解析（组是小表）。
    */
   group_id?: string
+  /** 引用该模型的路由链数量；0 = 没被任何链引用，可以自由删除。 */
+  route_count?: number
+  /**
+   * 是否是某条链的**链首**（首选目标）。
+   *
+   * true 时删除按钮置灰：链的顺序表达「先试谁」的显式配置，删掉首选等于
+   * 悄悄改了这条路由的流量分配，所以后端回 409 要求先去「路由」页改。
+   * 非链首的成员可以直接删，删除会自动把它从所有链里摘掉。
+   */
+  is_route_head?: boolean
   // 没有 created_at：upstream_models 表压根没有这一列，接口也不下发。
   // 曾在这里声明过一次，导致列表里永远渲染出一个「—」日期列。
   // 也没有 default_extra_json：存了但没有任何地方拿它构造请求，已随列一并摘除。
@@ -535,6 +559,21 @@ export interface ModelPrice {
   price_input: number
   price_output: number
   price_cache_hit: number
+}
+
+/**
+ * 把公开模型名连到上游模型行，供探测数据挂到同一张卡片上。
+ *
+ * 与 ModelPrice 同为 model-names 的平行数组元素（meta[i] ↔ models[i]）。
+ *
+ * 只含上游模型行 id 与供应商名 —— 刻意不给 endpoint / 凭据 / 协议：
+ * model-names 普通用户也可读，多给一个字段就多一条可枚举的信息。
+ */
+export interface ModelMeta {
+  name: string
+  /** upstream_models.id（探测表的外键）。空 = 该路由解析不出可用目标。 */
+  upstream_model_id: string
+  provider_name: string
 }
 
 export interface AuditEntry {

@@ -52,6 +52,76 @@ func (s *Store) ListAllRouteTargets(ctx context.Context) ([]RouteTarget, error) 
 	return result, rows.Err()
 }
 
+// ModelRouteRefs 是「哪个模型被几条链引用、其中哪些链把它当链首」。
+//
+// 一次性查完供列表渲染用 —— 逐模型查就是 N+1，而模型列表每行都要这两个值。
+type ModelRouteRefs struct {
+	// count: upstream_model_id → 引用它的链数（不分 position）。
+	count map[string]int
+	// heads: upstream_model_id → 是否出现在某条链的 position 0。
+	heads map[string]bool
+}
+
+// RouteReferencesByModel 一次查出全量模型 → 引用链数 / 链首标记。
+//
+// 查不到就返回空结构而不是 error：这两个字段只是给界面置灰用的辅助信息，
+// 让它把整个模型列表变成错误态不划算（而真正的删除约束在写入路径上，
+// 那里是强校验）。
+func (s *Store) RouteReferencesByModel(ctx context.Context) (ModelRouteRefs, error) {
+	out := ModelRouteRefs{
+		count: make(map[string]int),
+		heads: make(map[string]bool),
+	}
+	rows, err := s.read.QueryContext(ctx,
+		`SELECT upstream_model_id, position FROM route_targets`)
+	if err != nil {
+		return out, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var modelID string
+		var position int
+		if err := rows.Scan(&modelID, &position); err != nil {
+			return out, err
+		}
+		out.count[modelID]++
+		if position == 0 {
+			out.heads[modelID] = true
+		}
+	}
+	return out, rows.Err()
+}
+
+// RouteCompatHeadsByModel 查 routes 的「主目标」兼容列：model id → 是否被指着。
+//
+// 与 RouteReferencesByModel 并列查而不是合并：两者口径不同（一个看链的
+// position 0，一个看 routes 的向后兼容列），迁移期可能不一致，而
+// store 层的链首拒绝判定也正是两个来源都查。界面若只查一个，就会出现
+// 「按钮亮着但点下去必然 409」。
+func (s *Store) RouteCompatHeadsByModel(ctx context.Context) (map[string]bool, error) {
+	out := make(map[string]bool)
+	rows, err := s.read.QueryContext(ctx,
+		`SELECT upstream_model_id FROM routes WHERE upstream_model_id IS NOT NULL AND upstream_model_id <> ''`)
+	if err != nil {
+		return out, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var modelID string
+		if err := rows.Scan(&modelID); err != nil {
+			return out, err
+		}
+		out[modelID] = true
+	}
+	return out, rows.Err()
+}
+
+// Count 返回引用该模型的链数（0 = 没被任何链引用，可以自由删除）。
+func (r ModelRouteRefs) Count(modelID string) int { return r.count[modelID] }
+
+// IsHead 该模型是否是某条链的链首（链首不可删除）。
+func (r ModelRouteRefs) IsHead(modelID string) bool { return r.heads[modelID] }
+
 func (s *Store) ListRouteTargets(ctx context.Context, routeID string) ([]RouteTarget, error) {
 	rows, err := s.read.QueryContext(ctx,
 		`SELECT `+routeTargetColumns+` FROM route_targets WHERE route_id = ? ORDER BY position`, routeID)

@@ -406,6 +406,7 @@ import type {
   UserStatus,
   Group,
   ModelPrice,
+  ModelMeta,
 } from './types'
 
 /**
@@ -697,13 +698,32 @@ export const api = {
    *
    * 所以 models **保持 string[] 不变**（旧调用方零改动），价格以
    * `prices[i]` 对应 `models[i]` 的方式并行给出。两者的顺序都由后端保证
-   * 按公开名排序，长度必然相等（后端有测试钉住）。
+   * 按公开名排序，长度必然相等（后端有测试钉住）。`meta[i]` 同理。
+   */
+  /**
+   * modelNames 返回按身份收窄后的可用模型清单。
+   *
+   * 三个数组 `models` / `prices` / `meta` **逐位对应**（后端保证长度相等，
+   * 有测试钉住），所以下标 i 的模型名、价格、上游模型 id 是同一件事。
+   *
+   * # 为什么要有 meta（2026-10-14 页面合并）
+   *
+   * 探测数据挂在 `upstream_models.id` 上，而这份清单挂在**公开路由名**上 ——
+   * 主键不同。`Models.vue` 要在一张卡片里同时显示「价格 + 连通率」，
+   * 就得靠 meta 把两者对上。前端无法自己 join：model-names 返回的 models
+   * 是公开名而不是上游模型行 id，而 /admin/api/upstream-models 是 admin-only。
+   *
+   * meta 指向的与 prices 指向的是**同一个**上游模型（后端都取故障转移链
+   * 的 position 0），否则卡片会显示「A 的价配着 B 的健康」。
    */
   modelNames: () =>
-    get<{ models: string[]; restricted: boolean; prices?: ModelPrice[] }>('/model-names').then((r) => ({
+    get<{ models: string[]; restricted: boolean; prices?: ModelPrice[]; meta?: ModelMeta[] }>(
+      '/model-names',
+    ).then((r) => ({
       models: r.models ?? [],
       restricted: r.restricted ?? false,
       prices: r.prices ?? [],
+      meta: r.meta ?? [],
     })),
 
   // stats & usage（注意：usage 端点的 from/to 是【毫秒】时间戳；from=0 表示全部历史）

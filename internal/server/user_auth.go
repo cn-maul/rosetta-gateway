@@ -191,6 +191,19 @@ var userAccessibleRoutes = map[string]bool{
 	// 可选模型。返回内容已按身份收窄（只拿到自己组内的），且只是一串公开
 	// 模型名 —— 不含上游、凭据、路由拓扑。
 	"GET /admin/api/model-names": true,
+
+	// 上游模型连通率（2026-10-14 页面合并：与「可用模型」合到同一张卡片
+	// 里之后，普通用户也要读得到 —— 他能看到的模型列表和这些模型此刻通不通
+	// 是同一个问题，拆开问等于让他在两个页面之间来回跳）。
+	//
+	// **只放行读**：写探测记录的循环在后台跑，这两个端点只读 model_probes。
+	// 两个 handler 都已按组白名单收窄到「组内公开名的主目标模型」，
+	// 交集为空时返回空集而不是全集（与 model-names 同一口径）。
+	//
+	// 不放行 /providers /upstream-models /routes：那些会暴露端点、
+	// 凭据协议与整条故障转移链的拓扑。
+	"GET /admin/api/probes/models":   true,
+	"GET /admin/api/probes/timeline": true,
 }
 
 // AdminGateGuard 在会话鉴权之后再做一次「非白名单即要求管理员」的判定。

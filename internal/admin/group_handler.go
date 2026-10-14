@@ -289,6 +289,20 @@ func (h *GroupHandler) ModelNames(w http.ResponseWriter, r *http.Request) {
 	// 判定），改成 [{name,...}] 会同时打破这三个调用点，且它们并不需要价格。
 	// 平行数组的风险是长度必须对齐，所以它在同一个循环里构造。
 	prices := make([]modelPrice, 0, 32)
+	// meta 与 all / prices **同样逐位对应**：meta[i] 描述 all[i]。
+	//
+	// 为什么需要它（2026-10-14 页面合并）：探测数据（model_probes）是以
+	// **upstream_models.id** 组织的，而这份清单是以**公开路由名**组织的 ——
+	// 两者主键不同，前端要在一张卡片里同时显示「公开名 + 价格 + 连通率」
+	// 就必须有一张映射表。在前端用 models[] 去 join 做不到：这里返回的是
+	// 公开名，不是上游模型行 id。
+	//
+	// 只给**主目标**（故障转移链的 position 0）的上游模型 id，与
+	// priceForModel 取价的口径**逐字一致** —— 同一个 Candidates[0]。
+	// 这一点很重要：卡片上「显示的价格」与「显示的连通率」若来自链上的
+	// 不同位置，管理员会看到「A 的价配着 B 的健康」，而实际计费与实际
+	// 探测对象都是 A。
+	meta := make([]modelMeta, 0, 32)
 	routes := snapshot.Get().Routes
 	for _, route := range routes.ListRoutes() {
 		if _, dup := seen[route.PublicName]; dup {
@@ -297,10 +311,17 @@ func (h *GroupHandler) ModelNames(w http.ResponseWriter, r *http.Request) {
 		seen[route.PublicName] = struct{}{}
 		all = append(all, route.PublicName)
 		prices = append(prices, priceForModel(routes, route.PublicName))
+		meta = append(meta, metaForModel(routes, route.PublicName))
 	}
 	sort.Strings(all)
-	// 按公开名重排价格，与上面那次排序同步做。
+	// 按公开名重排价格与 meta，与上面那次排序同步做。
+	//
+	// meta 必须**跟着一起排**：它与 prices 一样是按 all 的下标对齐的
+	// 平行数组，只排 prices 会让 meta 留在构造顺序上 —— 而构造顺序是
+	// ListRoutes 的 map 遍历顺序（随机）。后果是「A 模型的连通率挂在
+	// B 模型的卡片上」，且每次刷新结果不同。
 	sort.Slice(prices, func(i, j int) bool { return prices[i].Name < prices[j].Name })
+	sort.Slice(meta, func(i, j int) bool { return meta[i].Name < meta[j].Name })
 
 	// 管理员不受分组白名单约束。
 	//
@@ -313,27 +334,75 @@ func (h *GroupHandler) ModelNames(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if me.IsAdmin() {
-		writeJSON(w, http.StatusOK, map[string]any{"models": all, "restricted": false, "prices": prices})
+		writeJSON(w, http.StatusOK, map[string]any{"models": all, "restricted": false, "prices": prices, "meta": meta})
 		return
 	}
 
 	u := snapshot.Get().UsersByID[me.ID]
 	if u == nil || u.AllowedModels.Unrestricted {
-		writeJSON(w, http.StatusOK, map[string]any{"models": all, "restricted": false, "prices": prices})
+		writeJSON(w, http.StatusOK, map[string]any{"models": all, "restricted": false, "prices": prices, "meta": meta})
 		return
 	}
 	// 组白名单生效：只给他组内那部分。交集为空时返回空数组而不是全集 ——
 	// 「全都看不到」和「什么都能看到」是两回事，返回全集会静默放宽。
 	filtered := make([]string, 0, len(u.AllowedModels.Models))
 	filteredPrices := make([]modelPrice, 0, len(u.AllowedModels.Models))
+	filteredMeta := make([]modelMeta, 0, len(u.AllowedModels.Models))
 	for i, m := range all {
 		if u.AllowedModels.Allows(m) {
 			filtered = append(filtered, m)
 			// prices 与 all 已按同一顺序排好，逐位取即可（见上面的构造）。
 			filteredPrices = append(filteredPrices, prices[i])
+			filteredMeta = append(filteredMeta, meta[i])
 		}
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"models": filtered, "restricted": true, "prices": filteredPrices})
+	writeJSON(w, http.StatusOK, map[string]any{
+		"models": filtered, "restricted": true, "prices": filteredPrices, "meta": filteredMeta,
+	})
+}
+
+// modelMeta 把公开模型名连到上游模型行，供探测数据挂到同一张卡片上。
+//
+// 只含上游模型行 id 与供应商显示名 —— 刻意**不给** endpoint、凭据、协议、
+// 上游模型名本身之外的东西：这份端点普通用户也能读（见 server 里的
+// userAccessibleRoutes），多给一个字段就多一个可被枚举的信息。
+//
+// 供应商名取快照里的 slug 而非「人类填的 name」：见 metaForModel 的说明。
+type modelMeta struct {
+	// Name 是所属的公开模型名 —— 排序与对齐用的键，语义与 modelPrice.Name
+	// 相同（prices 与 meta 都靠它与 models 逐位对齐，见构造处的注释）。
+	Name string `json:"name"`
+	// UpstreamModelID 是探测表 model_probes.model_id 的外键（32 位 hex）。
+	// 空 = 该路由解析不出可用目标（禁用/无可用模型），前端据此不画连通率。
+	UpstreamModelID string `json:"upstream_model_id"`
+	// ProviderName 是所属上游的显示名，仅用于给卡片加一个可读的副标题。
+	ProviderName string `json:"provider_name"`
+}
+
+// metaForModel 取公开名对应的上游模型行 id 与供应商名。
+//
+// 与 priceForModel **走同一条解析路径**（同一个 Resolve、同一个
+// Candidates[0]）：卡片上的价格与连通率必须指向同一个上游模型，否则
+// 管理员会看到「A 模型的价配着 B 模型的健康曲线」，而真实计费与真实
+// 探测对象都是 A —— 这类错位没有任何界面提示能让人发现。
+func metaForModel(routes *routing.RouteIndex, name string) modelMeta {
+	out := modelMeta{Name: name}
+	res, err := routes.Resolve(name)
+	if err != nil || len(res.Candidates) == 0 || res.Candidates[0].UpstreamModel == nil {
+		return out
+	}
+	c := res.Candidates[0]
+	out.UpstreamModelID = c.UpstreamModel.ID
+	// slug 在创建上游时由后端生成且**唯一**，比人类填的 name 更适合当
+	// 稳定标识；但用户看到的往往是 name，所以这里优先 name、再 slug、
+	// 两者都空时才回退短 id（见 frontend 的同类实现）。
+	if c.Provider != nil {
+		out.ProviderName = c.Provider.Slug
+		if out.ProviderName == "" {
+			out.ProviderName = c.Provider.ID
+		}
+	}
+	return out
 }
 
 // modelPrice 是某个公开模型名的三项单价（元 / 百万 tokens）。

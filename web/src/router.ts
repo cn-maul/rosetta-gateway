@@ -7,7 +7,17 @@ const router = createRouter({
   routes: [
     { path: '/login', name: 'login', component: () => import('./views/Login.vue'), meta: { title: '登录', public: true } },
     { path: '/', name: 'overview', component: () => import('./views/Overview.vue'), meta: { title: '总览' } },
-    { path: '/keys', name: 'keys', component: () => import('./views/Keys.vue'), meta: { title: '访问密钥' } },
+    // 「访问密钥」不再是一个独立侧栏项（2026-10-14 页面合并），它是
+    // 「用户与分组」页里的第三个页签 —— 那三样东西是一条权限链上的三环，
+    // 排查「这把 key 为什么调不通这个模型」必须同时看用户 / 分组 / 密钥。
+    //
+    // 老书签 /keys **重定向**到 /users，而不是就地渲染新页面：
+    // 普通用户进 /users 时默认页签就是「访问密钥」（他们看不到前两个），
+    // 管理员进 /users 落在「用户」页签 —— 与合并前的落点一致，不需要额外
+    // 记住「该带哪个 query」。刻意**不做** ?tab= 同步：那会让页签状态
+    // 同时存在于 URL 与组件两处，改一处忘另一处就会漂移（页签本身已经
+    // 有 :key 重建机制，不需要 URL 参与）。
+    { path: '/keys', redirect: { name: 'users' } },
     // 「调用历史」恢复给普通用户（2026-10-10）。上一轮按用户给的侧边栏顺序
     // 把它划进了 admin 区，理由是「普通用户看自己的消费记录走钱包页」——
     // 但那是**聚合数**，不是明细。排查「我刚才那次调用为什么报错/为什么这么慢/
@@ -53,18 +63,36 @@ const router = createRouter({
     // meta.adminOnly 让导航栏能按 isAdmin() 隐藏它们，守卫负责兜底——
     // 只做前者的话，手输 URL 就能打开。
     //
-    // 「用户与分组」合并成一个页面（2026-10-10）：分组是用户的属性
-    //（users.group_id），拆成两个页面让人得在「这个人在哪个组」和
-    // 「这个组有哪些人」之间来回跳。页内两个 tab 解决。
-    { path: '/users', name: 'users', component: () => import('./views/UsersGroups.vue'), meta: { title: '用户与分组', adminOnly: true } },
-    { path: '/providers', name: 'providers', component: () => import('./views/Providers.vue'), meta: { title: '上游与模型', adminOnly: true } },
-    // 模型归组紧跟「上游与模型」：两者都在管模型的元数据，一个逐条配置、
-    // 一个跨上游合并展示身份。
-    { path: '/model-groups', name: 'model-groups', component: () => import('./views/ModelGroups.vue'), meta: { title: '模型归组', adminOnly: true } },
-    // 上游模型连通率：定时探测的时间轴。紧跟「上游与模型」/「模型归组」，
-    // 三者都在管上游模型 —— 一个配置、一个归组、一个看健康。
-    { path: '/health', name: 'health', component: () => import('./views/Health.vue'), meta: { title: '连通率', adminOnly: true } },
-    { path: '/routes', name: 'routes', component: () => import('./views/Routes.vue'), meta: { title: '路由', adminOnly: true } },
+    // 「用户 / 分组 / 访问密钥」合并成一个页面（2026-10-14；用户与分组原
+    // 已在 2026-10-10 合并过一次）。三者是一条权限链上的三环：账号的分组、
+    // 组的模型白名单、key 级的更严覆盖 —— 排查一次「调不通」要同时看三处，
+    // 拆成三页就得凭记忆把 id/name 来回对上。
+    //
+    // **刻意不带 adminOnly**：普通用户在侧栏点这一项进来，看到的是自己的
+    // 访问密钥页签（页签按身份收窄，见 AccessControl.vue）。他们在合并前
+    // 用的正是 /keys 的能力，这里一比一保留；而 /admin/api/users 与
+    // /groups 对他们本就是 admin-only，给入口只会让人白撞一次 403。
+    { path: '/users', name: 'users', component: () => import('./views/AccessControl.vue'), meta: { title: '用户与分组' } },
+    // 「访问密钥」不再是独立侧栏项，它就是上面那一页的第三个页签。
+    // 老书签 /keys 重定向到 /users：普通用户的默认页签就是「访问密钥」，
+    // 管理员落在「用户」页签 —— 与合并前的落点一致，不必额外带 query。
+    // 刻意**不做** ?tab= 同步：页签状态一旦同时存在于 URL 与组件两处，
+    // 改一处忘另一处就会漂移。
+    { path: '/keys', redirect: { name: 'users' } },
+    // 「上游与模型 / 路由 / 模型归组」合并成一个页面（2026-10-14）。三者是
+    // 同一条数据面配置链的相邻三段，页签顺序即链的顺序（上游 → 路由 → 归组）。
+    { path: '/providers', name: 'providers', component: () => import('./views/Upstream.vue'), meta: { title: '上游与模型', adminOnly: true } },
+    // 老地址并进上面那个页面。**必须留重定向而不是删掉**：老书签与站内
+    // /routes 链接不该 404。重定向后统一落在配置链的起点页签。
+    { path: '/routes', redirect: { name: 'providers' } },
+    { path: '/model-groups', redirect: { name: 'providers' } },
+    // 「连通率」不再是独立页面（2026-10-14）：每张模型卡里已经同时显示单价与
+    // 连通率曲线（Models.vue）。拆成两页的代价是判断「该换档还是该降价」
+    // 得先记下模型名、去另一页按 id 找、再回来对价格。
+    //
+    // 老书签重定向到「可用模型」——那些链接记着的是「我要看连通率」，
+    // 而那张卡片现在就在那一页。
+    { path: '/health', redirect: { name: 'models' } },
     { path: '/settings', name: 'settings', component: () => import('./views/Settings.vue'), meta: { title: '设置', adminOnly: true } },
   ],
 })

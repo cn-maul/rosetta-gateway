@@ -123,7 +123,20 @@ function testResultLine(r: ModelTestResult): string {
                   {{ isTesting(m.id) ? '测试中…' : '测试' }}
                 </button>
                 <button class="btn btn-sm btn-ghost" @click="emit('edit', m)">编辑</button>
-                <button class="btn btn-sm btn-danger" @click="emit('remove', m)">删除</button>
+                <!-- 链首置灰（2026-10-14）：后端对链首删除回 409，所以这里提前
+                     拦住并把「该去哪儿改」写进 title。置灰而不是隐藏：模型确实
+                     需要一个删除入口，只是这个模型现在不能删 —— 藏起来会让人
+                     以为没有删除功能。 -->
+                <button
+                  class="btn btn-sm btn-danger"
+                  :disabled="m.is_route_head"
+                  :title="m.is_route_head
+                    ? '该模型是某条路由的首选目标，不能直接删除 —— 请先到「路由」页改掉那条路由的首选'
+                    : undefined"
+                  @click="emit('remove', m)"
+                >
+                  删除
+                </button>
               </div>
             </td>
           </tr>

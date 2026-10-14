@@ -586,6 +586,12 @@ func isWhitelisted(pattern string) bool {
 		"GET /admin/api/topups",
 		"POST /admin/api/logout",
 		"GET /admin/api/model-names",
+		// 连通率（2026-10-14 页面合并）：与「可用模型」并到同一张卡片后，
+		// 普通用户也要读得到自己够得着的那些模型的探测结果。两个 handler
+		// 都已按组白名单收窄到「组内公开名的主目标模型」，交集为空时返回
+		// 空集而不是全集（见 admin/probe_handler_test.go 的钉桩）。
+		"GET /admin/api/probes/models",
+		"GET /admin/api/probes/timeline",
 	} {
 		if pattern == p {
 			return true

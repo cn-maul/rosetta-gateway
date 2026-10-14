@@ -132,10 +132,18 @@ func TestEffortLevels_清除(t *testing.T) {
 	}
 }
 
-// TestUpsertModel_不覆盖挡位 与既有价格纪律同源：批量导入/重新发现的
-// 调用方拿不到挡位信息，若 upsert 把它覆盖成空，等于「点一次同步就抹掉
-// 手工配置」。
-func TestUpsertModel_不覆盖挡位(t *testing.T) {
+// TestUpsertModel_不覆盖已有挡位 但**会在空时回填**（2026-10-14 改）。
+//
+// 价格仍是「一律不覆盖」：上游返回的模型列表永远不带价格，覆盖它等于
+// 「点一次同步就抹掉手工配置」。
+//
+// effort_levels 的规则不同，因为它多了一个来源 —— 上游 /models 的
+// reasoning_supported_efforts。原实现假定导入侧拿不到挡位信息所以不覆盖，
+// 那个前提已经不成立，于是「不覆盖」从保护措施变成了缺陷：**已有模型
+// 永远填不上**，管理员只能逐个手勾。
+//
+// 现在是「只在空时回填」：能自动填上，同时不顶掉手工挑过的组合。
+func TestUpsertModel_不覆盖已有挡位但空时回填(t *testing.T) {
 	ctx := context.Background()
 	st := testStore(t, t.TempDir()+"/effort4.db")
 	pid := newModelTestProvider(t, st)
@@ -149,18 +157,118 @@ func TestUpsertModel_不覆盖挡位(t *testing.T) {
 		t.Fatalf("upsert 1: %v", err)
 	}
 
-	// 重新导入：同 provider + model_id，携带零值（探测侧拿不到这些信息）。
+	// 重新导入，且这次**带了**挡位（上游报了）：已有配置必须保留。
 	if err := st.UpsertUpstreamModel(ctx, &UpstreamModel{
 		ID: "m2", ProviderID: pid, ModelID: "gpt-5", Enabled: true,
+		EffortLevels: []effort.Level{effort.Low, effort.Medium},
 	}); err != nil {
 		t.Fatalf("upsert 2: %v", err)
 	}
-
 	got, _ := st.GetUpstreamModel(ctx, "m1")
 	if len(got.EffortLevels) != 2 {
-		t.Fatalf("重新导入把挡位抹掉了：%+v", got)
+		t.Fatalf("重新导入顶掉了手工挡位：%+v", got)
+	}
+	if got.EffortLevels[0] != effort.High || got.EffortLevels[1] != effort.XHigh {
+		t.Errorf("手工挡位内容变了：%v", got.EffortLevels)
 	}
 	if got.PriceInput != 3.0 {
 		t.Fatalf("重新导入把价格抹掉了：%v", got.PriceInput)
+	}
+
+	// 未配置过的模型：上游报了就应该被回填 —— 这正是本次要修的能力。
+	if err := st.UpsertUpstreamModel(ctx, &UpstreamModel{
+		ID: "m3", ProviderID: pid, ModelID: "fresh", Enabled: true,
+	}); err != nil {
+		t.Fatalf("upsert 3: %v", err)
+	}
+	// 模拟「首次导入时上游就报了」：清空后用带挡位的 payload 写入。
+	if err := st.UpsertUpstreamModel(ctx, &UpstreamModel{
+		ID: "m4", ProviderID: pid, ModelID: "fresh", Enabled: true,
+		EffortLevels: []effort.Level{effort.Low, effort.Medium, effort.Max},
+	}); err != nil {
+		t.Fatalf("upsert 4: %v", err)
+	}
+	got, _ = st.GetUpstreamModel(ctx, "m3")
+	if len(got.EffortLevels) != 3 {
+		t.Fatalf("空配置未被回填：%+v", got)
+	}
+	// 再来一次不带挡位的导入：已回填的值必须还在（不回退）。
+	if err := st.UpsertUpstreamModel(ctx, &UpstreamModel{
+		ID: "m5", ProviderID: pid, ModelID: "fresh", Enabled: true,
+	}); err != nil {
+		t.Fatalf("upsert 5: %v", err)
+	}
+	got, _ = st.GetUpstreamModel(ctx, "m3")
+	if len(got.EffortLevels) != 3 {
+		t.Fatalf("后续导入把已回填的挡位清掉了：%+v", got)
+	}
+}
+
+// TestUpsertModel_新模型可写入挡位 与上一条互为镜像：upsert 不覆盖**已有**
+// 值，但首次 INSERT 必须把发现来的挡位写进去 —— 否则「自动预填」在
+// 真实的导入路径（全是 upsert）上一条都落不了地。
+func TestUpsertModel_新模型可写入挡位(t *testing.T) {
+	ctx := context.Background()
+	st := testStore(t, t.TempDir()+"/effort5.db")
+	pid := newModelTestProvider(t, st)
+
+	if err := st.UpsertUpstreamModel(ctx, &UpstreamModel{
+		ID: "m1", ProviderID: pid, ModelID: "cn:space-bunny", Enabled: true,
+		EffortLevels: []effort.Level{effort.Low, effort.Medium, effort.High, effort.XHigh, effort.Max},
+	}); err != nil {
+		t.Fatalf("upsert: %v", err)
+	}
+	got, _ := st.GetUpstreamModel(ctx, "m1")
+	if len(got.EffortLevels) != 5 {
+		t.Fatalf("首次导入没写进挡位：%+v", got)
+	}
+	// max 必须以 max 存下来，而不是被压成 xhigh —— 上游的默认值就是它，
+	// 存成 xhigh 会让「上游默认档」这一信息在库这一层就丢了。
+	last := got.EffortLevels[len(got.EffortLevels)-1]
+	if last != effort.Max {
+		t.Errorf("最高档存成了 %q，期望 max（压成 xhigh 会与上游对不上账）", last)
+	}
+}
+
+// TestUpsertModel_supports_thinking_三态守住 nil 的含义。
+//
+// 「上游没报」（nil）绝不能把已有配置抹成 NULL：那会把「已明确支持」变成
+// 「不知道」，而管理界面上这两种状态长得一模一样，丢得无声无息。
+// 反过来，上游**明确表态**时必须能覆盖 —— 否则上游改了能力网关也看不见。
+func TestUpsertModel_supports_thinking_三态(t *testing.T) {
+	ctx := context.Background()
+	st := testStore(t, t.TempDir()+"/effort6.db")
+	pid := newModelTestProvider(t, st)
+
+	yes := true
+	if err := st.UpsertUpstreamModel(ctx, &UpstreamModel{
+		ID: "m1", ProviderID: pid, ModelID: "cn:space-bunny", Enabled: true,
+		SupportsThinking: &yes,
+	}); err != nil {
+		t.Fatalf("upsert 1: %v", err)
+	}
+
+	// 上游没报（nil）→ 保留 true。
+	if err := st.UpsertUpstreamModel(ctx, &UpstreamModel{
+		ID: "m2", ProviderID: pid, ModelID: "cn:space-bunny", Enabled: true,
+	}); err != nil {
+		t.Fatalf("upsert 2: %v", err)
+	}
+	got, _ := st.GetUpstreamModel(ctx, "m1")
+	if got.SupportsThinking == nil || !*got.SupportsThinking {
+		t.Fatalf("上游没报就把已配的 true 抹成了 %v", got.SupportsThinking)
+	}
+
+	// 上游明确说 false → 必须覆盖（上游能力变了要看得见）。
+	no := false
+	if err := st.UpsertUpstreamModel(ctx, &UpstreamModel{
+		ID: "m3", ProviderID: pid, ModelID: "cn:space-bunny", Enabled: true,
+		SupportsThinking: &no,
+	}); err != nil {
+		t.Fatalf("upsert 3: %v", err)
+	}
+	got, _ = st.GetUpstreamModel(ctx, "m1")
+	if got.SupportsThinking == nil || *got.SupportsThinking {
+		t.Fatalf("上游明确说 false 却没覆盖：%v", got.SupportsThinking)
 	}
 }

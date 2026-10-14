@@ -40,3 +40,9 @@
 *.db
 *.db-shm
 *.db-wal
+
+# 一次性调试脚本（2026-10-14）。曾出现过 tools/tmpbal/main.go：直接以只读
+# 模式打开 bin/data/gateway.db 把用户余额打到标准输出。入库既暴露数据形状，
+# 又让 go build ./... 把它当成第二个 main 包 —— 那条 import 路径写死在
+# bin/data 上，换个部署位置就直接编译失败。写前导斜杠只挡根目录。
+/tools/
