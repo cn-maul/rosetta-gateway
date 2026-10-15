@@ -269,14 +269,31 @@ func main() {
 
 	// 启动期一次性操作，与任何请求无关，故用 Background 而非请求 ctx。
 	ensureBootstrapAdmin(context.Background(), db, logger)
-	ensureBootstrapToken(context.Background(), db, logger)
+	// 拒绝启动的判据见 ensureBootstrapToken 的注释：只有「引导窗口开着
+	// 且没能用一次性令牌保护上」才是致命的。与 master.key 的处理同一个
+	// 原则 —— 一次瞬态失败不该换来一条明文凭据或一个免鉴权的管理员入口。
+	// 容器编排会按重启策略重试；单机部署则得到一条明确的日志而不是一个
+	// 悄悄裸奔的服务。
+	if err := ensureBootstrapToken(context.Background(), db, logger); err != nil {
+		logger.Error("bootstrap protection unavailable, refusing to start",
+			"error", err,
+			"impact", "免鉴权的 POST /admin/api/bootstrap 在本次启动中没有任何凭据保护；"+
+				"继续监听会把「首个管理员」的决定权交给任何能连到本端口的人",
+			"hint", "修复后重启即可；也可显式设置一个至少 32 字节的 "+
+				bootstrapTokenEnv+" 后重启")
+		os.Exit(1)
+	}
 
 	// 首次初始化窗口对所有能连到端口的人开放（POST /admin/api/bootstrap
-	// 免鉴权，直到管理员设完密码为止）。默认 listen 绑回环，只有本机能碰；
-	// 运维把它改成 0.0.0.0（Docker 的 `-p 8666:8666` 就会这么要求）是
-	// 很常见的做法，那时整个局域网都能**尝试**抢先成为第一个管理员 ——
-	// 但只有知道启动日志里那个一次性令牌的人才能真的完成它。
-	// 这个告警仍不能省：它提醒的是「尽快把这件事做掉」。
+	// 免鉴权，直到管理员设完密码为止），完成它需要那枚一次性引导令牌。
+	// 默认 listen 绑回环，只有本机能碰；运维把它改成 0.0.0.0
+	// （Docker 的 `-p 8666:8666` 就会这么要求）是很常见的做法，
+	// 那时整个局域网都能**尝试**抢先成为第一个管理员 —— 但只有知道
+	// 启动日志里那个一次性令牌的人才能真的完成它。这个告警仍不能省：
+	// 它提醒的是「尽快把这件事做掉」。
+	//
+	// 走到这里说明 ensureBootstrapToken 已成功返回：窗口要么已被令牌
+	// 保护，要么压根没开（引导已完成 / 没有待初始化管理员）。
 	pending, err := db.FindUninitializedAdmin(context.Background())
 	if err != nil {
 		logger.Error("cannot read bootstrap state; admin UI may be unreachable", "error", err)

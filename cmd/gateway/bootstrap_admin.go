@@ -11,6 +11,23 @@ import (
 	"github.com/cn-maul/rosetta-gateway/internal/store"
 )
 
+// bootstrapTokenStore 是 ensureBootstrapToken 需要的 store 能力子集。
+//
+// 抽成接口只有一个理由：**持久化失败必须可测**。第三种失效模式
+// （令牌生成成功、写库失败）无法靠构造一个坏环境来触发 —— 环境变量和
+// 随机源都正常时，只有数据库会失败。让测试拿一个包一层、只让
+// SetBootstrapToken 返回错误的假 store，就能把这条路径钉死，而不必去
+// 真的把数据库弄坏（那会连累同一个测试里的其他断言）。
+//
+// 刻意只声明这四个方法：接口越小，实现者越不可能「顺手」多依赖别的
+// 能力，也就越不会在测试替身上漏掉某个调用。
+type bootstrapTokenStore interface {
+	BootstrapCompleted(ctx context.Context) (bool, error)
+	BootstrapToken(ctx context.Context) (string, error)
+	SetBootstrapToken(ctx context.Context, token string) error
+	FindUninitializedAdmin(ctx context.Context) (*store.User, error)
+}
+
 // bootstrapAdminUsername 是引导出的管理员账号名。
 //
 // 固定值而不是可配置：多用户阶段还没有「建管理员」的管理界面，
@@ -29,7 +46,13 @@ const bootstrapAdminUsername = "admin"
 // 解法是建一个**登不进去但明确存在**的账号：
 // 它的 password_hash 为空，登录校验必然失败，但 `GET /admin/api/bootstrap`
 // 能据此告诉前端「请为 admin 设置密码」，而 `POST /admin/api/bootstrap`
-// 负责设密码并直接签发会话。整条链路自洽，无需任何旁路凭据。
+// 负责设密码并直接签发会话。
+//
+// **必须有一枚一次性引导令牌**（ensureBootstrapToken）：完成引导的端点
+// 是免鉴权的，而容器默认监听 0.0.0.0，「谁先连到端口谁就是管理员」是
+// 真实的抢注窗口。早期版本这里写的是「无需任何旁路凭据」—— 那句话已经
+// 随 2026-10-14 的加固作废，改它不是为了措辞，而是为了避免下一个人照着
+// 注释去写「凭据在哪」时得到错误答案。
 //
 // # 为什么 password_hash 留空
 //
@@ -82,7 +105,7 @@ func ensureBootstrapAdmin(ctx context.Context, db *store.Store, logger *slog.Log
 	logger.Info("created initial administrator account; set its password on first visit",
 		"username", u.Username,
 		"next_step", "打开管理后台的登录页会显示「首次设置密码」表单；"+
-			"设置完成后即可用该账号登录（不需要任何其他凭据）")
+			"设置完成后即可用该账号登录（需要一并填写本次部署的引导令牌）")
 }
 
 // bootstrapTokenEnv 是引导令牌的环境变量名。
@@ -116,32 +139,60 @@ const bootstrapTokenEnv = "ROSETTA_GW_BOOTSTRAP_TOKEN"
 //
 // 三者同进同退，所以不存在「设过密但令牌还在」（攻击者仍可重放）或
 // 「令牌清了但密码没设上」（管理员被永久锁在门外）这两种中间态。
-func ensureBootstrapToken(ctx context.Context, db *store.Store, logger *slog.Logger) {
+//
+// # 返回 error 的含义：只有「窗口开着且没能保护上」才是错误（2026-10-14）
+//
+// 早先这里只记 ERROR 日志然后 return，进程照常监听端口 —— 而引导窗口挂在
+// 免鉴权端点上，绑 0.0.0.0 时「日志里写了 ERROR」并不等于「窗口是关着的」。
+// 日志不是防线，**拒绝服务进入可接收状态**才是。
+//
+// 判定刻意只覆盖真正危险的组合，理由是「用一块用不上的凭据砖掉正常实例」
+// 比裸奔更难排查。四种失败路径（读标记失败 / 读令牌失败 / 弱环境变量 /
+// 随机源失败 / 写库失败）**全部**经由 unprotectedWindowError 收口到同一
+// 条规则，避免某一处偷偷比其他处宽松：
+//
+//   - 引导已完成（done）：窗口永久关着，没有令牌可保护 → 不是错误，
+//     否则每次重启已上线的实例都会因随机源异常而起不来。
+//   - 无待初始化管理员：窗口同样关着（BootstrapSetup 会回 409），同理放行。
+//   - 连「窗口开没开」都判不出来（查库失败）：**是**错误。状态不明时
+//     不能假设窗口关着 —— 那正是需要 fail-secure 的场景。
+//
+// 因此调用方收到 error 就应当拒绝启动（见 main）。
+func ensureBootstrapToken(ctx context.Context, db bootstrapTokenStore, logger *slog.Logger) error {
 	done, err := db.BootstrapCompleted(ctx)
 	if err != nil {
-		// 读不到状态时**不**生成：宁可这次部署没有令牌（回到旧的抢注风险、
-		// 但有启动日志里的 ERROR 告警），也不要往一个状态不明的库里
-		// 塞一条此后无法解释的凭据。
+		// 读不到状态时**不**生成，也**不**放行：不要往一个状态不明的库里
+		// 塞一条此后无法解释的凭据，更不能假设「窗口大概是关着的」。
+		//
+		// 判定仍交给 unprotectedWindowError：它会用 FindUninitializedAdmin
+		// 再问一次「窗口开着吗」，且在那一问也失败时按致命处理。让**所有**
+		// 失败路径共用同一个判据函数，比在这里另写一套更不容易出错 ——
+		// 这类分支最典型的失效方式就是某一处偷偷比其他处宽松。
 		logger.Error("bootstrap token: cannot read completed marker; skipping",
 			"error", err,
-			"impact", "本次部署的引导窗口没有令牌保护，请尽快完成首次设置密码")
-		return
+			"impact", "无法判断引导窗口是否开放，拒绝启动以免留下无令牌保护的免鉴权窗口")
+		return unprotectedWindowError(ctx, db, logger,
+			fmt.Errorf("read bootstrap completed marker: %w", err))
 	}
 	if done {
 		// 已完成引导：不再留令牌。已经完成过的安装也不该因为升级
 		// 而凭空多出一段日志和一个需要处置的凭据。
-		return
+		return nil
 	}
 	if tok, err := db.BootstrapToken(ctx); err != nil {
 		logger.Error("bootstrap token: cannot read existing token; skipping", "error", err)
-		return
+		// 读不到令牌 = 无法确认窗口是否已受保护。状态不明不能当安全，
+		// 但仍要问一句「窗口开着吗」：引导已完成的实例根本没有窗口，
+		// 不该因为一次无关的读失败而拒绝启动。
+		return unprotectedWindowError(ctx, db, logger,
+			fmt.Errorf("read bootstrap token: %w", err))
 	} else if tok != "" {
 		// 重启时令牌已存在：**不要**覆盖、不要重复打印。
 		// 覆盖会让运维手里那份失效；重复打印等于在每次重启时把同一个
 		// 凭据再往日志里摊一次。
 		logger.Info("bootstrap token already set; reuse the one printed at first start",
 			"hint", "日志若已轮转丢失，请删除该部署的 app_settings.bootstrap_token 后重启以重新生成")
-		return
+		return nil
 	}
 
 	token := os.Getenv(bootstrapTokenEnv)
@@ -157,7 +208,11 @@ func ensureBootstrapToken(ctx context.Context, db *store.Store, logger *slog.Log
 				"immediate_action", "设置一个至少 32 字节、建议 32 字节随机 hex 的令牌后重启；"+
 					"或移除该环境变量，让本次启动自行生成",
 				"accepted_length", bootstrapTokenMinLen)
-			return
+			// 弱令牌是运维显式写错的部署配置，值得一次响亮失败；但只有在
+			// 窗口**确实开着**时才致命，否则已上线的实例会因一个它再也
+			// 读不到的变量而拒绝启动。下面的判定负责这个收窄。
+			return unprotectedWindowError(ctx, db, logger, fmt.Errorf(
+				"%s is too weak: %w", bootstrapTokenEnv, err))
 		}
 	} else {
 		var err error
@@ -168,7 +223,7 @@ func ensureBootstrapToken(ctx context.Context, db *store.Store, logger *slog.Log
 			logger.Error("bootstrap token: crypto/rand failed;引导窗口没有令牌保护",
 				"error", err,
 				"immediate_action", "立即完成首次设置密码，或用 "+bootstrapTokenEnv+" 显式指定令牌后重启")
-			return
+			return unprotectedWindowError(ctx, db, logger, err)
 		}
 	}
 	if err := db.SetBootstrapToken(ctx, token); err != nil {
@@ -178,7 +233,8 @@ func ensureBootstrapToken(ctx context.Context, db *store.Store, logger *slog.Log
 			"error", err,
 			"immediate_action", "立即在浏览器打开 /admin/ 完成首次设置密码；"+
 				"在此之前不要把该端口暴露到公网")
-		return
+		return unprotectedWindowError(ctx, db, logger,
+			fmt.Errorf("persist bootstrap token: %w", err))
 	}
 
 	// 令牌只打一次、只进日志。绝不能进 HTTP 响应：BootstrapStatus 是
@@ -190,7 +246,53 @@ func ensureBootstrapToken(ctx context.Context, db *store.Store, logger *slog.Log
 			"设置成功后本令牌立即作废",
 		"recommendation", "生产环境建议显式设置 "+bootstrapTokenEnv+
 			"，避免令牌只能从日志里获取")
+	return nil
 }
+
+// unprotectedWindowError 在「令牌没布置上」的前提下，把失败收窄成
+// 「致命」或「无关」两种。
+//
+// 存在的理由：令牌布置失败**本身**不总是致命的。已经完成过引导的实例
+// （或压根没有待初始化管理员的实例）根本没有窗口可保护，让它们因为一个
+// 之后再也不会被读到的环境变量、或一次瞬态的随机源异常而拒绝启动，是把
+// 一个安全改进变成可用性事故 —— 而且症状（正常的实例起不来）完全指不到
+// 真正的原因上。
+//
+// 判定用 FindUninitializedAdmin（与 BootstrapSetup 的权威判定同源）：
+// 它为 nil 时窗口是关着的 —— 不存在「role=admin 且 password_hash 为空」
+// 的账号，BootstrapSetup 会在写库之前就回 409。
+//
+// 判不出来的情形（查库失败）按**致命**处理。方向很明确：宁可让一个状态
+// 不明的实例晚点再试，也不要在「窗口可能开着」时放它去监听端口。
+func unprotectedWindowError(ctx context.Context, db bootstrapTokenStore,
+	logger *slog.Logger, cause error) error {
+	pending, err := db.FindUninitializedAdmin(ctx)
+	switch {
+	case err != nil:
+		logger.Error("bootstrap token: cannot determine whether the setup window is open; "+
+			"refusing to treat this as harmless",
+			"error", err, "cause", cause)
+		return fmt.Errorf("cannot determine bootstrap window state after %w", cause)
+	case pending == nil:
+		// 没有待初始化管理员 = 窗口关着。安全，只是没有令牌可发。
+		logger.Info("bootstrap token not created, but no setup window is open",
+			"reason", "不存在待初始化管理员，免鉴权引导端点已关闭")
+		return nil
+	default:
+		logger.Error("bootstrap token not created WHILE the setup window is open; "+
+			"this deployment is refusing to serve the unauthenticated setup endpoint",
+			"pending_username", pending.Username, "cause", cause)
+		return fmt.Errorf("bootstrap window open but unprotected: %w", cause)
+	}
+}
+
+// bootstrapRandRead 是令牌生成用的随机源。
+//
+// 做成包级变量只有一个理由：**可测**。crypto/rand.Read 在正常机器上永远
+// 成功，那条「读随机源失败」的分支就永远跑不到，于是这个函数最该被钉住的
+// 语义（返回 error 而不是空串）只剩注释保证。抽成变量后测试能把它换成
+// 一个必然失败的实现，真实路径保持零分配、零间接。
+var bootstrapRandRead = rand.Read
 
 // newBootstrapToken 生成 32 字节（256 bit）CSPRNG 随机值并 hex 编码。
 //
@@ -203,7 +305,7 @@ func ensureBootstrapToken(ctx context.Context, db *store.Store, logger *slog.Log
 // 把状态不明的窗口伪装成已加固的窗口。
 func newBootstrapToken() (string, error) {
 	b := make([]byte, 32)
-	if _, err := rand.Read(b); err != nil {
+	if _, err := bootstrapRandRead(b); err != nil {
 		return "", fmt.Errorf("read crypto/rand: %w", err)
 	}
 	return hex.EncodeToString(b), nil
