@@ -295,18 +295,28 @@ async function load() {
     // 「全部」档额外要终身累计：明细被剪掉之后，byDay 的最早一天不再是
     // 真正的起点（只剩 30 天），first_record_at 才是（见 stats_handler）。
     const wantLifetime = range.value === 'all'
-    const [s, d, m, k, p] = await Promise.all([
+    // 六路并发，但**降级语义分两组**。
+    //
+    // 前五个是页面的骨架：任一失败整屏都拿不到数据，必须走外层 catch
+    // 进错误态。否则页面呈现的是「加载中…」消失后的空卡片，运维会读成
+    // 「今天没有流量」，恰好把网关/上游故障这个方向排除掉 —— 而那正是
+    // 需要排查的方向。
+    //
+    // providers 只是把 provider_id 翻成名字用的映射，失败回退成短 id 即可，
+    // 远不值得让整屏数据消失，所以它自带 .catch 降级、不参与那组语义。
+    //
+    // **关键**：它与前面五个是**同一个 Promise.all**，而不是排在后面
+    // 单独 await（2026-10-15 性能审计）。串行写法让首屏多等一个完整 RTT，
+    // 而降级语义靠 .catch 就能保证，与「是否并行」无关 —— 早先把它拆到
+    // 第二个 await 是把「降级」和「串行」这两件不相干的事绑在了一起。
+    const [s, d, m, k, p, provs] = await Promise.all([
       api.stats(from, to, wantLifetime),
       api.usageByDay(from, to),
       api.usageByModel(from, to),
       api.usageByKey(from, to),
       api.usageByProvider(from, to),
+      api.providers().catch(() => [] as Provider[]),
     ])
-    // 供应商名映射独立加载：它只用于把 provider_id 翻成名字，失败不该让
-    // 整页报错 —— 兜底成空映射，界面回退显示短 id 即可。
-    // 独立发而不是并进上面的 Promise.all：那边任一失败会走 catch 让整页
-    // 进错误态，而「名字取不到」远不值得让整屏数据消失。
-    providers.value = await api.providers().catch(() => [] as Provider[])
 
     if (seq !== reqSeq) return // 期间切换了新范围，本响应已过时
     stats.value = s
@@ -314,12 +324,14 @@ async function load() {
     byModel.value = m
     byKey.value = k
     byProvider.value = p
+    providers.value = provs
   } catch (e) {
     if (seq !== reqSeq) return
     if ((e as { status?: number }).status === 401) return
-    // 总览有四个并发请求，任一失败整页都拿不到数据。不留错误态的话，
-    // 页面呈现的是「加载中…」消失后的空卡片，运维会读成「今天没有流量」，
-    // 恰好把网关/上游故障这个方向排除掉 —— 而这正是需要排查的方向。
+    // 骨架那五个请求任一失败整页都拿不到数据。不留错误态的话，页面呈现的
+    // 是「加载中…」消失后的空卡片，运维会读成「今天没有流量」，恰好把
+    // 网关/上游故障这个方向排除掉 —— 而那正是需要排查的方向。
+    // （providers 那路自带降级，不会落到这里。）
     err.value = '加载总览失败：' + (e as Error).message
     toast(err.value, 'err')
   } finally {
