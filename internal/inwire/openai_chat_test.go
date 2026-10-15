@@ -3,6 +3,7 @@ package inwire
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -49,6 +50,76 @@ func decodeChat(t *testing.T, body string) *OpenAIChatRequest {
 		t.Fatalf("decode: %v", err)
 	}
 	return got
+}
+
+// n > 1 必须被拒绝（2026-10-14，交接文档 §7.2 第 1 条）。
+//
+// 本测试存在的全部理由是「**不得静默降级**」：rosetta 与三个上游协议都不
+// 支持多候选，ToRosetta 也从不读 n。若不拒绝，客户端传 `{"n":3}` 会拿到
+// 200 + 1 个候选 —— 请求被无声打了对折，调用方看到的是「模型就这样」，
+// 而不是「我的请求没被完整执行」。
+//
+// 这组断言里最要紧的不是「返回了 error」，而是 **n=1 与 n=0 仍然放行**。
+// 把拒绝写成 `req.N != nil && *req.N != 1` 之类的严格判定，会让按
+// 「0 = 不指定」生成请求体的客户端集体 400 —— 那是把一个小修变成事故。
+func TestDecodeOpenAIChatRequest_RejectsMultipleChoices(t *testing.T) {
+	const base = `{"model":"m","messages":[{"role":"user","content":"hi"}],`
+
+	for _, n := range []int{2, 3, 8, 128} {
+		t.Run(fmt.Sprintf("n=%d", n), func(t *testing.T) {
+			body := base + fmt.Sprintf(`"n":%d}`, n)
+			req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
+			_, err := DecodeOpenAIChatRequest(req, 1<<20)
+			if err == nil {
+				t.Fatalf("n=%d 被接受 —— 客户端会拿到 1 个候选却以为要了 %d 个", n, n)
+			}
+			// 错误消息必须指名 n：客户端要能据此改代码，而不是去猜
+			// 到底是 model、messages 还是别的字段的问题。
+			if !strings.Contains(err.Error(), "n=") {
+				t.Errorf("错误消息没有指明是 n 的问题：%v", err)
+			}
+		})
+	}
+}
+
+// n=1（OpenAI 默认）与 n=0（OpenAI 视同未指定）都必须放行。
+//
+// 这两条是上一组测试的对照：只测「n>1 被拒」的套件完全看不见
+// 「拒绝范围写宽了」这种回归，而那正是本改动最容易犯的错。
+func TestDecodeOpenAIChatRequest_AllowsSingleChoice(t *testing.T) {
+	cases := []struct {
+		name string
+		body string
+	}{
+		{"n=1", `{"model":"m","messages":[{"role":"user","content":"hi"}],"n":1}`},
+		{"n=0", `{"model":"m","messages":[{"role":"user","content":"hi"}],"n":0}`},
+		{"不传 n", `{"model":"m","messages":[{"role":"user","content":"hi"}]}`},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(tc.body))
+			got, err := DecodeOpenAIChatRequest(req, 1<<20)
+			if err != nil {
+				t.Fatalf("decode 失败：%v", err)
+			}
+			if got.Model != "m" {
+				t.Errorf("model = %q, want m", got.Model)
+			}
+		})
+	}
+}
+
+// 负数 n 必须被拒绝。
+//
+// 与 n>1 分开测而不是塞进同一组：两者虽然都走 400，但语义不同 ——
+// 一个是「支持不了」，一个是「取值本身不合法」。合成一条会让将来
+// 有人改动其中一支时看不出另一支的意图。
+func TestDecodeOpenAIChatRequest_RejectsNegativeN(t *testing.T) {
+	body := `{"model":"m","messages":[{"role":"user","content":"hi"}],"n":-1}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
+	if _, err := DecodeOpenAIChatRequest(req, 1<<20); err == nil {
+		t.Fatal("n=-1 被接受 —— 一个没有意义的取值不该被静默接受")
+	}
 }
 
 // chat → openai-responses：能等价翻译的字段必须翻译，不得整个静默丢弃（P1-8）。

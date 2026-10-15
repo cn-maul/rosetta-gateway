@@ -43,9 +43,17 @@ type OpenAIChatRequest struct {
 	// 与 low 已被合并，xhigh 与 high 已被合并 —— 夹取就退化成了「在 low/medium/
 	// high 里选」，模型只支持 xhigh 的那种配置会被夹到 high 去，也就是本功能
 	// 要消灭的那类静默降级。
-	RawEffort         string          `json:"-"`
-	PresencePenalty   *float64        `json:"presence_penalty,omitempty"`
-	FrequencyPenalty  *float64        `json:"frequency_penalty,omitempty"`
+	RawEffort        string   `json:"-"`
+	PresencePenalty  *float64 `json:"presence_penalty,omitempty"`
+	FrequencyPenalty *float64 `json:"frequency_penalty,omitempty"`
+	// N 是「每个输入生成几个候选」。**已声明但从未转发**（2026-10-14 起
+	// 显式拒绝 n>1，见 DecodeOpenAIChatRequest）。
+	//
+	// 为什么保留这个字段而不是删掉：删了它，客户端传 `{"n":3}` 会在
+	// 严格解码下变成「未知字段」错误，或者在宽松解码下被静默忽略 ——
+	// 后者正是要消灭的失败模式。留着字段、在 decode 侧明确拒绝，
+	// 客户端拿到的是一个可据以改代码的 400（带原因），而不是一个
+	// 看起来成功、实际少给了候选的 200。
 	N                 *int            `json:"n,omitempty"`
 	ResponseFormat    json.RawMessage `json:"response_format,omitempty"`
 	Seed              *int            `json:"seed,omitempty"`
@@ -166,6 +174,33 @@ func DecodeOpenAIChatRequest(r *http.Request, maxBytes int64) (*OpenAIChatReques
 	}
 	if len(req.Messages) == 0 {
 		return nil, fmt.Errorf("messages is required")
+	}
+	// n > 1 一律拒绝（2026-10-14，交接文档 §7.2 第 1 条）。
+	//
+	// # 为什么必须 400 而不是静默降级
+	//
+	// rosetta 与三个上游协议都不支持多候选，ToRosetta 也从不读这个字段。
+	// 于是客户端传 `{"n":3}` 时会拿到一个 200 响应、里面只有 1 个候选 ——
+	// 请求被静默打了对折，且**没有任何信号**指出发生过这件事。
+	//
+	// 这类「成功但结果不对」比报错难查得多：调用方看到的是模型行为，
+	// 不会想到去核对 choices 数组的长度。显式 400 让它在开发阶段
+	// 就暴露，而不是在生产里变成一个长期的错误结论。
+	//
+	// # 边界
+	//
+	//   - n == 1：合法且是 OpenAI 的默认，必须放行。
+	//   - n == 0：OpenAI 视同未指定（不是「要 0 个候选」），放行。
+	//     拒绝它会破坏按「0 = 不设」生成请求体的客户端。
+	//   - n < 0：不合法，一并拒绝 —— 与 n>1 同一个原因（无意义的取值
+	//     不该被静默接受），且响应里要说清楚是 n 的问题。
+	if req.N != nil {
+		if *req.N > 1 {
+			return nil, fmt.Errorf("n=%d is not supported: this gateway returns exactly 1 choice per request; set n=1 or omit it", *req.N)
+		}
+		if *req.N < 0 {
+			return nil, fmt.Errorf("n=%d is invalid: must be >= 0", *req.N)
+		}
 	}
 
 	if req.ReasoningEffort != nil {
