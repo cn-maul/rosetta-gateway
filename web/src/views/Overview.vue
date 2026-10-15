@@ -98,7 +98,7 @@ const daySeries = computed<Bucket[]>(() => {
   //
   // 修复前这里是「byDay 里最早的那一天」—— 明细剪掉 30 天以后，byDay 只剩
   // 30 天，趋势图会凭空丢掉更早的历史（usage_totals.first_record_at 存的就是
-  // 这个值，HANDOFF.md §「总览全部档」要求的正是改用它）。
+  // 这个值 —— 「全部」档必须用终身累计口径，不能用 30 天窗口的起点）。
   // 拿不到（普通用户 / 没请求 / 无数据）时回退到旧逻辑。
   let start: Date
   if (days === 0) {

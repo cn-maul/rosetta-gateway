@@ -626,7 +626,7 @@ func (s *Store) ReleaseUserQuota(ctx context.Context, userID string, reserved in
 // UserQuotaAndUsed 一次取回「配额 + 已用」，供 /stats 顺带下发。
 //
 // 2026-10-11：前端的钱包页原先只能从 /me 拿这两个字段，而 /me 是**登录快照**，
-// 于是「已用量」在页面上长期停更（见 AUDIT/frontend-audit-2026-10-11.md H1）。
+// 于是「已用量」在页面上长期停更（前端审计 H1）。
 // 把它们并入 /stats 后，界面每次刷新都能拿到当前值。
 //
 // 为什么单开这个方法而不是让调用方自己查两次：

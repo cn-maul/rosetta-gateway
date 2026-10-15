@@ -100,8 +100,7 @@ OpenAI 系客户端；额度查询端点（`/dashboard/billing/*`、`/v1/organiz
 | [DESIGN.md](DESIGN.md) | 设计文档：架构、数据模型、路由、配额、故障转移、协议转换、配置 |
 | [MULTIUSER.md](MULTIUSER.md) | ⚠️ **历史归档**（冻结于 2026-10-07）：多用户 / 分组 / 权限模型的设计记录。保留是因为代码中有 20+ 处注释以它的章节号为锚点 |
 | [DOCKER.md](DOCKER.md) | 容器化部署：镜像、挂载、日志、升级、健康检查 |
-| [AUDIT/](AUDIT/README.md) | 审计与测试留痕。**先读 [audit-2026-10-13.md](AUDIT/audit-2026-10-13.md)**（最新全量审计），索引见 [AUDIT/README.md](AUDIT/README.md) |
-| [HANDOFF.md](HANDOFF.md) | 项目状态交接：当前版本、已知缺口、环境事实、发布剩余步骤 |
+| [CONTRIBUTING.md](CONTRIBUTING.md) | 开发环境与协作约定：本机 `-race` 的 CC 陷阱、纯 Go 交叉编译、代理与 SSH、`sync-embed`、TS 版本上界、代码风格 |
 
 ## 开发
 
@@ -113,3 +112,4 @@ cd web && npm ci && npm run typecheck && npm run build && npm run sync
 
 提交前请跑全量测试；改动转发热路径（配额/限速/故障转移/落库）时，先读
 [DESIGN.md](DESIGN.md) 对应小节的决策留痕——那里的多数「为什么」都对应一次真实踩坑。
+本机特有的环境坑（`-race` 需要显式 CC 等）见 [CONTRIBUTING.md](CONTRIBUTING.md)。

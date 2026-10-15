@@ -488,12 +488,8 @@ export interface User {
 // store.Topup 的 json tag **逐字对齐**（2026-10-11 已核对实际实现），
 // 外加端点补的 username（被充值者的用户名）。
 //
-// ⚠️ **作用域口径待 Lead 决策**（详见 AUDIT/task-admin-wallet.md）：
-// 服务端 ListTopups 当前对**管理员也**按自己的 id 收窄 —— 而管理员不能被
-// 充值（AdjustBalance 已拦下），所以管理员调用它恒返回空列表。
-// 用户需求是「管理员看到所有用户的充值流水」，两者相反。
-// 扩作用域是服务端改动，本任务不自行修改；接口**形状**已按实际实现锁定，
-// 因此联调没有阻塞，只有「管理员看得到几张行」这一个待决问题。
+// 作用域按身份收窄：管理员拿**全站**流水，普通用户只看自己。
+// 见 `internal/admin/user_admin_handler.go` 的 ListTopups。
 export interface TopupRecord {
   id: string
   /** 被充值的用户（不是操作者）。 */

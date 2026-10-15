@@ -26,7 +26,7 @@ import type { ApiError, BootstrapStatus, Me, SessionStatus, LoginResult, ConfigI
 
 const TOKEN_KEY = 'rosetta_gw_admin_token'
 
-// sessionStorage 而非 localStorage（AUDIT P2-29）。
+// sessionStorage 而非 localStorage（前端安全审计 P2-29 的结论）。
 //
 // 差别只在「关掉标签页后是否还在」：localStorage 里的令牌会**长期驻留**，
 // 于是任何能在这个源上执行脚本的东西（供应链投毒的依赖、XSS）都能在
@@ -654,10 +654,9 @@ export const api = {
    * 作用域由服务端按会话身份决定，不接受查询参数指定查谁（普通用户传
    * ?user_id= 会被忽略）。
    *
-   * ⚠️ **作用域待 Lead 决策**：服务端 ListTopups 当前对**管理员也**按自己
-   * 的 id 收窄，而管理员不能被充值，所以管理员调它恒为空数组；用户需求是
-   * 管理员看**全站**流水。这是服务端改动，本任务不自行修改，详见
-   * AUDIT/task-admin-wallet.md。
+   * 作用域按身份收窄：管理员拿**全站**流水（`ListAllTopups`），普通用户只看
+   * 自己（`ListTopupsByUser`）。见 `internal/admin/user_admin_handler.go` 的
+   * ListTopups。
    */
   topups: (limit = 50, offset = 0) =>
     get<TopupPage>(`/topups?limit=${limit}&offset=${offset}`),

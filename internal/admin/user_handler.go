@@ -468,19 +468,24 @@ type bootstrapSetupRequest struct {
 //
 // # 安全性
 //
-// 免鉴权写接口，但受三重限制：
+// 免鉴权写接口，但受四重限制：
 //  1. 一次性标记（bootstrap_completed）先决：本安装完成过引导 → 409，
 //     此端点即失效 —— 哪怕库里恰好还存在空密码 admin（bug 期间建出的），
 //     也不能经这里被设上密码。标记与设密同事务写入，见 store.SetInitialAdminPassword。
 //  2. 只对「role=admin 且 password_hash 为空」的那个账号有效，且条件 UPDATE
 //     保证只设一次：引导完成后再调 → 409，不是覆盖。
-//  3. decodeJSON 强制 Content-Type: application/json（CSRF 防线，
+//  3. 一次性引导令牌（2026-10-14 加固）：本安装配置了令牌时，必须带对
+//     token 才能完成，比对恒定时间且发生在写事务内。缺了这条，
+//     「全新部署 + 监听非回环」就等于把第一个管理员的位置公开拍卖 ——
+//     SameOrigin 挡得住网页，挡不住 curl。
+//  4. decodeJSON 强制 Content-Type: application/json（CSRF 防线，
 //     见 helpers.go 的说明），且上面叠一层同源判定。
 //
-// 残留风险要说清楚：**全新部署且监听非回环时，任何能连到端口的人
-// 都能抢先成为第一个管理员**。这与旧实现「无凭据时 password/set 免鉴权」
-// 的暴露面完全相同 —— 统一认证没有把它变大，只是把它挪了个位置。
-// 真正的缓解是绑回环（默认 listen 就是），以及首次设密后立即失效。
+// 残留风险要说清楚：**全新部署且监听非回环时，知道引导令牌的人
+// 就能抢先成为第一个管理员**。令牌的来源只有启动日志或
+// ROSETTA_GW_BOOTSTRAP_TOKEN，所以防线是「谁能看到部署日志与部署清单」，
+// 而不是「谁能连到端口」。生产部署应显式设置该环境变量：自动生成的
+// 令牌只存在于日志里，而日志会随轮转与聚合平台长期留存。
 func (h *UserHandler) BootstrapSetup(w http.ResponseWriter, r *http.Request) {
 	// 引导窗口是「无凭据可校验」时开的，必须防跨站抢注 —— 与
 	// password/set 当年的同源判定同理由。放在最前面：不同源的请求

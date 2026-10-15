@@ -31,7 +31,7 @@ package main
 //
 // 复用 failover_test.go 的 buildHarness / buildHarnessFull / fakeGood /
 // fakeStreamGood / fakeStreamHang，不重造脚手架。**不修改任何生产代码**：
-// 发现的瓶颈只写进 AUDIT/test-perf.md，不在本文件里"顺手优化"。
+// 发现的瓶颈只写进注释，不在本文件里"顺手优化"。
 //
 // # 不在本文件里跑的东西
 //
@@ -705,7 +705,7 @@ func TestPerfConcurrencyScaling(t *testing.T) {
 	t.Logf("B-summary 并发 ×%.1f → QPS ×%.2f（线性则为 ×%.1f）；P99 %v → %v",
 		concRatio, qpsRatio, concRatio, first.p99.Round(time.Microsecond), last.p99.Round(time.Microsecond))
 	t.Logf("B-summary 扩展效率 = %.2f（1.00 = 完美线性；<0.5 说明已明显饱和）", qpsRatio/concRatio)
-	t.Logf("B-summary 拐点与瓶颈归因见 AUDIT/test-perf.md；" +
+	t.Logf("B-summary 拐点与瓶颈归因见本包 perf_test.go 的注释；" +
 		"perf_leak_test.go 的 TestDiagBottleneck 给出了直连对照与 DB 微基准")
 
 	if last.ok == 0 {

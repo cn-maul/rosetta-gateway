@@ -40,7 +40,7 @@ var (
 // 互相解不开。密钥落盘后两种方式共用同一把。
 // generated 表示本次是否新生成密钥（调用方可据此打日志）。
 // weak 表示密钥材料熵偏低（< 32 字符）——大概率是用户手填的口令而非随机密钥。
-// 推导仍是 SHA-256（改推导会锁死存量凭据，见 AUDIT 2026-10-04 的评估），
+// 推导仍是 SHA-256（改推导会锁死存量凭据，见 WeakMaterial 的注释），
 // 调用方应当 WARN 提醒改用自动生成的 master.key。
 func LoadMasterKey(envName, dir string) (key []byte, generated bool, weak bool, err error) {
 	if envName == "" {
@@ -256,7 +256,7 @@ func GenerateKey() string {
 // 阈值 32 字符：自动生成的 master.key 是 44 字符 base64url（熵充足）；
 // 手填的短口令（"123456"、公司名拼音）落库加密的是上游付费 API Key，
 // 值得被离线字典爆破。
-// 只作告警依据，不改变推导 —— 见 AUDIT 2026-10-04：改推导（KDF）会让
+// 只作告警依据，不改变推导 —— 改推导（KDF）会让
 // 存量密文全部解不开，锁死代价高于收益。
 func WeakMaterial(raw string) bool {
 	return len(strings.TrimSpace(raw)) < 32

@@ -23,7 +23,7 @@ func newArchiveStore(t *testing.T) *Store {
 }
 
 // users.used_tokens 从「展示快照」升级为配额判定数据源（2026-10-11，
-// 见 AUDIT/perf-2026-10-11.md §五）之后，它由 trg_update_user_used_tokens
+// 见 internal/config 的 UsageRetentionDays 注释）之后，它由 trg_update_user_used_tokens
 // 触发器累加、并在剪枝事务里回收。
 //
 // 这一组测试钉的就是那条**配对不变量**：触发器只加不減，剪枝负责減；

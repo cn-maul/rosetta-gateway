@@ -38,7 +38,7 @@ type Config struct {
 	// UsageRetentionDays 是 usage_records 明细保留天数，超期由归档剪枝
 	// （store.PruneOldUsage）聚合进 usage_daily_rollups 后删除。
 	//
-	// # 为什么要做成配置（2026-10-11，性能审计 AUDIT/perf-2026-10-11.md）
+	// # 为什么要做成配置（2026-10-11 性能审计）
 	//
 	// 此前是 store.DefaultRetentionDays 常量硬编码 30。实测增长曲线
 	// （0.5µs/行）显示这个值同时决定两件事，方向相反：

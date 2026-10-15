@@ -658,7 +658,7 @@ func main() {
 		runPrune := func(reason string) {
 			// 保留期来自配置（config.UsageRetentionDays），默认 30。
 			// 此前硬编码 store.DefaultRetentionDays，用量小的部署无法调短 ——
-			// 见 AUDIT/perf-2026-10-11.md §五：它直接决定用户级配额预检的
+			// 性能审计实测：它直接决定用户级配额预检的
 			// 单次耗时（30 天 ≈ 63ms，7 天 ≈ 15ms）。
 			res, err := db.PruneOldUsage(context.Background(), cfg.UsageRetentionDays)
 			switch {
@@ -2849,7 +2849,7 @@ const (
 
 	// usageBatchSize 是一批最多攒多少条 usage 记录（2026-11 P1 性能修复）。
 	//
-	// 取 50 是**实测**出来的（AUDIT/fix-p1-perf.md 的 batch 探针，
+	// 取 50 是**实测**出来的（batch 探针，
 	// 同机同方法）：每行耗时随批大小的曲线是
 	//   bs=1 → 305µs   bs=10 → 77µs   bs=50 → 39µs   bs=200 → 45µs
 	// 收益在 50 附近饱和，再往上反而略升（大 VALUES 文本变大，
@@ -2912,7 +2912,7 @@ func newUsageRecorder(db *store.Store, logger *slog.Logger) *usageRecorder {
 // **39µs/行（7.6×）**。差的是每次独立事务的固定开销（commit）。
 //
 // 写池是单连接（SetMaxOpenConns(1)），于是每个成功请求都要付一次那个
-// 固定开销 —— 这就是 AUDIT/test-perf.md 那条 P1 的直接成因：
+// 固定开销 —— 这就是「吞吐被落库钉死」那个 P1 的直接成因：
 // 吞吐被钉在落库速率上（实测仅 INSERT 时 3693 req/s）。
 //
 // 现在改成：**攒够一批（或队列已排空）就一个事务写入**。
@@ -2925,7 +2925,7 @@ func newUsageRecorder(db *store.Store, logger *slog.Logger) *usageRecorder {
 // 失败时**整批回滚**，store 返回**全 0 费用**，调用方据此**整批不扣费**。
 // 这与单条路径的「落库失败 → 不扣费」口径完全一致：账记不下来时不收钱。
 //
-// 扣费**不跟着批量**，仍是逐条一个事务 —— 理由见 AUDIT/fix-p1-perf.md 第 4 节：
+// 扣费**不跟着批量**，仍是逐条一个事务 —— 理由：
 // 幂等键 (request_id, user_id) 是逐条的，聚合扣费会让「哪几笔算已扣过」
 // 变成需要额外状态才能回答的问题，错一次就是漏收或重复收费。
 func (u *usageRecorder) worker() {

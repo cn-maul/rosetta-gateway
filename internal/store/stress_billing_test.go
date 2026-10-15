@@ -18,7 +18,7 @@ package store
 // # 并发测试为什么不能只跑一次
 //
 // 并发 bug 的触发依赖交错，单次运行很可能恰好走的是安全路径。所以：
-//   - 本文件里的并发用例都用 `-count=20` 重复跑过（见 AUDIT/test-billing.md）；
+//   - 本文件里的并发用例都用 `-count=20` 重复跑过；
 //   - 并发用例内部也刻意用 `sync.WaitGroup` + 显式 start 门闩放大交错，
 //     而不是串行调用后假装并发。
 //
@@ -30,7 +30,7 @@ package store
 //	CGO_ENABLED=1 CC=C:/mingw64/bin/gcc.exe go test -race ./internal/store/
 //
 // 已用阳性对照验证 race 运行时确实生效（故意制造的数据竞争被报告）。
-// 详见 AUDIT/test-billing.md 的「-race 环境」一节。
+// 本机需显式指定无空格的 gcc 路径（详见 CONTRIBUTING.md）。
 
 import (
 	"context"

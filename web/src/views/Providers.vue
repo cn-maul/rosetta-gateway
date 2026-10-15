@@ -177,7 +177,7 @@ const testTimeoutMs = ref(150_000 + 5_000)
 // 集合 + 按 id 清除后，每一行只受自己的测试约束。
 //
 // 现在只服务上游模型行的「测试」：provider 行上的那个按钮已按需求移除
-// （api.testProvider 与后端 /providers/{id}/test 都保留，见 AUDIT 报告）。
+// （api.testProvider 与后端 /providers/{id}/test 都保留，只是不再从 provider 行触发）。
 const testing = ref(new Set<string>())
 
 function isTesting(id: string): boolean {
@@ -238,7 +238,7 @@ async function testModel(m: UpstreamModel) {
 //   - 已有凭据的权重**保持原值**（PATCH 不传 weight = nil = 不改），
 //     不会被静默重置成 1。
 // 副作用是界面上再也改不了权重（多凭据配额分配只能靠后端/API），
-// 这是用户明确要求的结果，已在 AUDIT/task-provider-ui.md 里记明。
+// 这是用户明确要求的结果。
 const cForm = reactive({ open: false, provider: '' as string, editing: '' as string, label: '', api_key: '' })
 
 function openCred(providerId: string, c?: Credential) {
@@ -707,7 +707,7 @@ onMounted(() => {
                        「测试」（发一次最小真实推理）。留着它反而提供一个
                        比模型级测试更弱的绿色信号，容易被当成「都正常」。
                        后端 POST /providers/{id}/test 与 api.testProvider
-                       都保留（见 AUDIT/task-provider-ui.md 的理由）。 -->
+                       都保留，只是不再从这一行触发。 -->
                   <button class="btn btn-act btn-ghost" @click="openExpand(p.id)">
                     {{ expandedId === p.id ? '收起' : '展开' }}
                   </button>

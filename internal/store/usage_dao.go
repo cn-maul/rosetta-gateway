@@ -144,7 +144,7 @@ func (s *Store) CreateUsageRecordWithCost(ctx context.Context, r *UsageRecord) (
 //
 // # 为什么需要它（性能）
 //
-// 单条落库的实测成本是 **296µs/行**（AUDIT/fix-p1-perf.md 的 batch 探针）。
+// 单条落库的实测成本是 **296µs/行**（batch 探针实测）。
 // 拆开看，这 296µs 里绝大部分是**每次独立事务的固定开销**：
 // 把 N 行并进一个事务后，bs=50 时降到 **39µs/行（7.6×）**。
 // 单写连接（SetMaxOpenConns(1)）下每个成功请求都要付一次这个固定开销，
