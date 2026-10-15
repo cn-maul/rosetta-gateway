@@ -1,0 +1,1 @@
+var e=/\p{Ll}/u,t=/\p{Lu}/u,n=/\p{Nd}/u;function r(r){if(!r)return``;let i=[...r];if(i.length<8)return`至少 8 个字符`;let a=!1,o=!1,s=!1,c=!1;for(let r of i)e.test(r)?a=!0:t.test(r)?o=!0:n.test(r)?s=!0:c=!0;return[a,o,s,c].filter(Boolean).length<2?`需包含字母/数字/符号中的至少两类`:``}export{r as t};

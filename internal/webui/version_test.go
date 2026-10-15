@@ -46,7 +46,25 @@ func TestEmbeddedVersionMatchesPackageJSON(t *testing.T) {
 	}
 
 	js := embeddedBundle(t)
-	if !strings.Contains(js, `"`+want+`"`) {
+	// 两种引号形态都要接受（2026-10-15，Vite 5 → 8 迁移）。
+	//
+	// 版本号经 vite.config.ts 的 `define` 注入，落在模板字面量里。
+	// esbuild（Vite 5）把常量字符串折叠成**双引号**字面量；
+	// Rolldown/Oxc（Vite 8）则原样保留**反引号**模板字面量：
+	//
+	//	…`v${b(y(`1.6.0`))} · rosetta `…
+	//
+	// 原断言只认双引号，于是升级构建器后版本号明明在产物里、测试却报
+	// 「找不到」—— 而它的报错文案（"请重新执行 npm run build"）会把人
+	// 引向完全错误的方向。
+	//
+	// 仍要求它是一个**被引号包住的字面量**（而不是裸匹配）：后者会在
+	// 版本号恰好是别的数字子串时假绿，例如 want="1.6.0" 撞上 "11.6.05"。
+	// 本测试要守的是「产物与 package.json 同版本」，不是「构建器用哪种
+	// 引号」—— 后者会随构建器换代而变，前者不会。
+	quoted := `"` + want + `"`   // "1.6.0"
+	backtick := "`" + want + "`" // `1.6.0`
+	if !strings.Contains(js, quoted) && !strings.Contains(js, backtick) {
 		t.Errorf("内嵌前端产物里找不到版本号 %q —— "+
 			"请重新执行 `cd web && npm run build && node sync-embed.mjs` "+
 			"**并重新 go build**（//go:embed 是编译期固化，不重编译等于没生效）", want)
