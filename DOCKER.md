@@ -2,11 +2,11 @@
 
 镜像：`ghcr.io/cn-maul/rosetta-gateway`
 
-**镜像版本号 = 软件版本号**，两者都取自 `web/package.json` 的 `version`（当前 **1.6.0**）。
-发布 `v1.6.0` tag 会得到 `:1.6.0` 与 `:latest` 两个标签；CI 会校验 tag 与
+**镜像版本号 = 软件版本号**，两者都取自 `web/package.json` 的 `version`（当前 **1.6.1**）。
+发布 `v1.6.1` tag 会得到 `:1.6.1` 与 `:latest` 两个标签；CI 会校验 tag 与
 `package.json` 一致，不一致直接构建失败（防止打出名不副实的镜像）。
 
-> 下文示例中的 `:1.6.0` 是**编写时的当前版本**。实际部署请先 `docker pull ghcr.io/cn-maul/rosetta-gateway:1.6.0`
+> 下文示例中的 `:1.6.1` 是**编写时的当前版本**。实际部署请先 `docker pull ghcr.io/cn-maul/rosetta-gateway:1.6.1`
 > 确认该 tag 存在，或直接用 `:latest`。
 
 架构：`linux/amd64`（CI 只构建这一种；需要 arm64 再说）。
@@ -21,7 +21,7 @@ docker run -d \
   -p 8666:8666 \
   -v rosetta-gateway-data:/data \
   --restart unless-stopped \
-  ghcr.io/cn-maul/rosetta-gateway:1.6.0
+  ghcr.io/cn-maul/rosetta-gateway:1.6.1
 ```
 
 然后打开 `http://<主机>:8666/admin/` —— 首次进入会显示「首次设置密码」表单，
@@ -113,7 +113,7 @@ Chrome / Edge / Brave / Opera 一律硬拦；Firefox 也拦，只是报错文案
 > 第一次可以这样初始化：
 > ```bash
 > mkdir -p /srv/rosetta/data
-> docker run --rm ghcr.io/cn-maul/rosetta-gateway:1.6.0 \
+> docker run --rm ghcr.io/cn-maul/rosetta-gateway:1.6.1 \
 >   cat /app/config.default.json > /srv/rosetta/config.json
 > ```
 > （`mkdir` 了 `data`，因为 `db_path` 指向 `/data/data/gateway.db`，父目录必须存在；
@@ -133,7 +133,7 @@ Chrome / Edge / Brave / Opera 一律硬拦；Firefox 也拦，只是报错文案
 ```yaml
 services:
   rosetta-gateway:
-    image: ghcr.io/cn-maul/rosetta-gateway:1.6.0
+    image: ghcr.io/cn-maul/rosetta-gateway:1.6.1
     container_name: rosetta-gateway
     restart: unless-stopped
     ports:
