@@ -869,7 +869,123 @@ type rawModelEntry struct {
 	// 上游」，后者是「明确不支持，剥掉思考」。
 	SupportsReasoning *bool `json:"supports_reasoning"`
 	SupportsThinking  *bool `json:"supports_thinking"`
-	Reasoning         *bool `json:"reasoning"`
+	// Reasoning 是最麻烦的一个字段名：它在不同上游是**两种不兼容的形状**。
+	//
+	// 实测 OpenRouter（2026-10-15，462 个模型）给的是**对象**：
+	//
+	//	"reasoning": {"mandatory":true,"supported_efforts":["high","medium","low"],
+	//	               "default_effort":"medium"}
+	//	"reasoning": {"mandatory":false,"default_enabled":true}
+	//
+	// 而某些上游给的是裸布尔。原先这里声明成 *bool，OpenRouter 的对象形态
+	// 直接触发 `json: cannot unmarshal object into Go struct field
+	// .data.2.reasoning of type bool` —— **整个模型列表解析失败**，
+	// 「获取模型」整个功能不可用（不是某一个模型出错，是全部）。
+	//
+	// 两种形状的解读见 flexBool 的注释。
+	Reasoning flexBool `json:"reasoning"`
+}
+
+// flexBool 收「可能是布尔、也可能是对象」的思考能力字段。
+//
+// # 为什么需要它
+//
+// `reasoning` 这个字段名在不同上游是**两种不兼容的形状**。实测 OpenRouter
+// （2026-10-15，462 个模型全量统计）给的是**对象**，0 个模型给裸布尔：
+//
+//	"reasoning": {"mandatory":true,"supported_efforts":["high","medium","low"],
+//	               "default_effort":"medium"}
+//	"reasoning": {"mandatory":false,"default_enabled":true}
+//
+// 声明成 *bool 时，OpenRouter 的对象形态会触发
+// `json: cannot unmarshal object into Go struct field .data.N.reasoning of
+// type bool` —— 而这是**整个列表**解析失败，不是一个模型出错：
+// 「获取模型」功能对 OpenRouter 完全不可用。
+//
+// # 两种形状各自怎么解读
+//
+// 对象形态（OpenRouter）的 `mandatory` 语义**不是**「支持思考」而是
+// 「思考是强制的」—— 强制蕴含支持，于是 Mandatory=true → 支持；
+// 但 Mandatory=false 不等于不支持，它只说明「思考可选」，而 OpenRouter
+// 在这条分支上通常还给了 default_enabled 或 supported_efforts。
+// 所以判定顺序是：有 supported_efforts → 支持（上游明确列了档位）；
+// 否则取 mandatory。这个顺序不能反 —— 反了会把「思考可选」的模型
+// 误判成「不支持」，进而被网关剥掉思考。
+type flexBool struct {
+	set   bool
+	value bool
+	// isObj 区分「布尔形态」与「对象形态」。
+	//
+	// **必须有这个标志**：boolPtr 的判定要读 obj.Mandatory，而布尔形态下
+	// obj 是零值（Mandatory=false）。若不区分，布尔 `true` 会被读成
+	// obj.Mandatory=false —— 于是「上游明说支持」被翻转成「不支持」，
+	// 网关会开始剥掉这个模型的思考。那是比原 bug 更糟的结果：原 bug
+	// 是整个功能不可用，这个是**静默地做错事**。
+	isObj bool
+	// obj 收对象形态里的其余字段。effort 集合必须收：OpenRouter 把它
+	// 放在 reasoning 对象**内部**而非顶层平铺，不收的话接 OpenRouter 时
+	// effort_levels 全空 —— 而空 = 网关不干预 = 静默，客户端发的思考档位
+	// 裸奔，正是这个字段存在的意义要防的事。
+	obj struct {
+		Mandatory        bool     `json:"mandatory"`
+		DefaultEnabled   bool     `json:"default_enabled"`
+		SupportedEfforts []string `json:"supported_efforts"`
+		DefaultEffort    string   `json:"default_effort"`
+	}
+}
+
+// UnmarshalJSON 接受布尔、对象、以及 null 三种形态。
+//
+// 遇到**不认识的形状**（字符串、数字、数组）返回 error 而不是静默忽略：
+// 静默忽略的后果是「上游报了但我们没读到」，而空 = 网关不干预 = 静默 ——
+// 那正是最该避免的结果。宁可让整次发现失败并报出形态，
+// 也不要给管理员一个「配置成功但其实没填上」的假象。
+func (f *flexBool) UnmarshalJSON(b []byte) error {
+	trimmed := strings.TrimSpace(string(b))
+	if trimmed == "null" {
+		return nil
+	}
+	// 第一字节定形态，避免先 unmarshal 到 any 再断言类型。
+	switch trimmed[0] {
+	case 't', 'f':
+		var v bool
+		if err := json.Unmarshal(b, &v); err != nil {
+			return err
+		}
+		f.set, f.value, f.isObj = true, v, false
+		return nil
+	case '{':
+		if err := json.Unmarshal(b, &f.obj); err != nil {
+			return err
+		}
+		f.set, f.isObj = true, true
+		return nil
+	default:
+		return fmt.Errorf("reasoning: 不认识的形状 %q（期望布尔或对象）", trimmed)
+	}
+}
+
+// boolPtr 返回三态结果：nil = 上游没报（不知道，交给上游）。
+func (f *flexBool) boolPtr() *bool {
+	if !f.set {
+		return nil
+	}
+	if !f.isObj {
+		v := f.value
+		return &v
+	}
+	if len(f.obj.SupportedEfforts) > 0 {
+		// 明确列了档位 = 明确支持。mandatory 在这里不参与判定。
+		t := true
+		return &t
+	}
+	v := f.obj.Mandatory
+	return &v
+}
+
+// effortLevels 取对象形态里的 supported_efforts（布尔形态恒为 nil）。
+func (f *flexBool) effortLevels() []string {
+	return f.obj.SupportedEfforts
 }
 
 // effortLevelsFor 从各家字段名里取出第一个非空的挡位集合。
@@ -882,6 +998,10 @@ func (e *rawModelEntry) effortLevelsFor() []string {
 		e.SupportedReasoning,
 		e.SupportedEfforts,
 		e.EffortLevelsRaw,
+		// OpenRouter 把 supported_efforts 放在 reasoning 对象**内部**，
+		// 不是顶层平铺。放最后：顶层那些字段一旦有值就更权威（同一家
+		// 不会同时给两套矛盾值），这里只在它们都缺席时兜底。
+		e.Reasoning.effortLevels(),
 	} {
 		if len(cand) > 0 {
 			return cand
@@ -902,7 +1022,7 @@ func (e *rawModelEntry) supportsThinkingFor() *bool {
 	if e.SupportsThinking != nil {
 		return e.SupportsThinking
 	}
-	return e.Reasoning
+	return e.Reasoning.boolPtr()
 }
 
 // DiscoverUpstreamModels 直接向 provider 拉一次原始 /models，
