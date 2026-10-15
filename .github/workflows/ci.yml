@@ -100,7 +100,14 @@ jobs:
         # v4.4.0
         uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
         with:
-          node-version: '22'
+          # 显式写 22.12 而不是 '22'（2026-10-15，Vite 5 → 8 迁移）。
+          #
+          # Vite 8 的 engines 是 `^20.19.0 || >=22.12.0`。'22' 会解析到
+          # **当前最新**的 22.x，恰好满足下限 —— 但那是靠浮动侥幸满足的：
+          # 哪天有人图省事写成 '22.0' 或某个旧 minor，构建会直接失败，
+          # 而且报错来自 npm 的 engines 检查，与被测代码无关，很难一眼归因。
+          # 把下限写出来，这条约束就成了配置本身的一部分。
+          node-version: '22.12'
           cache: npm
           cache-dependency-path: web/package-lock.json
 
