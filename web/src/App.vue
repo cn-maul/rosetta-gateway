@@ -268,13 +268,13 @@ watch(
                 普通用户的侧栏必须自己有一份 —— 否则他们将完全失去入口。
              2) 用户与分组（= 访问密钥页签）：这是普通用户管理自己凭据的
                 唯一入口，删不得。管理员则从管理区那一项进（见上）。 -->
-        <RouterLink v-if="!isAdmin()" class="side-item" to="/history" :title="railCollapsed ? '调用历史' : undefined">
+        <RouterLink v-if="!isAdmin()" class="side-item" to="/usage" :title="railCollapsed ? '用量统计' : undefined">
           <svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
             <path d="M3 12a9 9 0 1 0 9-9 9.75 9.75 0 0 0-6.74 2.74L3 8" />
             <path d="M3 3v5h5" />
             <path d="M12 7v5l4 2" />
           </svg>
-          <span v-if="!railCollapsed">调用历史</span>
+          <span v-if="!railCollapsed">用量统计</span>
         </RouterLink>
         <RouterLink v-if="!isAdmin()" class="side-item" to="/users" :title="railCollapsed ? '用户与分组' : undefined">
           <svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
@@ -329,13 +329,13 @@ watch(
 
                所以这里**不能**写成 meta.adminOnly 那种隐藏式归类：普通用户
                仍需要这一页，只是侧栏上没有这一段。个人区那个等价入口见下。 -->
-          <RouterLink class="side-item" to="/history" :title="railCollapsed ? '调用历史' : undefined">
+          <RouterLink class="side-item" to="/usage" :title="railCollapsed ? '用量统计' : undefined">
             <svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
               <path d="M3 12a9 9 0 1 0 9-9 9.75 9.75 0 0 0-6.74 2.74L3 8" />
               <path d="M3 3v5h5" />
               <path d="M12 7v5l4 2" />
             </svg>
-            <span v-if="!railCollapsed">调用历史</span>
+            <span v-if="!railCollapsed">用量统计</span>
           </RouterLink>
           <RouterLink class="side-item" to="/settings" :title="railCollapsed ? '设置' : undefined">
             <svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">

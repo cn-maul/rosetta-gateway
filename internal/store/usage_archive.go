@@ -65,6 +65,20 @@ const usageDailyRollupsDDL = `CREATE TABLE IF NOT EXISTS usage_daily_rollups (
 	cost_total       REAL NOT NULL DEFAULT 0,
 	-- 延迟按请求数加权平均所需（算术平均会被快慢请求互相抵消）。
 	latency_sum_ms   INTEGER NOT NULL DEFAULT 0,
+	-- 首字延迟同样按请求数加权平均所需。与 latency 分成两列而不是复用：
+	-- ttfb 只在**真正流式**的请求上有值（非流式的 ttfb_ms 是 0），
+	-- 混进 latency_sum_ms 会把「没有首字概念」的请求也算进分母，
+	-- 平均值被一路稀释到没有参考价值。ttfb_count 记的是「测到过首字的
+	-- 请求数」，正是那个分母。
+	ttfb_sum_ms      INTEGER NOT NULL DEFAULT 0,
+	ttfb_count       INTEGER NOT NULL DEFAULT 0,
+	-- 成功请求的 token / 延迟累计值，单独成列而非用 success_count 去折算
+	-- 总体列。速度（output_tokens / latency）只对成功请求有意义：canceled
+	-- 的 latency 是「断开前跑了多久」，拿它当分母会把平均速度压低，而那个
+	-- 请求根本没跑完。折算出的估算值也让这张表失去「剪枝前后同窗口同数」
+	-- 的立身之本，所以宁可多存两列。
+	ok_output_tokens INTEGER NOT NULL DEFAULT 0,
+	ok_latency_sum_ms INTEGER NOT NULL DEFAULT 0,
 	PRIMARY KEY (day, user_id, access_key_id, public_model, upstream_model,
 	             provider_id, ingress_protocol, stream)
 )`
@@ -619,7 +633,8 @@ func (s *Store) PruneOldUsage(ctx context.Context, keepDays int) (*PruneResult, 
 			     ingress_protocol, stream,
 			     request_count, success_count, error_count,
 			     input_tokens, output_tokens, cached_tokens, reasoning_tokens, total_tokens,
-			     cost_total, latency_sum_ms)
+			     cost_total, latency_sum_ms, ttfb_sum_ms, ttfb_count,
+			     ok_output_tokens, ok_latency_sum_ms)
 			 SELECT `+dayExpr+` AS day,
 			       COALESCE(user_id, ''), access_key_id, public_model, upstream_model, provider_id, ingress_protocol, stream,
 			       COUNT(*),
@@ -628,7 +643,15 @@ func (s *Store) PruneOldUsage(ctx context.Context, keepDays int) (*PruneResult, 
 			       COALESCE(SUM(input_tokens), 0), COALESCE(SUM(output_tokens), 0),
 			       COALESCE(SUM(cached_tokens), 0), COALESCE(SUM(reasoning_tokens), 0),
 			       COALESCE(SUM(total_tokens), 0), COALESCE(SUM(cost_total), 0),
-			       COALESCE(SUM(latency_ms), 0)
+			       COALESCE(SUM(latency_ms), 0),
+			       -- 只累计**真正测到过首字**的请求（ttfb_ms > 0）。非流式请求的
+			       -- ttfb_ms 是 0，算进 sum 无害但算进 count 会把分母撑大，
+			       -- 平均首字被一路稀释。两列必须同口径。
+			       COALESCE(SUM(CASE WHEN ttfb_ms > 0 THEN ttfb_ms ELSE 0 END), 0),
+			       COUNT(CASE WHEN ttfb_ms > 0 THEN 1 END)
+			       ,
+			       COALESCE(SUM(CASE WHEN status = 'ok' THEN output_tokens ELSE 0 END), 0),
+			       COALESCE(SUM(CASE WHEN status = 'ok' THEN latency_ms ELSE 0 END), 0)
 			  FROM usage_records
 			 WHERE rowid IN (SELECT rid FROM prune_batch)
 			 GROUP BY day, COALESCE(user_id, ''), access_key_id, public_model, upstream_model, provider_id, ingress_protocol, stream
@@ -642,7 +665,11 @@ func (s *Store) PruneOldUsage(ctx context.Context, keepDays int) (*PruneResult, 
 			       reasoning_tokens = reasoning_tokens + excluded.reasoning_tokens,
 			       total_tokens     = total_tokens + excluded.total_tokens,
 			       cost_total       = cost_total + excluded.cost_total,
-			       latency_sum_ms   = latency_sum_ms + excluded.latency_sum_ms`); err != nil {
+			       latency_sum_ms   = latency_sum_ms + excluded.latency_sum_ms,
+			       ttfb_sum_ms      = ttfb_sum_ms + excluded.ttfb_sum_ms,
+			       ttfb_count       = ttfb_count + excluded.ttfb_count,
+			       ok_output_tokens = ok_output_tokens + excluded.ok_output_tokens,
+			       ok_latency_sum_ms = ok_latency_sum_ms + excluded.ok_latency_sum_ms`); err != nil {
 		return nil, fmt.Errorf("aggregate rollups: %w", err)
 	} else if n, aerr := rollupRes.RowsAffected(); aerr == nil {
 		res.RollupRows = n

@@ -751,6 +751,22 @@ func (s *Store) ensureColumns() error {
 		// 归档会静默少算 total_tokens / error_count，剪枝则直接报「无此列」。
 		{"usage_daily_rollups", "error_count", "INTEGER NOT NULL DEFAULT 0"},
 		{"usage_daily_rollups", "total_tokens", "INTEGER NOT NULL DEFAULT 0"},
+		// 首字延迟的加权平均（2026-10-16）。与 latency_sum_ms 同批补列：
+		// 归档层必须能原样复现明细层的每个统计口径，否则「同一时间窗口
+		// 剪枝前后数字一致」这条验收做不到 —— 而「首字」是上游/模型
+		// 用量统计表的一列，剪枝后它不能悄悄变成算不出来。
+		//
+		// 存量行补 0 而不是回填：明细侧的 ttfb_ms 虽在，但「哪几天已经
+		// 剪掉了」无从得知，回填只会把残留的几天算进去、让剪枝前后
+		// 出现一个说不清的差值。0 的口径是「未测得」，与「平均 0 秒」
+		// 在界面上同形但语义诚实（见 writeGroupEntries 的 n_ttfb 处理）。
+		{"usage_daily_rollups", "ttfb_sum_ms", "INTEGER NOT NULL DEFAULT 0"},
+		{"usage_daily_rollups", "ttfb_count", "INTEGER NOT NULL DEFAULT 0"},
+		// 成功请求的 token / 延迟累计（2026-10-16，速度列的分母）。
+		// 不用 success_count 折算总体列：折算值会让「剪枝前后同窗口同数」
+		// 这条验收失守 —— 而那正是归档表存在的全部理由。
+		{"usage_daily_rollups", "ok_output_tokens", "INTEGER NOT NULL DEFAULT 0"},
+		{"usage_daily_rollups", "ok_latency_sum_ms", "INTEGER NOT NULL DEFAULT 0"},
 		{"usage_totals", "total_tokens", "INTEGER NOT NULL DEFAULT 0"},
 		// 归档水位（已剪到哪一天）。剪枝流程靠它做幂等边界。
 		{"usage_totals", "pruned_through_day", "TEXT NOT NULL DEFAULT ''"},

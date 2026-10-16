@@ -760,10 +760,15 @@ export const api = {
   importConfig: (data: unknown, passphrase: string, dryRun: boolean) =>
     post<ConfigImportResult>('/config-export/import', { data, passphrase, dry_run: dryRun }),
   usageByDay: (from: number, to: number) => get<UsageGroupEntry[]>(`/usage/by-day?from=${from}&to=${to}`),
-  usageByModel: (from = 0, to = Date.now()) => get<UsageGroupEntry[]>(`/usage/by-model?from=${from}&to=${to}&limit=10`),
+  // limit 不再写死 10：总览页的「Top 10」只需要前几条，而用量统计页的
+  // 上游 / 模型页要列出**全部**参与调用的上游与模型 —— 写死 10 的话，
+  // 第 11 个之后的上游在统计页直接消失，而它在总览页也不出现，
+  // 于是「这个上游到底有没有在用」这个问题没有任何页面能回答。
+  usageByModel: (from = 0, to = Date.now(), limit = 200) =>
+    get<UsageGroupEntry[]>(`/usage/by-model?from=${from}&to=${to}&limit=${limit}`),
   usageByKey: (from = 0, to = Date.now()) => get<UsageGroupEntry[]>(`/usage/by-key?from=${from}&to=${to}&limit=10`),
-  usageByProvider: (from = 0, to = Date.now()) =>
-    get<UsageGroupEntry[]>(`/usage/by-provider?from=${from}&to=${to}&limit=10`),
+  usageByProvider: (from = 0, to = Date.now(), limit = 200) =>
+    get<UsageGroupEntry[]>(`/usage/by-provider?from=${from}&to=${to}&limit=${limit}`),
   /**
    * 按用户汇总消费（钱包页「消费汇总」一表一行一个用户）。
    *

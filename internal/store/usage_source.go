@@ -30,6 +30,13 @@ const (
 		CASE WHEN status NOT IN ('ok', 'canceled') THEN 1 ELSE 0 END AS n_err,
 		input_tokens, output_tokens, cached_tokens, reasoning_tokens, total_tokens,
 		cost_total, latency_ms AS latency_sum,
+		CASE WHEN ttfb_ms > 0 THEN ttfb_ms ELSE 0 END AS ttfb_sum,
+		CASE WHEN ttfb_ms > 0 THEN 1 ELSE 0 END AS n_ttfb,
+		-- 速度的分子分母，**只取成功请求**。canceled 的 latency 是
+		-- 「断开前跑了多久」而非完整耗时，用它当分母会把平均速度压低；
+		-- truncated / error 同理（它们往往还没开始吐 token）。
+		CASE WHEN status = 'ok' THEN output_tokens ELSE 0 END AS out_ok,
+		CASE WHEN status = 'ok' THEN latency_ms ELSE 0 END AS lat_ok,
 		` + dayExpr + ` AS day, ts AS bucket_ts,
 		COALESCE(user_id, '') AS user_id, access_key_id, public_model, upstream_model, provider_id`
 
@@ -42,6 +49,13 @@ const (
 		error_count AS n_err,
 		input_tokens, output_tokens, cached_tokens, reasoning_tokens, total_tokens,
 		cost_total, latency_sum_ms AS latency_sum,
+		ttfb_sum_ms AS ttfb_sum,
+		ttfb_count AS n_ttfb,
+		-- 归档侧直接带成功请求的 token / 延迟累计值，不靠 success_count 的
+		-- 比例去折算总体列：折算出来的是估算值，而这张表的立身之本是
+		-- 「剪枝前后同一个窗口给出同一个数」（见 usageDailyRollupsDDL）。
+		ok_output_tokens AS out_ok,
+		ok_latency_sum_ms AS lat_ok,
 		day, ` + dayStartMs + ` AS bucket_ts,
 		user_id, access_key_id, public_model, upstream_model, provider_id`
 

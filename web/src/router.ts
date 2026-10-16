@@ -28,7 +28,15 @@ const router = createRouter({
     // 且 history / history.csv 早已在 userAccessibleRoutes 白名单里
     // （internal/server/user_auth.go），并有 authz_matrix 测试钉住。
     // 页内无任何 admin-only 数据源：密钥下拉走 /keys（同样按身份收窄）。
-    { path: '/history', name: 'history', component: () => import('./views/History.vue'), meta: { title: '调用历史' } },
+    // 「用量统计」（2026-10-16 由「调用历史」改名并拆成三个子页：
+    // 调用明细 / 上游 / 模型）。三个子页共用一个时间范围，放在父页面持有 ——
+    // 各带一个选择器的话，用户在「上游」页选了 30 天、切到「明细」页
+    // 又看到默认 7 天，两页数字对不上且会被当成网关算错账。
+    //
+    // 老书签 /history **重定向**到本页并落在「调用明细」子页 ——
+    // 与合并前的落点一致，不给老书签一个「默认落到汇总页」的行为改变。
+    { path: '/usage', name: 'usage', component: () => import('./views/UsageStats.vue'), meta: { title: '用量统计' } },
+    { path: '/history', redirect: { name: 'usage' } },
     // 「可用模型」恢复（2026-10-10）：它一度随管理员退出数据面一起被删，
     // 理由是「管理员用不上这份清单」。这个理由只对管理员成立，却让**普通
     // 用户**也跟着没了入口 —— 而这页恰恰是普通用户最需要的：它回答

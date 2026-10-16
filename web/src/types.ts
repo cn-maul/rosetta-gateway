@@ -672,6 +672,26 @@ export interface UsageGroupEntry {
    * 显示层要靠别的信息（调用历史里逐条的费用）解释，不能在这里猜。
    */
   cost: number
+  /** 成功请求数（status='ok'）。canceled 既不算成功也不算失败。 */
+  ok: number
+  /** 失败请求数（status 不在 ok/canceled 之列）。 */
+  err: number
+  /**
+   * 平均首字延迟（毫秒），只对**真正流式**的请求取平均。
+   *
+   * 必须与 n_ttfb 一起读：n_ttfb=0 时这个值恒为 0，含义是
+   * 「没有流式请求、无从得知」而不是「首字快得不需要时间」。
+   */
+  avg_ttfb_ms: number
+  /** 参与上面那个平均的请求数。 */
+  n_ttfb: number
+  /**
+   * 平均输出速度（token/秒）。
+   *
+   * 只统计 status='ok' 的请求：canceled 的 latency 是「断开前跑了多久」，
+   * 拿它当分母会把平均速度压低，而那个请求根本没跑完。
+   */
+  tps: number
 }
 
 /**

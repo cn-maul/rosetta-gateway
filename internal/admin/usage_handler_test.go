@@ -3,6 +3,7 @@ package admin
 import (
 	"encoding/json"
 	"fmt"
+	"math"
 	"net/http"
 	"net/http/httptest"
 	"strconv"
@@ -135,6 +136,204 @@ func TestUsageGroupBy_AfterPrune(t *testing.T) {
 		if after != before[dim] {
 			t.Errorf("%s group count changed across prune: %d -> %d", dim, before[dim], after)
 		}
+	}
+}
+
+// TestUsageGroupBy_QualityColumns 钉住 by-provider / by-model 新增的四列
+// （ok / err / avg_ttfb_ms / n_ttfb / tps）的口径。
+//
+// 这几列最容易错在**分母**上，而分母错了不会报错、只会安静地给出一个
+// 「看起来合理」的数：
+//   - 成功率用 count 而非 ok+err 当分母 → canceled（客户端断开）被算成失败；
+//   - 首字用 AVG(ttfb) 而非 SUM/COUNT → 非流式的 0 把平均值稀释；
+//   - 速度用 AVG(latency) 而非 SUM/SUM → 归档行（一组请求的累计延迟）
+//     被当成一次请求的耗时，越剪越离谱。
+func TestUsageGroupBy_QualityColumns(t *testing.T) {
+	st := newTestStore(t)
+	h := NewUsageHandler(st)
+	ctx := t.Context()
+	now := time.Now().UnixMilli()
+
+	// 同一个上游 p1 下三条记录，刻意构造成「算术平均会给出错误答案」的分布：
+	//   A: ok, ttfb=100ms, latency=1000ms, out=100
+	//   B: ok, ttfb=300ms, latency=1000ms, out=100
+	//   C: canceled（非流式, ttfb=0, latency=2000ms, out=0）
+	//
+	// 期望值：
+	//   count=3, ok=2, err=0（canceled 不算错）
+	//   成功率=2/3=66.7%
+	//   avg_ttfb=(100+300)/2=200ms —— 注意 C 的 ttfb=0 不进分母，
+	//     若用 AVG(ttfb) 会算成 (100+300+0)/3=133ms，偏低 1/3。
+	//   n_ttfb=2
+	//   tps=(100+100)*1000/(1000+1000)=100 t/s
+	rows := []struct {
+		id, status  string
+		ttfb, latMs int64
+		out         int64
+	}{
+		{"g1", "ok", 100, 1000, 100},
+		{"g2", "ok", 300, 1000, 100},
+		{"g3", "canceled", 0, 2000, 0},
+	}
+	for _, r := range rows {
+		if err := st.CreateUsageRecord(ctx, &store.UsageRecord{
+			ID: r.id, Ts: now, AccessKeyID: "kA", PublicModel: "m",
+			ProviderID: "p1", UpstreamModel: "x",
+			IngressProtocol: "openai-chat",
+			InputTokens:     10,
+			OutputTokens:    r.out,
+			TotalTokens:     10 + r.out,
+			Status:          r.status,
+			HTTPStatus:      200,
+			LatencyMs:       r.latMs,
+			TTFBMs:          r.ttfb,
+		}); err != nil {
+			t.Fatalf("create usage %s: %v", r.id, err)
+		}
+	}
+
+	for _, tc := range []struct {
+		dim string
+		fn  func(http.ResponseWriter, *http.Request)
+	}{
+		{"by-provider", h.GroupByProvider},
+		{"by-model", h.GroupByModel},
+	} {
+		rec := httptest.NewRecorder()
+		tc.fn(rec, asAdmin(httptest.NewRequest(http.MethodGet,
+			"/admin/api/usage/"+tc.dim+"?from=0", nil)))
+		if rec.Code != http.StatusOK {
+			t.Fatalf("%s code=%d body=%s", tc.dim, rec.Code, rec.Body.String())
+		}
+		var entries []usageGroupEntry
+		if err := json.Unmarshal(rec.Body.Bytes(), &entries); err != nil {
+			t.Fatalf("%s unmarshal: %v", tc.dim, err)
+		}
+		if len(entries) != 1 {
+			t.Fatalf("%s entries=%d, want 1: %+v", tc.dim, len(entries), entries)
+		}
+		e := entries[0]
+		if e.Count != 3 || e.Ok != 2 {
+			t.Errorf("%s count=%d ok=%d, want 3/2", tc.dim, e.Count, e.Ok)
+		}
+		// canceled 不计入 err —— 它由客户端断开造成，算成失败会把
+		// 「上游健康度」与「客户端用得对不对」两件事混成一个数。
+		if e.Err != 0 {
+			t.Errorf("%s err=%d, want 0（canceled 不算失败）", tc.dim, e.Err)
+		}
+		if e.NTtfb != 2 {
+			t.Errorf("%s n_ttfb=%d, want 2（只有两条真流式）", tc.dim, e.NTtfb)
+		}
+		if math.Abs(e.AvgTtfbMs-200) > 0.5 {
+			t.Errorf("%s avg_ttfb_ms=%v, want 200（AVG 会算成 133）", tc.dim, e.AvgTtfbMs)
+		}
+		if math.Abs(e.Tps-100) > 0.5 {
+			t.Errorf("%s tps=%v, want 100", tc.dim, e.Tps)
+		}
+	}
+}
+
+// TestUsageGroupBy_QualityColumnsSurvivePrune 守住这四列在剪枝后仍可复现。
+//
+// 与 TestUsageGroupBy_AfterPrune 互补：那条只数「分组还在不在」，
+// 这条钉数字 —— 归档侧少记了 ttfb_count 之类的话，分组数照旧是 1，
+// 只有具体数值会错。
+func TestUsageGroupBy_QualityColumnsSurvivePrune(t *testing.T) {
+	st := newTestStore(t)
+	h := NewUsageHandler(st)
+	ctx := t.Context()
+	old := time.Now().AddDate(0, 0, -(store.DefaultRetentionDays + 5)).UnixMilli()
+
+	if err := st.CreateUsageRecord(ctx, &store.UsageRecord{
+		ID: "old1", Ts: old, AccessKeyID: "kA", PublicModel: "m",
+		ProviderID: "p1", UpstreamModel: "x",
+		IngressProtocol: "openai-chat",
+		InputTokens:     10, OutputTokens: 100, TotalTokens: 110,
+		Status: "ok", HTTPStatus: 200,
+		LatencyMs: 1000, TTFBMs: 400,
+	}); err != nil {
+		t.Fatalf("create usage: %v", err)
+	}
+
+	rec := httptest.NewRecorder()
+	h.GroupByProvider(rec, asAdmin(httptest.NewRequest(http.MethodGet,
+		"/admin/api/usage/by-provider?from=0", nil)))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("before prune code=%d body=%s", rec.Code, rec.Body.String())
+	}
+	var before []usageGroupEntry
+	if err := json.Unmarshal(rec.Body.Bytes(), &before); err != nil || len(before) != 1 {
+		t.Fatalf("before prune: %v entries=%+v", err, before)
+	}
+
+	if _, err := st.PruneOldUsage(ctx, store.DefaultRetentionDays); err != nil {
+		t.Fatalf("prune: %v", err)
+	}
+
+	rec2 := httptest.NewRecorder()
+	h.GroupByProvider(rec2, asAdmin(httptest.NewRequest(http.MethodGet,
+		"/admin/api/usage/by-provider?from=0", nil)))
+	if rec2.Code != http.StatusOK {
+		t.Fatalf("after prune code=%d body=%s", rec2.Code, rec2.Body.String())
+	}
+	var after []usageGroupEntry
+	if err := json.Unmarshal(rec2.Body.Bytes(), &after); err != nil || len(after) != 1 {
+		t.Fatalf("after prune: %v entries=%+v", err, after)
+	}
+
+	b, a := before[0], after[0]
+	if a.NTtfb != b.NTtfb || a.NTtfb != 1 {
+		t.Errorf("n_ttfb 剪枝前后不一致或未累计: %d -> %d（want 1）", b.NTtfb, a.NTtfb)
+	}
+	if math.Abs(a.AvgTtfbMs-400) > 0.5 {
+		t.Errorf("avg_ttfb_ms 剪枝后=%v, want 400（归档支没记 ttfb）", a.AvgTtfbMs)
+	}
+	if math.Abs(a.Tps-b.Tps) > 0.5 {
+		t.Errorf("tps 剪枝前后不一致: %v -> %v", b.Tps, a.Tps)
+	}
+}
+
+// TestUsageGroupBy_ProviderDownsName 守住 by-provider 下发上游**名字**
+// 而不是只给 provider_id。
+//
+// 这一列是「用量统计 / 上游」子页存在的全部理由：provider_id 是 8 位
+// 内部 id，界面上显示它等于什么都没显示。JOIN 表名又与 by-key 不同
+// （providers vs access_keys），别名一度写成 p 而 JOIN 用的是 a ——
+// 那条错误只在「恰好有 provider 数据」的库上才暴露，所以必须有这条用例。
+func TestUsageGroupBy_ProviderDownsName(t *testing.T) {
+	st := newTestStore(t)
+	h := NewUsageHandler(st)
+	ctx := t.Context()
+
+	if err := st.CreateProvider(ctx, &store.Provider{
+		ID: "pname1", Slug: "openai", Name: "OpenAI 官方", Protocol: "openai-chat",
+		Endpoint: "https://api.openai.com", Enabled: true, CreatedAt: 1, UpdatedAt: 1,
+	}); err != nil {
+		t.Fatalf("create provider: %v", err)
+	}
+	if err := st.CreateUsageRecord(ctx, &store.UsageRecord{
+		ID: "n1", Ts: time.Now().UnixMilli(), AccessKeyID: "kA",
+		PublicModel: "gpt-4o", ProviderID: "pname1", UpstreamModel: "gpt-4o",
+		IngressProtocol: "openai-chat",
+		InputTokens:     10, OutputTokens: 5, TotalTokens: 15,
+		Status: "ok", HTTPStatus: 200,
+	}); err != nil {
+		t.Fatalf("create usage: %v", err)
+	}
+
+	rec := httptest.NewRecorder()
+	h.GroupByProvider(rec, asAdmin(httptest.NewRequest(http.MethodGet,
+		"/admin/api/usage/by-provider?from=0", nil)))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("code=%d body=%s", rec.Code, rec.Body.String())
+	}
+	var entries []usageGroupEntry
+	if err := json.Unmarshal(rec.Body.Bytes(), &entries); err != nil || len(entries) != 1 {
+		t.Fatalf("unmarshal: %v entries=%+v", err, entries)
+	}
+	if entries[0].Name != "OpenAI 官方" {
+		t.Errorf("by-provider name=%q, want %q（界面上要显示上游名，不是 provider_id）",
+			entries[0].Name, "OpenAI 官方")
 	}
 }
 

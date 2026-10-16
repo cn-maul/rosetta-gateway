@@ -1,14 +1,18 @@
 <script setup lang="ts">
-import { computed, onMounted, ref } from 'vue'
+import { computed, onMounted, ref, watch } from 'vue'
 import { api, isAdmin } from '../api'
 import { toast } from '../ui'
 import { fmtNum, fmtTokens, fmtTimeMs, fmtSec, fmtSpeed, fmtMoney, statusLabel, statusBadge } from '../fmt'
 import type { AccessKey, UsageHistoryEntry, UsageHistoryPage } from '../types'
 
+// 时间范围由父页面（用量统计）统一持有：三个子页必须看同一个窗口，
+// 各带一个选择器的话，用户在「上游」页选了 30 天、切到「明细」页又看到
+// 默认的 7 天，两页数字对不上且没有任何提示。
+const props = defineProps<{ days: number }>()
+
 const err = ref('')
 const loading = ref(true)
 const rows = ref<UsageHistoryEntry[]>([])
-const days = ref(7)
 const pageSize = ref(20)
 const page = ref(1)
 // 过滤后的总条数（后端返回，不受分页影响）—— 用来算总页数
@@ -43,11 +47,6 @@ function filters() {
   }
 }
 
-const ranges = [
-  { label: '近 1 天', value: 1 },
-  { label: '近 7 天', value: 7 },
-  { label: '近 30 天', value: 30 },
-]
 const pageSizes = [20, 50, 100]
 
 const totalPages = computed(() => Math.max(1, Math.ceil(total.value / pageSize.value)))
@@ -127,11 +126,11 @@ async function fetchPage(p: number): Promise<void> {
   const seq = ++reqSeq
   loading.value = true
   try {
-    let res = await api.usageHistory(days.value, pageSize.value, (p - 1) * pageSize.value, filters())
+    let res = await api.usageHistory(props.days, pageSize.value, (p - 1) * pageSize.value, filters())
     let target = p
     const last = Math.max(1, Math.ceil(res.total / pageSize.value))
     if (p > last) {
-      res = await api.usageHistory(days.value, pageSize.value, (last - 1) * pageSize.value, filters())
+      res = await api.usageHistory(props.days, pageSize.value, (last - 1) * pageSize.value, filters())
       target = last
     }
     if (seq !== reqSeq) return // 期间又发起了新请求，本响应的数据已过时，丢弃
@@ -164,10 +163,14 @@ function load() {
 
 // 换时间范围 / 换每页条数 / 换过滤条件都必须回到第 1 页：留在原页码毫无意义，
 // 而且极可能直接越界（原来在第 5 页，换成「近 1 天」后只有 1 页）。
-function changeDays() {
+//
+// 时间范围由父页面持有，所以 days 的变化走 watch 而不是页内的 @change ——
+// 父页面改范围时本页必须跟着回到第 1 页，否则会带着旧页码去查新窗口。
+watch(() => props.days, () => {
   page.value = 1
   load()
-}
+})
+
 function changePageSize() {
   page.value = 1
   load()
@@ -261,7 +264,7 @@ async function exportCSV() {
       page.value = 1
       await load()
     }
-    const r = await api.exportUsageCSV(days.value, filters())
+    const r = await api.exportUsageCSV(props.days, filters())
     if (r.truncated) {
       // 「已导出多少、总共多少」都要说出来：只说「被截断了」的话，用户既
       // 不知道手上的文件有多大，也不知道该把范围缩到多小才够。
@@ -297,23 +300,18 @@ onMounted(() => {
 </script>
 
 <template>
-  <main class="page">
-    <div class="page-head">
-      <div>
-        <h1>调用历史</h1>
-        <!-- 口径随身份变化，必须写在界面上（2026-10-10 对普通用户开放本页后）：
-             管理员看到全站，普通用户只看到自己的。后端按会话身份强制收窄
-             （usage_handler.scopeUserID），不是前端过滤。不写明的话，
-             普通用户会以为「网关没记录到我的调用」—— 而实际是他只能看到
-             自己的那部分，两种情况的排查方向完全不同。 -->
-        <div class="sub">
-          请求明细（按时间倒序，可分页）· {{ isAdmin() ? '全站' : '仅你自己' }}的调用记录
-        </div>
-      </div>
+  <!-- 「用量统计」的调用明细子页（2026-10-16 从 History.vue 抽出并改名）。
+
+       它**只渲染明细**，不拥有 .page / .page-head 外壳 —— 那两层由父页面
+       UsageStats.vue 提供，与另两个子页（上游 / 模型）共用同一个标题栏与
+       时间范围选择器。三页各带一套 header 会让「当前看的是哪个时间窗」
+       这件事在页面上出现三次，且三者可能不同步。 -->
+  <div class="usage-detail">
+    <div class="detail-bar">
+      <span class="dim">
+        请求明细（按时间倒序，可分页）· {{ isAdmin() ? '全站' : '仅你自己' }}的调用记录
+      </span>
       <div class="head-actions">
-        <select v-model.number="days" class="select w-auto" @change="changeDays">
-          <option v-for="r in ranges" :key="r.value" :value="r.value">{{ r.label }}</option>
-        </select>
         <select v-model.number="pageSize" class="select w-auto" @change="changePageSize">
           <option v-for="s in pageSizes" :key="s" :value="s">{{ s }} 条/页</option>
         </select>
@@ -439,10 +437,18 @@ onMounted(() => {
         </div>
       </template>
     </div>
-  </main>
+  </div>
 </template>
 
 <style scoped>
+.detail-bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  flex-wrap: wrap;
+  margin-bottom: 12px;
+}
 .w-auto {
   width: auto;
 }

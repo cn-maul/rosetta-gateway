@@ -690,6 +690,15 @@ type usageGroupEntry struct {
 	Key    string `json:"key"`
 	Count  int64  `json:"count"`
 	Tokens int64  `json:"tokens"`
+	// Ok / Err 是成功与失败次数（status 口径见 usage_source 的 n_ok / n_err：
+	// canceled 既不算成功也不算失败 —— 它由客户端断开造成，不是上游的问题）。
+	//
+	// 下发原始计数而不是算好的比率：前端要同时显示「98%」和「196/200」，
+	// 而 196/200 是判断「这 2 次失败值不值得查」的唯一依据。只给比率的话
+	// 99%（1/100 里错 1 次）与 99%（10000 次里错 100 次）在界面上完全同形，
+	// 前者可以忽略、后者是事故。
+	Ok  int64 `json:"ok"`
+	Err int64 `json:"err"`
 	// Cost 是固化费用合计（元），即 SUM(cost_total)。
 	//
 	// 2026-10-10 新增：钱包页的「消耗记录」改成按天列总额（逐条明细在
@@ -707,6 +716,15 @@ type usageGroupEntry struct {
 	Cost float64 `json:"cost"`
 	// Name：按密钥分组时下发的密钥名称（JOIN access_keys）；其余维度为空。
 	Name string `json:"name,omitempty"`
+	// AvgTtfbMs 是「测到过首字的请求」的平均首字延迟；N_ttfb 是那些请求
+	// 的数量。两者一起下发，前端才能区分「平均 0.4 秒」与「没有流式请求、
+	// 无从得知」—— 后者显示成 0 会让管理员以为首字快得不可思议。
+	AvgTtfbMs float64 `json:"avg_ttfb_ms"`
+	NTtfb     int64   `json:"n_ttfb"`
+	// Tps 是平均输出速度（output_tokens × 1000 / latency_ms 之和）。
+	// 与 usage_dao.go 的 GetRecentThroughput 同口径：只算 status='ok' 且
+	// 两者都 > 0 的请求，否则一次 latency=0 的脏数据能把均值拉到 infinity。
+	Tps float64 `json:"tps"`
 }
 
 // groupBy 的分组列取自归一化来源。传的是**列名**而非表达式，四个调用点
@@ -717,7 +735,7 @@ func (h *UsageHandler) GroupByKey(w http.ResponseWriter, r *http.Request) {
 	// 密钥被删除后 LEFT JOIN 取不到名字，前端回退显示原始 key。
 	//
 	// 时间过滤在 groupBy 里统一拼，调用方只给列名与展示名表达式。
-	h.groupBy(w, r, "access_key_id", `COALESCE(a.name, '')`)
+	h.groupBy(w, r, "access_key_id", `COALESCE(a.name, '')`, "access_keys")
 }
 
 // GroupByModel 按「模型归组」聚合用量；未归组的模型保持按 upstream_model 分组。
@@ -756,6 +774,13 @@ func (h *UsageHandler) GroupByModel(w http.ResponseWriter, r *http.Request) {
 		`COALESCE(SUM(u.n), 0) AS count, ` +
 		store.UsageSumExpr("total_tokens", "u") + ` AS tokens, ` +
 		store.UsageSumExpr("cost_total", "u") + ` AS cost, ` +
+		// 成功率 / 首字 / 速度：口径与 groupBy 逐字相同（同归一化列、同分母），
+		// 两条 SQL 各自演进的话，「按上游」与「按模型」两页上的同一个数
+		// 会因为一条改了另一条没改而对不上 —— 而它们本该能互相校验。
+		`COALESCE(SUM(u.n_ok), 0) AS ok, COALESCE(SUM(u.n_err), 0) AS err, ` +
+		store.UsageRatioExpr("ttfb_sum", "n_ttfb", "u") + ` AS avg_ttfb_ms, ` +
+		`COALESCE(SUM(u.n_ttfb), 0) AS n_ttfb, ` +
+		`COALESCE(SUM(u.out_ok) * 1000.0 / NULLIF(SUM(u.lat_ok), 0), 0) AS tps, ` +
 		`COALESCE(g.display_name, '') AS name` +
 		` FROM ` + src +
 		` LEFT JOIN upstream_models um ON um.provider_id = u.provider_id AND um.model_id = u.upstream_model` +
@@ -773,7 +798,15 @@ func (h *UsageHandler) GroupByModel(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *UsageHandler) GroupByProvider(w http.ResponseWriter, r *http.Request) {
-	h.groupBy(w, r, "provider_id", "")
+	// 按 provider_id 分组，但**下发上游名字**：provider_id 是内部 id
+	// （8 位随机串），界面上显示它等于什么都没显示，而这一页的存在意义
+	// 就是「哪个上游在花钱 / 哪个上游不好用」。
+	//
+	// 上游被删除后 LEFT JOIN 取不到名字，此时 name 为空串，前端回退显示
+	// provider_id —— 但那种行的用量通常也随路由停用而不再新增。
+	// 别名统一是 `a`（groupBy 内部固定），表名才随维度变 ——
+	// 之前写成 `p.name` 而 JOIN 的别名是 `a`，报「no such column: p.name」。
+	h.groupBy(w, r, "provider_id", `COALESCE(a.name, '')`, "providers")
 }
 
 func (h *UsageHandler) GroupByDay(w http.ResponseWriter, r *http.Request) {
@@ -786,7 +819,7 @@ func (h *UsageHandler) GroupByDay(w http.ResponseWriter, r *http.Request) {
 	//
 	// 这一条顺带修掉了「全部」档趋势起点：合并来源后最早的一天来自表 A，
 	// 剪枝不再让图上凭空少掉 30 天以前。
-	h.groupBy(w, r, "day", "")
+	h.groupBy(w, r, "day", "", "")
 }
 
 // groupBy 是四个 by-* 端点的唯一实现。
@@ -798,7 +831,11 @@ func (h *UsageHandler) GroupByDay(w http.ResponseWriter, r *http.Request) {
 // 请求（n=request_count），COUNT(*) 会把它当成 1 次请求，直接少算。
 //
 // column 与 nameExpr 只由本文件的字面量调用点传入，不含用户输入。
-func (h *UsageHandler) groupBy(w http.ResponseWriter, r *http.Request, column, nameExpr string) {
+// nameTable 是 nameExpr 里那个别名（`a` / `p`）对应的**真实表名**。
+// 它只来自本文件的字面量调用点，不含用户输入；JOIN 语句要按维度换表
+// （密钥名在 access_keys、上游名在 providers），而 groupBy 原本把
+// JOIN 目标写死成 access_keys —— 于是 by-provider 拿不到上游名字。
+func (h *UsageHandler) groupBy(w http.ResponseWriter, r *http.Request, column, nameExpr, nameTable string) {
 	q := r.URL.Query()
 	from, to, explicit, err := queryRangeExplicit(q, 7*24*time.Hour)
 	if err != nil {
@@ -822,6 +859,18 @@ func (h *UsageHandler) groupBy(w http.ResponseWriter, r *http.Request, column, n
 	query := `SELECT u.` + column + ` AS key, COALESCE(SUM(u.n), 0) AS count, ` +
 		store.UsageSumExpr("total_tokens", "u") + ` AS tokens, ` +
 		store.UsageSumExpr("cost_total", "u") + ` AS cost`
+	// 成功率与速度：分子分母都走归一化列，明细与归档两支自动同口径。
+	//
+	// 速度必须**只算 status='ok' 的请求**，这一点比看上去重要：
+	// canceled（客户端中途断开）的 latency 是「断开前跑了多久」，
+	// output_tokens 是断开前吐出的量 —— 拿它当分母，一个提前断开的慢请求
+	// 会把整个上游的平均速度压下去，而它根本没跑完、用速度评价它没有意义。
+	// 同时把 ok 的 latency 与 output 配对成两个独立 CASE，而不是过滤行 ——
+	// 过滤会让「ok 但 ttfb/latency 为 0」的脏数据把分母带走。
+	query += `, COALESCE(SUM(u.n_ok), 0) AS ok, COALESCE(SUM(u.n_err), 0) AS err, ` +
+		store.UsageRatioExpr("ttfb_sum", "n_ttfb", "u") + ` AS avg_ttfb_ms, ` +
+		`COALESCE(SUM(u.n_ttfb), 0) AS n_ttfb, ` +
+		`COALESCE(SUM(u.out_ok) * 1000.0 / NULLIF(SUM(u.lat_ok), 0), 0) AS tps`
 	if withName {
 		// JOIN 放在归一化来源之外：密钥名是展示属性，不参与聚合，
 		// 放里面会因一条密钥对应多行来源而把计数复制多份。
@@ -829,7 +878,10 @@ func (h *UsageHandler) groupBy(w http.ResponseWriter, r *http.Request, column, n
 	}
 	query += ` FROM ` + src
 	if withName {
-		query += ` LEFT JOIN access_keys a ON a.id = u.` + column
+		// 展示属性（名字）是**逐行**的取值，不参与聚合。放在归一化来源
+		// 里面会让一条密钥/上游对应多行来源时被复制多份；放在外面
+		// GROUP BY 之后只影响 SELECT 的一列，不影响计数。
+		query += ` LEFT JOIN ` + nameTable + ` a ON a.id = u.` + column
 	}
 	// 聚合别名在 ORDER BY 里可直接引用（SQLite 允许），GROUP BY 不行 ——
 	// 那里必须写原列名。
@@ -894,13 +946,16 @@ func writeGroupEntries(w http.ResponseWriter, rows *sql.Rows, withName bool) {
 		var key, name string
 		var err error
 		// 扫描顺序必须与 groupBy 里 SELECT 的列顺序**逐字对应**：
-		// key, count, tokens, cost[, name]。加 cost 时漏改这里的表现是
-		// Scan 报「期望 N 列、实际 M 列」—— 报错点在 Scan，读代码的人会先
-		// 去查 Scan 本身，而不是想到「上面那条 SELECT 加了一列」。
+		// key, count, tokens, cost, ok, err, avg_ttfb_ms, n_ttfb, tps[, name]。
+		// 加列时漏改这里的表现是 Scan 报「期望 N 列、实际 M 列」—— 报错点
+		// 在 Scan，读代码的人会先查 Scan 本身，而不是想到「上面那条 SELECT
+		// 加了一列」。name 恒在最后，因为它只由 withName 决定位置。
 		if withName {
-			err = rows.Scan(&key, &e.Count, &e.Tokens, &e.Cost, &name)
+			err = rows.Scan(&key, &e.Count, &e.Tokens, &e.Cost,
+				&e.Ok, &e.Err, &e.AvgTtfbMs, &e.NTtfb, &e.Tps, &name)
 		} else {
-			err = rows.Scan(&key, &e.Count, &e.Tokens, &e.Cost)
+			err = rows.Scan(&key, &e.Count, &e.Tokens, &e.Cost,
+				&e.Ok, &e.Err, &e.AvgTtfbMs, &e.NTtfb, &e.Tps)
 		}
 		if err != nil {
 			writeServerError(w, "usage group scan", err)
