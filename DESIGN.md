@@ -404,7 +404,7 @@ resolve(model):
 |---|---|---|
 | `POST /v1/chat/completions` | OpenAI Chat | P0，已实现 |
 | `POST /v1/messages` | Anthropic Messages | **已实现（2026-10-02）**——Claude Code 把 `ANTHROPIC_BASE_URL` 指向网关即可用；thinking 回放（含签名）见 §17 R4 |
-| `POST /v1/responses` | OpenAI Responses | **已实现（2026-10-04）**——Codex CLI 等客户端接入点；`previous_response_id`/`store` 被忽略（网关不托管会话状态，store:false 的全量历史客户端天然兼容）；`text.format` 跨协议映射为 openai-chat 的 response_format |
+| `POST /v1/responses` | OpenAI Responses | **已实现（2026-10-04）**——Codex CLI 等客户端接入点；`previous_response_id`/`store` 由上游承接（见 §17 R11）；`text.format` 跨协议映射为 openai-chat 的 response_format；reasoning item 的 `encrypted_content` 随 Rosetta v1.2.0 起无损往返（同样见 R11） |
 | `GET /v1/models` | 形状按认证头分流（D9） | 已实现，`?include=upstream` 展开轨道二；**条目带容量元数据**（见 §5.3） |
 | `GET /v1/models/{model}` | 单模型详情 | 已实现（OpenAI/Anthropic 形状 + 容量元数据；`/openai/v1/models/{m}`、`/anthropic/v1/models/{m}` 别名） |
 | `GET /dashboard/billing/*`、`GET /v1/organization/usage|costs` | 额度/费用查询 | 已实现（2026-10-04），见 §6.4 |
@@ -691,6 +691,34 @@ Anthropic Messages（2026-10-02）、OpenAI Responses（2026-10-04）。转发�
 （tool_choice 三方互译、response_format ↔ text.format 等）与硬约束过滤
 （结构化输出请求不打 anthropic 上游）见 §10 与 `internal/inwire`。
 
+### 7.1 sealed reasoning 的跨协议边界
+
+统一模型的价值在抹平协议差异，但有一类载荷**刻意不抹平**：reasoning item 的
+密封载荷。OpenAI Responses 的 `encrypted_content` 与 Anthropic 的 signed
+thinking block 都是「provider 要求原样回传的不透明状态」，转译即失效 ——
+这不是翻译问题，是载荷的语义本身。
+
+Rosetta 用一对字段表达它：`Sealed` 装载荷，`SealedBy` 记下是哪个协议族封的。
+回放时按 `SealedBy` 门闩判断，只写回同一个族；别的族拿到底要不要，由那个族的
+适配器自己决定（chat / anthropic 上游剥除，那两个协议没有对应概念）。
+
+网关的职责是在两侧都别把它弄丢：
+
+| 方向 | 处理 |
+|---|---|
+| Responses 入站 | `reasoning` item 搬成 `SealedThinking(summary, sealed, "openai-responses")`。**空 item 跳过**：无 `encrypted_content` 且 summary 为空时硬造 block 会被 validate 拒掉，把本来能跑的请求变成 400 |
+| Responses 出站（流式） | `EventThinkingDelta` 发 `output_item.added` → `reasoning_summary_text.delta` → `output_item.done`（带 `encrypted_content`）。`SealedBy` 非本族的整条丢弃 |
+| Responses 出站（非流式） | `BlockThinking` 输出 reasoning item，同样过 `SealedBy` 门闩 |
+
+**这条边界是 R11 的落点。** 在 Rosetta v1.2.0 之前，SDK 的流式侧没有承载
+`Sealed` 的通道（`Event` 无此字段，`output_item.done` 不处理 reasoning item），
+网关只能把 thinking 增量整个丢掉；非流式侧 SDK 早已闭环，是网关自己跳过了
+`BlockThinking`。两侧都补齐之后，Codex CLI 一类客户端的多轮 reasoning 会话
+才能跨网关存活。
+
+**仍然不做**：会话状态托管。`previous_response_id` / `store` 由上游承接
+（`inwire` 经 `Extra` 透传），网关不存、不续、不校验 item 归属。
+
 ---
 
 ## 8. 流式转发
@@ -710,7 +738,7 @@ Anthropic Messages（2026-10-02）、OpenAI Responses（2026-10-04）。转发�
 | 首字节时机 | `ChatStream` 成功后才写 `200 + Content-Type: text/event-stream` + `Cache-Control: no-cache` + `X-Accel-Buffering: no` |
 | 结束事件 | OpenAI 系发 `data: [DONE]`；Anthropic 发 `event: message_stop`。**只有 `status=="ok"` 才发** |
 | 思考增量 | `EventThinkingDelta` 编码为 `delta.reasoning_content`（DeepSeek / Qwen / vLLM 的既成约定，Rosetta 的 openai-chat 适配器也按这个键回读）。**不能丢**：只吐思考的流丢了它就是个零内容的流 |
-| 空文本事件 | `EventThinkingDelta` 的 `Text==""` 是 Anthropic thinking signature 的载体，OpenAI 下游无对应字段，跳过即可 |
+| 空文本事件 | `EventThinkingDelta` 的 `Text==""` 是 Anthropic thinking signature 的载体，OpenAI 下游无对应字段，跳过即可。**但 Responses 下游不能跳过**：空 `Text` 同时是 sealed 载荷的载体，跳了就丢续接状态（§7.1） |
 | usage 合成 | OpenAI 下游要 usage 需客户端传 `stream_options.include_usage`；网关在 `EventMessageEnd` 处合成仅含 usage 的 chunk，且仅当客户端要求时下发 |
 | 断流处理 | 见 §8.2 |
 | 缓冲 | 逐事件 Flush，不做批量聚合（延迟优先） |
@@ -1383,6 +1411,7 @@ rosetta-gateway/
 | R8 | 每凭证一个 `rosetta.Client` ⇒ 连接池随 key 数增长 | 上百把 key 时资源偏高 | 共享 `WithHTTPClient` 的 Transport，或后续向 Rosetta 提 per-request 覆盖 |
 | R9 | 上游 usage 缺失时无法区分「真报 0」与「没报」 | 配额失效、账单漏账且不可见 | **已改为两态显式区分**（2026-10-06）：`usageStateFor()` 按 SDK `Usage.IsZero()` 判「上游一个 token 数都没给」→ 记 `missing`，否则 `reported`。关键在于旧实现按「0 token + reported」记账，接不回 usage 的第三方兼容服务等于整 provider 静默漏账、配额形同虚设，且事后无法从库里分辨。`missing` 在界面单列统计，TPM 保留预占量不回滚。注意 `IsZero` 把 cached/reasoning 也计入 —— 只报缓存命中或思考 token 仍算「报了」，否则会丢掉真实数字 |
 | R10 | 同类成熟产品（one-api / new-api / LiteLLM / Portkey / Higress）功能面重合 | 自研投入产出比 | 自研的唯一正当理由是「Rosetta 作内核」与「深度定制」。已确认走自研 |
+| R11 | **Responses 的 reasoning item 跨协议转换会失效** | 下游 Responses + 上游非 Responses 时，多轮回传 reasoning 断链 | **已解决（2026-10-16）**：Rosetta v1.2.0 起，`Block.Sealed/SealedBy/ReasoningID` 与流式 `Event.Sealed/SealedBy/ReasoningID` 成对表达「provider 私有的不透明续接载荷 + 密封它的协议族」，`SealedBy` 门闩保证它只写回同一个族。网关侧 `inwire` 把 reasoning item 搬进 `SealedThinking`、`outwire` 两侧（流式 SSE + 非流式对象）输出 reasoning item。此前流式侧整个不出 thinking 事件、非流式侧跳过 `BlockThinking`，客户端多轮 reasoning 会话在第二轮回放时报 `Item with id 'rs_…' not found`。见 §7.1 |
 
 ---
 
