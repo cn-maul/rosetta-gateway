@@ -23,6 +23,81 @@ func decodeResponses(t *testing.T, body string) *ResponsesRequest {
 
 // 全特性解码：instructions、字符串/数组 input、function_call 回放、
 // reasoning 剥除、tools、thinking effort、图像。
+// reasoning item 的续接载体必须搬进统一模型：encrypted_content 是
+// OpenAI 要求原样回传的状态，丢了它下一轮回放报 "Item with id 'rs_…' not found"。
+func TestDecodeResponses_ReasoningSealed(t *testing.T) {
+	got := decodeResponses(t, `{
+		"model":"gpt-4o",
+		"input":[
+			{"type":"reasoning","id":"rs_abc","summary":[{"type":"summary_text","text":"先想一下"}],"encrypted_content":"gAAAAA-secret"},
+			{"type":"message","role":"user","content":[{"type":"input_text","text":"继续"}]}
+		]
+	}`)
+
+	req := got.ToRosetta()
+	if len(req.Messages) != 2 {
+		t.Fatalf("message count = %d, want 2: %+v", len(req.Messages), req.Messages)
+	}
+	r := req.Messages[0]
+	if r.Role != rosetta.RoleAssistant {
+		t.Fatalf("reasoning item role = %q, want assistant", r.Role)
+	}
+	blk := r.Blocks[0]
+	if blk.Type != rosetta.BlockThinking {
+		t.Fatalf("reasoning block type = %q, want thinking", blk.Type)
+	}
+	if blk.Sealed != "gAAAAA-secret" || blk.SealedBy != "openai-responses" {
+		t.Fatalf("sealed payload not carried verbatim: %+v", blk)
+	}
+	// ReasoningID 是下一轮寻址的依据，SDK 靠它写出 item 的 "id"。
+	// 漏了它等于带着载荷却没有地址。
+	if blk.ReasoningID != "rs_abc" {
+		t.Fatalf("ReasoningID = %q, want rs_abc", blk.ReasoningID)
+	}
+	if blk.Thinking != "先想一下" {
+		t.Fatalf("summary text = %q, want 先想一下", blk.Thinking)
+	}
+}
+
+// 空 reasoning item（无 encrypted_content 且 summary 为空）不产消息。
+// 硬造一个空 thinking block 会被 rosetta validate 以 "thinking block is
+// empty" 拒掉，把本来能跑的请求变成 400 —— 这与修复前的行为一致。
+func TestDecodeResponses_ReasoningEmptySkipped(t *testing.T) {
+	got := decodeResponses(t, `{
+		"model":"gpt-4o",
+		"input":[
+			{"type":"reasoning","summary":[]},
+			{"type":"message","role":"user","content":[{"type":"input_text","text":"你好"}]}
+		]
+	}`)
+
+	req := got.ToRosetta()
+	if len(req.Messages) != 1 {
+		t.Fatalf("message count = %d, want 1: %+v", len(req.Messages), req.Messages)
+	}
+}
+
+// 只有 encrypted_content、没有可读 summary 时同样要搬 —— 载荷本身就是
+// 内容，续接靠的是它而不是展示文本。
+func TestDecodeResponses_ReasoningSealedOnly(t *testing.T) {
+	got := decodeResponses(t, `{
+		"model":"gpt-4o",
+		"input":[
+			{"type":"reasoning","id":"rs_xyz","encrypted_content":"gAAAAA-blob"},
+			{"type":"message","role":"user","content":[{"type":"input_text","text":"继续"}]}
+		]
+	}`)
+
+	req := got.ToRosetta()
+	if len(req.Messages) != 2 {
+		t.Fatalf("message count = %d, want 2: %+v", len(req.Messages), req.Messages)
+	}
+	blk := req.Messages[0].Blocks[0]
+	if blk.Sealed != "gAAAAA-blob" || blk.Thinking != "" {
+		t.Fatalf("sealed-only block = %+v", blk)
+	}
+}
+
 func TestDecodeResponses_Full(t *testing.T) {
 	got := decodeResponses(t, `{
 		"model":"gpt-4o",

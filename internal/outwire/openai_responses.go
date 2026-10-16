@@ -46,6 +46,9 @@ type ResponsesSSE struct {
 	toolOpen bool
 	toolID   string
 	toolName string
+	// thinkText 累积当前 reasoning item 的可读文本，供 output_item.done
+	// 的 summary 收尾。与 text（message 正文）分开：两者是不同的 item。
+	thinkText strings.Builder
 	// toolIdx 是当前开放 function_call item 对应的 ToolIndex。
 	// 同项判据必须是它而不是 toolID：rosetta 的续片（Responses 侧的
 	// function_call_arguments.delta）只带 ToolIndex+ArgumentsDelta，ToolID 为空。
@@ -152,12 +155,87 @@ func (s *ResponsesSSE) closeTool() {
 	s.toolOpen = false
 }
 
+// thinkingDelta 把统一模型的 thinking 增量编码为 reasoning item。
+//
+// 修复前这里没有 EventThinkingDelta 分支，Responses 流式下的思考内容
+// 整个不出事件。可读文本丢失只是体验问题，真正的损失是 sealed 载荷：
+// 它是 OpenAI 要求原样回传的续接状态，客户端多轮 reasoning 会话要靠它。
+//
+// 事件按 OpenAI 规范走，与 message / function_call 两条支路同构：
+//
+//	response.output_item.added(type=reasoning)
+//	  → response.reasoning_summary_text.delta*   （有可读文本时）
+//	→ response.output_item.done(带 encrypted_content)
+//
+// 只在 SealedBy == "openai-responses" 时发。别的协议族封的载荷不该
+// 出现在 Responses 事件里 —— 那是别家的不透明状态，写出来既无意义，
+// 也可能把跨协议的内部形状泄漏给客户端。
+func (s *ResponsesSSE) thinkingDelta(ev *rosetta.Event) {
+	if ev.SealedBy != "" && ev.SealedBy != "openai-responses" {
+		return
+	}
+	// 没有 sealed 载荷的裸思考增量仍可显示，但没有续接价值。
+	// 上游是 OpenAI 时它总会带 sealed，这里兜住别家实现。
+	if ev.Sealed == "" && ev.Text == "" {
+		return
+	}
+
+	s.ensureStarted("")
+	idx := s.outputIndex
+	s.outputIndex++
+
+	// encrypted_content 只在 output_item.done 出现（OpenAI 不在任何
+	// *.delta 事件里发它），所以这里不发 reasoning_summary_part.* 的
+	// added/done 配对 —— 规范的流式形状里 reasoning item 不是分块容器。
+	item := map[string]any{
+		"type":   "reasoning",
+		"status": "in_progress",
+	}
+	if ev.ReasoningID != "" {
+		item["id"] = ev.ReasoningID
+	}
+	s.writeEvent("response.output_item.added", map[string]any{
+		"output_index": idx, "item": item,
+	})
+
+	if ev.Text != "" {
+		s.thinkText.WriteString(ev.Text)
+		s.wroteContent = true
+		s.writeEvent("response.reasoning_summary_text.delta", map[string]any{
+			"item_id": ev.ReasoningID, "output_index": idx,
+			"summary_index": 0, "delta": ev.Text,
+		})
+	}
+
+	done := map[string]any{
+		"type":   "reasoning",
+		"status": "completed",
+	}
+	if ev.ReasoningID != "" {
+		done["id"] = ev.ReasoningID
+	}
+	if ev.Text != "" {
+		done["summary"] = []map[string]any{{
+			"type": "summary_text", "text": s.thinkText.String(),
+		}}
+	}
+	if ev.Sealed != "" {
+		done["encrypted_content"] = ev.Sealed
+	}
+	s.writeEvent("response.output_item.done", map[string]any{
+		"output_index": idx, "item": done,
+	})
+	s.output = append(s.output, done)
+}
+
 func (s *ResponsesSSE) Event(ev *rosetta.Event) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	switch ev.Type {
 	case rosetta.EventMessageStart:
 		s.ensureStarted(ev.ID)
+	case rosetta.EventThinkingDelta:
+		s.thinkingDelta(ev)
 	case rosetta.EventTextDelta:
 		if ev.Text == "" {
 			return
@@ -291,6 +369,29 @@ func WriteResponsesResponse(w http.ResponseWriter, resp *rosetta.ChatResponse, m
 	msgIdx := 0
 	for _, blk := range resp.Content {
 		switch blk.Type {
+		case rosetta.BlockThinking:
+			// reasoning item 是 reasoning 会话的续接载体，非流式侧同样要出。
+			// 修复前这里只处理 BlockText / BlockToolCall，sealed 载荷被
+			// 整个丢掉，客户端下一轮回放时报 "Item with id 'rs_…' not found"。
+			//
+			// SealedBy 门闩：只有 openai-responses 自己封的载荷才写回
+			// Responses。chat / anthropic 封的写进来是这个协议的异物。
+			if blk.SealedBy != "" && blk.SealedBy != "openai-responses" {
+				continue
+			}
+			item := map[string]any{"type": "reasoning", "status": "completed"}
+			if blk.ReasoningID != "" {
+				item["id"] = blk.ReasoningID
+			}
+			if blk.Thinking != "" {
+				item["summary"] = []map[string]any{{
+					"type": "summary_text", "text": blk.Thinking,
+				}}
+			}
+			if blk.Sealed != "" {
+				item["encrypted_content"] = blk.Sealed
+			}
+			output = append(output, item)
 		case rosetta.BlockText:
 			output = append(output, map[string]any{
 				"type": "message", "id": id + "-msg-" + itoa(msgIdx), "status": "completed", "role": "assistant",

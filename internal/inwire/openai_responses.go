@@ -74,6 +74,12 @@ type responsesItem struct {
 	Output    json.RawMessage `json:"output,omitempty"` // function_call_output
 
 	ID string `json:"id,omitempty"` // item_reference
+
+	// reasoning item 的续接载体。EncryptedContent 是 OpenAI 要求原样回传的
+	// 不透明载荷；Summary 是它在 Responses 上的可读文本。ID 是 item 自身的
+	// id（`rs_…`），与 encrypted_content 共同构成跨轮可寻址的状态。
+	EncryptedContent string          `json:"encrypted_content,omitempty"`
+	Summary          json.RawMessage `json:"summary,omitempty"`
 }
 
 type responsesContentPart struct {
@@ -199,7 +205,36 @@ func (a *ResponsesRequest) ToRosetta() *rosetta.ChatRequest {
 		case "function_call_output":
 			req.Messages = append(req.Messages, rosetta.ToolResult(item.CallID, "", responsesItemOutputText(item)))
 		case "reasoning":
-			// 历史思考不是对话内容：剥除（与 OpenAI 适配器对 thinking 块的处置一致）。
+			// reasoning item 是 reasoning 会话的续接载体，不能剥除。
+			//
+			// 修复前这里按「历史思考不是对话内容」整个丢弃，与 OpenAI chat
+			// 适配器对 thinking 块的处置看齐。但 Responses 协议下丢的不只是
+			// 可读文本，还有 encrypted_content —— 那是 OpenAI 要求原样回传的
+			// 状态，丢了它下一轮回放会报 "Item with id 'rs_…' not found"，
+			// 客户端多轮 reasoning 会话直接断在这里。
+			//
+			// 现在原样搬进统一模型的 Sealed/SealedBy，由 rosetta 的
+			// SealedBy 门闩决定写回哪个协议族：openai-responses 上游完整
+			// 回放，chat / anthropic 上游自动剥除（那两个协议没有对应概念，
+			// 客户端本应自带全量历史）。
+			//
+			// 边界：两者都空时整项跳过。空 summary（`"summary":[]`）是
+			// 常见形态，此时 reasoning item 不带任何可搬运的状态，
+			// 硬造一个 thinking block 只会被 rosetta validate 以
+			// "thinking block is empty" 拒掉，把本来能跑的请求变成 400。
+			summary := responsesItemReasoningText(item)
+			if item.EncryptedContent == "" && summary == "" {
+				continue
+			}
+			// ReasoningID 单独设：SealedThinking 只填 summary/sealed/sealedBy，
+			// 而 item id 是下一轮寻址的依据（SDK 的 Responses 适配器按
+			// Block.ReasoningID 写出 "id"），漏了它等于带着载荷却没有地址。
+			blk := rosetta.SealedThinking(summary, item.EncryptedContent, "openai-responses")
+			blk.ReasoningID = item.ID
+			req.Messages = append(req.Messages, rosetta.Message{
+				Role:   rosetta.RoleAssistant,
+				Blocks: []rosetta.Block{blk},
+			})
 		default:
 			// item_reference / 内建工具调用等：留空块让 rosetta validate 以
 			// 明确错误拒绝，不静默吞。
@@ -325,6 +360,24 @@ func responsesItemOutputText(item responsesItem) string {
 	var sb strings.Builder
 	for _, p := range decodeResponsesParts(item.Output) {
 		if p.Type == "output_text" {
+			sb.WriteString(p.Text)
+		}
+	}
+	return sb.String()
+}
+
+// responsesItemReasoningText 展平 reasoning item 的 summary（字符串或分块）。
+// 只认 summary_text —— reasoning_text 属于 content，与 summary 是同一份
+// 思考的不同视图，两个都读会把正文重复一遍。读不到就返回空串：summary
+// 只是附带的可读视图，续接真正依赖的是 encrypted_content。
+func responsesItemReasoningText(item responsesItem) string {
+	var s string
+	if err := json.Unmarshal(item.Summary, &s); err == nil {
+		return s
+	}
+	var sb strings.Builder
+	for _, p := range decodeResponsesParts(item.Summary) {
+		if p.Type == "summary_text" {
 			sb.WriteString(p.Text)
 		}
 	}

@@ -66,6 +66,90 @@ func TestResponsesSSE_TextFlow(t *testing.T) {
 	}
 }
 
+// reasoning item：output_item.added → summary delta → output_item.done
+// （带 encrypted_content），并且 completed 内嵌完整的 reasoning item。
+// 修复前 thinking 增量整个不出事件，客户端拿不到续接状态。
+func TestResponsesSSE_ReasoningSealed(t *testing.T) {
+	rec := httptest.NewRecorder()
+	s := NewResponsesSSE(rec, nil, "resp_1", "gw-model")
+
+	s.Event(&rosetta.Event{Type: rosetta.EventMessageStart, ID: "up-1"})
+	s.Event(&rosetta.Event{Type: rosetta.EventThinkingDelta, Text: "先想一下", Sealed: "gAAAAA-secret", SealedBy: "openai-responses", ReasoningID: "rs_abc"})
+	s.Event(&rosetta.Event{Type: rosetta.EventTextDelta, Text: "答案是 42"})
+	s.Event(&rosetta.Event{Type: rosetta.EventMessageEnd, Usage: &rosetta.Usage{InputTokens: 7, OutputTokens: 3}})
+	s.Finish("ok", rosetta.StopEnd, rosetta.Usage{InputTokens: 7, OutputTokens: 3, TotalTokens: 10}, false)
+
+	raw := rec.Body.String()
+	if !strings.Contains(raw, `"encrypted_content":"gAAAAA-secret"`) {
+		t.Fatalf("sealed payload missing from stream:\n%s", raw)
+	}
+	if !strings.Contains(raw, `"id":"rs_abc"`) {
+		t.Fatalf("upstream reasoning item id missing:\n%s", raw)
+	}
+
+	// completed 内嵌的 output 必须含 reasoning item，否则只消费
+	// response.completed 的客户端（非流式兜底路径）拿不到续接状态。
+	var done struct {
+		Response struct {
+			Output []struct {
+				Type             string `json:"type"`
+				ID               string `json:"id"`
+				EncryptedContent string `json:"encrypted_content"`
+				Summary          []struct {
+					Text string `json:"text"`
+				} `json:"summary"`
+			} `json:"output"`
+		} `json:"response"`
+	}
+	last := collect(t, raw)[len(collect(t, raw))-1]
+	if last[0] != "response.completed" {
+		t.Fatalf("last event = %s, want response.completed", last[0])
+	}
+	if err := json.Unmarshal([]byte(last[1]), &done); err != nil {
+		t.Fatalf("parse completed: %v", err)
+	}
+	var reasoning *struct {
+		Type             string `json:"type"`
+		ID               string `json:"id"`
+		EncryptedContent string `json:"encrypted_content"`
+		Summary          []struct {
+			Text string `json:"text"`
+		} `json:"summary"`
+	}
+	for i := range done.Response.Output {
+		if done.Response.Output[i].Type == "reasoning" {
+			reasoning = &done.Response.Output[i]
+		}
+	}
+	if reasoning == nil {
+		t.Fatalf("completed output has no reasoning item: %+v", done.Response.Output)
+	}
+	if reasoning.EncryptedContent != "gAAAAA-secret" || reasoning.ID != "rs_abc" ||
+		len(reasoning.Summary) != 1 || reasoning.Summary[0].Text != "先想一下" {
+		t.Fatalf("reasoning item in completed = %+v", reasoning)
+	}
+}
+
+// 别家协议族封的载荷不得出现在 Responses 事件里 —— 那是跨协议的异物。
+func TestResponsesSSE_ReasoningForeignSealDropped(t *testing.T) {
+	rec := httptest.NewRecorder()
+	s := NewResponsesSSE(rec, nil, "resp_1", "gw-model")
+
+	s.Event(&rosetta.Event{Type: rosetta.EventMessageStart, ID: "up-1"})
+	s.Event(&rosetta.Event{Type: rosetta.EventThinkingDelta, Text: "anthropic 的思考", Sealed: "sig-abc", SealedBy: "anthropic"})
+	s.Event(&rosetta.Event{Type: rosetta.EventTextDelta, Text: "答案是 42"})
+	s.Event(&rosetta.Event{Type: rosetta.EventMessageEnd})
+	s.Finish("ok", rosetta.StopEnd, rosetta.Usage{InputTokens: 1, OutputTokens: 1, TotalTokens: 2}, false)
+
+	raw := rec.Body.String()
+	if strings.Contains(raw, "sig-abc") {
+		t.Fatalf("foreign sealed payload leaked into Responses stream:\n%s", raw)
+	}
+	if strings.Contains(raw, "reasoning") {
+		t.Fatalf("foreign seal produced a reasoning item:\n%s", raw)
+	}
+}
+
 // 工具调用：function_call item + arguments delta/done；断流发 response.failed。
 func TestResponsesSSE_ToolCallAndFailure(t *testing.T) {
 	rec := httptest.NewRecorder()
@@ -106,6 +190,46 @@ func TestResponsesSSE_ToolCallAndFailure(t *testing.T) {
 		if n == "response.completed" {
 			t.Fatalf("truncated stream must not complete")
 		}
+	}
+}
+
+// 非流式 reasoning item：修复前 BlockThinking 被整个跳过，客户端下一轮
+// 回放时报 "Item with id 'rs_…' not found"。
+func TestWriteResponsesResponse_ReasoningSealed(t *testing.T) {
+	rec := httptest.NewRecorder()
+	WriteResponsesResponse(rec, &rosetta.ChatResponse{
+		ID: "up-9", Model: "x",
+		Content: []rosetta.Block{
+			{Type: rosetta.BlockThinking, Thinking: "先想一下", Sealed: "gAAAAA-secret", SealedBy: "openai-responses", ReasoningID: "rs_abc"},
+			{Type: rosetta.BlockText, Text: "答"},
+		},
+		StopReason: rosetta.StopEnd,
+		Usage:      rosetta.Usage{InputTokens: 5, OutputTokens: 6, TotalTokens: 11},
+	}, "gw-model")
+
+	var out struct {
+		Output []struct {
+			Type             string `json:"type"`
+			ID               string `json:"id"`
+			EncryptedContent string `json:"encrypted_content"`
+			Summary          []struct {
+				Text string `json:"text"`
+			} `json:"summary"`
+			Content []struct {
+				Text string `json:"text"`
+			} `json:"content"`
+		} `json:"output"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil {
+		t.Fatalf("parse: %v\n%s", err, rec.Body.String())
+	}
+	if len(out.Output) != 2 {
+		t.Fatalf("output count = %d, want 2: %+v", len(out.Output), out.Output)
+	}
+	r := out.Output[0]
+	if r.Type != "reasoning" || r.EncryptedContent != "gAAAAA-secret" || r.ID != "rs_abc" ||
+		len(r.Summary) != 1 || r.Summary[0].Text != "先想一下" {
+		t.Fatalf("reasoning item = %+v", r)
 	}
 }
 
