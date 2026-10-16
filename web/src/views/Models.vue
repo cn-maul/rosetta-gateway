@@ -52,6 +52,7 @@ import type { ModelMeta, ModelPrice, ProbeHealth, ProbeTimelineBucket } from '..
 import { fmtMoney } from '../fmt'
 import { toast } from '../ui'
 import AppModal from '../components/AppModal.vue'
+import HeartbeatBar from '../components/HeartbeatBar.vue'
 
 const models = ref<string[]>([])
 /** 清单是否已被所属分组的白名单收窄。false = 这是你此刻能看到的全部。 */
@@ -251,109 +252,15 @@ async function load() {
 
 onMounted(load)
 
-// ---------- 折线图（纯 SVG） ----------
+// ---------- 连通率条形图 ----------
 //
-// 与原「连通率」页逐字同一套算法，纯 SVG 不引图表库（NAS 自用部署不值得
-// 让单二进制多背几百 KB 依赖）。
-
-const CH_W = 320 // viewBox 宽；卡片小，用小一点的坐标系，CSS 再拉伸
-const CH_H = 96
-const PAD_L = 6
-const PAD_R = 6
-const PAD_T = 8
-const PAD_B = 8
-
-interface LinePoint {
-  ts: number
-  rate: number | null // null = 该桶无探测记录（缺口，不是 0%）
-  bucket: ProbeTimelineBucket | null
-}
-
-/**
- * buildPoints 把稀疏桶补成连续时间轴。
- *
- * 后端对「该时间窗没有探测记录」的桶**不返回**（没探测 ≠ 全失败，两者必须
- * 可区分）。而折线天然连接相邻点 —— 于是「上午正常 / 停机 5 小时 / 下午恢复」
- * 会被画成一条从 100% 直通 100% 的斜线，**故障时段在图上彻底消失**。所以
- * 缺口必须是 null，渲染成断线。
- */
-function buildPoints(buckets: ProbeTimelineBucket[]): LinePoint[] {
-  const bucketMs = granularity.value === 'day' ? 86400000 : 3600000
-  const now = Date.now()
-  const from = now - days.value * 86400000
-  const byTs = new Map<number, ProbeTimelineBucket>()
-  for (const b of buckets) byTs.set(b.ts, b)
-
-  const out: LinePoint[] = []
-  const start = Math.floor(from / bucketMs) * bucketMs
-  for (let ts = start; ts <= now; ts += bucketMs) {
-    const b = byTs.get(ts)
-    out.push({ ts, rate: b && b.count > 0 ? b.ok / b.count : null, bucket: b ?? null })
-  }
-  return out
-}
-
-function pxFor(n: number, i: number): number {
-  const d = Math.max(n - 1, 1)
-  return PAD_L + (i / d) * (CH_W - PAD_L - PAD_R)
-}
-function pyFor(rate: number): number {
-  const h = CH_H - PAD_T - PAD_B
-  return PAD_T + (1 - rate) * h
-}
-
-/** 一条曲线的渲染结果：若干段折线（缺口断开）+ 有效点。 */
-interface Curve {
-  segments: { coords: string }[]
-  // dots 带原始 point：悬停要显示该桶的成功率/延迟，光有 x/y 不够。
-  dots: { x: number; y: number; rate: number; point: LinePoint }[]
-  hasData: boolean
-}
-
-function buildCurve(buckets: ProbeTimelineBucket[]): Curve {
-  const points = buildPoints(buckets)
-  const n = points.length
-  const segments: Curve['segments'] = []
-  const dots: Curve['dots'] = []
-  let cur: LinePoint[] = []
-  let curStart = 0
-
-  const flush = () => {
-    if (!cur.length) return
-    segments.push({
-      coords: cur
-        .map((p, k) => `${pxFor(n, curStart + k).toFixed(1)},${pyFor(p.rate!).toFixed(1)}`)
-        .join(' '),
-    })
-    cur = []
-  }
-
-  points.forEach((p, i) => {
-    if (p.rate === null) {
-      flush()
-      return
-    }
-    if (!cur.length) curStart = i
-    cur.push(p)
-    dots.push({ x: pxFor(n, i), y: pyFor(p.rate), rate: p.rate, point: p })
-  })
-  flush()
-
-  return { segments, dots, hasData: dots.length > 0 }
-}
-
-function fmtTs(ts: number): string {
-  const d = new Date(ts)
-  const hh = `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`
-  if (granularity.value === 'day') return `${d.getMonth() + 1}/${d.getDate()}`
-  return hh
-}
-
-function curveTitle(p: LinePoint): string {
-  if (!p.bucket) return `${fmtTs(p.ts)} · 没有探测记录`
-  const rate = Math.round((p.rate ?? 0) * 100)
-  return `${fmtTs(p.ts)} · 成功率 ${rate}% (${p.bucket.ok}/${p.bucket.count}) · 平均 ${p.bucket.latency}ms`
-}
+// 原来是纯 SVG 折线（buildCurve / pxFor / pyFor 一整套），2026-10-16 换成
+// HeartbeatBar：折线把「停机 5 小时」画成一条直通 100% 的斜线，故障时段
+// 在图上消失；条形图每个探测桶一根胶囊，坏的直接是红的。
+//
+// 跨度 = days × 24 小时（与数据面同源，只换渲染不改查询）。
+// 两种粒度都是 24×days 小时，差别只在后端怎么聚合，所以这里不必分支。
+const HB_HOURS = days.value * 24
 
 /** healthOf 这个公开模型对应的上游模型的健康摘要（可能 undefined）。 */
 function healthOf(name: string): ProbeHealth | undefined {
@@ -540,31 +447,7 @@ function lineNote(name: string): string {
               <template v-if="lineState(m) === 'ok' && drawn.includes(m)">
                 <div v-if="timelineLoading" class="chart-empty dim">加载中…</div>
                 <template v-else>
-                  <svg class="chart" :viewBox="`0 0 ${CH_W} ${CH_H}`" preserveAspectRatio="none">
-                    <line class="grid" :x1="PAD_L" :x2="CH_W - PAD_R" :y1="pyFor(1)" :y2="pyFor(1)" />
-                    <line class="grid" :x1="PAD_L" :x2="CH_W - PAD_R" :y1="pyFor(0)" :y2="pyFor(0)" />
-                    <line class="thr" :x1="PAD_L" :x2="CH_W - PAD_R" :y1="pyFor(0.8)" :y2="pyFor(0.8)" />
-                    <polyline
-                      v-for="(seg, si) in buildCurve(curveFor(m)).segments"
-                      :key="si"
-                      class="line"
-                      :points="seg.coords"
-                    />
-                    <circle
-                      v-for="(d, di) in buildCurve(curveFor(m)).dots"
-                      :key="'d' + di"
-                      class="dot"
-                      :class="{ bad: d.rate < 0.5 }"
-                      :cx="d.x"
-                      :cy="d.y"
-                      r="1.6"
-                    >
-                      <title>{{ curveTitle(d.point) }}</title>
-                    </circle>
-                  </svg>
-                  <div v-if="!buildCurve(curveFor(m)).hasData" class="chart-empty dim">
-                    该时段没有探测记录
-                  </div>
+                  <HeartbeatBar :buckets="curveFor(m)" :hours="HB_HOURS" :bucket-minutes="60" />
                 </template>
               </template>
               <div v-else-if="drawn.includes(m)" class="chart-empty dim">{{ lineNote(m) }}</div>
@@ -739,36 +622,6 @@ function lineNote(name: string): string {
 }
 .health-stat {
   font-size: 11.5px;
-}
-.chart {
-  width: 100%;
-  height: 96px;
-  display: block;
-}
-.chart .grid {
-  stroke: var(--border);
-  stroke-width: 1;
-  vector-effect: non-scaling-stroke;
-}
-.chart .thr {
-  stroke: var(--text-4);
-  stroke-dasharray: 3 3;
-  opacity: 0.6;
-  vector-effect: non-scaling-stroke;
-}
-.chart .line {
-  fill: none;
-  stroke: var(--accent);
-  stroke-width: 1.4;
-  vector-effect: non-scaling-stroke;
-  stroke-linejoin: round;
-  stroke-linecap: round;
-}
-.chart .dot {
-  fill: var(--accent);
-}
-.chart .dot.bad {
-  fill: var(--danger);
 }
 .chart-empty {
   font-size: 11.5px;
