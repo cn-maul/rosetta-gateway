@@ -101,10 +101,13 @@ type Bootstrap struct {
 }
 
 type BootstrapProvider struct {
-	Slug        string                `json:"slug"`
-	Name        string                `json:"name"`
-	Protocol    string                `json:"protocol"`
-	Endpoint    string                `json:"endpoint"`
+	Slug     string `json:"slug"`
+	Name     string `json:"name"`
+	Protocol string `json:"protocol"`
+	Endpoint string `json:"endpoint"`
+	// ProxyURL 是该上游独享的出站代理（http/https/socks5）。空 = 不代理。
+	// 与 providers 表里的 proxy_url 同义，bootstrap 路径才能配到它。
+	ProxyURL    string                `json:"proxy_url"`
 	Credentials []BootstrapCredential `json:"credentials"`
 	Models      []string              `json:"models"`
 }

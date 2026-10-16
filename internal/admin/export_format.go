@@ -96,6 +96,9 @@ type providerExport struct {
 	TimeoutMs  int    `json:"timeout_ms"`
 	MaxRetries int    `json:"max_retries"`
 	QuirksJSON string `json:"quirks_json,omitempty"`
+	// 出站代理。omitempty：不代理的 provider 不该在导出体里多出一行空值，
+	// 那会让「这个文件配过代理吗」在肉眼上变得难判。
+	ProxyURL string `json:"proxy_url,omitempty"`
 }
 
 type credentialExport struct {

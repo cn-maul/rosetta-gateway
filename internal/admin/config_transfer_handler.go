@@ -129,7 +129,7 @@ func (h *ConfigTransferHandler) buildExport(ctx context.Context) (configExport, 
 		out.Providers = append(out.Providers, providerExport{
 			Slug: p.Slug, Name: p.Name, Protocol: p.Protocol, Endpoint: p.Endpoint,
 			Enabled: p.Enabled, TimeoutMs: p.TimeoutMs, MaxRetries: p.MaxRetries,
-			QuirksJSON: p.QuirksJSON,
+			QuirksJSON: p.QuirksJSON, ProxyURL: p.ProxyURL,
 		})
 		for _, m := range byProvider[p.ID] {
 			out.Models = append(out.Models, modelExport{
@@ -278,6 +278,11 @@ func (h *ConfigTransferHandler) apply(ctx context.Context, in *configExport, dry
 			Slug: target, Name: strings.TrimSpace(pe.Name), Protocol: strings.TrimSpace(pe.Protocol),
 			Endpoint: strings.TrimSpace(pe.Endpoint), Enabled: pe.Enabled,
 			TimeoutMs: pe.TimeoutMs, MaxRetries: pe.MaxRetries, QuirksJSON: pe.QuirksJSON,
+			// 代理跟着一起搬。注意它指向的是**本机**的代理地址
+			// （如 127.0.0.1:7897），换一台机器导入时该端口未必相同 ——
+			// 但那是运维该判断的事，导入侧原样搬运、不做「猜一个新地址」
+			// 这种自作聪明。
+			ProxyURL:  strings.TrimSpace(pe.ProxyURL),
 			CreatedAt: time.Now().UnixMilli(), UpdatedAt: time.Now().UnixMilli(),
 		}
 		// 与手工创建保持同一套兜底：缺协议/端点的记录导进来就 unusable，

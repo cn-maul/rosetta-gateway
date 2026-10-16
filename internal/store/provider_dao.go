@@ -16,12 +16,15 @@ type Provider struct {
 	TimeoutMs  int
 	MaxRetries int
 	QuirksJSON string
-	CreatedAt  int64
-	UpdatedAt  int64
+	// ProxyURL 是该 provider 独享的出站代理。空串 = 不代理（直连或读
+	// 进程环境变量）。见 store.go 里 proxy_url 列的注释。
+	ProxyURL  string
+	CreatedAt int64
+	UpdatedAt int64
 }
 
 // providerColumns 是 providers 三处读路径共用的列清单。
-const providerColumns = `id, slug, name, protocol, endpoint, enabled, timeout_ms, max_retries, quirks_json, created_at, updated_at`
+const providerColumns = `id, slug, name, protocol, endpoint, enabled, timeout_ms, max_retries, quirks_json, proxy_url, created_at, updated_at`
 
 // scanProvider 用 sql.NullString 承接可空列 quirks_json，
 // 否则该列为 NULL 时扫描会直接报错。
@@ -29,14 +32,16 @@ func scanProvider(sc scanner) (Provider, error) {
 	var p Provider
 	var enabled int
 	var quirks sql.NullString
+	var proxyURL sql.NullString
 
 	err := sc.Scan(&p.ID, &p.Slug, &p.Name, &p.Protocol, &p.Endpoint, &enabled,
-		&p.TimeoutMs, &p.MaxRetries, &quirks, &p.CreatedAt, &p.UpdatedAt)
+		&p.TimeoutMs, &p.MaxRetries, &quirks, &proxyURL, &p.CreatedAt, &p.UpdatedAt)
 	if err != nil {
 		return p, err
 	}
 	p.Enabled = enabled == 1
 	p.QuirksJSON = quirks.String
+	p.ProxyURL = proxyURL.String
 	return p, nil
 }
 
@@ -92,8 +97,9 @@ func createProvider(ctx context.Context, ex execer, p *Provider) error {
 		enabled = 1
 	}
 	_, err := ex.ExecContext(ctx,
-		`INSERT INTO providers (id, slug, name, protocol, endpoint, enabled, timeout_ms, max_retries, quirks_json, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		p.ID, p.Slug, p.Name, p.Protocol, p.Endpoint, enabled, p.TimeoutMs, p.MaxRetries, nullIfEmpty(p.QuirksJSON), now, now)
+		`INSERT INTO providers (id, slug, name, protocol, endpoint, enabled, timeout_ms, max_retries, quirks_json, proxy_url, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		p.ID, p.Slug, p.Name, p.Protocol, p.Endpoint, enabled, p.TimeoutMs, p.MaxRetries,
+		nullIfEmpty(p.QuirksJSON), nullIfEmpty(p.ProxyURL), now, now)
 	// 回写时间戳，否则创建响应里的 created_at/updated_at 是 0，与库里不一致。
 	if err == nil {
 		p.CreatedAt, p.UpdatedAt = now, now
@@ -107,8 +113,9 @@ func (s *Store) UpdateProvider(ctx context.Context, id string, p *Provider) erro
 		enabled = 1
 	}
 	res, err := s.db.ExecContext(ctx,
-		`UPDATE providers SET slug = ?, name = ?, protocol = ?, endpoint = ?, enabled = ?, timeout_ms = ?, max_retries = ?, quirks_json = ?, updated_at = ? WHERE id = ?`,
-		p.Slug, p.Name, p.Protocol, p.Endpoint, enabled, p.TimeoutMs, p.MaxRetries, nullIfEmpty(p.QuirksJSON), time.Now().UnixMilli(), id)
+		`UPDATE providers SET slug = ?, name = ?, protocol = ?, endpoint = ?, enabled = ?, timeout_ms = ?, max_retries = ?, quirks_json = ?, proxy_url = ?, updated_at = ? WHERE id = ?`,
+		p.Slug, p.Name, p.Protocol, p.Endpoint, enabled, p.TimeoutMs, p.MaxRetries,
+		nullIfEmpty(p.QuirksJSON), nullIfEmpty(p.ProxyURL), time.Now().UnixMilli(), id)
 	return checkAffected(res, err)
 }
 

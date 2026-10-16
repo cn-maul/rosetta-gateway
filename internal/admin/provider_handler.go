@@ -33,6 +33,7 @@ type providerCreateRequest struct {
 	Name       string `json:"name"`
 	Protocol   string `json:"protocol"`
 	Endpoint   string `json:"endpoint"`
+	ProxyURL   string `json:"proxy_url"`
 	QuirksJSON string `json:"quirks_json"`
 	APIKey     string `json:"api_key"`
 }
@@ -53,6 +54,10 @@ type providerUpdateRequest struct {
 	TimeoutMs  *int    `json:"timeout_ms"`
 	MaxRetries *int    `json:"max_retries"`
 	QuirksJSON *string `json:"quirks_json"`
+	// ProxyURL 是**指针**而非 string：空串是合法值（= 不代理，清掉已配的
+	// 代理）。用 string 的话，未提供时会被序列化成 ""，与「显式清空」不可分辨，
+	// 于是「只想改个名字」会把代理悄悄抹掉。
+	ProxyURL *string `json:"proxy_url"`
 }
 
 type providerResponse struct {
@@ -65,6 +70,7 @@ type providerResponse struct {
 	TimeoutMs  int    `json:"timeout_ms"`
 	MaxRetries int    `json:"max_retries"`
 	QuirksJSON string `json:"quirks_json"`
+	ProxyURL   string `json:"proxy_url"`
 	CreatedAt  int64  `json:"created_at"`
 	UpdatedAt  int64  `json:"updated_at"`
 	// Ready / ReadyReason 是**运行时**状态（P4 / 设计 §4.7），来自快照，
@@ -184,6 +190,7 @@ func (h *ProviderHandler) Create(w http.ResponseWriter, r *http.Request) {
 		TimeoutMs:  h.cfg.Defaults.UpstreamTimeoutMs,
 		MaxRetries: h.cfg.Defaults.MaxRetries,
 		QuirksJSON: req.QuirksJSON,
+		ProxyURL:   req.ProxyURL,
 		CreatedAt:  now,
 		UpdatedAt:  now,
 	}
@@ -308,6 +315,11 @@ func (h *ProviderHandler) Update(w http.ResponseWriter, r *http.Request, id stri
 	// 可清空字段
 	if req.QuirksJSON != nil {
 		existing.QuirksJSON = *req.QuirksJSON
+	}
+	// 代理同样可清空：留空 = 不代理。与 QuirksJSON 同一档处理，
+	// 因为「卸掉代理」和「从没配过代理」在使用上没有任何区别。
+	if req.ProxyURL != nil {
+		existing.ProxyURL = strings.TrimSpace(*req.ProxyURL)
 	}
 
 	if err := h.store.UpdateProvider(r.Context(), id, existing); err != nil {
@@ -474,6 +486,7 @@ func toProviderResponse(p store.Provider) providerResponse {
 		TimeoutMs:  p.TimeoutMs,
 		MaxRetries: p.MaxRetries,
 		QuirksJSON: p.QuirksJSON,
+		ProxyURL:   p.ProxyURL,
 		CreatedAt:  p.CreatedAt,
 		UpdatedAt:  p.UpdatedAt,
 	}

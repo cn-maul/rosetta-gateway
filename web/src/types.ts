@@ -10,6 +10,14 @@ export interface Provider {
   timeout_ms: number
   max_retries: number
   quirks_json: string
+  /**
+   * 该上游独享的出站代理（http/https/socks5）。空串 = 不代理。
+   *
+   * 为什么是 per-provider 而不是全局：上游的网络位置差异很大 ——
+   * 有的要翻墙、有的国内直连即可、有的只能走公司内网代理。
+   * 全局开关会让能直连的那些也平白多绕一跳。
+   */
+  proxy_url: string
   created_at: number
   // ready 是**运行时**状态（后端快照），不是库里的配置字段：
   // 库只记录配了什么，快照才反映「上游池实际建出了什么」。
@@ -26,6 +34,8 @@ export interface ProviderCreatePayload {
   name: string
   protocol: string
   endpoint: string
+  /** 出站代理；留空 = 不代理。 */
+  proxy_url?: string
   api_key?: string
 }
 
@@ -41,6 +51,8 @@ export interface ProviderUpdatePayload {
   timeout_ms?: number
   max_retries?: number
   quirks_json?: string
+  /** 出站代理。传空串是**清空**，不是「不改」—— 卸载代理必须能表达。 */
+  proxy_url?: string
 }
 
 // discover 端点返回的上游模型条目；后端已把探测不到的容量替换为设置里的默认值

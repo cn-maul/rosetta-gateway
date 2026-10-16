@@ -95,6 +95,18 @@ func (s *Store) migrate() error {
 			timeout_ms    INTEGER NOT NULL DEFAULT 0,
 			max_retries   INTEGER NOT NULL DEFAULT 2,
 			quirks_json   TEXT,
+			-- 该 provider 独享的出站代理（HTTP/HTTPS/SOCKS5 的 URL）。
+			-- 空串 = 直连，读进程环境变量里的 HTTP_PROXY / HTTPS_PROXY。
+			--
+			-- 为什么要 per-provider 而不是全局：上游服务商的网络位置差异很大
+			-- —— 有的要翻墙（api.openai.com）、有的国内直连即可（deepseek）、
+			-- 有的只能走公司内网代理。一个全局开关会让「能直连的那些」也平白
+			-- 多绕一跳，延迟和故障面都上去。
+			--
+			-- 为什么可空而不带 DEFAULT：空串是「不代理」的显式值，与 NULL 必须
+			-- 可区分 —— 老库迁移后 NULL 表示「从没配过」，语义上等价于不代理，
+			-- 于是这里不设 DEFAULT，读取时靠 COALESCE 兜。
+			proxy_url     TEXT,
 			created_at    INTEGER NOT NULL,
 			updated_at    INTEGER NOT NULL
 		)`,
@@ -767,6 +779,12 @@ func (s *Store) ensureColumns() error {
 		// 这条验收失守 —— 而那正是归档表存在的全部理由。
 		{"usage_daily_rollups", "ok_output_tokens", "INTEGER NOT NULL DEFAULT 0"},
 		{"usage_daily_rollups", "ok_latency_sum_ms", "INTEGER NOT NULL DEFAULT 0"},
+		// 该 provider 独享的出站代理（2026-10-16）。
+		//
+		// **刻意可空、不带 DEFAULT**：老库没有「代理」这个概念，迁移后为 NULL
+		// 才是诚实的「从没配过」。填 '' 会让「配了空串」与「没配过」不可分辨，
+		// 而前者在界面上要显示成「不代理」、后者要显示成占位提示。
+		{"providers", "proxy_url", "TEXT"},
 		{"usage_totals", "total_tokens", "INTEGER NOT NULL DEFAULT 0"},
 		// 归档水位（已剪到哪一天）。剪枝流程靠它做幂等边界。
 		{"usage_totals", "pruned_through_day", "TEXT NOT NULL DEFAULT ''"},

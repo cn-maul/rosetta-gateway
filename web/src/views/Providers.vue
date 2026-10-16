@@ -82,6 +82,7 @@ const pForm = reactive({
   slug: '',
   timeout_ms: 0,
   max_retries: 0,
+  proxy_url: '',
   showAdvanced: false,
 })
 
@@ -94,6 +95,7 @@ function openProvider(p?: Provider) {
   pForm.slug = p?.slug ?? ''
   pForm.timeout_ms = p?.timeout_ms ?? 0
   pForm.max_retries = p?.max_retries ?? 0
+  pForm.proxy_url = p?.proxy_url ?? ''
   pForm.showAdvanced = false
   pForm.open = true
 }
@@ -112,6 +114,9 @@ async function submitProvider() {
         endpoint: pForm.endpoint.trim(),
         timeout_ms: Number(pForm.timeout_ms) || 0,
         max_retries: Number(pForm.max_retries) || 0,
+        // 代理**每次都发**，空串 = 清空已配的代理。不能只在非空时才发 ——
+        // 那会让「卸掉代理」这个动作永远发不出去。
+        proxy_url: pForm.proxy_url.trim(),
       })
       toast('上游已更新')
     } else {
@@ -119,6 +124,7 @@ async function submitProvider() {
         name: pForm.name.trim(),
         protocol: pForm.protocol,
         endpoint: pForm.endpoint.trim(),
+        proxy_url: pForm.proxy_url.trim(),
         api_key: pForm.api_key.trim() || undefined,
       })
       toast('上游已创建')
@@ -783,6 +789,21 @@ onMounted(() => {
             <label>API Key</label>
             <input v-model="pForm.api_key" class="input mono" type="password" placeholder="sk-...（可留空，稍后单独添加）" autocomplete="new-password" />
             <span class="tip">添加即启用；slug、超时与重试将自动使用默认值</span>
+          </div>
+
+          <!-- 代理放在主表单而不是「高级选项」里：它是**网络连通性**的一部分，
+               和 Endpoint 是同一类配置 —— 建上游时通常就要一起决定好，
+               而「高级选项」只在编辑时才展开，等于逼着用户建完再改一次。
+
+               留空 = 不代理（直连或读网关进程的环境变量）。 -->
+          <div class="field span2">
+            <label>代理（可选）</label>
+            <input v-model="pForm.proxy_url" class="input mono" placeholder="http://127.0.0.1:7897" autocomplete="off" />
+            <span class="tip">
+              只对这个上游生效，其它上游不受影响。支持 http / https / socks5。
+              留空表示不代理。填错不会阻断请求，但该上游会<strong>退回直连</strong>，
+              网关启动日志里会留一条告警。
+            </span>
           </div>
 
           <template v-if="pForm.editing">

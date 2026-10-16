@@ -10,6 +10,7 @@ import (
 	"math/rand/v2"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"strings"
 	"sync"
@@ -78,6 +79,22 @@ type ProviderEntry struct {
 	Timeout     time.Duration
 	MaxRetries  int
 	Credentials []*CredentialEntry
+	// ProxyURL 是该 provider 独享的出站代理（http/https/socks5）。
+	// 空 = 不代理，走进程环境变量。见 store.go 里 proxy_url 列的注释。
+	ProxyURL string
+	// ProxyConfigError 记录该 provider 的代理配置为什么没生效（URL 非法）。
+	// 非空时请求仍会发 —— 走直连 —— 但管理面据此把「代理没生效」说出来，
+	// 而不是让运维对着一个连不上的上游瞎猜。
+	//
+	// 实际暴露方式是建池循环里的一条 warn 日志（见 PrepareFromStore），
+	// 不是 ProviderFailure —— 那个清单的语义是「未就绪」，而配错代理的
+	// provider 是就绪的，混进去会让管理面把一个能用的上游标成坏的。
+	//
+	// 为什么是字段而不是返回值：buildClient 的调用点有三处，而这三处
+	// 各自对「构建失败」的处理策略不同（建池记 failure、探测路径直接返回）。
+	// 加返回值会逼着三处都改签名，而它们真正需要区分的只是「能不能用」，
+	// 不是「代理有没有配错」。
+	ProxyConfigError error
 }
 
 // ProviderFailure 描述「一个 provider 为什么没能在本次重建里就绪」。
@@ -148,6 +165,7 @@ func (p *Pool) BuildFromConfig(cfg *config.Config) error {
 			Enabled:    true,
 			Timeout:    cfg.UpstreamTimeout(),
 			MaxRetries: cfg.Defaults.MaxRetries,
+			ProxyURL:   bp.ProxyURL,
 		}
 
 		for _, bc := range bp.Credentials {
@@ -163,6 +181,14 @@ func (p *Pool) BuildFromConfig(cfg *config.Config) error {
 			client, err := buildClient(prov, apiKey, cfg)
 			if err != nil {
 				return fmt.Errorf("build client for %s/%s: %w", bp.Slug, bc.Label, err)
+			}
+
+			// 代理配错：回落直连、请求照常能发，所以不阻断建池（那会让 /v1
+			// 全站断粮），但必须说出来。bootstrap 路径同样要 —— 它是零配置
+			// 部署的入口，配错代理时的症状与库路径一模一样。
+			if prov.ProxyConfigError != nil {
+				p.logger.Warn("provider proxy_url invalid; falling back to direct connection",
+					"provider", bp.Slug, "error", prov.ProxyConfigError)
 			}
 
 			cred := &CredentialEntry{
@@ -265,6 +291,7 @@ func (p *Pool) PrepareFromStore(ctx context.Context, st *store.Store, masterKey 
 			Enabled:    sp.Enabled,
 			Timeout:    timeout,
 			MaxRetries: maxRetries,
+			ProxyURL:   sp.ProxyURL,
 		}
 
 		credErrs := 0
@@ -347,6 +374,18 @@ func (p *Pool) PrepareFromStore(ctx context.Context, st *store.Store, masterKey 
 				Stage:  "no_credentials",
 				Reason: "没有已启用的凭据，该 provider 不会有可用上游",
 			})
+		}
+
+		// 代理配错：client 建成了（回落直连），请求照常能发，所以**不**
+		// 记进 failures —— 那个清单的语义是「未就绪」，而这里 provider 是
+		// 就绪的，混进去会让管理面把一个能用的上游标成坏的。
+		//
+		// 但也不能不出声：运维以为流量过了代理，实际在直连，排查「上游连不上」
+		// 时会朝着完全错误的方向猜（代理挂了？IP 被封了？）。日志记一次，
+		// 且带上 provider 与那个非法值 —— 前者定位是哪家，后者让人看出错在哪。
+		if prov.ProxyConfigError != nil {
+			p.logger.Warn("provider proxy_url invalid; falling back to direct connection",
+				"provider", sp.Slug, "error", prov.ProxyConfigError)
 		}
 
 		newProviders[sp.Slug] = prov
@@ -701,6 +740,7 @@ func NewProviderClient(ctx context.Context, st *store.Store, providerID string, 
 		Endpoint:   p.Endpoint,
 		Timeout:    timeout,
 		MaxRetries: p.MaxRetries,
+		ProxyURL:   p.ProxyURL,
 	}
 	// 探测路径同样注入模型档案（理由同 buildClient）。整份档案都带上是
 	// 安全的：SDK 的思考闸门按 req.Model 逐条查，其余模型的条目对本次请求
@@ -1189,6 +1229,80 @@ var upstreamHTTPClient = &http.Client{
 	},
 }
 
+// upstreamProxyClients 按 proxy URL 缓存「走该代理的 http.Client」。
+//
+// # 为什么不能只改那一个共享 client 的 Proxy
+//
+// Proxy 是 **Transport 级**的属性，而 Transport 由 client 持有。一个全局
+// 共享 client 意味着「要么全走代理、要么全不走」—— 而现实是上游服务商的
+// 网络位置差异很大：api.openai.com 要翻墙、deepseek 直连即可、公司内网
+// 的 vLLM 只能走内网代理。做成全局开关会让能直连的那些也平白多绕一跳，
+// 延迟和故障面都上去。
+//
+// # 为什么按 URL 缓存而不是每把凭据建一个
+//
+// 每个 Transport 自带一套连接池。同一个 provider 下 N 把凭据若各建一个，
+// 就是 N 套到同一个代理的连接池 —— MaxIdleConnsPerHost=64 会被 N 等分，
+// 且代理侧同时维持 N 倍的空闲连接。而「同一 provider 的凭据共享代理配置」
+// 是既定事实（proxy_url 在 provider 行上，不在凭据行上），所以按 URL 缓存
+// 恰好命中这个粒度。
+//
+// # 为什么值里放 *http.Client 而不是 *http.Transport
+//
+// buildClient 需要的是 client（WithHTTPClient 收 *http.Client）。放在值里
+// 顺带把 Transport 的构造细节收拢在这一处。
+var (
+	upstreamProxyMu       sync.Mutex
+	upstreamProxyClients  = make(map[string]*http.Client)
+	upstreamProxyBuildErr = make(map[string]error)
+)
+
+// proxyHTTPClientFor 返回走指定代理的 client；proxyURL 为空表示不代理
+// （回落到进程环境变量），此时返回全局共享的那个。
+//
+// 代理 URL 非法时返回错误，同时回落全局 client（调用方 buildClient 把错误
+// 记进 prov.ProxyConfigError）。理由：代理配错是**配置错误**，不是运行时
+// 故障 —— 但让整个 provider 建池失败会把症状变成「路由配好了、请求莫名 500」，
+// 而根因躺在建池日志里没人看（这正是 ProviderFailure 机制要消灭的东西）。
+// 更合适的做法是让它继续用直连 client 服务，同时把「代理没生效」说出来。
+func proxyHTTPClientFor(proxyURL string) (*http.Client, error) {
+	if strings.TrimSpace(proxyURL) == "" {
+		return upstreamHTTPClient, nil
+	}
+	u, err := url.Parse(proxyURL)
+	if err != nil || u.Host == "" || (u.Scheme != "http" && u.Scheme != "https" &&
+		u.Scheme != "socks5" && u.Scheme != "socks5h") {
+		return upstreamHTTPClient, fmt.Errorf("proxy_url %q 不是合法的代理地址（支持 http/https/socks5，如 http://127.0.0.1:7897）", proxyURL)
+	}
+
+	upstreamProxyMu.Lock()
+	defer upstreamProxyMu.Unlock()
+	if c, ok := upstreamProxyClients[proxyURL]; ok {
+		return c, nil
+	}
+	// 代理地址的 scheme 已校验，这里不再判错；http.ProxyURL 只吃 *url.URL。
+	tr := &http.Transport{
+		Proxy: http.ProxyURL(u),
+		// 其余参数与全局 client 逐字相同 —— 抄一份而不是共用 Transport：
+		// Proxy 不同就必须是不同的 Transport，而池子参数不一致会让「走代理的
+		// 上游」和「直连的上游」在连接复用、超时行为上表现不同，
+		// 排查时会被这个差异带偏。
+		MaxIdleConns:          128,
+		MaxIdleConnsPerHost:   64,
+		IdleConnTimeout:       90 * time.Second,
+		ForceAttemptHTTP2:     true,
+		ResponseHeaderTimeout: 60 * time.Second,
+		DialContext: (&net.Dialer{
+			Timeout:   10 * time.Second,
+			KeepAlive: 30 * time.Second,
+		}).DialContext,
+		TLSHandshakeTimeout: 10 * time.Second,
+	}
+	c := &http.Client{Transport: tr}
+	upstreamProxyClients[proxyURL] = c
+	return c, nil
+}
+
 func buildClient(prov *ProviderEntry, apiKey string, cfg *config.Config, modelInfos ...rosetta.ModelInfo) (*rosetta.Client, error) {
 	opts := []rosetta.Option{
 		rosetta.WithEndpoint(prov.Endpoint),
@@ -1202,8 +1316,13 @@ func buildClient(prov *ProviderEntry, apiKey string, cfg *config.Config, modelIn
 		// 且 Idempotency-Key 对 DeepSeek/vLLM/各类中转普遍无效。
 		// 网关自己的重试策略：故障转移链（route_targets），不是同一个上游反复打。
 		rosetta.WithQuirks(rosetta.Quirks{NoIdempotencyKey: true}),
-		rosetta.WithHTTPClient(upstreamHTTPClient),
 	}
+	// 代理：为空走全局共享 client（读进程环境变量），否则用该 provider
+	// 独享的 client。代理配错时**不失败**，而是回落到全局 client 并把错误
+	// 记进 ProviderFailure —— 理由见 proxyHTTPClientFor 的注释。
+	hc, proxyErr := proxyHTTPClientFor(prov.ProxyURL)
+	opts = append(opts, rosetta.WithHTTPClient(hc))
+	prov.ProxyConfigError = proxyErr
 	if prov.Protocol != "" && prov.Protocol != "auto" {
 		switch prov.Protocol {
 		case "openai-chat":
