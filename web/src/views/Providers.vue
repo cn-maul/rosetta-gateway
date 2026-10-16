@@ -699,6 +699,13 @@ onMounted(() => {
               <td><span class="badge">{{ p.protocol }}</span></td>
               <td>
                 <span class="mono ep" :title="p.endpoint">{{ shortEndpoint(p.endpoint) }}</span>
+                <!-- 代理贴着 Endpoint：它说的就是「这个地址怎么到达」，
+                     拆到别的列会让人对不上是哪个上游走了代理。
+                     只在配了的时候才占一行 —— 绝大多数上游是直连的，
+                     每行都印一句「直连」只是噪音。 -->
+                <div v-if="p.proxy_url" class="sub-line dim" :title="`出站代理：${p.proxy_url}`">
+                  代理 {{ p.proxy_url }}
+                </div>
                 <!-- 未就绪的原因贴着 Endpoint：它说的就是「这个地址打不通」，
                      拆到别的列会让人对不上是哪个上游出的问题。 -->
                 <div v-if="p.enabled && !p.ready && p.ready_reason" class="sub-line err">
@@ -726,6 +733,18 @@ onMounted(() => {
 
             <tr v-if="expandedId === p.id" class="expand-row">
               <td colspan="4">
+                <!-- 网络路径：排查「这个上游到底通不通」时第一眼要看的就是它。
+                     直连时只说结论、不占空间；配了代理才把地址摊开 ——
+                     因为「以为走了代理、实际在直连」是最难自己发现的那类
+                     配置偏差（网关会照常工作，只是慢或被墙）。 -->
+                <div class="net-line">
+                  <span class="net-label">网络</span>
+                  <template v-if="p.proxy_url">
+                    <span class="mono">{{ p.proxy_url }}</span>
+                    <span class="dim">→ 出站代理</span>
+                  </template>
+                  <span v-else class="dim">直连（不经过代理）</span>
+                </div>
                 <div class="expand-grid">
                 <!-- 展开区的两块内容已抽成子组件（2026-10-12）：
                      本文件原本 1179 行，是整站最大的，而展开区叠着两张
@@ -800,9 +819,15 @@ onMounted(() => {
             <label>代理（可选）</label>
             <input v-model="pForm.proxy_url" class="input mono" placeholder="http://127.0.0.1:7897" autocomplete="off" />
             <span class="tip">
-              只对这个上游生效，其它上游不受影响。支持 http / https / socks5。
+              只对这个上游生效，其它上游不受影响。支持 http / https / socks5 /
+              socks5h（<code>socks5h</code> 让 DNS 也走代理，本地 DNS 被污染时用它）。
               留空表示不代理。填错不会阻断请求，但该上游会<strong>退回直连</strong>，
-              网关启动日志里会留一条告警。
+              网关日志里会留一条告警。
+              <br />
+              <strong>网关跑在 Docker 里时注意</strong>：<code>127.0.0.1</code>
+              指的是网关容器自己，不是宿主机。代理也在容器里的话，填
+              <code>http://代理容器名:端口</code>（同一 Docker 网络内用容器名互访）；
+              代理在宿主机上时才用 <code>host.docker.internal</code>。
             </span>
           </div>
 
@@ -1086,6 +1111,25 @@ onMounted(() => {
 /* 展开区：整行铺满。它是详情而不是一条记录，所以不吃表格的行高亮。 */
 .expand-row:hover { background: transparent; }
 .expand-row > td { padding: 14px 12px 18px; white-space: normal; }
+/* 网络路径条：贴在展开区顶部、两张子表之上。它是这一层的「前提」——
+   凭据解不开、模型测试超时，往下翻之前先该知道流量是怎么出去的。 */
+.net-line {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin-bottom: 12px;
+  padding-bottom: 10px;
+  border-bottom: 1px solid var(--separator);
+  font-size: 12.5px;
+}
+.net-label {
+  color: var(--muted);
+  font-size: 11.5px;
+  padding: 1px 6px;
+  border-radius: var(--r-chip, 6px);
+  background: var(--surface-secondary);
+}
 /* 子表比主表更紧凑：两层同尺寸表头会把展开区撑成一堵墙，
    而凭据/模型往往一列就是十几行。 */
 .sub-tbl { font-size: 12.5px; }
