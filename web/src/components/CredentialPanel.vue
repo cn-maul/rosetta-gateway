@@ -84,13 +84,15 @@ function balanceClass(r: CredentialBalance): string {
       <div v-if="creds.length === 0" class="empty sub-empty">
         无凭据 —— 上游鉴权必需
       </div>
-      <!-- 「同时只启用一把」是本面板的硬约束，必须写在开关旁边而不是藏进
-           文档：它是**跨行**的，打开一行会让另一行的徽章当场翻转。只在
-           多于一把时提示 —— 只有一把时这句话是废话。 -->
-      <p v-else-if="creds.length > 1" class="dim sub-line">
+      <!-- 「同时只启用一把」的提示必须与表格**并存**，不能写成 v-else-if。
+           修复前它占着 v-else 的位置，凭据数 ≥ 2 时渲染的是这句提示、
+           表格整个不渲染 —— 两把 key 从界面上消失，而后端数据完好、
+           调用照常成功。用户看到的是「我加的 key 不见了」。
+           它是**跨行**的约束，必须写在开关旁边而不是藏进文档。 -->
+      <p v-if="creds.length > 1" class="dim sub-line">
         同一上游同时只启用一把 key：打开其中一把会自动停用其它。
       </p>
-      <table v-else class="tbl sub-tbl">
+      <table v-if="creds.length > 0" class="tbl sub-tbl">
         <thead>
           <tr>
             <th>凭据</th>
