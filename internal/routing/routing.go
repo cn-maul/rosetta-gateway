@@ -2,6 +2,7 @@ package routing
 
 import (
 	"errors"
+	"sort"
 	"strings"
 
 	"github.com/cn-maul/rosetta-gateway/internal/effort"
@@ -313,6 +314,84 @@ func (ri *RouteIndex) ListPublicNames() []string {
 		names = append(names, name)
 	}
 	return names
+}
+
+// SuggestModel 对一个未命中的模型名给出可用名建议，返回 nil 表示没有可建议的。
+//
+// # 为什么要给建议（而不是让用户自己对着 /v1/models 找）
+//
+// 「模型名打错」是最高频的接入故障，而它现在的报错只有一句
+// `model "xxx" not found`：用户不知道是名字错了、还是这个模型根本没配、
+// 还是自己没权限，于是只能去翻管理界面逐个比对。给出「你是不是想用 X」
+// 把这一步消掉，是 magpie 的 unknownModel + provider.Closest 做的事
+// （错误信息即产品）。
+//
+// 判定分两档，都刻意不用编辑距离那种需要浮点阈值的算法 —— 阈值调不准会出现
+// 「明显不像的名字被推荐出来」，那比不给建议更糟：
+//  1. 前缀/包含匹配：命中最强的信号。用户多打了一段前缀、漏了版本后缀、
+//     或把 gpt-4o 写成 gpt4o 时都能命中。
+//  2. 子序列匹配：字符按序出现即可，用来接住漏字符/多字符的笔误。
+//
+// 上限 5 条：再多就成了清单噪音，与错误文案的定位相悖。
+func (ri *RouteIndex) SuggestModel(requested string, max int) []string {
+	if max <= 0 {
+		max = 5
+	}
+	names := ri.ListPublicNames()
+	lower := strings.ToLower(requested)
+	type hit struct {
+		name     string
+		contains bool
+	}
+	hits := make([]hit, 0, len(names))
+	for _, n := range names {
+		ln := strings.ToLower(n)
+		if strings.Contains(ln, lower) {
+			hits = append(hits, hit{name: n, contains: true})
+			continue
+		}
+		if isSubsequence(lower, ln) {
+			hits = append(hits, hit{name: n})
+		}
+	}
+	if len(hits) == 0 {
+		return nil
+	}
+	// 含 requested 的排前面（最可能是漏了前缀/后缀），其次按长度升序
+	// 让更具体的名字优先，最后按字典序保证输出稳定（map 遍历无序）。
+	sort.Slice(hits, func(i, j int) bool {
+		if hits[i].contains != hits[j].contains {
+			return hits[i].contains
+		}
+		if len(hits[i].name) != len(hits[j].name) {
+			return len(hits[i].name) < len(hits[j].name)
+		}
+		return hits[i].name < hits[j].name
+	})
+	if len(hits) > max {
+		hits = hits[:max]
+	}
+	out := make([]string, len(hits))
+	for i, h := range hits {
+		out[i] = h.name
+	}
+	return out
+}
+
+// isSubsequence 判断 want 的字符是否按序出现在 have 中（调用方已转小写）。
+// 长度必须不大于 have，否则直接否 —— 否则 requested 的超长部分恒为子序列，
+// 会把「明显不是它」的模型全推荐出来。
+func isSubsequence(want, have string) bool {
+	if len(want) == 0 || len(want) > len(have) {
+		return false
+	}
+	i := 0
+	for j := 0; j < len(have) && i < len(want); j++ {
+		if want[i] == have[j] {
+			i++
+		}
+	}
+	return i == len(want)
 }
 
 // UpstreamModelRef 是轨道二（slug/model 直连）的枚举项。

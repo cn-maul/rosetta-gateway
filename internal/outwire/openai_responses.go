@@ -33,8 +33,10 @@ import (
 type ResponsesSSE struct {
 	w       io.Writer
 	flusher http.Flusher
-	model   string
-	mu      sync.Mutex
+	// rw 用于单次写截止时间（可为 nil），见 setWriteDeadline 的注释。
+	rw    http.ResponseWriter
+	model string
+	mu    sync.Mutex
 
 	id          string
 	started     bool // response.created 已发出
@@ -68,7 +70,15 @@ func NewResponsesSSE(w io.Writer, flusher http.Flusher, id, model string) *Respo
 	return &ResponsesSSE{w: w, flusher: flusher, id: id, model: model}
 }
 
+// WithResponseWriter 绑定底层 ResponseWriter，用于设置单次写截止时间。
+func (s *ResponsesSSE) WithResponseWriter(rw http.ResponseWriter) *ResponsesSSE {
+	s.rw = rw
+	return s
+}
+
 func (s *ResponsesSSE) writeEvent(event string, payload map[string]any) {
+	setWriteDeadline(s.rw)
+	defer clearWriteDeadline(s.rw)
 	payload["type"] = event
 	data, err := json.Marshal(payload)
 	if err != nil {
@@ -336,6 +346,8 @@ func (s *ResponsesSSE) Finish(status string, stop rosetta.StopReason, usage rose
 func (s *ResponsesSSE) Keepalive() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	setWriteDeadline(s.rw)
+	defer clearWriteDeadline(s.rw)
 	fmt.Fprintf(s.w, ": %s\n\n", "keepalive")
 	if s.flusher != nil {
 		s.flusher.Flush()

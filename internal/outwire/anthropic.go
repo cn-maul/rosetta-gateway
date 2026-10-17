@@ -209,7 +209,9 @@ func AnthropicStopReason(s rosetta.StopReason) string {
 type AnthropicSSE struct {
 	w       io.Writer
 	flusher http.Flusher
-	model   string
+	// rw 用于单次写截止时间（可为 nil），见 setWriteDeadline 的注释。
+	rw    http.ResponseWriter
+	model string
 	// mu 串行化写底层 writer：心跳 goroutine（Keepalive）与主事件循环
 	// （Event/Finish）会并发到达，与 SSEWriter 同理。
 	mu sync.Mutex
@@ -237,7 +239,15 @@ func NewAnthropicSSE(w io.Writer, flusher http.Flusher, id, model string) *Anthr
 	return &AnthropicSSE{w: w, flusher: flusher, id: id, model: model, openToolIdx: -1}
 }
 
+// WithResponseWriter 绑定底层 ResponseWriter，用于设置单次写截止时间。
+func (s *AnthropicSSE) WithResponseWriter(rw http.ResponseWriter) *AnthropicSSE {
+	s.rw = rw
+	return s
+}
+
 func (s *AnthropicSSE) writeRaw(event, data string) {
+	setWriteDeadline(s.rw)
+	defer clearWriteDeadline(s.rw)
 	fmt.Fprintf(s.w, "event: %s\ndata: %s\n\n", event, data)
 	if s.flusher != nil {
 		s.flusher.Flush()
@@ -258,6 +268,8 @@ func (s *AnthropicSSE) writeEvent(event string, payload any) {
 func (s *AnthropicSSE) Keepalive() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	setWriteDeadline(s.rw)
+	defer clearWriteDeadline(s.rw)
 	fmt.Fprintf(s.w, ": %s\n\n", "keepalive")
 	if s.flusher != nil {
 		s.flusher.Flush()

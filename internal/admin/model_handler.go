@@ -9,6 +9,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/cn-maul/rosetta"
 	"github.com/cn-maul/rosetta-gateway/internal/config"
 	"github.com/cn-maul/rosetta-gateway/internal/effort"
 	"github.com/cn-maul/rosetta-gateway/internal/store"
@@ -571,6 +572,41 @@ type modelTestResponse struct {
 	// InBand 表示上游用 HTTP 200 + 错误体回绝了请求（部分中转网关如此）。
 	// 前端据此把文案说明白，否则「HTTP 成功却报错」看起来像网关自己坏了。
 	InBand bool `json:"in_band,omitempty"`
+	// Hint 是把上游错误翻成的**下一步动作**（失败时才有）。
+	//
+	// 为什么 message 不够：message 是上游英文原文，它准确但不回答「所以呢」。
+	// 而 401/403/404/402/429 在「这个模型现在能不能用」这个场景下各自对应
+	// 一个完全不同的动作（换 key / 开权限 / 改模型名 / 充值 / 等一会），
+	// 必须点破，否则用户只能自己把英文错误翻译成操作判断。
+	Hint string `json:"hint,omitempty"`
+}
+
+// probeErrorHint 把上游错误翻成管理员下一步该做什么。
+//
+// 刻意逐个状态码手写而不是按文案猜：文案是上游的、随时可能变，状态码是
+// 协议层稳定的。这是三家审计里 new-api 做对的一条 —— 判定优先用结构化信号
+// （HTTP 状态码 / vendor 的 code），关键词匹配只当最后兜底。
+func probeErrorHint(err error) string {
+	var apiErr *rosetta.APIError
+	if !errors.As(err, &apiErr) {
+		return "上游连接失败或超时：检查 endpoint 是否可达，以及网络与代理设置"
+	}
+	switch apiErr.StatusCode {
+	case http.StatusUnauthorized:
+		return "凭据无效或已过期：更新该上游的 API Key"
+	case http.StatusForbidden:
+		return "账号无权使用该模型：在上游后台开通权限，或换一个模型"
+	case http.StatusNotFound, http.StatusGone:
+		return "上游没有这个模型：核对模型名拼写与大小写，或改用上游列表里的名字"
+	case http.StatusPaymentRequired:
+		return "上游余额不足：充值，或换一把凭据"
+	case http.StatusTooManyRequests:
+		return "被上游限流：稍后重试，或换一把凭据"
+	}
+	if apiErr.StatusCode >= 500 {
+		return "上游服务端错误：该模型此刻不可用，故障转移链会改打其他上游"
+	}
+	return "上游拒绝了这次请求：对照上面的错误原文检查请求参数"
 }
 
 // Test 对单个上游模型发一次最小真实推理，验证它现在可用。
@@ -628,6 +664,7 @@ func (h *ModelHandler) Test(w http.ResponseWriter, r *http.Request, id string) {
 	if res.Err != nil {
 		resp.Status = "error"
 		resp.Message = res.Err.Error()
+		resp.Hint = probeErrorHint(res.Err)
 	} else {
 		resp.Message = fmt.Sprintf("模型可用，%dms", res.LatencyMs)
 	}

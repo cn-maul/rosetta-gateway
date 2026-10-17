@@ -1,6 +1,8 @@
 package outwire
 
 import (
+	"net/http"
+
 	"github.com/cn-maul/rosetta"
 )
 
@@ -32,6 +34,18 @@ type StreamSink interface {
 	// SawTerminal 报告是否收到过 EventMessageEnd。供空闲看门狗开火后的
 	// 终态判定（idleTimedOut && !sawTerminal → truncated）。
 	SawTerminal() bool
+}
+
+// BindWriteDeadline 给实现了 WithResponseWriter 的 sink 绑定底层
+// ResponseWriter，用于每次写前设置单次写截止时间。
+//
+// 用能力探测而不是把该方法加进 StreamSink 接口：接口已有三个实现，
+// 加方法会强制所有实现（包括测试替身）一起改，而截止时间只是增强项。
+func BindWriteDeadline(s StreamSink, w http.ResponseWriter) {
+	type binder interface{ WithResponseWriter(http.ResponseWriter) }
+	if b, ok := s.(binder); ok {
+		b.WithResponseWriter(w)
+	}
 }
 
 // openaiSink 把统一事件流编码为 OpenAI chat.completion.chunk 序列。

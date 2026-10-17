@@ -69,6 +69,9 @@ type PromptTokensDetails struct {
 type SSEWriter struct {
 	w       io.Writer
 	flusher http.Flusher
+	// rw 是底层 ResponseWriter 的引用（可为 nil，单测直接传 bytes.Buffer 时）。
+	// 每次写前用它设单次写截止时间，见 setWriteDeadline 的注释。
+	rw      http.ResponseWriter
 	id      string
 	model   string
 	created int64
@@ -86,6 +89,13 @@ func NewSSEWriter(w io.Writer, flusher http.Flusher, id, model string, created i
 	return &SSEWriter{w: w, flusher: flusher, id: id, model: model, created: created}
 }
 
+// WithResponseWriter 绑定底层 ResponseWriter，用于设置单次写截止时间。
+// 不改变原有构造签名（多处调用点与测试在用），由 codec.NewSink 额外调用。
+func (sw *SSEWriter) WithResponseWriter(rw http.ResponseWriter) *SSEWriter {
+	sw.rw = rw
+	return sw
+}
+
 // SetResponseID 在上游 message_start 带回真实响应 id 后覆盖预先生成的兜底 id；
 // 必须在首个分片写出前调用，否则分片已带旧 id 无法追溯。
 func (sw *SSEWriter) SetResponseID(id string) {
@@ -100,6 +110,8 @@ func (sw *SSEWriter) SetResponseID(id string) {
 func (sw *SSEWriter) WriteEvent(event, data string) error {
 	sw.mu.Lock()
 	defer sw.mu.Unlock()
+	setWriteDeadline(sw.rw)
+	defer clearWriteDeadline(sw.rw)
 	if event != "" {
 		fmt.Fprintf(sw.w, "event: %s\n", event)
 	}
@@ -115,6 +127,8 @@ func (sw *SSEWriter) WriteEvent(event, data string) error {
 func (sw *SSEWriter) WriteComment(text string) error {
 	sw.mu.Lock()
 	defer sw.mu.Unlock()
+	setWriteDeadline(sw.rw)
+	defer clearWriteDeadline(sw.rw)
 	fmt.Fprintf(sw.w, ": %s\n\n", text)
 	if sw.flusher != nil {
 		sw.flusher.Flush()

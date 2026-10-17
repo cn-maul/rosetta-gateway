@@ -1826,7 +1826,7 @@ func handleIngress(pool *upstream.Pool, cfg *config.Config, usage *usageRecorder
 		res, err := snap.Routes.Resolve(ing.model)
 		if err != nil {
 			rate.commit(0)
-			codec.WriteError(w, http.StatusNotFound, "model_not_found", fmt.Sprintf("model %q not found", ing.model))
+			codec.WriteError(w, http.StatusNotFound, "model_not_found", modelNotFoundMessage(snap, ing.model))
 			return
 		}
 		route := res.Route
@@ -1984,6 +1984,10 @@ func handleIngress(pool *upstream.Pool, cfg *config.Config, usage *usageRecorder
 		// 从 lastTried 本身区分，必须有独立布尔。
 		var lastTried routing.Candidate
 		var triedAny bool
+		// routeTrace 记录链上的失败决策（2026-10-17）。只在真的发生过转移时
+		// 才有内容 —— 单目标成功、首跳成功都不写，避免给每条记录加噪声。
+		// 由 appendRouteTrace 统一格式化，保证「第几个目标」与失败原因成对出现。
+		var routeTrace []string
 		for i, cand := range active {
 			isLast := i == len(active)-1
 
@@ -2014,6 +2018,7 @@ func handleIngress(pool *upstream.Pool, cfg *config.Config, usage *usageRecorder
 				if !pool.ClaimTargetProbe(cand.TargetID) {
 					// 仍在冷却中，或探测名额已被同链的并发请求领走 —— 沿链继续。
 					// 没领到名额，也就没有归还义务。
+					routeTrace = appendRouteTrace(routeTrace, i+1, cand, "skip", "probe_busy_or_cooling")
 					if !isLast {
 						logger.Warn("failover: target not claiming a probe slot, switching target",
 							"model", ing.model, "provider", cand.Provider.Slug, "attempt", i+1,
@@ -2038,6 +2043,7 @@ func handleIngress(pool *upstream.Pool, cfg *config.Config, usage *usageRecorder
 				probeRecorded = true // 名额由记账释放
 				out = attemptOutcome{eligible: true, statusCode: http.StatusBadGateway,
 					code: "upstream_error", message: "no available upstream provider"}
+				routeTrace = appendRouteTrace(routeTrace, i+1, cand, "fail", "no_healthy_credential")
 				if !isLast {
 					logger.Warn("failover: no healthy credential, switching target",
 						"model", ing.model, "provider", cand.Provider.Slug, "request_id", server.RequestIDFromContext(r.Context()))
@@ -2047,9 +2053,9 @@ func handleIngress(pool *upstream.Pool, cfg *config.Config, usage *usageRecorder
 			}
 
 			if ing.stream {
-				out = attemptStream(w, r, client, ing, cand, authCtx, codec, rate, cfg, snap, usage, start)
+				out = attemptStream(w, r, client, ing, cand, authCtx, codec, rate, cfg, snap, usage, start, routeTrace)
 			} else {
-				out = attemptNonStream(w, r, client, ing, cand, authCtx, codec, rate, cfg, snap, usage, start)
+				out = attemptNonStream(w, r, client, ing, cand, authCtx, codec, rate, cfg, snap, usage, start, routeTrace)
 			}
 			// 记住**实际尝试到**的候选，供链耗尽时记账归因。
 			// 不能用 active[len(active)-1] —— 那是链上最后一个候选，而实际最后
@@ -2064,8 +2070,10 @@ func handleIngress(pool *upstream.Pool, cfg *config.Config, usage *usageRecorder
 				if out.success {
 					pool.RecordCredentialSuccess(credID)
 					pool.RecordTargetSuccess(cand.TargetID)
+					routeTrace = appendRouteTrace(routeTrace, i+1, cand, "ok", "")
 				} else {
 					pool.RecordTargetFailure(cand.TargetID, threshold)
+					routeTrace = appendRouteTrace(routeTrace, i+1, cand, "committed_fail", out.code)
 				}
 				probeRecorded = true // 名额由记账释放
 				return
@@ -2091,6 +2099,14 @@ func handleIngress(pool *upstream.Pool, cfg *config.Config, usage *usageRecorder
 				}
 			}
 
+			// 未提交的失败：记下「哪个目标、什么原因、是否可转移」。
+			// 不可转移同样要记 —— 运维最常问的正是「为什么这次没换上游」。
+			if out.eligible {
+				routeTrace = appendRouteTrace(routeTrace, i+1, cand, "fail_switch", out.code)
+			} else {
+				routeTrace = appendRouteTrace(routeTrace, i+1, cand, "fail_terminal", out.code)
+			}
+
 			// 没走到记账的两种形态 —— 不可转移错误（out.eligible==false）与
 			// 客户端中断（ctx 已取消）—— 在此归还探测名额，否则 halfOpen 卡死、
 			// 该目标被跳到下一次 Install 才复位。已记账的绝不能再还：
@@ -2105,7 +2121,7 @@ func handleIngress(pool *upstream.Pool, cfg *config.Config, usage *usageRecorder
 			}
 			logger.Warn("failover: switching to next target",
 				"model", ing.model, "from_provider", cand.Provider.Slug,
-				"error_code", out.code, "attempt", i+1,
+				"error_code", out.code, "attempt", i+1, "route_trace", strings.Join(routeTrace, "; "),
 				"request_id", server.RequestIDFromContext(r.Context()))
 		}
 
@@ -2169,8 +2185,68 @@ func handleIngress(pool *upstream.Pool, cfg *config.Config, usage *usageRecorder
 			ErrorCode:       errorCode,
 			ErrorDetail:     errorDetail,
 			LatencyMs:       time.Since(start).Milliseconds(),
+			RouteTrace:      strings.Join(routeTrace, "; "),
 		})
 	}
+}
+
+// modelNotFoundMessage 拼「模型不存在」的文案，并在能猜到时给出候选。
+//
+// # 为什么值得加这一段（magpie 的 unknownModel 做法）
+//
+// 只回 `model "xxx" not found` 时，用户面对三个无法区分的可能性：
+// 名字打错了 / 这个模型压根没配 / 名字对但我没权限。三个的后续动作完全不同，
+// 而原文什么都不说 —— 于是最常见的一类接入故障（打错字）需要用户自己去翻
+// 管理界面逐个比对才能排除。
+//
+// 追加候选把这一步消掉。刻意**只列名字、不列数量**以外的任何配置信息：
+// 这条错误会回给持有任一有效 key 的调用方，列出全部可调模型等于把网关的
+// 模型清单暴露给任何一个拿到 key 的人（哪怕该 key 的白名单本应只许调一个）。
+//
+// 鉴权口径：路由索引是全局的，不按身份收窄 —— 但 model_not_found 之前
+// 已经过了 auth 与白名单（白名单在下面才判），能走到这里的调用方本来就有
+// 一把有效 key。列候选名不新增暴露面，因为同一把 key 调
+// GET /v1/models 就能拿到同一份清单。
+func modelNotFoundMessage(snap *snapshot.Snapshot, requested string) string {
+	base := fmt.Sprintf("model %q not found", requested)
+	if snap == nil || snap.Routes == nil {
+		return base
+	}
+	sugg := snap.Routes.SuggestModel(requested, 5)
+	if len(sugg) == 0 {
+		return base + "（该名字没有匹配到已配置的模型；用 GET /v1/models 查看可用清单）"
+	}
+	return fmt.Sprintf("%s。可用的相似模型：%s", base, strings.Join(sugg, ", "))
+}
+
+// appendRouteTrace 记录一次链上决策：第几个目标、谁、结果、原因。
+//
+// 格式固定为 "N:provider/model -> outcome[:reason]"，按发生顺序用 "; " 连接。
+// 固定格式是为了让运维能在调用明细里直接读，也方便将来需要时用简单切分做统计；
+// 不引入 JSON 是为了不为一次排障增加 schema 与查询复杂度。
+func appendRouteTrace(trace []string, attempt int, cand routing.Candidate, outcome, reason string) []string {
+	provider, model := "?", "?"
+	if cand.Provider != nil {
+		provider = cand.Provider.Slug
+	}
+	if cand.UpstreamModel.ModelID != "" {
+		model = cand.UpstreamModel.ModelID
+	}
+	entry := fmt.Sprintf("%d:%s/%s -> %s", attempt, provider, model, outcome)
+	if reason != "" {
+		entry += ":" + reason
+	}
+	return append(trace, entry)
+}
+
+// streamCommitOutcome 把已提交流式的终态映射成轨迹里的结果词。
+// 用 "ok" / "committed_fail" 与未提交路径保持同一套词汇，避免同一种
+// 「流断了」在不同路径里出现两种叫法（status 本身只用于计费判读）。
+func streamCommitOutcome(status string) string {
+	if status == "ok" {
+		return "ok"
+	}
+	return "committed_fail"
 }
 
 // attemptOutcome 是一次「对某个链目标发起上游调用」的结果。
@@ -2398,7 +2474,11 @@ func wantsStreamUsage(req *inwire.OpenAIChatRequest) bool {
 //
 // 本函数只做与协议无关的事：看门狗、心跳、事件循环、断流状态归类、落库；
 // 「统一事件 → 下游协议分片」全部经由 codec.NewSink 的 StreamSink 完成。
-func attemptStream(w http.ResponseWriter, r *http.Request, client *rosetta.Client, ing *ingressRequest, cand routing.Candidate, authCtx *auth.Context, codec ingressCodec, rate *rateCommit, cfg *config.Config, snap *snapshot.Snapshot, usage *usageRecorder, start time.Time) attemptOutcome {
+// priorTrace 是外层循环在本目标之前已经做出的决策（例如「第 1 个目标 404，
+// 可转移」）。它必须带进来：本 attempt 一旦提交（写下首字节），usage 就在
+// 这里落库且不会再回到外层 —— 只写当前一跳会丢掉「为什么走到备用上游」，
+// 而那恰恰是这条记录最有价值的部分。
+func attemptStream(w http.ResponseWriter, r *http.Request, client *rosetta.Client, ing *ingressRequest, cand routing.Candidate, authCtx *auth.Context, codec ingressCodec, rate *rateCommit, cfg *config.Config, snap *snapshot.Snapshot, usage *usageRecorder, start time.Time, priorTrace []string) attemptOutcome {
 	ctx := r.Context()
 	logger := usage.logger
 	publicModel := ing.model
@@ -2499,6 +2579,10 @@ func attemptStream(w http.ResponseWriter, r *http.Request, client *rosetta.Clien
 
 	// 流式编码器由 codec 构造：OpenAI 走 SSEWriter，Anthropic 走块状态机。
 	sink := codec.NewSink(w, publicModel)
+	// 单次写截止时间（2026-10-17）：下游挂死不读时让 Write 自己返回超时，
+	// 而不是让 handler 永久阻塞、连带把上游流与 token 一起耗着。
+	// 用法是能力探测，测试替身等无底层连接的实现会静默跳过。
+	outwire.BindWriteDeadline(sink, w)
 
 	idleTimeout := streamIdleTimeout(snap, cfg)
 	var idleTimedOut atomic.Bool
@@ -2665,6 +2749,9 @@ func attemptStream(w http.ResponseWriter, r *http.Request, client *rosetta.Clien
 		ErrorDetail:     errorDetail,
 		LatencyMs:       latency,
 		TTFBMs:          ttfbMs,
+		// 流式已提交后的断流无法再转移，但「打到了哪个目标、为什么断」
+		// 仍需可查。成功时留 ok，断流留对应状态。
+		RouteTrace: strings.Join(appendRouteTrace(priorTrace, len(priorTrace)+1, cand, streamCommitOutcome(status), errorCode), "; "),
 	})
 	// 收尾按「usage 是否已知」分两条（2026-10-07 修复的 P1-3）：
 	//   - 已知：全量收尾 —— TPM 以真实 usage（输入+输出）替换估算值，
@@ -2687,7 +2774,9 @@ func attemptStream(w http.ResponseWriter, r *http.Request, client *rosetta.Clien
 	return attemptOutcome{committed: true, success: status == "ok"}
 }
 
-func attemptNonStream(w http.ResponseWriter, r *http.Request, client *rosetta.Client, ing *ingressRequest, cand routing.Candidate, authCtx *auth.Context, codec ingressCodec, rate *rateCommit, cfg *config.Config, snap *snapshot.Snapshot, usage *usageRecorder, start time.Time) attemptOutcome {
+// priorTrace 的含义与 attemptStream 相同：提交后的落库在这里发生，
+// 必须把此前目标的失败决策一并带上。
+func attemptNonStream(w http.ResponseWriter, r *http.Request, client *rosetta.Client, ing *ingressRequest, cand routing.Candidate, authCtx *auth.Context, codec ingressCodec, rate *rateCommit, cfg *config.Config, snap *snapshot.Snapshot, usage *usageRecorder, start time.Time, priorTrace []string) attemptOutcome {
 	publicModel := ing.model
 	// 同attemptStream：别名 → 上游 model_id 的映射与协议私有字段的透传
 	// 必须在本次 attempt 内完成，不能由调用方造好传入。
@@ -2732,6 +2821,7 @@ func attemptNonStream(w http.ResponseWriter, r *http.Request, client *rosetta.Cl
 		HTTPStatus:      200,
 		LatencyMs:       latency,
 		TTFBMs:          ttfbMs,
+		RouteTrace:      strings.Join(appendRouteTrace(priorTrace, len(priorTrace)+1, cand, "ok", ""), "; "),
 	})
 	// 收尾口径与 attemptStream 一致（见该处的注释）：usage 已知 → 全量收尾；
 	// missing → 只退配额预占，TPM 预占保留（窗口自愈）。
@@ -3493,7 +3583,7 @@ func handleGetModel(forceShape string) http.HandlerFunc {
 		snap := snapshot.Get()
 		res, rerr := snap.Routes.Resolve(modelID)
 		if rerr != nil {
-			writeErr(w, http.StatusNotFound, "model_not_found", fmt.Sprintf("model %q not found", modelID))
+			writeErr(w, http.StatusNotFound, "model_not_found", modelNotFoundMessage(snap, modelID))
 			return
 		}
 		// 模型白名单（P1）：校验**解析后**的公开模型名，而不是 URL 原文。
