@@ -7,13 +7,14 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"net/http"
+	"strings"
+	"time"
+
 	"github.com/cn-maul/rosetta-gateway/internal/config"
 	"github.com/cn-maul/rosetta-gateway/internal/snapshot"
 	"github.com/cn-maul/rosetta-gateway/internal/store"
 	"github.com/cn-maul/rosetta-gateway/internal/upstream"
-	"net/http"
-	"strings"
-	"time"
 )
 
 type ProviderHandler struct {
@@ -30,12 +31,13 @@ func NewProviderHandler(st *store.Store, masterKey []byte, cfg *config.Config) *
 // slug 由系统生成、enabled 固定 true、超时与重试取「设置」里的全局默认，
 // 三者都不接受客户端指定 —— 所以不与 PATCH 共用结构体。
 type providerCreateRequest struct {
-	Name       string `json:"name"`
-	Protocol   string `json:"protocol"`
-	Endpoint   string `json:"endpoint"`
-	ProxyURL   string `json:"proxy_url"`
-	QuirksJSON string `json:"quirks_json"`
-	APIKey     string `json:"api_key"`
+	Name            string `json:"name"`
+	Protocol        string `json:"protocol"`
+	Endpoint        string `json:"endpoint"`
+	ProxyURL        string `json:"proxy_url"`
+	QuirksJSON      string `json:"quirks_json"`
+	BalanceSpecJSON string `json:"balance_spec_json"`
+	APIKey          string `json:"api_key"`
 }
 
 // providerUpdateRequest 是上游的 PATCH 输入。
@@ -58,21 +60,24 @@ type providerUpdateRequest struct {
 	// 代理）。用 string 的话，未提供时会被序列化成 ""，与「显式清空」不可分辨，
 	// 于是「只想改个名字」会把代理悄悄抹掉。
 	ProxyURL *string `json:"proxy_url"`
+	// BalanceSpecJSON 与 ProxyURL 同为指针：空串是「不配余额查询」的显式值。
+	BalanceSpecJSON *string `json:"balance_spec_json"`
 }
 
 type providerResponse struct {
-	ID         string `json:"id"`
-	Slug       string `json:"slug"`
-	Name       string `json:"name"`
-	Protocol   string `json:"protocol"`
-	Endpoint   string `json:"endpoint"`
-	Enabled    bool   `json:"enabled"`
-	TimeoutMs  int    `json:"timeout_ms"`
-	MaxRetries int    `json:"max_retries"`
-	QuirksJSON string `json:"quirks_json"`
-	ProxyURL   string `json:"proxy_url"`
-	CreatedAt  int64  `json:"created_at"`
-	UpdatedAt  int64  `json:"updated_at"`
+	ID              string `json:"id"`
+	Slug            string `json:"slug"`
+	Name            string `json:"name"`
+	Protocol        string `json:"protocol"`
+	Endpoint        string `json:"endpoint"`
+	Enabled         bool   `json:"enabled"`
+	TimeoutMs       int    `json:"timeout_ms"`
+	MaxRetries      int    `json:"max_retries"`
+	QuirksJSON      string `json:"quirks_json"`
+	ProxyURL        string `json:"proxy_url"`
+	BalanceSpecJSON string `json:"balance_spec_json"`
+	CreatedAt       int64  `json:"created_at"`
+	UpdatedAt       int64  `json:"updated_at"`
 	// Ready / ReadyReason 是**运行时**状态（P4 / 设计 §4.7），来自快照，
 	// 不是库里的配置字段。
 	//
@@ -175,24 +180,34 @@ func (h *ProviderHandler) Create(w http.ResponseWriter, r *http.Request) {
 	}
 
 	now := time.Now().UnixMilli()
+	// 创建时就校验余额配置：与 PATCH 同一份 parseBalanceSpec，保证
+	// 「保存通过」与「查询能跑」不会各说各话。
+	balanceSpec := balanceSpecOrEmpty(req.BalanceSpecJSON)
+	if balanceSpec != "" {
+		if _, err := upstream.ParseBalanceSpec(balanceSpec); err != nil {
+			writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+	}
 	slug, err := h.uniqueSlug(r.Context(), slugify(name))
 	if err != nil {
 		writeServerError(w, "resolve unique slug", err)
 		return
 	}
 	p := &store.Provider{
-		ID:         generateID(),
-		Slug:       slug,
-		Name:       name,
-		Protocol:   protocol,
-		Endpoint:   endpoint,
-		Enabled:    true,
-		TimeoutMs:  h.cfg.Defaults.UpstreamTimeoutMs,
-		MaxRetries: h.cfg.Defaults.MaxRetries,
-		QuirksJSON: req.QuirksJSON,
-		ProxyURL:   req.ProxyURL,
-		CreatedAt:  now,
-		UpdatedAt:  now,
+		ID:              generateID(),
+		Slug:            slug,
+		Name:            name,
+		Protocol:        protocol,
+		Endpoint:        endpoint,
+		Enabled:         true,
+		TimeoutMs:       h.cfg.Defaults.UpstreamTimeoutMs,
+		MaxRetries:      h.cfg.Defaults.MaxRetries,
+		QuirksJSON:      req.QuirksJSON,
+		ProxyURL:        req.ProxyURL,
+		BalanceSpecJSON: balanceSpec,
+		CreatedAt:       now,
+		UpdatedAt:       now,
 	}
 
 	// 表单填了 api_key 就一并创建首条凭据。两半必须原子落库：
@@ -320,6 +335,22 @@ func (h *ProviderHandler) Update(w http.ResponseWriter, r *http.Request, id stri
 	// 因为「卸掉代理」和「从没配过代理」在使用上没有任何区别。
 	if req.ProxyURL != nil {
 		existing.ProxyURL = strings.TrimSpace(*req.ProxyURL)
+	}
+	// 余额查询配置同样可清空（留空 = 回到按端点特征的自动判定）。
+	//
+	// **写前先校验**：path 缺失、给了绝对 URL、auth 取值非法这三类错误如果
+	// 放到查询时才报，管理员保存时看着一切正常，直到点「查余额」才发现 ——
+	// 而那一步还会顺便打一次上游。在这里挡住，错误信息直接来自
+	// parseBalanceSpec，与查询时读到的完全一致（同一份解析，不会两套口径）。
+	if req.BalanceSpecJSON != nil {
+		spec := strings.TrimSpace(*req.BalanceSpecJSON)
+		if spec != "" {
+			if _, err := upstream.ParseBalanceSpec(spec); err != nil {
+				writeError(w, http.StatusBadRequest, err.Error())
+				return
+			}
+		}
+		existing.BalanceSpecJSON = spec
 	}
 
 	if err := h.store.UpdateProvider(r.Context(), id, existing); err != nil {
@@ -475,20 +506,30 @@ func slugify(s string) string {
 	return slug
 }
 
+// balanceSpecOrEmpty 把创建请求里的 balance_spec_json 归一成库里的形态。
+//
+// 创建时也校验（不只是 PATCH）：写错就当场 400，不会留下一条
+// 「保存成功、点查余额才失败」的脏配置。空串原样返回 —— 那表示「不配，
+// 走自动判定」，是合法且最常见的输入。
+func balanceSpecOrEmpty(spec string) string {
+	return strings.TrimSpace(spec)
+}
+
 func toProviderResponse(p store.Provider) providerResponse {
 	return providerResponse{
-		ID:         p.ID,
-		Slug:       p.Slug,
-		Name:       p.Name,
-		Protocol:   p.Protocol,
-		Endpoint:   p.Endpoint,
-		Enabled:    p.Enabled,
-		TimeoutMs:  p.TimeoutMs,
-		MaxRetries: p.MaxRetries,
-		QuirksJSON: p.QuirksJSON,
-		ProxyURL:   p.ProxyURL,
-		CreatedAt:  p.CreatedAt,
-		UpdatedAt:  p.UpdatedAt,
+		ID:              p.ID,
+		Slug:            p.Slug,
+		Name:            p.Name,
+		Protocol:        p.Protocol,
+		Endpoint:        p.Endpoint,
+		Enabled:         p.Enabled,
+		TimeoutMs:       p.TimeoutMs,
+		MaxRetries:      p.MaxRetries,
+		QuirksJSON:      p.QuirksJSON,
+		ProxyURL:        p.ProxyURL,
+		BalanceSpecJSON: p.BalanceSpecJSON,
+		CreatedAt:       p.CreatedAt,
+		UpdatedAt:       p.UpdatedAt,
 	}
 }
 

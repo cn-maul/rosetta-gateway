@@ -7,6 +7,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"net/url"
 	"strconv"
 	"strings"
 	"time"
@@ -193,13 +194,30 @@ var balanceDialect = detectBalanceDialect
 // 端点而绝大多数中转站没有。若按协议先行，每个中转站都会被发一次注定 404
 // 的请求，而「这个上游不支持」与「这个 key 欠费了」在上游侧返回的东西
 // 无法区分。
+//
+// 2026-10-17：**显式配置优先于一切自动判定**。管理员填了 balance_spec_json
+// 就走自定义路径，没填才落到这里（OpenAI 官方 / DeepSeek / 明确不支持）。
+// 自动判定只覆盖「内置已知的少数几家」，长尾（中转站、自建网关、以及
+// Moonshot/OpenRouter 这类有自己的 credits 端点的）一律靠显式配置。
 func detectBalanceDialect() func(context.Context, *store.Provider, string) (float64, string, string, error) {
 	return func(ctx context.Context, p *store.Provider, apiKey string) (float64, string, string, error) {
+		if spec, err := ParseBalanceSpec(p.BalanceSpecJSON); err != nil {
+			// 配置错了就如实报错，不静默回落到自动判定：那会让管理员以为
+			// 改配置没生效，从而反复排查一个「看起来被忽略了」的问题。
+			return 0, "", "", fmt.Errorf("余额查询配置无效：%w", err)
+		} else if spec != nil {
+			return fetchCustomBalance(ctx, p, apiKey, spec)
+		}
 		base := strings.TrimRight(p.Endpoint, "/")
 		switch {
-		case strings.Contains(base, "api.openai.com"):
+		// 用 hostname 精确相等而不是 Contains：老写法会把
+		// `https://corp-mirror/api.openai.com.evil.example` 这类域名
+		// 判成 OpenAI 官方，把 key 与账单信息送去不该去的地方。
+		// 子域名（api.openai.com 自身）是需要的，故用 EqualFold 或
+		// 后缀 `.openai.com` 判定。
+		case hostIs(base, "api.openai.com"):
 			return fetchOpenAIBalance(ctx, base, apiKey)
-		case strings.Contains(base, "api.deepseek.com"):
+		case hostIs(base, "api.deepseek.com"):
 			return fetchDeepSeekBalance(ctx, base, apiKey)
 		case p.Protocol == "anthropic":
 			// Anthropic 至今没有公开的余额查询 API（组织用量要走管理后台/
@@ -226,6 +244,142 @@ var balanceHTTPClient = &http.Client{
 	CheckRedirect: func(req *http.Request, via []*http.Request) error {
 		return http.ErrUseLastResponse
 	},
+}
+
+// hostIs 判断 base URL 的主机名是否等于 want（不区分大小写）。
+//
+// # 为什么不用 strings.Contains（2026-10-17 修）
+//
+// Contains 会命中「域名里含目标串」的任意主机。上游余额查询带着 API key
+// 与账单信息，一次误判就把它们送去第三方：
+// `https://api.openai.com.evil.example/` 含 `api.openai.com`，
+// 旧写法会照 OpenAI 的路径去打它。
+//
+// 只判「完全相等」而不是后缀匹配：`evil-api.deepseek.com` 不是 DeepSeek，
+// 而自建的官方域名镜像极少见（真有就填 balance_spec_json，走显式配置）。
+func hostIs(base, want string) bool {
+	u, err := url.Parse(base)
+	if err != nil {
+		return false
+	}
+	return strings.EqualFold(u.Hostname(), want)
+}
+
+// BalanceSpec 是余额查询的显式配置。
+//
+// 四个字段都可空，各有默认值 —— 目标是「填一个 path 就能用」：
+// 多数上游的余额响应就是 {"balance": 12.3}，此时只需 path 与 field。
+type BalanceSpec struct {
+	// Path 是余额端点的路径（必填），相对 provider endpoint。
+	// 例：`/credits`、`/v1/user/balance`、`/dashboard/billing/subscription`。
+	Path string `json:"path"`
+	// Field 是余额数值在 JSON 里的路径，用点号分隔（默认 "balance"）。
+	// 嵌套示例：`data.remaining_quota`；多币种映射示例：`balance_infos.CNY`。
+	Field string `json:"field,omitempty"`
+	// Currency 是币种代码（默认 USD）。**不换算**，只是把上游的数值
+	// 标上单位 —— 上游报什么就写什么，编一个换算值等于撒谎。
+	Currency string `json:"currency,omitempty"`
+	// Auth 是鉴权方式：`bearer`（默认，Authorization: Bearer）或
+	// `anthropic`（x-api-key + anthropic-version）。
+	Auth string `json:"auth,omitempty"`
+}
+
+// ParseBalanceSpec 解析 providers.balance_spec_json。导出给管理 API 做写入校验
+// —— 校验与查询必须用同一份解析，否则会出现「保存通过、查询才报错」。
+//
+// 空串 / 纯空白 → (nil, nil)：这是「未配置」的正常形态，调用方据此回落
+// 到自动判定。解析失败返回 error 而不是 nil：配置错了必须说出来，
+// 静默回落会让管理员以为改的东西生效了。
+func ParseBalanceSpec(raw string) (*BalanceSpec, error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return nil, nil
+	}
+	var spec BalanceSpec
+	if err := json.Unmarshal([]byte(raw), &spec); err != nil {
+		return nil, fmt.Errorf("不是合法 JSON：%w", err)
+	}
+	spec.Path = strings.TrimSpace(spec.Path)
+	if spec.Path == "" {
+		return nil, fmt.Errorf("path 不能为空")
+	}
+	// 必须是以 / 开头的相对路径：给绝对 URL 会把请求打到 provider
+	// endpoint 之外的主机上，而那正是本模块刻意收紧的行为（见 hostIs）。
+	if !strings.HasPrefix(spec.Path, "/") {
+		return nil, fmt.Errorf("path 必须以 / 开头（只允许相对路径，避免把请求打到别的域名）")
+	}
+	if spec.Field == "" {
+		spec.Field = "balance"
+	}
+	if spec.Currency == "" {
+		spec.Currency = "USD"
+	}
+	if spec.Auth == "" {
+		spec.Auth = "bearer"
+	}
+	if spec.Auth != "bearer" && spec.Auth != "anthropic" {
+		return nil, fmt.Errorf("auth 只支持 bearer / anthropic，当前是 %q", spec.Auth)
+	}
+	return &spec, nil
+}
+
+// fetchCustomBalance 按管理员配的 spec 查余额。
+//
+// 走通用的「取 JSON → 按点号路径取数值」而不是每家一个函数：自定义配置的
+// 用途就是长尾，而长尾的共同点正是「响应形状各不相同」。
+func fetchCustomBalance(ctx context.Context, p *store.Provider, apiKey string, spec *BalanceSpec) (float64, string, string, error) {
+	base := strings.TrimRight(p.Endpoint, "/")
+	body, err := doBalanceGET(ctx, base+spec.Path, apiKey, spec.Auth == "anthropic")
+	if err != nil {
+		return 0, "", "", err
+	}
+	var payload any
+	if err := json.Unmarshal(body, &payload); err != nil {
+		return 0, "", "", fmt.Errorf("解析余额响应失败：%w", err)
+	}
+	amount, ok := lookupNumber(payload, spec.Field)
+	if !ok {
+		return 0, "", "", fmt.Errorf("响应里没有字段 %q（或它不是数值）", spec.Field)
+	}
+	// detail 带上「取了哪个字段」：自定义配置下管理员可能配错路径而恰好
+	// 命中另一个数字，此时能看到取值路径才有法自查。
+	return amount, spec.Currency, fmt.Sprintf("取自 %s.%s", spec.Path, spec.Field), nil
+}
+
+// lookupNumber 按点号路径从任意 JSON 里取数值。
+//
+// 支持 map 与一层数组下标（`items.0.amount`）：余额响应偶尔把记录放在数组里
+// （如订阅列表），只支持 map 会让这类上游无法表达。
+func lookupNumber(v any, path string) (float64, bool) {
+	cur := v
+	for _, seg := range strings.Split(path, ".") {
+		switch t := cur.(type) {
+		case map[string]any:
+			next, ok := t[seg]
+			if !ok {
+				return 0, false
+			}
+			cur = next
+		case []any:
+			idx, err := strconv.Atoi(seg)
+			if err != nil || idx < 0 || idx >= len(t) {
+				return 0, false
+			}
+			cur = t[idx]
+		default:
+			return 0, false
+		}
+	}
+	switch t := cur.(type) {
+	case float64:
+		return t, true
+	case string:
+		f, err := strconv.ParseFloat(strings.TrimSpace(t), 64)
+		if err == nil {
+			return f, true
+		}
+	}
+	return 0, false
 }
 
 // doBalanceGET 发一次带凭据的 GET 并返回响应体。
