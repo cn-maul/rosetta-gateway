@@ -1075,10 +1075,7 @@ func DiscoverUpstreamModels(ctx context.Context, st *store.Store, providerID str
 	}
 
 	base := strings.TrimRight(p.Endpoint, "/")
-	urls := []string{base + "/models"}
-	if p.Protocol == "anthropic" {
-		urls = []string{base + "/v1/models", base + "/models"}
-	}
+	urls := modelListURLs(base)
 
 	// 不跟随重定向。默认的 10 跳 + 跨主机跟随意味着：一个 302 就能把
 	// 探测面从「管理员填的那个 endpoint」扩大到「任意主机」—— 包括
@@ -1093,10 +1090,15 @@ func DiscoverUpstreamModels(ctx context.Context, st *store.Store, providerID str
 		},
 	}
 	var lastErr error
+	// triedErrs 按候选顺序留痕：全部候选都失败时，管理员需要知道网关
+	// **试过哪些路径**，否则「endpoint 填错了」与「上游不提供模型列表」
+	// 在界面上是同一句话，只能靠猜。
+	triedErrs := make([]string, 0, len(urls))
 	for _, u := range urls {
 		cands, err := fetchModels(ctx, client, u, p.Protocol, apiKey)
 		if err != nil {
 			lastErr = err
+			triedErrs = append(triedErrs, fmt.Sprintf("%s → %v", u, err))
 			continue
 		}
 		return cands, nil
@@ -1104,7 +1106,67 @@ func DiscoverUpstreamModels(ctx context.Context, st *store.Store, providerID str
 	if lastErr == nil {
 		lastErr = fmt.Errorf("无法获取模型列表")
 	}
-	return nil, lastErr
+	// errors.Join 需要 []error：每个候选的「路径 → 原因」各占一条，
+	// lastErr 再单列（它已经是最后一条路径的 error，重复会让文案变啰嗦）。
+	parts := make([]error, 0, len(triedErrs)+1)
+	for _, e := range triedErrs {
+		parts = append(parts, errors.New(e))
+	}
+	parts = append(parts, lastErr)
+	return nil, fmt.Errorf("模型列表探测失败（已尝试 %d 个路径）：%w", len(urls), errors.Join(parts...))
+}
+
+// modelListURLs 给出模型列表端点的候选路径，按「最可能命中」排序。
+//
+// # 为什么要多个候选
+//
+// 管理员填的 endpoint 形态并不统一：有人填到域根（https://api.x.com），
+// 有人填到已经带版本的那一层（https://api.x.com/v1）。前者要的模型端点是
+// /v1/models，后者要的是 /v1/models 之下**不能**再加一次 /v1。
+//
+// 修复前非 anthropic 协议只试 /models 一个路径，于是「endpoint 填域根 +
+// OpenAI 兼容」这个最常见的组合（DeepSeek、Moonshot、OpenRouter、vLLM、
+// 各类中转都如此）必然 404 —— 而真实错误会被报成「上游返回 HTTP 404」，
+// 指向管理员去检查 API Key，而 key 其实完全正常。
+//
+// 候选表只含三种形态，都来自实际部署：
+//   - base 已以 /vN 结尾 → base/models（不重复加版本）
+//   - base 以 /v1 结尾 → base/models
+//   - 域根 → 先试 base/v1/models（OpenAI 系的事实标准），再退回 base/models
+//
+// 三家上游（OpenAI 系、Anthropic、vLLM）的模型列表都在 /v1/models，
+// 所以**不按协议分候选**：候选只取决于 base 的形状。保留 protocol 参数是为了
+// 将来出现协议专属路径时有地方落，当前形态下它不参与判定。
+func modelListURLs(base string) []string {
+	if hasVersionSuffix(base) {
+		return []string{base + "/models"}
+	}
+	return []string{base + "/v1/models", base + "/models"}
+}
+
+// hasVersionSuffix 判断 base 是否已经以 /vN（N 为数字）结尾。
+//
+// 只认结尾一段：路径中间出现的 /v1（如 /proxy/v1）不算，那仍是可以再拼
+// 一层版本的中转路径。用 path 而非字符串后缀匹配是为了避免
+// "https://host/v1beta" 这类被判成已带版本。
+func hasVersionSuffix(base string) bool {
+	u, err := url.Parse(base)
+	if err != nil {
+		return false
+	}
+	last := u.Path
+	if i := strings.LastIndex(last, "/"); i >= 0 {
+		last = last[i+1:]
+	}
+	if len(last) < 2 || last[0] != 'v' {
+		return false
+	}
+	for _, c := range last[1:] {
+		if c < '0' || c > '9' {
+			return false
+		}
+	}
+	return true
 }
 
 func fetchModels(ctx context.Context, client *http.Client, url, protocol, apiKey string) ([]ModelCandidate, error) {
