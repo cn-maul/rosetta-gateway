@@ -20,9 +20,13 @@
   分组模型白名单，key 级收紧不放宽，管理写操作全量审计。
 - **配额与限速**：用户级 / key 级两级终身 token 配额（原子预占）+
   RPM/TPM 固定窗口限速。
+- **余额闸门**：用户级人民币余额（亚分精度累积、待结算账本），
+  耗尽即 402 拒绝调用；与 token 配额是两条独立的闸，处置动作不同。
 - **用量记账与归档**：逐请求明细（含固化费用）保留 30 天，
   日归档 + 终身累计单行表保证「明细可删、累计不变」；
   历史费用按落库时单价固化，改价不改历史。
+- **上游模型探测**：定时对每个上游模型发最小真实推理，得出连通率曲线，
+  画在「可用模型」页的模型卡上（探测不扣网关用户的钱，也不写熔断状态）。
 - **Web 管理界面**：Vue 3 + Vite，产物经 `go:embed` 进二进制，无外部静态资源。
 
 ## 快速开始
@@ -62,11 +66,14 @@ go build -o gateway ./cmd/gateway
 
 ```
 <home>/
-├── config.json        # 可选的引导配置，程序不回写
-├── master.key         # 上游凭据加密主密钥（缺失时自动生成）
-├── session_secret     # 会话签名密钥（缺失时自动生成）
+├── config.json        # 可选的引导配置；不存在时程序自动生成一份，**不回写已存在的**
+├── master.key         # 上游凭据加密主密钥（缺失时自动生成并落盘）
+├── session_secret     # 会话签名密钥（缺失时自动生成并落盘）
 └── data/gateway.db    # SQLite：配置 + 身份 + 用量
 ```
+
+三把「状态」的代价不对称，备份时按这个优先级：`master.key` 丢了上游凭据全部作废；
+`session_secret` 丢了只是所有人重新登录；`data/` 删了要重走首次初始化。
 
 ### 下游接入
 
@@ -98,17 +105,26 @@ OpenAI 系客户端；额度查询端点（`/dashboard/billing/*`、`/v1/organiz
 | 文档 | 内容 |
 |---|---|
 | [DESIGN.md](DESIGN.md) | 设计文档：架构、数据模型、路由、配额、故障转移、协议转换、配置 |
-| [MULTIUSER.md](MULTIUSER.md) | ⚠️ **历史归档**（冻结于 2026-10-07）：多用户 / 分组 / 权限模型的设计记录。保留是因为代码中有 20+ 处注释以它的章节号为锚点 |
+| [MULTIUSER.md](MULTIUSER.md) | ⚠️ **历史归档**（冻结于 2026-10-07）：多用户 / 分组 / 权限模型的设计记录。保留是因为代码与 DESIGN.md 中有多处注释以它的章节号为锚点（`§5.1` / `§4.3` / `§4.8` 等） |
 | [DOCKER.md](DOCKER.md) | 容器化部署：镜像、挂载、日志、升级、健康检查 |
 | [CONTRIBUTING.md](CONTRIBUTING.md) | 开发环境与协作约定：本机 `-race` 的 CC 陷阱、纯 Go 交叉编译、代理与 SSH、`sync-embed`、TS 版本上界、代码风格 |
+
+仓库里还有两个本机脚本（不进文档表格，Windows 开发用）：`build.ps1`
+（纯编译，产物 `bin\gateway.exe`）与 `gateway.ps1`（编译 + 启动/停止，
+前台 / `-Detached` / `-Stop`）。
 
 ## 开发
 
 ```bash
 go build ./... && go vet ./... && go test ./...   # 后端门禁
 cd web && npm ci && npm run typecheck && npm run build && npm run sync
-# sync 把前端产物同步进 internal/webui/dist（embed 源）；CI 会校验产物已同步
+# sync（= node sync-embed.mjs）把 web/dist 同步进 internal/webui/dist（embed 源）；
+# CI 的 webui-sync job 会重新构建一遍并与入库产物做 git diff，不一致即红灯
 ```
+
+Windows 上一键做同样的事：`.\build.ps1`（`-NoWeb` 跳过前端、`-Typecheck` 加类型检查）；
+启动用 `.\gateway.ps1`（前台）或 `.\gateway.ps1 -Detached`（后台，日志落 `bin\logs\`），
+`-Stop` 停止。产物是 `bin\gateway.exe`，配置自动落在它同级的 `bin\config.json`。
 
 提交前请跑全量测试；改动转发热路径（配额/限速/故障转移/落库）时，先读
 [DESIGN.md](DESIGN.md) 对应小节的决策留痕——那里的多数「为什么」都对应一次真实踩坑。

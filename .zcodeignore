@@ -3,6 +3,12 @@
 # 所有目录型规则都以 / 开头锚定根目录，与 .gitignore 保持同一口径。
 # 裸写的目录名会匹配**任意层级**的同名目录 —— `gateway/` 曾把
 # `cmd/gateway/`（源码目录）整个排除在外，这个坑已经踩过一次。
+#
+# 本文件必须保持 LF 行尾。真实踩中过（2026-10-17 本机复现）：一旦变成 CRLF，
+# 每个「空行」的 \r\n 剥掉 \n 后残留的 \r 被 git 当成有效模式，而 \r 能匹配
+# 任意目录名 —— 于是每个空行都变成一条「匹配任意层级任意目录」的幽灵规则，
+# `git check-ignore -v zzz/` 假报命中一个空行，真实的未跟踪目录反被藏起来。
+# 详见 .gitignore 顶部注释里的实测记录。
 /bin/
 *.log
 
@@ -17,6 +23,10 @@
 # 工作区数据（配置、数据库、截图、备份等，含敏感凭据）
 /.workbuddy/
 
+# 二进制产物：不锚定根目录，覆盖 scripts/authz_probe/dbdump.exe 这类
+# 子目录里的构建结果，以及 `-Out` 参数把产物放到任意路径的情况。
+*.exe
+
 # 根目录测试遗留二进制
 /gateway.exe
 
@@ -26,6 +36,11 @@
 # 主密钥（44字符 base64url）。入库即等于把全部上游凭据的加密材料公开——
 # 拿到它就能解出 providers 里所有 api_key。运行时自动生成，每台机器各不相同。
 /master.key
+
+# 会话签名密钥（internal/userauth.SessionFileName）。与 master.key 同级：
+# 拿到它可以伪造任意用户的登录会话。缺失时自动生成，所以一定会出现。
+/session_secret
+/session_secret.oldbak
 
 # 本地实际配置（含上游 providers 的 api_key / routes 等敏感项）。
 # config.example.json 才是应该入库的那份。
@@ -37,6 +52,18 @@
 *.db-shm
 *.db-wal
 
+# 备份文件：密钥 / 会话密钥 / 整库的副本，危害与原文件完全相同。
+# `*.bak-*` 与 `*.oldbak` 必须分开写：只写 `*.bak` 挡不住
+# .oldbak 与 gateway.exe.bak-20260921-105153 这种带时间戳的命名。
+*.oldbak
+*.bak-*
+*.bak
+
+# 上游 SDK 的设计 / 审计过程文档：属于 rosetta 仓库，不是本仓库的文档
+/work/
+
 # 注：原此处列过 admin_auth.json 与 admin_token 的忽略规则，
 # 那两条对应的认证通道已在统一认证改造中删除（只剩 users 表 + 会话），
 # 文件不会再被生成。留着会让后来人以为它们仍是活的配置项。
+# 但 .gitignore / .dockerignore 仍保留 admin_auth.json：本机磁盘上那份
+# 历史文件还在（含盐哈希），两道防线的口径不能因为「通道已删」就撤掉。

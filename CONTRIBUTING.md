@@ -26,6 +26,12 @@ go test -race -count=1 ./...
 `C:\mingw64\bin\gcc.exe`，显式指定即可。同样的说明也记在
 `.github/workflows/ci.yml` 的对应步骤旁。
 
+> 注意这份「无空格副本」是**本机事实，不是仓库保证**：换一台机器、
+> 或重装 MinGW 之后 `C:\mingw64\bin\gcc.exe` 可能不存在。照抄这条命令前
+> 先 `Test-Path` 一下；真缺就把带空格那份用引号包起来
+> （`$env:CC='"C:\Program Files\mingw64\bin\gcc.exe"'`）—— 内层引号是
+> 给 Go 的工具链解析器看的，PowerShell 会把它当整体传下去。
+
 CI 跑在 ubuntu，用默认 gcc 即可，不需要这个变量。
 
 > 为什么产物不受影响：race detector 只支持 cgo，所以**测试**需要 CGO；
@@ -117,6 +123,18 @@ webui-sync job 都会红。tsgo 没有内置替代品 —— 它是编译器，�
 
 因此 `package.json` 用 `~6.0.3` 钉住。将来 vue-tsc 官方支持 tsgo 之后
 再单独评估，不要跟着 npm 顺手升上去。
+
+### Node 至少 22.12（Vite 8 的 engines 下限）
+
+`vite` 已升到 8.x，它的 `engines` 是 `^20.19.0 || >=22.12.0` ——
+CI 因此把 `node-version` 写成**具体的 `22.12`** 而不是 `'22'`
+（`.github/workflows/ci.yml` 的 `Set up Node` 步骤旁有完整说明）。
+写 `'22'` 会解析到当时最新的 22.x、恰好满足下限，那是靠浮动侥幸：
+哪天有人写成 `22.0` 或某个旧 minor，构建会直接失败，且报错来自 npm 的
+`engines` 检查，与被测代码无关，很难一眼归因。
+
+本机没有 Node 22.12+ 时的表现是 `npm install` 阶段就报 `EBADENGINE`，
+而不是编译报错 —— 看到它先去核对 `node -v`，别去查代码。
 
 ### lockfile 的 registry
 

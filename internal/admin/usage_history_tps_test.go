@@ -367,18 +367,23 @@ func TestUsage_ExportCSV_IncludesOutputTokensAndTps(t *testing.T) {
 	}
 	// 新增列必须**追加在末尾**：原有 11 列的下标不能变，
 	// 否则任何按下标取值的既有消费方（脚本、Excel 模板）会静默错位。
-	want := "ts,public_model,upstream_model,key_name,key_id,total_tokens,ttfb_ms,latency_ms,status,stream,cost,output_tokens,tps"
+	// route_trace 是第 14 列（2026-10-17 的失败决策轨迹），同样追加在末尾。
+	want := "ts,public_model,upstream_model,key_name,key_id,total_tokens,ttfb_ms,latency_ms,status,stream,cost,output_tokens,tps,route_trace"
 	if strings.TrimSpace(header) != want {
 		t.Errorf("CSV 表头 = %q\nwant %q\n（新增列必须追加在末尾，不得插入中间）",
 			strings.TrimSpace(header), want)
 	}
 	// 正常样本那一行必须写出 50（200*1000/4000）。
-	if !strings.Contains(body, ",50\n") {
+	// 不能直接搜 ",50\n"：route_trace 是最后一列，样本里它是空的，
+	// 于是行尾是 ",50," 而不是 ",50\n" —— 按行首的 total_tokens 定位才稳。
+	if !strings.Contains(body, ",1100,3600,4000,ok,true,0,200,50,") {
 		t.Errorf("CSV 未写出正常样本的 tps=50：%s", body)
 	}
 	// 无样本的两条必须留空而不是写 0：0 会被表格工具算进平均值、
 	// 把整体速度往下拽；空单元格才是"缺失"。
-	if strings.Contains(body, ",0\n") {
-		t.Errorf("CSV 把无样本的 tps 写成了 0（应留空）：%s", body)
+	// 同样因为 route_trace 垫在最后，行尾从 ",0\n" 变成 ",0,"，
+	// 所以按行首的 total_tokens 定位到那一行再判空。
+	if !strings.Contains(body, ",900,1000,5000,ok,true,0,0,,") {
+		t.Errorf("CSV 把无样本的 tps 写成了 0 或该行缺失（tps 应留空）：%s", body)
 	}
 }

@@ -1,8 +1,31 @@
 # 构建产物与本地运行时
-#注意：所有目录型规则都必须以 / 开头锚定根目录。
-#裸写的目录名会匹配**任意层级**的同名目录——`gateway/` 曾把
-# `cmd/gateway/` 整个排除在版本控制之外，导致 billing.go 等7 个文件从未入库，
-# CI 检出后编译报 `undefined: billingSubscription`。
+#
+# 注意：所有目录型规则都必须以 / 开头锚定根目录。
+# 裸写的目录名会匹配**任意层级**的同名目录 —— `gateway/` 曾把
+# `cmd/gateway/`（源码目录）整个排除在版本控制之外，导致 billing.go 等
+# 7 个文件从未入库，CI 检出后编译报 `undefined: billingSubscription`。
+# 这个坑已经踩过一次，别再犯。
+#
+# 本文件必须保持 LF 行尾。
+#
+# 这是个**真实踩中过**的坑（2026-10-17 在本机复现，见 scripts/check-repo-hygiene.ps1
+# 的第三节自检）：只要 .gitignore 变成 CRLF 行尾，git 逐行剥行尾时空行的
+# \r\n 剥掉 \n 后会残留一个 \r，而 \r 在 git 的 fnmatch 里能匹配任意目录名，
+# 于是**每个空行都变成一条「匹配任意层级任意目录」的幽灵规则**：
+#     $ git check-ignore -v zzz/
+#     .gitignore:43:	zzz/        ← 第 43 行原本是个空行
+# 危害不是「规则失效」而是**假报生效**：该挡的看起来都挡住了，
+# `git status` 也会因此把真实的未跟踪目录藏起来，误以为加了规则就安全了。
+# 改回 LF 后同一份内容立刻恢复正常（zzz/ 不再命中，其余规则照常生效）。
+#
+# Windows 上踩到它的路径很日常：本机 `core.autocrlf=true`（全局配置），
+# 任何编辑器或用 `Set-Content` / `Out-File` 重写本文件都会带上 CRLF，
+# 而 git 对本文件没有 `text eol=lf` 属性（.gitattributes 只锁了 *.go / *.md /
+# *.yml / *.sh），所以没有任何东西会自动把它转回来。
+# 自查（一条命令，命中即说明中招）：
+#     git check-ignore -v zzz/
+# 转成 LF（PowerShell）：
+#     (Get-Content .gitignore -Raw) -replace "`r`n","`n" | Set-Content .gitignore -NoNewline
 /bin/
 *.log
 
@@ -17,7 +40,14 @@
 # 工作区数据（配置、数据库、截图、备份等，含敏感凭据）
 /.workbuddy/
 
-# 根目录测试遗留二进制
+# 二进制产物：不锚定根目录，覆盖 scripts/authz_probe/dbdump.exe 这类
+# 子目录里的构建结果，以及 `-Out` 参数把产物放到任意路径的情况。
+# probe.ps1 每次跑都会在 scripts/authz_probe/ 下重新构建 dbdump.exe，
+# 不全局挡住它迟早会被 `git add -A` 顺手带进提交。
+*.exe
+
+# 根目录测试遗留二进制。*.exe 已全局覆盖，这里保留一条显式记录：
+# 它是这个仓库最早的一批误推风险，也是当初补 .gitignore 的起因。
 /gateway.exe
 
 # 管理后台密码（含盐哈希，不应入库）
@@ -28,8 +58,16 @@
 /gateway/
 
 # 主密钥（44字符 base64url）。入库即等于把全部上游凭据的加密材料公开——
-# 拿到它就能解出providers 里所有 api_key。运行时自动生成，每台机器各不相同。
+# 拿到它就能解出 providers 里所有 api_key。运行时自动生成，每台机器各不相同。
 /master.key
+
+# 会话签名密钥（internal/userauth.SessionFileName）。与 master.key 同级：
+# 拿到它可以伪造任意用户的登录会话（JWT 的签名密钥），无需密码即可登录。
+# 文件缺失时网关会自动生成并原子落盘，所以它一定会出现在运行目录里，
+# 不显式挡住就会被 `git add -A` 一起提交。Docker 部署时它在 /data 卷中，
+# 由 .dockerignore 单独负责。
+/session_secret
+/session_secret.oldbak
 
 # 本地实际配置（含 admin_token / providers api_key / routes）。
 # config.example.json 才是应该入库的那份。
@@ -41,8 +79,26 @@
 *.db-shm
 *.db-wal
 
+# 备份文件：备份的是同一批敏感物（密钥 / 会话密钥 / 整库），
+# 危害与原文件完全相同，只是文件名多一个后缀。
+# 实测存在：bin/master.key.oldbak、bin/session_secret.oldbak、
+# bin/data/gateway.db.oldbak，以及 gateway.exe.bak-20260921-105153
+# 这种带时间戳的命名（MULTIUSER.md 里的 `cp gateway.db gateway.db.bak-$(date ...)`
+# 就是它的来源）。
+# `*.bak-*` 与 `*.oldbak` 必须分开写：shell 通配符不认「后缀里再带后缀」，
+# 只写 `*.bak` 挡不住 .oldbak 与 .bak-20260921-105153。
+*.oldbak
+*.bak-*
+*.bak
+
 # 一次性调试脚本（2026-10-14）。曾出现过 tools/tmpbal/main.go：直接以只读
 # 模式打开 bin/data/gateway.db 把用户余额打到标准输出。入库既暴露数据形状，
 # 又让 go build ./... 把它当成第二个 main 包 —— 那条 import 路径写死在
 # bin/data 上，换个部署位置就直接编译失败。写前导斜杠只挡根目录。
 /tools/
+
+# 上游 SDK 的设计 / 审计过程文档（2026-10 的 5 份，约 94KB）。
+# 这些是 rosetta 仓库的工作产物，不属于本仓库的文档体系，不应进版本库；
+# 一旦入库，`git log` 与代码考古会被这批外部过程稿持续污染。
+# 同理不写裸 `docs/`：本仓库的文档根目录如果哪天要建，不能连带被排除。
+/work/

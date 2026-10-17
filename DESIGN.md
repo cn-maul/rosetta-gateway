@@ -5,10 +5,10 @@
 | 项目名 | **rosetta-gateway** |
 | 项目性质 | 独立项目，不在 Rosetta 上改造（2026-09-15 定，理由见 §2.1） |
 | module path | `github.com/cn-maul/rosetta-gateway` |
-| 运行时依赖 | `github.com/cn-maul/rosetta` v1.1.1（上游 SDK）、`modernc.org/sqlite`（纯 Go SQLite）、`github.com/golang-jwt/jwt/v5`（管理会话） |
-| 版本 | 与 `web/package.json` 同源（当前 1.5.3），镜像与二进制共用 |
+| 运行时依赖 | `github.com/cn-maul/rosetta` v1.2.0（上游 SDK）、`modernc.org/sqlite`（纯 Go SQLite）、`github.com/golang-jwt/jwt/v5`（管理会话） |
+| 版本 | 与 `web/package.json` 同源（当前 1.6.2），镜像与二进制共用 |
 | 状态 | **已实现**（P0–P3 全部落地，多用户、用量归档、配置导入导出均已上线） |
-| 更新 | 2026-10-11 |
+| 更新 | 2026-10-17 |
 
 ---
 
@@ -444,7 +444,8 @@ resolve(model):
 失败返回 401；Key 被停用、过期、来源 IP 不在白名单均返回 **403**
 （`invalid_api_key` / `key_expired` / `ip_not_allowed`）；配额耗尽返回
 429 `insufficient_quota`；模型不在该 key 的白名单内返回 403 `model_not_allowed`。
-无归属的 key 返回 401（`ErrKeyUnowned`）—— 见 §6.4「先建后认领」。
+无归属的 key 返回 401（`ErrKeyUnowned`）—— 历史存量数据的形态，迁移时已被
+`retireOrphanKeys` 禁用，见 §6.3 的 PATCH `user_id` 说明。
 
 ### 6.3 管理接口
 
@@ -480,17 +481,23 @@ resolve(model):
 
 | 端点 | 放行规则 |
 |---|---|
+| `GET /admin/api/session` | 恒放行（探测是否已登录；未初始化时一并回报） |
 | `GET /admin/api/bootstrap` | 恒放行（返回是否需要初始化与待初始化账号名） |
-| `POST /admin/api/bootstrap` | 仅当 `bootstrap_completed` 标记未写入且存在未初始化 admin 时放行；同源 + JSON Content-Type；本安装配置了引导令牌时还必须带对令牌（同事务内恒定时间比对）。标记、令牌与首次设密同事务写入，窗口一次性 |
-| `POST /admin/api/login` / `POST /admin/api/logout` | 免鉴权（登录 / 登出本体） |
+| `POST /admin/api/bootstrap` | 仅当 `bootstrap_completed` 标记未写入且存在未初始化 admin 时放行；同源 + JSON Content-Type；本安装配置了引导令牌时还必须带对令牌（同事务内恒定时间比对）。标记、令牌与首次设密同事务写入，窗口一次性。它挂在 `publicAdminMux` 上因而**绕过**了 `adminAuto` 的审计，故单独套 `server.AuditOnly` 补上（只补审计，不触发快照重建 —— 它只改密码哈希） |
+| `POST /admin/api/login` | 免鉴权（登录本体；失败计入来源 IP 限速，§11.4） |
+| `POST /admin/api/logout` | **要会话**：它必须知道吊销谁（`BumpAuthVersion`）。「免鉴权」的登出只会清 cookie，而令牌在自然过期前仍然可用 —— 那是一次假登出 |
 | 其余 | `Authorization: Bearer <会话令牌>`，查 users 表比对 `auth_version` |
 
 ```
 GET    /admin/api/providers                     列表
 POST   /admin/api/providers                     新建
+GET    /admin/api/providers/{id}                单个详情（编辑表单回显）
 PATCH  /admin/api/providers/{id}
 DELETE /admin/api/providers/{id}
 POST   /admin/api/providers/{id}/test           连通性测试（调 ListModels）
+POST   /admin/api/providers/{id}/balance        查询上游服务商余额（管理员；2026-10-11
+                                                 新增，透传 internal/upstream/balance.go；
+                                                 纯读，**刻意不触发** AutoReload 重建）
 
 GET    /admin/api/providers/{id}/credentials
 POST   /admin/api/providers/{id}/credentials
@@ -501,11 +508,31 @@ GET    /admin/api/providers/{id}/models
 POST   /admin/api/providers/{id}/models
 POST   /admin/api/providers/{id}/models/discover  从上游 /models 拉取并批量导入
 POST   /admin/api/providers/{id}/models/import    批量导入（单事务，要么全进要么全不进）
+POST   /admin/api/models/{id}/test                单模型可用性探测：发一次最小真实推理
+                                                 （max_tokens=1）。与 /providers/{id}/test 是
+                                                 两件事 —— 那个证明「endpoint + 凭据通」，
+                                                 这个证明「这个 model_id 现在真的能推理」
+                                                 （模型下架 / 无权限 / 名字写错时前者照样绿）
+POST   /admin/api/models/batch-price              批量改价：同一组价格写到多个模型。
+                                                 POST 语义是**整体替换**，与单条 PATCH 的
+                                                 nil=不改 不同（model_handler.batchPriceRequest）
 PATCH  /admin/api/models/{id}
 DELETE /admin/api/models/{id}
 GET    /admin/api/upstream-models                 全部上游模型扁平列表（含 provider_id，
                                                   供 Routes/Settings 一次拉全，替代逐 provider 的 N+1；
                                                   不挂吞吐重查询）
+
+GET    /admin/api/model-groups                    模型归组（统计展示层，不参与路由判定）
+POST   /admin/api/model-groups
+PATCH  /admin/api/model-groups/{id}
+DELETE /admin/api/model-groups/{id}
+GET    /admin/api/model-groups/{id}/members       组内上游模型
+POST   /admin/api/model-groups/{id}/assign        把多个上游模型指派进组（{id} 是**组** id）
+POST   /admin/api/model-groups/unassign           移出组（不属于任何组，故单独一个端点）
+
+GET    /admin/api/probes/models                   上游模型健康探测汇总（读 model_probes，
+                                                 按组白名单收窄；**不触发**探测）
+GET    /admin/api/probes/timeline                 探测时间线（「可用模型」页的连通率曲线）
 
 GET    /admin/api/routes
 POST   /admin/api/routes
@@ -520,19 +547,22 @@ PATCH  /admin/api/users/{id}                    角色/状态/配额/分组/备�
                                                  自动递增 auth_version 使旧会话失效
 DELETE /admin/api/users/{id}
 POST   /admin/api/users/{id}/password           管理员重置该用户密码
+PUT    /admin/api/users/{id}/balance             管理员充值/扣减余额，body `{delta_cents}`（分，正充负扣）
 
 GET    /admin/api/groups                        分组与组级模型白名单（admin）
 PUT    /admin/api/groups/{id}/models            设置分组模型白名单（写入口，**仅管理员**）
 
 GET    /admin/api/keys                          列表（普通用户只看到自己的）
-POST   /admin/api/keys                          **所有登录用户**（2026-10-07 重开）：
-                                                  归属恒为创建者自己，请求里的
-                                                  `user_id` 被忽略（含管理员）；
-                                                  普通用户额度封顶到用户级
-                                                  quota_tokens、rpm/tpm 清零
+POST   /admin/api/keys                          普通用户自助发 key；归属恒为创建者自己，
+                                                 请求里的 `user_id` 被忽略。
+                                                 **管理员被路由层 403**（denyAdminKeyCreate）——
+                                                 控制面/数据面分离：管理员要建普通用户、
+                                                 由那个人自己发 key。普通用户额度封顶到用户级
+                                                 quota_tokens、rpm/tpm 清零
 PATCH  /admin/api/keys/{id}                     可改 name / enabled / quota_tokens /
                                                  rpm_limit / tpm_limit / expires_at /
-                                                 allowed_models / allowed_ips / group_id；
+                                                 allowed_models / allowed_ips / group_id /
+                                                 **user_id（仅管理员，归属变更的唯一入口）**；
                                                  普通用户只能收紧不能放宽（guardNoLoosening）
 DELETE /admin/api/keys/{id}
 POST   /admin/api/keys/{id}/recompute-usage     从用量记录重算 used_tokens（配额漂移自愈）
@@ -542,26 +572,29 @@ GET    /admin/api/usage?from=&to=&group_by=key|model|provider|day
                                                  from/to 为毫秒时间戳；**from=0 一律表示
                                                  「全部历史」**（本端点与 by-* 系列语义统一，
                                                  未传 from 时 Query 默认近 24h）
+GET    /admin/api/usage/history                  逐条调用明细（分页 + status/model/key_id 过滤）
+GET    /admin/api/usage/history.csv             同一套过滤的 CSV 导出（后端一次最多 1000 行，
+                                                 超出时响应头 X-Export-Total 给真实总行数）
 GET    /admin/api/usage/by-provider|by-day|by-model|by-key    分维度用量（按身份收窄）
 GET    /admin/api/usage/by-user                              **仅管理员**：按用户维度用量
-GET    /admin/api/usage/history.csv             调用明细 CSV 导出（与 history 同一套
-                                                 status/model/key_id 过滤，无分页）
 POST   /admin/api/usage/prune                   手动触发归档剪枝（每日定时之外的人口）
 GET    /admin/api/stats                         当前快照：总请求/总 token/错误率/各 provider 健康
 GET/PUT /admin/api/settings                     运行时全局默认（超时/故障转移策略，§10）
 POST   /admin/api/config-export/export|import   配置导出/导入（§13.3，requireAdmin）
 GET    /admin/api/model-names                   公开模型名清单（按身份收窄，供白名单选择）；附带
-                                                  `prices[]`（与 `models` **平行**的数组，prices[i]
-                                                  对应 models[i]，三项单价元/百万 tokens，0 = 未配置）
+                                                 `prices[]`（与 `models` **平行**的数组，prices[i]
+                                                 对应 models[i]，三项单价元/百万 tokens，0 = 未配置）
+                                                 与 `meta[]`（`name` / `provider_name` /
+                                                 `upstream_model_id`，供连通率曲线
+                                                 按上游模型 id 与公开名对号）
 PUT    /admin/api/users/{id}/balance             管理员充值/扣减余额，body `{delta_cents}`（分，正充负扣）
 GET    /admin/api/topups                         充值流水（按身份收窄：管理员看全部、
                                                  普通用户只看自己的）
 POST   /admin/api/me/password                    当前用户自助改密（校验旧密码；
                                                  改密后递增 auth_version 使旧会话失效）
-POST   /admin/api/providers/{id}/balance         查询上游服务商余额（管理员；2026-10-11
-                                                 新增，透传 internal/upstream/balance.go）
-GET    /admin/api/me / POST /admin/api/logout   当前用户信息 / 登出（递增 auth_version）
-POST   /admin/api/reload                        从 DB 重建内存快照
+GET    /admin/api/me                            当前用户信息
+POST   /admin/api/logout                         登出（递增 auth_version）
+POST   /admin/api/reload                        从 DB 重建内存快照（前端兜底，见下）
 ```
 
 所有写操作的事务边界：**先写 DB，提交成功后再重建快照**。DB 写失败则快照不动。
@@ -622,10 +655,14 @@ PATCH 端点一律「只看请求体里出现了哪些字段」：
 三处刻意偏离上面这套通用规则，各有理由：
 
 - **`POST /admin/api/keys` 的归属恒为创建者自己**：`user_id` 被**静默忽略**（不 403）。
-  任何人都不能代建 —— 包括管理员。这样 key 的来源永远是「谁建的」，
-  归属变更永远是「谁改的」，审计里两件事不会混在一条记录里。忽略而不是拒绝，
-  是因为旧版本前端仍会带这个字段，让一个本该成功的建 key 操作硬失败没有意义；
-  越权没有发生，就不该为它中断。拿不到身份 → 401（fail-closed：绝不放行空 ID）。
+  任何人都不能代建。这样 key 的来源永远是「谁建的」，归属变更永远是「谁改的」，
+  审计里两件事不会混在一条记录里。忽略而不是拒绝，是因为旧版本前端仍会带这个字段，
+  让一个本该成功的建 key 操作硬失败没有意义；越权没有发生，就不该为它中断。
+  拿不到身份 → 401（fail-closed：绝不放行空 ID）。
+  注意**管理员连「给自己建」都被路由层挡掉**（`denyAdminKeyCreate`，403）：
+  那是比「归属不可代建」更强的一条控制面/数据面分离规则 —— 管理员要建普通用户、
+  由那个人自己发 key。两条规则的方向一致（数据面凭据只能由用它的人生出来），
+  但**层次不同**：忽略 `user_id` 是 handler 内的字段级规则，403 是路由层的身份级规则。
 - **自助发 key 的封顶**（仅普通用户，管理员不受限）：`quota_tokens` 不得超过其
   **用户级** `users.quota_tokens`（0 = 不限时才允许 key 不限）；`rpm_limit` /
   `tpm_limit` **强制清零** —— users 表没有 rpm/tpm 列，没有用户级上限可比，
@@ -636,7 +673,9 @@ PATCH 端点一律「只看请求体里出现了哪些字段」：
   重建一把也不会「更宽松」，只会失去该 key 上已有的全部限制性配置。
   部署侧仍应给普通用户配 `users.quota_tokens`：它不设时自助建 key 就是不限额凭证。
 - **`PATCH /admin/api/keys/{id}` 的 `user_id`**（仅管理员有效）：这是**归属变更的
-  唯一入口** —— 管理员先给自己建一把，再用这个字段认领给某个**已存在**的用户。
+  唯一入口** —— 管理员把一把**已存在的** key（某个普通用户自己发的那把）认领 /
+  转交给另一个**已存在**的用户。管理员自己发不出 key（见上一条），所以这里
+  处置的永远是「用户发的 key 归错了人」。
   落库走独立的 `store.ReassignAccessKey`；`UpdateAccessKey` 刻意不写 `user_id`
   （归属不该由一个 PATCH 随手改写，见 `user_dao_test.go` 的断言）。指向不存在的
   用户 → 400。历史数据里仍可能存在 `user_id:""` 的无归属 key：鉴权时得到
@@ -1039,7 +1078,7 @@ per-model 配额、per-provider 配额仍不做，记入后续路线。
 | 配置类别 | 存放位置 | 可否运行时改 |
 |---|---|---|
 | Provider / 模型 / Route / Key / **用户与管理员账号** | **数据库** | 是（管理 API / Web 界面） |
-| 监听地址、DB 路径、日志级别、加密主密钥、**日界时区（`timezone`）**、**用量保留天数（`usage_retention_days`）**、全局默认超时与重试、body 大小上限 | **配置文件** | 否（改后重启） |
+| 监听地址、DB 路径、日志级别、加密主密钥、**日界时区（`timezone`）**、**用量保留天数（`usage_retention_days`）**、**连通率探测（`probes`）**、全局默认超时与重试、body 大小上限 | **配置文件** | 否（改后重启） |
 | 首次 bootstrap 的 provider/route | 配置文件（仅当 DB 为空时生效） | 否 |
 
 **关键纪律**：DB 非空时，配置文件里的 `providers` / `routes` 段落被**忽略并打印 warning**。这防止出现「界面改完、重启被配置文件覆盖」这类经典事故。
@@ -1062,17 +1101,22 @@ users 表 + 会话一条通道后，管理员只是一个 `role='admin'` 的普�
 
 所有相对路径默认按**可执行文件所在目录**解析（与进程 CWD 无关）；设了
 `ROSETTA_GW_HOME` 则整体重定向到该目录（容器部署就是这么把状态指到挂载卷的）。
-部署形态是「一个目录装下全部状态」：
+两个规则的事实来源是 `cmd/gateway/main.go` 的 `resolveHome`：`exeDir` 兜底、
+环境变量优先且过 `filepath.Abs`。部署形态是「一个目录装下全部状态」：
 
 ```
 <home>/
-├── gateway.exe          # 单个二进制（前端已 embed）
-├── config.json          # 手写引导配置，程序不回写
-├── master.key           # 上游凭据加密主密钥（缺失时自动生成）
-├── session_secret       # 会话签名密钥（缺失时自动生成并原子落盘）
+├── gateway(.exe)      # 单个二进制（前端已 embed）
+├── config.json        # 引导配置：不存在时程序自动生成一份默认值，**不回写已存在的**
+├── master.key         # 上游凭据加密主密钥（缺失时自动生成并原子落盘）
+├── session_secret     # 会话签名密钥（缺失时自动生成并原子落盘）
 └── data/
-    └── gateway.db       # SQLite：provider/模型/路由/key/用户/用量记录
+    └── gateway.db     # SQLite：provider/模型/路由/key/用户/用量记录
 ```
+
+`db_path` 是**相对 `<home>`** 解析的（`main.go` 里非绝对路径就 `filepath.Join(homeDir, ...)`），
+所以 `<home>` 整个搬走（或换 `ROSETTA_GW_HOME`）时库跟着走，不会留下一个
+「配置在这、库在那」的撕裂状态。
 
 删掉 `data/` 等于重置全部业务数据（管理员账号随之消失，重启后重新走首次初始化）；
 删掉 `master.key` 等于上游凭据全部作废；删掉 `session_secret` 只影响登录态
@@ -1117,10 +1161,20 @@ users 表 + 会话一条通道后，管理员只是一个 `role='admin'` 的普�
   "master_key_env": "ROSETTA_GW_MASTER_KEY",
   "timezone": "Asia/Shanghai",
   "usage_retention_days": 30,
+  "probes": {
+    "enabled": true,
+    "interval_sec": 600,
+    "timeout_ms": 30000,
+    "concurrency": 4,
+    "down_threshold": 3,
+    "window_size": 10,
+    "healthy_rate": 0.8,
+    "retention_days": 30
+  },
   "defaults": {
-    "upstream_timeout_ms": 120000,
-    "stream_idle_timeout_ms": 60000,
-    "stream_first_token_timeout_ms": 30000,
+    "upstream_timeout_ms": 300000,
+    "stream_idle_timeout_ms": 120000,
+    "stream_first_token_timeout_ms": 60000,
     "max_retries": 2,
     "max_request_body_bytes": 33554432,
     "failover_max_targets": 3,
@@ -1133,18 +1187,24 @@ users 表 + 会话一条通道后，管理员只是一个 `role='admin'` 的普�
         "name": "DeepSeek 官方",
         "protocol": "auto",
         "endpoint": "https://api.deepseek.com/v1",
+        "proxy_url": "",
         "credentials": [{ "label": "主号", "api_key_env": "DEEPSEEK_API_KEY" }],
         "models": ["deepseek-chat", "deepseek-reasoner"]
       }
     ],
     "routes": [
-      { "public_name": "gpt-4o", "provider": "openai", "model": "gpt-4o" }
+      { "public_name": "gpt-4o", "provider": "deepseek", "model": "deepseek-chat" }
     ]
   }
 }
 ```
 
-`api_key_env` 支持从环境变量读，避免密钥落盘到配置文件。
+`api_key_env` 支持从环境变量读，避免密钥落盘到配置文件；`api_key` 是同一字段的
+另一半写法（**直接把明文密钥写进配置文件**），只在环境变量不可用的场合使用 ——
+两种都配时 `api_key` 优先（`internal/config/config.go` 的 `BootstrapCredential`
+只校验「二者至少有一个」）。样例里刻意只演示 `api_key_env`：配置文件是会进
+版本库、进备份、进镜像层的东西，把一种「可以安全照抄」的形态放在示例里，
+比把两种都列出来更不容易被误用。
 
 **`usage_retention_days`（2026-10-11 新增）**：
 `usage_records` 明细保留天数，超期由归档剪枝聚合进 `usage_daily_rollups` 后删除。
@@ -1157,9 +1217,36 @@ users 表 + 会话一条通道后，管理员只是一个 `role='admin'` 的普�
 
 硬编码 30 无法同时服务这两类部署。取值范围 1~3650，缺省 30，**改后需重启**。
 
+**`timezone`（按天统计的日界）**：IANA 名（如 `Asia/Shanghai`），启动最早期被
+`config.ApplyTimezone` 应用 —— 它同时写 `time.Local` 与 `TZ` 环境变量，因为
+modernc SQLite 的 `'localtime'` 在 Linux 上走 C 的 `tzset`（只认 `TZ`），
+Windows 上才跟 `time.Local`，**只设一个会跨平台失效**（第一版修复就是这么
+在 CI 上翻车的）。空串 = 沿用进程现有时区。它决定总览日趋势、钱包页按天消耗、
+用量归档的日界三处，配错的症状是「过了 0 点按天数据不切日」，详见 DOCKER.md。
+
+**`probes`（2026-10-14 新增，连通率探测）**：定时对上游模型发最小真实推理
+（`max_tokens=1`、不走 usage_recorder，**不扣网关用户的钱**，但上游侧照常计费
+几 token），结果落 `model_probes`，「可用模型」页每张卡片画的就是这条曲线。
+**默认开**（`enabled` 缺省 true，且 `interval_sec` 为 0 时也按「没配过」处理）——
+用户明确要这个功能。其余默认值：间隔 600s、超时 30s、并发 4、连续 3 次失败判 down、
+窗口 10 次、成功率阈值 0.8、探测记录保留 30 天。
+两个必须说清的边界：探测**绝不写 pool 的冷却/熔断**（隔离红线，见
+`internal/probe/runner.go` 与 `store.go` 的建表注释）—— 否则「探测不通」会
+被放大成「上游整体不可用」；它也不是 `/admin/api/usage` 的一部分，与配额
+统计完全隔离。健康判定是「连续失败 + 窗口成功率」两个独立信号叠加
+（`probe.Classify`），单次结果噪声太大，据此切状态会让看板红绿来回跳。
+
 **故障转移相关默认**（`defaults` 下，全部可省略、缺省由 `setDefaults` 兜底）：
 `stream_first_token_timeout_ms` 是流式首字（TTFT）看门狗——区别于 `stream_idle_timeout_ms`（已出字后的空闲超时），掐的是「一个事件都没等到」的慢上游，触发即在写出 SSE 头前转移下一目标。
 `failover_max_targets` 是一次请求最多尝试链上几个目标；`failover_failure_threshold` 是某目标连续失败几次即熔断进 60s 冷却。
+
+三个超时项的**现行默认值是 2026-10-13 上调过的**（300s / 120s / 60s，此前
+120s / 60s / 30s）：对非流式长回复与带思考的上游，旧值会把**正常请求**判成
+超时并触发故障转移，用户侧看到的是「无故变慢 + 结果不对」而不是明确报错。
+三处必须保持同一个口径：`internal/config` 的 `setDefaults`、`config.example.json`、
+web 设置页的 `RUNTIME_DEFAULTS`（`web/src/views/Settings.vue`）——
+界面回显的是生效值，DB 未配置时生效值就来自 `setDefaults`，三处不一致会让运维
+照着界面推理出错误的预期。
 
 这些值同时也是「设置」页可热改项（写入 `app_settings.runtime_defaults`）。**优先级：设置页 > 本文件**：
 设置页里显式保存过的值覆盖 config，未配置的字段回落到这里的 `defaults`，见 §10「参数落点」。
@@ -1227,30 +1314,37 @@ Docker 侧对齐，且避开浏览器的保留端口表（6666 是 IRC 段，浏
 
 ### 13.2 页面清单
 
-实际路由（`web/src/router.ts`，2026-10-15 核实）共 **8 个可渲染页面**，
-其中 2 页 `adminOnly` —— 未登录或非 admin 看不到也进不去。
+实际路由（`web/src/router.ts`，2026-10-17 核实）共 **8 个可渲染页面**
+（`/login`、`/`、`/usage`、`/models`、`/wallet`、`/users`、`/providers`、`/settings`），
+其中 2 页带 `meta.adminOnly`（`/providers`、`/settings`）—— 未登录或非 admin
+看不到也进不去。注意「页面数」与「侧栏项数」不是一回事：普通用户那一侧的侧栏
+只有 5 项（总览 / 可用模型 / 钱包与充值 / 用量统计 / 用户与分组），
+管理员那一侧是 7 项（个人 3 项 + 上游与模型 / 用户与分组 / 用量统计 / 设置）。
+`/wallet` 与 `/profile` 渲染的是**同一个** `Wallet.vue`（后者是重定向），
+路由名 `profile` 被守卫的「非 admin 踢回」与登出回跳复用，所以两条路径都得在。
 
-另有若干**只做重定向的老书签**（`/keys` → `/users`；`/routes` 与
-`/model-groups` → `/providers`；`/health` → `/models`），它们不渲染独立组件，
-保留是为了不把旧链接变成 404。
+另有若干**只做重定向的老书签**（`/keys` → `/users`；`/history` → `/usage`；
+`/profile` → `/wallet`；`/routes` 与 `/model-groups` → `/providers`；
+`/health` → `/models`），它们不渲染独立组件，保留是为了不把旧链接变成 404。
+`/keys` 在 router.ts 里出现了两次（一次在注释块之后、一次在 `/users` 之后），
+vue-router 的 `insertMatcher` 按路径得分二分插入（`findInsertionIndex`），
+两条同路径得分相同 → 后注册的排在前面，而 `resolve` 用 `matchers.find(...)`
+取第一个匹配，所以**后注册的那条胜出**。两条目标都是 `name: 'users'`，
+重复注册不影响行为 —— 但这是巧合而不是设计，后人改其中一条时两条都要看。
 
 | 路由 | 页签 | 可见 | 内容 |
 |---|---|---|---|
 | `/login` | 登录 | 公开 | 账号密码换 JWT；未初始化时改走引导设密 |
-| `/` | 总览 | 全体 | 今日请求数 / token / 错误率 / 各 provider 健康灯 |
-| ~~`/keys`~~ | 访问密钥 | — | **已重定向到 `/users`**（2026-10-14 页面合并）。访问密钥不再是独立侧栏项，而是「用户与分组」页的第三个页签 —— 用户 / 分组 / 密钥是一条权限链上的三环，排查「这把 key 为什么调不通这个模型」必须同时看三者。普通用户进 `/users` 默认落在密钥页签（他们看不到前两个），管理员落在「用户」页签 |
-| `/history` | 调用历史 | 全体 | 按时间倒序的调用明细，含 usage_state 与耗时 |
-| `/profile` | 钱包与充值 | 全体 | 自改密码、看自己的配额、**余额**（`balance_unlimited` 时显示「不限」而非 0.00 元）与用量；余额为 0 时显式提示「余额已用尽，请联系管理员充值」，对应数据面真实的 402 |
-| `/models` | 可用模型 | 全体 | **只读**清单：`GET /admin/api/model-names` 按身份收窄后的模型名（普通用户 = 所属组白名单 ∩ 全部路由名）+ 输入/输出/缓存命中三项单价；`restricted=true` 时显式提示「已被分组收窄」。刻意不给勾选控件 —— 白名单的写入口在 `/keys`（只能收紧）与 `/groups`（管理员按组收紧），且**空清单一律解释为「一个模型都调不了」而非 ModelPicker 的「一个都不选 = 不限制」**（后者只属于配置态）。未配置的单价显示「未配置」并弱化，**不显示 0.00**（会被读成「确认免费」） |
-| `/users` | 用户与分组 | 全体 | 三个页签：**用户**（CRUD、角色、启停、密码重置、**余额充值** —— `delta_cents` 是相对调整，填 100 是「加 100 元」而非「设为 100 元」，误操作不会清零；给不限额用户充值会把它切成有限额，界面上必须写明；admin 账号必须带初始密码。余额列区分「不限」与「0.00 元」）、**分组**（分组增删改、成员增删、**组级模型白名单** `PUT /admin/api/groups/{id}/models`）、**访问密钥**（原 `/keys` 页内容）。路由刻意**不带 `adminOnly`** —— 普通用户看得到这一项、进来落在密钥页签，后端按会话身份强制收窄每个操作的数据面 |
-| ~~`/groups`~~ | ~~分组~~ | ~~admin~~ | **已移除**（2026-10-10）：无独立分组路由。分组管理已合并进 `/users` 页的分组 tab（`UsersGroups.vue`）。删除原因见 `web/src/router.ts` 注释：普通用户的导航项与管理员的「删除后可见性」语义纠缠不清 |
-| `/providers` | 上游与模型 | admin | 列表（协议/端点/凭证健康）、新建/编辑、连通性测试、模型管理、**路由映射与模型分组**（原 `/routes`、`/model-groups` 已并入本页）、导入导出 |
-| ~~`/routes`~~ | ~~路由~~ | — | **已重定向到 `/providers`**（2026-10-14）：路由映射与模型分组合并进「上游与模型」页 |
-| ~~`/model-groups`~~ | ~~模型分组~~ | — | **已重定向到 `/providers`**（同上） |
-| `/settings` | 设置 | admin | 版本、DB 大小、重建快照、日志级别、配置导入导出。**审计日志页签已移除**（用户要求）—— 后端 `GET /admin/api/audit` 端点保留，那是运维取证的正路，删的只是界面那一块 |
+| `/` | 总览 | 全体 | 今日请求数 / token / 错误率 / 各 provider 健康灯；「全部」档的区间聚合与缓存命中率在同一条 SELECT 里完成 |
+| `/usage` | 用量统计 | 全体 | **2026-10-16 由「调用历史」改名并拆成三个子页**：**调用明细**（`UsageDetail.vue`，原 `/history` 的逐条列表，含 usage_state、耗时、tps、失败轨迹与 CSV 导出）、**上游**、**模型**（两者是 `UsageByGroup.vue` 的按维度汇总）。三个子页共用一个时间范围，选择器由父页面持有 —— 各带一个的话，用户在「上游」页选了 30 天、切到「明细」页又看到默认 7 天，两页数字对不上且会被当成网关算错账。老书签 `/history` 重定向到本页并落在「调用明细」子页 |
+| `/models` | 可用模型 | 全体 | **只读**清单：`GET /admin/api/model-names` 按身份收窄后的模型名（普通用户 = 所属组白名单 ∩ 全部路由名）+ 输入/输出/缓存命中三项单价；`restricted=true` 时显式提示「已被分组收窄」。每张模型卡同时画**连通率曲线**（探测数据，2026-10-14 并表）。刻意不给勾选控件 —— 白名单的写入口在 `/keys`（只能收紧）与 `/groups`（管理员按组收紧），且**空清单一律解释为「一个模型都调不了」而非 ModelPicker 的「一个都不选 = 不限制」**（后者只属于配置态）。未配置的单价显示「未配置」并弱化，**不显示 0.00**（会被读成「确认免费」） |
+| `/wallet` | 钱包与充值 | 全体 | **按身份分两种形态的同一页**：管理员看到全站的用户消费汇总 + 全部充值流水 + 充值入口（没有消耗记录，明细在「用量统计」页）；普通用户看到自己的余额、按天消耗与充值记录。自改密码已迁到「设置」页（2026-10-13）。余额（`balance_cents`）在 `balance_unlimited` 时显示「不限」而非 0.00 元，为 0 时显式提示「余额已用尽，请联系管理员充值」，对应数据面真实的 402 |
+| `/users` | 用户与分组 | 全体 | 组件是 `AccessControl.vue`，三个页签：**用户**与**分组**（都是 `UsersGroups.vue`，由宿主按 tab 分发）、**访问密钥**（`Keys.vue`，原 `/keys` 页内容）。用户页含 CRUD、角色、启停、密码重置、**余额充值** —— `delta_cents` 是相对调整，填 100 是「加 100 元」而非「设为 100 元」，误操作不会清零；给不限额用户充值会把它切成有限额，界面上必须写明；admin 账号必须带初始密码。余额列区分「不限」与「0.00 元」。分组页含增删改、成员增删、**组级模型白名单** `PUT /admin/api/groups/{id}/models`。路由刻意**不带 `adminOnly`** —— 普通用户看得到这一项、进来落在密钥页签，后端按会话身份强制收窄每个操作的数据面 |
+| `/providers` | 上游与模型 | admin | 组件是 `Upstream.vue`，三个页签顺序即数据面配置链的顺序（上游 → 路由 → 归组）：**上游与模型**（`Providers.vue`，列表、协议/端点/**per-provider 代理 `proxy_url`**、余额查询配置、连通性测试、模型管理与批量改价）、**路由**（`Routes.vue`，公开名 → 有序上游链，PUT 整体换链）、**模型归组**（`ModelGroups.vue`，跨上游同名模型的统计身份，不影响转发）。原 `/routes`、`/model-groups` 已并入本页 |
+| `/settings` | 设置 | admin | 五个页签：模型默认、运行时、模型价格、修改密码、导入导出（§13.3）。**审计日志页签已移除**（用户要求）—— 后端 `GET /admin/api/audit` 端点与 `api.ts` 的 `api.audit()` 都保留，那是运维取证的正路，删的只是界面那一块 |
 
-「用量看板」不是独立页 —— 按天 / 按 Key / 按模型 / 按 provider 的 token 趋势以
-分组切换的形式内嵌在 `/history`。设置页的导入导出即 §13.3 描述的功能。
+「用量看板」不是独立页 —— 按天 / 按 Key / 按模型 / 按 provider 的汇总以
+子页签的形式内嵌在 `/usage`（调用明细 / 上游 / 模型）。设置页的导入导出即 §13.3 描述的功能。
 
 > **`/model-names` 加价格为什么是「平行数组」而不是把 `models` 改成对象数组**
 >
@@ -1334,38 +1428,62 @@ provider / 模型 / 路由搬进当前版本空库），不能简单复制 db �
 
 ## 15. 目录结构
 
-> **2026-10-06 按实际仓库核实重写。** 原版本列的是 P1 时期的规划结构，与代码已严重脱节：
-> `quota/` 包从未存在（配额逻辑最终落在 `cmd/gateway/main.go` 的请求热路径里）、
+> **2026-10-17 按实际仓库核实重写。** 上一次（2026-10-06）改写时原版本列的是 P1 时期的规划结构，
+> 与代码已严重脱节：`quota/` 包从未存在（配额逻辑最终落在 `cmd/gateway/main.go` 的请求热路径里）、
 > `examples/curl.md` 从未创建、`inwire`/`outwire` 下标注「P3」的三个文件早已实现、
 > 缺了后来新增的 `userauth` 与 `ratelimit`。
+>
+> 本轮补上的是 2026-10-06 之后新增的根级资产（`scripts/`、`docker/`、`.github/`、
+> `build.ps1`、`gateway.ps1`、`CONTRIBUTING.md`）与 `internal/` 下新增的
+> `effort`（思考挡位唯一口径）和 `probe`（上游模型定时探测），并把
+> `migrate-legacy` 的版本描述改成「旧库 → 当前版本」（它搬的不只 v1.4.1 一种形态）。
+> 核对方式：`Get-ChildItem -Directory` + 逐个 `internal/*/` 的包注释。
 
 ```
 rosetta-gateway/
 ├── README.md                       项目门面：简介、快速开始、文档索引
 ├── DESIGN.md                       本文件
-├── MULTIUSER.md                    多用户 / 分组 / 权限模型（§6.3 的展开）
+├── MULTIUSER.md                    多用户 / 分组 / 权限模型（§6.3 的展开；历史归档）
 ├── DOCKER.md                       容器化部署
+├── CONTRIBUTING.md                 开发环境与协作约定（本机 -race 的 CC、sync-embed、TS 上界）
 ├── config.example.json             配置样例（config.json 本身不入库）
+├── Dockerfile                      两段式（golang:alpine 构建 → alpine 运行），CGO_ENABLED=0
+├── build.ps1                       纯编译脚本：前端构建 + go build → bin\gateway.exe
+├── gateway.ps1                     一键脚本：编译 + 启动/停止（前台 / -Detached / -Stop）
+├── docker/
+│   ├── config.default.json         首次启动播种的配置模板（listen 0.0.0.0:8666）
+│   └── docker-entrypoint.sh         播种配置 + chown/su-exec 降权运行
+├── scripts/                        一次性探测脚本（结论已写进注释与文档，用完即删的例外）
+│   ├── probe_tz_child.go           时区子进程探针（internal/store 的 day_bucket_tz_test 调它）
+│   ├── check-repo-hygiene.ps1      push 前本地守卫：索引里不许有 exe/db/密钥/数据，
+│   │                               外加 .gitignore 防线自检（只读，不改任何文件）
+│   └── authz_probe/                鉴权矩阵取证（dbdump 与 probe.ps1）
+├── .github/
+│   └── workflows/
+│       ├── ci.yml                  go / webui-sync / -race / repo-hygiene 四道门禁
+│       └── docker.yml               tag 触发构建推送 GHCR（发布前复跑最小门禁）
 ├── cmd/
 │   ├── gateway/                    装配与启动；**配额预占、限速、故障转移链、usage 记账
 │   │                               都在这里**（请求热路径，非独立包）
-│   └── migrate-legacy/             一次性工具：v1.4.1 旧库 → 当前版本（见 §13.3）
+│   └── migrate-legacy/             一次性工具：旧库 → 当前版本（见 §13.3）
 ├── internal/
-│   ├── config/                     启动配置加载、校验、端口占用检查
-│   ├── store/                      SQLite 连接、迁移、各表 DAO、归档与对账
+│   ├── config/                     启动配置加载、校验、时区应用、端口占用检查
+│   ├── store/                      SQLite 连接、迁移、各表 DAO、归档与对账、探测记录
 │   ├── snapshot/                   运行时快照：路由索引、Provider 池，atomic.Pointer 热替换
 │   ├── routing/                    模型名解析（§5）
-│   ├── upstream/                   凭证池、健康与冷却、Client 生命周期、故障转移
+│   ├── upstream/                   凭证池、健康与冷却、Client 生命周期、故障转移、出站代理
+│   ├── probe/                      上游模型定时探测与健康判定（写 model_probes，不碰熔断）
 │   ├── ratelimit/                  RPM / TPM 固定窗口限速器
 │   ├── auth/                       下游 Key 校验
 │   ├── userauth/                   登录、PBKDF2、会话密钥、JWT 签发
+│   ├── effort/                     思考挡位的唯一口径（Parse / Normalize / Clamp）
 │   ├── inwire/                     下游 → 统一模型（openai_chat / openai_responses / anthropic
 │   │                               + 跨协议字段翻译与硬约束判定）
 │   ├── outwire/                    统一模型 → 下游（响应 + SSE + 错误映射 §9）
 │   ├── admin/                      管理 API handlers（含配置导入导出）
 │   ├── crypto/                     上游 key 加解密（AES-256-GCM）
 │   ├── webui/                      embed 静态资源（dist 由 web/ 构建同步而来）
-│   └── server/                     HTTP 装配、中间件、请求 ID、访问日志
+│   └── server/                     HTTP 装配、中间件、请求 ID、访问日志、管理面授权门
 └── web/                            Vue 3 + Vite + TS 工程（npm run build && npm run sync）
 ```
 

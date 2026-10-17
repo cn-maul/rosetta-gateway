@@ -9,7 +9,8 @@
 > 下文示例中的 `:1.6.2` 是**编写时的当前版本**。实际部署请先 `docker pull ghcr.io/cn-maul/rosetta-gateway:1.6.2`
 > 确认该 tag 存在，或直接用 `:latest`。
 
-架构：`linux/amd64`（CI 只构建这一种；需要 arm64 再说）。
+架构：`linux/amd64`（`docker.yml` 的 buildx 只构建这一种；需要 arm64 再说）。
+非 tag 推送（`main` 分支）会额外打一个 `:edge` 标签。
 
 ---
 

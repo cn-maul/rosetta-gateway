@@ -3,7 +3,18 @@
   "db_path": "./data/gateway.db",
   "log_level": "info",
   "master_key_env": "ROSETTA_GW_MASTER_KEY",
+  "timezone": "Asia/Shanghai",
   "usage_retention_days": 30,
+  "probes": {
+    "enabled": true,
+    "interval_sec": 600,
+    "timeout_ms": 30000,
+    "concurrency": 4,
+    "down_threshold": 3,
+    "window_size": 10,
+    "healthy_rate": 0.8,
+    "retention_days": 30
+  },
   "defaults": {
     "upstream_timeout_ms": 300000,
     "stream_idle_timeout_ms": 120000,
@@ -20,6 +31,7 @@
         "name": "DeepSeek",
         "protocol": "auto",
         "endpoint": "https://api.deepseek.com/v1",
+        "proxy_url": "",
         "credentials": [
           {
             "label": "main",

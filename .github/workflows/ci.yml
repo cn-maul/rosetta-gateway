@@ -1,13 +1,14 @@
 name: ci
 
-# 三道检查，全部在 push/PR 时跑：
+# 四道检查，全部在 push/PR 时跑：
 #
-# 1. go：gofmt / build / vet / 全量测试。历史上 P0 与 P2 阶段各出过一次
+# 1. 仓库卫生：已入库文件里不许出现 exe / db / 密钥 / 数据文件（见 repo-hygiene）。
+# 2. go：gofmt / build / vet / 全量测试。历史上 P0 与 P2 阶段各出过一次
 #    「只跑 -run TestXxx 让 cmd/gateway 整包红了一轮」的事故 —— 契约改动
 #    必须全量跑，这条红绿灯保证它不靠本地自觉。
-# 2. 前端类型检查（vue-tsc）。类型全绿证明不了界面正确（见 AUDIT-2026-10-06），
+# 3. 前端类型检查（vue-tsc）。类型全绿证明不了界面正确（见 DESIGN.md），
 #    但能拦住字段漂移这类最低级的错。
-# 3. 校验「前端产物已同步入库」。
+# 4. 校验「前端产物已同步入库」。
 #
 # Docker 镜像只是 `COPY . .` + `go build`，用 go:embed 打包仓库里的
 # internal/webui/dist —— 它**从不**重新构建前端。于是改完 web/src 却忘了
@@ -24,6 +25,70 @@ permissions:
   contents: read
 
 jobs:
+  # 仓库卫生：已入库文件里不许出现二进制产物 / 数据库 / 密钥 / 运行数据。
+  #
+  # 为什么值得单列一个 job（而不是塞进 go job 里当一步）：
+  #
+  # 这类文件一旦进了历史就**擦不掉** —— 删掉当前文件只是让 blob 变成
+  # dangling，`git clone` 一样能捞出来（filter-repo / BFG 能改写，但要
+  # 强推、要所有协作者重新 clone，代价极高）。本项目历史上真的误推过一次，
+  # 所以这里要在「push 之后」立刻发现，而不是等谁本地 `git status` 看见。
+  #
+  # 为什么用 git ls-files 而不是再检查一遍 .gitignore：
+  #   .gitignore 只对**未跟踪**文件生效；已经 add 过的文件即使后来被
+  #   写进 .gitignore，git 也照样跟踪它。所以唯一的真相来源是
+  #   「索引里到底有什么」，即 git ls-files。ignore 规则管未来，
+  #   这个 job 管过去与现在，两层缺一不可。
+  #
+  # 单独成 job 而不是并进 go job：它只读索引、不装 Go、不跑测试，
+  # 几秒钟出结果，可以并行跑；而且它的失败与代码质量无关，
+  # 混在一个 job 里会让「红」的原因变得含糊。
+  repo-hygiene:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        # v4.4.0。fetch-depth: 0 拉全量历史：本 job 只查索引，
+        # 但浅克隆会让 `git ls-files` 报 shallow 相关的边界行为，
+        # 全量拉取最稳妥（仓库体量很小，成本可忽略）。
+        uses: actions/checkout@11d5960a326750d5838078e36b85af677262
+        with:
+          fetch-depth: 0
+
+      - name: 检查已入库文件不含产物 / 密钥 / 数据
+        run: |
+          set -uo pipefail
+          # 先把匹配打出来再判失败。只给一句「有文件不该入库」是不够的：
+          # 没人知道该去删哪个，而修复动作是 `git rm --cached <file>`，
+          # 漏掉文件名就得靠人去猜。
+          bad="$(git ls-files \
+                  | grep -Ei '\.(exe|dll|so|db|db-shm|db-wal|sqlite|sqlite3|key|pem|crt|log|bak|bak-[0-9].*|oldbak)$' \
+                  || true)"
+          bad="$bad
+          $(git ls-files | grep -Ex 'session_secret(\.oldbak)?' || true)"
+          bad="$bad
+          $(git ls-files | grep -Ex 'master\.key' || true)"
+          bad="$bad
+          $(git ls-files | grep -Ex '(admin_auth|config)\.json' || true)"
+          bad="$bad
+          $(git ls-files | grep -E '^(data|bin|work|tools)/' || true)"
+
+          # 去掉上面若干次 grep 叠出来的空行，只留真正的命中
+          bad="$(printf '%s\n' "$bad" | sed '/^$/d' | sort -u)"
+
+          if [ -n "$bad" ]; then
+            echo "::error::以下文件已被 git 跟踪，但它们属于构建产物 / 数据库 / 密钥 / 运行数据，绝不应入库："
+            printf '%s\n' "$bad" | sed 's/^/    /'
+            echo ""
+            echo "修复（保留本地文件、只从索引移除）："
+            printf '%s\n' "$bad" | sed 's|^|    git rm --cached |'
+            echo ""
+            echo "若这些文件已在历史里，删当前文件不足以消除泄露："
+            echo "    git filter-repo --path <file> --invert-paths"
+            echo "  （会重写历史，需要强推，并让所有协作者重新 clone）"
+            exit 1
+          fi
+          echo "已入库文件干净：无 exe / db / 密钥 / 数据文件。"
+
   go:
     runs-on: ubuntu-latest
     steps:

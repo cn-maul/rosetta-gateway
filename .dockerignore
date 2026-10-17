@@ -1,14 +1,28 @@
 # 构建上下文裁剪：不进镜像的东西一律排除，减小上下文并避免缓存失效。
+#
+# 本文件的口径与 .gitignore / .zcodeignore 保持一致（同一批文件、同一批理由），
+# 但三者的目的不同：.gitignore 管「别进版本库」，这里管「别进镜像层」。
+# 本文件同样必须保持 LF 行尾：CRLF 的「空行」会被 git 解析出一个残留 \r，
+# 进而当成匹配任意目录的幽灵规则（详见 .gitignore 顶部注释里的实测记录）。
 
 # 版本控制与工作区
 .git
 .github
 .workbuddy
 
+# 上游 SDK 的设计 / 审计过程文档：纯过程稿，镜像里用不到
+work/
+
 # 本机构建产物（镜像内自行编译）
 bin/
+*.exe
 gateway.exe
 *.log
+
+# 备份文件（密钥 / 会话密钥 / 整库的副本，危害与原文件相同）
+*.oldbak
+*.bak-*
+*.bak
 
 # 前端依赖。dist 已随仓库入库到 internal/webui/dist 并被 go:embed 打包，
 # 镜像内不需要再装一遍 node_modules。
@@ -18,4 +32,10 @@ web/dist/
 # 本地凭据与数据，绝不进镜像
 admin_auth.json
 master.key
+session_secret
+session_secret.oldbak
+config.json
 data/
+*.db
+*.db-shm
+*.db-wal
