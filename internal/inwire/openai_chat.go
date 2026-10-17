@@ -165,7 +165,7 @@ func DecodeOpenAIChatRequest(r *http.Request, maxBytes int64) (*OpenAIChatReques
 	}
 
 	var req OpenAIChatRequest
-	if err := json.Unmarshal(body, &req); err != nil {
+	if err := decodeTopLevelObject(body, &req); err != nil {
 		return nil, fmt.Errorf("decode body: %w", err)
 	}
 

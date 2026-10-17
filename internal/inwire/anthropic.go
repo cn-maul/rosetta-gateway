@@ -125,7 +125,7 @@ func DecodeAnthropicMessagesRequest(r *http.Request, maxBytes int64) (*Anthropic
 	}
 
 	var req AnthropicMessagesRequest
-	if err := json.Unmarshal(body, &req); err != nil {
+	if err := decodeTopLevelObject(body, &req); err != nil {
 		return nil, fmt.Errorf("decode body: %w", err)
 	}
 
