@@ -719,6 +719,28 @@ Rosetta 用一对字段表达它：`Sealed` 装载荷，`SealedBy` 记下是哪�
 **仍然不做**：会话状态托管。`previous_response_id` / `store` 由上游承接
 （`inwire` 经 `Extra` 透传），网关不存、不续、不校验 item 归属。
 
+### 7.2 工具输出与用户附件的媒体块
+
+Responses 协议的媒体可以出现在两个位置，且都容易被漏掉：
+
+| 位置 | 分块类型 | 说明 |
+|---|---|---|
+| user 消息的 content | `input_image` / `input_file` / `input_audio` | 「让模型看看这个」 |
+| `function_call_output` 的 output | 同上 | agent 读图 / 读 PDF / 听音频的结果 |
+
+两类都转成 `rosetta.Block` 的 image / file / audio。`input_file` 的三种载荷
+形态（`file_url` 远端引用、`file_data` 内联 base64、`file_id` 已上传引用）
+与 `input_audio` 的两种都支持；`data:` 前缀剥成裸 base64（rosetta 的口径）。
+
+**tool_result 内的媒体必须另起一条 user 消息**：`BlockToolResult.Content` 是
+纯文本语义（`rosetta.ToolResult` 只收字符串），把媒体塞进去会让上游解不出结构。
+搬走时在文本里留一行「N 个附件已移至下一条消息」—— 不留的话，模型看到一条
+只有文字（甚至没有文字）的工具结果，会以为工具什么都没返回，而真相是内容
+在紧跟着的下一条消息里。这一行是把两处接上的唯一线索。
+
+这是 R12 的落点。漏掉它的症状是**静默**的：请求照常 200、回答照常生成，
+只是模型从没见过那些附件 —— 比明确失败危险得多。
+
 ---
 
 ## 8. 流式转发
@@ -1412,6 +1434,8 @@ rosetta-gateway/
 | R9 | 上游 usage 缺失时无法区分「真报 0」与「没报」 | 配额失效、账单漏账且不可见 | **已改为两态显式区分**（2026-10-06）：`usageStateFor()` 按 SDK `Usage.IsZero()` 判「上游一个 token 数都没给」→ 记 `missing`，否则 `reported`。关键在于旧实现按「0 token + reported」记账，接不回 usage 的第三方兼容服务等于整 provider 静默漏账、配额形同虚设，且事后无法从库里分辨。`missing` 在界面单列统计，TPM 保留预占量不回滚。注意 `IsZero` 把 cached/reasoning 也计入 —— 只报缓存命中或思考 token 仍算「报了」，否则会丢掉真实数字 |
 | R10 | 同类成熟产品（one-api / new-api / LiteLLM / Portkey / Higress）功能面重合 | 自研投入产出比 | 自研的唯一正当理由是「Rosetta 作内核」与「深度定制」。已确认走自研 |
 | R11 | **Responses 的 reasoning item 跨协议转换会失效** | 下游 Responses + 上游非 Responses 时，多轮回传 reasoning 断链 | **已解决（2026-10-16）**：Rosetta v1.2.0 起，`Block.Sealed/SealedBy/ReasoningID` 与流式 `Event.Sealed/SealedBy/ReasoningID` 成对表达「provider 私有的不透明续接载荷 + 密封它的协议族」，`SealedBy` 门闩保证它只写回同一个族。网关侧 `inwire` 把 reasoning item 搬进 `SealedThinking`、`outwire` 两侧（流式 SSE + 非流式对象）输出 reasoning item。此前流式侧整个不出 thinking 事件、非流式侧跳过 `BlockThinking`，客户端多轮 reasoning 会话在第二轮回放时报 `Item with id 'rs_…' not found`。见 §7.1 |
+| R12 | **Responses 的工具输出媒体块被静默丢弃** | agent 让模型读图 / 读 PDF / 听音频时，内容无声消失 | **已解决（2026-10-17）**：`function_call_output` 与 user content 的 `input_file` / `input_audio` 分块此前只读文本，媒体块被 `encoding/json` 静默忽略 —— 客户端以为它们参与了推理，实际没有。现在拆成 `rosetta.Block` 的 image / file / audio 块；tool_result 内的媒体另起一条 user 消息（tool_result 的 Content 是纯文本语义），并留一行「N 个附件已移至下一条消息」把两处接上。data: 前缀剥成裸 base64（rosetta 的口径）。参考 cc-switch 的 `TOOL_RESULT_MEDIA_MOVED_MARKER` |
+| R13 | **effort 夹取方向与两个独立实现相反** | 客户端选 high 而模型只支持 low/high 时，我们给 low | **已解决（2026-10-17）**：`Clamp` 原为「同距取更弱」，改为「同距取更强」。客户端显式选档表达的是「我要这么强」，夹到更弱等于无声打折。cc-switch 的 zen 模式只取不小于请求的最近合法档、Magpie 的 `NearestEffort` 注释直说「a tie going up」，我们是被反驳的那一方。顺带修掉 `None` 参与竞争：`rankOf(None)` 是 -1，旧代码取绝对值后它变成很大的距离，某些支持集下会被选中，结果是「模型不思考」 |
 
 ---
 

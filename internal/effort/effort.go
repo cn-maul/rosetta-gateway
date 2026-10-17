@@ -172,9 +172,28 @@ func FormatLevels(known []Level, unknown []string) string {
 
 // Clamp 把 wanted 夹到 supported 之内；supported 为空时原样返回 wanted。
 //
-// 取的是**绝对距离最近**的一档，同距时取较弱的那一档：客户端说 high 而模型
-// 只支持 minimal/low 时，给 low 比给 minimal 更贴近本意（high 到 low 的落差
-// 小于 high 到 minimal），而「宁可少想一点」也比「超出一个未列出的档位」安全。
+// 取**绝对距离最近**的一档，同距时取**更强**的那一档。
+//
+// # 为什么同距向上（2026-10-17 改）
+//
+// 原实现同距取更弱，理由是「宁可少想一点安全」。但客户端显式选一个档位，
+// 表达的意图是「我要这么强的思考」；夹到更弱等于把那个意图打折，而且是无声的
+// —— 用户看到的是「我选了 high，怎么答得这么浅」，没有任何线索指向网关。
+//
+// 两个独立实现在这一点上一致：cc-switch 的 zen 模式只取「不小于请求的最近
+// 合法档」，Magpie 的 NearestEffort 注释写得最直白 ——
+// 「a tie going up — xhigh on a model of high and max is max」。
+// 我们是被反驳的那一方，故改。
+//
+// 典型场景：模型支持 [low, high]，客户端要 medium。原实现给 low，
+// 现在给 high —— 后者才是「要 medium 而 medium 没有」时更贴近的选择。
+//
+// # None 永远不作为候选
+//
+// rankOf(None) 是 -1（KnownLevels 刻意不含它，见那里的注释），而旧代码用
+// rankOf(s) - w 再取绝对值，-1 会变成一个**很大的距离**参与竞争 ——
+// 某些支持集下 None 会被选中，结果是「模型不思考」。
+// None 表达的是「不思考」而不是「某档强度」，与 supported 不同轴。
 //
 // supported 为空返回 wanted 是刻意的 —— 「未配置」与「一个都不支持」语义不同：
 // 前者意为「本网关不管这件事」，此时把客户端的值原样交回给 rosetta 的三档
@@ -187,15 +206,24 @@ func Clamp(wanted Level, supported []Level) Level {
 	if w < 0 {
 		return wanted // 不认识的挡位：不猜，让上游自己决定
 	}
-	best, bestDist := supported[0], -1
+	best, bestDist, found := Level(""), -1, false
 	for _, s := range supported {
-		d := rankOf(s) - w
+		r := rankOf(s)
+		if r < 0 {
+			continue // None 与一切未知写法：不当候选
+		}
+		d := r - w
 		if d < 0 {
 			d = -d
 		}
-		if bestDist < 0 || d < bestDist || (d == bestDist && rankOf(s) < rankOf(best)) {
-			best, bestDist = s, d
+		if !found || d < bestDist || (d == bestDist && r > rankOf(best)) {
+			best, bestDist, found = s, d, true
 		}
+	}
+	// 支持集里一个合法档都没有（全是 None 或未知值）→ 原样返回，
+	// 与 supported 为空同口径：这不是「一个都不支持」，是「没告诉我们有用的信息」。
+	if !found {
+		return wanted
 	}
 	return best
 }

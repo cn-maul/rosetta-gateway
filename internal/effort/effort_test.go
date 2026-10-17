@@ -110,11 +110,34 @@ func TestClamp_就近夹取(t *testing.T) {
 	}
 }
 
-func TestClamp_同距取较弱(t *testing.T) {
-	// low(1) 与 high(3) 之间，medium(2) 到两边距离相同 → 取较弱的一侧。
-	// 「宁可少想一点」比「超出一个未列出的档位」安全。
-	if got := Clamp(Medium, []Level{Low, High}); got != Low {
-		t.Fatalf("同距时应取较弱档，实际 %q", got)
+func TestClamp_同距取更强(t *testing.T) {
+	// low(1) 与 high(3) 之间，medium(2) 到两边距离相同 → 取**更强**的一侧。
+	//
+	// 2026-10-17 改向：原为取较弱，理由是「宁可少想一点安全」。但客户端显式
+	// 选档表达的是「我要这么强」，夹到更弱等于无声打折。cc-switch 的 zen 模式
+	// 与 Magpie 的 NearestEffort 都是向上，见 Clamp 的注释。
+	if got := Clamp(Medium, []Level{Low, High}); got != High {
+		t.Fatalf("同距时应取更强档，实际 %q", got)
+	}
+}
+
+// TestClamp_None 不当候选。
+//
+// rankOf(None) 是 -1（KnownLevels 刻意不含它），旧代码用 rankOf(s) - w 再取
+// 绝对值，-1 会变成很大的距离参与竞争 —— 某些支持集下 None 会被选中，
+// 结果是「模型不思考」。这是 2026-10-17 改 Clamp 时一并修的。
+func TestClamp_NoneNotACandidate(t *testing.T) {
+	// 支持集里只有 None：没有合法档可夹，原样返回 wanted。
+	if got := Clamp(Medium, []Level{None}); got != Medium {
+		t.Fatalf("Clamp(medium, [none]) = %q，期望 medium（无合法候选时原样返回）", got)
+	}
+	// None 与 high 并存：必须选 high，不能被 None 的距离优势抢走。
+	if got := Clamp(Medium, []Level{None, High}); got != High {
+		t.Fatalf("Clamp(medium, [none, high]) = %q，期望 high", got)
+	}
+	// None 与 unknown 混合：同样原样返回。
+	if got := Clamp(Medium, []Level{None, Level("turbo")}); got != Medium {
+		t.Fatalf("Clamp(medium, [none, turbo]) = %q，期望 medium", got)
 	}
 }
 
