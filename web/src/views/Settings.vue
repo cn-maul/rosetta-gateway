@@ -1,10 +1,11 @@
 <script setup lang="ts">
+import DataTable from '../components/DataTable.vue'
 import { computed, onMounted, reactive, ref, watch } from 'vue'
-import { useRouter } from 'vue-router'
-import { api, ApiFail, session, saveToken } from '../api'
+import { useRoute, useRouter } from 'vue-router'
+import { api, ApiFail } from '../api'
 import { toast, confirmBox } from '../ui'
-import { fmtMoney, fmtNum } from '../fmt'
-import { checkPasswordStrength } from '../password'
+import { fmtNum } from '../fmt'
+import { unitPrice, cacheUnitPrice } from '../modelPrice'
 import AppModal from '../components/AppModal.vue'
 import Tabs from '../components/Tabs.vue'
 import type {
@@ -20,7 +21,7 @@ import type {
 // 「审计日志」页签已移除（用户要求）。后端 GET /admin/api/audit 端点与
 // api.ts 的 api.audit() 一并保留 —— 它们是运维取证的正路，删掉的是
 // 界面上的那一块，不是能力本身（见 task 报告里「api.audit 去留」一节）。
-type TabKey = 'model' | 'runtime' | 'price' | 'password' | 'transfer'
+type TabKey = 'model' | 'runtime' | 'price' | 'transfer'
 
 const TABS: { key: TabKey; label: string; sub: string }[] = [
   { key: 'model', label: '模型默认', sub: '全局默认值；模型容量探测不到时回落到这里' },
@@ -31,78 +32,20 @@ const TABS: { key: TabKey; label: string; sub: string }[] = [
   // 改价只影响**此后**的用量：历史费用在落库时已按当时的价固化，
   // 所以这里改的是「往后怎么算」，不是「重算历史」。
   { key: 'price', label: '模型价格', sub: '按供应商 × 模型配置单价；改价只对之后的用量生效，不改写历史费用' },
-  // 修改密码（2026-10-13 从「钱包与充值」页挪来）。
-  //
-  // 改密与钱无关，放在钱包页只是因为那里是普通用户唯一的自助页面 ——
-  // 于是用户要改密码得先"想起来"它在钱包里。设置页才是它该在的地方。
-  //
-  // 位置在导入导出**之前**：导入导出是低频的运维动作，改密比它常用。
-  { key: 'password', label: '修改密码', sub: '修改当前登录账号的密码；成功后需要重新登录' },
   {
     key: 'transfer',
     label: '导入导出',
     sub: '导出供应商与模型配置，或从文件导入。只影响供应商与模型，不含路由与密钥',
   },
 ]
-const tab = ref<TabKey>('model')
+const route = useRoute()
+const router = useRouter()
+const tab = computed<TabKey>({
+  get: () => TABS.find(t => t.key === route.query.tab)?.key ?? 'model',
+  set: key => { void router.push({ query: { ...route.query, tab: key } }) },
+})
 
 const tabSub = computed(() => TABS.find((t) => t.key === tab.value)?.sub ?? '')
-
-// ---------- 修改密码 ----------
-//
-// 2026-10-13 从「钱包与充值」页挪来。改密与钱无关，放在钱包页只是因为
-// 那里是普通用户唯一的自助页面 —— 于是用户要改密码得先"想起来"它在钱包里。
-//
-// 与 UsersGroups 里管理员「重置他人密码」是**两件事**：这里改的是
-// 当前登录者自己的密码，且需要旧密码；那边是管理员强制设置，不需要旧的。
-// 两者共用的只有强度校验（password.ts 的同一份实现）。
-const router = useRouter()
-const oldPwd = ref('')
-const newPwd = ref('')
-const confirmPwd = ref('')
-const pwdBusy = ref(false)
-const pwdErr = ref('')
-const newPwdErr = ref('')
-
-// 强度门槛与后端 userauth.ValidatePassword 同一套（见 password.ts）。
-// 刻意与后端保持一致但**不替代**它：前端只是提前告知，真正的强度判断
-// 必须在服务端做（绕过前端直接打接口是常态）。
-function checkStrength(p: string) {
-  return checkPasswordStrength(p)
-}
-
-async function submitPwd() {
-  if (pwdBusy.value) return
-  pwdErr.value = ''
-  newPwdErr.value = checkStrength(newPwd.value)
-  if (newPwdErr.value) return
-  if (newPwd.value !== confirmPwd.value) {
-    pwdErr.value = '两次输入的新密码不一致'
-    return
-  }
-  pwdBusy.value = true
-  try {
-    await api.changeMyPassword(oldPwd.value, newPwd.value)
-    // 后端在此递增了 auth_version，**当前这个会话已经失效**（ChangePassword
-    // 还顺手清了会话 cookie）。延迟跳转的那段时间里界面还在、任何点击都会打到
-    // 一个必然 401 的接口上；所以立刻清掉本地会话并跳登录页 ——
-    // 改密成功与「需要重新登录」是同一件事，不该拆成两步。
-    //
-    // 不调 logout()：那个端点也会（按用户）递增 auth_version 并清 cookie，
-    // 而我们已经处在「会话已失效」的状态下，再发一请求只会拿到 401，
-    // 还会在 api.ts 的 401 分支里再清一次令牌。本地 saveToken('') 就够了。
-    saveToken('')
-    session.me = null
-    toast('密码已更新，请用新密码重新登录', 'ok')
-    oldPwd.value = newPwd.value = confirmPwd.value = ''
-    // redirect 指回设置页：重新登录后回到这里，而不是被丢到总览再自己找回来。
-    await router.replace({ name: 'login', query: { redirect: '/settings' } })
-  } catch (e) {
-    pwdErr.value = e instanceof ApiFail ? e.message : '改密失败'
-  } finally {
-    pwdBusy.value = false
-  }
-}
 
 // ---------- 导入 / 导出 ----------
 //
@@ -311,7 +254,9 @@ function fmtDur(ms: number): string {
 // 某个具体故障调过的。界面上看不出偏离，运维很容易在别的故障里顺手改回去。
 function recNote(k: RuntimeKey): string {
   const rec = RUNTIME_DEFAULTS[k]
-  const s = `推荐 ${fmtNum(rec)}（${fmtDur(rec)}）`
+  const unit = k === 'failover_max_targets' ? ' 个目标'
+    : k === 'failover_failure_threshold' ? ' 次连续失败' : `（${fmtDur(rec)}）`
+  const s = `推荐 ${fmtNum(rec)}${unit}`
   return Number(form[k]) === rec ? s : `${s} · 当前已自定义`
 }
 
@@ -532,7 +477,7 @@ function isPriced(m: UpstreamModel): boolean {
 // 单价单元格：条目里的某一档没填（如缓存命中留空=按输入价计）时写「未配置」，
 // 不写 0.00 —— 那会被读成「确认这一档免费」。
 function priceCell(v: number): string {
-  return v > 0 ? fmtMoney(v) : '未配置'
+  return unitPrice(v)
 }
 
 // 模型总数（跨全部供应商，不随筛选变化）：空态要区分
@@ -898,7 +843,7 @@ onMounted(() => {
   <main class="page">
     <div class="page-head">
       <div>
-        <h1>设置</h1>
+        <h1>系统设置</h1>
         <div class="sub">{{ tabSub }}</div>
       </div>
       <div class="head-actions">
@@ -923,22 +868,38 @@ onMounted(() => {
         <div style="margin-top: 10px">表单中的数值是默认值而非当前配置，已阻止保存以免覆盖。</div>
         <button class="btn btn-primary" type="button" style="margin-top: 10px" @click="load">重新加载</button>
       </div>
-      <form v-else class="form-grid" style="max-width: 560px" @submit.prevent="save('model')">
-        <div class="field span2">
-          <label>默认上下文窗口（tokens）</label>
-          <input v-model.number="form.default_context_window" class="input num" type="number" min="1" step="1" />
-          <span class="tip">添加模型时若上游未暴露 context_length，则用此值</span>
-        </div>
-        <div class="field span2">
-          <label>默认最大输出（tokens）</label>
-          <input v-model.number="form.default_max_output_tokens" class="input num" type="number" min="1" step="1" />
-          <span class="tip">添加模型时若上游未暴露 max_completion_tokens，则用此值</span>
-        </div>
-        <div class="field span2 form-actions" style="padding: 0">
-          <button type="submit" class="btn btn-primary" :disabled="saving">
-            {{ saving ? '保存中…' : '保存设置' }}
-          </button>
-        </div>
+      <!-- 与「运行时」页签同一套卡片语言（2026-10-17）：原先这里是 .panel 里
+           一张裸表单，没有卡片也没有块标题，于是同一个「设置」页的四个
+           页签里有两个用卡片、两个用裸面板，切换时层级感会跳。
+           只有两个字段，所以给它一张卡而不是一排。 -->
+      <form v-else class="model-form" @submit.prevent="save('model')">
+        <section class="card">
+          <div class="card__header">
+            <div class="card__title">模型默认值</div>
+            <div class="card__description">
+              上游没报这两个数时用它兜底。改这里不会影响已导入模型的既有值。
+            </div>
+          </div>
+          <div class="card__content">
+            <div class="form-grid">
+              <div class="field span2">
+                <label>默认上下文窗口（tokens）</label>
+                <input v-model.number="form.default_context_window" class="input num" type="number" min="1" step="1" />
+                <span class="tip">添加模型时若上游未暴露 context_length，则用此值</span>
+              </div>
+              <div class="field span2">
+                <label>默认最大输出（tokens）</label>
+                <input v-model.number="form.default_max_output_tokens" class="input num" type="number" min="1" step="1" />
+                <span class="tip">添加模型时若上游未暴露 max_completion_tokens，则用此值</span>
+              </div>
+            </div>
+          </div>
+          <div class="card__footer">
+            <button type="submit" class="btn btn-primary" :disabled="saving">
+              {{ saving ? '保存中…' : '保存设置' }}
+            </button>
+          </div>
+        </section>
       </form>
     </div>
 
@@ -955,10 +916,15 @@ onMounted(() => {
            原来 5 个旋钮挤在一张表里，只靠两个小标题分隔；更要紧的是它们
            **失效后果不同**：改错超时是「请求变慢/被切走」，改错故障转移是
            「一直重试坏目标」。块与块之间的分隔必须能一眼看出这是两类东西，
-           所以用带边框的卡片而不是行内标题。 -->
+           所以用**卡片**（.card，投影 + 32px 圆角、无描边）而不是行内标题。
+
+           2026-10-17：这几张卡原先是本页自造的 .rt-card —— 1px 描边 +
+           16px 圆角 + 纯色底，与站里其它 .card（无描边 + 32px 圆角 +
+           轻投影）不是同一套语言，两种卡片在同一页里并排时圆角和边界
+           对不上。现在直接用全局 .card，本页只保留布局。 -->
       <form v-else class="rt-form" @submit.prevent="save('runtime')">
         <!-- 分类 1：非流式 -->
-        <section class="rt-card">
+        <section class="card rt-card">
           <div class="rt-card-h">
             <div class="rt-card-t">
               <h3>非流式请求超时</h3>
@@ -992,7 +958,7 @@ onMounted(() => {
         </section>
 
         <!-- 分类 2：流式 -->
-        <section class="rt-card">
+        <section class="card rt-card">
           <div class="rt-card-h">
             <div class="rt-card-t">
               <h3>流式看门狗</h3>
@@ -1042,7 +1008,7 @@ onMounted(() => {
         </section>
 
         <!-- 分类 3：故障转移 -->
-        <section class="rt-card">
+        <section class="card rt-card">
           <div class="rt-card-h">
             <div class="rt-card-t">
               <h3>自动故障转移</h3>
@@ -1092,7 +1058,7 @@ onMounted(() => {
         </section>
 
         <!-- 分类 4：派生值（只读） -->
-        <section class="rt-card ro">
+        <section class="card rt-card ro">
           <div class="rt-card-h">
             <div class="rt-card-t">
               <h3>
@@ -1150,8 +1116,11 @@ onMounted(() => {
     <div v-else-if="tab === 'transfer'" class="panel">
       <div class="xfer-grid">
         <!-- 导出 -->
-        <section class="xfer-card">
-          <h3>导出</h3>
+        <section class="card xfer-card">
+          <div class="card__header">
+            <div class="card__title">导出</div>
+          </div>
+          <div class="card__content">
           <p class="xfer-note">
             导出当前全部供应商、模型、它们的参数（超时、重试、协议、端点、价格）
             以及<b>上游 API Key</b>。文件用口令整体加密，产物是
@@ -1183,11 +1152,15 @@ onMounted(() => {
           >
             {{ transferBusy ? '处理中…' : '导出为加密文件' }}
           </button>
+          </div>
         </section>
 
         <!-- 导入 -->
-        <section class="xfer-card">
-          <h3>导入</h3>
+        <section class="card xfer-card">
+          <div class="card__header">
+            <div class="card__title">导入</div>
+          </div>
+          <div class="card__content">
           <p class="xfer-note">
             选择一份此前导出的文件。先「预演」看清会发生什么，确认后才真正写入。
           </p>
@@ -1278,37 +1251,9 @@ onMounted(() => {
             </button>
             <button v-else class="btn" type="button" @click="resetImport">再导一个</button>
           </div>
+          </div>
         </section>
       </div>
-    </div>
-
-    <!-- 修改密码（2026-10-13 从「钱包与充值」页挪来）。
-         必须在模型价格那个「兜底 v-else」之前，否则永远轮不到它。 -->
-    <div v-else-if="tab === 'password'" class="panel">
-      <div class="panel-title">
-        修改密码
-        <span class="hint">修改后当前登录状态会立即失效，需要用新密码重新登录</span>
-      </div>
-      <form class="form" style="max-width: 420px" @submit.prevent="submitPwd">
-        <label class="flabel" for="op">当前密码</label>
-        <input id="op" v-model="oldPwd" type="password" class="input" autocomplete="current-password" />
-
-        <label class="flabel" for="np">新密码</label>
-        <input id="np" v-model="newPwd" type="password" class="input" autocomplete="new-password" />
-        <!-- 强度提示在提交前就给出：等后端 400 再说一次，用户已经白填了一遍。
-             但前端提示只作提前告知，真正的判定仍在服务端（见 checkStrength）。 -->
-        <div v-if="checkStrength(newPwd)" class="fhint warn">{{ checkStrength(newPwd) }}</div>
-        <div v-else-if="newPwd" class="fhint ok">强度符合要求</div>
-
-        <label class="flabel" for="cp">确认新密码</label>
-        <input id="cp" v-model="confirmPwd" type="password" class="input" autocomplete="new-password" />
-
-        <div v-if="pwdErr" class="fhint err">{{ pwdErr }}</div>
-
-        <button class="btn btn-primary" type="submit" :disabled="pwdBusy">
-          {{ pwdBusy ? '提交中…' : '修改密码' }}
-        </button>
-      </form>
     </div>
 
     <!-- 分类 4：模型价格（兜底分支 v-else，页签顺序见 TABS） -->
@@ -1354,7 +1299,7 @@ onMounted(() => {
         </template>
       </div>
       <template v-else>
-        <div class="tbl-wrap">
+        <DataTable label="模型价格">
           <table class="tbl">
             <thead>
               <tr>
@@ -1384,8 +1329,8 @@ onMounted(() => {
                 <td class="num-h" :class="{ unset: r.model.price_input <= 0 }">
                   {{ priceCell(r.model.price_input) }}
                 </td>
-                <td class="num-h" :class="{ unset: r.model.price_cache_hit <= 0 }">
-                  {{ priceCell(r.model.price_cache_hit) }}
+                <td class="num-h" :class="{ unset: r.model.price_cache_hit <= 0 && r.model.price_input <= 0 }">
+                  {{ cacheUnitPrice(r.model.price_input, r.model.price_cache_hit) }}
                 </td>
                 <td class="num-h" :class="{ unset: r.model.price_output <= 0 }">
                   {{ priceCell(r.model.price_output) }}
@@ -1416,7 +1361,7 @@ onMounted(() => {
               </tr>
             </tbody>
           </table>
-        </div>
+        </DataTable>
 
         <div class="pager">
           <button class="btn btn-sm" :disabled="pricePage <= 1" @click="pricePage = 1">首页</button>
@@ -1623,6 +1568,12 @@ onMounted(() => {
 </template>
 
 <style scoped>
+/* 模型默认值：宽度与运行时那列（680px）对齐，让四个页签的表单左边线
+   在同一条竖线上 —— 换页签时内容不会左右跳。 */
+.model-form {
+  max-width: 680px;
+}
+
 /* 运行时分类块（2026-10-13）
    分隔用「卡片」而不是行内小标题：这几类的失效后果不同（改错超时 =
    请求变慢/被切走，改错故障转移 = 一直重试坏目标），视觉上必须能一眼
@@ -1635,10 +1586,12 @@ onMounted(() => {
 }
 .rt-card {
   padding: 16px 18px;
-  border: 1px solid var(--border);
-  border-radius: var(--r-card);
-  background: var(--surface);
 }
+/* 头部：标题 + 说明 + 一个右侧动作。HeroUI 的 .card__header 是纯竖排，
+   这里因为要放「恢复推荐默认」按钮而改成横排，所以不能直接套用那个
+   类 —— 但字号/字重/说明色对齐 .card__title / .card__description
+   （14px/500、说明用 muted），否则这几张卡与总览页的 .card 标题会有
+   肉眼可见的粗细差。 */
 .rt-card-h {
   display: flex;
   align-items: flex-start;
@@ -1652,16 +1605,17 @@ onMounted(() => {
   gap: 8px;
   margin: 0;
   font-size: 14px;
-  font-weight: 600;
+  font-weight: 500;
+  color: var(--foreground);
 }
 .rt-card-h p {
   /* 说明文字限宽：铺满整行会把右侧的「恢复推荐默认」推到很远，
      眼睛要在一条长行里来回找按钮。 */
   max-width: 46ch;
   margin: 5px 0 0;
-  font-size: 12px;
-  line-height: 1.55;
-  color: var(--text-3);
+  font-size: 14px;
+  line-height: 1.45;
+  color: var(--muted);
 }
 .rt-card-h .btn {
   flex: none;
@@ -1675,9 +1629,11 @@ onMounted(() => {
   color: var(--text-4);
   font-variant-numeric: tabular-nums;
 }
-/* 只读派生块：没有输入框，用弱一档的底色与可配卡片区分。 */
+/* 只读派生块：没有输入框，用弱一档的底色与可配卡片区分。
+   用 .card--tertiary（HeroUI 的第三级表面）而不是自写底色：这样它的
+   色值跟着主题走，且与站里其它 tertiary 卡（徽章底色同理）是同一档。 */
 .rt-card.ro {
-  background: var(--field-background);
+  background: var(--surface-tertiary);
 }
 .derived {
   display: flex;

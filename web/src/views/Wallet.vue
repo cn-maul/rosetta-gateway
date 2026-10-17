@@ -1,4 +1,5 @@
 <script setup lang="ts">
+import DataTable from '../components/DataTable.vue'
 /**
  * 钱包与充值：**按身份分两种形态**的同一页。
  *
@@ -501,7 +502,7 @@ onMounted(load)
   <main class="page">
     <div class="page-head">
       <div>
-        <h1>钱包与充值</h1>
+        <h1>{{ admin ? '账户与充值' : '余额与账单' }}</h1>
         <!-- 副标题按身份换：管理员这一页讲的是「别人的钱」，普通用户讲的是
              「我的钱」。同一句话复用到两种身份上会有一半是错的。 -->
         <div class="sub">{{ admin ? '用户消费与充值流水' : '余额、消费与流水' }}</div>
@@ -673,7 +674,7 @@ onMounted(load)
             </div>
           </div>
           <template v-else>
-            <div class="tbl-wrap">
+            <DataTable label="账户账单">
               <table class="tbl">
                 <thead>
                   <tr>
@@ -704,7 +705,7 @@ onMounted(load)
                   </tr>
                 </tbody>
               </table>
-            </div>
+            </DataTable>
 
             <!-- 截断提示：**必须可见**。一张被 limit 截断的表与一张完整的表
                  在界面上完全同形，而这张表是按金额读账的 —— 把「前 N 名」
@@ -771,7 +772,7 @@ onMounted(load)
           近 {{ USAGE_DAYS }} 天没有消耗记录
         </div>
         <template v-else>
-          <div class="tbl-wrap">
+          <DataTable label="账户账单">
             <table class="tbl">
               <thead>
                 <tr>
@@ -798,7 +799,7 @@ onMounted(load)
                 </tr>
               </tbody>
             </table>
-          </div>
+          </DataTable>
 
           <!-- 逐条明细在「调用历史」页：那里有时间范围、状态/模型/密钥过滤与
                CSV 导出。这一页刻意不复制那套控件 —— 两份筛选器各自演化，
@@ -864,7 +865,7 @@ onMounted(load)
           </div>
         </div>
         <template v-else>
-          <div class="tbl-wrap">
+          <DataTable label="账户账单">
             <table class="tbl">
               <thead>
                 <tr>
@@ -895,7 +896,7 @@ onMounted(load)
                 </tr>
               </tbody>
             </table>
-          </div>
+          </DataTable>
           <!-- 截断提示对两种身份都要显示（2026-10-11 前端审计 H3）：
                原先带 admin && 条件，于是普通用户流水超过一页时**既没有
                完整计数也没有截断提示**，只能看着 50 行以为那就是全部。

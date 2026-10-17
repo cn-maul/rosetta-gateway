@@ -1,4 +1,5 @@
 <script setup lang="ts">
+import DataTable from './DataTable.vue'
 /**
  * 用量统计的「按维度汇总」面板 —— 上游页与模型页共用。
  *
@@ -9,6 +10,7 @@
  */
 import { onMounted, ref, watch } from 'vue'
 import { fmtNum, fmtTokens, fmtMoney, fmtSec, fmtSpeed } from '../fmt'
+import { rangeBounds } from '../range'
 import type { UsageGroupEntry } from '../types'
 
 const props = defineProps<{
@@ -18,7 +20,7 @@ const props = defineProps<{
    * 维度。决定副标题的措辞 —— 见 subLabel 的注释。
    * 不从 firstCol 反推：两个表头都可能被人改文案，用文案当语义会静默失效。
    */
-  kind: 'provider' | 'model'
+  kind: 'provider' | 'model' | 'key'
   /** 取数端点。两者都返回 UsageGroupEntry[]。 */
   fetch: (from: number, to: number) => Promise<UsageGroupEntry[]>
   /** 时间范围（天），由父页面统一持有。 */
@@ -29,21 +31,25 @@ const rows = ref<UsageGroupEntry[]>([])
 const err = ref('')
 const loading = ref(true)
 
+let reqSeq = 0
 async function load() {
+  const seq = ++reqSeq
   loading.value = true
   err.value = ''
   try {
     // to 现算而不是缓存：页面开着跨过零点时，缓存的 to 会让最新
     // 那批数据永远落在窗口外。
-    const now = Date.now()
-    rows.value = await props.fetch(now - props.days * 86400000, now)
+    const { from, to } = rangeBounds(props.days)
+    const result = await props.fetch(from, to)
+    if (seq === reqSeq) rows.value = result
   } catch (e) {
+    if (seq !== reqSeq) return
     // 失败必须留可见错误态：空表与「这段时间真的没有调用」在界面上
     // 长得一模一样，用户会把一次网关故障读成「没人用过这个上游」。
     err.value = '加载用量统计失败：' + (e instanceof Error ? e.message : String(e))
     rows.value = []
   } finally {
-    loading.value = false
+    if (seq === reqSeq) loading.value = false
   }
 }
 
@@ -107,7 +113,7 @@ function tpsText(r: UsageGroupEntry): string {
 function firstCell(r: UsageGroupEntry): string {
   // 占位文案按维度给：模型页的 key 是上游裸模型名（不会是空串），
   // 写「未知上游」在那里是错的；只有 provider_id 可能为空。
-  return r.name || r.key || (props.kind === 'model' ? '（未命名）' : '（未知上游）')
+  return r.name || r.key || (props.kind === 'provider' ? '（未知上游）' : '（未命名）')
 }
 
 /**
@@ -136,16 +142,16 @@ function hasSub(r: UsageGroupEntry): boolean {
   return subLabel(r) !== ''
 }
 
-/** 花费为 0 时提示「未配价」，避免被读成「免费」。 */
+/** 汇总为零无法反推出未配价或免费。 */
 function costTitle(r: UsageGroupEntry): string {
-  return r.cost === 0 ? '该维度没有配过单价 —— 未配价 ≠ 免费，实际花费以调用历史里的逐条记录为准' : ''
+  return r.cost === 0 ? '记录费用为 0，可能未配置价格；仅凭汇总无法判断，需结合请求日志核对' : ''
 }
 </script>
 
 <template>
   <div class="panel">
     <div class="panel-actions">
-      <span class="dim">共 {{ rows.length }} 项 · 按用量降序</span>
+      <span class="dim">{{ rows.length >= 200 ? '前 200 项' : '共 ' + rows.length + ' 项' }} · 按用量降序</span>
       <button class="btn btn-sm" :disabled="loading" @click="load">
         {{ loading ? '加载中…' : '刷新' }}
       </button>
@@ -158,7 +164,7 @@ function costTitle(r: UsageGroupEntry): string {
     <div v-else-if="loading" class="empty sub-empty">加载中…</div>
     <div v-else-if="rows.length === 0" class="empty sub-empty">该时段没有调用记录</div>
 
-    <div v-else class="tbl-wrap">
+    <DataTable v-else label="用量分组统计">
       <table class="tbl">
         <thead>
           <tr>
@@ -191,7 +197,7 @@ function costTitle(r: UsageGroupEntry): string {
           </tr>
         </tbody>
       </table>
-    </div>
+    </DataTable>
   </div>
 </template>
 

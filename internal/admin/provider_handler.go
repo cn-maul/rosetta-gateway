@@ -91,6 +91,12 @@ type providerResponse struct {
 	// 无意义 —— 前端只在 enabled 时展示这个状态，避免「停用」被读成「故障」。
 	Ready       bool   `json:"ready"`
 	ReadyReason string `json:"ready_reason,omitempty"`
+	// ModelCount / CredCount 是**已导入/已配置的条目数**，不是上游「理论上
+	// 支持多少个」。前者来自本库 upstream_models / provider_credentials 的
+	// 实际行数（store 侧用相关子查询一次查出来，见 providerColumns），
+	// 后者要真问上游才行，而那是一次带凭据的网络请求、不该挂在列表上。
+	ModelCount int `json:"model_count"`
+	CredCount  int `json:"cred_count"`
 }
 
 // validProtocols 是管理 API 接受的 protocol 取值，与 upstream.buildClient
@@ -530,6 +536,8 @@ func toProviderResponse(p store.Provider) providerResponse {
 		BalanceSpecJSON: p.BalanceSpecJSON,
 		CreatedAt:       p.CreatedAt,
 		UpdatedAt:       p.UpdatedAt,
+		ModelCount:      p.ModelCount,
+		CredCount:       p.CredCount,
 	}
 }
 

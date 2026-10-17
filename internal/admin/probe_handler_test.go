@@ -2,6 +2,7 @@ package admin
 
 import (
 	"context"
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -242,5 +243,42 @@ func TestProbeTimeline_AdminUnrestricted(t *testing.T) {
 	}
 	if len(buckets) == 0 {
 		t.Error("管理员应能查到 opus 的桶")
+	}
+}
+
+func TestProbeTimeline_FrontendJSONContract(t *testing.T) {
+	st := newScopeStore(t)
+	initProbeScopedSnapshot(t, nil)
+	seedProbe(t, st, "up/flash", true)
+	h := NewProbeHandler(st)
+	rec := httptest.NewRecorder()
+	h.Timeline(rec, asAdmin(httptest.NewRequest(http.MethodGet, "/admin/api/probes/timeline?model_id=up%2Fflash", nil)))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("timeline: status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	// Decode raw field names: decoding back into the store type masks casing bugs.
+	var rows []map[string]json.RawMessage
+	decodeBody(t, rec, &rows)
+	if len(rows) != 1 {
+		t.Fatalf("want one bucket, got %s", rec.Body.String())
+	}
+	for _, key := range []string{"model_id", "ts", "count", "ok", "latency"} {
+		if _, exists := rows[0][key]; !exists {
+			t.Fatalf("missing frontend field %q: %s", key, rec.Body.String())
+		}
+	}
+	var id string
+	if err := json.Unmarshal(rows[0]["model_id"], &id); err != nil || id != "up/flash" {
+		t.Fatalf("wrong model_id: %s", rows[0]["model_id"])
+	}
+	var ts int64
+	if err := json.Unmarshal(rows[0]["ts"], &ts); err != nil || ts <= 0 || ts%3600000 != 0 {
+		t.Fatalf("want hour-aligned millisecond timestamp, got %s", rows[0]["ts"])
+	}
+	for key, want := range map[string]int64{"count": 1, "ok": 1, "latency": 12} {
+		var got int64
+		if err := json.Unmarshal(rows[0][key], &got); err != nil || got != want {
+			t.Fatalf("%s=%s, want %d", key, rows[0][key], want)
+		}
 	}
 }

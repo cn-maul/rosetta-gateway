@@ -7,108 +7,37 @@ const router = createRouter({
   routes: [
     { path: '/login', name: 'login', component: () => import('./views/Login.vue'), meta: { title: '登录', public: true } },
     { path: '/', name: 'overview', component: () => import('./views/Overview.vue'), meta: { title: '总览' } },
-    // 「访问密钥」不再是一个独立侧栏项（2026-10-14 页面合并），它是
-    // 「用户与分组」页里的第三个页签 —— 那三样东西是一条权限链上的三环，
-    // 排查「这把 key 为什么调不通这个模型」必须同时看用户 / 分组 / 密钥。
-    //
-    // 老书签 /keys **重定向**到 /users，而不是就地渲染新页面：
-    // 普通用户进 /users 时默认页签就是「访问密钥」（他们看不到前两个），
-    // 管理员进 /users 落在「用户」页签 —— 与合并前的落点一致，不需要额外
-    // 记住「该带哪个 query」。刻意**不做** ?tab= 同步：那会让页签状态
-    // 同时存在于 URL 与组件两处，改一处忘另一处就会漂移（页签本身已经
-    // 有 :key 重建机制，不需要 URL 参与）。
-    { path: '/keys', redirect: { name: 'users' } },
-    // 「调用历史」恢复给普通用户（2026-10-10）。上一轮按用户给的侧边栏顺序
-    // 把它划进了 admin 区，理由是「普通用户看自己的消费记录走钱包页」——
-    // 但那是**聚合数**，不是明细。排查「我刚才那次调用为什么报错/为什么这么慢/
-    // 为什么花了 0.4 分」需要逐条记录，钱包页的汇总答不了这个问题。
-    //
-    // 刻意**不带 adminOnly**：后端按会话身份强制收窄作用域
-    // （usage_handler.scopeUserID：普通用户只见自己的，管理员空串=全量），
-    // 且 history / history.csv 早已在 userAccessibleRoutes 白名单里
-    // （internal/server/user_auth.go），并有 authz_matrix 测试钉住。
-    // 页内无任何 admin-only 数据源：密钥下拉走 /keys（同样按身份收窄）。
-    // 「用量统计」（2026-10-16 由「调用历史」改名并拆成三个子页：
-    // 调用明细 / 上游 / 模型）。三个子页共用一个时间范围，放在父页面持有 ——
-    // 各带一个选择器的话，用户在「上游」页选了 30 天、切到「明细」页
-    // 又看到默认 7 天，两页数字对不上且会被当成网关算错账。
-    //
-    // 老书签 /history **重定向**到本页并落在「调用明细」子页 ——
-    // 与合并前的落点一致，不给老书签一个「默认落到汇总页」的行为改变。
-    { path: '/usage', name: 'usage', component: () => import('./views/UsageStats.vue'), meta: { title: '用量统计' } },
-    { path: '/history', redirect: { name: 'usage' } },
-    // 「可用模型」恢复（2026-10-10）：它一度随管理员退出数据面一起被删，
-    // 理由是「管理员用不上这份清单」。这个理由只对管理员成立，却让**普通
-    // 用户**也跟着没了入口 —— 而这页恰恰是普通用户最需要的：它回答
-    // 「我实际能调哪些模型、单价多少」，ModelPicker 只在打开建 key 表单时
-    // 顺带露一眼，且那是「写白名单」的控件、语义完全不同（见 Models.vue
-    // 的文件头注释）。
-    //
-    // 刻意**不带 adminOnly**：普通用户查自己的可用模型与用量同权，
-    // 后端 GET /admin/api/model-names 早已在 userAccessibleRoutes 白名单里
-    // （见 internal/server/user_auth.go），并按身份收窄返回。
+    { path: '/history', name: 'history', component: () => import('./views/UsageStats.vue'), meta: { title: '请求日志' } },
+    { path: '/usage', name: 'usage', component: () => import('./views/UsageStats.vue'), meta: { title: '用量与费用' } },
     { path: '/models', name: 'models', component: () => import('./views/Models.vue'), meta: { title: '可用模型' } },
-    // 「钱包与充值」。**刻意保留 name/path 为 profile**：路由名已经进了
-    // 若干跳转（守卫把非 admin 踢回这里、登出后 push 回这里），改路径会让
-    // 老书签 404。展示标题改成「钱包与充值」，见下方 meta.title。
-    { path: '/profile', name: 'profile', component: () => import('./views/Wallet.vue'), meta: { title: '钱包与充值' } },
-    // /wallet 别名（2026-10-12）：地址栏写着 profile、页面写着「钱包与充值」，
-    // 分享链接或做书签时会困惑。加一条语义正确的路径并让 profile 重定向过去，
-    // 老书签（/profile）与守卫里已有的 name: 'profile' 跳转都不受影响 ——
-    // 重定向是 profile → wallet，而跳转用的是**路由名**而非路径，
-    // 所以「踢回钱包」仍然落在 /wallet 上。
+    { path: '/wallet', name: 'wallet', component: () => import('./views/Wallet.vue'), meta: { title: '余额与账单' } },
+    { path: '/profile', name: 'profile', redirect: { name: 'wallet' } },
+    { path: '/keys', name: 'keys', component: () => import('./views/AccessControl.vue'), meta: { title: 'API 密钥' } },
+    { path: '/users', name: 'users', component: () => import('./views/AccessControl.vue'), meta: { title: '用户与权限', adminOnly: true } },
     {
-      path: '/wallet',
-      name: 'wallet',
-      component: () => import('./views/Wallet.vue'),
-      meta: { title: '钱包与充值' },
+      path: '/providers', name: 'providers', component: () => import('./views/Providers.vue'),
+      meta: { title: '上游服务', adminOnly: true },
+      // 旧页签地址继续定位到对应任务。
+      beforeEnter: to => to.query.tab === 'routes' ? { name: 'routes' }
+        : to.query.tab === 'model-groups' ? { name: 'usage', query: { tab: 'groups' } } : true,
     },
-    {
-      path: '/profile',
-      redirect: { name: 'wallet' },
-    },
-    // 以下 admin-only：普通用户既看不到入口，也会被守卫踢走。
-    // meta.adminOnly 让导航栏能按 isAdmin() 隐藏它们，守卫负责兜底——
-    // 只做前者的话，手输 URL 就能打开。
-    //
-    // 「用户 / 分组 / 访问密钥」合并成一个页面（2026-10-14；用户与分组原
-    // 已在 2026-10-10 合并过一次）。三者是一条权限链上的三环：账号的分组、
-    // 组的模型白名单、key 级的更严覆盖 —— 排查一次「调不通」要同时看三处，
-    // 拆成三页就得凭记忆把 id/name 来回对上。
-    //
-    // **刻意不带 adminOnly**：普通用户在侧栏点这一项进来，看到的是自己的
-    // 访问密钥页签（页签按身份收窄，见 AccessControl.vue）。他们在合并前
-    // 用的正是 /keys 的能力，这里一比一保留；而 /admin/api/users 与
-    // /groups 对他们本就是 admin-only，给入口只会让人白撞一次 403。
-    { path: '/users', name: 'users', component: () => import('./views/AccessControl.vue'), meta: { title: '用户与分组' } },
-    // 「访问密钥」不再是独立侧栏项，它就是上面那一页的第三个页签。
-    // 老书签 /keys 重定向到 /users：普通用户的默认页签就是「访问密钥」，
-    // 管理员落在「用户」页签 —— 与合并前的落点一致，不必额外带 query。
-    // 刻意**不做** ?tab= 同步：页签状态一旦同时存在于 URL 与组件两处，
-    // 改一处忘另一处就会漂移。
-    { path: '/keys', redirect: { name: 'users' } },
-    // 「上游与模型 / 路由 / 模型归组」合并成一个页面（2026-10-14）。三者是
-    // 同一条数据面配置链的相邻三段，页签顺序即链的顺序（上游 → 路由 → 归组）。
-    { path: '/providers', name: 'providers', component: () => import('./views/Upstream.vue'), meta: { title: '上游与模型', adminOnly: true } },
-    // 老地址并进上面那个页面。**必须留重定向而不是删掉**：老书签与站内
-    // /routes 链接不该 404。重定向后统一落在配置链的起点页签。
-    { path: '/routes', redirect: { name: 'providers' } },
-    { path: '/model-groups', redirect: { name: 'providers' } },
-    // 「连通率」不再是独立页面（2026-10-14）：每张模型卡里已经同时显示单价与
-    // 连通率曲线（Models.vue）。拆成两页的代价是判断「该换档还是该降价」
-    // 得先记下模型名、去另一页按 id 找、再回来对价格。
-    //
-    // 老书签重定向到「可用模型」——那些链接记着的是「我要看连通率」，
-    // 而那张卡片现在就在那一页。
+    { path: '/routes', name: 'routes', component: () => import('./views/Routes.vue'), meta: { title: '模型与路由', adminOnly: true } },
+    { path: '/model-groups', redirect: { name: 'usage', query: { tab: 'groups' } } },
+    { path: '/providers/:id', name: 'provider-detail', component: () => import('./views/ProviderDetail.vue'), meta: { title: '上游详情', adminOnly: true } },
     { path: '/health', redirect: { name: 'models' } },
-    { path: '/settings', name: 'settings', component: () => import('./views/Settings.vue'), meta: { title: '设置', adminOnly: true } },
+    { path: '/account', name: 'account', component: () => import('./views/AccountSettings.vue'), meta: { title: '账号设置' } },
+    {
+      path: '/settings', name: 'settings', component: () => import('./views/Settings.vue'),
+      meta: { title: '系统设置', adminOnly: true },
+    },
+    { path: '/:pathMatch(.*)*', redirect: '/' },
   ],
 })
 
 // 路由守卫：两件事。
 //
 // 1. 未登录 → 去登录页。
-// 2. 要访问 admin-only 页而当前不是管理员 → 回自己的账号页。
+// 2. 要访问 admin-only 页而当前不是管理员 → 回个人总览（旧用户入口回密钥页）。
 //
 // 判定提成 guardDecision：除了 beforeEach，App.vue 在 loadSession 完成后
 // 还要**重判一次当前路由**（reapplyGuard）—— 两处共用同一套规则，
@@ -157,18 +86,26 @@ function guardDecision(to: RouteLocationNormalized): true | RouteLocationRaw {
     // 公开页回跳用的是同一套校验（单斜杠开头且排除 //）。
     return { name: 'login', query: to.meta.public ? {} : { redirect: to.fullPath } }
   }
+  // 个人改密的旧地址对两种角色都映射到账号页，先于管理权限判断。
+  if (to.name === 'settings' && to.query.tab === 'password') return { name: 'account' }
   if (to.meta.adminOnly && !isAdmin()) {
-    return { name: 'profile' }
+    return { name: to.name === 'users' ? 'keys' : 'overview' }
   }
   return true
 }
 
 router.beforeEach((to) => guardDecision(to))
 
-router.afterEach((to) => {
-  const pageTitle = typeof to.meta.title === 'string' ? to.meta.title : ''
-  document.title = pageTitle ? `${pageTitle} · Rosetta Gateway` : 'Rosetta Gateway · 管理后台'
-})
+function updateDocumentTitle(to: RouteLocationNormalized) {
+  const titles: Record<string, string> = {
+    overview: isAdmin() ? '网关总览' : '我的总览',
+    history: isAdmin() ? '请求日志' : '我的调用',
+    wallet: isAdmin() ? '账户与充值' : '余额与账单',
+  }
+  const pageTitle = titles[String(to.name)] ?? (typeof to.meta.title === 'string' ? to.meta.title : '')
+  document.title = pageTitle ? pageTitle + ' · Rosetta Gateway' : 'Rosetta Gateway'
+}
+router.afterEach(updateDocumentTitle)
 
 /**
  * 探测（loadSession）完成后用守卫规则重判**当前**路由。
@@ -185,6 +122,7 @@ export function reapplyGuard(): void {
   const cur = router.currentRoute.value
   const d = guardDecision(cur)
   if (d !== true) void router.replace(d)
+  else updateDocumentTitle(cur)
 }
 
 export default router

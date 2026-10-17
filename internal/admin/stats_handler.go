@@ -20,15 +20,19 @@ func NewStatsHandler(st *store.Store) *StatsHandler {
 }
 
 type statsResponse struct {
-	TotalRequests   int64   `json:"total_requests"`
-	TotalTokens     int64   `json:"total_tokens"`
-	InputTokens     int64   `json:"input_tokens"`
-	OutputTokens    int64   `json:"output_tokens"`
-	CachedTokens    int64   `json:"cached_tokens"`
-	CacheHitRate    float64 `json:"cache_hit_rate"`
-	ErrorCount      int64   `json:"error_count"`
-	AvgTokensPerSec float64 `json:"avg_tokens_per_sec"`
-	AvgTtfbMs       float64 `json:"avg_ttfb_ms"`
+	ThroughputSamples       int     `json:"throughput_samples"`
+	TtfbSamples             int     `json:"ttfb_samples"`
+	RecentPerformanceStatus string  `json:"recent_performance_status"` // ready / error; count=0 means no eligible samples
+	RecentSampleLimit       int     `json:"recent_sample_limit"`
+	TotalRequests           int64   `json:"total_requests"`
+	TotalTokens             int64   `json:"total_tokens"`
+	InputTokens             int64   `json:"input_tokens"`
+	OutputTokens            int64   `json:"output_tokens"`
+	CachedTokens            int64   `json:"cached_tokens"`
+	CacheHitRate            float64 `json:"cache_hit_rate"`
+	ErrorCount              int64   `json:"error_count"`
+	AvgTokensPerSec         float64 `json:"avg_tokens_per_sec"`
+	AvgTtfbMs               float64 `json:"avg_ttfb_ms"`
 	// Cost 为费用（元）：每条用量记录落库**当时**按模型单价算好并固化的金额
 	// 求和（usage_records.cost_total），未配置价格的模型贡献 0。
 	//
@@ -134,20 +138,15 @@ func (h *StatsHandler) Get(w http.ResponseWriter, r *http.Request) { // from/to 
 		writeServerError(w, "usage stats", err)
 		return
 	}
-	// 缓存命中率已并入 GetUsageStats 同一条 SELECT（见 usage_dao.go）：
-	// 此前它是对同一区间 usage_records 的第二次独立全扫，纯属重复。
-	// tps/ttfb 是补充指标，查询失败不应让整份 stats 报 500（主统计已成功）；
-	// 但旧实现把错误丢进 _ 后指标静默显示 0，运维无从分辨「真的是 0」还是「查挂了」。
-	// 补 WARN：值仍回 0，但日志说明原因。
-	tps, tpsErr := h.store.GetRecentThroughput(r.Context(), 5, scope)
-	if tpsErr != nil {
-		slog.Warn("admin stats: recent throughput query failed", "error", tpsErr)
-	}
-	ttfb, ttfbErr := h.store.GetRecentTtfbMs(r.Context(), 5, scope)
-	if ttfbErr != nil {
-		slog.Warn("admin stats: recent ttfb query failed", "error", ttfbErr)
+	performance, performanceErr := h.store.GetRecentPerformance(r.Context(), 5, scope)
+	performanceStatus := "ready"
+	if performanceErr != nil {
+		performanceStatus = "error"
+		slog.Warn("admin stats: recent performance query failed", "error", performanceErr)
 	}
 	resp := statsResponse{
+		ThroughputSamples: performance.ThroughputSamples, TtfbSamples: performance.TtfbSamples,
+		RecentPerformanceStatus: performanceStatus, RecentSampleLimit: 5,
 		TotalRequests:   stats.TotalRequests,
 		TotalTokens:     stats.TotalTokens,
 		InputTokens:     stats.InputTokens,
@@ -155,8 +154,8 @@ func (h *StatsHandler) Get(w http.ResponseWriter, r *http.Request) { // from/to 
 		CachedTokens:    stats.CachedTokens,
 		CacheHitRate:    stats.CacheHitRate,
 		ErrorCount:      stats.ErrorCount,
-		AvgTokensPerSec: tps,
-		AvgTtfbMs:       ttfb,
+		AvgTokensPerSec: performance.TokensPerSec,
+		AvgTtfbMs:       performance.TtfbMs,
 		Cost:            stats.Cost,
 	}
 

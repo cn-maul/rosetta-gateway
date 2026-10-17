@@ -1,4 +1,5 @@
 <script setup lang="ts">
+import DataTable from '../components/DataTable.vue'
 /**
  * 模型归组（管理员）。把不同上游的「同一个模型」标成一组，用量统计按组名合并。
  *
@@ -216,7 +217,7 @@ function labelFor(mm: UpstreamModel): string {
         还没有模型组 —— 点上方「新建模型组」，再把各上游的同名模型并进来
       </div>
 
-    <div v-else class="tbl-wrap">
+    <DataTable v-else label="模型分组">
       <table class="tbl">
         <thead>
           <tr>
@@ -239,7 +240,7 @@ function labelFor(mm: UpstreamModel): string {
           </tr>
         </tbody>
       </table>
-    </div>
+    </DataTable>
     </div>
 
     <!-- 建组 / 改名 -->

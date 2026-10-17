@@ -49,7 +49,7 @@
 import { computed, onMounted, ref } from 'vue'
 import { api, ApiFail, isAdmin } from '../api'
 import type { ModelMeta, ModelPrice, ProbeHealth, ProbeTimelineBucket } from '../types'
-import { fmtMoney } from '../fmt'
+import { unitPrice, cacheUnitPrice } from '../modelPrice'
 import { toast } from '../ui'
 import AppModal from '../components/AppModal.vue'
 import HeartbeatBar from '../components/HeartbeatBar.vue'
@@ -127,12 +127,10 @@ function providerOf(name: string): string {
 /**
  * 单价单元格：**0 显示「未配置」而不是 0.00**。
  *
- * 与 Settings.vue 的 priceCell 同一口径、同一理由：没填单价时实际计费按 0，
- * 但「算过了，就是免费」与「还没人填」是两件不同的事。
+ * 与路由和价格设置共用单价格式，避免小额单价被金额格式舍入成零。
  */
 function priceCell(v: number | undefined): string {
-  if (v === undefined || !(v > 0)) return '未配置'
-  return fmtMoney(v)
+  return unitPrice(v ?? 0)
 }
 
 /** 有探测记录的公开名（按清单顺序），用于默认勾选与「全选」。 */
@@ -258,9 +256,19 @@ onMounted(load)
 // HeartbeatBar：折线把「停机 5 小时」画成一条直通 100% 的斜线，故障时段
 // 在图上消失；条形图每个探测桶一根胶囊，坏的直接是红的。
 //
-// 跨度 = days × 24 小时（与数据面同源，只换渲染不改查询）。
-// 两种粒度都是 24×days 小时，差别只在后端怎么聚合，所以这里不必分支。
-const HB_HOURS = days.value * 24
+// 跨度与桶宽都必须**跟着 granularity 走**，两者缺一整张图就是错的：
+//
+//   - HB_HOURS 曾写成 `const HB_HOURS = days.value * 24`（普通 const，
+//     只求值一次）。切「近 7 天 → 30 天」时跨度纹丝不动，于是条数不变、
+//     覆盖的时间窗还是 7 天 —— 选择器看着生效了，实际没换。
+//   - bucketMinutes 曾写死 60。选「按天」时后端按 24h 分桶，前端却仍按
+//     小时对齐 ts，于是每 24 根条里只有 1 根能对上 bucket，其余全被
+//     判成「无记录」画成灰条 —— 整个页面看上去就是「只有占位」。
+//
+// 两处都改成 computed，且 HB_HOURS 的分钟数必须与 bucketMinutes 同步推导，
+// 否则 total 的算法（hours / bucketMinutes）自己跟自己不一致。
+const bucketMinutes = computed(() => (granularity.value === 'day' ? 1440 : 60))
+const HB_HOURS = computed(() => days.value * 24)
 
 /** healthOf 这个公开模型对应的上游模型的健康摘要（可能 undefined）。 */
 function healthOf(name: string): ProbeHealth | undefined {
@@ -273,7 +281,7 @@ function healthClass(h: string): string {
     case 'healthy':
       return 'badge-live'
     case 'down':
-      return 'badge-off'
+      return 'badge-st-error'
     case 'degraded':
       return 'badge-warn'
     default:
@@ -333,7 +341,7 @@ function lineNote(name: string): string {
     <div class="page-head">
       <div>
         <h1>可用模型</h1>
-        <div class="sub">你能调用的模型清单 · 单价与连通率（只读）</div>
+        <div class="sub">公开模型清单 · 首选参考价与首选目标探测（只读）</div>
       </div>
       <div class="head-actions">
         <select v-model="days" class="select sel" @change="loadTimeline">
@@ -349,6 +357,7 @@ function lineNote(name: string): string {
       </div>
     </div>
 
+    <p class="context-note">参考价与探测均指向首选目标（位置 0）；发生故障转移时，费用以请求日志中的实际目标记录为准。<RouterLink v-if="isAdminUser" to="/routes" class="text-link"> 管理模型与路由 →</RouterLink></p>
     <div class="panel">
       <div class="panel-title">
         <span>模型清单</span>
@@ -396,13 +405,29 @@ function lineNote(name: string): string {
 
         <div class="model-grid">
           <article v-for="m in sorted" :key="m" class="card model-card">
-            <div class="card__header">
-              <div class="card__title model-name mono">{{ m }}</div>
-              <!-- 副标题位优先放供应商名（有 meta 才有）；没有就退回单价单位。
-                   两者都不该写「未配置」式的说明 —— 那是下面每行的职责。 -->
-              <div class="card__description model-sub">
-                <template v-if="providerOf(m)">{{ providerOf(m) }} · </template>
-                单价（元 / 百万 tokens）
+            <div class="card__header model-head">
+              <div class="model-id">
+                <div class="card__title model-name mono">{{ m }}</div>
+                <!-- 副标题位优先放供应商名（有 meta 才有）；没有就退回单价单位。
+                     两者都不该写「未配置」式的说明 —— 那是下面每行的职责。 -->
+                <div class="card__description model-sub">
+                  <template v-if="providerOf(m)">{{ providerOf(m) }} · </template>
+                  首选参考价（元 / 百万 tokens）
+                </div>
+              </div>
+
+              <!-- 健康态与近窗成功率贴着模型名右对齐（2026-10-17）。
+                   之前它们在卡片底部的连通率区里，于是「这个模型现在正常吗」
+                   要先扫过三行单价才看到 —— 而这是扫一眼就该有答案的问题。
+                   放到标题行后，一屏扫过去能同时读到「叫什么」与「好不好」；
+                   底部只留曲线本身。 -->
+              <div class="model-health-tag">
+                <span class="badge" :class="healthClass(healthOf(m)?.health ?? 'unknown')">
+                  {{ healthLabel(healthOf(m)?.health ?? 'unknown') }}
+                </span>
+                <span v-if="healthOf(m)?.window_count" class="dim health-stat">
+                  首选探测 {{ Math.round((healthOf(m)?.success_rate ?? 0) * 100) }}%
+                </span>
               </div>
             </div>
 
@@ -424,8 +449,8 @@ function lineNote(name: string): string {
                    （两个上游协议里 cached 都 ⊆ input），它是命中时的**折扣价**。 -->
               <div class="price-row">
                 <span class="price-lab">其中:缓存命中</span>
-                <span class="price-val mono" :class="{ unset: (priceOf(m)?.price_cache_hit ?? 0) <= 0 }">
-                  {{ priceCell(priceOf(m)?.price_cache_hit) }}
+                <span class="price-val mono" :class="{ unset: (priceOf(m)?.price_cache_hit ?? 0) <= 0 && (priceOf(m)?.price_input ?? 0) <= 0 }">
+                  {{ cacheUnitPrice(priceOf(m)?.price_input ?? 0, priceOf(m)?.price_cache_hit ?? 0) }}
                 </span>
               </div>
             </div>
@@ -433,24 +458,21 @@ function lineNote(name: string): string {
             <!-- 连通率：与价格同卡，但**状态必须逐个区分** ——
                  「配置没指向上游」「网关读不到」「还没探测过」「正常」四件事
                  全都显示成空白或「无数据」的话，管理员无法判断该修哪一处。 -->
-            <div class="card__footer model-health">
-              <div class="health-line">
-                <span class="badge" :class="healthClass(healthOf(m)?.health ?? 'unknown')">
-                  {{ healthLabel(healthOf(m)?.health ?? 'unknown') }}
-                </span>
-                <span v-if="healthOf(m)?.window_count" class="dim health-stat">
-                  近窗成功率 {{ Math.round((healthOf(m)?.success_rate ?? 0) * 100) }}%
-                </span>
-                <span v-else class="dim health-stat">{{ lineNote(m) }}</span>
-              </div>
-
-              <template v-if="lineState(m) === 'ok' && drawn.includes(m)">
+            <!-- 连通率区：只在**真的要画或要解释画不出来**时才出现。
+                 未被勾选的模型整块不渲染 —— 否则会留下一条
+                 padding-top + border-top 的空分隔线，卡片底部凭空多一道
+                 横线，而下面什么都没有。 -->
+            <div v-if="drawn.includes(m)" class="card__footer model-health">
+              <template v-if="lineState(m) === 'ok'">
                 <div v-if="timelineLoading" class="chart-empty dim">加载中…</div>
                 <template v-else>
-                  <HeartbeatBar :buckets="curveFor(m)" :hours="HB_HOURS" :bucket-minutes="60" />
+                  <HeartbeatBar :buckets="curveFor(m)" :hours="HB_HOURS" :bucket-minutes="bucketMinutes" />
                 </template>
               </template>
-              <div v-else-if="drawn.includes(m)" class="chart-empty dim">{{ lineNote(m) }}</div>
+              <!-- 「想画但画不出来」的成因（无可用上游 / 读取失败 / 未探测）。
+                   必须留着 —— 否则一张空白的连通率区会让人以为是不需要画，
+                   而不是画不出来。 -->
+              <div v-else class="chart-empty dim">{{ lineNote(m) }}</div>
             </div>
           </article>
         </div>
@@ -486,7 +508,7 @@ function lineNote(name: string): string {
         </li>
         <li>
           连通率来自后台定时探测（<b>max_tokens=1</b>、不扣网关用户的钱），
-          每张卡的价格与曲线<b>指向同一个上游模型</b>。
+          每张卡仅代表目标链位置 0 的<b>首选目标</b>，不能代表整条路由的可用性；故障转移后的费用按实际目标记录。
         </li>
         <li class="dim">
           看不到某个模型不一定是故障：路由被停用、或模型名拼错，都会让它不出现在这份清单里。
@@ -555,7 +577,7 @@ function lineNote(name: string): string {
    232px 会把曲线压成一条竖线。 */
 .model-grid {
   display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(288px, 1fr));
+  grid-template-columns: repeat(auto-fill, minmax(min(100%, 288px), 1fr));
   gap: 12px;
 }
 .model-card {
@@ -572,6 +594,29 @@ function lineNote(name: string): string {
   font-size: 13.5px;
   line-height: 1.4;
   overflow-wrap: anywhere;
+}
+/* 标题行：左边模型名（可长、可折），右边健康态徽章 + 成功率，右对齐。
+   min-width:0 是关键 —— 不给的话长模型名会把右侧徽章顶出卡片右缘
+   （grid/flex 子项默认 min-width:auto，不许小于内容最小宽度）。
+   窄屏由下面的媒体查询塌成竖排，此时徽章改为左对齐（贴在名字下方
+   比贴着卡片右缘更易读 —— 竖排时右对齐会离它的名字很远）。 */
+.model-head {
+  flex-direction: row;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 10px;
+}
+.model-id {
+  min-width: 0;
+  flex: 1;
+}
+.model-health-tag {
+  flex: none;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 3px;
+  text-align: right;
 }
 .model-sub {
   font-size: 12px;
@@ -614,14 +659,11 @@ function lineNote(name: string): string {
   flex-direction: column;
   gap: 6px;
 }
-.health-line {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  flex-wrap: wrap;
-}
 .health-stat {
   font-size: 11.5px;
+  /* 等宽数字：成功率跳动时（如 99% → 100%）右对齐的数字不会左右抖。 */
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
 }
 .chart-empty {
   font-size: 11.5px;
@@ -700,4 +742,22 @@ function lineNote(name: string): string {
 }
 .notes b { color: var(--text); }
 .notes .dim { color: var(--text-3); }
+
+/* 极窄卡（单列且视口很小）：标题行塌成竖排。
+   横排时一个 40 字符的模型名 + 徽章 + 「近窗成功率 100%」至少要 ~300px，
+   放不下时右对齐的徽章会把模型名挤成两三行，而成功率文字与它的名字
+   上下离得太远，反而更难对应。 */
+@media (max-width: 420px) {
+  .model-head {
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 6px;
+  }
+  .model-health-tag {
+    flex-direction: row;
+    align-items: center;
+    gap: 8px;
+    text-align: left;
+  }
+}
 </style>

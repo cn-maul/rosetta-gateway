@@ -691,8 +691,28 @@ func buildRealAdminMux(h *authzHarness) *http.ServeMux {
 	mux.HandleFunc("PUT /admin/api/users/{id}/balance", func(w http.ResponseWriter, r *http.Request) { userH.AdjustBalance(w, r, r.PathValue("id")) })
 	mux.HandleFunc("GET /admin/api/groups", groupH.List)
 	mux.HandleFunc("GET /admin/api/routes", routeH.List)
+	mux.HandleFunc("GET /admin/api/route-catalog", routeH.Catalog)
 	mux.HandleFunc("GET /admin/api/model-names", groupH.ModelNames)
 	return mux
+}
+
+func TestRouteCatalogRealAuthBoundary(t *testing.T) {
+	h := newAuthzHarness(t)
+	mux := buildRealAdminMux(h)
+	guarded := h.chain(mux)
+	for _, tc := range []struct {
+		identity string
+		status   int
+	}{
+		{idAnon, http.StatusUnauthorized},
+		{idUser, http.StatusForbidden},
+		{idAdmin, http.StatusOK},
+	} {
+		result := h.do(guarded, tc.identity, http.MethodGet, "/admin/api/route-catalog", "")
+		if result.Status != tc.status {
+			t.Fatalf("%s catalog status=%d body=%s", tc.identity, result.Status, truncate(result.Body))
+		}
+	}
 }
 
 // TestAuthzUsageByUser_OnlyDefenceIsInsideTheHandler 是本文件最重要的一条。

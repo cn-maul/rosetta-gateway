@@ -50,7 +50,7 @@ jobs:
         # v4.4.0。fetch-depth: 0 拉全量历史：本 job 只查索引，
         # 但浅克隆会让 `git ls-files` 报 shallow 相关的边界行为，
         # 全量拉取最稳妥（仓库体量很小，成本可忽略）。
-        uses: actions/checkout@11d5960a326750d5838078e36b85af677262
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
           fetch-depth: 0
 

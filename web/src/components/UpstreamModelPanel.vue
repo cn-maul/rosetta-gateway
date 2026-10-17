@@ -1,4 +1,5 @@
 <script setup lang="ts">
+import DataTable from './DataTable.vue'
 /**
  * 上游模型面板：某个上游下声明的模型列表（Providers 页展开区的一列）。
  *
@@ -6,6 +7,7 @@
  * 与 CredentialPanel 同样只搬展示，写操作（测试/编辑/删除）由父组件持有。
  */
 import { fmtSpeed, fmtSec, fmtPercent } from '../fmt'
+import { modelPriceLine as priceLine } from '../modelPrice'
 import type { UpstreamModel, ModelTestResult } from '../types'
 
 const props = defineProps<{
@@ -61,7 +63,12 @@ function testResultLine(r: ModelTestResult): string {
       <div v-if="models.length === 0" class="empty sub-empty">
         无模型 —— 路由必须指向一个上游模型
       </div>
-      <table v-else class="tbl sub-tbl">
+      <!-- tbl-wrap 不能省：这张表有 5 列，其中 4 列是 .num-h（整段读、
+           不许折行）。在详情页它只占半屏宽（与凭据表并排），不裹
+           overflow-x 的话表格会撑破卡片而不是自己横向滚动，
+           把右侧「操作」列顶出可视区 —— 而那是这一行唯一能点的东西。 -->
+      <DataTable v-else label="上游模型">
+        <table class="tbl sub-tbl">
         <thead>
           <tr>
             <th>模型</th>
@@ -80,6 +87,7 @@ function testResultLine(r: ModelTestResult): string {
                   {{ m.enabled ? '启用' : '停用' }}
                 </span>
               </div>
+              <div class="sub-line price-line">价格（元/1M）：{{ priceLine(m) }}</div>
               <!-- 思考挡位。agent 工具靠 /v1/models 的 supported_reasoning
                    决定给用户开几档，那份数据就来自这一列的配置。
                    不显示的话「客户端以为支持、实际被静默降级」无从追查。 -->
@@ -147,6 +155,11 @@ function testResultLine(r: ModelTestResult): string {
           </tr>
         </tbody>
       </table>
+      </DataTable>
     </div>
   </div>
 </template>
+
+<style scoped>
+.price-line { color: var(--muted); overflow-wrap: anywhere; }
+</style>

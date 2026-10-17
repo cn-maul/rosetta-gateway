@@ -30,10 +30,29 @@ type Provider struct {
 	BalanceSpecJSON string
 	CreatedAt       int64
 	UpdatedAt       int64
+
+	// ModelCount / CredCount 是**派生的统计值**，不在 providers 表里 ——
+	// 它们的真源分别是 upstream_models 与 provider_credentials 的行数。
+	// 只有 ListProviders 会填（见该函数的注释），单条读路径（GetProvider 等）
+	// 一律留 0。
+	ModelCount int
+	CredCount  int
 }
 
-// providerColumns 是 providers 三处读路径共用的列清单。
-const providerColumns = `id, slug, name, protocol, endpoint, enabled, timeout_ms, max_retries, quirks_json, proxy_url, balance_spec_json, created_at, updated_at`
+// providerColumns 是 providers 全部读路径共用的列清单，末尾两个是**派生
+// 计数**（见 Provider.ModelCount 的注释）。
+//
+// 为什么用 LEFT JOIN 子查询而不是「先查 providers 再逐个数」：那是 N+1 ——
+// 十几个上游就是十几次往返，而列表页每次刷新都要跑一遍。两个子查询各自
+// 只扫一张表按 provider_id 过滤（UNIQUE(provider_id, model_id) 约束让
+// SQLite 走索引前缀），成本远低于多一次网络往返。
+//
+// 为什么不做成 providers 上的物化列：它会被「导入模型 / 删除模型 /
+// 加凭据 / 删凭据」四类写操作中的任何一处漏更新，而漏更新的后果是
+// 静默显示错误数字 —— 那比慢更难查。
+const providerColumns = `id, slug, name, protocol, endpoint, enabled, timeout_ms, max_retries, quirks_json, proxy_url, balance_spec_json, created_at, updated_at,
+	(SELECT COUNT(*) FROM upstream_models um WHERE um.provider_id = providers.id) AS model_count,
+	(SELECT COUNT(*) FROM provider_credentials c WHERE c.provider_id = providers.id) AS cred_count`
 
 // scanProvider 用 sql.NullString 承接可空列 quirks_json，
 // 否则该列为 NULL 时扫描会直接报错。
@@ -44,8 +63,10 @@ func scanProvider(sc scanner) (Provider, error) {
 	var proxyURL sql.NullString
 	var balanceSpec sql.NullString
 
+	// 派生计数来自 COALESCE 出来的非空值，扫进 int 即可。
 	err := sc.Scan(&p.ID, &p.Slug, &p.Name, &p.Protocol, &p.Endpoint, &enabled,
-		&p.TimeoutMs, &p.MaxRetries, &quirks, &proxyURL, &balanceSpec, &p.CreatedAt, &p.UpdatedAt)
+		&p.TimeoutMs, &p.MaxRetries, &quirks, &proxyURL, &balanceSpec, &p.CreatedAt, &p.UpdatedAt,
+		&p.ModelCount, &p.CredCount)
 	if err != nil {
 		return p, err
 	}

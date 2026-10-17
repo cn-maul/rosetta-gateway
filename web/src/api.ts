@@ -401,6 +401,7 @@ import type {
   ModelTestResult,
   ProviderBalance,
   Route,
+  RouteCatalog,
   RouteTarget,
   RouteTargetInput,
   AccessKey,
@@ -525,6 +526,7 @@ export const api = {
 
   // routes
   routes: () => get<Route[]>('/routes'),
+  routeCatalog: () => get<RouteCatalog>('/route-catalog'),
   createRoute: (b: Partial<Route>) => mutate(() => post<Route>('/routes', b)),
   updateRoute: (id: string, b: Partial<Route>) => mutate(() => patch<Route>(`/routes/${id}`, b)),
   deleteRoute: (id: string) => mutate(() => del(`/routes/${id}`)),
@@ -766,7 +768,8 @@ export const api = {
   // 于是「这个上游到底有没有在用」这个问题没有任何页面能回答。
   usageByModel: (from = 0, to = Date.now(), limit = 200) =>
     get<UsageGroupEntry[]>(`/usage/by-model?from=${from}&to=${to}&limit=${limit}`),
-  usageByKey: (from = 0, to = Date.now()) => get<UsageGroupEntry[]>(`/usage/by-key?from=${from}&to=${to}&limit=10`),
+  usageByKey: (from = 0, to = Date.now(), limit = 200) =>
+    get<UsageGroupEntry[]>(`/usage/by-key?from=${from}&to=${to}&limit=${limit}`),
   usageByProvider: (from = 0, to = Date.now(), limit = 200) =>
     get<UsageGroupEntry[]>(`/usage/by-provider?from=${from}&to=${to}&limit=${limit}`),
   /**

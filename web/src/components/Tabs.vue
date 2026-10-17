@@ -61,6 +61,21 @@ function measure() {
   indicator.value = { left: active.offsetLeft, width: active.offsetWidth }
 }
 
+function onTabKey(event: KeyboardEvent, key: string) {
+  const index = props.tabs.findIndex(t => t.key === key)
+  let next = index
+  if (event.key === 'ArrowRight') next = (index + 1) % props.tabs.length
+  else if (event.key === 'ArrowLeft') next = (index - 1 + props.tabs.length) % props.tabs.length
+  else if (event.key === 'Home') next = 0
+  else if (event.key === 'End') next = props.tabs.length - 1
+  else return
+  event.preventDefault()
+  const item = props.tabs[next]
+  if (!item) return
+  emit('update:modelValue', item.key)
+  listRef.value?.querySelectorAll<HTMLButtonElement>('[role="tab"]')[next]?.focus()
+}
+
 // 选中项变化、列表内容变化、容器尺寸变化都要重新测量。
 watch(() => props.modelValue, () => nextTick(measure))
 watch(() => props.tabs, () => nextTick(measure))
@@ -102,6 +117,8 @@ watch(listRef, (el) => {
           role="tab"
           :data-selected="t.key === props.modelValue"
           :aria-selected="t.key === props.modelValue"
+          :tabindex="t.key === props.modelValue ? 0 : -1"
+          @keydown="onTabKey($event, t.key)"
           @click="emit('update:modelValue', t.key)"
         >
           {{ t.label }}

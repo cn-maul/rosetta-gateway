@@ -35,6 +35,17 @@ export interface Provider {
   ready: boolean
   // ready_reason 面向运维的一句话原因（凭据解密失败 / 读不到凭据清单 / 无凭据）。
   ready_reason?: string
+  /**
+   * model_count 是**已导入本库清单**的模型条数，不是这个上游「理论上支持
+   * 多少个」。后者要去问上游 /models 才知道，那是一次带凭据的网络请求，
+   * 不该挂在列表上（十几个上游就是十几次，且大多数上游压根不支持）。
+   *
+   * cred_count 同理：已配置的凭据条数。
+   *
+   * 两者由后端在列表查询里用相关子查询一次算出，不额外往返。
+   */
+  model_count?: number
+  cred_count?: number
 }
 
 // 新增上游只需这三项 + 可选 api_key；slug、启用、超时、重试由后端决定。
@@ -634,6 +645,10 @@ export interface KeyCreateResponse extends AccessKey {
 }
 
 export interface Stats {
+  throughput_samples: number
+  ttfb_samples: number
+  recent_performance_status: 'ready' | 'error'
+  recent_sample_limit: number
   total_requests: number
   total_tokens: number
   input_tokens: number
@@ -976,4 +991,17 @@ export interface ConfigImportResult {
   credentials_skipped: number
   warnings?: string[]
   notes?: string[]
+}
+
+// Admin route catalog: provider selection needs no endpoint or credentials.
+export type RouteCatalogProvider = Pick<Provider, 'id' | 'slug' | 'name' | 'enabled' | 'ready_reason'> & { ready: boolean | null }
+export interface RouteCatalogEntry extends Route {
+  targets: RouteTarget[]
+  chain: { total: number; enabled: number; standby: number }
+}
+export interface RouteCatalog {
+  routes: RouteCatalogEntry[]
+  providers: RouteCatalogProvider[]
+  models: UpstreamModel[]
+  generated_at: number
 }

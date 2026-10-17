@@ -1,804 +1,177 @@
 <script setup lang="ts">
+import DataTable from '../components/DataTable.vue'
+// 列表仅取摘要，凭据、模型与余额请求留在上游详情页。
 import { computed, onMounted, reactive, ref } from 'vue'
+import { useRoute, useRouter } from 'vue-router'
 import { api } from '../api'
 import { toast, confirmBox } from '../ui'
-import { fmtSpeed, fmtSec, fmtPercent } from '../fmt'
-import type { Provider, Credential, UpstreamModel, DiscoveredModel, ModelTestResult, ProviderBalance, CredentialBalance } from '../types'
+import type { Provider } from '../types'
 import AppModal from '../components/AppModal.vue'
-import CredentialPanel from '../components/CredentialPanel.vue'
-import UpstreamModelPanel from '../components/UpstreamModelPanel.vue'
+import { useQueryText } from '../composables/useQueryText'
+
+const router = useRouter()
+const route = useRoute()
+const search = useQueryText('q')
+const status = useQueryText('status')
+const saving = ref(false)
+const pending = ref(new Set<string>())
+const filtered = computed(() => providers.value.filter(p => {
+  const q = search.value.trim().toLowerCase()
+  const matches = !q || [p.name, p.slug, p.endpoint, p.protocol].some(v => v.toLowerCase().includes(q))
+  const state = !p.enabled ? 'disabled' : p.ready === false ? 'unready' : p.ready === true ? 'ready' : 'unknown'
+  return matches && (!status.value || status.value === state)
+}))
+function readyLabel(p: Provider) {
+  if (!p.enabled) return '已停用'
+  return p.ready === true ? '凭据就绪' : p.ready === false ? '未就绪' : '状态未知'
+}
+function clearFilters() { void router.replace({ query: { ...route.query, q: undefined, status: undefined } }) }
+let loadSeq = 0
 
 const err = ref('')
 const loading = ref(true)
 const providers = ref<Provider[]>([])
-const expandedId = ref('')
-const credsMap = reactive<Record<string, Credential[]>>({})
-const modelsMap = reactive<Record<string, UpstreamModel[]>>({})
-// testing / modelTestResults（在 testModel 附近定义）见那里的说明。
-
-/**
- * shortEndpoint 把过长的 Endpoint 压成「头 … 尾」。
- *
- * 为什么必须压：Endpoint 是这行里最长的字段，不压就会把整张表撑宽到需要
- * 横向滚动 —— 而横滚会把右侧的「操作」列推出视野，那一列恰好是这一行里
- * 唯一有交互的东西。为了一条只读文本牺牲操作入口，是最亏的交换。
- *
- * 为什么掐中间而不是尾部省略（…）：一个地址最有辨识度的是**两端** ——
- * 域名说明打的是谁，路径尾巴说明打到哪。尾部省略会把「chat/completions」
- * 这半截丢掉，留下的 `https://api.deepseek.com/v1/…` 反而不如掐中间有用。
- * 完整地址仍在 title 里，鼠标悬停可见。
- */
-function shortEndpoint(s: string): string {
-  if (s.length <= 44) return s
-  return s.slice(0, 22) + '…' + s.slice(-20)
-}
 
 async function load() {
+  const seq = ++loadSeq
   loading.value = true
   err.value = ''
   try {
-    providers.value = await api.providers()
-    // 已展开的行刷新子资源
-    if (expandedId.value) await openExpand(expandedId.value, true)
+    const result = await api.providers()
+    if (seq === loadSeq) providers.value = result
   } catch (e) {
+    if (seq !== loadSeq) return
     if ((e as { status?: number }).status === 401) return
-    // 失败**必须留下可见的错误态**：只弹 toast 的话，页面保留空列表/
-    // 空表格，呈现成「暂无数据」—— 而真实原因是请求失败了。运维会据此
-    // 判断「今天没有流量」，进而排除掉网关/上游故障这个真正的方向。
-    // 与 Users/Groups 的持久错误态同口径（见其 v-else-if="err"）。
+    // 失败必须留下可见错误态：呈现成「暂无数据」会让运维误判为无流量，
+    // 从而排除掉网关/上游故障这个真正的方向。
     err.value = '加载上游失败：' + (e as Error).message
     toast('加载失败：' + (e as Error).message, 'err')
   } finally {
-    loading.value = false
+    if (seq === loadSeq) loading.value = false
   }
 }
 
-async function openExpand(id: string, silent = false) {
-  if (expandedId.value === id && !silent) {
-    expandedId.value = ''
-    return
-  }
-  expandedId.value = id
-  try {
-    const [c, m] = await Promise.all([api.credentials(id), api.models(id)])
-    credsMap[id] = c
-    modelsMap[id] = m
-  } catch (e) {
-    if ((e as { status?: number }).status !== 401) toast('加载子资源失败：' + (e as Error).message, 'err')
-  }
-}
-
-// ---------- Provider 表单 ----------
-// 新建只填 显示名称 / 协议 / Endpoint（可选 api_key）；
-// 编辑时可展开高级选项，单独调整 slug（只读）、超时、重试。
+// ---------- 新建表单 ----------
+// 新建只填 显示名称 / 协议 / Endpoint（+ 可选 api_key）。
+// slug、启用、超时与重试由后端给默认值；代理与余额查询可以事后在详情页改，
+// 但它们不在这里问 —— 新建时这两个对大多数上游是空的。
 
 const pForm = reactive({
   open: false,
-  editing: '' as string,
   name: '',
   protocol: 'openai-chat',
   endpoint: '',
   api_key: '',
-  slug: '',
-  timeout_ms: 0,
-  max_retries: 0,
-  proxy_url: '',
-  balance_spec_json: '',
-  showAdvanced: false,
 })
 
-function openProvider(p?: Provider) {
-  pForm.editing = p?.id ?? ''
-  pForm.name = p?.name ?? ''
-  pForm.protocol = p?.protocol || 'openai-chat'
-  pForm.endpoint = p?.endpoint ?? ''
+function openCreate() {
+  pForm.name = ''
+  pForm.protocol = 'openai-chat'
+  pForm.endpoint = ''
   pForm.api_key = ''
-  pForm.slug = p?.slug ?? ''
-  pForm.timeout_ms = p?.timeout_ms ?? 0
-  pForm.max_retries = p?.max_retries ?? 0
-  pForm.proxy_url = p?.proxy_url ?? ''
-  pForm.balance_spec_json = p?.balance_spec_json ?? ''
-  pForm.showAdvanced = false
   pForm.open = true
 }
 
-// openRouterSpec 是提示里给的那个示例。提成常量而不是直接写在模板里：
-// 模板中插值一个含双引号的 JSON 串会与 HTML 属性/文本转义纠缠，
-// 放 script 侧最省心，也顺便让这条示例与后端字段名只有一处定义。
-const openRouterSpec =
-  '{"path":"/api/v1/credits","field":"data.total_credits","currency":"USD"}'
-
 async function submitProvider() {
+  if (saving.value) return
   if (!pForm.endpoint.trim()) {
     toast('Endpoint 为必填项', 'err')
     return
   }
+  saving.value = true
   try {
-    if (pForm.editing) {
-      // PATCH 为字段级部分更新：只发要改的字段；timeout_ms/max_retries 传 0 即「回到全局默认」
-      await api.updateProvider(pForm.editing, {
-        name: pForm.name.trim() || pForm.endpoint.trim(),
-        protocol: pForm.protocol,
-        endpoint: pForm.endpoint.trim(),
-        timeout_ms: Number(pForm.timeout_ms) || 0,
-        max_retries: Number(pForm.max_retries) || 0,
-        // 代理**每次都发**，空串 = 清空已配的代理。不能只在非空时才发 ——
-        // 那会让「卸掉代理」这个动作永远发不出去。
-        proxy_url: pForm.proxy_url.trim(),
-        // 与 proxy_url 同口径：**每次都发**，空串 = 清空（回到自动判定）。
-        // 只在非空时才发会让「卸掉自定义配置」永远发不出去。
-        balance_spec_json: pForm.balance_spec_json.trim(),
-      })
-      toast('上游已更新')
-    } else {
-      await api.createProvider({
-        name: pForm.name.trim(),
-        protocol: pForm.protocol,
-        endpoint: pForm.endpoint.trim(),
-        proxy_url: pForm.proxy_url.trim(),
-        balance_spec_json: pForm.balance_spec_json.trim(),
-        api_key: pForm.api_key.trim() || undefined,
-      })
-      toast('上游已创建')
-    }
+    await api.createProvider({
+      name: pForm.name.trim(),
+      protocol: pForm.protocol,
+      endpoint: pForm.endpoint.trim(),
+      api_key: pForm.api_key.trim() || undefined,
+    })
+    toast('上游已创建')
     pForm.open = false
     await load()
   } catch (e) {
     if ((e as { status?: number }).status !== 401) toast('保存失败：' + (e as Error).message, 'err')
+  } finally {
+    saving.value = false
   }
 }
 
+function goDetail(p: Provider) {
+  router.push({ name: 'provider-detail', params: { id: p.id }, query: route.query })
+}
+
 async function toggleProvider(p: Provider) {
+  if (pending.value.has(p.id)) return
+  pending.value.add(p.id)
   try {
-    // 只发改动字段：其余字段后端保持原值
+    // 只发改动字段：其余字段后端保持原值（PATCH 是字段级部分更新）。
     await api.updateProvider(p.id, { enabled: !p.enabled })
     toast(!p.enabled ? '已启用' : '已停用')
     await load()
   } catch (e) {
     if ((e as { status?: number }).status !== 401) toast('操作失败：' + (e as Error).message, 'err')
+  } finally {
+    pending.value.delete(p.id)
   }
 }
 
 async function removeProvider(p: Provider) {
+  if (pending.value.has(p.id)) return
   const ok = await confirmBox({
     title: `删除上游「${p.name}」？`,
     body: '将同时影响其下模型与路由的可用性；关联数据不会自动清理。',
     danger: true,
     confirmLabel: '删除',
   })
-  if (!ok) return
+  if (!ok || pending.value.has(p.id)) return
+  pending.value.add(p.id)
   try {
     await api.deleteProvider(p.id)
     toast('已删除')
-    if (expandedId.value === p.id) expandedId.value = ''
     await load()
   } catch (e) {
     if ((e as { status?: number }).status !== 401) toast('删除失败：' + (e as Error).message, 'err')
-  }
-}
-
-// 「测试」按钮的客户端超时（FE-06）：测试走的是真实的上游调用，耗时由上游与
-// 设置页配的 upstream_timeout_ms 决定，不能沿用管理 API 的默认 30s。
-// 取「运行时非流式超时 + 5s 余量」，让后端先一步超时、把真实的失败原因带回来，
-// 而不是被浏览器端掐成一句「请求超时」。设置读取失败时退回 150s 保守值。
-const testTimeoutMs = ref(150_000 + 5_000)
-
-// 正在飞行中的探测：**按行 id 的集合**，不是单个字符串（2026-10-10 修复的 P1）。
-//
-// 单一字符串装不下两个并行的测试：一次探测最长可达 upstream_timeout + 余量
-// （真实打上游），期间点第二行的「测试」会把标记冲成后者，于是
-//   - 前一行的按钮立刻解禁（判定是 testing === id），可以再点一次，
-//     对同一个正在挣扎的上游并发两个探测；
-//   - 先结束的那轮在 finally 里清空**同一个**标记，把仍在跑的那行也解锁。
-// 结果是「测试中…」显示错误，且对病态上游的探测次数失去上限。
-//
-// 集合 + 按 id 清除后，每一行只受自己的测试约束。
-//
-// 现在只服务上游模型行的「测试」：provider 行上的那个按钮已按需求移除
-// （api.testProvider 与后端 /providers/{id}/test 都保留，只是不再从 provider 行触发）。
-const testing = ref(new Set<string>())
-
-function isTesting(id: string): boolean {
-  return testing.value.has(id)
-}
-function setTesting(id: string, on: boolean): void {
-  // 整体替换而不是 add/delete：Vue 的 ref 对 Set 的深层响应式需要
-  // 重新赋值才必然触发（Proxy 的就地修改在部分场景下漏更新）。
-  const next = new Set(testing.value)
-  if (on) next.add(id)
-  else next.delete(id)
-  testing.value = next
-}
-
-// 每行的探测结果，按 upstream_models.id 索引。
-//
-// 为什么留住结果而不是只弹 toast：探测会**真实计费**，且失败原因是管理员
-// 唯一能据以行动的信息（404 改模型名、403 开权限、401 换 key）。
-// toast 5.2 秒后消失，用户来不及照着改配置；而且并发点几行时单例 toast
-// 会被后来的顶掉，只剩最后一条。
-const modelTestResults = reactive<Record<string, ModelTestResult>>({})
-
-async function testModel(m: UpstreamModel) {
-  if (isTesting(m.id)) return // 防连点：同一行已有探测在跑
-  setTesting(m.id, true)
-  delete modelTestResults[m.id] // 先清旧结果，避免把上一轮的绿/红留在屏幕上
-  try {
-    modelTestResults[m.id] = await api.testModel(m.id, testTimeoutMs.value)
-  } catch (e) {
-    if ((e as { status?: number }).status === 401) return
-    // 走到这里说明**管理接口本身**失败了（网络/超时/5xx），与「模型不可用」
-    // 不是一回事 —— 后者是 200 + status=error，由上面的分支处理。
-    // 分开显示，否则会把网关自己的问题读成上游模型的问题。
-    modelTestResults[m.id] = {
-      status: 'error',
-      model_id: m.model_id,
-      provider_id: m.provider_id,
-      message: '管理接口调用失败：' + (e as Error).message,
-      latency_ms: 0,
-    }
   } finally {
-    setTesting(m.id, false) // 只清自己这一行
+    pending.value.delete(p.id)
   }
 }
 
-// testResultLine 已随模型表一起搬进 UpstreamModelPanel.vue（2026-10-12）。
-// 这里的探测结果状态（modelTestResults / testing）仍留在本组件 ——
-// 它们是写路径的一部分（testModel 自己发请求），只把渲染搬走。
-
-// ---------- 凭据表单 ----------
-
-// 表单里**没有 weight**：需求明确要求凭据区域去掉权重。
-//
-// 权重没有被删除 —— `provider_credentials.weight` 列还在，负载均衡
-// （upstream.Pool.selectWeighted）照常按它轮询，后端也照常接受
-// PATCH weight。这里只是不再提供输入口，于是：
-//   - 新建凭据由后端兜底为权重 1（credential_handler.go 的 `weight <= 0 → 1`）；
-//   - 已有凭据的权重**保持原值**（PATCH 不传 weight = nil = 不改），
-//     不会被静默重置成 1。
-// 副作用是界面上再也改不了权重（多凭据配额分配只能靠后端/API），
-// 这是用户明确要求的结果。
-const cForm = reactive({ open: false, provider: '' as string, editing: '' as string, label: '', api_key: '' })
-
-function openCred(providerId: string, c?: Credential) {
-  cForm.provider = providerId
-  cForm.editing = c?.id ?? ''
-  cForm.label = c?.label ?? ''
-  cForm.api_key = ''
-  cForm.open = true
-}
-
-async function submitCred() {
-  if (!cForm.editing && !cForm.api_key) {
-    toast('api_key 为必填项', 'err')
-    return
-  }
-  try {
-    if (cForm.editing) {
-      // 刻意不带 weight：nil 语义是「保持原值」，正是这里要的。
-      await api.updateCredential(cForm.editing, { label: cForm.label.trim(), ...(cForm.api_key ? { api_key: cForm.api_key } : {}) })
-    } else {
-      await api.createCredential(cForm.provider, { label: cForm.label.trim(), api_key: cForm.api_key })
-    }
-    cForm.open = false
-    toast(cForm.editing ? '凭据已更新' : '凭据已创建')
-    await openExpand(cForm.provider, true)
-  } catch (e) {
-    if ((e as { status?: number }).status !== 401) toast('保存失败：' + (e as Error).message, 'err')
-  }
-}
-
-async function removeCred(c: Credential) {
-  const ok = await confirmBox({
-    title: `删除凭据「${c.label || c.id}」？`,
-    // 补影响说明（2026-10-11 前端审计）：同页另外两处删除都写了后果，
-    // 只有这里只有标题。而凭据是路由池里 enabled 的成员，删掉最后一个
-    // 启用凭据会让该上游直接变成 ready=false —— 用户会看到「服务商不可用」
-    // 却完全不知道是自己刚才点的这个确认框造成的。
-    body: '删除后该上游可能变为不可用（若已无其他启用的凭据），指向它的路由会失败转移。',
-    danger: true,
-    confirmLabel: '删除',
-  })
-  if (!ok) return
-  try {
-    await api.deleteCredential(c.id)
-    toast('已删除')
-    await openExpand(c.provider_id, true)
-  } catch (e) {
-    if ((e as { status?: number }).status !== 401) toast('删除失败：' + (e as Error).message, 'err')
-  }
-}
-
-// ---------- 凭据启停（同一上游同时只启用一把） ----------
-
-// 与 testing / balanceBusy 同款的按 id 防连点。
-//
-// 启停尤其需要它：它是「切换」语义，连点两次的结果与点一次完全相反
-// （开了又关），而期间请求池真的换过一次 key。
-const credToggling = ref(new Set<string>())
-
-// credTogglingIds 是给子组件的数组形态。Set 本身不能跨组件传（它是
-// ref 里的可变对象，就地改不保证触发更新），所以整体替换后展开成数组。
-const credTogglingIds = computed(() => [...credToggling.value])
-
-function isCredToggling(id: string): boolean {
-  return credToggling.value.has(id)
-}
-function setCredToggling(id: string, on: boolean): void {
-  const next = new Set(credToggling.value)
-  if (on) next.add(id)
-  else next.delete(id)
-  credToggling.value = next
-}
-
-async function toggleCred(c: Credential) {
-  if (isCredToggling(c.id)) return
-  const turningOn = !c.enabled
-  // 先记下「本来开着的是谁」：这次请求会把它们一并关掉，而响应只描述
-  // 这一把凭据。若不在这里数一遍，切换发生的事实就只剩列表里一个
-  // 悄悄翻转的徽章 —— 用户会以为流量没换过去。
-  const previouslyOn = (credsMap[c.provider_id] ?? []).filter((x) => x.enabled && x.id !== c.id)
-
-  setCredToggling(c.id, true)
-  try {
-    await api.updateCredential(c.id, { enabled: turningOn })
-    if (turningOn && previouslyOn.length > 0) {
-      toast(`已切到「${c.label || c.id}」，原启用的 ${previouslyOn.length} 把已停用`)
-    } else {
-      toast(turningOn ? '已启用' : '已停用')
-    }
-    // 必须整表重载：同 provider 的其它行状态也变了，而 PATCH 的响应
-    // 只带这一把。只更新这一行会让界面显示出两把都启用。
-    await openExpand(c.provider_id, true)
-  } catch (e) {
-    if ((e as { status?: number }).status !== 401) toast('操作失败：' + (e as Error).message, 'err')
-  } finally {
-    setCredToggling(c.id, false)
-  }
-}
-
-// ---------- 凭据余额 ----------
-
-// 余额是**点按查询**的结果，不是后台轮询的快照。
-//
-// 为什么不做自动刷新：那是一个会被据此做充值决策的数字。让它可能显示
-// 十分钟前的值，比不给这个功能更糟 —— 管理员看到「还剩 300 元」而实际已经
-// 见底，据此决定「不用充」，问题在第二天才暴露。所以这里只保留手动查询，
-// 并把取数时刻一并显示出来，让人知道这个数字有多旧。
-//
-// 每行一个独立标记（而不是全局单个）：多凭据可以并发点，否则点第二行会
-// 被第一行的「查询中…」挡住，而两者的等待时间是各自的。
-const balances = reactive<Record<string, ProviderBalance>>({})
-const balanceBusy = ref(new Set<string>())
-
-function isBalanceBusy(id: string): boolean {
-  return balanceBusy.value.has(id)
-}
-function setBalanceBusy(id: string, on: boolean): void {
-  const next = new Set(balanceBusy.value)
-  if (on) next.add(id)
-  else next.delete(id)
-  balanceBusy.value = next
-}
-
-async function queryBalance(providerId: string) {
-  if (isBalanceBusy(providerId)) return
-  setBalanceBusy(providerId, true)
-  try {
-    balances[providerId] = await api.providerBalance(providerId)
-  } catch (e) {
-    if ((e as { status?: number }).status === 401) return
-    // 管理接口本身失败与「上游余额查不到」是两件事：前者是网关的问题，
-    // 后者在响应里是 status=error。分开显示，否则管理员会去换 key 而真正
-    // 该做的是重试。
-    balances[providerId] = {
-      provider_id: providerId,
-      provider: '',
-      status: 'error',
-      message: '管理接口调用失败：' + (e as Error).message,
-      results: [],
-    }
-  } finally {
-    setBalanceBusy(providerId, false)
-  }
-}
-
-// balanceLine / balanceClass 已随凭据表搬进 CredentialPanel.vue（2026-10-12）。
-// balances / balanceBusy 仍留在本组件 —— 查余额是写路径（queryBalance 发请求），
-// 只把渲染搬走。
-
-// ---------- 模型：编辑表单 ----------
-
-// 模型编辑表单。价格不在这里配 —— 单价属于「设置 → 模型价格」分类，
-// 按 供应商 × 模型 维度管理（同一 model_id 不同供应商可以不同价）。
-const mForm = reactive({
-  open: false,
-  provider: '' as string,
-  editing: '' as string,
-  model_id: '',
-  context_window: 0,
-  max_output_tokens: 0,
-  enabled: true,
-  // effortCsv 是「思考挡位」的逗号分隔原文，与后端列、导出文件同形。
-  // 空串 = 未配置（网关不干预思考强度）。
-  effortCsv: '',
-  // thinking 是「能否思考」的三态。必须显式建模成三态而不是布尔加一个
-  // 「未配置」隐含态：checkbox 天然只有 on/off，而 on/off 与
-  // 「支持 / 不支持」都对应不上第三种状态（未配置）。用 string 三态
-  // ('unset' | 'yes' | 'no') 是唯一诚实的表示。
-  thinking: 'unset' as 'unset' | 'yes' | 'no',
-})
-
-// knownEffortLevels 是网关认识的挡位（强度升序），必须与后端
-// internal/effort.KnownLevels 一致。**刻意不放在后端下发**：这份清单是
-// 网关的常量而非某个部署的配置，多一次请求换一份常量不值得；而一旦写死在
-// 两处，后端加档时前端会静默少一个可选项 —— 那种故障没有任何症状。
-const knownEffortLevels = ['minimal', 'low', 'medium', 'high', 'xhigh', 'max'] as const
-
-// thinkingOptions 是「能否思考」的三态选项。措辞刻意用「未配置」而不是
-// 「自动」/「默认」—— 后两者暗示网关会替你决定，而「未配置」的含义是
-// 「网关不干预」，这是两件不同的事。
-const thinkingOptions = [
-  { v: 'unset' as const, label: '未配置' },
-  { v: 'yes' as const, label: '支持' },
-  { v: 'no' as const, label: '不支持' },
-]
-
-function openModel(providerId: string, m?: UpstreamModel) {
-  mForm.provider = providerId
-  mForm.editing = m?.id ?? ''
-  mForm.model_id = m?.model_id ?? ''
-  mForm.context_window = m?.context_window ?? 0
-  mForm.max_output_tokens = m?.max_output_tokens ?? 0
-  mForm.enabled = m?.enabled ?? true
-  // unknown 档位附在后面：它们是网关不认、但可能是上游认得的厂商私有值，
-  // 编辑时必须原样带回去，否则点一次保存就把它们悄悄抹掉了。
-  mForm.effortCsv = [...(m?.effort_levels ?? []), ...(m?.unknown_effort_levels ?? [])].join(',')
-  mForm.thinking =
-    m?.supports_thinking === undefined ? 'unset' : m.supports_thinking ? 'yes' : 'no'
-  // 重置「添加」流程状态
-  discovered.value = []
-  selected.value = []
-  discoverMsg.value = ''
-  filter.value = ''
-  mForm.open = true
-}
-
-// toggleEffortLevel 勾/取消某个挡位。
-//
-// 用集合而不是字符串拼装来算勾选态：CSV 是有序文本，直接 includes 会把
-// 「xhigh」误判为含「high」（子串包含），那是会点错的。
-function hasEffortLevel(l: string): boolean {
-  return mForm.effortCsv.split(',').some((x) => x.trim() === l)
-}
-
-function toggleEffortLevel(l: string) {
-  const parts = mForm.effortCsv.split(',').map((x) => x.trim()).filter(Boolean)
-  const i = parts.indexOf(l)
-  if (i >= 0) parts.splice(i, 1)
-  else parts.push(l)
-  // 按强度升序写回：CSV 是人手抄的，同一组挡位的两种顺序在库里应当是同一个值。
-  const rank = (x: string) => {
-    const i = knownEffortLevels.indexOf(x as (typeof knownEffortLevels)[number])
-    return i < 0 ? knownEffortLevels.length : i
-  }
-  parts.sort((a, b) => rank(a) - rank(b))
-  mForm.effortCsv = parts.join(',')
-}
-
-// setThinking 设定「能否思考」三态，并把挡位与它保持自洽。
-//
-// 自洽规则只有一条，且方向是刻意的：**明确不支持思考时清空挡位**。
-// 反过来不成立 —— 「支持思考」不必配挡位（客户端可以用上游默认）。
-// 不这样收敛的话，界面上会出现「不支持思考，却配了 high/xhigh」这种
-// 自相矛盾的状态，而它的实际后果是：网关照常剥掉思考配置，档位却仍被
-// 当成有效能力披露给 /v1/models，于是客户端以为能选、选了没效果。
-// 这正是本次要消灭的那类沉默故障，所以宁可让配置保持自洽。
-function setThinking(v: 'unset' | 'yes' | 'no') {
-  mForm.thinking = v
-  if (v === 'no') mForm.effortCsv = ''
-}
-
-async function submitModel() {
-  if (!mForm.editing) return
-  if (!mForm.model_id.trim()) {
-    toast('上游模型名（model_id）为必填项', 'err')
-    return
-  }
-  const body = {
-    model_id: mForm.model_id.trim(),
-    context_window: Number(mForm.context_window) || 0,
-    max_output_tokens: Number(mForm.max_output_tokens) || 0,
-    enabled: mForm.enabled,
-    // 空串 = 清除（回到未配置），不是「保持原值」—— 与界面上的「一个都不
-    // 勾选」是同一个动作，后端据此落 NULL。
-    effort_levels: mForm.effortCsv,
-    // 三态映射：unset → null（后端解成「清除」，落 NULL = 未配置）。
-    // 不能省掉这个字段 —— 省略是「不改」，而界面上「切回未配置并保存」
-    // 必须真的写下去，否则这个动作在下次打开表单时会「弹回来」。
-    supports_thinking: mForm.thinking === 'unset' ? null : mForm.thinking === 'yes',
-  }
-  try {
-    await api.updateModel(mForm.editing, body)
-    mForm.open = false
-    toast('模型已更新')
-    await openExpand(mForm.provider, true)
-  } catch (e) {
-    if ((e as { status?: number }).status !== 401) toast('保存失败：' + (e as Error).message, 'err')
-  }
-}
-
-// ---------- 模型：探测 + 多选胶囊式添加 ----------
-
-const discovering = ref(false)
-const discovered = ref<DiscoveredModel[]>([])
-const discoverMsg = ref('')
-const importing = ref(false)
-const filter = ref('')
-// 已选中的模型（胶囊池），一次获取后可点击多条加入
-const selected = ref<DiscoveredModel[]>([])
-
-const filteredDiscovered = computed(() => {
-  const q = filter.value.trim().toLowerCase()
-  if (!q) return discovered.value
-  return discovered.value.filter(
-    (d) => d.model_id.toLowerCase().includes(q) || (d.display_name ?? '').toLowerCase().includes(q),
-  )
-})
-
-function isSelected(id: string) {
-  return selected.value.some((s) => s.model_id === id)
-}
-
-function toggleSelect(d: DiscoveredModel) {
-  const i = selected.value.findIndex((s) => s.model_id === d.model_id)
-  if (i >= 0) selected.value.splice(i, 1)
-  else selected.value.push(d)
-}
-
-function removeSelected(id: string) {
-  const i = selected.value.findIndex((s) => s.model_id === id)
-  if (i >= 0) selected.value.splice(i, 1)
-}
-
-async function runDiscover() {
-  discovering.value = true
-  discovered.value = []
-  selected.value = []
-  discoverMsg.value = ''
-  try {
-    const r = await api.discoverModels(mForm.provider)
-    if (r.status === 'ok') {
-      discovered.value = r.models ?? []
-      if (discovered.value.length === 0) discoverMsg.value = '上游未返回任何模型'
-    } else {
-      discoverMsg.value = r.message || '获取失败'
-    }
-  } catch (e) {
-    discoverMsg.value = (e as Error).message
-  } finally {
-    discovering.value = false
-  }
-}
-
-async function confirmImport() {
-  const list = selected.value
-  if (list.length === 0) return
-  importing.value = true
-  try {
-    const r = await api.importModels(
-      mForm.provider,
-      list.map((d) => ({
-        model_id: d.model_id,
-        display_name: d.display_name ?? '',
-        context_window: d.context_window ?? 0,
-        max_output_tokens: d.max_output_tokens ?? 0,
-        // 上游自报的思考挡位随导入一起落库（2026-10-14）。刻意原样透传、
-        // 不在这里拼装：闸门在后端（空串 = 上游没报 = 留空给管理员手工配），
-        // 前端再判一次只会出现两套口径。
-        //
-        // supports_thinking 用 `?? undefined` 而不是 `|| undefined`：
-        // **false 是一个有意义的值**（「上游明确说不支持」），`||` 会把它
-        // 抹成 undefined，恰好丢掉最该保留的那一档信息。
-        effort_levels: d.effort_levels ?? '',
-        supports_thinking: d.supports_thinking ?? undefined,
-      })),
-    )
-    toast(`已添加 ${r.imported} 个模型`)
-    mForm.open = false
-    await openExpand(mForm.provider, true)
-  } catch (e) {
-    if ((e as { status?: number }).status !== 401) toast('添加失败：' + (e as Error).message, 'err')
-  } finally {
-    importing.value = false
-  }
-}
-
-async function removeModel(m: UpstreamModel) {
-  // 链首不能删：后端会回 409。界面提前拦住并说清该去哪儿改，
-  // 好过让人点下去撞一次再读错误消息。
-  if (m.is_route_head) {
-    toast('该模型是某条路由的首选目标，不能直接删除 —— 请先到「路由」页改掉那条路由的首选', 'err')
-    return
-  }
-  const refs = m.route_count ?? 0
-  const ok = await confirmBox({
-    title: `删除模型「${m.model_id}」？`,
-    // 后果必须写清：链首被拒是本次的规则，所以这里只可能提到「从链里摘掉」。
-    // 不说的话，管理员会以为「引用它的路由会失效」，实际只是少一个备选。
-    body: refs > 0
-      ? `它被 ${refs} 条路由链作为非首选目标引用 —— 删除后会自动从这些链中移除（其余成员顺序不变），该路由的首选目标不受影响。`
-      : '它没有被任何路由链引用，可以直接删除。',
-    danger: true,
-    confirmLabel: '删除',
-  })
-  if (!ok) return
-  try {
-    await api.deleteModel(m.id)
-    toast('已删除')
-    await openExpand(m.provider_id, true)
-  } catch (e) {
-    if ((e as { status?: number }).status !== 401) toast('删除失败：' + (e as Error).message, 'err')
-  }
-}
-
-onMounted(() => {
-  load()
-  // 设置只需 upstream_timeout_ms 一个字段：拉不到（罕见）就保持保守值，
-  // 不阻塞列表加载。
-  api
-    .settings()
-    .then((s) => {
-      if (s.upstream_timeout_ms > 0) testTimeoutMs.value = s.upstream_timeout_ms + 5_000
-    })
-    .catch(() => {
-      /* 保持 150s 保守值 */
-    })
-})
+onMounted(load)
 </script>
 
 <template>
-  <!-- 面板形态（2026-10-14 页面合并）：并进 Upstream.vue 的「上游与模型」页签。
-       标题 / 副标题 / 刷新由宿主页统一提供，这里只留本页**特有**的主动作
-       （新建上游）—— 宿主页的「刷新」已经覆盖本页的 load()。 -->
-  <div class="panel-body">
-    <div class="panel-actions">
-      <button class="btn btn-primary btn-sm" @click="openProvider()">新建上游</button>
+  <main class="page providers-page">
+    <div class="page-head">
+      <div><h1>上游服务</h1><div class="sub">接入服务、管理凭据与上游模型 · 全站配置</div></div>
+      <div class="head-actions"><button class="btn" :disabled="loading" @click="load">刷新</button><button class="btn btn-primary" @click="openCreate">新建上游</button></div>
     </div>
-
-    <div class="panel">
-      <div v-if="loading && providers.length === 0" class="loading">加载中…</div>
-      <!--加载失败**必须**与「确实没有数据」在界面上可区分：把请求失败呈现成
-           「暂无数据」会让运维误判为无流量，从而排除掉网关/上游故障这个方向。
-           与 Users/Groups 的错误态同口径。 -->
-      <div v-else-if="err" class="empty"><div class="big">⚠</div>{{ err }}</div>
-      <div v-else-if="providers.length === 0" class="empty">
-        <div class="big">∅</div>
-        还没有上游服务，点击右上角「新建上游」开始
-      </div>
-      <div v-else class="tbl-wrap">
-        <table class="tbl">
-          <thead>
-            <tr>
-              <th>上游</th>
-              <th>协议</th>
-              <th>Endpoint</th>
-              <th class="c-act">操作</th>
-            </tr>
-          </thead>
-          <!-- 每个上游自带一个 tbody，展开区作为该 tbody 里的第二个 <tr>。
-               不能把展开区写成 tbody 之外的 div —— 那不是合法的表格结构，
-               浏览器会把 tbody 之间的孤立行吞掉或重排。 -->
-          <tbody v-for="p in providers" :key="p.id">
-            <tr>
-              <td>
-                <div class="cell-key">
-                  <span class="name">{{ p.name }}</span>
-                  <span class="badge" :class="p.enabled ? 'badge-live' : 'badge-off'">{{ p.enabled ? '启用' : '停用' }}</span>
-                  <!-- 运行时未就绪：库里配得好好的，但上游池没建出任何可用凭据，
-                       请求打过去必然失败。改造前这个状态只进日志，界面上完全看不出来，
-                       运维只能靠「莫名 500」反推。只在「已启用」时标 ——
-                       停用是主动行为，不是故障。 -->
-                  <span
-                    v-if="p.enabled && !p.ready"
-                    class="badge badge-err"
-                    :title="p.ready_reason || '没有可用的上游凭据'"
-                  >
-                    未就绪
-                  </span>
-                </div>
-                <div class="sub-line mono">{{ p.slug }}</div>
-              </td>
+    <div class="data-toolbar">
+      <label class="search-field"><span class="sr-only">搜索上游</span><input v-model="search" class="input" type="search" placeholder="搜索名称、协议或 Endpoint" /></label>
+      <label><span class="sr-only">上游状态</span><select v-model="status" class="select"><option value="">全部状态</option><option value="ready">凭据就绪</option><option value="unready">未就绪</option><option value="disabled">已停用</option><option value="unknown">状态未知</option></select></label>
+      <span class="result-count">{{ filtered.length }} / {{ providers.length }} 个上游</span>
+    </div>
+    <p class="context-note">“凭据就绪”表示已构建可用凭据池；实时推理是否成功需结合模型探测与请求日志判断。</p>
+    <DataTable class="panel table-panel" label="上游列表" :loading="loading" :error="err" :has-data="!!providers.length" :empty="!filtered.length" @retry="load">
+      <template #empty><template v-if="!providers.length">尚未接入上游。新建后添加凭据与模型，再配置路由。</template><template v-else>没有匹配的上游<button class="btn btn-sm" @click="clearFilters">清除筛选</button></template></template>
+        <table class="tbl providers-table">
+          <thead><tr><th>上游 / Endpoint</th><th>协议</th><th>配置状态</th><th class="num-h">模型 / 凭据</th><th class="c-act">操作</th></tr></thead>
+          <tbody>
+            <tr v-for="p in filtered" :key="p.id">
+              <td class="provider-identity"><button class="text-link name-link" @click="goDetail(p)">{{ p.name || p.slug }}</button><div class="sub-line mono endpoint">{{ p.endpoint }}</div><span v-if="p.proxy_url" class="sub-line">经代理转发</span></td>
               <td><span class="badge">{{ p.protocol }}</span></td>
-              <td>
-                <span class="mono ep" :title="p.endpoint">{{ shortEndpoint(p.endpoint) }}</span>
-                <!-- 代理贴着 Endpoint：它说的就是「这个地址怎么到达」，
-                     拆到别的列会让人对不上是哪个上游走了代理。
-                     只在配了的时候才占一行 —— 绝大多数上游是直连的，
-                     每行都印一句「直连」只是噪音。 -->
-                <div v-if="p.proxy_url" class="sub-line dim" :title="`出站代理：${p.proxy_url}`">
-                  代理 {{ p.proxy_url }}
-                </div>
-                <!-- 未就绪的原因贴着 Endpoint：它说的就是「这个地址打不通」，
-                     拆到别的列会让人对不上是哪个上游出的问题。 -->
-                <div v-if="p.enabled && !p.ready && p.ready_reason" class="sub-line err">
-                  {{ p.ready_reason }}
-                </div>
-              </td>
-              <td class="c-act">
-                <div class="row-actions">
-                  <!-- provider 级的「测试」按钮已按需求移除。
-                       它拉的是 /models，只能证明「endpoint + 凭据通」，
-                       证明不了任何具体模型能推理 —— 而模型行现在各有自己的
-                       「测试」（发一次最小真实推理）。留着它反而提供一个
-                       比模型级测试更弱的绿色信号，容易被当成「都正常」。
-                       后端 POST /providers/{id}/test 与 api.testProvider
-                       都保留，只是不再从这一行触发。 -->
-                  <button class="btn btn-act btn-ghost" @click="openExpand(p.id)">
-                    {{ expandedId === p.id ? '收起' : '展开' }}
-                  </button>
-                  <button class="btn btn-act btn-ghost" @click="openProvider(p)">编辑</button>
-                  <button class="btn btn-act btn-danger" @click="removeProvider(p)">删除</button>
-                  <button class="switch" :class="{ on: p.enabled }" :title="p.enabled ? '停用' : '启用'" @click="toggleProvider(p)"></button>
-                </div>
-              </td>
-            </tr>
-
-            <tr v-if="expandedId === p.id" class="expand-row">
-              <td colspan="4">
-                <!-- 网络路径：排查「这个上游到底通不通」时第一眼要看的就是它。
-                     直连时只说结论、不占空间；配了代理才把地址摊开 ——
-                     因为「以为走了代理、实际在直连」是最难自己发现的那类
-                     配置偏差（网关会照常工作，只是慢或被墙）。 -->
-                <div class="net-line">
-                  <span class="net-label">网络</span>
-                  <template v-if="p.proxy_url">
-                    <span class="mono">{{ p.proxy_url }}</span>
-                    <span class="dim">→ 出站代理</span>
-                  </template>
-                  <span v-else class="dim">直连（不经过代理）</span>
-                </div>
-                <div class="expand-grid">
-                <!-- 展开区的两块内容已抽成子组件（2026-10-12）：
-                     本文件原本 1179 行，是整站最大的，而展开区叠着两张
-                     子表。抽出去后这里只剩「传数据 + 接事件」，
-                     写操作（换钥/删除/测试/查余额）仍全部留在本组件 ——
-                     没有第二处状态真相。 -->
-                <CredentialPanel
-                  :provider-id="p.id"
-                  :creds="credsMap[p.id] ?? []"
-                  :balance="balances[p.id]"
-                  :balance-busy="isBalanceBusy(p.id)"
-                  :toggling="credTogglingIds"
-                  :balance-spec-configured="!!p.balance_spec_json?.trim()"
-                  @add="openCred(p.id)"
-                  @query-balance="queryBalance(p.id)"
-                  @edit="(c) => openCred(p.id, c)"
-                  @remove="removeCred"
-                  @toggle="toggleCred"
-                />
-                <UpstreamModelPanel
-                  :models="modelsMap[p.id] ?? []"
-                  :testing="testing"
-                  :test-results="modelTestResults"
-                  @add="openModel(p.id)"
-                  @test="testModel"
-                  @edit="(m) => openModel(p.id, m)"
-                  @remove="removeModel"
-                />
-                </div>
-              </td>
+              <td class="provider-state"><span class="badge" :class="!p.enabled ? 'badge-off' : p.ready === false ? 'badge-st-error' : p.ready === true ? 'badge-live' : 'badge-dim'">{{ readyLabel(p) }}</span><div v-if="p.enabled && p.ready !== true" class="sub-line state-reason">{{ p.ready_reason || (p.ready === false ? '未建立可用凭据池，请检查凭据' : '暂未取得运行时状态') }}</div></td>
+              <td class="num"><span>{{ p.model_count ?? '—' }}</span><span class="dim"> / </span><span>{{ p.cred_count ?? '—' }}</span></td>
+              <td class="c-act"><div class="row-actions">
+                <button class="btn btn-act" @click="goDetail(p)">配置</button>
+                <button class="switch" :class="{ on: p.enabled }" role="switch" :aria-checked="p.enabled" :aria-label="(p.enabled ? '停用 ' : '启用 ') + p.name" :disabled="pending.has(p.id)" @click="toggleProvider(p)"></button>
+                <details class="row-menu"><summary :aria-label="'更多操作：' + p.name">⋯</summary><div class="row-menu-content"><button class="btn btn-sm btn-danger" :disabled="pending.has(p.id)" @click="removeProvider(p)">删除上游</button></div></details>
+              </div></td>
             </tr>
           </tbody>
         </table>
-      </div>
-    </div>
+    </DataTable>
 
-    <!-- Provider 表单：表单填一半别丢，遮罩/Esc 都不关 -->
-    <AppModal
-      :open="pForm.open"
-      :title="pForm.editing ? '编辑上游' : '新建上游'"
-      :dismissable="false"
-    >
+    <AppModal :open="pForm.open" title="新建上游" :dismissable="false">
       <form @submit.prevent="submitProvider">
         <div class="form-grid">
           <div class="field">
@@ -817,488 +190,39 @@ onMounted(() => {
             <label>Endpoint *</label>
             <input v-model="pForm.endpoint" class="input mono" placeholder="https://api.deepseek.com" />
           </div>
-          <div v-if="!pForm.editing" class="field span2">
+          <div class="field span2">
             <label>API Key</label>
-            <input v-model="pForm.api_key" class="input mono" type="password" placeholder="sk-...（可留空，稍后单独添加）" autocomplete="new-password" />
-            <span class="tip">添加即启用；slug、超时与重试将自动使用默认值</span>
-          </div>
-
-          <!-- 代理放在主表单而不是「高级选项」里：它是**网络连通性**的一部分，
-               和 Endpoint 是同一类配置 —— 建上游时通常就要一起决定好，
-               而「高级选项」只在编辑时才展开，等于逼着用户建完再改一次。
-
-               留空 = 不代理（直连或读网关进程的环境变量）。 -->
-          <div class="field span2">
-            <label>代理（可选）</label>
-            <input v-model="pForm.proxy_url" class="input mono" placeholder="http://127.0.0.1:7897" autocomplete="off" />
+            <input v-model="pForm.api_key" class="input mono" type="password" placeholder="sk-...（可留空，稍后在详情页添加）" autocomplete="new-password" />
             <span class="tip">
-              只对这个上游生效，其它上游不受影响。支持 http / https / socks5 /
-              socks5h（<code>socks5h</code> 让 DNS 也走代理，本地 DNS 被污染时用它）。
-              留空表示不代理。填错不会阻断请求，但该上游会<strong>退回直连</strong>，
-              网关日志里会留一条告警。
-              <br />
-              <strong>网关跑在 Docker 里时注意</strong>：<code>127.0.0.1</code>
-              指的是网关容器自己，不是宿主机。代理也在容器里的话，填
-              <code>http://代理容器名:端口</code>（同一 Docker 网络内用容器名互访）；
-              代理在宿主机上时才用 <code>host.docker.internal</code>。
+              添加即启用；slug、超时与重试将自动使用默认值。
+              代理与余额查询可在创建后到详情页设置。
             </span>
-          </div>
-
-          <!-- 余额查询配置只在**编辑**时出现（新建时留空即可）。
-
-               为什么不放在主表单：内置的自动判定对 OpenAI 官方与 DeepSeek
-               已经够用，新建上游时不需要为它懂任何知识。只有接中转站、
-               自建网关、或 Moonshot/OpenRouter 这类自带余额端点的上游才要填 ——
-               那已经是「这个上游有点特殊」的信号，与高级选项同档。
-
-               留空 = 回到自动判定，点「查余额」时若两者都试不出就说不支持。 -->
-          <template v-if="pForm.editing">
-            <div class="field span2">
-              <button type="button" class="btn btn-sm btn-ghost" @click="pForm.showAdvanced = !pForm.showAdvanced">
-                {{ pForm.showAdvanced ? '收起高级选项' : '展开高级选项' }}
-              </button>
-            </div>
-            <template v-if="pForm.showAdvanced">
-              <div class="field span2">
-                <label>余额查询（可选）</label>
-                <textarea
-                  v-model="pForm.balance_spec_json"
-                  class="input mono"
-                  rows="2"
-                  spellcheck="false"
-                  placeholder='{"path":"/credits","field":"data.remaining","currency":"USD"}'
-                ></textarea>
-                <span class="tip">
-                  填 JSON，留空则用内置判定（OpenAI 官方与 DeepSeek 自动识别，其余上报「不支持」）。
-                  <code>path</code> 必填，是以 <code>/</code> 开头的相对路径；
-                  <code>field</code> 是余额在响应里的点号路径（默认 <code>balance</code>）；
-                  <code>currency</code> 只是标单位、不做换算；
-                  <code>auth</code> 取 <code>bearer</code>（默认）或 <code>anthropic</code>。
-                  <br />
-                  例：OpenRouter 是 <code>{{ openRouterSpec }}</code>。
-                  填错会在保存时直接报错，不会等到点「查余额」才失败。
-                </span>
-              </div>
-            </template>
-          </template>
-
-          <template v-if="pForm.editing">
-            <div class="field span2">
-              <button type="button" class="btn btn-sm btn-ghost" @click="pForm.showAdvanced = !pForm.showAdvanced">
-                {{ pForm.showAdvanced ? '收起高级选项' : '展开高级选项' }}
-              </button>
-            </div>
-            <template v-if="pForm.showAdvanced">
-              <div class="field">
-                <label>Slug</label>
-                <input :value="pForm.slug" class="input mono" disabled />
-                <span class="tip">系统生成，不可修改</span>
-              </div>
-              <div class="field">
-                <label>超时（毫秒）</label>
-                <input v-model.number="pForm.timeout_ms" class="input num" type="number" min="0" step="1" />
-                <span class="tip">0 = 使用全局默认</span>
-              </div>
-              <div class="field">
-                <label>最大重试</label>
-                <input v-model.number="pForm.max_retries" class="input num" type="number" min="0" max="10" step="1" />
-                <span class="tip">
-                  仅作用于<strong>幂等</strong>请求（如连通性测试时的 GET /models）。
-                  对话是 POST，SDK 不会重试 —— 重试由「故障转移链换目标」承担。
-                </span>
-              </div>
-            </template>
-          </template>
-        </div>
-        <div class="form-actions">
-          <button type="button" class="btn btn-ghost" @click="pForm.open = false">取消</button>
-          <button type="submit" class="btn btn-primary">保存</button>
-        </div>
-      </form>
-    </AppModal>
-
-    <!-- 凭据表单：表单填一半别丢，遮罩/Esc 都不关 -->
-    <AppModal
-      :open="cForm.open"
-      :title="cForm.editing ? '更新凭据' : '添加凭据'"
-      max-width="480px"
-      :dismissable="false"
-    >
-      <form @submit.prevent="submitCred">
-        <div class="form-grid">
-          <div class="field span2">
-            <label>标签</label>
-            <input v-model="cForm.label" class="input" placeholder="主账号 / 备用池" />
-          </div>
-          <div class="field span2">
-            <label>API Key {{ cForm.editing ? '（留空则不更换）' : '*' }}</label>
-            <input v-model="cForm.api_key" class="input mono" type="password" placeholder="sk-..." autocomplete="new-password" />
-            <span class="tip">保存后加密入库，仅显示掩码，不再可见明文</span>
-          </div>
-          <!-- 启停不在表单里问（同 Routes 页的理由：问的是还没发生的事）。
-               但「同时只启用一把」的默认规则必须提前讲清楚，否则用户
-               会把新 key 加进来就以为它已经在跑，实际是停用态。 -->
-          <div v-if="!cForm.editing" class="field span2">
-            <span class="tip">
-              同一上游同时只启用一把 key：若该上游已有启用的凭据，新建的这把会先以
-              <strong>停用</strong>状态保存 —— 确认可用后在凭据列表里打开它的开关即可切换。
-            </span>
-          </div>
-          <!-- 权重输入框已按需求移除。weight 列与负载均衡逻辑都还在，
-               只是界面上不再提供入口；已有凭据的权重保持原值不被改写。 -->
-        </div>
-        <div class="form-actions">
-          <button type="button" class="btn btn-ghost" @click="cForm.open = false">取消</button>
-          <button type="submit" class="btn btn-primary">保存</button>
-        </div>
-      </form>
-    </AppModal>
-
-    <!-- 模型：编辑单条（表单填一半别丢，遮罩/Esc 都不关） -->
-    <AppModal
-      v-if="mForm.editing"
-      :open="mForm.open"
-      title="编辑上游模型"
-      max-width="500px"
-      :dismissable="false"
-    >
-      <form @submit.prevent="submitModel">
-        <div class="form-grid">
-          <div class="field span2">
-            <label>上游模型名（model_id）*</label>
-            <input v-model="mForm.model_id" class="input mono" placeholder="deepseek-chat" />
-            <span class="tip">上游 API 接受的真实模型名</span>
-          </div>
-          <div class="field">
-            <label>上下文窗口</label>
-            <input v-model.number="mForm.context_window" class="input num" type="number" min="0" step="1" placeholder="0 = 未设置" />
-          </div>
-          <div class="field">
-            <label>最大输出</label>
-            <input v-model.number="mForm.max_output_tokens" class="input num" type="number" min="0" step="1" placeholder="0 = 未设置" />
-          </div>
-          <div class="field span2">
-            <span class="tip">单价（元/1M tokens）在「设置 → 模型价格」里按供应商 × 模型配置</span>
-          </div>
-          <!-- 「能否思考」用三态而不是 checkbox：这是不少工具侧的那个开关，
-               而它的第三态（未配置）有真实语义 —— 网关不干预。把未配置
-               显示成「不支持」会让所有没配过的模型凭空失去思考能力。 -->
-          <div class="field span2">
-            <label>思考模式</label>
-            <div class="tri-switch" role="radiogroup" aria-label="思考模式">
-              <button
-                v-for="opt in thinkingOptions"
-                :key="opt.v"
-                type="button"
-                class="btn btn-sm"
-                :class="mForm.thinking === opt.v ? 'btn-primary' : 'btn-ghost'"
-                role="radio"
-                :aria-checked="mForm.thinking === opt.v"
-                @click="setThinking(opt.v)"
-              >
-                {{ opt.label }}
-              </button>
-            </div>
-            <span class="tip">
-              「未配置」= 网关不干预，客户端要什么就发什么；「不支持」= 数据面会
-              剥掉请求上的思考配置（并随 /v1/models 下发该声明）。该声明同时注入
-              SDK 的模型档案。
-            </span>
-          </div>
-
-          <!-- 思考挡位。用勾选而不是自由文本：档位名拼错（"x-hig"）在库里
-               就成了一个网关不认、上游也未必认的值，而它的表现是「配了不生效」
-               —— 那正是这一行要消灭的失败。勾选保证写进去的每个值都有定义。
-
-               只在「明确支持思考」或「未配置」时出现：声明不支持思考却配着档位
-               是自相矛盾的（setThinking 会顺手清空它），没有可展示的余地。 -->
-          <div v-if="mForm.thinking !== 'no'" class="field span2">
-            <label>思考挡位</label>
-            <div class="effort-picker">
-              <button
-                v-for="l in knownEffortLevels"
-                :key="l"
-                type="button"
-                class="btn btn-sm"
-                :class="hasEffortLevel(l) ? 'btn-primary' : 'btn-ghost'"
-                :aria-pressed="hasEffortLevel(l)"
-                @click="toggleEffortLevel(l)"
-              >
-                {{ l }}
-              </button>
-            </div>
-            <span class="tip">
-              勾选该模型**真实支持**的思考强度档位。一个都不勾 = 未配置，网关不干预强度。
-              客户端选了不在此列表里的档位时，网关会就近夹取（例如要 xhigh 而模型只支持
-              high）并在日志留痕；档位**原样**发往上游（xhigh 不会被压成 high）。
-              这份列表也会随 /v1/models 下发给 agent 工具（supported_reasoning）。
-            </span>
-          </div>
-          <div class="field span2">
-            <label class="check-line">
-              <input v-model="mForm.enabled" type="checkbox" />
-              启用该模型
-            </label>
           </div>
         </div>
         <div class="form-actions">
-          <button type="button" class="btn btn-ghost" @click="mForm.open = false">取消</button>
-          <button type="submit" class="btn btn-primary">保存</button>
+          <button type="button" class="btn btn-ghost" :disabled="saving" @click="pForm.open = false">取消</button>
+          <button type="submit" class="btn btn-primary" :disabled="saving">{{ saving ? '保存中…' : '创建上游' }}</button>
         </div>
       </form>
     </AppModal>
-
-    <!-- 模型：探测 + 多选胶囊式添加（勾选状态是填到一半的「表单」，同样不许误关） -->
-    <AppModal
-      v-else
-      :open="mForm.open"
-      title="添加上游模型"
-      max-width="560px"
-      :dismissable="false"
-    >
-      <div class="add-model">
-        <div class="am-toolbar">
-          <button type="button" class="btn btn-sm" :disabled="discovering" @click="runDiscover">
-            {{ discovering ? '获取中…' : '获取模型列表' }}
-          </button>
-          <input
-            v-if="discovered.length"
-            v-model="filter"
-            class="input input-sm"
-            placeholder="搜索模型…"
-            style="flex: 1"
-          />
-        </div>
-        <span v-if="discoverMsg" class="tip" style="color: var(--danger)">{{ discoverMsg }}</span>
-
-        <!-- 已选胶囊池：点击列表项加入，点 × 移除 -->
-        <div v-if="selected.length" class="pill-pool">
-          <span v-for="s in selected" :key="s.model_id" class="pill">
-            <span class="mono">{{ s.model_id }}</span>
-            <button type="button" class="pill-x" title="移除" @click="removeSelected(s.model_id)">×</button>
-          </span>
-        </div>
-
-        <!-- 可选列表 -->
-        <div v-if="discovered.length" class="discover-list">
-          <button
-            v-for="d in filteredDiscovered"
-            :key="d.model_id"
-            type="button"
-            class="discover-item"
-            :class="{ active: isSelected(d.model_id) }"
-            @click="toggleSelect(d)"
-          >
-            <span class="di-check">{{ isSelected(d.model_id) ? '✓' : '+' }}</span>
-            <span class="mono">{{ d.model_id }}</span>
-            <!-- 挡位徽章（2026-10-14）：上游 /models 报了 reasoning 挡位时显示出来，
-                 让管理员在导入**之前**就知道这批模型会带上配置 ——
-                 否则「导入后挡位 mysteriously 已配好」反而让人怀疑自己
-                 误配过，而想复核还得逐个进编辑弹窗看。
-
-                 措辞区分两种情况（与后端 upsert 的 COALESCE 方向一致）：
-                 上游报了 → 「思考 xxx」将被回填（仅当库里还没配）；
-                 上游没报 → 「思考 待配置」，提醒需要手工勾。 -->
-            <span v-if="d.effort_levels" class="badge badge-accent di-lvls">
-              思考 {{ d.effort_levels }}
-            </span>
-            <span v-else class="badge di-lvls dim-lvls">思考 待配置</span>
-            <span class="di-cap">{{ d.context_window ? d.context_window + ' ctx' : '' }}{{ d.context_window && d.max_output_tokens ? ' / ' : '' }}{{ d.max_output_tokens ? d.max_output_tokens + ' out' : '' }}</span>
-          </button>
-        </div>
-        <div v-else-if="!discovering && !discoverMsg" class="empty" style="padding: 18px 0">
-          点击「获取模型列表」拉取上游可用模型
-        </div>
-      </div>
-      <div class="form-actions">
-        <button type="button" class="btn btn-ghost" @click="mForm.open = false">取消</button>
-        <button
-          type="button"
-          class="btn btn-primary"
-          :disabled="!selected.length || importing"
-          @click="confirmImport"
-        >
-          {{ importing ? '添加中…' : `添加（${selected.length}）` }}
-        </button>
-      </div>
-    </AppModal>
-  </div>
+  </main>
 </template>
 
 <style scoped>
-/* 表格末线的去留见 styles.css 的共享块（多 tbody 结构的理由记在那里）。 */
-/* 单元格骨架（.cell-key）用全局的（styles.css），这里只留页面私有部分。 */
-.sub-line.err { color: var(--danger); }
-/* 单模型探测结果。成功/失败用与全局错误态一致的语义色，
-   且允许换行：上游的失败原因是整句话，nowrap 会把它截断成看不全的半截。 */
-.test-ok { color: var(--success); }
-.test-err { color: var(--danger); white-space: normal; }
-/* 凭据余额行。ok 用成功色，unsupported 用中性灰（它是「不适用」而不是故障，
-   染成红色会让人以为要去修一个根本不存在的问题）。允许换行：余额附注常是
-   一整句上游文案（额度不足、下周重置），nowrap 会把它截成看不懂的半截。 */
-.bal-line { white-space: normal; }
-.bal-ok { color: var(--success); }
-.bal-na { color: var(--text-4); }
-.bal-cell { min-width: 0; }
-/* 挡位选择器：按钮按强度从弱到强排成一行，间距足够让「勾了哪几个」一眼可分。 */
-.effort-picker {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 6px;
-  margin-bottom: 4px;
-}
-/* 三态选择器与挡位选择器同一套按钮，靠 tri-switch 的类名区分间距与语义；
-   独立成类是为了让「这是互斥的三选一」在 CSS 上也可读（radiogroup 的角色
-   由模板给出，这里只管视觉）。 */
-.tri-switch {
-  display: flex;
-  gap: 6px;
-  margin-bottom: 4px;
-}
-/* Endpoint 的兜底宽度：shortEndpoint 已经把绝大多数地址掐到 44 字符内，
-   这条 max-width 只兜极端情况（超长自定义路径），真正的主战场是 JS 截断，
-   因为 CSS 的尾部省略会把路径尾巴吃掉。 */
-.ep { display: inline-block; max-width: 360px; overflow: hidden; text-overflow: ellipsis; vertical-align: bottom; }
-/* 展开区：整行铺满。它是详情而不是一条记录，所以不吃表格的行高亮。 */
-.expand-row:hover { background: transparent; }
-.expand-row > td { padding: 14px 12px 18px; white-space: normal; }
-/* 网络路径条：贴在展开区顶部、两张子表之上。它是这一层的「前提」——
-   凭据解不开、模型测试超时，往下翻之前先该知道流量是怎么出去的。 */
-.net-line {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  flex-wrap: wrap;
-  margin-bottom: 12px;
-  padding-bottom: 10px;
-  border-bottom: 1px solid var(--separator);
-  font-size: 12.5px;
-}
-.net-label {
-  color: var(--muted);
-  font-size: 11.5px;
-  padding: 1px 6px;
-  border-radius: var(--r-chip, 6px);
-  background: var(--surface-secondary);
-}
-/* 子表比主表更紧凑：两层同尺寸表头会把展开区撑成一堵墙，
-   而凭据/模型往往一列就是十几行。 */
-.sub-tbl { font-size: 12.5px; }
-.sub-tbl th,
-.sub-tbl td { padding: 6px 8px; }
-.sub-empty { padding: 14px 0; }
-.sr {
-  font-size: 11px;
-  padding: 1px 7px;
-  border-radius: var(--r-chip, 6px);
-  background: var(--success-soft);
-  color: var(--success-soft-foreground);
-}
-.sr.warn {
-  background: var(--warning-soft);
-  color: var(--warning-soft-foreground);
-}
-.add-model {
-  display: flex;
-  flex-direction: column;
-  gap: 10px;
-}
-.am-toolbar {
-  display: flex;
-  gap: 8px;
-  align-items: center;
-}
-.pill-pool {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 6px;
-}
-.pill {
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
-  padding: 4px 6px 4px 10px;
-  font-size: 12px;
-  border-radius: var(--r-pill, 999px);
-  background: var(--accent-soft);
-  border: 1px solid color-mix(in oklab, var(--accent) 30%, transparent);
-  color: var(--accent-soft-foreground);
-}
-.pill-x {
-  border: none;
-  background: transparent;
-  color: inherit;
-  cursor: pointer;
-  font-size: 14px;
-  line-height: 1;
-  padding: 0 2px;
-  opacity: 0.7;
-}
-.pill-x:hover {
-  opacity: 1;
-}
-.discover-list {
-  margin-top: 8px;
-  max-height: 300px;
-  overflow-y: auto;
-  display: flex;
-  flex-direction: column;
-  gap: 4px;
-  border: 1px solid var(--border);
-  border-radius: var(--r-thumb, 12px);
-  padding: 6px;
-}
-.discover-item {
-  display: flex;
-  gap: 8px;
-  align-items: center;
-  justify-content: flex-start;
-  text-align: left;
-  background: transparent;
-  border: 1px solid transparent;
-  border-radius: var(--r-chip, 6px);
-  padding: 6px 8px;
-  font-size: 12px;
-  cursor: pointer;
-  color: var(--text-2, inherit);
-}
-.discover-item:hover {
-  background: var(--default);
-}
-.discover-item.active {
-  border-color: var(--accent);
-  color: var(--text);
-}
-.di-check {
-  width: 16px;
-  text-align: center;
-  color: var(--accent);
-}
-/* 挡位徽章（2026-10-14）：紧跟模型名、在容量之前 —— 读序是「这是什么、
-   它能怎么思考、多大」。flex:none 防止长档位串把容量挤掉。
-   弱化底色：它是导入时的**附带信息**，不是选中状态的主要提示。 */
-.di-lvls {
-  flex: none;
-  font-weight: 500;
-  margin-right: 2px;
-  max-width: 220px;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-/* 上游没报挡位时的弱化形态：它表达的是「这件事需要人工处理」，
-   不是「已配好」，所以不能与上面那个 accent 徽章同色 —— 同色会让人
-   以为已经生效了。 */
-.dim-lvls {
-  background: var(--default);
-  color: var(--text-3);
-  font-weight: 400;
-}
-.di-cap {
-  margin-left: auto;
-  color: var(--text-4);
-  white-space: nowrap;
+.providers-table { min-width: 760px; }
+.provider-identity { width: 34%; min-width: 240px; }
+.name-link { font-weight: 650; text-align: left; overflow-wrap: anywhere; }
+.endpoint { color: var(--muted); font-size: 12px; overflow-wrap: anywhere; }
+.provider-state { width: 25%; min-width: 180px; }
+.state-reason { max-width: 320px; white-space: normal; color: var(--danger); font-size: 12px; }
+@media (max-width: 640px) {
+  .providers-table { min-width: 0; table-layout: fixed; }
+  .providers-table th:nth-child(2), .providers-table td:nth-child(2),
+  .providers-table th:nth-child(4), .providers-table td:nth-child(4),
+  .providers-table th:nth-child(5), .providers-table td:nth-child(5) { display: none; }
+  .provider-identity { min-width: 0; width: 56%; }
+  .provider-state { min-width: 0; width: 44%; }
+  .provider-state .badge { padding: 0 6px; }
+  .name-link { white-space: normal; }
 }
 </style>
-
-

@@ -61,6 +61,52 @@ watch(
   },
 )
 
+// 导航按任务与角色组织，图标沿用项目的描边风格。
+const icons = {
+  overview: 'M3 3h7v7H3z M14 3h7v7h-7z M3 14h7v7H3z M14 14h7v7h-7z',
+  history: 'M4 3h16v18H4z M8 7h8 M8 12h8 M8 17h5',
+  usage: 'M4 20V10 M12 20V4 M20 20v-7',
+  routes: 'M3 12h7 M10 12l5-7h6 M10 12l5 7h6 M17 3l4 2-4 2 M17 17l4 2-4 2',
+  providers: 'M3 3h18v7H3z M3 14h18v7H3z M7 7h.01 M7 18h.01',
+  users: 'M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2 M9 3a4 4 0 1 0 0 8 4 4 0 0 0 0-8 M17 4a4 4 0 0 1 0 7 M22 21v-2a4 4 0 0 0-3-3.87',
+  wallet: 'M3 5h17v15H3z M3 5V3h14 M15 11h6v5h-6z',
+  settings: 'M12 3v3 M12 18v3 M3 12h3 M18 12h3 M5.6 5.6l2.1 2.1 M16.3 16.3l2.1 2.1 M5.6 18.4l2.1-2.1 M16.3 7.7l2.1-2.1 M12 8a4 4 0 1 0 0 8 4 4 0 0 0 0-8',
+  models: 'M12 3l9 5v8l-9 5-9-5V8z M3 8l9 5 9-5 M12 13v8',
+  keys: 'M14 4a6 6 0 1 1-4 10l-7 7v-5l7-7a6 6 0 0 1 4-5 M17 7h.01',
+}
+const navigation = computed(() => isAdmin() ? [
+  { label: '运行', items: [
+    { to: '/', label: '网关总览', icon: icons.overview },
+    { to: '/history', label: '请求日志', icon: icons.history },
+    { to: '/usage', label: '用量与费用', icon: icons.usage },
+  ] },
+  { label: '网关配置', items: [
+    { to: '/routes', label: '模型与路由', icon: icons.routes },
+    { to: '/providers', label: '上游服务', icon: icons.providers },
+    { to: '/users', label: '用户与权限', icon: icons.users },
+  ] },
+  { label: '管理', items: [
+    { to: '/wallet', label: '账户与充值', icon: icons.wallet },
+    { to: '/settings', label: '系统设置', icon: icons.settings },
+  ] },
+] : [
+  { label: '我的工作台', items: [
+    { to: '/', label: '我的总览', icon: icons.overview },
+    { to: '/models', label: '可用模型', icon: icons.models },
+    { to: '/keys', label: 'API 密钥', icon: icons.keys },
+    { to: '/history', label: '我的调用', icon: icons.history },
+    { to: '/wallet', label: '余额与账单', icon: icons.wallet },
+  ] },
+])
+const locationLabel = computed(() => {
+  if (route.path === '/account') return '账号 / 安全设置'
+  for (const group of navigation.value) {
+    const item = group.items.find(i => i.to === route.path || (i.to !== '/' && route.path.startsWith(i.to + '/')))
+    if (item) return (isAdmin() ? '管理控制台' : '个人工作台') + ' / ' + group.label
+  }
+  return isAdmin() ? '管理控制台' : '个人工作台'
+})
+
 // ---------- 身份 ----------
 //
 // 管理面只有一条通道：users 表里的账号 + 会话。App 不再持有任何凭据 UI，
@@ -211,141 +257,23 @@ watch(
         <div class="side-logo">RG</div>
         <div v-if="!railCollapsed" class="side-title">
           <span class="side-name">Rosetta Gateway</span>
-          <span class="side-sub">管理后台</span>
+          <span class="side-sub">{{ isAdmin() ? '管理控制台' : '个人工作台' }}</span>
         </div>
       </div>
 
-      <!-- admin-only 页签对普通用户隐藏。真正的拦截在路由守卫与后端，
-           这里只是不让用户看到点进去才发现没权限的入口。
-
-           顺序按「从常看到配置」排（2026-10-10 调整，同日二次修正）：
-           总览 → 访问密钥 → 可用模型 → 钱包与充值 → 调用历史
-                → 上游与模型 → 路由 → 用户与分组 → 设置。
-           admin 部分的动线是「看概况 → 配上游 → 配路由 → 管人 → 改设置」，
-           每一步都建立在前面步骤的产物上。
-           个人功能（密钥 / 模型 / 钱包 / 调用历史）放在 admin 区之外，
-           因为它们是**普通用户仅有的**四个页面，而管理员看这些页面时
-           拿到的仍是自己的那一份（后端按身份收窄），不存在只有管理员
-           才需要的内容。删减个人区会直接让普通用户无处可去，
-           所以这几个入口不再随管理员动线调整而增删。 -->
-      <nav class="side-nav" aria-label="管理后台导航">
-        <RouterLink class="side-item" to="/" :title="railCollapsed ? '总览' : undefined">
-          <svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-            <rect width="7" height="9" x="3" y="3" rx="1" />
-            <rect width="7" height="5" x="14" y="3" rx="1" />
-            <rect width="7" height="9" x="14" y="12" rx="1" />
-            <rect width="7" height="5" x="3" y="16" rx="1" />
-          </svg>
-          <span v-if="!railCollapsed">总览</span>
-        </RouterLink>
-        <!-- 「可用模型」排在第二位（2026-10-14 按用户要求重排）：
-             它回答的是「我实际能调哪些模型、单价多少、此刻通不通」，
-             紧跟在总览之后 —— 前两页都是「我的现状」，第三页才是「钱」。
-             ModelPicker 不能替代它：那只是建 key 表单里的一个控件，
-             「一个都不选 = 不限制」的配置态语义与本页的「我实际能用哪些」
-             正好相反（见 Models.vue 文件头注释）。连通率也已并进它的卡片。 -->
-        <RouterLink class="side-item" to="/models" :title="railCollapsed ? '可用模型' : undefined">
-          <svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-            <path d="M12 2a3 3 0 0 0-3 3v1a3 3 0 0 0-3 3v1a3 3 0 0 0 0 6v1a3 3 0 0 0 3 3v1a3 3 0 0 0 6 0v-1a3 3 0 0 0 3-3v-1a3 3 0 0 0 0-6V9a3 3 0 0 0-3-3V5a3 3 0 0 0-3-3Z" />
-            <path d="M12 8v8M8 12h8" />
-          </svg>
-          <span v-if="!railCollapsed">可用模型</span>
-        </RouterLink>
-        <RouterLink class="side-item" to="/profile" :title="railCollapsed ? '钱包与充值' : undefined">
-          <svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-            <path d="M18 20a6 6 0 0 0-12 0" />
-            <circle cx="12" cy="10" r="4" />
-            <circle cx="12" cy="12" r="10" />
-          </svg>
-          <span v-if="!railCollapsed">钱包与充值</span>
-        </RouterLink>
-        <!-- 以下两项**只对普通用户显示**：它们在管理区已被同名的入口覆盖，
-             给管理员再放一份只会让侧栏出现两处指向同一页的项（点哪一处
-             都对，但人会怀疑自己看错了）。
-
-             1) 调用历史：管理区那一项按用户指定的顺序排进了「管理」段，
-                而本页对普通用户仍然开放（后端按身份收窄作用域），所以
-                普通用户的侧栏必须自己有一份 —— 否则他们将完全失去入口。
-             2) 用户与分组（= 访问密钥页签）：这是普通用户管理自己凭据的
-                唯一入口，删不得。管理员则从管理区那一项进（见上）。 -->
-        <RouterLink v-if="!isAdmin()" class="side-item" to="/usage" :title="railCollapsed ? '用量统计' : undefined">
-          <svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-            <path d="M3 12a9 9 0 1 0 9-9 9.75 9.75 0 0 0-6.74 2.74L3 8" />
-            <path d="M3 3v5h5" />
-            <path d="M12 7v5l4 2" />
-          </svg>
-          <span v-if="!railCollapsed">用量统计</span>
-        </RouterLink>
-        <RouterLink v-if="!isAdmin()" class="side-item" to="/users" :title="railCollapsed ? '用户与分组' : undefined">
-          <svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-            <path d="M2 18v3c0 .6.4 1 1 1h4v-3h3v-3h2l1.4-1.4a6.5 6.5 0 1 0-4-4Z" />
-            <circle cx="16.5" cy="7.5" r=".5" fill="currentColor" />
-          </svg>
-          <span v-if="!railCollapsed">用户与分组</span>
-        </RouterLink>
-        <!-- 分组分隔（2026-10-12）：上面是「我的」，下面是「管全站的」。
-             分类此前只存在于这段注释里 —— 模板上一串图标项长得完全一样，
-             管理员看不出哪些是自己的、哪些影响所有人。
-             收起态只留一条 hairline：没有横向空间放文字，但分组边界仍在。
-
-             顺序（2026-10-14 按用户指定）：总览 → 可用模型 → 钱包与充值
-             ‖ 上游与模型 → 用户与分组 → 调用历史 → 设置。 -->
-        <div v-if="isAdmin()" class="side-sep" :class="{ 'sep-label': !railCollapsed }">
-          <span v-if="!railCollapsed" class="side-sep-text">管理</span>
+      <nav class="side-nav" aria-label="网关导航">
+        <div v-for="group in navigation" :key="group.label" class="nav-group">
+          <div class="side-sep sep-label"><span v-if="!railCollapsed" class="side-sep-text">{{ group.label }}</span></div>
+          <RouterLink v-for="item in group.items" :key="item.to" class="side-item" :to="item.to" :class="{ 'nav-active': route.path === item.to || item.to !== '/' && route.path.startsWith(item.to + '/') || isAdmin() && item.to === '/users' && route.name === 'keys' }" :title="railCollapsed ? item.label : undefined" :aria-label="item.label">
+            <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path :d="item.icon" /></svg>
+            <span v-if="!railCollapsed">{{ item.label }}</span>
+          </RouterLink>
         </div>
-        <template v-if="isAdmin()">
-          <!-- 「模型归组」「连通率」「路由」不再是独立侧栏项（2026-10-14）：
-               三个与「上游与模型」合成一页三个页签，连通率则并进了
-               「可用模型」的每张模型卡。老地址都留了重定向（见 router.ts），
-               所以旧书签不会 404。 -->
-          <RouterLink class="side-item" to="/providers" :title="railCollapsed ? '上游与模型' : undefined">
-            <svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-              <rect width="20" height="8" x="2" y="2" rx="2" ry="2" />
-              <rect width="20" height="8" x="2" y="14" rx="2" ry="2" />
-              <line x1="6" x2="6.01" y1="6" y2="6" />
-              <line x1="6" x2="6.01" y1="18" y2="18" />
-            </svg>
-            <span v-if="!railCollapsed">上游与模型</span>
-          </RouterLink>
-          <!-- 「用户 / 分组 / 访问密钥」合并成一页三个页签（2026-10-14）：
-               分组是用户的属性（users.group_id），访问密钥又是用户自己的凭据
-               —— 排查「这把 key 为什么调不通这个模型」要同时看这三处。
-               位置与「访问密钥」在个人区时等价（用户与密钥同一条权限链），
-               只是这一项在 admin 模板内，因此普通用户的侧栏没有它 ——
-               他们改用自己的入口在下面。 -->
-          <RouterLink class="side-item" to="/users" :title="railCollapsed ? '用户与分组' : undefined">
-            <svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-              <path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2" />
-              <circle cx="9" cy="7" r="4" />
-              <path d="M22 21v-2a4 4 0 0 0-3-3.87" />
-              <path d="M16 3.13a4 4 0 0 1 0 7.75" />
-            </svg>
-            <span v-if="!railCollapsed">用户与分组</span>
-          </RouterLink>
-          <!-- 「调用历史」移进管理区（2026-10-14 按用户指定的顺序）。它仍对
-               普通用户开放 —— 钱包页给的是**聚合数**，而排障要的是**逐条明细**
-               （「我刚才那次为什么报错 / 为什么这么慢 / 为什么花了 0.4 分」，
-               钱包页一个都答不了），后端也早已按身份收窄作用域。
-
-               所以这里**不能**写成 meta.adminOnly 那种隐藏式归类：普通用户
-               仍需要这一页，只是侧栏上没有这一段。个人区那个等价入口见下。 -->
-          <RouterLink class="side-item" to="/usage" :title="railCollapsed ? '用量统计' : undefined">
-            <svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-              <path d="M3 12a9 9 0 1 0 9-9 9.75 9.75 0 0 0-6.74 2.74L3 8" />
-              <path d="M3 3v5h5" />
-              <path d="M12 7v5l4 2" />
-            </svg>
-            <span v-if="!railCollapsed">用量统计</span>
-          </RouterLink>
-          <RouterLink class="side-item" to="/settings" :title="railCollapsed ? '设置' : undefined">
-            <svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-              <path d="M12.22 2h-.44a2 2 0 0 0-2 2v.18a2 2 0 0 1-1 1.73l-.43.25a2 2 0 0 1-2 0l-.15-.08a2 2 0 0 0-2.73.73l-.22.38a2 2 0 0 0 .73 2.73l.15.1a2 2 0 0 1 1 1.72v.51a2 2 0 0 1-1 1.74l-.15.09a2 2 0 0 0-.73 2.73l.22.38a2 2 0 0 0 2.73.73l.15-.08a2 2 0 0 1 2 0l.43.25a2 2 0 0 1 1 1.73V20a2 2 0 0 0 2 2h.44a2 2 0 0 0 2-2v-.18a2 2 0 0 1 1-1.73l.43-.25a2 2 0 0 1 2 0l.15.08a2 2 0 0 0 2.73-.73l.22-.39a2 2 0 0 0-.73-2.73l-.15-.08a2 2 0 0 1-1-1.74v-.5a2 2 0 0 1 1-1.74l.15-.09a2 2 0 0 0 .73-2.73l-.22-.38a2 2 0 0 0-2.73-.73l-.15.08a2 2 0 0 1-2 0l-.43-.25a2 2 0 0 1-1-1.73V4a2 2 0 0 0-2-2z" />
-              <circle cx="12" cy="12" r="3" />
-            </svg>
-            <span v-if="!railCollapsed">设置</span>
-          </RouterLink>
-        </template>
       </nav>
+      <RouterLink to="/account" class="side-item account-link" title="账号设置" aria-label="账号设置">
+        <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="1.75" aria-hidden="true"><circle cx="12" cy="8" r="4" /><path d="M4 21v-2a8 8 0 0 1 16 0v2" /></svg>
+        <span v-if="!railCollapsed">账号设置</span>
+      </RouterLink>
 
       <div class="side-foot">
         <span class="side-version">v{{ appVersion }} · rosetta {{ rosettaVersion }}</span>
@@ -365,12 +293,8 @@ watch(
 
     <div class="main-col">
       <header class="topbar" :class="{ scrolled }">
-        <!-- 当前页标题（2026-10-12）：页面自己的 <h1> 在 .content 里，
-             一滚就消失了；而 ≤900px 时侧栏收成图标栏，滚到长表格中段
-             既看不到标题也看不到文字导航，用户不知道自己在哪。
-             标题取路由 meta.title，与 router.afterEach 设 document.title
-             的是**同一个来源**，不会两处漂移。 -->
-        <span class="topbar-title">{{ route.meta.title }}</span>
+        <!-- 顶栏提供作用域与分区，任务标题由页面 h1 显示。 -->
+        <span class="topbar-title">{{ locationLabel }}</span>
         <span
           v-if="session.me"
           class="who"

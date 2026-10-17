@@ -1,4 +1,5 @@
 <script setup lang="ts">
+import DataTable from '../components/DataTable.vue'
 import { computed, onMounted, reactive, ref } from 'vue'
 import { api, isAdmin, session } from '../api'
 import { toast, confirmBox } from '../ui'
@@ -586,7 +587,7 @@ async function recomputeUsage(k: AccessKey) {
           <button class="btn btn-sm" @click="resetFilter">清除筛选</button>
         </div>
       </div>
-      <div v-else class="tbl-wrap">
+      <DataTable v-else label="调用密钥">
         <table class="tbl">
           <thead>
             <tr>
@@ -674,7 +675,7 @@ async function recomputeUsage(k: AccessKey) {
             </tr>
           </tbody>
         </table>
-      </div>
+      </DataTable>
     </div>
 
     <!-- 创建表单：表单填一半别丢，遮罩/Esc 都不关 -->

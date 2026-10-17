@@ -5,6 +5,8 @@ let pageLockCount = 0
 let previousBodyOverflow = ''
 let appRoot: HTMLElement | null = null
 let appRootWasInert = false
+const modalStack: symbol[] = []
+let nextModalLayer = 90
 
 function lockBackground(): void {
   if (pageLockCount === 0) {
@@ -32,7 +34,7 @@ function unlockBackground(): void {
 <script setup lang="ts">
 import { nextTick, onUnmounted, ref, watch } from 'vue'
 
-const props = defineProps<{
+const props = withDefaults(defineProps<{
   open: boolean
   title: string
   maxWidth?: string
@@ -48,42 +50,34 @@ const props = defineProps<{
    */
   maxHeight?: string
   dismissable?: boolean
-}>()
+  placement?: 'center' | 'right'
+}>(), { dismissable: true })
 
 const emit = defineEmits<{ close: [] }>()
 
 /** 挂载弹窗内容的容器：打开时把焦点放进第一个可聚焦控件，
  *  键盘用户不必从页面头部一路 Tab 摸进弹窗。 */
 const sheet = ref<HTMLElement | null>(null)
+const modalLayer = ref(90)
 let active = false
 let previouslyFocused: HTMLElement | null = null
 
-/**
- * 模块作用域：当前应当响应键盘的「栈顶」弹窗（2026-10-10 修复的 P2）。
- *
- * 起因：页面自己的表单弹窗打开时，其内部还会 confirmBox() 弹一个确认框，
- * 于是**两个** AppModal 同时 active，各自往 window 上挂了一个 keydown。
- * 同一次按键派发里两个处理器都会跑，Tab 的焦点陷阱因此互相抢焦点 ——
- * 后挂上的（确认框）赢，可它抢到的又未必是当前可见弹窗该去的地方。
- *
- * 按「激活顺序」而不是「open」判定：确认框是后开的，天然就是视觉上的栈顶，
- * 键盘也应该归它；下面的表单弹窗在确认框关闭前对键盘无响应。
- */
-let topModalId: symbol | null = null
+// 每个实例的标识存入模块共享栈；激活顺序同时决定视觉层级和键盘归属。
 const modalId = Symbol('app-modal')
 
 function activateModal() {
   if (active) return
   active = true
-  topModalId = modalId
+  modalStack.push(modalId)
+  modalLayer.value = ++nextModalLayer
   previouslyFocused = document.activeElement instanceof HTMLElement ? document.activeElement : null
   lockBackground()
   window.addEventListener('keydown', onKeydown)
   nextTick(() => {
     // 顺序即语义：表单类弹窗第一个控件就是输入框，确认类第一个是「取消」
     // —— 把默认焦点放在取消上，回车连按也不会误触发危险操作。
-    const first = sheet.value?.querySelector<HTMLElement>('input, select, textarea, button')
-    first?.focus()
+    const first = focusableNodes()[0]
+    if (active && modalStack.at(-1) === modalId) (first ?? sheet.value)?.focus()
   })
 }
 
@@ -91,8 +85,9 @@ function deactivateModal() {
   if (!active) return
   active = false
   window.removeEventListener('keydown', onKeydown)
-  // 只有自己还在栈顶时才清空：下面还有弹窗的话，栈顶是别人（见 topModalId）。
-  if (topModalId === modalId) topModalId = null
+  // 移除当前实例后，键盘控制自然交还给剩余的栈顶弹窗。
+  const index = modalStack.indexOf(modalId)
+  if (index >= 0) modalStack.splice(index, 1)
   unlockBackground()
 
   const target = previouslyFocused
@@ -103,9 +98,15 @@ function deactivateModal() {
   })
 }
 
+function focusableNodes(): HTMLElement[] {
+  return Array.from(sheet.value?.querySelectorAll<HTMLElement>(
+    'a[href], button, input, select, textarea, [tabindex]',
+  ) ?? []).filter(node => !node.matches(':disabled, [tabindex="-1"]') && node.getClientRects().length > 0)
+}
+
 function onKeydown(e: KeyboardEvent) {
   // 非栈顶弹窗不处理任何按键（焦点与 Esc 归当前可见的那一个）。
-  if (topModalId !== modalId) return
+  if (modalStack.at(-1) !== modalId) return
   // Esc 与「点遮罩」同一资格：dismissable=false 的表单弹窗两者都不响应，
   // 关闭只能走弹窗内自己的取消 / 确定按钮。
   // 监听挂在 window 而不是 scrim 元素：焦点尚未进入弹窗时 Esc 也要能用。
@@ -115,10 +116,8 @@ function onKeydown(e: KeyboardEvent) {
   }
   // 焦点陷阱：Tab / Shift+Tab 只在弹窗内循环，不许跑到弹窗背后的页面上去。
   if (e.key !== 'Tab') return
-  const nodes = sheet.value?.querySelectorAll<HTMLElement>(
-    'a[href], button:not([disabled]), input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])',
-  )
-  if (!nodes || nodes.length === 0) return
+  const nodes = focusableNodes()
+  if (nodes.length === 0) { e.preventDefault(); sheet.value?.focus(); return }
   const first = nodes[0]
   const last = nodes[nodes.length - 1]
   const active = document.activeElement
@@ -149,7 +148,7 @@ onUnmounted(deactivateModal)
 
 <template>
   <Teleport to="body">
-    <div v-if="open" class="scrim" @click.self="dismissable !== false && emit('close')">
+    <div v-if="open" class="scrim" :style="{ zIndex: modalLayer }" :class="{ 'scrim-drawer': placement === 'right' }" @click.self="dismissable !== false && emit('close')">
       <div
         ref="sheet"
         class="sheet"
@@ -159,11 +158,15 @@ onUnmounted(deactivateModal)
           // 免得两处各有一个「默认高度」日后漂移。
           ...(maxHeight ? { maxHeight: `min(92vh, ${maxHeight})` } : {}),
         }"
+        tabindex="-1"
         role="dialog"
         aria-modal="true"
+        :aria-label="title"
       >
-        <div class="sheet-title">{{ title }}</div>
-        <slot />
+        <div class="sheet-title">{{ title }}<button v-if="placement === 'right' && dismissable !== false" type="button" class="btn btn-ghost btn-sm drawer-close" aria-label="关闭详情" @click="emit('close')">✕</button></div>
+        <div v-if="placement === 'right'" class="drawer-body"><slot /></div>
+        <slot v-else />
+        <div v-if="placement === 'right' && $slots.footer" class="drawer-footer"><slot name="footer" /></div>
       </div>
     </div>
   </Teleport>

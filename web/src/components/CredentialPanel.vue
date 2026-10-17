@@ -1,4 +1,5 @@
 <script setup lang="ts">
+import DataTable from './DataTable.vue'
 /**
  * 凭据面板：某个上游下的多把 API 凭据（Providers 页展开区的一列）。
  *
@@ -120,7 +121,11 @@ function balanceClass(r: CredentialBalance): string {
       <p v-if="balanceMode" class="dim sub-line">
         {{ balanceMode }}
       </p>
-      <table v-if="creds.length > 0" class="tbl sub-tbl">
+      <!-- tbl-wrap 不能省：操作列是 .c-act（不换行），余额列里的附注也整段读。
+           在详情页这张表只占半屏宽，不裹 overflow-x 的话会把右侧的操作
+           按钮顶出可视区 —— 而那是这一行唯一能点的东西。 -->
+      <DataTable v-if="creds.length > 0" label="上游凭据">
+        <table class="tbl sub-tbl">
         <thead>
           <tr>
             <th>凭据</th>
@@ -185,6 +190,7 @@ function balanceClass(r: CredentialBalance): string {
           </tr>
         </tbody>
       </table>
+      </DataTable>
     </div>
   </div>
 </template>

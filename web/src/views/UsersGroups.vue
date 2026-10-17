@@ -1,4 +1,5 @@
 <script setup lang="ts">
+import DataTable from '../components/DataTable.vue'
 /**
  * 用户与分组（仅管理员可见）。
  *
@@ -576,7 +577,7 @@ async function askDeleteGroup(g: Group) {
       <div v-else-if="users.length === 0" class="empty">
         <div class="big">∅</div>还没有用户
       </div>
-      <div v-else class="tbl-wrap">
+      <DataTable v-else label="用户与权限组">
         <table class="tbl">
           <thead>
             <tr>
@@ -663,7 +664,7 @@ async function askDeleteGroup(g: Group) {
             </tr>
           </tbody>
         </table>
-      </div>
+      </DataTable>
     </div>
     </template>
 
@@ -680,7 +681,7 @@ async function askDeleteGroup(g: Group) {
       <div v-else-if="groups.length === 0" class="empty">
         <div class="big">∅</div>还没有分组 —— 当前所有密钥都能看到全部模型
       </div>
-      <div v-else class="tbl-wrap">
+      <DataTable v-else label="用户与权限组">
         <table class="tbl">
           <thead>
             <tr>
@@ -720,7 +721,7 @@ async function askDeleteGroup(g: Group) {
             </tr>
           </tbody>
         </table>
-      </div>
+      </DataTable>
     </div>
     </template>
 
