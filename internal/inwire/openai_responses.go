@@ -14,7 +14,8 @@ import (
 //
 // 覆盖面与取舍：
 //   - input 收字符串与 item 数组两种形态；message 的 content 收字符串与
-//     分块数组（input_text / output_text / input_image）。
+//     分块数组（input_text / output_text / input_image / input_file /
+//     input_audio）。
 //   - function_call / function_call_output item 映射为 rosetta 的工具调用与
 //     工具结果；reasoning item 剥除（历史思考不属于对话内容）。
 //   - instructions 映射为 System；developer/system 角色 item 映射为 RoleSystem。
@@ -86,6 +87,61 @@ type responsesContentPart struct {
 	Type     string `json:"type"`
 	Text     string `json:"text"`
 	ImageURL string `json:"image_url"`
+	// input_file / input_audio 的载荷。三者的 url 形态各异：
+	//   file_url  / audio_url  —— 远端引用（http(s)）
+	//   file_data / audio_data —— 内联 base64（可带 data: 前缀）
+	//   file_id                —— provider 侧已上传的文件引用
+	// 都不设为指针：空串就是「这一项没给」，与显式空值是同一回事。
+	FileURL   string `json:"file_url"`
+	FileData  string `json:"file_data"`
+	FileID    string `json:"file_id"`
+	Filename  string `json:"filename"`
+	AudioURL  string `json:"audio_url"`
+	AudioData string `json:"audio_data"`
+	// format 是 input_audio 的容器格式（"wav" / "mp3"）。OpenAI 只认这两个。
+	Format string `json:"format"`
+}
+
+// responsesSupportedItemTypes 是 input 数组里能代理到上游的 item 类型。
+//
+// 内建工具调用（web_search_call / file_search_call / code_interpreter_call …）
+// **不在其中**：它们由 OpenAI 服务端执行，结果不是可转译的消息内容，
+// 任何第三方上游都无法承接。客户端应改用 function tool 自己实现。
+var responsesSupportedItemTypes = map[string]bool{
+	"":                     true, // type 缺失的裸 {role, content} 简写
+	"message":              true,
+	"function_call":        true,
+	"function_call_output": true,
+	"reasoning":            true,
+}
+
+// validateResponsesInputItems 检查 input 数组里的 item 类型是否可代理。
+//
+// # 为什么报错而不是跳过
+//
+// 静默丢弃一个 item 会让上游看到一段**缺了内容**的对话，而模型对缺失
+// 浑然不觉，照样接着往下答 —— 那比明确失败危险得多：客户端以为它的
+// 搜索结果参与了推理，实际没有。
+//
+// # 为什么带上位置与可读文案
+//
+// 「input[3] 的 item 类型 web_search_call 不受支持」能直接指到请求里的
+// 哪一个元素；而原先 rosetta 报的 unknown block type
+// "responses_item:web_search_call" 是一个内部编码，客户端无从下手。
+func validateResponsesInputItems(input json.RawMessage) error {
+	var items []responsesItem
+	if err := json.Unmarshal(input, &items); err != nil {
+		// 不是数组（字符串简写或非法 JSON）—— 由调用方与 ToRosetta 各自处置。
+		return nil
+	}
+	for i, item := range items {
+		if !responsesSupportedItemTypes[item.Type] {
+			return fmt.Errorf("input[%d]: 不支持的 item 类型 %q"+
+				"（内建工具由服务端执行，无法转译给上游；请改用 function 工具自行实现）",
+				i, item.Type)
+		}
+	}
+	return nil
 }
 
 // DecodeResponsesRequest 解析 /v1/responses 请求体。超限以 *http.MaxBytesError
@@ -103,7 +159,7 @@ func DecodeResponsesRequest(r *http.Request, maxBytes int64) (*ResponsesRequest,
 	}
 
 	var req ResponsesRequest
-	if err := json.Unmarshal(body, &req); err != nil {
+	if err := decodeTopLevelObject(body, &req); err != nil {
 		return nil, fmt.Errorf("decode body: %w", err)
 	}
 	if req.Model == "" {
@@ -117,6 +173,17 @@ func DecodeResponsesRequest(r *http.Request, maxBytes int64) (*ResponsesRequest,
 	}
 	if req.MaxOutputTokens != nil && *req.MaxOutputTokens <= 0 {
 		return nil, fmt.Errorf("max_output_tokens: must be a positive integer")
+	}
+	// input 里的 item 类型白名单。放在 decode 而不是 ToRosetta：
+	// ToRosetta 是逐 attempt 调用的工厂（见 main.go 的 buildRosetta），
+	// 而类型不支持是**请求本身**的问题，第一次就该报，不该等走到某个
+	// 上游才由 rosetta validate 说出来。
+	//
+	// 顺带解决可读性：原先这类 item 被转成 BlockType("responses_item:xxx")，
+	// 最终由 rosetta 报 "unknown block type \"responses_item:web_search_call\"" ——
+	// 客户端看到的是一个内部编码，既不知道那是什么、也不知道该改什么。
+	if err := validateResponsesInputItems(req.Input); err != nil {
+		return nil, err
 	}
 	for _, t := range req.Tools {
 		if t.Type != "function" {
@@ -203,7 +270,30 @@ func (a *ResponsesRequest) ToRosetta() *rosetta.ChatRequest {
 				Blocks: []rosetta.Block{rosetta.ToolCall(item.CallID, item.Name, args)},
 			})
 		case "function_call_output":
-			req.Messages = append(req.Messages, rosetta.ToolResult(item.CallID, "", responsesItemOutputText(item)))
+			// 工具结果可能带**媒体块**（截图、PDF、音频）—— agent 的典型用法：
+			// 让模型读一张图、读一份文档、听一段录音。
+			//
+			// 修复前只读 output_text，媒体块被静默丢弃。后果与 sealed reasoning
+			// 同类：客户端以为那些内容参与了推理，实际没有，且没有任何一方能察觉。
+			//
+			// 媒体块不能塞进 tool_result —— 那个块的 Content 是纯文本语义
+			// （rosetta.ToolResult 只接受字符串），硬塞会让上游解不出结构。
+			// 所以拆成紧随其后的一条 user 消息，并在文本里留一行说明它被搬去了哪。
+			// 这与 cc-switch 的 TOOL_RESULT_MEDIA_MOVED_MARKER 同一思路：
+			// 不丢内容，也不假装它还在原来的位置。
+			text, media := responsesItemToolOutput(item)
+			if text != "" || len(media) == 0 {
+				req.Messages = append(req.Messages, rosetta.ToolResult(item.CallID, "", text))
+			}
+			if len(media) > 0 {
+				blocks := append([]rosetta.Block{{
+					Type: rosetta.BlockText,
+					Text: responsesToolMediaNotice(len(media)),
+				}}, media...)
+				req.Messages = append(req.Messages, rosetta.Message{
+					Role: rosetta.RoleUser, Blocks: blocks,
+				})
+			}
 		case "reasoning":
 			// reasoning item 是 reasoning 会话的续接载体，不能剥除。
 			//
@@ -236,8 +326,12 @@ func (a *ResponsesRequest) ToRosetta() *rosetta.ChatRequest {
 				Blocks: []rosetta.Block{blk},
 			})
 		default:
-			// item_reference / 内建工具调用等：留空块让 rosetta validate 以
-			// 明确错误拒绝，不静默吞。
+			// 兜底分支。正常路径下走不到这里 —— decode 阶段的
+			// validateResponsesInputItems 已经用带位置与原因的错误拦掉了
+			// （见那里的注释）。留着它是因为 ToRosetta 是逐 attempt 的工厂，
+			// 不能假设 input 一定经过过 validate（测试与内部调用可能直接构造）。
+			//
+			// 仍然不静默吞：留一个可识别的空块让 rosetta validate 拒绝。
 			req.Messages = append(req.Messages, rosetta.Message{
 				Role:   rosetta.RoleUser,
 				Blocks: []rosetta.Block{{Type: rosetta.BlockType("responses_item:" + item.Type)}},
@@ -295,6 +389,17 @@ func userMessageFromContent(content json.RawMessage) []rosetta.Message {
 		case "input_image":
 			if p.ImageURL != "" {
 				blocks = append(blocks, rosetta.Block{Type: rosetta.BlockImage, ImageURL: p.ImageURL})
+			}
+		// file / audio 与 image 同属「用户发来的附件」。原先只认 image，
+		// 于是「让模型读这份 PDF」在 user 侧同样被静默丢弃 —— 与
+		// function_call_output 那次修复是同一个漏点，只是另一个入口。
+		case "input_file":
+			if b, ok := responsesFileBlock(p); ok {
+				blocks = append(blocks, b)
+			}
+		case "input_audio":
+			if b, ok := responsesAudioBlock(p); ok {
+				blocks = append(blocks, b)
 			}
 		}
 	}
@@ -364,6 +469,104 @@ func responsesItemOutputText(item responsesItem) string {
 		}
 	}
 	return sb.String()
+}
+
+// responsesItemToolOutput 把 function_call_output 拆成「文本」与「媒体块」两份。
+//
+// 为什么要拆：tool_result 的 Content 是纯文本语义（rosetta.ToolResult 只收
+// 字符串），而 Responses 的工具输出可以带 input_image / input_file /
+// input_audio 分块 —— agent 让模型读图、读文档、听录音都走这里。
+//
+// 文本部分保持原口径（只认 output_text），媒体部分转成 rosetta 的
+// image / file / audio 块，由调用方搬去紧随其后的 user 消息。
+func responsesItemToolOutput(item responsesItem) (string, []rosetta.Block) {
+	// 字符串形态：整体就是文本，没有媒体可拆。
+	if s, ok := plainContentText(item.Output); ok {
+		return s, nil
+	}
+	var text strings.Builder
+	var media []rosetta.Block
+	for _, p := range decodeResponsesParts(item.Output) {
+		switch p.Type {
+		case "output_text":
+			text.WriteString(p.Text)
+		case "input_image":
+			if p.ImageURL != "" {
+				media = append(media, rosetta.Block{Type: rosetta.BlockImage, ImageURL: p.ImageURL})
+			}
+		case "input_file":
+			if b, ok := responsesFileBlock(p); ok {
+				media = append(media, b)
+			}
+		case "input_audio":
+			if b, ok := responsesAudioBlock(p); ok {
+				media = append(media, b)
+			}
+		}
+	}
+	return text.String(), media
+}
+
+// responsesFileBlock 把 input_file 分块转成 rosetta 的 file 块。
+//
+// 三种载荷形态都支持（与 rosetta.Block.FileData 的口径一致）：远端 URL、
+// 内联 base64（可带 data: 前缀）、provider 侧已上传的 file id。
+// 三者皆空时返回 false —— 那一项什么都没说，造一个空 file 块会被
+// rosetta validate 拒掉，把本来能跑的请求变成 400。
+func responsesFileBlock(p responsesContentPart) (rosetta.Block, bool) {
+	data := firstNonEmpty(p.FileData, p.FileURL, p.FileID)
+	if data == "" {
+		return rosetta.Block{}, false
+	}
+	// data: URL 只保留 base64 部分 —— rosetta 的 FileData 注释明确
+	// 「raw base64, data: URL or http(s) URL」，带前缀它也认，但剥掉前缀
+	// 能让 SDK 侧不必反复解析同一件事。
+	if idx := strings.Index(data, ","); strings.HasPrefix(data, "data:") && idx > 0 {
+		data = data[idx+1:]
+	}
+	return rosetta.Block{
+		Type:     rosetta.BlockFile,
+		FileName: p.Filename,
+		FileData: data,
+		FileID:   p.FileID,
+	}, true
+}
+
+// responsesAudioBlock 把 input_audio 分块转成 rosetta 的 audio 块。
+// AudioData 同样剥掉 data: 前缀；format 只认 wav / mp3（OpenAI 的口径），
+// 其它值原样带上，由上游决定是否拒绝。
+func responsesAudioBlock(p responsesContentPart) (rosetta.Block, bool) {
+	data := firstNonEmpty(p.AudioData, p.AudioURL)
+	if data == "" {
+		return rosetta.Block{}, false
+	}
+	if idx := strings.Index(data, ","); strings.HasPrefix(data, "data:") && idx > 0 {
+		data = data[idx+1:]
+	}
+	return rosetta.Block{
+		Type:        rosetta.BlockAudio,
+		AudioData:   data,
+		AudioFormat: p.Format,
+	}, true
+}
+
+// responsesToolMediaNotice 是搬走媒体块后留在 tool_result 前的那行说明。
+//
+// 为什么必须留：模型要知道「有东西被搬走了」。不留的话，它看到一条
+// 只有文字（甚至没有文字）的工具结果，会以为工具什么都没返回 ——
+// 而真相是内容在紧跟着的下一条消息里。一行说明把这两件事接上。
+func responsesToolMediaNotice(n int) string {
+	return fmt.Sprintf("[工具结果中的 %d 个附件已移至下一条消息]", n)
+}
+
+// firstNonEmpty 返回第一个非空串；全空返回 ""。
+func firstNonEmpty(vals ...string) string {
+	for _, v := range vals {
+		if v != "" {
+			return v
+		}
+	}
+	return ""
 }
 
 // responsesItemReasoningText 展平 reasoning item 的 summary（字符串或分块）。

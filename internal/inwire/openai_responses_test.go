@@ -265,23 +265,164 @@ func TestResponses_RequiresStructuredOutput(t *testing.T) {
 	}
 }
 
-// 不支持的 item 类型不静默丢弃：转成显式的未知块，rosetta 在请求时以
-// ErrInvalidRequest 拒绝（映射 400）—— 这里验证块被保留为可识别形态。
+// 不支持的 item 类型必须在 decode 阶段就拒绝，且错误要能指到具体位置。
+//
+// 2026-10-17 改：原先把它转成 BlockType("responses_item:xxx") 留给 rosetta
+// validate 报 "unknown block type \"responses_item:web_search_call\"" ——
+// 客户端拿到的是一个内部编码，既不知道那是什么、也不知道该改什么。
+// 现在错误在 decode 出，带 item 下标与类型名，并说明为什么（内建工具由
+// 服务端执行）与该怎么办（改用 function 工具）。
 func TestDecodeResponses_UnknownItemRejected(t *testing.T) {
-	got := decodeResponses(t, `{"model":"m","input":[
-		{"role":"user","content":"hi"},
-		{"type":"web_search_call","status":"completed"}]}`)
-	req := got.ToRosetta()
-	found := false
-	for _, m := range req.Messages {
-		for _, b := range m.Blocks {
-			if b.Type == "responses_item:web_search_call" {
-				found = true
-			}
+	_, err := DecodeResponsesRequest(httptest.NewRequest(http.MethodPost, "/v1/responses",
+		strings.NewReader(`{"model":"m","input":[
+			{"role":"user","content":"hi"},
+			{"type":"web_search_call","status":"completed"}]}`)), 1<<20)
+	if err == nil {
+		t.Fatalf("unknown item type should be rejected at decode time")
+	}
+	// 三个要素缺一不可：位置、类型名、原因。少了位置，客户端得自己数是第几个。
+	for _, want := range []string{"input[1]", "web_search_call", "function"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Fatalf("error should mention %q: %v", want, err)
 		}
 	}
-	if !found {
-		t.Fatalf("unknown item should be preserved for upstream-side rejection")
+}
+
+// 工具结果里的媒体块必须被搬到独立的 user 消息，不能静默丢弃。
+//
+// 这是真实数据丢失的修复：agent 让模型读一张图、读一份 PDF、听一段录音，
+// 内容都走 function_call_output 的分块。修复前只读 output_text，
+// 媒体块无声消失 —— 客户端以为它们参与了推理，实际没有。
+func TestDecodeResponses_ToolOutputMediaPreserved(t *testing.T) {
+	got := decodeResponses(t, `{"model":"m","input":[
+		{"type":"function_call","call_id":"c1","name":"screenshot","arguments":"{}"},
+		{"type":"function_call_output","call_id":"c1","output":[
+			{"type":"output_text","text":"已截图"},
+			{"type":"input_image","image_url":"https://x/y.png"},
+			{"type":"input_file","file_url":"https://x/doc.pdf","filename":"doc.pdf"},
+			{"type":"input_audio","audio_data":"AAAAbase64","format":"wav"}
+		]}
+	]}`)
+
+	req := got.ToRosetta()
+	// 期望三条：function_call（assistant）→ tool_result → 搬走媒体的 user 消息。
+	if len(req.Messages) != 3 {
+		t.Fatalf("message count = %d, want 3: %+v", len(req.Messages), req.Messages)
+	}
+
+	tr := req.Messages[1]
+	if tr.Role != rosetta.RoleTool {
+		t.Fatalf("second message role = %q, want tool", tr.Role)
+	}
+	if tr.Blocks[0].Content != "已截图" {
+		t.Fatalf("tool result text = %q, want 已截图", tr.Blocks[0].Content)
+	}
+
+	media := req.Messages[2]
+	if media.Role != rosetta.RoleUser {
+		t.Fatalf("third message role = %q, want user", media.Role)
+	}
+	// 第一个块是说明文字，其后是三个媒体块。
+	if len(media.Blocks) != 4 {
+		t.Fatalf("media message blocks = %d, want 4 (notice + 3 media): %+v", len(media.Blocks), media.Blocks)
+	}
+	if media.Blocks[0].Type != rosetta.BlockText || !strings.Contains(media.Blocks[0].Text, "3 个附件") {
+		t.Fatalf("notice block = %+v, want text mentioning 3 attachments", media.Blocks[0])
+	}
+	if media.Blocks[1].Type != rosetta.BlockImage || media.Blocks[1].ImageURL != "https://x/y.png" {
+		t.Fatalf("image block = %+v", media.Blocks[1])
+	}
+	if media.Blocks[2].Type != rosetta.BlockFile || media.Blocks[2].FileData != "https://x/doc.pdf" {
+		t.Fatalf("file block = %+v", media.Blocks[2])
+	}
+	if media.Blocks[3].Type != rosetta.BlockAudio || media.Blocks[3].AudioData != "AAAAbase64" ||
+		media.Blocks[3].AudioFormat != "wav" {
+		t.Fatalf("audio block = %+v", media.Blocks[3])
+	}
+}
+
+// user 侧的 input_file / input_audio 同样要保留。
+// 原先只认 input_image，于是「让模型读这份 PDF」在 user 入口被静默丢弃 ——
+// 与 function_call_output 那次修复是同一个漏点的另一个入口。
+func TestDecodeResponses_UserFileAndAudioPreserved(t *testing.T) {
+	got := decodeResponses(t, `{"model":"m","input":[
+		{"type":"message","role":"user","content":[
+			{"type":"input_text","text":"看看这个"},
+			{"type":"input_file","file_url":"https://x/a.pdf","filename":"a.pdf"},
+			{"type":"input_audio","audio_url":"https://x/b.wav","format":"wav"}
+		]}
+	]}`)
+	req := got.ToRosetta()
+	if len(req.Messages) != 1 {
+		t.Fatalf("message count = %d, want 1: %+v", len(req.Messages), req.Messages)
+	}
+	blocks := req.Messages[0].Blocks
+	if len(blocks) != 3 {
+		t.Fatalf("block count = %d, want 3 (text + file + audio): %+v", len(blocks), blocks)
+	}
+	if blocks[0].Type != rosetta.BlockText || blocks[0].Text != "看看这个" {
+		t.Fatalf("text block = %+v", blocks[0])
+	}
+	if blocks[1].Type != rosetta.BlockFile || blocks[1].FileData != "https://x/a.pdf" ||
+		blocks[1].FileName != "a.pdf" {
+		t.Fatalf("file block = %+v", blocks[1])
+	}
+	if blocks[2].Type != rosetta.BlockAudio || blocks[2].AudioData != "https://x/b.wav" ||
+		blocks[2].AudioFormat != "wav" {
+		t.Fatalf("audio block = %+v", blocks[2])
+	}
+}
+
+// 纯文本的工具结果**不该**多出一条 user 消息 —— 那会让每一次普通工具调用
+// 都带一行噪音，模型会看到一个不存在附件的提示。
+func TestDecodeResponses_ToolOutputTextOnlyNoExtraMessage(t *testing.T) {
+	got := decodeResponses(t, `{"model":"m","input":[
+		{"type":"function_call_output","call_id":"c1","output":"晴"}
+	]}`)
+	req := got.ToRosetta()
+	if len(req.Messages) != 1 {
+		t.Fatalf("message count = %d, want 1: %+v", len(req.Messages), req.Messages)
+	}
+	if req.Messages[0].Blocks[0].Content != "晴" {
+		t.Fatalf("tool result content = %q", req.Messages[0].Blocks[0].Content)
+	}
+}
+
+// data: 前缀要剥掉，只留 base64 —— rosetta 的 FileData/AudioData 收裸 base64。
+func TestDecodeResponses_ToolOutputMediaStripsDataURLPrefix(t *testing.T) {
+	got := decodeResponses(t, `{"model":"m","input":[
+		{"type":"function_call_output","call_id":"c1","output":[
+			{"type":"input_file","file_data":"data:application/pdf;base64,JVBERi0="},
+			{"type":"input_audio","audio_data":"data:audio/wav;base64,AAAA"}
+		]}
+	]}`)
+	req := got.ToRosetta()
+	if len(req.Messages) != 1 {
+		t.Fatalf("message count = %d, want 1 (只有媒体、没有文本时仍只发一条): %+v",
+			len(req.Messages), req.Messages)
+	}
+	file := req.Messages[0].Blocks[1]
+	if file.FileData != "JVBERi0=" {
+		t.Fatalf("file data = %q, want 剥掉 data: 前缀后的 base64", file.FileData)
+	}
+	audio := req.Messages[0].Blocks[2]
+	if audio.AudioData != "AAAA" {
+		t.Fatalf("audio data = %q, want 剥掉 data: 前缀后的 base64", audio.AudioData)
+	}
+}
+
+// 支持的类型一个都不能被误伤 —— 白名单收紧过头会把正常请求全打成 400，
+// 而这类回归在「只测不支持的」的用例里完全看不出来。
+func TestDecodeResponses_SupportedItemTypesAccepted(t *testing.T) {
+	body := `{"model":"m","input":[
+		{"role":"user","content":"hi"},
+		{"type":"message","role":"assistant","content":[{"type":"output_text","text":"yo"}]},
+		{"type":"function_call","call_id":"c1","name":"f","arguments":"{}"},
+		{"type":"function_call_output","call_id":"c1","output":"ok"},
+		{"type":"reasoning","summary":[{"type":"summary_text","text":"think"}],"encrypted_content":"gAAAAA"}]}`
+	if _, err := DecodeResponsesRequest(httptest.NewRequest(http.MethodPost, "/v1/responses",
+		strings.NewReader(body)), 1<<20); err != nil {
+		t.Fatalf("supported item types should decode: %v", err)
 	}
 }
 
