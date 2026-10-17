@@ -230,7 +230,11 @@ function failureTitle(h: UsageHistoryEntry): string | undefined {
   if (h.status === 'ok') return undefined
   const head = h.http_status > 0 ? `HTTP ${h.http_status}` : '失败'
   const code = h.error_code ? ` · ${h.error_code}` : ''
-  if (h.error_detail) return `${head}${code}\n${h.error_detail}`
+  // 决策轨迹优先展示：它解释「为什么换/没换上游」，比上游原文更接近
+  // 运维要回答的问题。上游原文仍接在后面，两者都有时一起给。
+  const trace = h.route_trace ? `\n路由：${h.route_trace.replaceAll('; ', '\n      ')}` : ''
+  if (h.error_detail) return `${head}${code}${trace}\n${h.error_detail}`
+  if (trace) return `${head}${code}${trace}`
   return `${head}${code} · 无更多详情（上游未返回正文，或记录已超出保留期）`
 }
 

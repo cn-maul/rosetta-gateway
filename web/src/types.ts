@@ -18,6 +18,14 @@ export interface Provider {
    * 全局开关会让能直连的那些也平白多绕一跳。
    */
   proxy_url: string
+  /**
+   * 余额查询的显式配置（JSON 串），空串 = 不配（走内置自动判定）。
+   *
+   * 内置判定只认 OpenAI 官方与 DeepSeek；接中转站、自建网关或
+   * Moonshot / OpenRouter 这类自带余额端点的上游时，在这里填 path 与
+   * field。只在编辑上游时的高级选项里出现 —— 新建时留空即可。
+   */
+  balance_spec_json: string
   created_at: number
   // ready 是**运行时**状态（后端快照），不是库里的配置字段：
   // 库只记录配了什么，快照才反映「上游池实际建出了什么」。
@@ -36,6 +44,15 @@ export interface ProviderCreatePayload {
   endpoint: string
   /** 出站代理；留空 = 不代理。 */
   proxy_url?: string
+  /**
+   * 余额查询的显式配置（JSON 字符串，不是对象 —— 后端整串存、整串校验）。
+   * 留空 = 不配，回落到内置的自动判定（OpenAI 官方 / DeepSeek）。
+   *
+   * 只有接中转站、自建网关、或 Moonshot/OpenRouter 这类自带余额端点的
+   * 上游时才需要填。形如：
+   * `{"path":"/credits","field":"data.remaining","currency":"USD"}`
+   */
+  balance_spec_json?: string
   api_key?: string
 }
 
@@ -53,6 +70,8 @@ export interface ProviderUpdatePayload {
   quirks_json?: string
   /** 出站代理。传空串是**清空**，不是「不改」—— 卸载代理必须能表达。 */
   proxy_url?: string
+  /** 余额查询配置。传空串是**清空**（回到自动判定），与 proxy_url 同语义。 */
+  balance_spec_json?: string
 }
 
 // discover 端点返回的上游模型条目；后端已把探测不到的容量替换为设置里的默认值
@@ -238,6 +257,14 @@ export interface ModelTestResult {
    * 为真时需向用户说明「HTTP 成功却报错」，否则看起来像网关自己坏了。
    */
   in_band?: boolean
+  /**
+   * 后端把上游错误翻成的**下一步动作**（失败时才有）。
+   *
+   * message 是上游英文原文 —— 准确，但不回答「所以呢」。而 401/403/404/402/429
+   * 各自对应完全不同的动作（换 key / 开权限 / 改模型名 / 充值 / 等一会），
+   * 直接点破能省掉用户自己把英文错误翻译成操作判断这一步。
+   */
+  hint?: string
 }
 
 /** 单条凭据在上游侧的余额查询结果（对应 internal/upstream.CredentialBalance）。 */
@@ -825,6 +852,14 @@ export interface UsageHistoryEntry {
   http_status: number
   error_code?: string
   error_detail?: string
+  /**
+   * 失败决策轨迹（2026-10-17）：链上每个目标的决策与原因，形如
+   * "1:deepseek/deepseek-chat -> fail_switch:upstream_error; 2:openai/gpt-4o -> ok"。
+   *
+   * 只在发生过转移或非首跳结束时才有内容。它回答 error_code 回答不了的问题：
+   * 这次为什么走了备用上游，或者为什么明明失败了却没有换上游。
+   */
+  route_trace?: string
 }
 
 // 调用历史的分页结果：当页明细 + 过滤后的总条数（用于计算总页数）

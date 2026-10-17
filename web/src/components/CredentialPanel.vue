@@ -10,6 +10,7 @@
  * 父组件仍是唯一的写路径持有者 —— 抽组件只减少单文件长度，
  * 不引入第二处状态真相。
  */
+import { computed } from 'vue'
 import type { Credential, ProviderBalance, CredentialBalance } from '../types'
 
 const props = defineProps<{
@@ -20,6 +21,8 @@ const props = defineProps<{
   balanceBusy: boolean
   /** 正在提交启停的凭据 id：只给那一行的开关上防连点。 */
   toggling: string[]
+  /** 该上游是否配了自定义余额查询（有 spec 走自定义，没有则走内置判定）。 */
+  balanceSpecConfigured: boolean
 }>()
 
 const emit = defineEmits<{
@@ -29,6 +32,25 @@ const emit = defineEmits<{
   remove: [cred: Credential]
   toggle: [cred: Credential]
 }>()
+
+// balanceMode 说明这次查询走的是哪条路径。
+//
+// 为什么要显示：自动判定只覆盖 OpenAI 官方与 DeepSeek 两家，其余上游
+// 一律「不支持」。当管理员看到「不支持」时，他需要知道的是「这是内置判定
+// 的结论」还是「我配了但没匹配上」—— 两者的下一步完全不同
+// （前者去填 balance_spec_json，后者去改配置）。
+//
+// props.balance.status === 'unsupported' 且没配 spec 时，提示直接给出
+// 「去编辑上游填配置」这个动作，而不是让用户自己猜。
+const balanceMode = computed(() => {
+  if (!props.balance) return ''
+  if (props.balance.status === 'unsupported') {
+    return props.balanceSpecConfigured
+      ? '按自定义配置查询，但上游没有返回可用数据 —— 检查 path / field 是否与上游文档一致'
+      : '未配置余额查询方式，且内置判定不认识这个上游（内置支持 OpenAI 官方与 DeepSeek）'
+  }
+  return ''
+})
 
 // isPending 判某一行是否正在提交启停。
 //
@@ -91,6 +113,12 @@ function balanceClass(r: CredentialBalance): string {
            它是**跨行**的约束，必须写在开关旁边而不是藏进文档。 -->
       <p v-if="creds.length > 1" class="dim sub-line">
         同一上游同时只启用一把 key：打开其中一把会自动停用其它。
+      </p>
+      <!-- 查询方式的说明：只在查过且拿到「不支持」时出现。它的价值在于
+           区分「内置判定不认识这个上游」与「配了但没匹配上」—— 下一步动作
+           完全不同（去填配置 vs 去改配置），而两者在界面上原本是同一句话。 -->
+      <p v-if="balanceMode" class="dim sub-line">
+        {{ balanceMode }}
       </p>
       <table v-if="creds.length > 0" class="tbl sub-tbl">
         <thead>

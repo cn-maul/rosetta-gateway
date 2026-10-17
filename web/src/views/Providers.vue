@@ -83,6 +83,7 @@ const pForm = reactive({
   timeout_ms: 0,
   max_retries: 0,
   proxy_url: '',
+  balance_spec_json: '',
   showAdvanced: false,
 })
 
@@ -96,9 +97,16 @@ function openProvider(p?: Provider) {
   pForm.timeout_ms = p?.timeout_ms ?? 0
   pForm.max_retries = p?.max_retries ?? 0
   pForm.proxy_url = p?.proxy_url ?? ''
+  pForm.balance_spec_json = p?.balance_spec_json ?? ''
   pForm.showAdvanced = false
   pForm.open = true
 }
+
+// openRouterSpec 是提示里给的那个示例。提成常量而不是直接写在模板里：
+// 模板中插值一个含双引号的 JSON 串会与 HTML 属性/文本转义纠缠，
+// 放 script 侧最省心，也顺便让这条示例与后端字段名只有一处定义。
+const openRouterSpec =
+  '{"path":"/api/v1/credits","field":"data.total_credits","currency":"USD"}'
 
 async function submitProvider() {
   if (!pForm.endpoint.trim()) {
@@ -117,6 +125,9 @@ async function submitProvider() {
         // 代理**每次都发**，空串 = 清空已配的代理。不能只在非空时才发 ——
         // 那会让「卸掉代理」这个动作永远发不出去。
         proxy_url: pForm.proxy_url.trim(),
+        // 与 proxy_url 同口径：**每次都发**，空串 = 清空（回到自动判定）。
+        // 只在非空时才发会让「卸掉自定义配置」永远发不出去。
+        balance_spec_json: pForm.balance_spec_json.trim(),
       })
       toast('上游已更新')
     } else {
@@ -125,6 +136,7 @@ async function submitProvider() {
         protocol: pForm.protocol,
         endpoint: pForm.endpoint.trim(),
         proxy_url: pForm.proxy_url.trim(),
+        balance_spec_json: pForm.balance_spec_json.trim(),
         api_key: pForm.api_key.trim() || undefined,
       })
       toast('上游已创建')
@@ -757,6 +769,7 @@ onMounted(() => {
                   :balance="balances[p.id]"
                   :balance-busy="isBalanceBusy(p.id)"
                   :toggling="credTogglingIds"
+                  :balance-spec-configured="!!p.balance_spec_json?.trim()"
                   @add="openCred(p.id)"
                   @query-balance="queryBalance(p.id)"
                   @edit="(c) => openCred(p.id, c)"
@@ -830,6 +843,44 @@ onMounted(() => {
               代理在宿主机上时才用 <code>host.docker.internal</code>。
             </span>
           </div>
+
+          <!-- 余额查询配置只在**编辑**时出现（新建时留空即可）。
+
+               为什么不放在主表单：内置的自动判定对 OpenAI 官方与 DeepSeek
+               已经够用，新建上游时不需要为它懂任何知识。只有接中转站、
+               自建网关、或 Moonshot/OpenRouter 这类自带余额端点的上游才要填 ——
+               那已经是「这个上游有点特殊」的信号，与高级选项同档。
+
+               留空 = 回到自动判定，点「查余额」时若两者都试不出就说不支持。 -->
+          <template v-if="pForm.editing">
+            <div class="field span2">
+              <button type="button" class="btn btn-sm btn-ghost" @click="pForm.showAdvanced = !pForm.showAdvanced">
+                {{ pForm.showAdvanced ? '收起高级选项' : '展开高级选项' }}
+              </button>
+            </div>
+            <template v-if="pForm.showAdvanced">
+              <div class="field span2">
+                <label>余额查询（可选）</label>
+                <textarea
+                  v-model="pForm.balance_spec_json"
+                  class="input mono"
+                  rows="2"
+                  spellcheck="false"
+                  placeholder='{"path":"/credits","field":"data.remaining","currency":"USD"}'
+                ></textarea>
+                <span class="tip">
+                  填 JSON，留空则用内置判定（OpenAI 官方与 DeepSeek 自动识别，其余上报「不支持」）。
+                  <code>path</code> 必填，是以 <code>/</code> 开头的相对路径；
+                  <code>field</code> 是余额在响应里的点号路径（默认 <code>balance</code>）；
+                  <code>currency</code> 只是标单位、不做换算；
+                  <code>auth</code> 取 <code>bearer</code>（默认）或 <code>anthropic</code>。
+                  <br />
+                  例：OpenRouter 是 <code>{{ openRouterSpec }}</code>。
+                  填错会在保存时直接报错，不会等到点「查余额」才失败。
+                </span>
+              </div>
+            </template>
+          </template>
 
           <template v-if="pForm.editing">
             <div class="field span2">

@@ -33,13 +33,18 @@ function isTesting(id: string): boolean {
 // 成本与体感全在这两个数上 —— 只说「可用」就没法区分「可用但很慢」。
 // 失败：原样给出上游原因；InBand 的错误额外加一句说明，否则
 // 「HTTP 是成功的却报错」会看起来像网关自己坏了。
+//
+// 失败时把后端给的 hint 附在后面：上游原文是英文且不回答「所以呢」，
+// 而 401/403/404 在这里分别对应「换 key / 开权限 / 改模型名」——
+// 不点破的话用户只能自己把错误翻译成操作判断。
 function testResultLine(r: ModelTestResult): string {
   if (r.status === 'ok') {
     const parts = [`可用`, `${r.latency_ms}ms`]
     if (r.output_tokens) parts.push(`输出 ${r.output_tokens} tok`)
     return parts.join(' · ')
   }
-  return r.in_band ? `${r.message}（上游以 HTTP 200 返回错误）` : r.message
+  const base = r.in_band ? `${r.message}（上游以 HTTP 200 返回错误）` : r.message
+  return r.hint ? `${base} → ${r.hint}` : base
 }
 </script>
 
