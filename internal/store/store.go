@@ -107,6 +107,16 @@ func (s *Store) migrate() error {
 			-- 可区分 —— 老库迁移后 NULL 表示「从没配过」，语义上等价于不代理，
 			-- 于是这里不设 DEFAULT，读取时靠 COALESCE 兜。
 			proxy_url     TEXT,
+			-- 余额查询的显式配置（JSON）。空串 = 不配，回落到按端点特征的
+			-- 自动判定（OpenAI 官方 billing / DeepSeek user/balance）。
+			--
+			-- 为什么默认留空：内置的自动判定对绝大多数「只接一两家」的部署
+			-- 已经够用，且它要求管理员不额外懂任何知识。填了才走自定义路径，
+			-- 覆盖中转站与自建网关 —— 那一类才是真正需要手写配置的长尾。
+			--
+			-- 为什么可空不带 DEFAULT：NULL = 从没配过（老库迁移后的诚实状态），
+			-- '' = 配过又清空（与 NULL 的语义差一层，与 proxy_url 同款纪律）。
+			balance_spec_json TEXT,
 			created_at    INTEGER NOT NULL,
 			updated_at    INTEGER NOT NULL
 		)`,
@@ -306,7 +316,11 @@ func (s *Store) migrate() error {
 			error_code        TEXT,
 			latency_ms        INTEGER NOT NULL,
 			ttfb_ms           INTEGER NOT NULL DEFAULT 0,
-			request_id        TEXT
+			request_id        TEXT,
+			-- 失败决策轨迹（2026-10-17）。只存在于明细层，随 30 天保留期剪枝；
+			-- 归档表没有单次决策的位置。新库在建表时就带上，老库由
+			-- ensureColumns 补列（两处缺一都会让首次写入直接报「无此列」）。
+			route_trace       TEXT
 		)`,
 		`CREATE INDEX IF NOT EXISTS idx_usage_ts ON usage_records(ts)`,
 		`CREATE INDEX IF NOT EXISTS idx_usage_key_ts ON usage_records(access_key_id, ts)`,
@@ -785,6 +799,9 @@ func (s *Store) ensureColumns() error {
 		// 才是诚实的「从没配过」。填 '' 会让「配了空串」与「没配过」不可分辨，
 		// 而前者在界面上要显示成「不代理」、后者要显示成占位提示。
 		{"providers", "proxy_url", "TEXT"},
+		// 余额查询的显式配置（2026-10-17）。可空、不带 DEFAULT：NULL 是
+		// 「从没配过」的诚实状态，与显式清空成 '' 可区分。
+		{"providers", "balance_spec_json", "TEXT"},
 		{"usage_totals", "total_tokens", "INTEGER NOT NULL DEFAULT 0"},
 		// 归档水位（已剪到哪一天）。剪枝流程靠它做幂等边界。
 		{"usage_totals", "pruned_through_day", "TEXT NOT NULL DEFAULT ''"},
@@ -813,6 +830,10 @@ func (s *Store) ensureColumns() error {
 		// 归档表 usage_daily_rollups 按 (day × 维度) 聚合、没有单次失败
 		// 的位置，所以**不加到归档表** —— 详情随明细 30 天一起消失。
 		{"usage_records", "error_detail", "TEXT"},
+		// 失败决策轨迹（2026-10-17）。可空、不带 DEFAULT：成功的历史记录
+		// 没有轨迹可补，补成 '' 会让「没记录」与「记录为空」不可分辨。
+		// 与 error_detail 同理，只存在于明细层，不进归档表。
+		{"usage_records", "route_trace", "TEXT"},
 		// 模型归组（2026-10-14）。把「不同上游的同一个模型」标成一组，
 		// 用量统计可按组显示统一名称。可空 = 未归组。
 		//

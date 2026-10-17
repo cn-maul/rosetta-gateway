@@ -41,6 +41,15 @@ type UsageRecord struct {
 	LatencyMs   int64
 	TTFBMs      int64
 	RequestID   string
+	// RouteTrace 是失败决策轨迹（2026-10-17）：按发生顺序记录链上每个目标的
+	// 决策与原因，形如 "1:deepseek/model -> 404 model_not_found (switch);
+	// 2:openai/gpt-4o -> ok"。
+	//
+	// 为什么用文本而不是结构化列：这张表已有 30 天明细保留期与日归档机制，
+	// 轨迹只服务于「这一次为什么走了备用上游」的排障，不需要按字段聚合；
+	// 一个 TEXT 列就能在调用明细里原样展示，避免为一次排障新增 JSON schema
+	// 与迁移面。空串 = 单目标或成功首跳，没有可讲的决策。
+	RouteTrace string
 }
 
 // CreateUsageRecord 落一条用量记录。
@@ -129,8 +138,8 @@ func (s *Store) CreateUsageRecordWithCost(ctx context.Context, r *UsageRecord) (
 	// 可以各自忘记的地方，而忘了的表征是**费用静默偏低**，没人会发现。
 	cost := s.freezeUsageCost(ctx, r)
 	_, err := s.db.ExecContext(ctx,
-		`INSERT INTO usage_records (id, ts, access_key_id, user_id, public_model, provider_id, upstream_model, ingress_protocol, stream, input_tokens, output_tokens, total_tokens, reasoning_tokens, cached_tokens, usage_state, status, http_status, error_code, error_detail, latency_ms, ttfb_ms, request_id, cost_total) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		r.ID, ts, r.AccessKeyID, nullIfEmpty(r.UserID), r.PublicModel, r.ProviderID, r.UpstreamModel, r.IngressProtocol, stream, r.InputTokens, r.OutputTokens, r.TotalTokens, r.ReasoningTokens, r.CachedTokens, r.UsageState, r.Status, r.HTTPStatus, nullIfEmpty(r.ErrorCode), nullIfEmpty(r.ErrorDetail), r.LatencyMs, r.TTFBMs, nullIfEmpty(r.RequestID), cost)
+		`INSERT INTO usage_records (id, ts, access_key_id, user_id, public_model, provider_id, upstream_model, ingress_protocol, stream, input_tokens, output_tokens, total_tokens, reasoning_tokens, cached_tokens, usage_state, status, http_status, error_code, error_detail, latency_ms, ttfb_ms, request_id, route_trace, cost_total) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		r.ID, ts, r.AccessKeyID, nullIfEmpty(r.UserID), r.PublicModel, r.ProviderID, r.UpstreamModel, r.IngressProtocol, stream, r.InputTokens, r.OutputTokens, r.TotalTokens, r.ReasoningTokens, r.CachedTokens, r.UsageState, r.Status, r.HTTPStatus, nullIfEmpty(r.ErrorCode), nullIfEmpty(r.ErrorDetail), r.LatencyMs, r.TTFBMs, nullIfEmpty(r.RequestID), nullIfEmpty(r.RouteTrace), cost)
 	if err != nil {
 		// 落库失败：费用随记录一起作废。返回 0 而不是 cost —— 调用方若误用
 		// 这个值去扣费，扣的金额必须与「库里真实存在的记录」对应，
@@ -200,13 +209,14 @@ func (s *Store) CreateUsageRecordsBatched(ctx context.Context, recs []*UsageReco
 		(id, ts, access_key_id, user_id, public_model, provider_id, upstream_model,
 		 ingress_protocol, stream, input_tokens, output_tokens, total_tokens,
 		 reasoning_tokens, cached_tokens, usage_state, status, http_status,
-		 error_code, error_detail, latency_ms, ttfb_ms, request_id, cost_total) VALUES `)
+		 error_code, error_detail, latency_ms, ttfb_ms, request_id, route_trace,
+		 cost_total) VALUES `)
 
 	for i, r := range recs {
 		if i > 0 {
 			sb.WriteByte(',')
 		}
-		sb.WriteString("(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)")
+		sb.WriteString("(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)")
 		args = append(args, usageInsertArgs(r, costs[i])...)
 	}
 
@@ -221,7 +231,7 @@ func (s *Store) CreateUsageRecordsBatched(ctx context.Context, recs []*UsageReco
 }
 
 // usageInsertColumns 是 usage_records 写入路径的列数（仅用于容量预估）。
-const usageInsertColumns = 23
+const usageInsertColumns = 24
 
 // batchComputeCosts 逐条算固化费用，并顺带完成 token 负值归一与 ts 兜底。
 //
@@ -267,7 +277,7 @@ func usageInsertArgs(r *UsageRecord, cost float64) []any {
 		r.InputTokens, r.OutputTokens, r.TotalTokens,
 		r.ReasoningTokens, r.CachedTokens, r.UsageState, r.Status,
 		r.HTTPStatus, nullIfEmpty(r.ErrorCode), nullIfEmpty(r.ErrorDetail),
-		r.LatencyMs, r.TTFBMs, nullIfEmpty(r.RequestID), cost,
+		r.LatencyMs, r.TTFBMs, nullIfEmpty(r.RequestID), nullIfEmpty(r.RouteTrace), cost,
 	}
 }
 

@@ -450,6 +450,12 @@ type usageHistoryEntry struct {
 	HTTPStatus  int    `json:"http_status"`
 	ErrorCode   string `json:"error_code,omitempty"`
 	ErrorDetail string `json:"error_detail,omitempty"`
+	// RouteTrace 是失败决策轨迹（2026-10-17）：链上每个目标的决策与原因，
+	// 形如 "1:deepseek/deepseek-chat -> fail_switch:upstream_error;
+	// 2:openai/gpt-4o -> ok"。只在发生过转移或非首跳结束时才有内容。
+	// 它回答的是 ErrorCode 回答不了的问题：这次为什么走了备用上游、
+	// 或者为什么明明失败了却没有换上游。
+	RouteTrace string `json:"route_trace,omitempty"`
 }
 
 // tpsFor 计算单条请求的平均输出速度（token/s）；无样本时返回 0。
@@ -566,7 +572,7 @@ func (h *UsageHandler) ExportCSV(w http.ResponseWriter, r *http.Request) {
 	}
 
 	rows, err := h.store.Reader().Query(
-		`SELECT u.ts, u.public_model, u.upstream_model, COALESCE(a.name, ''), u.access_key_id, u.total_tokens, u.output_tokens, u.ttfb_ms, u.latency_ms, u.status, u.stream, COALESCE(u.cost_total, 0)
+		`SELECT u.ts, u.public_model, u.upstream_model, COALESCE(a.name, ''), u.access_key_id, u.total_tokens, u.output_tokens, u.ttfb_ms, u.latency_ms, u.status, u.stream, COALESCE(u.cost_total, 0), COALESCE(u.route_trace, '')
 		   FROM usage_records u LEFT JOIN access_keys a ON a.id = u.access_key_id`+where+
 			` ORDER BY u.ts DESC, u.id DESC LIMIT ?`, append(args, limit)...)
 	if err != nil {
@@ -593,11 +599,12 @@ func (h *UsageHandler) ExportCSV(w http.ResponseWriter, r *http.Request) {
 	// 让原有 11 列的下标保持不变。
 	_ = cw.Write([]string{"ts", "public_model", "upstream_model", "key_name", "key_id",
 		"total_tokens", "ttfb_ms", "latency_ms", "status", "stream", "cost",
-		"output_tokens", "tps"})
+		"output_tokens", "tps", "route_trace"})
 	for rows.Next() {
 		var e usageHistoryEntry
 		if err := rows.Scan(&e.Ts, &e.PublicModel, &e.UpstreamModel, &e.KeyName, &e.KeyID,
-			&e.TotalTokens, &e.OutputTokens, &e.TTFBMs, &e.LatencyMs, &e.Status, &e.Stream, &e.Cost); err != nil {
+			&e.TotalTokens, &e.OutputTokens, &e.TTFBMs, &e.LatencyMs, &e.Status, &e.Stream, &e.Cost,
+			&e.RouteTrace); err != nil {
 			return
 		}
 		e.Tps = tpsFor(e.OutputTokens, e.LatencyMs)
@@ -619,6 +626,7 @@ func (h *UsageHandler) ExportCSV(w http.ResponseWriter, r *http.Request) {
 			strconv.FormatInt(e.LatencyMs, 10), e.Status, stream,
 			strconv.FormatFloat(e.Cost, 'f', -1, 64),
 			strconv.FormatInt(e.OutputTokens, 10), tps,
+			e.RouteTrace,
 		})
 	}
 	cw.Flush()
@@ -656,7 +664,7 @@ func (h *UsageHandler) History(w http.ResponseWriter, r *http.Request) {
 	}
 
 	rows, err := h.store.Reader().Query(
-		`SELECT u.ts, u.public_model, u.upstream_model, COALESCE(a.name, ''), u.access_key_id, u.total_tokens, u.output_tokens, u.ttfb_ms, u.latency_ms, u.status, u.stream, COALESCE(u.cost_total, 0), u.http_status, COALESCE(u.error_code, ''), COALESCE(u.error_detail, '')
+		`SELECT u.ts, u.public_model, u.upstream_model, COALESCE(a.name, ''), u.access_key_id, u.total_tokens, u.output_tokens, u.ttfb_ms, u.latency_ms, u.status, u.stream, COALESCE(u.cost_total, 0), u.http_status, COALESCE(u.error_code, ''), COALESCE(u.error_detail, ''), COALESCE(u.route_trace, '')
 		   FROM usage_records u LEFT JOIN access_keys a ON a.id = u.access_key_id`+where+
 			` ORDER BY u.ts DESC, u.id DESC LIMIT ? OFFSET ?`, append(args, limit, offset)...)
 	if err != nil {
@@ -670,7 +678,7 @@ func (h *UsageHandler) History(w http.ResponseWriter, r *http.Request) {
 		var e usageHistoryEntry
 		if err := rows.Scan(&e.Ts, &e.PublicModel, &e.UpstreamModel, &e.KeyName, &e.KeyID,
 			&e.TotalTokens, &e.OutputTokens, &e.TTFBMs, &e.LatencyMs, &e.Status, &e.Stream, &e.Cost,
-			&e.HTTPStatus, &e.ErrorCode, &e.ErrorDetail); err != nil {
+			&e.HTTPStatus, &e.ErrorCode, &e.ErrorDetail, &e.RouteTrace); err != nil {
 			writeServerError(w, "usage history scan", err)
 			return
 		}
