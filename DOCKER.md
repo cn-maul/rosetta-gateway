@@ -137,6 +137,11 @@ services:
     image: ghcr.io/cn-maul/rosetta-gateway:1.6.2
     container_name: rosetta-gateway
     restart: unless-stopped
+    # 优雅关停的总预算是 24s（剪枝 5s + 费用重算 2s + 探测 2s +
+    # HTTP 10s + 用量落库 5s），而 docker compose 的默认宽限期只有 **10s**。
+    # 不调大的话 `docker compose down` 会在用量队列还在落库时 SIGKILL，
+    # 表现为「最后几次调用的用量查不到」（这些请求因此免单且配额被放宽）。
+    stop_grace_period: 30s
     ports:
       - "8666:8666"
     volumes:
@@ -294,9 +299,21 @@ docker run -e TZ=Asia/Tokyo ...
 ## 数据与升级
 
 ```bash
-docker run --rm -v rosetta-gateway-data:/data -v "$PWD:/backup" alpine \
-  tar czf /backup/rosetta-gateway-$(date +%F).tar.gz -C /data .
+docker run --rm -v rosetta-gateway-data:/data -v "$PWD:/backup" alpine sh -c '
+  # 一致性快照：VACUUM INTO 在事务内产出一个完整副本，
+  # 不受 -wal / -shm 与主库不同步的影响。
+  apk add --no-cache sqlite >/dev/null
+  sqlite3 /data/data/gateway.db "VACUUM INTO /backup/gateway-$(date +%F).db"
+  tar czf /backup/rosetta-gateway-$(date +%F).tar.gz -C /backup gateway-$(date +%F).db
+  rm -f /backup/gateway-$(date +%F).db
+'
 ```
+
+> **不要直接 `tar -C /data .`**。本项目用 WAL（`synchronous=NORMAL`），
+> 已提交但尚未 checkpoint 的事务只存在于 `gateway.db-wal` 里。把主库与
+> `-wal`/`-shm` 当三个普通文件分别拷走，它们取自不同时刻 —— 恢复出来
+> 可能**丢掉最近若干笔已提交用量**（表现为额度、余额与报表对不上）。
+> 停机拷贝三个文件、或用上面的 `VACUUM INTO` 都安全。
 
 升级就是换镜像标签后重建容器 —— `/data` 原样保留：
 
@@ -326,15 +343,19 @@ docker run -d --name rosetta-gw -p 8666:8666 \
 
 ## 健康检查
 
-镜像自带 `HEALTHCHECK`，探 `127.0.0.1:8666/admin/`：
+镜像自带 `HEALTHCHECK`，探 `127.0.0.1:8666/healthz`：
 
 ```
 --interval=30s --timeout=5s --start-period=10s --retries=3
 ```
 
-探 `/admin/` 而不是 `/v1/models` —— 后者要鉴权、稳定返回 401，那种「健康」
-毫无意义。`/admin/` 只依赖 embed 的静态产物、不碰数据库，能返回 200 就证明
-进程还活着且路由正常。
+`/healthz` 会 ping 数据库的**两个**连接池，并检查运行时快照有没有落后于库
+（配置热重载失败时返回 503）。它取代了原先探 `/admin/` 的写法 —— 后者只读
+embed 的静态产物、不碰数据库，写池被卡住、用量写入持续失败时依然返回 200，
+容器既不重启也不告警。同理也不探 `/v1/models`：那个要鉴权、会稳定返回 401，
+那种「健康」毫无意义。
+
+该端点**免鉴权**且不返回任何业务数据，只暴露一个状态码。
 
 ```
 docker inspect --format '{{.State.Health.Status}}' rosetta-gw

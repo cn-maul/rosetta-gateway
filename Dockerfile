@@ -73,14 +73,15 @@ VOLUME ["/data"]
 EXPOSE 8666
 
 # HEALTHCHECK：死锁时容器不会自动重启，编排系统也探不到活性。
-# 探 /admin/（静态产物）而不是 /v1/models —— 后者要鉴权，会稳定返回 401，
-# 那种「健康」毫无意义。前者只依赖 embed FS，不碰数据库，
-# 所以「能返回 200」证明的是**进程还在跑且路由活着**，这正是要探的东西。
+# 探 /healthz：它 ping 数据库两个连接池，并检查运行时快照有没有落后于库。
+# 此前探 /admin/（静态产物），而那条路径只读 embed FS、不碰数据库 ——
+# 写池被卡住、用量写入持续失败时容器仍然报 healthy，既不重启也不告警。
+# 不探 /v1/models：那个要鉴权、会稳定返回 401，那种「健康」毫无意义。
 #
 # 间隔 30s / 超时 5s / 宽限 10s：SQLite 启动剪枝偶发慢，宽限期别太短，
 # 否则滚动更新时新容器会被反复判死并重启。
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
-	CMD wget -q -O /dev/null http://127.0.0.1:8666/admin/ || exit 1
+	CMD wget -q -O /dev/null http://127.0.0.1:8666/healthz || exit 1
 
 WORKDIR /app
 ENTRYPOINT ["/usr/local/bin/docker-entrypoint.sh"]

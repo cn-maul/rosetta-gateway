@@ -1078,7 +1078,7 @@ per-model 配额、per-provider 配额仍不做，记入后续路线。
 | 配置类别 | 存放位置 | 可否运行时改 |
 |---|---|---|
 | Provider / 模型 / Route / Key / **用户与管理员账号** | **数据库** | 是（管理 API / Web 界面） |
-| 监听地址、DB 路径、日志级别、加密主密钥、**日界时区（`timezone`）**、**用量保留天数（`usage_retention_days`）**、**连通率探测（`probes`）**、全局默认超时与重试、body 大小上限 | **配置文件** | 否（改后重启） |
+| 监听地址、DB 路径、日志级别、加密主密钥、**主密钥强度校验（`require_strong_master_key`）**、**日界时区（`timezone`）**、**用量保留天数（`usage_retention_days`）**、**审计日志行数上限（`audit_log_keep_rows`）**、**连通率探测（`probes`）**、全局默认超时与重试、body 大小上限 | **配置文件** | 否（改后重启） |
 | 首次 bootstrap 的 provider/route | 配置文件（仅当 DB 为空时生效） | 否 |
 
 **关键纪律**：DB 非空时，配置文件里的 `providers` / `routes` 段落被**忽略并打印 warning**。这防止出现「界面改完、重启被配置文件覆盖」这类经典事故。
@@ -1216,6 +1216,21 @@ users 表 + 会话一条通道后，管理员只是一个 `role='admin'` 的普�
 2. **写放大** —— 每条明细要维护 5 个二级索引 + 2 个触发器。
 
 硬编码 30 无法同时服务这两类部署。取值范围 1~3650，缺省 30，**改后需重启**。
+
+**`audit_log_keep_rows`（2026-10-18 新增）**：
+`audit_log` 保留的最大**行数**（不是天数），与用量剪枝共用同一个每日循环。
+按行数而非按天，是因为本表的唯一读路径是 `ORDER BY id DESC LIMIT ?`
+（管理面只看最近几十条），更早的行没有任何下游消费者 —— 与 `usage_records`
+（超期数据会折叠进 `usage_daily_rollups`）和 `model_probes`（超期数据喂连通率
+趋势图）不同，审计日志没有聚合去向。此前只插不删，表随写操作次数无界增长。
+取值 1~10000000，缺省 20000；写 `-1` 显式关闭剪枝（合规审计要求全量留存时用）。
+
+**`require_strong_master_key`（2026-10-18 新增）**：
+缺省 `false` = 低熵主密钥（< 32 字符，`crypto.WeakMaterial`）只告警，这是既有
+行为 —— 很多部署点有意用口令形态的主密钥，直接改成硬失败等于让它们在升级后
+起不来。置 `true` 后，低熵主密钥会让进程**拒绝启动**，与引导令牌路径
+（fail-closed）取向一致：主密钥一旦可离线爆破，全部上游 API key 一起失守。
+`bootstrap_token` 那条路径本来就 fail-closed，两者的不一致正是本次补齐的。
 
 **`timezone`（按天统计的日界）**：IANA 名（如 `Asia/Shanghai`），启动最早期被
 `config.ApplyTimezone` 应用 —— 它同时写 `time.Local` 与 `TZ` 环境变量，因为

@@ -1,5 +1,3 @@
-github.com/cn-maul/rosetta v1.1.1 h1:I943nH3wuOksoP3xwQPvmmPdROZTGhKP0TD2WHrggGg=
-github.com/cn-maul/rosetta v1.1.1/go.mod h1:AUlgHWkUeFbcdMUaeJ896ypHt7DPF+DFeePMvxrG6YI=
 github.com/cn-maul/rosetta v1.2.0 h1:B6GafuJOveuIWBDBVjcAJIRINTRg9Zw7idEC42Rt8Ls=
 github.com/cn-maul/rosetta v1.2.0/go.mod h1:AUlgHWkUeFbcdMUaeJ896ypHt7DPF+DFeePMvxrG6YI=
 github.com/dustin/go-humanize v1.0.1 h1:GzkhY7T5VNhEkwH0PVJgjz+fX1rhBrR7pRT3mDkpeCY=

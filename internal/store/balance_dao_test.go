@@ -729,10 +729,11 @@ func TestCostLookup_UsesReadPool(t *testing.T) {
 
 	done := make(chan float64, 1)
 	go func() {
-		done <- st.freezeUsageCost(ctx, &UsageRecord{
+		cost, _ := st.freezeUsageCost(ctx, &UsageRecord{
 			ProviderID: "p1", UpstreamModel: "priced",
 			InputTokens: 1_000_000, TotalTokens: 1_000_000,
 		})
+		done <- cost
 	}()
 
 	select {

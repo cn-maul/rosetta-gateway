@@ -116,6 +116,15 @@ jobs:
           go build ./...
           go vet ./...
 
+      # go.sum 的陈旧条目没有别的门禁能发现：go build 不会因为多一行旧版本
+      # hash 而失败，于是「升过依赖但 go.sum 没 tidy」会一直悄悄留着，
+      # 直到某个工具链在 -mod=readonly 下报错。go mod verify 同样只校验
+      # 已下载模块的哈希，与 tidy 是两件事，两个都跑。
+      - name: 依赖清单与校验和一致
+        run: |
+          go mod tidy -diff
+          go mod verify
+
       - name: 全量测试
         # -count=1 禁用缓存：改契约后只跑 -run TestXxx 的老坑（cmd/gateway
         # 整包红一轮）就是这么漏进主干的。
@@ -181,6 +190,13 @@ jobs:
 
       - name: 类型检查
         run: npm run typecheck
+
+      # 前端单测此前不在任何 runner 里：tests/routeTrace.test.mjs 有真实断言
+      # （转发轨迹解析、单价格式化），但 package.json 没有 test 脚本、
+      # 本 job 也不调它 —— 改坏 parseRouteStep 只能等运行时才发现。
+      # 这里接进 CI，Node 26 的类型剥离直接跑 .ts import。
+      - name: 前端单测
+        run: npm test
 
       - name: 构建前端并同步到 go:embed 目录
         run: |
