@@ -1,0 +1,1 @@
+import{C as e}from"./api-hJ3a6lW5.js";import{a as t,o as n}from"./index-K-JZg3Qy.js";function r(r,i=``){let a=t(),o=n();return e({get:()=>typeof a.query[r]==`string`?a.query[r]:i,set:e=>{o.replace({query:{...a.query,[r]:e===i?void 0:e}})}})}export{r as t};
