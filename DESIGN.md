@@ -780,6 +780,84 @@ Responses 协议的媒体可以出现在两个位置，且都容易被漏掉：
 这是 R12 的落点。漏掉它的症状是**静默**的：请求照常 200、回答照常生成，
 只是模型从没见过那些附件 —— 比明确失败危险得多。
 
+### 7.3 客户端工具形态的兼容层（2026-10-18，v1.6.4）
+
+入站 Requests 的 `tools` 不止 `function` 一种。Codex、CC Switch、Magpie 这类
+客户端会带两种网关原本不认的形态，而它们都不是「模型不支持」，而是
+**协议族之间没有对应概念**：第三方上游只认 `type:"function"`，托管搜索
+由 OpenAI 服务端执行。
+
+| 形态 | 来源 | 处置 | 理由 |
+|---|---|---|---|
+| `{"type":"namespace","name":…,"tools":[…]}` | Codex 的工具打包 | **展平成平级 function**（`父名__原名`） | namespace 是「先声明命名空间、再按需检索展开」，第三方上游没有这个概念。展平保留全部工具，只丢掉分组信息（对模型无意义）。展平让工具表变长，但工具表每轮字节相同，上游前缀缓存完全吸收：实测 30 工具 / 4531 token 连续三次，每次 4530 命中缓存 |
+| `{"type":"web_search"}` 等托管工具 | Codex 按模型目录 `supports_search_tool` 字段自动附加 | **400 明确拒绝** | 这是**OpenAI 服务端执行**的功能，任何第三方上游都承接不了，网关无法代理。静默丢弃比报错更糟：客户端以为有搜索，实际没有，症状是模型在多轮后说「我没有联网能力」，用户要过几轮才会怀疑是代理吞了工具 |
+
+namespace 展平的细节（`flattenNamespaceTools`）：
+
+- **必须加前缀**：展平后两个 namespace 里可能有同名工具，不加前缀会在
+  上游表里撞名，模型看到两个同名不同定义的 function，调用哪个全靠猜。
+- **`__` 而非 `.`**：部分上游把 `.` 当路径分隔符；`__` 是 MCP 生态既有的
+  命名惯例，客户端也能从展平后的名字认出工具来源。
+- **description 不重写**：客户端已写完整，再拼前缀只会挤占模型注意力预算。
+- **`tool_choice` 同步改名**：指向组内工具时（`{"type":"function","name":"ls"}`
+  其中 `ls` 住在 `shell` 里）必须改成 `shell__ls`，否则上游收到「强制调用 `ls`」
+  而表里只有 `shell__ls`，要么 400 要么被静默忽略退回 auto。后者更糟：
+  客户端要强制，实际拿到模型自由选择，无任何信号。歧义（两个 namespace 同名
+  工具）不猜，保持原值发出让上游自己处理。
+- **嵌套 namespace 拒绝**：真实客户端不出现，递归支持会让前缀拼接规则不可预测。
+
+`validateResponsesTool` 递归校验并带位置报错（`tools.tools[0]`），让客户端
+直接看到是哪个位置、哪个类型不对。
+
+**客户端侧没有关闭 namespace 的开关**（Codex 1.6.x 实测）：`codex doctor` 报
+`` `tool_namespace` is ignored``，`tool_search` / `search_tool` 在
+`codex features list` 里状态均为 `removed`。namespace 打包是该客户端版本的
+硬编码行为，只能在网关侧展平。
+
+`web_search` 的处置留在网关侧（拒绝）而非客户端侧改目录：改模型目录
+（`supports_search_tool: false`）确实能让 Codex 不发，但那是 CC Switch /
+Magpie 生成的配置文件，会被它们重新同步时覆盖，且逐客户端改不统一。网关
+侧拒绝是唯一的统一处置点。代价是这类客户端走 Responses 接入时**不能带
+托管搜索工具** —— 客户端若不需要该能力（多数第三方上游场景），在模型目录
+里关掉即可。
+
+**注意**：第三方代理（CC Switch / Magpie）对 `web_search` 的处置**与网关不同**：
+CC Switch 透传，网关 400；Magpie 静默丢弃（200 但 output 无 `web_search_call`）。
+两种都不是网关的选择，但症状差别很大，排查时先确认请求经过了几层代理。
+
+### 7.4 出站回放闸门：剥掉目标协议无法回放的思考块（2026-10-18，v1.6.4）
+
+§7.1 的 `SealedBy` 门闩只管**带封**的载荷。Anthropic Messages 入站允许
+客户端回传 thinking / redacted_thinking（`assistantBlocks` 原样搬进统一
+模型，带签名），这是正确的 —— 签名的 thinking 只有原样回放才有效。但下游
+目标协议不一定有这个概念，于是同一批块在出站时撞上 Rosetta 各家的硬约束：
+
+| 目标协议 | SDK 行为 | 撞上的约束 |
+|---|---|---|
+| `openai-chat` | thinking / redacted-thinking 一律跳过 | 该 assistant turn 恰好只有这些块时，跳完变成一条什么都没有的 assistant，SDK 报 `assistant turn has only thinking/redacted-thinking blocks, which the OpenAI chat protocol cannot replay`（400） |
+| `anthropic` | 无签名的 thinking 被跳过 | turn 因此空了同样报 `assistant turn has only unsigned thinking blocks, which anthropic cannot replay` |
+| `openai-responses` | 由 `SealedBy` 门闩自管 | 不需要这一刀 |
+
+这两条报错是 SDK **故意**写清楚的（宁可报错也不发畸形空消息出去），但它
+没有退路可选 —— 客户端无法为别人的协议重造签名，剥掉是唯一走法。网关在
+`attemptStream` / `attemptNonStream` 各调一次 `applyReplayGate`（必须在 attempt
+内：故障转移链上换一个目标就换一个协议）。
+
+| 目标协议 | thinking | redacted_thinking |
+|---|---|---|
+| `openai-chat` / `""` / `auto` | 剥（带不带签名都剥） | 剥 |
+| `anthropic` | 剥无签名的，保留有签名的 | 保留 |
+| `openai-responses` | 不动 | 不动 |
+
+剥空之后的 assistant turn 整条删掉 —— 留着零块消息 SDK 照样会以「只有思考块
+无法回放」报 400。删掉是安全的：turn 空了意味着它既没有正文也没有 tool_call，
+对模型本来就是一条空消息；工具调用链不受影响（tool_call 在同一 turn 里会保留）。
+
+**症状与验证**：deepseek harness 经 `/v1/messages` → `openai-chat`，第一轮正常，
+第二轮必然 400（客户端回传了上一轮的 thinking）。修复后四种回放形态（带签名
+thinking / 无签名 thinking / redacted_thinking / thinking+text+tool_use 混合）
+全部 200，且模型仍知道前文问了什么 —— 剥掉不损失对话语义。
+
 ---
 
 ## 8. 流式转发
@@ -798,7 +876,7 @@ Responses 协议的媒体可以出现在两个位置，且都容易被漏掉：
 | Flush | 用 `http.NewResponseController(w).Flush()`（Go 1.20+），不用 `http.Flusher` 类型断言 |
 | 首字节时机 | `ChatStream` 成功后才写 `200 + Content-Type: text/event-stream` + `Cache-Control: no-cache` + `X-Accel-Buffering: no` |
 | 结束事件 | OpenAI 系发 `data: [DONE]`；Anthropic 发 `event: message_stop`。**只有 `status=="ok"` 才发** |
-| 思考增量 | `EventThinkingDelta` 编码为 `delta.reasoning_content`（DeepSeek / Qwen / vLLM 的既成约定，Rosetta 的 openai-chat 适配器也按这个键回读）。**不能丢**：只吐思考的流丢了它就是个零内容的流 |
+| 思考增量 | `EventThinkingDelta` 编码为 `delta.reasoning_content`（DeepSeek / Qwen / vLLM 的既成约定，Rosetta 的 openai-chat 适配器也按这个键回读）。**不能丢**：只吐思考的流丢了它就是个零内容的流。**Responses 下游的 reasoning item 生命周期必须跨增量**（2026-10-18 修复，§7.4）：每片增量独立 `added → delta → done` 会让 N 片思考变成 N 个 item，且 `thinkText` 跨 item 累积使 summary 变成「第 1+2 片」「第 1+2+3 片」——客户端按 item 渲染就是逐段变长、前缀重复的思考块 |
 | 空文本事件 | `EventThinkingDelta` 的 `Text==""` 是 Anthropic thinking signature 的载体，OpenAI 下游无对应字段，跳过即可。**但 Responses 下游不能跳过**：空 `Text` 同时是 sealed 载荷的载体，跳了就丢续接状态（§7.1） |
 | usage 合成 | OpenAI 下游要 usage 需客户端传 `stream_options.include_usage`；网关在 `EventMessageEnd` 处合成仅含 usage 的 chunk，且仅当客户端要求时下发 |
 | 断流处理 | 见 §8.2 |
@@ -1569,6 +1647,10 @@ rosetta-gateway/
 | R11 | **Responses 的 reasoning item 跨协议转换会失效** | 下游 Responses + 上游非 Responses 时，多轮回传 reasoning 断链 | **已解决（2026-10-16）**：Rosetta v1.2.0 起，`Block.Sealed/SealedBy/ReasoningID` 与流式 `Event.Sealed/SealedBy/ReasoningID` 成对表达「provider 私有的不透明续接载荷 + 密封它的协议族」，`SealedBy` 门闩保证它只写回同一个族。网关侧 `inwire` 把 reasoning item 搬进 `SealedThinking`、`outwire` 两侧（流式 SSE + 非流式对象）输出 reasoning item。此前流式侧整个不出 thinking 事件、非流式侧跳过 `BlockThinking`，客户端多轮 reasoning 会话在第二轮回放时报 `Item with id 'rs_…' not found`。见 §7.1 |
 | R12 | **Responses 的工具输出媒体块被静默丢弃** | agent 让模型读图 / 读 PDF / 听音频时，内容无声消失 | **已解决（2026-10-17）**：`function_call_output` 与 user content 的 `input_file` / `input_audio` 分块此前只读文本，媒体块被 `encoding/json` 静默忽略 —— 客户端以为它们参与了推理，实际没有。现在拆成 `rosetta.Block` 的 image / file / audio 块；tool_result 内的媒体另起一条 user 消息（tool_result 的 Content 是纯文本语义），并留一行「N 个附件已移至下一条消息」把两处接上。data: 前缀剥成裸 base64（rosetta 的口径）。参考 cc-switch 的 `TOOL_RESULT_MEDIA_MOVED_MARKER` |
 | R13 | **effort 夹取方向与两个独立实现相反** | 客户端选 high 而模型只支持 low/high 时，我们给 low | **已解决（2026-10-17）**：`Clamp` 原为「同距取更弱」，改为「同距取更强」。客户端显式选档表达的是「我要这么强」，夹到更弱等于无声打折。cc-switch 的 zen 模式只取不小于请求的最近合法档、Magpie 的 `NearestEffort` 注释直说「a tie going up」，我们是被反驳的那一方。顺带修掉 `None` 参与竞争：`rankOf(None)` 是 -1，旧代码取绝对值后它变成很大的距离，某些支持集下会被选中，结果是「模型不思考」 |
+| R14 | **Anthropic 入站的 thinking 块在 chat/anthropic 上游无法回放** | deepseek harness 等客户端第二轮必然 400（回传了上一轮 thinking），多轮会话完全不可用 | **已解决（2026-10-18，v1.6.4）**：新增 `applyReplayGate`，按目标协议剥掉无法回放的 thinking / redacted_thinking，剥空的 assistant turn 整条删除。chat 剥全部、anthropic 剥无签名的、responses 不动。见 §7.4 |
+| R15 | **Codex 的 namespace 工具形态被网关拒绝** | Codex 经 `/v1/responses` 接入整体 400，不是功能缺失而是整条路径不可用 | **已解决（2026-10-18，v1.6.4）**：`flattenNamespaceTools` 把 namespace 展平成平级 function（`父名__原名`），`tool_choice` 同步改名。展平让工具表变长但被上游前缀缓存完全吸收（实测 4531 token 里 4530 命中）。客户端侧无开关（`tool_namespace` 被 Codex 忽略）。见 §7.3 |
+| R16 | **Responses 流式 reasoning item 被逐增量切碎** | 客户端看到一串逐段变长、前缀重复的思考块；携带 sealed 载荷的那一片单独成 item，其余片对模型无意义且在历史里多出垃圾 item | **已解决（2026-10-18，v1.6.4）**：reasoning item 生命周期改为跨增量（首片 added、中间片 delta、末片或 `Finish` 才 done），`reasonItemID` 在 added/delta/done 里复用，`thinkText` 在开新 item 时 Reset。见 §7.4 与 §8.1 |
+| R17 | **客户端按模型目录声明的托管工具（`web_search`）被网关拒绝** | 走 Responses 接入时整体 400；客户端若不关该能力则无法使用任何走 Responses 的模型 | **有意接受（2026-10-18）**：托管搜索由 OpenAI 服务端执行，任何第三方上游都承接不了，网关无法代理。拒绝而非静默丢弃 —— 静默丢弃的症状是模型在多轮后说「我没有联网能力」，用户要过几轮才会怀疑是代理吞了工具。处置在客户端侧：模型目录（`supports_search_tool: false`）关掉该能力。注意 Magpie 会静默丢弃（200 但无 `web_search_call`），CC Switch 透传到网关导致 400。见 §7.3 |
 
 ---
 
