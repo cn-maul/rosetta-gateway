@@ -51,6 +51,25 @@ type ResponsesSSE struct {
 	// thinkText 累积当前 reasoning item 的可读文本，供 output_item.done
 	// 的 summary 收尾。与 text（message 正文）分开：两者是不同的 item。
 	thinkText strings.Builder
+	// reasonOpen 标记当前是否有**未收尾**的 reasoning item，reasonIdx 是它的
+	// output_index。
+	//
+	// 这两个字段是必需的，不是优化：思考增量是**多次到达**的（上游每 reasoning
+	// chunk 一次），而一个 reasoning item 按规范只能 added→delta*→done 一次。
+	// 没有这两个字段时，每个增量都独立开一个 item 又立刻收尾，于是 N 片思考
+	// 变成 N 个 reasoning item；更要命的是 thinkText 是跨 item 累积的，于是
+	// 第 2 个 item 的 summary 变成「第 1+2 片」、第 3 个变成「第 1+2+3 片」——
+	// 客户端（Codex / harness）按 item 渲染思考过程，看到的就是一串逐段变长、
+	// 前缀重复的思考块（2026-10-18 用户实测截图）。真正丢失的不是显示效果：
+	// 携带 sealed 载荷的那一片会单独成一个 item，其余片的思考内容对模型没有任何
+	// 意义，而对话历史里会多出 N-1 条垃圾 item。
+	reasonOpen bool
+	reasonIdx  int
+	// reasonItemID 是这个 reasoning item 的 id。上游给了 rs_ id 就用它
+	// （客户端靠它回放寻址），否则网关生成 —— 但必须**记住**并在后续的
+	// delta/done 事件里复用同一个值：added 用 A、done 用 B 会让客户端
+	// 认不出这是同一个 item。
+	reasonItemID string
 	// toolIdx 是当前开放 function_call item 对应的 ToolIndex。
 	// 同项判据必须是它而不是 toolID：rosetta 的续片（Responses 侧的
 	// function_call_arguments.delta）只带 ToolIndex+ArgumentsDelta，ToolID 为空。
@@ -194,50 +213,77 @@ func (s *ResponsesSSE) thinkingDelta(ev *rosetta.Event) {
 		return
 	}
 
-	s.ensureStarted("")
-	idx := s.outputIndex
-	s.outputIndex++
-
 	// encrypted_content 只在 output_item.done 出现（OpenAI 不在任何
 	// *.delta 事件里发它），所以这里不发 reasoning_summary_part.* 的
 	// added/done 配对 —— 规范的流式形状里 reasoning item 不是分块容器。
-	item := map[string]any{
-		"type":   "reasoning",
-		"status": "in_progress",
+	//
+	// item 的生命周期因此横跨多片增量：**首片**才 added，**末片**才 done。
+	// 提前 done 会让每个增量各成一个 item（见 reasonOpen 的注释）。
+	if !s.reasonOpen {
+		s.ensureStarted("")
+		// 思考 item 必须在正文/工具 item 之前收尾：Responses 的 output_index
+		// 是严格递增的分配序，不能在开着的 item 中间插一个新 item。
+		s.closeMessage()
+		s.closeTool()
+		s.reasonOpen = true
+		s.reasonIdx = s.outputIndex
+		s.outputIndex++
+		s.thinkText.Reset()
+		if ev.ReasoningID != "" {
+			s.reasonItemID = ev.ReasoningID
+		} else {
+			s.reasonItemID = s.id + "-reason-" + itoa(s.reasonIdx)
+		}
+		s.writeEvent("response.output_item.added", map[string]any{
+			"output_index": s.reasonIdx,
+			"item":         map[string]any{"type": "reasoning", "status": "in_progress", "id": s.reasonItemID},
+		})
 	}
-	if ev.ReasoningID != "" {
-		item["id"] = ev.ReasoningID
-	}
-	s.writeEvent("response.output_item.added", map[string]any{
-		"output_index": idx, "item": item,
-	})
 
 	if ev.Text != "" {
 		s.thinkText.WriteString(ev.Text)
 		s.wroteContent = true
 		s.writeEvent("response.reasoning_summary_text.delta", map[string]any{
-			"item_id": ev.ReasoningID, "output_index": idx,
+			"item_id": s.reasonItemID, "output_index": s.reasonIdx,
 			"summary_index": 0, "delta": ev.Text,
 		})
 	}
 
+	// 末片判定：sealed 载荷只能落在一个 item 上（它是一整块不透明状态，
+	// 拆到多个 item 里客户端只能拼第一个、其余丢弃），裸文本增量则等到
+	// 「不再有思考」时由 closeReason 收尾 —— 不能每片都收，否则又回到
+	// 一片一个 item。
+	if ev.Sealed == "" {
+		return
+	}
+	s.closeReason(ev)
+}
+
+// closeReason 收尾打开中的 reasoning item（output_item.done）。
+// done 事件只发一次（reasonOpen 是幂等闩）。
+func (s *ResponsesSSE) closeReason(ev *rosetta.Event) {
+	if !s.reasonOpen {
+		return
+	}
+	s.reasonOpen = false
 	done := map[string]any{
 		"type":   "reasoning",
 		"status": "completed",
+		"id":     s.reasonItemID,
+		"summary": func() []map[string]any {
+			if s.thinkText.Len() == 0 {
+				return []map[string]any{}
+			}
+			return []map[string]any{{
+				"type": "summary_text", "text": s.thinkText.String(),
+			}}
+		}(),
 	}
-	if ev.ReasoningID != "" {
-		done["id"] = ev.ReasoningID
-	}
-	if ev.Text != "" {
-		done["summary"] = []map[string]any{{
-			"type": "summary_text", "text": s.thinkText.String(),
-		}}
-	}
-	if ev.Sealed != "" {
+	if ev != nil && ev.Sealed != "" {
 		done["encrypted_content"] = ev.Sealed
 	}
 	s.writeEvent("response.output_item.done", map[string]any{
-		"output_index": idx, "item": done,
+		"output_index": s.reasonIdx, "item": done,
 	})
 	s.output = append(s.output, done)
 }
@@ -255,6 +301,9 @@ func (s *ResponsesSSE) Event(ev *rosetta.Event) {
 			return
 		}
 		s.ensureStarted("")
+		// output_index 是严格递增的分配序：思考 item 还没 done 就开新的
+		// message item，客户端会看到交错的半开 item。
+		s.closeReason(nil)
 		if !s.msgOpen {
 			s.closeTool()
 			idx := s.outputIndex
@@ -278,6 +327,7 @@ func (s *ResponsesSSE) Event(ev *rosetta.Event) {
 		})
 	case rosetta.EventToolCall:
 		s.ensureStarted("")
+		s.closeReason(nil)
 		if !s.toolOpen || s.toolIdx != ev.ToolIndex {
 			s.closeMessage()
 			s.closeTool()
@@ -318,8 +368,13 @@ func (s *ResponsesSSE) Finish(status string, stop rosetta.StopReason, usage rose
 	defer s.mu.Unlock()
 
 	if status == "canceled" {
+		// canceled 不写任何东西，收尾 item 也一样（与 message/tool 同纪律）。
 		return
 	}
+	// 思考全程没有 sealed 载荷时，reasoning item 要在这里才收尾 ——
+	// 否则一次纯文本思考响应会漏掉 output_item.done，客户端的 item 序列
+	// 悬在半开状态。
+	s.closeReason(nil)
 	s.closeMessage()
 	s.closeTool()
 
