@@ -579,6 +579,10 @@ func (p *Pool) ClaimTargetProbe(targetID string) bool {
 // threshold<=0 表示不启用目标级熔断（仅凭据级冷却生效）。
 func (p *Pool) RecordTargetFailure(targetID string, threshold int) {
 	if threshold <= 0 {
+		// 名额仍要归还：ClaimTargetProbe 不看 threshold，只看冷却是否到期，
+		// 所以即便关了目标级熔断，探测名额照样被领走。此处提前 return 而不
+		// 清 halfOpen，目标会被永久占死 —— 直到下一次池重建才恢复。
+		p.ReleaseTargetProbe(targetID)
 		return
 	}
 	p.mu.Lock()

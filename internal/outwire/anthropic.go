@@ -240,9 +240,13 @@ func NewAnthropicSSE(w io.Writer, flusher http.Flusher, id, model string) *Anthr
 }
 
 // WithResponseWriter 绑定底层 ResponseWriter，用于设置单次写截止时间。
-func (s *AnthropicSSE) WithResponseWriter(rw http.ResponseWriter) *AnthropicSSE {
+//
+// 签名必须**不返回值**：BindWriteDeadline 的能力探测用的是
+// `interface{ WithResponseWriter(http.ResponseWriter) }`，返回自身的那版
+// 不满足该接口（Go 的方法集按签名精确匹配），于是探测失败、rw 恒为 nil，
+// 截止时间整条路径静默失效。链式调用的写法已无人使用。
+func (s *AnthropicSSE) WithResponseWriter(rw http.ResponseWriter) {
 	s.rw = rw
-	return s
 }
 
 func (s *AnthropicSSE) writeRaw(event, data string) {

@@ -389,11 +389,50 @@ func (t *FailureThrottle) sweepLocked() {
 		return
 	}
 	now := time.Now()
+	// 访问预算：这一段跑在**全局互斥锁**里，而所有鉴权路径（Allow / Fail /
+	// Success）都要抢同一把锁。扫描本身不能成为放大器 —— 否则攻击者只要
+	// 慢速地把条目维持在阈值之上，每次失败尝试都要拖着全表扫一遍。
+	// 4096 次 map 迭代在现代 CPU 上是几十微秒量级，取够本量级的预算。
+	const visitBudget = 8192
+	visited := 0
 	for ip, e := range t.fails {
+		visited++
+		if visited > visitBudget {
+			break
+		}
 		if !now.Before(e.until) {
 			delete(t.fails, ip)
 		}
 	}
+	// 冷却期内的条目扫不掉：攻击者把登录尝试摊到成百上千个来源 IP 上，
+	// 就能让全部条目同时「在冷却中」，map 从此无界增长，而扫描代价
+	// 落在每个合法用户的鉴权请求上。**必须硬封顶**。
+	//
+	// 无差别淘汰是安全的：条目 key 就是来源 IP，被淘汰的条目顶多让该 IP
+	// 的失败计数从头开始 —— 而这正是本函数注释里早就写明并接受的行为
+	//（「攻击者换个 IP 就能重置计数」）。真正被防护的场景（单个来源暴力
+	// 枚举）只涉及一个 key，永远进不了淘汰路径。
+	//
+	// Go 的 map 迭代顺序是随机化的，所以遍历中淘汰的条目在 key 空间上
+	// 均匀分布，不会变成「先挤掉哪一批」的可预测行为。
+	evictTo := func(wantIdle bool) {
+		for ip, e := range t.fails {
+			if len(t.fails) < maxEntries/2 {
+				return
+			}
+			if wantIdle && e.inflight > 0 {
+				continue // 有在途请求的条目留到最后，见下方说明
+			}
+			delete(t.fails, ip)
+		}
+	}
+	evictTo(true)
+	// 仍超上限说明**所有**条目都有在途请求。此时才动它们：并发额度被
+	// 淘汰后，迟到的 Fail 会凭空造出一个 count=1 的新条目 —— 该 IP 的
+	// 失败计数从头开始，正是本函数早已接受的行为；但让它同时越过并发
+	// 上限就是另一回事了，所以第二遍没有「只删空闲」的约束，且必然收敛
+	// （map 非空就能删到一半）。
+	evictTo(false)
 }
 
 // bearerToken 取出 Authorization 头里的 Bearer 令牌（大小写不敏感）。

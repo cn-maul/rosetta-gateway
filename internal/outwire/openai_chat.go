@@ -91,9 +91,13 @@ func NewSSEWriter(w io.Writer, flusher http.Flusher, id, model string, created i
 
 // WithResponseWriter 绑定底层 ResponseWriter，用于设置单次写截止时间。
 // 不改变原有构造签名（多处调用点与测试在用），由 codec.NewSink 额外调用。
-func (sw *SSEWriter) WithResponseWriter(rw http.ResponseWriter) *SSEWriter {
+//
+// 签名必须**不返回值**：BindWriteDeadline 的能力探测用的是
+// `interface{ WithResponseWriter(http.ResponseWriter) }`，返回自身的那版
+// 不满足该接口（Go 的方法集按签名精确匹配），于是探测失败、rw 恒为 nil，
+// 截止时间整条路径静默失效。
+func (sw *SSEWriter) WithResponseWriter(rw http.ResponseWriter) {
 	sw.rw = rw
-	return sw
 }
 
 // SetResponseID 在上游 message_start 带回真实响应 id 后覆盖预先生成的兜底 id；

@@ -136,10 +136,20 @@ func (s *Store) CreateUsageRecordWithCost(ctx context.Context, r *UsageRecord) (
 	// 刻意放在 DAO 内而不是调用方：落库点有 worker、sync fallback、启动自检
 	// 三处，任一处的闭包都不同 —— 在调用方算等于把「别忘了算」变成三个
 	// 可以各自忘记的地方，而忘了的表征是**费用静默偏低**，没人会发现。
-	cost := s.freezeUsageCost(ctx, r)
+	cost, costPending := s.freezeUsageCost(ctx, r)
+	// 查价失败时把待重算标记**随这条 INSERT 一起写进去**。
+	// 旧实现是 INSERT 之后再 UPDATE 那一行，而此刻行还不存在 ——
+	// UPDATE 影响 0 行且不报错，于是这笔用量带着**原 usage_state**
+	// （通常是 reported）与 cost_total=0 落库，后台的
+	// RecomputePendingCosts 按 usage_state='cost_pending' 扫描，
+	// 永远捞不到它 —— 「一次读池抖动 = 一笔永久免单」，且事后无从发现。
+	usageState := r.UsageState
+	if costPending {
+		usageState = usageStateCostPending
+	}
 	_, err := s.db.ExecContext(ctx,
 		`INSERT INTO usage_records (id, ts, access_key_id, user_id, public_model, provider_id, upstream_model, ingress_protocol, stream, input_tokens, output_tokens, total_tokens, reasoning_tokens, cached_tokens, usage_state, status, http_status, error_code, error_detail, latency_ms, ttfb_ms, request_id, route_trace, cost_total) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		r.ID, ts, r.AccessKeyID, nullIfEmpty(r.UserID), r.PublicModel, r.ProviderID, r.UpstreamModel, r.IngressProtocol, stream, r.InputTokens, r.OutputTokens, r.TotalTokens, r.ReasoningTokens, r.CachedTokens, r.UsageState, r.Status, r.HTTPStatus, nullIfEmpty(r.ErrorCode), nullIfEmpty(r.ErrorDetail), r.LatencyMs, r.TTFBMs, nullIfEmpty(r.RequestID), nullIfEmpty(r.RouteTrace), cost)
+		r.ID, ts, r.AccessKeyID, nullIfEmpty(r.UserID), r.PublicModel, r.ProviderID, r.UpstreamModel, r.IngressProtocol, stream, r.InputTokens, r.OutputTokens, r.TotalTokens, r.ReasoningTokens, r.CachedTokens, usageState, r.Status, r.HTTPStatus, nullIfEmpty(r.ErrorCode), nullIfEmpty(r.ErrorDetail), r.LatencyMs, r.TTFBMs, nullIfEmpty(r.RequestID), nullIfEmpty(r.RouteTrace), cost)
 	if err != nil {
 		// 落库失败：费用随记录一起作废。返回 0 而不是 cost —— 调用方若误用
 		// 这个值去扣费，扣的金额必须与「库里真实存在的记录」对应，
@@ -189,11 +199,9 @@ func (s *Store) CreateUsageRecordsBatched(ctx context.Context, recs []*UsageReco
 		return []float64{cost}, nil
 	}
 
-	costs := make([]float64, len(recs))
-
 	// 计价在事务外做：freezeUsageCost 只读数据库（查价），
 	// 放到事务内会延长持写锁时间，而查价走的是读池（WAL 下不阻塞）。
-	costs = s.batchComputeCosts(recs)
+	costs, costPending := s.batchComputeCosts(recs)
 
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
@@ -217,7 +225,7 @@ func (s *Store) CreateUsageRecordsBatched(ctx context.Context, recs []*UsageReco
 			sb.WriteByte(',')
 		}
 		sb.WriteString("(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)")
-		args = append(args, usageInsertArgs(r, costs[i])...)
+		args = append(args, usageInsertArgs(r, costs[i], costPending[i])...)
 	}
 
 	if _, err := tx.ExecContext(ctx, sb.String(), args...); err != nil {
@@ -238,9 +246,12 @@ const usageInsertColumns = 24
 // 归一必须在这里做（而不能只在单条路径做）：批量路径也是写入口，
 // 绕过归一会让负 token 经触发器永久拉低终身累计（见
 // CreateUsageRecordWithCost 的注释）。
-func (s *Store) batchComputeCosts(recs []*UsageRecord) []float64 {
+//
+// 第二个返回值逐条标记「查价失败、需随 INSERT 一起写成 cost_pending」。
+func (s *Store) batchComputeCosts(recs []*UsageRecord) ([]float64, []bool) {
 	now := time.Now().UnixMilli()
 	costs := make([]float64, len(recs))
+	pending := make([]bool, len(recs))
 	for i, r := range recs {
 		if r.InputTokens < 0 {
 			r.InputTokens = 0
@@ -260,22 +271,32 @@ func (s *Store) batchComputeCosts(recs []*UsageRecord) []float64 {
 		if r.Ts == 0 {
 			r.Ts = now
 		}
-		costs[i] = s.freezeUsageCost(context.Background(), r)
+		cost, p := s.freezeUsageCost(context.Background(), r)
+		costs[i] = cost
+		pending[i] = p
 	}
-	return costs
+	return costs, pending
 }
 
 // usageInsertArgs 把一条记录摊成 INSERT 的绑定参数（顺序与列清单一致）。
-func usageInsertArgs(r *UsageRecord, cost float64) []any {
+//
+// costPending 为真时把 usage_state 改写为 cost_pending：待重算标记必须与记录
+// 同时落库，单独事后 UPDATE 会命中 0 行（那时行还不存在），于是该笔用量
+// 永久免单。
+func usageInsertArgs(r *UsageRecord, cost float64, costPending bool) []any {
 	stream := 0
 	if r.Stream {
 		stream = 1
+	}
+	usageState := r.UsageState
+	if costPending {
+		usageState = usageStateCostPending
 	}
 	return []any{
 		r.ID, r.Ts, r.AccessKeyID, nullIfEmpty(r.UserID), r.PublicModel,
 		r.ProviderID, r.UpstreamModel, r.IngressProtocol, stream,
 		r.InputTokens, r.OutputTokens, r.TotalTokens,
-		r.ReasoningTokens, r.CachedTokens, r.UsageState, r.Status,
+		r.ReasoningTokens, r.CachedTokens, usageState, r.Status,
 		r.HTTPStatus, nullIfEmpty(r.ErrorCode), nullIfEmpty(r.ErrorDetail),
 		r.LatencyMs, r.TTFBMs, nullIfEmpty(r.RequestID), nullIfEmpty(r.RouteTrace), cost,
 	}
@@ -364,7 +385,11 @@ const usageStateCostPending = "cost_pending"
 // 但**绝不能只是打个 WARN 就完事**（2026-10-12 修 P1-2）：那会让一次读池
 // 抖动永久变成一笔免单，且事后无从发现。所以失败时把 usage_state 标成
 // usageStateCostPending，让后台的 RecomputePendingCosts 能把它捞回来重算。
-func (s *Store) freezeUsageCost(ctx context.Context, r *UsageRecord) float64 {
+//
+// 第二个返回值 pending 为真时，调用方**必须**把 usage_state 一并写成
+// cost_pending（随 INSERT 落库）。这个标记与「记录已存在」必须同时成立，
+// 否则待重算队列与待重算记录会永久错开。
+func (s *Store) freezeUsageCost(ctx context.Context, r *UsageRecord) (float64, bool) {
 	var pin, phit, pout float64
 	err := s.read.QueryRowContext(ctx,
 		`SELECT COALESCE(price_input, 0), COALESCE(price_cache_hit, 0), COALESCE(price_output, 0)
@@ -380,20 +405,12 @@ func (s *Store) freezeUsageCost(ctx context.Context, r *UsageRecord) float64 {
 			s.logger.Warn("freeze usage cost: price lookup failed, marked cost_pending",
 				"provider_id", r.ProviderID, "upstream_model", r.UpstreamModel,
 				"request_id", r.RequestID, "error", err)
-			// 标记失败也不能影响落库：这条 UPDATE 走写池，本身可能因
-			// 同一故障而失败，静默忽略即可 —— 那种情况下后台的重算
-			// 任务会靠 usage_state 的抽样兜底（见 RecomputePendingCosts）。
-			if _, merr := s.db.ExecContext(ctx,
-				`UPDATE usage_records SET usage_state = ? WHERE id = ?`,
-				usageStateCostPending, r.ID); merr != nil {
-				s.logger.Warn("freeze usage cost: mark cost_pending failed",
-					"request_id", r.RequestID, "error", merr)
-			}
+			return 0, true
 		}
-		return 0
+		return 0, false
 	}
 	return priceUsage(pin, phit, pout,
-		float64(r.InputTokens), float64(r.CachedTokens), float64(r.OutputTokens))
+		float64(r.InputTokens), float64(r.CachedTokens), float64(r.OutputTokens)), false
 }
 
 // RecomputePendingCosts 重算所有 usage_state='cost_pending' 的记录（2026-10-12 修 P1-2）。
@@ -482,10 +499,17 @@ func (s *Store) RecomputeCost(ctx context.Context, recordID string) (bool, error
 	if err != nil {
 		return false, err
 	}
-	cost := s.freezeUsageCost(ctx, &r)
+	cost, costPending := s.freezeUsageCost(ctx, &r)
+	// 重算成功即复位为 reported；查价仍然失败则**保持** cost_pending，
+	// 让下一轮继续捞它（旧实现无条件写 reported，于是重算失败的那次
+	// 把这条记录永久移出待重算队列，变成一笔没被纠正的 0 元）。
+	state := "reported"
+	if costPending {
+		state = usageStateCostPending
+	}
 	res, err := s.db.ExecContext(ctx,
 		`UPDATE usage_records SET cost_total = ?, usage_state = ? WHERE id = ?`,
-		cost, "reported", recordID)
+		cost, state, recordID)
 	if err != nil {
 		return false, err
 	}

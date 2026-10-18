@@ -101,6 +101,17 @@ func (s *openaiSink) Finish(status string, stop rosetta.StopReason, usage rosett
 }
 
 func (s *openaiSink) Keepalive() { s.sse.WriteComment("keepalive") }
+
+// WithResponseWriter 把底层 ResponseWriter 转发给 SSEWriter。
+//
+// 没有这一层，BindWriteDeadline 的能力探测会在 openaiSink 上失败，
+// sw.rw 永远是 nil，于是 30 秒单次写截止时间整条 OpenAI Chat 路径都是
+// no-op —— 下游挂死不读时 Write 阻塞在 send buffer，handler 与上游流、
+// 它的 token 一起泄漏，而空闲看门狗根本跑不到（主循环卡在写里）。
+func (s *openaiSink) WithResponseWriter(rw http.ResponseWriter) {
+	s.sse.WithResponseWriter(rw)
+}
+
 func (s *openaiSink) WroteContent() bool {
 	return s.wroteContent
 }
