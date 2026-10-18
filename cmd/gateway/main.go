@@ -176,9 +176,20 @@ func main() {
 	case generatedKey:
 		logger.Info("generated master key", "path", filepath.Join(homeDir, crypto.KeyFileName))
 	case weakKey:
+		if cfg.RequireStrongMasterKey {
+			// require_strong_master_key=true 是部署点显式声明「不接受低熵主密钥」。
+			// 与 bootstrap 令牌那条路径（fail-closed）保持同一取向：主密钥一旦
+			// 可爆破，全部上游 API key 一起失守，不给「先跑起来再说」的余地。
+			// 改法：删掉该文件让网关自动生成随机 master.key，然后逐条重存凭据
+			// （或改用环境变量注入一条 44 字符的 base64url 密钥）。
+			logger.Error("master key material is weak (<32 chars) and require_strong_master_key is set; refusing to start",
+				"hint", "删除 "+filepath.Join(homeDir, crypto.KeyFileName)+" 后重启以自动生成随机主密钥，并重新保存全部上游凭据")
+			os.Exit(1)
+		}
 		logger.Warn("master key material is short (<32 chars) and looks like a passphrase; " +
 			"upstream API keys encrypted with it are brute-forceable offline. " +
-			"Recommended: delete the weak key, restart to auto-generate a random master.key, then re-save every credential")
+			"Recommended: delete the weak key, restart to auto-generate a random master.key, then re-save every credential. " +
+			"Or set require_strong_master_key=true to refuse to start on a weak key")
 	}
 
 	db, err := store.Open(cfg.DBPath, logger)
@@ -320,7 +331,7 @@ func main() {
 	settingsHandler := admin.NewSettingsHandler(db, cfg)
 	reloadHandler := admin.NewReloadHandler(reloader.Reload)
 	auditHandler := admin.NewAuditHandler(db)
-	usageHandler := admin.NewUsageHandler(db)
+	usageHandler := admin.NewUsageHandler(db, cfg)
 	// 供应商 + 模型的导入导出。写在 settings 附近是因为它在界面上的入口
 	// 也在「设置」页里，与设置项同一层级。
 	configTransferHandler := admin.NewConfigTransferHandler(db, masterKey, cfg)
@@ -613,6 +624,32 @@ func main() {
 	// 于是 "GET /admin/api/" 在路径上严格更具体、方法相同，冲突消除。
 	mux.HandleFunc("GET /admin/", webHandler)
 
+	// 存活 / 就绪探针。**不放在 /admin/ 下**：那个路径只读 embed FS，
+	// 数据库写池卡死、用量写入持续失败、快照重建长期落后时它照样返回 200，
+	// 容器与编排系统因此既不重启也不告警。这里 ping 两个连接池，
+	// 并把「运行时落后于数据库」这件事报成不就绪。
+	//
+	// 免鉴权是刻意的：探针要在没有会话、没有 token 的情况下可用。
+	// 因此只返回布尔状态，不泄露任何配置或凭据。
+	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) {
+		ctx, cancel := context.WithTimeout(r.Context(), 3*time.Second)
+		defer cancel()
+		body := map[string]any{"status": "ok"}
+		code := http.StatusOK
+		if err := db.Ping(ctx); err != nil {
+			body = map[string]any{"status": "unhealthy", "error": err.Error()}
+			code = http.StatusServiceUnavailable
+		} else if reloader.IsDirty() {
+			// 数据库可用、运行时落后：进程还活着但配置未生效，
+			// 报 503 让编排系统有机会介入，同时区别于「进程死了」。
+			body = map[string]any{"status": "degraded", "error": "runtime lags behind database"}
+			code = http.StatusServiceUnavailable
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(code)
+		_ = json.NewEncoder(w).Encode(body)
+	})
+
 	handler := server.Recovery(mux, logger)
 	handler = server.Middleware(handler, logger)
 	handler = server.SecurityHeaders(handler)
@@ -656,6 +693,23 @@ func main() {
 	pruneDone := make(chan struct{})
 	go func() {
 		defer close(pruneDone)
+		// 审计日志按**行数**封顶（不是天数）：它的唯一读路径是
+		// 「最近 N 条」，更早的行没有任何下游消费者，却随写操作次数无界增长。
+		// 跟着用量剪枝同一个循环跑即可，keepRows <= 0 表示部署点显式关闭。
+		pruneAudit := func(reason string) {
+			if cfg.AuditLogKeepRows <= 0 {
+				return
+			}
+			n, err := db.PruneAuditLog(context.Background(), cfg.AuditLogKeepRows)
+			if err != nil {
+				logger.Error("audit log prune failed", "error", err, "trigger", reason)
+				return
+			}
+			if n > 0 {
+				logger.Info("audit log pruned", "trigger", reason,
+					"deleted_rows", n, "keep_rows", cfg.AuditLogKeepRows)
+			}
+		}
 		runPrune := func(reason string) {
 			// 保留期来自配置（config.UsageRetentionDays），默认 30。
 			// 此前硬编码 store.DefaultRetentionDays，用量小的部署无法调短 ——
@@ -674,6 +728,7 @@ func main() {
 					"deleted_rows", res.DeletedRows, "rollup_rows", res.RollupRows,
 					"pruned_through_day", res.PrunedThrough)
 			}
+			pruneAudit(reason)
 		}
 		runPrune("startup")
 		t := time.NewTicker(24 * time.Hour)
@@ -2072,6 +2127,14 @@ func handleIngress(pool *upstream.Pool, cfg *config.Config, usage *usageRecorder
 					pool.RecordCredentialSuccess(credID)
 					pool.RecordTargetSuccess(cand.TargetID)
 					routeTrace = appendRouteTrace(routeTrace, i+1, cand, "ok", "")
+				} else if out.clientGone {
+					// 客户端自己走了（用户点停止 / 进程退出 / 网络切换）。
+					// 这既不是上游故障也不该罚凭据：照记的话，连续三次
+					// 取消就会把健康目标熔断一整个冷却窗口，期间该路由
+					// 全量 502。凭据同样不冷却 —— key 本身没问题。
+					routeTrace = appendRouteTrace(routeTrace, i+1, cand, "committed_fail", "client_canceled")
+					pool.RecordTargetSuccess(cand.TargetID)
+					pool.RecordCredentialSuccess(credID)
 				} else {
 					pool.RecordTargetFailure(cand.TargetID, threshold)
 					routeTrace = appendRouteTrace(routeTrace, i+1, cand, "committed_fail", out.code)
@@ -2092,7 +2155,11 @@ func handleIngress(pool *upstream.Pool, cfg *config.Config, usage *usageRecorder
 			// （凭据冷却期内不再被选中，也就没有任何请求能成功以触发复苏）。
 			// r.Context() 只在客户端断开/服务关停时取消（上游超时用的是派生 ctx），
 			// 因此这个判据能精确区分「客户端跑了」与「上游真的坏了」。
-			if out.eligible && r.Context().Err() == nil {
+			// 判据只认 Canceled：请求 ctx 上还挂着 totalRequestBudget 的超时，
+			// 用 ctx.Err()==nil 会把「预算到期」也一起放过去 —— 那是网关侧的
+			// 事件，但请求确实已经打到了这个目标，用它当「上游健康」的证据
+			// 同样不成立，所以这里只排除真正的客户端取消。
+			if out.eligible && !isClientGone(r.Context(), nil) {
 				pool.RecordTargetFailure(cand.TargetID, threshold)
 				probeRecorded = true // 名额由记账释放
 				if out.credCooldown > 0 {
@@ -2130,7 +2197,11 @@ func handleIngress(pool *upstream.Pool, cfg *config.Config, usage *usageRecorder
 		// 写出最终错误并记一条 usage —— 若 active 为空（理论不该发生）兜底成 502。
 		// 客户端已经断开时它根本收不到这个响应（写了只会撞 broken pipe），
 		// 且这次失败与上游无关，按 canceled 记账，与流式路径同一口径。
-		clientGone := r.Context().Err() != nil
+		// 只把「客户端真的走了」算作 clientGone：ctx 上还挂着
+		// totalRequestBudget 的超时（DeadlineExceeded），那是网关侧事件，
+		// 记成 canceled 会让网关自己的超时在报表里与用户主动取消混为一谈，
+		// 并让「写不写错误响应」这个决定被预算到期误触发。
+		clientGone := isClientGone(r.Context(), r.Context().Err())
 
 		statusCode, code, message := out.statusCode, out.code, out.message
 		// 兜底：不许把 200 或 0 当作「失败结果」发出去。
@@ -2261,7 +2332,15 @@ type attemptOutcome struct {
 	// success 表示本次 attempt 真的成功抵达上游（流式仅 status=="ok" 为真）。
 	// committed 只说明「字节已写出、不能回退」，断流/溢出同样是 committed
 	// 却是失败 —— 熔断与凭据健康必须看success，不能看 committed。
-	success      bool
+	success bool
+	// clientGone 标记「这次 attempt 是客户端自己走了」，不是上游故障。
+	//
+	// 必须显式带出来而不能靠外层看 r.Context().Err()：请求的 ctx 身上还挂着
+	// totalRequestBudget 的超时（见 handleIngress），所以预算到期时
+	// ctx.Err() 也是 DeadlineExceeded —— 与用户点「停止」在那一刻无法区分。
+	// 旧实现只按「committed 且非 ok」一律记目标失败，于是连点三次停止就把
+	// 健康目标熔断 60 秒；预算到期同样被误记成上游故障。
+	clientGone   bool
 	eligible     bool
 	credCooldown time.Duration
 	statusCode   int
@@ -2772,7 +2851,9 @@ func attemptStream(w http.ResponseWriter, r *http.Request, client *rosetta.Clien
 	// truncated / overflow / error / canceled 都已提交，但对上游而言是失败。
 	// 只有 status=="ok" 才允许外层记成功，否则「先200 再断流」这类最常见的
 	// 上游故障永远不累计失败、目标永不熔断。
-	return attemptOutcome{committed: true, success: status == "ok"}
+	// clientGone 只给「客户端自己走了」的那一种：它不该计入熔断计数
+	// （见 attemptOutcome.clientGone）。
+	return attemptOutcome{committed: true, success: status == "ok", clientGone: status == "canceled"}
 }
 
 // priorTrace 的含义与 attemptStream 相同：提交后的落库在这里发生，
@@ -2869,11 +2950,16 @@ const (
 // 请求 context 被取消（用户点「停止生成」、客户端进程退出、网络切换）时，
 // SDK 会把 context 错误从流里透出来。这类中断既不该算进上游的成功率，
 // 也不该打成 ERROR —— 它跟路由、凭据、上游的健康状况无关。
+//
+// 只认 context.Canceled，**不认 context.DeadlineExceeded**：请求 ctx 上还挂着
+// 网关自己的 totalRequestBudget（handleIngress 里 WithTimeout 派生），
+// 预算到期同样是 DeadlineExceeded，那是网关侧事件，不能记成用户主动离开。
 func isClientGone(ctx context.Context, err error) bool {
-	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+	if errors.Is(err, context.Canceled) {
 		return true
 	}
-	return ctx.Err() != nil
+	// ctx.Err() 也只认 Canceled：DeadlineExceeded 属于预算到期，见上。
+	return errors.Is(ctx.Err(), context.Canceled)
 }
 
 // usageRecorder 负责把用量记录异步落库，并在关停时等它们写完。
@@ -3175,14 +3261,26 @@ func (u *usageRecorder) flush(ctx context.Context, batch []*store.UsageRecord) b
 // 这正是降级要买的保险。
 //
 // 返回值报告**是否全部成功**：有任何一条失败就返回 false，worker 据此
-// 把整批插回队头重试（宁可让已成功的那几条下次被幂等键挡掉，
-// 也不要让失败的那条无声消失）。幂等由 store 的
-// CreateUsageRecordWithCost 保证（request_id 唯一约束），重复落库不会重复计费。
+// 把整批插回队头重试（宁可多试一遍，也不要让失败的那条无声消失）。
+//
+// **重试必须能认出「这条已经写过了」**。usage_records 的幂等键是记录主键
+// id（同一个 *UsageRecord 指针重试时 id 不变），而 request_id 上并没有唯一
+// 约束 —— 旧注释写反了。认不出主键冲突时，一次「批量失败 → 逐条降级 →
+// 部分成功」的路径会变成永久活锁：批量重试因已存在的行整体回滚，
+// 逐条重试又把这些行继续判为失败，那批记录再也冲不出去，
+// worker 停在 stillPending 分支不再消费队列，之后每条用量都退化到
+// 请求路径上的同步写并大概率丢失（配额不涨、余额不扣）。
 func (u *usageRecorder) flushOneByOne(ctx context.Context, batch []*store.UsageRecord) bool {
 	allOK := true
 	for _, rec := range batch {
 		cost, err := u.db.CreateUsageRecordWithCost(ctx, rec)
 		if err != nil {
+			if store.IsUniqueViolation(err) {
+				// 这一条上一轮已经落库成功。不再 charge：余额扣费本身以
+				// (request_id, user_id) 幂等，再调一次是空操作，但跳过它
+				// 让「已落库」与「已扣费」这对关系保持单一发生点。
+				continue
+			}
 			allOK = false
 			// 带 request_id —— 原来的批级日志不含它，事后无从对账。
 			u.logger.Error("usage record lost (per-record write also failed)",

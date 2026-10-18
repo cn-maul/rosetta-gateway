@@ -327,7 +327,7 @@ func (h *ConfigTransferHandler) apply(ctx context.Context, in *configExport, dry
 		for _, n := range newProviders {
 			placeholder[n.origSlug] = "dry-run-placeholder"
 		}
-		out := h.attach(ctx, in, bySlug, placeholder, true, resp)
+		out := h.attach(ctx, in, bySlug, placeholder, true, resp, nil)
 		resp.ModelsCreated, resp.CredentialsAdded = out.models, out.creds
 		return resp, nil
 	}
@@ -342,17 +342,30 @@ func (h *ConfigTransferHandler) apply(ctx context.Context, in *configExport, dry
 	for slug, p := range bySlug {
 		idOf[slug] = p.ID
 	}
-	for _, n := range newProviders {
-		p := n.provider
-		if err := h.store.CreateProvider(ctx, &p); err != nil {
-			return nil, fmt.Errorf("创建供应商 %s：%w", p.Slug, err)
+	// 真实写入整批放进一笔事务：provider / 模型组 / 模型 / 凭据任一条硬失败
+	// 都让整批不生效。
+	//
+	// 旧实现逐条自动提交。中途失败时接口回 500，但先前那几条**已经落库**；
+	// 运维重试就会因重名再追加 `-2`/`-3` 后缀 —— 「导入失败一次」在库里
+	// 留下半套配置加一份重名副本，两者都不会自动消失。
+	//
+	// 校验所需的数据（现有 slug、模型清单）在事务外读齐（见上方
+	// ListProviders / ListAllUpstreamModels），事务内只做写入。
+	if err := h.store.RunTx(ctx, func(ctx context.Context, tx store.Tx) error {
+		for _, n := range newProviders {
+			p := n.provider
+			if err := h.store.CreateProviderTx(ctx, tx, &p); err != nil {
+				return fmt.Errorf("创建供应商 %s：%w", p.Slug, err)
+			}
+			idOf[n.origSlug] = p.ID
+			resp.ProvidersCreated++
 		}
-		idOf[n.origSlug] = p.ID
-		resp.ProvidersCreated++
+		out := h.attach(ctx, in, bySlug, idOf, false, resp, tx)
+		resp.ModelsCreated, resp.CredentialsAdded = out.models, out.creds
+		return nil
+	}); err != nil {
+		return nil, err
 	}
-
-	out := h.attach(ctx, in, bySlug, idOf, false, resp)
-	resp.ModelsCreated, resp.CredentialsAdded = out.models, out.creds
 	return resp, nil
 }
 
@@ -384,6 +397,8 @@ func (h *ConfigTransferHandler) attach(
 	idOf map[string]string,
 	dry bool,
 	resp *importResponse,
+	// tx 非 nil 时所有写入走这笔事务（真实导入路径）；干跑时为 nil，只数不写。
+	tx store.Tx,
 ) attachOutcome {
 	var out attachOutcome
 
@@ -410,17 +425,30 @@ func (h *ConfigTransferHandler) attach(
 		if dry {
 			continue
 		}
-		if err := h.store.CreateModelGroup(ctx, &store.ModelGroup{
+		ng := &store.ModelGroup{
 			ID: generateID(), DisplayName: name,
-		}); err != nil {
-			resp.Warnings = append(resp.Warnings, fmt.Sprintf("模型组 %q 创建失败：%v", name, err))
+		}
+		var cerr error
+		if tx != nil {
+			cerr = h.store.CreateModelGroupTx(ctx, tx, ng)
+		} else {
+			cerr = h.store.CreateModelGroup(ctx, ng)
+		}
+		if cerr != nil {
+			resp.Warnings = append(resp.Warnings, fmt.Sprintf("模型组 %q 创建失败：%v", name, cerr))
 		}
 	}
 	// 名字 → 库内组 id 的解析表。dry 路径不建组，这里按名字查一遍现状
 	// （干跑报出的模型归组数与实际一致才有意义）。
 	resolveGroup := make(map[string]string)
+	lookupGroup := h.store.GetModelGroupByName
+	if tx != nil {
+		lookupGroup = func(ctx context.Context, name string) (*store.ModelGroup, error) {
+			return h.store.GetModelGroupByNameTx(ctx, tx, name)
+		}
+	}
 	for name := range groupByName {
-		g, err := h.store.GetModelGroupByName(ctx, name)
+		g, err := lookupGroup(ctx, name)
 		if err == nil && g != nil {
 			resolveGroup[name] = g.ID
 		}
@@ -509,10 +537,16 @@ func (h *ConfigTransferHandler) attach(
 			out.models++
 			continue
 		}
-		if err := h.store.CreateUpstreamModel(ctx, &m); err != nil {
+		merr := error(nil)
+		if tx != nil {
+			merr = h.store.CreateUpstreamModelTx(ctx, tx, &m)
+		} else {
+			merr = h.store.CreateUpstreamModel(ctx, &m)
+		}
+		if merr != nil {
 			resp.ModelsSkipped++
 			resp.Warnings = append(resp.Warnings,
-				fmt.Sprintf("模型 %s / %s 写入失败：%v", slug, modelID, err))
+				fmt.Sprintf("模型 %s / %s 写入失败：%v", slug, modelID, merr))
 			continue
 		}
 		out.models++
@@ -558,10 +592,16 @@ func (h *ConfigTransferHandler) attach(
 			out.creds++
 			continue
 		}
-		if err := h.store.CreateCredential(ctx, &c); err != nil {
+		cerr := error(nil)
+		if tx != nil {
+			cerr = h.store.CreateCredentialTx(ctx, tx, &c)
+		} else {
+			cerr = h.store.CreateCredential(ctx, &c)
+		}
+		if cerr != nil {
 			resp.CredentialsSkipped++
 			resp.Warnings = append(resp.Warnings,
-				fmt.Sprintf("凭据 %s / %s 写入失败：%v", slug, ce.Label, err))
+				fmt.Sprintf("凭据 %s / %s 写入失败：%v", slug, ce.Label, cerr))
 			continue
 		}
 		out.creds++

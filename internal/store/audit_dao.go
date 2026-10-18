@@ -2,7 +2,9 @@ package store
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
+	"fmt"
 	"sort"
 	"strings"
 )
@@ -51,12 +53,60 @@ func (s *Store) ListAuditEntries(ctx context.Context, limit int) ([]AuditEntry, 
 	result := make([]AuditEntry, 0)
 	for rows.Next() {
 		var e AuditEntry
-		if err := rows.Scan(&e.ID, &e.Ts, &e.Actor, &e.Remote, &e.Method, &e.Path, &e.Status, &e.Fields); err != nil {
+		// fields 落库时走 nullIfEmpty：没有请求体（GET / DELETE，或 body 为
+		// 空）的记录存的是 NULL 而不是 ''。直接扫进 string 会报
+		// "converting NULL to string is unsupported"，**整页查询失败** ——
+		// 而只要有任意一条这类记录就会触发，等于审计日志页对所有部署恒 500。
+		var fields sql.NullString
+		if err := rows.Scan(&e.ID, &e.Ts, &e.Actor, &e.Remote, &e.Method, &e.Path, &e.Status, &fields); err != nil {
 			return nil, err
 		}
+		e.Fields = fields.String
 		result = append(result, e)
 	}
 	return result, rows.Err()
+}
+
+// PruneAuditLog 只保留最近 keepRows 条审计记录，返回删除行数。
+//
+// **按行数而不是按天**：本表的唯一读路径 ListAuditEntries 是
+// `ORDER BY id DESC LIMIT ?`，管理面永远只看最近几十条，保留更早的行对
+// 可观测性零贡献，却让表无界增长（写操作每次一条，配上自动重试与批量导入
+// 配置，几十 MB 起步）。用行数封顶同时也让磁盘占用有确定上界。
+//
+// 与 PruneOldUsage / PruneOldProbes 分开：这两张表的下游还有聚合与
+// 连通率趋势图，超期数据会被折叠进 rollup，而审计日志没有下游消费者。
+func (s *Store) PruneAuditLog(ctx context.Context, keepRows int) (int64, error) {
+	if keepRows <= 0 {
+		return 0, nil
+	}
+	// 保留**最新**的 keepRows 条，删掉更早的。
+	//
+	// 阈值取第 keepRows 条（从新往旧数）的 id，删掉 `id <` 阈值的行。
+	// 两个容易写错的点：
+	//
+	//  1. **参数必须是 keepRows-1**。`LIMIT 1 OFFSET k` 取的是第 k+1 条
+	//     （第 1 条是 OFFSET 0），所以第 keepRows 条对应 OFFSET keepRows-1。
+	//     写成 keepRows 会取到第 keepRows+1 条，多留下一条 —— 实测
+	//     keepRows=100 剪完剩 101 行，正是这个 off-by-one。
+	//  2. 比较必须是 `<` 而不是 `>`。反过来写会把**最新**的 keepRows 条删掉，
+	//     保留旧数据 —— 审计日志要留的恰恰是新记录，这个方向的 bug 比不剪更糟。
+	//
+	// 行数**正好等于** keepRows 时子查询无行 → `id < NULL` 为 NULL → 不匹配
+	// 任何行 → 删 0 行；不足 keepRows 时同理。两种情况都天然幂等。
+	off := keepRows - 1
+	res, err := s.db.ExecContext(ctx,
+		`DELETE FROM audit_log WHERE id < (
+			SELECT id FROM audit_log ORDER BY id DESC LIMIT 1 OFFSET ?
+		)`, off)
+	if err != nil {
+		return 0, fmt.Errorf("prune audit_log: %w", err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return 0, err
+	}
+	return n, nil
 }
 
 // AuditFieldNames 从管理请求的 JSON body 提取顶层字段名（排序后逗号分隔）。

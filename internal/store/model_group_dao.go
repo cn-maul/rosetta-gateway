@@ -54,8 +54,21 @@ func (s *Store) GetModelGroup(ctx context.Context, id string) (*ModelGroup, erro
 
 // GetModelGroupByName 按显示名查组（导入侧按名字匹配用）。
 func (s *Store) GetModelGroupByName(ctx context.Context, name string) (*ModelGroup, error) {
+	return getModelGroupByName(ctx, s.read, name)
+}
+
+// GetModelGroupByNameTx 是事务内版本。
+//
+// 导入在事务里新建的组必须能被**同一笔事务**读到：WAL 下读池看不到未提交行，
+// 走读池会拿到 nil，于是模型拿不到 group_id —— 表现为「归组导入成功但模型
+// 全都没归组」，且界面不会报错。
+func (s *Store) GetModelGroupByNameTx(ctx context.Context, tx Tx, name string) (*ModelGroup, error) {
+	return getModelGroupByName(ctx, tx, name)
+}
+
+func getModelGroupByName(ctx context.Context, q execer, name string) (*ModelGroup, error) {
 	var g ModelGroup
-	err := s.read.QueryRowContext(ctx,
+	err := q.QueryRowContext(ctx,
 		`SELECT `+modelGroupColumns+` FROM model_groups WHERE display_name = ?`, name).
 		Scan(&g.ID, &g.DisplayName, &g.CreatedAt)
 	if err == sql.ErrNoRows {
@@ -70,6 +83,15 @@ func (s *Store) GetModelGroupByName(ctx context.Context, name string) (*ModelGro
 func (s *Store) CreateModelGroup(ctx context.Context, g *ModelGroup) error {
 	g.CreatedAt = time.Now().UnixMilli()
 	_, err := s.db.ExecContext(ctx,
+		`INSERT INTO model_groups (id, display_name, created_at) VALUES (?, ?, ?)`,
+		g.ID, g.DisplayName, g.CreatedAt)
+	return err
+}
+
+// CreateModelGroupTx 在一笔事务里创建归组，供批量导入整体回滚使用。
+func (s *Store) CreateModelGroupTx(ctx context.Context, tx Tx, g *ModelGroup) error {
+	g.CreatedAt = time.Now().UnixMilli()
+	_, err := tx.ExecContext(ctx,
 		`INSERT INTO model_groups (id, display_name, created_at) VALUES (?, ?, ?)`,
 		g.ID, g.DisplayName, g.CreatedAt)
 	return err

@@ -1,6 +1,7 @@
 package store
 
 import (
+	"context"
 	"database/sql"
 	"fmt"
 	"log/slog"
@@ -81,6 +82,21 @@ func (s *Store) DB() *sql.DB {
 // Reader 返回读池：一切只读查询都应走这里，与写池上的写入互不阻塞。
 func (s *Store) Reader() *sql.DB {
 	return s.read
+}
+
+// Ping 对写池与读池各做一次最轻量的查询，确认 SQLite 连接真的可用。
+//
+// 供 /healthz 用。此前容器的健康检查只打静态页面，而那条路径只读 embed FS、
+// 完全不碰数据库 —— 于是写池被 WAL 或磁盘故障卡住、用量写入持续失败时，
+// 容器仍然报 healthy，编排系统既不重启也不告警。
+func (s *Store) Ping(ctx context.Context) error {
+	if err := s.db.PingContext(ctx); err != nil {
+		return fmt.Errorf("write pool: %w", err)
+	}
+	if err := s.read.PingContext(ctx); err != nil {
+		return fmt.Errorf("read pool: %w", err)
+	}
+	return nil
 }
 
 func (s *Store) migrate() error {

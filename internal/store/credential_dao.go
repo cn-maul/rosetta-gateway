@@ -75,6 +75,11 @@ func (s *Store) CreateCredential(ctx context.Context, c *Credential) error {
 	return createCredential(ctx, s.db, c)
 }
 
+// CreateCredentialTx 在一笔事务里创建凭据，供批量导入整体回滚使用。
+func (s *Store) CreateCredentialTx(ctx context.Context, tx Tx, c *Credential) error {
+	return createCredential(ctx, tx, c)
+}
+
 // createCredential 接受 execer，供事务内复用（见 CreateProviderWithCredential）。
 func createCredential(ctx context.Context, ex execer, c *Credential) error {
 	now := time.Now().UnixMilli()

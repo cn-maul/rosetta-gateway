@@ -24,6 +24,10 @@ type execer interface {
 	QueryRowContext(ctx context.Context, query string, args ...any) *sql.Row
 }
 
+// Tx 是 execer 的导出别名：让包外的「整批写入」回调能拿到事务句柄，
+// 而不必把 execer 本身暴露成公共 API（它的方法集就是 *sql.Tx 的公共面）。
+type Tx = execer
+
 // ErrNotFound 表示按主键操作的目标行不存在。
 //
 // 旧的 DAO 是裸 ExecContext 且不看 RowsAffected：删一个不存在的 ID 也返回 nil，
@@ -84,6 +88,31 @@ func IsUniqueViolation(err error) bool {
 // 而是「还有依赖没清干净」—— 该回 409 + 一句人能看懂的话，而不是 500 + 裸 SQL 错误。
 func IsForeignKeyViolation(err error) bool {
 	return err != nil && strings.Contains(err.Error(), "FOREIGN KEY constraint failed")
+}
+
+// TxFunc 是「在一笔事务里做完一串写入」的执行体。
+type TxFunc func(ctx context.Context, ex execer) error
+
+// RunTx 在一个事务里执行 fn。fn 返回错误即整体回滚。
+//
+// 给「批量导入」用：配置导入要连续写 provider / 模型组 / 模型 / 凭据，
+// 任何一条硬失败（重名、外键、磁盘）都应让整批不生效。此前逐条自动提交，
+// 中途失败只把错误返回给调用方，先前那几条却已落库 —— 重试一次就会因
+// 重名追加 `-2` 后缀，于是「导入失败一次」在库里留下半套配置加一份重名副本，
+// 而两者都不会自动消失。
+//
+// 读路径不参与事务：fn 内部若经由 s.read 读取，WAL 下可能看到事务外的状态。
+// 因此调用方需要在事务外把要校验的数据（现有 slug / 模型清单）先读齐。
+func (s *Store) RunTx(ctx context.Context, fn TxFunc) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	if err := fn(ctx, tx); err != nil {
+		_ = tx.Rollback() //nolint:errcheck // 已失败，Rollback 错误不改变结果
+		return err
+	}
+	return tx.Commit()
 }
 
 // ValidateRouteTargetRef 校验 (providerID, modelID) 是一个可用的路由目标：

@@ -10,16 +10,29 @@ import (
 	"strings"
 	"time"
 
+	"github.com/cn-maul/rosetta-gateway/internal/config"
 	"github.com/cn-maul/rosetta-gateway/internal/server"
 	"github.com/cn-maul/rosetta-gateway/internal/store"
 )
 
 type UsageHandler struct {
 	store *store.Store
+	// cfg 提供「手动归档」的默认保留天数。定时剪枝走的是
+	// config.UsageRetentionDays（cmd/gateway 的后台循环），两者必须是
+	// 同一个来源：曾把手动端点写死 30 天，于是配置了
+	// usage_retention_days=7 的部署点一下设置页的「立即归档剪枝」就多删
+	// 23 天明细，而隔天定时任务又只按 7 天跑 —— 数据缺口既无声又不可逆。
+	cfg *config.Config
 }
 
-func NewUsageHandler(st *store.Store) *UsageHandler {
-	return &UsageHandler{store: st}
+// NewUsageHandler 构造用量 handler。cfg 可为 nil（测试与探针路径），
+// 此时手动归档回落到 store.DefaultRetentionDays。
+func NewUsageHandler(st *store.Store, cfg ...*config.Config) *UsageHandler {
+	h := &UsageHandler{store: st}
+	if len(cfg) > 0 {
+		h.cfg = cfg[0]
+	}
+	return h
 }
 
 // 用量查询的分页口径：默认 100，上限 1000（与 History 一致）。
@@ -620,16 +633,39 @@ func (h *UsageHandler) ExportCSV(w http.ResponseWriter, r *http.Request) {
 			tps = strconv.FormatFloat(e.Tps, 'f', -1, 64)
 		}
 		_ = cw.Write([]string{
-			time.UnixMilli(e.Ts).Format(time.RFC3339), e.PublicModel, e.UpstreamModel,
-			e.KeyName, e.KeyID,
+			time.UnixMilli(e.Ts).Format(time.RFC3339),
+			csvCell(e.PublicModel), csvCell(e.UpstreamModel),
+			csvCell(e.KeyName), csvCell(e.KeyID),
 			strconv.FormatInt(e.TotalTokens, 10), strconv.FormatInt(e.TTFBMs, 10),
 			strconv.FormatInt(e.LatencyMs, 10), e.Status, stream,
 			strconv.FormatFloat(e.Cost, 'f', -1, 64),
 			strconv.FormatInt(e.OutputTokens, 10), tps,
-			e.RouteTrace,
+			csvCell(e.RouteTrace),
 		})
 	}
 	cw.Flush()
+}
+
+// csvCell 拦掉电子表格公式注入。
+//
+// encoding/csv 只做引号与分隔符转义，**不做**公式防护：单元格以
+// `=` / `+` / `-` / `@`（或前导制表符、回车）开头时，Excel、LibreOffice、
+// Google Sheets 打开文件就会当公式求值。这里导出的字段里至少 key_name 与
+// public_model 是**用户可控**的（任何登录用户都能给自己的 key 起名），
+// route_trace 则含上游原样文本，于是「用户 A 起一个恶意名字 → 管理员导出
+// CSV → 打开即执行」是一条真实路径。
+//
+// 处置是给危险前缀加一个前导单引号：表格把它当文本，值本身肉眼不变。
+// 只对危险首字符生效，正常单元格（时间戳、数字、模型名）完全不受影响。
+func csvCell(s string) string {
+	if s == "" {
+		return s
+	}
+	switch s[0] {
+	case '=', '+', '-', '@', '\t', '\r':
+		return "'" + s
+	}
+	return s
 }
 
 // History 返回调用明细（时间倒序，分页），供「调用历史」页展示。
@@ -916,7 +952,7 @@ func (h *UsageHandler) groupBy(w http.ResponseWriter, r *http.Request, column, n
 // 这个端点让它当场可查、可控 —— 干完还会回 PruneResult（删了多少行、
 // 剪到哪一天），不需要再去翻库。
 //
-// keep_days 缺省用 store.DefaultRetentionDays（定时任务用的是同一个值）。
+// keep_days 缺省用 config.UsageRetentionDays —— 与后台定时剪枝**同一个来源**。
 // 参数非法时 store 侧返回 skipped=true 而不是报错，所以这里**不**预先拒绝 ——
 // 两处各有一套校验，迟早在某个边界上给出不同答案。越界的语义（1 或 99999）
 // 写进 reason 字段回给调用方。
@@ -925,6 +961,9 @@ func (h *UsageHandler) Prune(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	keepDays := store.DefaultRetentionDays
+	if h.cfg != nil && h.cfg.UsageRetentionDays > 0 {
+		keepDays = h.cfg.UsageRetentionDays
+	}
 	if raw := strings.TrimSpace(r.URL.Query().Get("keep_days")); raw != "" {
 		n, err := strconv.Atoi(raw)
 		if err != nil {

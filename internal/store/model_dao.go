@@ -171,11 +171,21 @@ func (s *Store) GetUpstreamModel(ctx context.Context, id string) (*UpstreamModel
 }
 
 func (s *Store) CreateUpstreamModel(ctx context.Context, m *UpstreamModel) error {
+	return createUpstreamModel(ctx, s.db, m)
+}
+
+// CreateUpstreamModelTx 在一笔事务里创建模型，供批量导入整体回滚使用。
+func (s *Store) CreateUpstreamModelTx(ctx context.Context, tx Tx, m *UpstreamModel) error {
+	return createUpstreamModel(ctx, tx, m)
+}
+
+// createUpstreamModel 接受 execer，供事务内复用（见 ImportUpstreamModels）。
+func createUpstreamModel(ctx context.Context, ex execer, m *UpstreamModel) error {
 	enabled := 0
 	if m.Enabled {
 		enabled = 1
 	}
-	_, err := s.db.ExecContext(ctx,
+	_, err := ex.ExecContext(ctx,
 		`INSERT INTO upstream_models (id, provider_id, model_id, display_name, enabled, context_window, max_output_tokens, supports_thinking, effort_levels, price_input, price_cache_hit, price_output, group_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		m.ID, m.ProviderID, m.ModelID, nullIfEmpty(m.DisplayName), enabled,
 		nullIfZeroInt(m.ContextWindow), nullIfZeroInt(m.MaxOutputTokens), m.SupportsThinking,

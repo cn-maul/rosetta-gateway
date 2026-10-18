@@ -121,6 +121,11 @@ func (s *Store) CreateProvider(ctx context.Context, p *Provider) error {
 	return createProvider(ctx, s.db, p)
 }
 
+// CreateProviderTx 在一笔事务里创建上游，供批量导入整体回滚使用。
+func (s *Store) CreateProviderTx(ctx context.Context, tx Tx, p *Provider) error {
+	return createProvider(ctx, tx, p)
+}
+
 // createProvider 接受 execer，供事务内复用（见 CreateProviderWithCredential）。
 func createProvider(ctx context.Context, ex execer, p *Provider) error {
 	now := time.Now().UnixMilli()

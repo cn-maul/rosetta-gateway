@@ -16,6 +16,16 @@ type Config struct {
 	DBPath       string `json:"db_path"`
 	LogLevel     string `json:"log_level"`
 	MasterKeyEnv string `json:"master_key_env"`
+	// RequireStrongMasterKey 让「低熵主密钥」从告警升级为拒绝启动。
+	//
+	// 缺省 false = 只 WARN（保持既有行为）：大量部署点确实是有意用口令
+	// 形态的主密钥（比如从密码管理器里取一条），直接改成硬失败等于
+	// 让这些实例在升级后起不来 —— 那是最糟糕的升级故障。
+	//
+	// 置 true 后，低熵（< 32 字符，见 crypto.WeakMaterial）主密钥会让进程
+	// 拒绝启动。低熵密钥保护的是**全部上游 API key**，拿到数据库的人可以
+	// 离线字典爆破，所以对安全要求高的部署点应该显式打开这个开关。
+	RequireStrongMasterKey bool `json:"require_strong_master_key"`
 	// Timezone 是按天统计的日界时区（IANA 名，如 "Asia/Shanghai"）。
 	//
 	// # 为什么必须有这个字段（2026-10-09 修复的线上缺陷）
@@ -56,6 +66,18 @@ type Config struct {
 	// 实时 SUM、仍有界。上界 3650 天防止明显笔误。
 	UsageRetentionDays int `json:"usage_retention_days"`
 
+	// AuditLogKeepRows 是 audit_log 保留的最大行数（不是天数）。
+	//
+	// 按行数而非按天：本表的唯一读路径是 `ORDER BY id DESC LIMIT ?`，
+	// 管理面永远只看最近几十条，更早的行对可观测性零贡献。此前的实现
+	// 只插不删，表随写操作次数无界增长（批量导入配置 + 自动重试会显著
+	// 放大写入量）。
+	//
+	// 缺省 20000 行 ≈ 每行 100 字节也才 2MB，而覆盖掉的问题要连续写上
+	// 几个月才出现；设成 0 则**关闭剪枝**（保留全部），供合规审计要求
+	// 全量留存的部署点显式声明。
+	AuditLogKeepRows int `json:"audit_log_keep_rows"`
+
 	// Probes 是上游模型定时探测的配置（2026-10-14）。
 	//
 	// 探测请求复用 upstream.TestUpstreamModel（max_tokens=1、不经
@@ -78,6 +100,35 @@ type ProbeConfig struct {
 	WindowSize    int     `json:"window_size"`
 	HealthyRate   float64 `json:"healthy_rate"`
 	RetentionDays int     `json:"retention_days"`
+
+	// configured 记录「probes 块在配置里出现过」，不参与 JSON 编解码。
+	//
+	// 为什么必须显式记录而不能用 `c.Probes == (ProbeConfig{})` 判断：
+	// `{"probes":{"enabled":false}}` 反序列化后**恰好就是零值结构体**，
+	// 与「整块没配」不可区分，于是 setDefaults 判定为「没配过 → 默认开启」
+	// 并把用户明确写下的 false 改回 true —— 之后每 10 分钟对每个上游模型
+	// 发一次真实推理并向上游付费，而配置文件里明明写着关闭。
+	// 布尔值天然无法区分「显式 false」与「缺省」，只能靠 key 是否出现来判断。
+	configured bool
+}
+
+// UnmarshalJSON 记录 key 是否出现过。
+//
+// 用 map[string]json.RawMessage 只为取 presence，字段本身仍交给默认解码：
+// 这样新增探针字段时不需要在这里同步维护一份键名清单（漏一个就静默失效）。
+func (p *ProbeConfig) UnmarshalJSON(b []byte) error {
+	type plain ProbeConfig // 无方法，避免递归
+	var v plain
+	if err := json.Unmarshal(b, &v); err != nil {
+		return err
+	}
+	var keys map[string]json.RawMessage
+	if err := json.Unmarshal(b, &keys); err != nil {
+		return err
+	}
+	*p = ProbeConfig(v)
+	p.configured = len(keys) > 0
+	return nil
 }
 
 type Defaults struct {
@@ -258,14 +309,22 @@ func (c *Config) setDefaults() {
 	if c.UsageRetentionDays == 0 {
 		c.UsageRetentionDays = 30
 	}
+	// 审计日志保留行数：0 是「没配过」的缺省形态，填成 20000。
+	// 显式关闭剪枝的部署写 -1，不会被这里改回（见 validate）。
+	if c.AuditLogKeepRows == 0 {
+		c.AuditLogKeepRows = 20000
+	}
 
 	// 探测配置默认值。Enabled 默认 true（用户明确要这个功能）。
 	// 间隔 10 分钟、超时 30s、并发 4、连续 3 次判 down、窗口 10 次、
 	// 成功率 80%、保留 30 天。
-	if !c.Probes.Enabled && c.Probes.IntervalSec == 0 {
-		// 全零 = 用户没配过 → 默认开。显式 enabled=false 且其它字段为 0
-		// 时这里会误开，但显式关探测的人通常也会顺手配间隔；更稳妥的
-		// 判断是「只要 IntervalSec 非 0 就认为配过」。
+	//
+	// 「完全没配」与「显式 enabled=false」必须可区分（见 ProbeConfig.configured
+	// 的注释）：判据是 **probes 这个 key 有没有出现过**，不是它的值。
+	// 曾用 `c.Probes == (ProbeConfig{})` 判断，而 `{"probes":{"enabled":false}}`
+	// 反序列化后正好等于零值结构体，于是用户明确写的 false 被静默改回 true
+	// —— 之后每 10 分钟对每个模型发一次真实推理并向上游付费。
+	if !c.Probes.configured {
 		c.Probes.Enabled = true
 	}
 	if c.Probes.IntervalSec == 0 {
@@ -361,6 +420,11 @@ func (c *Config) validate() error {
 	// 降到几毫秒），把它挡在门外会让本配置失去意义。上界 3650 防笔误。
 	if c.UsageRetentionDays < 1 || c.UsageRetentionDays > 3650 {
 		return fmt.Errorf("usage_retention_days: must be 1..3650, got %d", c.UsageRetentionDays)
+	}
+	// -1 是「关闭剪枝、永久留存」的显式声明；其余非正取值都是笔误
+	// （0 走不到这里，setDefaults 已填成 20000）。
+	if c.AuditLogKeepRows < -1 || c.AuditLogKeepRows > 10000000 {
+		return fmt.Errorf("audit_log_keep_rows: must be -1 (keep all) or 1..10000000, got %d", c.AuditLogKeepRows)
 	}
 
 	// 探测配置校验。这些值会喂给 time.NewTicker / context.WithTimeout /
