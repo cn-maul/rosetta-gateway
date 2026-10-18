@@ -101,6 +101,11 @@ function updateDocumentTitle(to: RouteLocationNormalized) {
     overview: isAdmin() ? '网关总览' : '我的总览',
     history: isAdmin() ? '请求日志' : '我的调用',
     wallet: isAdmin() ? '账户与充值' : '余额与账单',
+    // /keys 与 /users 共用 AccessControl.vue，但浏览器标题必须跟着当前
+    // 页签走：管理员在 /users?tab=keys 时停在「API 密钥」页签，标题却仍是
+    // meta.title 的「用户与权限」—— 与组件 h1（已按页签取值）不一致。
+    keys: 'API 密钥',
+    users: '用户与权限',
   }
   const pageTitle = titles[String(to.name)] ?? (typeof to.meta.title === 'string' ? to.meta.title : '')
   document.title = pageTitle ? pageTitle + ' · Rosetta Gateway' : 'Rosetta Gateway'

@@ -42,6 +42,12 @@ const loading = ref(true)
 
 const creds = ref<Credential[]>([])
 const models = ref<UpstreamModel[]>([])
+// 子资源各自的加载失败态。**不能**只弹 toast：失败时 creds/models 仍是空数组，
+// 页面于是渲染「无凭据 —— 上游鉴权必需」「无模型 —— 路由必须指向一个上游模型」，
+// 把一次网关不可达说成「配置真的没有了」，而空态与失败态的处置动作完全相反
+// （一个要新增配置，一个要重试）。
+const credsErr = ref('')
+const modelsErr = ref('')
 
 function is401(e: unknown): boolean {
   return (e as { status?: number }).status === 401
@@ -72,15 +78,23 @@ async function loadProvider() {
 /** reloadSub 拉取该上游的凭据与模型。silent 时不弹 toast（后台刷新失败不该抢注意力）。 */
 async function reloadSub(silent = false) {
   const id = providerId.value
-  try {
-    const [c, m] = await Promise.all([api.credentials(id), api.models(id)])
-    if (id !== providerId.value) return
-    creds.value = c
-    models.value = m
-  } catch (e) {
-    if (id !== providerId.value) return
-    if (!is401(e) && !silent) toast('加载子资源失败：' + (e as Error).message, 'err')
-  }
+	// 两个子资源各自成败互不牵连：凭据接口挂了不该把模型表也标成失败。
+	const [c, m] = await Promise.allSettled([api.credentials(id), api.models(id)])
+	if (id !== providerId.value) return
+	if (c.status === 'fulfilled') {
+		creds.value = c.value
+		credsErr.value = ''
+	} else if (!is401(c.reason)) {
+		credsErr.value = '凭据加载失败：' + (c.reason as Error).message
+		if (!silent) toast(credsErr.value, 'err')
+	}
+	if (m.status === 'fulfilled') {
+		models.value = m.value
+		modelsErr.value = ''
+	} else if (!is401(m.reason)) {
+		modelsErr.value = '模型加载失败：' + (m.reason as Error).message
+		if (!silent) toast(modelsErr.value, 'err')
+	}
 }
 
 let loadSeq = 0
@@ -216,13 +230,18 @@ async function closeEdit() {
 
 async function toggleProvider() {
   const p = provider.value
-  if (!p) return
+  // 在途守卫：连点会发出 enable 再 disable，而两个响应各自提示一次成功，
+  // 最终状态取决于返回顺序。
+  if (!p || togglingProvider.value) return
+  togglingProvider.value = true
   try {
     await api.updateProvider(p.id, { enabled: !p.enabled })
     toast(!p.enabled ? '已启用' : '已停用')
     await loadProvider()
   } catch (e) {
     if (!is401(e)) toast('操作失败：' + (e as Error).message, 'err')
+  } finally {
+    togglingProvider.value = false
   }
 }
 
@@ -339,6 +358,7 @@ async function removeCred(c: Credential) {
 }
 
 const credToggling = ref(new Set<string>())
+const togglingProvider = ref(false)
 const credTogglingIds = computed(() => [...credToggling.value])
 
 function isCredToggling(id: string): boolean {
@@ -684,7 +704,7 @@ function goBack() {
   <!-- 用全局的 .page / .page-head（与其余 10 个页面同一套外壳），而不是本页
        自造一个 padding —— 自造外壳会让这一页的标题区、留白、最大宽度都
        与其它页面不一致，一眼就能看出「这页是另做的」。 -->
-  <main class="page">
+  <div class="page">
     <div class="page-head">
       <div>
         <h1>{{ provider?.name ?? '上游详情' }}</h1>
@@ -754,6 +774,10 @@ function goBack() {
               <button
                 class="switch"
                 :class="{ on: provider.enabled }"
+                role="switch"
+                :aria-checked="provider.enabled"
+                :aria-label="(provider.enabled ? '停用 ' : '启用 ') + (provider.name || provider.slug)"
+                :disabled="togglingProvider"
                 :title="provider.enabled ? '停用' : '启用'"
                 @click="toggleProvider"
               ></button>
@@ -797,6 +821,10 @@ function goBack() {
         <div class="expand-col">
           <!-- 余额刻意**不**单独成块：它本来就逐凭据显示（同一把 key
                可能只剩一把有余额），汇总成一个数字反而要自己对应是哪把。 -->
+          <p v-if="credsErr" class="notice-warn" role="alert">
+            {{ credsErr }}
+            <button class="btn btn-sm" @click="reloadSub(true)">重试</button>
+          </p>
           <CredentialPanel
             :provider-id="provider.id"
             :creds="creds"
@@ -808,14 +836,17 @@ function goBack() {
             @query-balance="queryBalance"
             @edit="(c) => openCred(c)"
             @remove="removeCred"
-            @toggle="toggleCred"
-          />
+            @toggle="toggleCred"/>
         </div>
       </div>
 
       <!-- 模型表：整行占满宽度。见上面的说明（五列、四列 nowrap、
            且可能是这一页行数最多的块）。 -->
       <div class="models-card">
+        <p v-if="modelsErr" class="notice-warn" role="alert">
+          {{ modelsErr }}
+          <button class="btn btn-sm" @click="reloadSub(true)">重试</button>
+        </p>
         <UpstreamModelPanel
           :models="models"
           :testing="testing"
@@ -823,8 +854,7 @@ function goBack() {
           @add="openModel()"
           @test="testModel"
           @edit="(m) => openModel(m)"
-          @remove="removeModel"
-        />
+          @remove="removeModel"/>
       </div>
     </template>
 
@@ -842,34 +872,34 @@ function goBack() {
       <form @submit.prevent="saveProvider">
         <div class="form-grid">
           <div class="field">
-            <label>显示名称</label>
-            <input v-model="pForm.name" class="input" placeholder="DeepSeek" />
+            <label for="cgw-lProviderDetail-1">显示名称</label>
+            <input v-model="pForm.name" class="input" placeholder="DeepSeek" id="cgw-lProviderDetail-1"/>
           </div>
           <div class="field">
-            <label>协议</label>
-            <select v-model="pForm.protocol" class="select">
+            <label for="cgw-lProviderDetail-2">协议</label>
+            <select v-model="pForm.protocol" class="select" id="cgw-lProviderDetail-2">
               <option value="openai-chat">openai-chat</option>
               <option value="anthropic">anthropic</option>
               <option value="openai-responses">openai-responses</option>
             </select>
           </div>
           <div class="field span2">
-            <label>Endpoint *</label>
-            <input v-model="pForm.endpoint" class="input mono" placeholder="https://api.deepseek.com" />
+            <label for="cgw-lProviderDetail-3">Endpoint *</label>
+            <input v-model="pForm.endpoint" class="input mono" placeholder="https://api.deepseek.com" id="cgw-lProviderDetail-3"/>
           </div>
           <div class="field">
-            <label>Slug</label>
-            <input :value="pForm.slug" class="input mono" disabled />
+            <label for="cgw-lProviderDetail-4">Slug</label>
+            <input :value="pForm.slug" class="input mono" disabled id="cgw-lProviderDetail-4"/>
             <span class="tip">系统生成，不可修改</span>
           </div>
           <div class="field">
-            <label>超时（毫秒）</label>
-            <input v-model.number="pForm.timeout_ms" class="input num" type="number" min="0" step="1" />
+            <label for="cgw-lProviderDetail-5">超时（毫秒）</label>
+            <input v-model.number="pForm.timeout_ms" class="input num" type="number" min="0" step="1" id="cgw-lProviderDetail-5"/>
             <span class="tip">0 = 使用全局默认</span>
           </div>
           <div class="field span2">
-            <label>最大重试</label>
-            <input v-model.number="pForm.max_retries" class="input num" type="number" min="0" max="10" step="1" />
+            <label for="cgw-lProviderDetail-6">最大重试</label>
+            <input v-model.number="pForm.max_retries" class="input num" type="number" min="0" max="10" step="1" id="cgw-lProviderDetail-6"/>
             <span class="tip">
               仅作用于<strong>幂等</strong>请求（如连通性测试时的 GET /models）。
               对话是 POST，SDK 不会重试 —— 重试由「故障转移链换目标」承担。
@@ -877,14 +907,14 @@ function goBack() {
           </div>
 
           <div class="field span2">
-            <label>代理（可选）</label>
-            <input v-model="pForm.proxy_url" class="input mono" placeholder="http://127.0.0.1:7897" autocomplete="off" />
+            <label for="cgw-lProviderDetail-7">代理（可选）</label>
+            <input v-model="pForm.proxy_url" class="input mono" placeholder="http://127.0.0.1:7897" autocomplete="off" id="cgw-lProviderDetail-7"/>
             <span class="tip">
               只对这个上游生效，其它上游不受影响。支持 http / https / socks5 /
               socks5h（<code>socks5h</code> 让 DNS 也走代理，本地 DNS 被污染时用它）。
               留空表示不代理。填错不会阻断请求，但该上游会<strong>退回直连</strong>，
               网关日志里会留一条告警。
-              <br />
+              <br/>
               <strong>网关跑在 Docker 里时注意</strong>：<code>127.0.0.1</code>
               指的是网关容器自己，不是宿主机。代理也在容器里的话，填
               <code>http://代理容器名:端口</code>（同一 Docker 网络内用容器名互访）；
@@ -893,21 +923,20 @@ function goBack() {
           </div>
 
           <div class="field span2">
-            <label>余额查询（可选）</label>
+            <label for="cgw-lProviderDetail-8">余额查询（可选）</label>
             <textarea
               v-model="pForm.balance_spec_json"
               class="input mono"
               rows="2"
               spellcheck="false"
-              placeholder='{"path":"/credits","field":"data.remaining","currency":"USD"}'
-            ></textarea>
+              placeholder='{"path":"/credits","field":"data.remaining","currency":"USD"}' id="cgw-lProviderDetail-8"></textarea>
             <span class="tip">
               填 JSON，留空则用内置判定（OpenAI 官方与 DeepSeek 自动识别，其余上报「不支持」）。
               <code>path</code> 必填，是以 <code>/</code> 开头的相对路径；
               <code>field</code> 是余额在响应里的点号路径（默认 <code>balance</code>）；
               <code>currency</code> 只是标单位、不做换算；
               <code>auth</code> 取 <code>bearer</code>（默认）或 <code>anthropic</code>。
-              <br />
+              <br/>
               例：OpenRouter 是 <code>{{ openRouterSpec }}</code>。
               填错会在保存时直接报错，不会等到点「查询余额」才失败。
             </span>
@@ -943,12 +972,12 @@ function goBack() {
       <form @submit.prevent="submitCred">
         <div class="form-grid">
           <div class="field span2">
-            <label>标签</label>
-            <input v-model="cForm.label" class="input" placeholder="主账号 / 备用池" />
+            <label for="cgw-lProviderDetail-9">标签</label>
+            <input v-model="cForm.label" class="input" placeholder="主账号 / 备用池" id="cgw-lProviderDetail-9"/>
           </div>
           <div class="field span2">
-            <label>API Key {{ cForm.editing ? '（留空则不更换）' : '*' }}</label>
-            <input v-model="cForm.api_key" class="input mono" type="password" placeholder="sk-..." autocomplete="new-password" />
+            <label for="cgw-lProviderDetail-10">API Key {{ cForm.editing ? '（留空则不更换）' : '*' }}</label>
+            <input v-model="cForm.api_key" class="input mono" type="password" placeholder="sk-..." autocomplete="new-password" id="cgw-lProviderDetail-10"/>
             <span class="tip">保存后加密入库，仅显示掩码，不再可见明文</span>
           </div>
           <div v-if="!cForm.editing" class="field span2">
@@ -977,29 +1006,29 @@ function goBack() {
         <fieldset class="model-edit-fields" :disabled="mForm.saving">
         <div class="form-grid">
           <div class="field span2">
-            <label>上游模型名（model_id）*</label>
-            <input v-model="mForm.model_id" class="input mono" placeholder="deepseek-chat" />
+            <label for="cgw-lProviderDetail-11">上游模型名（model_id）*</label>
+            <input v-model="mForm.model_id" class="input mono" placeholder="deepseek-chat" id="cgw-lProviderDetail-11"/>
             <span class="tip">上游 API 接受的真实模型名</span>
           </div>
           <div class="field">
-            <label>上下文窗口</label>
-            <input v-model.number="mForm.context_window" class="input num" type="number" min="0" step="1" placeholder="0 = 未设置" />
+            <label for="cgw-lProviderDetail-12">上下文窗口</label>
+            <input v-model.number="mForm.context_window" class="input num" type="number" min="0" step="1" placeholder="0 = 未设置" id="cgw-lProviderDetail-12"/>
           </div>
           <div class="field">
-            <label>最大输出</label>
-            <input v-model.number="mForm.max_output_tokens" class="input num" type="number" min="0" step="1" placeholder="0 = 未设置" />
+            <label for="cgw-lProviderDetail-13">最大输出</label>
+            <input v-model.number="mForm.max_output_tokens" class="input num" type="number" min="0" step="1" placeholder="0 = 未设置" id="cgw-lProviderDetail-13"/>
           </div>
           <div class="field span2">
-            <label>单价（元 / 1M tokens）</label>
+            <span class="field-label">单价（元 / 1M tokens）</span>
             <div class="price-edit-grid">
-              <label><span>输入</span><input v-model.number="mForm.price_input" class="input num" type="number" min="0" step="any" placeholder="未配置" /></label>
-              <label><span>缓存命中</span><input v-model.number="mForm.price_cache_hit" class="input num" type="number" min="0" step="any" placeholder="未配置" /></label>
-              <label><span>输出</span><input v-model.number="mForm.price_output" class="input num" type="number" min="0" step="any" placeholder="未配置" /></label>
+              <label><span>输入</span><input v-model.number="mForm.price_input" class="input num" type="number" min="0" step="any" placeholder="未配置"/></label>
+              <label><span>缓存命中</span><input v-model.number="mForm.price_cache_hit" class="input num" type="number" min="0" step="any" placeholder="未配置"/></label>
+              <label><span>输出</span><input v-model.number="mForm.price_output" class="input num" type="number" min="0" step="any" placeholder="未配置"/></label>
             </div>
             <span class="tip">输入价和输出价填 0 就是不计费；缓存命中价填 0 时沿用输入价。改价只影响之后的调用，历史费用按记录时单价保留。</span>
           </div>
           <div class="field span2">
-            <label>思考模式</label>
+            <span class="field-label">思考模式</span>
             <div class="tri-switch" role="radiogroup" aria-label="思考模式">
               <button
                 v-for="opt in thinkingOptions"
@@ -1020,7 +1049,7 @@ function goBack() {
             </span>
           </div>
           <div v-if="mForm.thinking !== 'no'" class="field span2">
-            <label>思考挡位</label>
+            <span class="field-label">思考挡位</span>
             <div class="effort-picker">
               <button
                 v-for="l in knownEffortLevels"
@@ -1041,7 +1070,7 @@ function goBack() {
           </div>
           <div class="field span2">
             <label class="check-line">
-              <input v-model="mForm.enabled" type="checkbox" />
+              <input v-model="mForm.enabled" type="checkbox"/>
               启用该模型
             </label>
           </div>
@@ -1072,8 +1101,7 @@ function goBack() {
             v-model="filter"
             class="input input-sm"
             placeholder="搜索模型…"
-            style="flex: 1"
-          />
+            style="flex: 1"/>
         </div>
         <span v-if="discoverMsg" class="tip" style="color: var(--danger)">{{ discoverMsg }}</span>
 
@@ -1111,7 +1139,7 @@ function goBack() {
         </button>
       </div>
     </AppModal>
-  </main>
+  </div>
 </template>
 
 <style scoped>

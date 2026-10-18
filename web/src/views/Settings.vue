@@ -428,6 +428,7 @@ const providers = ref<Provider[]>([])
 const modelsMap = reactive<Record<string, UpstreamModel[]>>({})
 const pricesLoading = ref(false)
 const pricesLoaded = ref(false)
+const pricesErr = ref('')
 
 const priceProvider = ref('') // '' = 全部供应商
 const priceSearch = ref('')
@@ -496,9 +497,15 @@ async function loadPrices() {
     for (const m of all) (grouped[m.provider_id] ??= []).push(m)
     for (const p of providers.value) modelsMap[p.id] = grouped[p.id] ?? []
     pricesLoaded.value = true
+    pricesErr.value = ''
   } catch (e) {
-    if ((e as { status?: number }).status !== 401)
-      toast('加载模型价格失败：' + (e as Error).message, 'err')
+    if ((e as { status?: number }).status !== 401) {
+      // 失败必须留成可见的 err 态而不是只弹 toast：否则下面的
+      // 「还没有任何模型 —— 请先到上游页添加模型」会照常渲染，
+      // 把一次接口失败说成「你没配模型」，而处置动作正好相反。
+      pricesErr.value = '加载模型价格失败：' + (e as Error).message
+      toast(pricesErr.value, 'err')
+    }
   } finally {
     pricesLoading.value = false
   }
@@ -840,7 +847,7 @@ onMounted(() => {
 </script>
 
 <template>
-  <main class="page">
+  <div class="page">
     <div class="page-head">
       <div>
         <h1>系统设置</h1>
@@ -854,7 +861,7 @@ onMounted(() => {
     <!-- 分类页签：设置项按类别分页，避免一页塞满互不相干的表单 -->
     <!-- 页签改用共享 Tabs（2026-10-12）：原先是 .set-tabs + 手写 v-for，
          与 Wallet / UsersGroups 各写一份。 -->
-    <Tabs v-model="tab" :tabs="TABS" aria-label="设置分区" />
+    <Tabs v-model="tab" :tabs="TABS" aria-label="设置分区"/>
 
     <!-- 分类 1：模型默认 -->
     <div v-if="tab === 'model'" class="panel">
@@ -883,13 +890,13 @@ onMounted(() => {
           <div class="card__content">
             <div class="form-grid">
               <div class="field span2">
-                <label>默认上下文窗口（tokens）</label>
-                <input v-model.number="form.default_context_window" class="input num" type="number" min="1" step="1" />
+                <label for="cgw-lSettings-1">默认上下文窗口（tokens）</label>
+                <input v-model.number="form.default_context_window" class="input num" type="number" min="1" step="1" id="cgw-lSettings-1"/>
                 <span class="tip">添加模型时若上游未暴露 context_length，则用此值</span>
               </div>
               <div class="field span2">
-                <label>默认最大输出（tokens）</label>
-                <input v-model.number="form.default_max_output_tokens" class="input num" type="number" min="1" step="1" />
+                <label for="cgw-lSettings-2">默认最大输出（tokens）</label>
+                <input v-model.number="form.default_max_output_tokens" class="input num" type="number" min="1" step="1" id="cgw-lSettings-2"/>
                 <span class="tip">添加模型时若上游未暴露 max_completion_tokens，则用此值</span>
               </div>
             </div>
@@ -940,15 +947,14 @@ onMounted(() => {
             </button>
           </div>
           <div class="field">
-            <label>整体超时（毫秒）</label>
+            <label for="cgw-lSettings-3">整体超时（毫秒）</label>
             <input
               v-model.number="form.upstream_timeout_ms"
               class="input num"
               type="number"
               min="1"
               max="86400000"
-              step="1"
-            />
+              step="1" id="cgw-lSettings-3"/>
             <span class="tip">
               超时后按可转移错误处理 —— 有机会切到下一个上游，而不是直接失败。
               这是<b>单次尝试</b>的预算，不是整请求的上限（见下方「派生上限」）。
@@ -974,15 +980,14 @@ onMounted(() => {
             </button>
           </div>
           <div class="field">
-            <label>首字超时（TTFT，毫秒）</label>
+            <label for="cgw-lSettings-4">首字超时（TTFT，毫秒）</label>
             <input
               v-model.number="form.stream_first_token_timeout_ms"
               class="input num"
               type="number"
               min="1"
               max="86400000"
-              step="1"
-            />
+              step="1" id="cgw-lSettings-4"/>
             <span class="tip">
               已建立连接后，首个事件迟迟不来即掐流并切换下一个上游。
               <b>仅在尚未写出任何字节时生效</b>；带思考的上游首字本来就慢，别调太紧。
@@ -990,15 +995,14 @@ onMounted(() => {
             <span class="tip rec">{{ recNote('stream_first_token_timeout_ms') }}</span>
           </div>
           <div class="field">
-            <label>流式空闲超时（毫秒）</label>
+            <label for="cgw-lSettings-5">流式空闲超时（毫秒）</label>
             <input
               v-model.number="form.stream_idle_timeout_ms"
               class="input num"
               type="number"
               min="1"
               max="86400000"
-              step="1"
-            />
+              step="1" id="cgw-lSettings-5"/>
             <span class="tip">
               已开始出字后，多久没有任何新事件即判定卡死（按截断收尾）。
               流已经发给客户端了，此时不会切换上游，只会以截断结束。
@@ -1024,15 +1028,14 @@ onMounted(() => {
             </button>
           </div>
           <div class="field">
-            <label>最多尝试目标数</label>
+            <label for="cgw-lSettings-6">最多尝试目标数</label>
             <input
               v-model.number="form.failover_max_targets"
               class="input num"
               type="number"
               min="1"
               max="100"
-              step="1"
-            />
+              step="1" id="cgw-lSettings-6"/>
             <span class="tip">
               一次请求最多打某条路由链上的几个目标。每多一个，最坏耗时就多乘一截
               （见下方「派生上限」）。是否启用按路由单独开关（路由页）。
@@ -1040,15 +1043,14 @@ onMounted(() => {
             <span class="tip rec">{{ recNote('failover_max_targets') }}</span>
           </div>
           <div class="field">
-            <label>失败熔断阈值</label>
+            <label for="cgw-lSettings-7">失败熔断阈值</label>
             <input
               v-model.number="form.failover_failure_threshold"
               class="input num"
               type="number"
               min="1"
               max="1000"
-              step="1"
-            />
+              step="1" id="cgw-lSettings-7"/>
             <span class="tip">
               某目标连续失败几次后临时摘除（60 秒冷却），期间请求自动让位给链上下一个目标。
               调高等于继续把请求送给已经坏掉的目标。
@@ -1130,14 +1132,13 @@ onMounted(() => {
           </p>
 
           <div class="field">
-            <label>加密口令（必填，至少 8 位）</label>
+            <label for="cgw-lSettings-8">加密口令（必填，至少 8 位）</label>
             <input
               v-model="exportPass"
               class="input"
               type="password"
               autocomplete="new-password"
-              placeholder="导入这份文件时要用同一个口令"
-            />
+              placeholder="导入这份文件时要用同一个口令" id="cgw-lSettings-8"/>
             <span class="tip">
               文件里包含全部上游 API Key，口令是唯一的保护 —— 请用区别于登录密码的独立口令，
               并把口令与文件分开传递。
@@ -1166,21 +1167,20 @@ onMounted(() => {
           </p>
 
           <div class="field">
-            <label>导出文件</label>
-            <input class="input" type="file" accept=".json,.json.enc,.enc,application/json" @change="onPickFile" />
+            <label for="cgw-lSettings-9">导出文件</label>
+            <input class="input" type="file" accept=".json,.json.enc,.enc,application/json" @change="onPickFile" id="cgw-lSettings-9"/>
             <span v-if="importFile" class="tip">已选择：{{ importFile.name }}</span>
           </div>
 
           <div v-if="importParsed?.encrypted" class="field">
-            <label>文件口令 *</label>
+            <label for="cgw-lSettings-10">文件口令 *</label>
             <input
               v-model="importPass"
               class="input"
               type="password"
               autocomplete="off"
               placeholder="导出时设置的那个"
-              @input="importPreview = null"
-            />
+              @input="importPreview = null" id="cgw-lSettings-10"/>
             <span class="tip">该文件已加密，必须输入导出时用的口令</span>
             <button
               class="btn btn-sm"
@@ -1282,7 +1282,7 @@ onMounted(() => {
           <option value="">全部供应商</option>
           <option v-for="p in providers" :key="p.id" :value="p.id">{{ p.name || p.slug }}</option>
         </select>
-        <input v-model="priceSearch" class="input" placeholder="搜索价格条目…" />
+        <input v-model="priceSearch" class="input" placeholder="搜索价格条目…"/>
         <!-- 批量入口。**不再要求先勾选**：弹窗内自带的模型选择器含未配价的模型，
              而列表只列已配价的 —— 让人「先在这里勾」等于要求目标已经配过价，
              恰好把批量配价最该解决的场景排除在外。 -->
@@ -1291,6 +1291,10 @@ onMounted(() => {
       </div>
 
       <div v-if="pricesLoading" class="loading">加载中…</div>
+      <p v-else-if="pricesErr" class="notice-warn" role="alert">
+        {{ pricesErr }}
+        <button class="btn btn-sm" :disabled="pricesLoading" @click="loadPrices">重试</button>
+      </p>
       <div v-else-if="totalModelCount === 0" class="empty">还没有任何模型 —— 请先在「上游」页添加模型</div>
       <div v-else-if="priceRows.length === 0" class="empty">
         <template v-if="priceProvider || priceSearch.trim()">没有匹配的价格条目</template>
@@ -1318,8 +1322,7 @@ onMounted(() => {
                   <input
                     type="checkbox"
                     :checked="isPriceSelected(r.model.id)"
-                    @change="togglePriceSelected(r.model.id)"
-                  />
+                    @change="togglePriceSelected(r.model.id)"/>
                 </td>
                 <td>{{ r.providerName }}</td>
                 <td class="mono">
@@ -1391,21 +1394,20 @@ onMounted(() => {
       <form @submit.prevent="savePrice">
         <div class="form-grid">
           <div class="field span2">
-            <label>供应商 *</label>
+            <label for="cgw-lSettings-11">供应商 *</label>
             <select
               v-model="pForm.providerId"
               class="select"
               :disabled="pForm.editing"
-              @change="onPriceProviderChange"
-            >
+              @change="onPriceProviderChange" id="cgw-lSettings-11">
               <option value="" disabled>请选择供应商</option>
               <option v-for="p in providers" :key="p.id" :value="p.id">{{ p.name || p.slug }}</option>
             </select>
             <span class="tip">同一个 model_id 在不同供应商下价格可能不同</span>
           </div>
           <div class="field span2">
-            <label>模型 *</label>
-            <select v-model="pForm.modelId" class="select" :disabled="pForm.editing">
+            <label for="cgw-lSettings-12">模型 *</label>
+            <select v-model="pForm.modelId" class="select" :disabled="pForm.editing" id="cgw-lSettings-12">
               <option value="" disabled>{{ pForm.providerId ? '请选择模型' : '请先选择供应商' }}</option>
               <option v-for="m in modalModelOptions" :key="m.id" :value="m.id">{{ m.model_id }}</option>
             </select>
@@ -1418,39 +1420,36 @@ onMounted(() => {
             </span>
           </div>
           <div class="field">
-            <label>输入价格（元/1M）</label>
+            <label for="cgw-lSettings-13">输入价格（元/1M）</label>
             <input
               v-model.number="pForm.price_input"
               class="input num"
               type="number"
               min="0"
               step="0.001"
-              placeholder="0 = 不计费"
-            />
+              placeholder="0 = 不计费" id="cgw-lSettings-13"/>
             <span class="tip">缓存未命中的输入 token</span>
           </div>
           <div class="field">
-            <label>缓存命中价格（元/1M）</label>
+            <label for="cgw-lSettings-14">缓存命中价格（元/1M）</label>
             <input
               v-model.number="pForm.price_cache_hit"
               class="input num"
               type="number"
               min="0"
               step="0.001"
-              placeholder="0 = 同输入价"
-            />
+              placeholder="0 = 同输入价" id="cgw-lSettings-14"/>
             <span class="tip">留空/填 0 时按输入价计</span>
           </div>
           <div class="field span2">
-            <label>输出价格（元/1M）</label>
+            <label for="cgw-lSettings-15">输出价格（元/1M）</label>
             <input
               v-model.number="pForm.price_output"
               class="input num"
               type="number"
               min="0"
               step="0.001"
-              placeholder="0 = 不计费"
-            />
+              placeholder="0 = 不计费" id="cgw-lSettings-15"/>
           </div>
         </div>
         <div class="form-actions" :class="{ spread: modalHasPrice }">
@@ -1487,14 +1486,14 @@ onMounted(() => {
       <form @submit.prevent="saveBatchPrice">
         <div class="form-grid">
           <div class="field span2">
-            <label>目标模型（已选 {{ batchSelectedModels.length }} 个）</label>
+            <span class="field-label">目标模型（已选 {{ batchSelectedModels.length }} 个）</span>
             <div class="batch-picker">
               <div class="batch-picker-filters">
                 <select v-model="batchProvider" class="select batch-sel">
                   <option value="">全部供应商</option>
                   <option v-for="p in providers" :key="p.id" :value="p.id">{{ p.name || p.slug }}</option>
                 </select>
-                <input v-model="batchSearch" class="input" placeholder="搜索模型…" />
+                <input v-model="batchSearch" class="input" placeholder="搜索模型…"/>
                 <button class="btn btn-sm btn-ghost" type="button" @click="selectAllBatch">全选</button>
                 <button class="btn btn-sm btn-ghost" type="button" @click="clearBatchSelection">清空</button>
               </div>
@@ -1503,8 +1502,7 @@ onMounted(() => {
                   <input
                     type="checkbox"
                     :checked="isBatchSelected(r.model.id)"
-                    @change="toggleBatchSelected(r.model.id)"
-                  />
+                    @change="toggleBatchSelected(r.model.id)"/>
                   <span class="mono batch-name">{{ r.model.model_id }}</span>
                   <span class="dim batch-prov">{{ r.providerName }}</span>
                   <!-- 已配价的标出来：批量覆盖它们是有意还是误勾，一眼可辨 -->
@@ -1520,37 +1518,34 @@ onMounted(() => {
             </span>
           </div>
           <div class="field">
-            <label>输入价格（元/1M）</label>
+            <label for="cgw-lSettings-16">输入价格（元/1M）</label>
             <input
               v-model.number="batchForm.price_input"
               class="input num"
               type="number"
               min="0"
               step="0.001"
-              placeholder="0 = 不计费"
-            />
+              placeholder="0 = 不计费" id="cgw-lSettings-16"/>
           </div>
           <div class="field">
-            <label>缓存命中价格（元/1M）</label>
+            <label for="cgw-lSettings-17">缓存命中价格（元/1M）</label>
             <input
               v-model.number="batchForm.price_cache_hit"
               class="input num"
               type="number"
               min="0"
               step="0.001"
-              placeholder="0 = 同输入价"
-            />
+              placeholder="0 = 同输入价" id="cgw-lSettings-17"/>
           </div>
           <div class="field span2">
-            <label>输出价格（元/1M）</label>
+            <label for="cgw-lSettings-18">输出价格（元/1M）</label>
             <input
               v-model.number="batchForm.price_output"
               class="input num"
               type="number"
               min="0"
               step="0.001"
-              placeholder="0 = 不计费"
-            />
+              placeholder="0 = 不计费" id="cgw-lSettings-18"/>
             <span class="tip">三项全填 0 = 清除这些模型的价格（不是设为免费）</span>
           </div>
         </div>
@@ -1564,7 +1559,7 @@ onMounted(() => {
         </div>
       </form>
     </AppModal>
-  </main>
+  </div>
 </template>
 
 <style scoped>

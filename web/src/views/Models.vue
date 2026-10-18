@@ -337,7 +337,7 @@ function lineNote(name: string): string {
 </script>
 
 <template>
-  <main class="page">
+  <div class="page">
     <div class="page-head">
       <div>
         <h1>可用模型</h1>
@@ -542,7 +542,7 @@ function lineNote(name: string): string {
         </div>
       </div>
     </AppModal>
-  </main>
+  </div>
 </template>
 
 <style scoped>

@@ -38,7 +38,7 @@ async function submit() {
 </script>
 
 <template>
-  <main class="page">
+  <div class="page">
     <div class="page-head"><div><h1>账号设置</h1><div class="sub">{{ session.me?.username }} · 管理自己的登录安全</div></div></div>
     <section class="panel account-panel">
       <div class="panel-title">修改密码<span class="hint">修改后需要重新登录</span></div>
@@ -50,7 +50,7 @@ async function submit() {
         <div><button class="btn btn-primary" :disabled="busy">{{ busy ? '提交中…' : '修改密码' }}</button></div>
       </form>
     </section>
-  </main>
+  </div>
 </template>
 
 <style scoped>

@@ -76,7 +76,7 @@ const currentPanel = computed(() => {
 </script>
 
 <template>
-  <main class="page">
+  <div class="page">
     <div class="page-head">
       <div>
         <h1>上游与模型</h1>
@@ -90,7 +90,7 @@ const currentPanel = computed(() => {
     <Tabs v-model="tab" :tabs="TABS" aria-label="上游与模型 / 路由 / 模型归组" />
 
     <component :is="currentPanel" :key="panelKey" />
-  </main>
+  </div>
 </template>
 
 <style scoped>

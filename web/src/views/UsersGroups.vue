@@ -736,8 +736,8 @@ async function askDeleteGroup(g: Group) {
             <div class="fhint">登录用。不支持中文与空格。</div>
           </div>
           <div class="fcell">
-            <label class="flabel" for="cp">初始密码</label>
-            <input id="cp" v-model="cPassword" type="password" class="input" autocomplete="new-password" placeholder="留空则由用户自行设置" />
+            <label class="flabel" for="newuser-initial-password">初始密码</label>
+            <input id="newuser-initial-password" v-model="cPassword" type="password" class="input" autocomplete="new-password" placeholder="留空则由用户自行设置" />
             <div v-if="cRole === 'admin' && !cPassword" class="fhint warn">创建管理员必须设置初始密码。</div>
             <div v-else class="fhint">留空的账号无法登录，需重置密码后才能使用。</div>
           </div>
@@ -831,8 +831,8 @@ async function askDeleteGroup(g: Group) {
     <!-- 重置密码：与同页另外两个弹窗同一遮罩行为（不可点外关闭）。 -->
     <AppModal :open="!!pwdFor" :title="pwdFor ? `重置密码 · ${pwdFor.username}` : '重置密码'" max-width="460px" :dismissable="false">
         <div class="fhint warn">重置后该用户的所有登录状态立即失效。</div>
-        <label class="flabel" for="np">新密码</label>
-        <input id="np" v-model="pwdValue" type="password" class="input" autocomplete="new-password" />
+        <label class="flabel" for="reset-new-password">新密码</label>
+        <input id="reset-new-password" v-model="pwdValue" type="password" class="input" autocomplete="new-password" />
         <!-- 与后端同款门槛（password.ts），提交前就说明白要什么，
              而不是等一个 400 回来。 -->
         <div v-if="pwdValue && checkPasswordStrength(pwdValue)" class="fhint">{{ checkPasswordStrength(pwdValue) }}</div>

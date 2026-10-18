@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed } from 'vue'
+import { computed, ref } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { api, isAdmin } from '../api'
 import Tabs from '../components/Tabs.vue'
@@ -9,6 +9,9 @@ import ModelGroups from './ModelGroups.vue'
 
 const route = useRoute()
 const router = useRouter()
+// 面板的 id / aria-labelledby 要与 Tabs 发出的 aria-controls 配对，
+// 所以要拿到 Tabs 实例（模板 ref）。
+const tabsRef = ref<{ panelIdFor: (k: string) => string; tabIdFor: (k: string) => string } | null>(null)
 const logs = computed(() => route.name === 'history')
 const tabs = computed(() => [
   { key: 'providers', label: '按上游' },
@@ -35,7 +38,7 @@ const fetchKeys = (from: number, to: number) => api.usageByKey(from, to)
 </script>
 
 <template>
-  <main class="page">
+  <div class="page">
     <div class="page-head">
       <div><h1>{{ title }}</h1><div class="sub">{{ subtitle }} · {{ scope }}</div></div>
       <div v-if="logs || tab !== 'groups'" class="head-actions">
@@ -47,13 +50,20 @@ const fetchKeys = (from: number, to: number) => api.usageByKey(from, to)
     </div>
     <UsageDetail v-if="logs" :days="days" />
     <template v-else>
-      <Tabs v-model="tab" :tabs="tabs" aria-label="用量分析维度" />
+    <Tabs ref="tabsRef" v-model="tab" :tabs="tabs" aria-label="用量分析维度" />
+    <div
+      :id="tabsRef?.panelIdFor(tab)"
+      role="tabpanel"
+      :aria-labelledby="tabsRef?.tabIdFor(tab)"
+      tabindex="0"
+    >
       <ModelGroups v-if="tab === 'groups' && isAdmin()" />
       <UsageByGroup v-else-if="tab === 'providers'" key="providers" first-col="上游名称" kind="provider" :fetch="fetchProviders" :days="days" />
       <UsageByGroup v-else-if="tab === 'models'" key="models" first-col="模型" kind="model" :fetch="fetchModels" :days="days" />
       <UsageByGroup v-else key="keys" first-col="密钥" kind="key" :fetch="fetchKeys" :days="days" />
+    </div>
     </template>
-  </main>
+  </div>
 </template>
 
 <style scoped>

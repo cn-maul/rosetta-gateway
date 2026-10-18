@@ -196,19 +196,19 @@ async function submitSetup() {
 
         <!-- 「显示密码」只给这一处：引导设的密码是要记住的，且没有第二次机会。 -->
         <div class="login-pw-row">
-          <label class="login-label" for="np">新密码</label>
+          <label class="login-label" for="login-new-password">新密码</label>
           <label class="login-show">
             <input v-model="showSetupPwd" type="checkbox" />
             显示密码
           </label>
         </div>
-        <input id="np" v-model="newPwd" :type="showSetupPwd ? 'text' : 'password'" class="login-input" autocomplete="new-password" />
+        <input id="login-new-password" v-model="newPwd" :type="showSetupPwd ? 'text' : 'password'" class="login-input" autocomplete="new-password" />
         <div v-if="checkStrength(newPwd)" class="login-pw-hint">{{ checkStrength(newPwd) }}</div>
 
-        <label class="login-label" for="cp">确认新密码</label>
-        <input id="cp" v-model="confirmPwd" :type="showSetupPwd ? 'text' : 'password'" class="login-input" autocomplete="new-password" />
+        <label class="login-label" for="login-confirm-password">确认新密码</label>
+        <input id="login-confirm-password" v-model="confirmPwd" :type="showSetupPwd ? 'text' : 'password'" class="login-input" autocomplete="new-password" />
 
-        <div v-if="error" class="login-err">{{ error }}</div>
+        <div v-if="error" class="login-err" role="alert">{{ error }}</div>
 
         <button class="btn btn-primary login-btn" type="submit" :disabled="submitting">
           {{ submitting ? '设置中…' : '设置密码并进入' }}
@@ -225,7 +225,7 @@ async function submitSetup() {
         <input id="p" v-model="password" type="password" class="login-input"
                autocomplete="current-password" />
 
-        <div v-if="error" class="login-err">{{ error }}</div>
+        <div v-if="error" class="login-err" role="alert">{{ error }}</div>
 
         <button class="btn btn-primary login-btn" type="submit" :disabled="submitting">
           {{ submitting ? '登录中…' : '登录' }}

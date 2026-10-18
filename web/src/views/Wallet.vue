@@ -499,7 +499,7 @@ onMounted(load)
 </script>
 
 <template>
-  <main class="page">
+  <div class="page">
     <div class="page-head">
       <div>
         <h1>{{ admin ? '账户与充值' : '余额与账单' }}</h1>
@@ -965,7 +965,7 @@ onMounted(load)
         </button>
       </div>
     </AppModal>
-  </main>
+  </div>
 </template>
 
 <style scoped>

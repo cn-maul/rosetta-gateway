@@ -395,13 +395,13 @@ onMounted(() => {
 </script>
 
 <template>
-  <main class="page routes-page">
+  <div class="page routes-page">
     <div class="page-head">
       <div><h1>模型与路由</h1><div class="sub">客户端公开模型名 → 首选目标 → 有序后备链 · 全站配置</div></div>
       <div class="head-actions"><button class="btn" :disabled="loading" @click="load">刷新</button><button class="btn btn-primary" @click="openRoute()">新建公开模型</button></div>
     </div>
     <div class="data-toolbar">
-      <label class="search-field"><span class="sr-only">搜索模型与路由</span><input v-model="search" class="input" type="search" placeholder="搜索公开名、首选上游或模型" /></label>
+      <label class="search-field"><span class="sr-only">搜索模型与路由</span><input v-model="search" class="input" type="search" placeholder="搜索公开名、首选上游或模型"/></label>
       <label><span class="sr-only">路由状态</span><select v-model="status" class="select"><option value="">全部路由</option><option value="enabled">已启用</option><option value="disabled">已停用</option><option value="failover">已开启故障转移</option></select></label>
       <span class="result-count">{{ filtered.length }} / {{ routes.length }} 个公开模型</span>
     </div>
@@ -444,8 +444,8 @@ onMounted(() => {
       <form class="route-form" @submit.prevent="submitRoute">
         <div class="form-grid">
           <div class="field span2">
-            <label>公开模型名 *</label>
-            <input v-model="form.public_name" :disabled="chainBlocked" class="input mono" placeholder="gpt-4o" />
+            <label for="cgw-lRoutes-1">公开模型名 *</label>
+            <input v-model="form.public_name" :disabled="chainBlocked" class="input mono" placeholder="gpt-4o" id="cgw-lRoutes-1"/>
             <span class="tip">客户端在 /v1/chat/completions 里填的 model 名</span>
           </div>
         </div>
@@ -453,7 +453,7 @@ onMounted(() => {
         <!-- 有序上游链 -->
         <div class="chain">
           <div class="chain-head">
-            <label class="section-label">有序目标链</label>
+            <span class="section-label">有序目标链</span>
             <button type="button" class="btn btn-sm btn-ghost" :disabled="chainBlocked" @click="addTarget">+ 添加目标</button>
           </div>
           <p class="chain-explanation">{{ form.failover_enabled ? '符合转移条件时按此顺序选择下一目标；停用、熔断和尝试预算会影响实际执行。' : '当前只使用第 1 个目标。后备目标会保留，开启故障转移后才会参与。' }}</p>
@@ -464,7 +464,7 @@ onMounted(() => {
             <div class="chain-row-heading">
               <strong class="chain-idx">{{ i + 1 }} · {{ i === 0 ? '首选目标' : '后备目标' }}</strong>
               <span v-if="i > 0 && !form.failover_enabled" class="badge badge-off">暂不参与</span>
-              <label class="check-inline"><input v-model="t.enabled" type="checkbox" :disabled="chainBlocked" /> 目标启用</label>
+              <label class="check-inline"><input v-model="t.enabled" type="checkbox" :disabled="chainBlocked"/> 目标启用</label>
             </div>
             <label class="chain-field"><span>上游服务</span><select v-model="t.provider_id" class="select" :disabled="chainBlocked" @change="onTargetProviderChange(t)">
               <option value="" disabled>选择上游</option>
@@ -502,7 +502,7 @@ onMounted(() => {
         <!-- 故障转移开关（策略参数在「设置」页统一配置） -->
         <div class="failover">
           <label class="check-line">
-            <input v-model="form.failover_enabled" type="checkbox" :disabled="chainBlocked" />
+            <input v-model="form.failover_enabled" type="checkbox" :disabled="chainBlocked"/>
             启用自动故障转移
           </label>
           <p class="tip" style="margin-top: 6px">
@@ -540,7 +540,7 @@ onMounted(() => {
         </div>
       </form>
     </AppModal>
-  </main>
+  </div>
 </template>
 
 <style scoped>

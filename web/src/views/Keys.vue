@@ -287,6 +287,9 @@ async function load() {
 
 // ---------- 创建表单 ----------
 
+/** 创建在途标记：挡住双击创建出两把同名密钥。 */
+const creating = ref(false)
+
 const form = reactive({
   open: false,
   name: '',
@@ -316,10 +319,14 @@ function openCreate() {
 }
 
 async function submitCreate() {
+  // 在途守卫：连点两次「创建」会真的建出两把同名密钥（后端每次都生成新
+  // key，没有幂等键），而第二把的明文会被第二次成功的弹窗顶掉、此后无法找回。
+  if (creating.value) return
   if (!form.name.trim()) {
     toast('名称为必填项', 'err')
     return
   }
+  creating.value = true
   try {
     const created = await api.createKey({
       name: form.name.trim(),
@@ -345,6 +352,8 @@ async function submitCreate() {
     await load()
   } catch (e) {
     if ((e as { status?: number }).status !== 401) toast('创建失败：' + (e as Error).message, 'err')
+  } finally {
+    creating.value = false
   }
 }
 
@@ -463,12 +472,19 @@ async function submitEdit() {
 }
 
 async function toggleKey(k: AccessKey) {
+  // 在途守卫：开关是无幂等键的翻转请求，连点两次会发出 enable 再 disable，
+  // 两个响应各自提示一次成功，而最终状态取决于网络返回顺序 —— 用户看到
+  // 「已启用」却发现 key 是停用的。
+  if (toggling.value.has(k.id)) return
+  toggling.value.add(k.id)
   try {
     await api.updateKey(k.id, { enabled: !k.enabled })
     toast(!k.enabled ? '已启用' : '已停用')
     await load()
   } catch (e) {
     if ((e as { status?: number }).status !== 401) toast('操作失败：' + (e as Error).message, 'err')
+  } finally {
+    toggling.value.delete(k.id)
   }
 }
 
@@ -494,6 +510,13 @@ async function removeKey(k: AccessKey) {
 // 配额预检会让这把 key 永远 429（死 key）。这里是唯一的界面自愈入口
 // （POST /keys/{id}/recompute-usage），按调用明细重算并覆盖计数。
 const recomputing = ref('')
+
+/** 启停在途的 key id 集合：同一行的开关在请求返回前不接受第二次点击。 */
+const toggling = ref(new Set<string>())
+
+function isToggling(id: string): boolean {
+  return toggling.value.has(id)
+}
 
 async function recomputeUsage(k: AccessKey) {
   recomputing.value = k.id
@@ -669,7 +692,16 @@ async function recomputeUsage(k: AccessKey) {
                   </button>
                   <button class="btn btn-act btn-ghost" @click="openEdit(k)">编辑</button>
                   <button class="btn btn-act btn-danger" @click="removeKey(k)">删除</button>
-                  <button class="switch" :class="{ on: k.enabled }" :title="k.enabled ? '停用' : '启用'" @click="toggleKey(k)"></button>
+                  <button
+                    class="switch"
+                    :class="{ on: k.enabled }"
+                    role="switch"
+                    :aria-checked="k.enabled"
+                    :aria-label="(k.enabled ? '停用 ' : '启用 ') + (k.name || k.key_prefix)"
+                    :disabled="isToggling(k.id)"
+                    :title="k.enabled ? '停用' : '启用'"
+                    @click="toggleKey(k)"
+                  ></button>
                 </div>
               </td>
             </tr>
@@ -683,8 +715,8 @@ async function recomputeUsage(k: AccessKey) {
       <form @submit.prevent="submitCreate">
         <div class="form-grid">
           <div class="field span2">
-            <label>名称 *</label>
-            <input v-model="form.name" class="input" placeholder="cursor-主力 / 内部测试" />
+            <label for="cgw-lKeys-1">名称 *</label>
+            <input v-model="form.name" class="input" placeholder="cursor-主力 / 内部测试" id="cgw-lKeys-1"/>
           </div>
           <!-- 归属**不是**一个可选字段，界面上也不给任何改归属的入口：
                任何人（含管理员）建 key 都只归属自己（后端 Create 强制
@@ -693,27 +725,27 @@ async function recomputeUsage(k: AccessKey) {
                updateKey）—— 归属只能通过那条 admin-only 的认领路径改变，
                前端从不暴露它。要替别人建，请让对方自行创建。 -->
           <div class="field span2">
-            <label>归属用户</label>
-            <input class="input" :value="meName" disabled />
+            <label for="cgw-lKeys-2">归属用户</label>
+            <input class="input" :value="meName" disabled id="cgw-lKeys-2"/>
             <span class="tip">密钥始终归属你自己。需要给别人用，请让对方自行创建。</span>
           </div>
           <div class="field span2">
-            <label>可用模型</label>
-            <ModelPicker v-model="form.models" :options="modelOptions" :restricted="modelsRestricted" />
+            <span class="field-label">可用模型</span>
+            <ModelPicker v-model="form.models" :options="modelOptions" :restricted="modelsRestricted"/>
           </div>
           <div class="field">
-            <label>有效期（天）</label>
-            <input v-model.number="form.days" class="input num" type="number" min="0" step="1" placeholder="0" />
+            <label for="cgw-lKeys-3">有效期（天）</label>
+            <input v-model.number="form.days" class="input num" type="number" min="0" step="1" placeholder="0" id="cgw-lKeys-3"/>
             <span class="tip">0 = 永不过期。到期后该密钥请求返回 403。</span>
           </div>
           <div class="field">
-            <label>来源 IP 白名单</label>
-            <input v-model="form.ips" class="input" placeholder="留空 = 不限制" />
+            <label for="cgw-lKeys-4">来源 IP 白名单</label>
+            <input v-model="form.ips" class="input" placeholder="留空 = 不限制" id="cgw-lKeys-4"/>
             <span class="tip">逗号分隔的 CIDR 或单 IP，如 <code>10.0.0.0/8, 203.0.113.7</code>。按直连地址判定，不认 <code>X-Forwarded-For</code>。</span>
           </div>
           <div v-if="isAdmin()" class="field span2">
-            <label>分组覆盖</label>
-            <select v-model="form.groupId" class="input">
+            <label for="cgw-lKeys-5">分组覆盖</label>
+            <select v-model="form.groupId" class="input" id="cgw-lKeys-5">
               <option value="">（沿用归属用户所属的分组）</option>
               <option v-for="g in groupOptions" :key="g.id" :value="g.id">
                 {{ g.name }}{{ g.models.length === 0 ? '（未限制模型）' : '' }}
@@ -725,23 +757,23 @@ async function recomputeUsage(k: AccessKey) {
                限速由网关统一控制 —— 表单里不给他们这两个输入框，
                而不是给一个填了也不生效的框（静默失效最容易让人误判）。 -->
           <div v-if="isAdmin()" class="field span2">
-            <label>Token 配额</label>
-            <input v-model.number="form.quota" class="input num" type="number" min="0" step="1" placeholder="0" />
+            <label for="cgw-lKeys-6">Token 配额</label>
+            <input v-model.number="form.quota" class="input num" type="number" min="0" step="1" placeholder="0" id="cgw-lKeys-6"/>
             <span class="tip">累计 input+output token 上限，用尽后 /v1 返回 429；0 = 不限</span>
           </div>
           <div v-if="isAdmin()" class="field">
-            <label>RPM 限速</label>
-            <input v-model.number="form.rpm" class="input num" type="number" min="0" step="1" placeholder="0" />
+            <label for="cgw-lKeys-7">RPM 限速</label>
+            <input v-model.number="form.rpm" class="input num" type="number" min="0" step="1" placeholder="0" id="cgw-lKeys-7"/>
             <span class="tip">每分钟请求数上限；0 = 不限</span>
           </div>
           <div v-if="isAdmin()" class="field">
-            <label>TPM 限速</label>
-            <input v-model.number="form.tpm" class="input num" type="number" min="0" step="1" placeholder="0" />
+            <label for="cgw-lKeys-8">TPM 限速</label>
+            <input v-model.number="form.tpm" class="input num" type="number" min="0" step="1" placeholder="0" id="cgw-lKeys-8"/>
             <span class="tip">每分钟 token 上限（估算预占+事后校正）；0 = 不限</span>
           </div>
           <div v-else class="field span2">
-            <label>Token 配额</label>
-            <input class="input num" disabled :value="quotaHint" />
+            <label for="cgw-lKeys-9">Token 配额</label>
+            <input class="input num" disabled :value="quotaHint" id="cgw-lKeys-9"/>
             <span class="tip">
               你的密钥额度不能超过管理员为你设置的用户级配额。下面的有效期与 IP
               白名单可以自己设 —— 那只会让你的密钥更受限，不会更宽松。
@@ -750,7 +782,9 @@ async function recomputeUsage(k: AccessKey) {
         </div>
         <div class="form-actions">
           <button type="button" class="btn btn-ghost" @click="form.open = false">取消</button>
-          <button type="submit" class="btn btn-primary">创建</button>
+          <button type="submit" class="btn btn-primary" :disabled="creating">
+            {{ creating ? '创建中…' : '创建' }}
+          </button>
         </div>
       </form>
     </AppModal>
@@ -777,27 +811,27 @@ async function recomputeUsage(k: AccessKey) {
       <form @submit.prevent="submitEdit">
         <div class="form-grid">
           <div class="field span2">
-            <label>名称 *</label>
-            <input v-model="eForm.name" class="input" />
+            <label for="cgw-lKeys-10">名称 *</label>
+            <input v-model="eForm.name" class="input" id="cgw-lKeys-10"/>
           </div>
           <div class="field span2">
-            <label>可用模型</label>
-            <ModelPicker v-model="eForm.models" :options="modelOptions" :restricted="modelsRestricted" />
+            <span class="field-label">可用模型</span>
+            <ModelPicker v-model="eForm.models" :options="modelOptions" :restricted="modelsRestricted"/>
           </div>
           <div class="field">
-            <label>有效期（天）</label>
-            <input v-model.number="eForm.days" class="input num" type="number" min="0" step="1" placeholder="0" />
+            <label for="cgw-lKeys-11">有效期（天）</label>
+            <input v-model.number="eForm.days" class="input num" type="number" min="0" step="1" placeholder="0" id="cgw-lKeys-11"/>
             <span v-if="eForm.keyExpired" class="tip">该密钥已过期。改动天数会重新设定有效期（从现在起 N 天）；不改动则维持过期状态。</span>
             <span v-else class="tip">0 = 永不过期。改动天数会按「从现在起 N 天」重设截止时间；不改动则保持原值。</span>
           </div>
           <div class="field">
-            <label>来源 IP 白名单</label>
-            <input v-model="eForm.ips" class="input" placeholder="留空 = 不限制" />
+            <label for="cgw-lKeys-12">来源 IP 白名单</label>
+            <input v-model="eForm.ips" class="input" placeholder="留空 = 不限制" id="cgw-lKeys-12"/>
             <span class="tip">逗号分隔的 CIDR 或单 IP。写错会让这把密钥从所有地址都连不上。</span>
           </div>
           <div v-if="isAdmin()" class="field span2">
-            <label>分组覆盖</label>
-            <select v-model="eForm.groupId" class="input">
+            <label for="cgw-lKeys-13">分组覆盖</label>
+            <select v-model="eForm.groupId" class="input" id="cgw-lKeys-13">
               <option value="">（沿用归属用户所属的分组）</option>
               <option v-for="g in groupOptions" :key="g.id" :value="g.id">
                 {{ g.name }}{{ g.models.length === 0 ? '（未限制模型）' : '' }}
@@ -811,18 +845,18 @@ async function recomputeUsage(k: AccessKey) {
                只会让一次改名之类的正常保存被 403 整个打掉。
                普通用户的服务端额度仍按「用户级配额」封顶，见 submitEdit 的注释。 -->
           <div v-if="isAdmin()" class="field span2">
-            <label>Token 配额</label>
-            <input v-model.number="eForm.quota" class="input num" type="number" min="0" step="1" placeholder="0" />
+            <label for="cgw-lKeys-14">Token 配额</label>
+            <input v-model.number="eForm.quota" class="input num" type="number" min="0" step="1" placeholder="0" id="cgw-lKeys-14"/>
             <span class="tip">累计 input+output token 上限，用尽后 /v1 返回 429；0 = 不限</span>
           </div>
           <div v-if="isAdmin()" class="field">
-            <label>RPM 限速</label>
-            <input v-model.number="eForm.rpm" class="input num" type="number" min="0" step="1" placeholder="0" />
+            <label for="cgw-lKeys-15">RPM 限速</label>
+            <input v-model.number="eForm.rpm" class="input num" type="number" min="0" step="1" placeholder="0" id="cgw-lKeys-15"/>
             <span class="tip">每分钟请求数上限；0 = 不限</span>
           </div>
           <div v-if="isAdmin()" class="field">
-            <label>TPM 限速</label>
-            <input v-model.number="eForm.tpm" class="input num" type="number" min="0" step="1" placeholder="0" />
+            <label for="cgw-lKeys-16">TPM 限速</label>
+            <input v-model.number="eForm.tpm" class="input num" type="number" min="0" step="1" placeholder="0" id="cgw-lKeys-16"/>
             <span class="tip">每分钟 token 上限（估算预占+事后校正）；0 = 不限</span>
           </div>
         </div>

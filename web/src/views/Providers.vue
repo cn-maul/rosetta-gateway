@@ -140,13 +140,13 @@ onMounted(load)
 </script>
 
 <template>
-  <main class="page providers-page">
+  <div class="page providers-page">
     <div class="page-head">
       <div><h1>上游服务</h1><div class="sub">接入服务、管理凭据与上游模型 · 全站配置</div></div>
       <div class="head-actions"><button class="btn" :disabled="loading" @click="load">刷新</button><button class="btn btn-primary" @click="openCreate">新建上游</button></div>
     </div>
     <div class="data-toolbar">
-      <label class="search-field"><span class="sr-only">搜索上游</span><input v-model="search" class="input" type="search" placeholder="搜索名称、协议或 Endpoint" /></label>
+      <label class="search-field"><span class="sr-only">搜索上游</span><input v-model="search" class="input" type="search" placeholder="搜索名称、协议或 Endpoint"/></label>
       <label><span class="sr-only">上游状态</span><select v-model="status" class="select"><option value="">全部状态</option><option value="ready">凭据就绪</option><option value="unready">未就绪</option><option value="disabled">已停用</option><option value="unknown">状态未知</option></select></label>
       <span class="result-count">{{ filtered.length }} / {{ providers.length }} 个上游</span>
     </div>
@@ -175,24 +175,24 @@ onMounted(load)
       <form @submit.prevent="submitProvider">
         <div class="form-grid">
           <div class="field">
-            <label>显示名称</label>
-            <input v-model="pForm.name" class="input" placeholder="DeepSeek（留空则用 Endpoint）" />
+            <label for="cgw-lProviders-1">显示名称</label>
+            <input v-model="pForm.name" class="input" placeholder="DeepSeek（留空则用 Endpoint）" id="cgw-lProviders-1"/>
           </div>
           <div class="field">
-            <label>协议</label>
-            <select v-model="pForm.protocol" class="select">
+            <label for="cgw-lProviders-2">协议</label>
+            <select v-model="pForm.protocol" class="select" id="cgw-lProviders-2">
               <option value="openai-chat">openai-chat</option>
               <option value="anthropic">anthropic</option>
               <option value="openai-responses">openai-responses</option>
             </select>
           </div>
           <div class="field span2">
-            <label>Endpoint *</label>
-            <input v-model="pForm.endpoint" class="input mono" placeholder="https://api.deepseek.com" />
+            <label for="cgw-lProviders-3">Endpoint *</label>
+            <input v-model="pForm.endpoint" class="input mono" placeholder="https://api.deepseek.com" id="cgw-lProviders-3"/>
           </div>
           <div class="field span2">
-            <label>API Key</label>
-            <input v-model="pForm.api_key" class="input mono" type="password" placeholder="sk-...（可留空，稍后在详情页添加）" autocomplete="new-password" />
+            <label for="cgw-lProviders-4">API Key</label>
+            <input v-model="pForm.api_key" class="input mono" type="password" placeholder="sk-...（可留空，稍后在详情页添加）" autocomplete="new-password" id="cgw-lProviders-4"/>
             <span class="tip">
               添加即启用；slug、超时与重试将自动使用默认值。
               代理与余额查询可在创建后到详情页设置。
@@ -205,7 +205,7 @@ onMounted(load)
         </div>
       </form>
     </AppModal>
-  </main>
+  </div>
 </template>
 
 <style scoped>

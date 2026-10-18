@@ -86,6 +86,10 @@ const navigation = computed(() => isAdmin() ? [
     { to: '/users', label: '用户与权限', icon: icons.users },
   ] },
   { label: '管理', items: [
+    // 管理员也要一条独立的「API 密钥」入口。此前只有「用户与权限」一条，
+    // 而两个路由共用一个组件：/users?tab=keys 停在密钥页签时，侧栏高亮的
+    // 却是「用户与权限」，浏览器标题与页面 h1 也各说各话（同一个页面三重身份）。
+    { to: '/keys', label: 'API 密钥', icon: icons.keys },
     { to: '/wallet', label: '账户与充值', icon: icons.wallet },
     { to: '/settings', label: '系统设置', icon: icons.settings },
   ] },
@@ -106,6 +110,18 @@ const locationLabel = computed(() => {
   }
   return isAdmin() ? '管理控制台' : '个人工作台'
 })
+
+/**
+ * 侧栏高亮用的路径。
+ *
+ * 两个路由共用 AccessControl.vue：管理员在 /users?tab=keys 时停的其实是
+ * 密钥页签，此时该高亮「API 密钥」而不是「用户与权限」。这里把该形态
+ * 归一到 /keys，高亮与页面内容、浏览器标题三者保持一致。
+ */
+function activeNavTo(): string {
+  if (route.name === 'users' && route.query.tab === 'keys') return '/keys'
+  return route.path
+}
 
 // ---------- 身份 ----------
 //
@@ -264,7 +280,7 @@ watch(
       <nav class="side-nav" aria-label="网关导航">
         <div v-for="group in navigation" :key="group.label" class="nav-group">
           <div class="side-sep sep-label"><span v-if="!railCollapsed" class="side-sep-text">{{ group.label }}</span></div>
-          <RouterLink v-for="item in group.items" :key="item.to" class="side-item" :to="item.to" :class="{ 'nav-active': route.path === item.to || item.to !== '/' && route.path.startsWith(item.to + '/') || isAdmin() && item.to === '/users' && route.name === 'keys' }" :title="railCollapsed ? item.label : undefined" :aria-label="item.label">
+          <RouterLink v-for="item in group.items" :key="item.to" class="side-item" :to="item.to" :class="{ 'nav-active': item.to === activeNavTo() || item.to !== '/' && activeNavTo()?.startsWith(item.to + '/') }" :title="railCollapsed ? item.label : undefined" :aria-label="item.label">
             <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path :d="item.icon" /></svg>
             <span v-if="!railCollapsed">{{ item.label }}</span>
           </RouterLink>

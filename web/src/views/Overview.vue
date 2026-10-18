@@ -281,7 +281,7 @@ onMounted(refresh)
 </script>
 
 <template>
-  <main class="page overview-page">
+  <div class="page overview-page">
     <div class="page-head">
       <div><h1>{{ isAdmin() ? '网关总览' : '我的总览' }}</h1><div class="sub">{{ isAdmin() ? '全站流量、请求质量与待处理配置' : '个人调用、费用与账户状态' }}</div></div>
       <div class="head-actions">
@@ -339,7 +339,7 @@ onMounted(refresh)
       </section>
       <div class="overview-shortcuts"><RouterLink to="/history">查看{{ isAdmin() ? '请求日志' : '我的调用' }} →</RouterLink><RouterLink v-if="isAdmin()" to="/routes">管理模型与路由 →</RouterLink><RouterLink v-else to="/keys">管理 API 密钥 →</RouterLink></div>
     </template>
-  </main>
+  </div>
 </template>
 
 <style scoped>

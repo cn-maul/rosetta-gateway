@@ -1157,7 +1157,8 @@ textarea {
   gap: 5px;
   min-width: 0;
 }
-.field > label {
+.field > label,
+.field > .field-label {
   font-size: 12.5px;
   font-weight: 550;
   color: var(--muted);
@@ -1280,6 +1281,11 @@ textarea {
 .sheet-body {
   font-size: 13.5px;
   color: var(--text-2);
+  /* 确认框正文保留换行：Settings 的导入确认用 \n\n 与全角空格缩进排一份
+     可读清单，默认 white-space:normal 会把它们折成一长串连读、段落分隔
+     消失。pre-line 保留换行、压缩连续空行。
+     顺带解决了「删除上游/删除路由」这类多行确认文案被压扁的问题。 */
+  white-space: pre-line;
 }
 /* 凭据对话框的行内错误：密码错误 / 网关不可达。
    用 warning（暖橙）而非 danger（红）—— 红在本项目里专留给破坏性操作。 */
@@ -1480,6 +1486,65 @@ textarea {
 }
 .stale-bar .btn {
   flex: none;
+}
+
+/* 状态条：DataTable / ProviderDetail / Keys / UsageDetail 共用一条「加载失败」
+   视觉。此前 .notice-warn 只在 Models / Wallet / UsageDetail 三个页面的
+   scoped 样式里各定义一份，于是 DataTable 的错误条与 ProviderDetail 的
+   「未就绪」提示在别处引用时完全没有样式 —— 渲染成一段没有底色、没有
+   边距的正文，视觉上与普通文字无异。这里提到全局，四处共用同一份。
+   保持与 .stale-bar 视觉同族（warning-soft），语义也相同：失败但保留
+   上次成功结果。 */
+.notice-warn {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 12px;
+  margin: 12px 0;
+  padding: 12px 14px;
+  border-radius: 10px;
+  background: var(--warning-soft);
+  color: var(--warning-soft-foreground);
+  font-size: 12px;
+}
+.notice-warn .btn {
+  flex: none;
+}
+
+/* 诊断结果行（上游模型探测 / 凭据余额）。
+   .test-ok / .test-err / .bal-ok / .bal-na / .bal-line / .bal-cell 这组类名
+   在组件里被使用，但此前**没有任何样式表定义过它们** —— 于是「模型探测失败」
+   与「探测成功」、以及「该上游不支持余额查询」与「余额为 0」在页面上完全同形。
+   这类诊断信息的价值全部来自可区分性，所以补齐四个状态类：
+   ok（成功）/ na（不适用，不算失败）/ err（失败）。 */
+.test-ok,
+.bal-ok {
+  color: var(--success-soft-foreground);
+}
+.test-err {
+  color: var(--danger-soft-foreground);
+}
+.bal-na {
+  color: var(--text-3);
+}
+.bal-cell {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  font-size: 11.5px;
+}
+.bal-line {
+  overflow-wrap: anywhere;
+}
+
+/* 成功率低于 100% 时提示色。组件里用的是 .sr（而不是 .sr-only —— 那是给
+   读屏的隐藏文本，两者不同），此前只定义了 .sr-only，于是这个告警色从不
+   生效，成功率 60% 与 100% 长得一样。 */
+.sr {
+  color: var(--text-2);
+}
+.sr.warn {
+  color: var(--warning-soft-foreground);
 }
 
 /* 首用引导（2026-10-11 前端审计 Overview）
@@ -1997,8 +2062,15 @@ textarea {
 .row-menu summary { display: grid; place-items: center; list-style: none; width: 30px; height: 30px; cursor: pointer; border-radius: 8px; font-size: 20px; }
 .row-menu summary::-webkit-details-marker { display: none; }
 .row-menu summary:hover { background: var(--default); }
-.row-menu-content { position: absolute; right: 0; bottom: calc(100% + 4px); z-index: 8; background: var(--overlay); border: 1px solid var(--border); padding: 6px; border-radius: 10px; box-shadow: var(--sh-overlay); }
+.row-menu-content { position: absolute; right: 0; top: calc(100% + 4px); z-index: 8; background: var(--overlay); border: 1px solid var(--border); padding: 6px; border-radius: 10px; box-shadow: var(--sh-overlay); }
 .row-menu[open] { z-index: 9; }
+
+/* 行操作菜单被表格滚动容器裁掉：.tbl-wrap 是 overflow-x:auto，
+   于是 overflow-y 计算值也是 auto —— 绝对定位的子元素仍会被裁剪。
+   菜单向上弹出（bottom:100%+4px）时，位于表格**顶部几行**的菜单完全落在
+   滚动框之外，直接不可见。
+   处置：让菜单向下弹出。代价是最后几行可能落出底部，但表格底部一般有
+   分页条与留白，比顶部被裁更少被遇到；且两个方向都不必依赖 JS 测量。 */
 .scrim.scrim-drawer { display: flex; justify-content: flex-end; align-items: stretch; padding: 12px; }
 .scrim-drawer .sheet { height: 100%; max-height: 100%; border-radius: 16px; animation: drawer-in 0.24s var(--ease-out-quart); }
 .scrim-drawer .sheet-title { display: flex; align-items: center; justify-content: space-between; gap: 12px; overflow-wrap: anywhere; }

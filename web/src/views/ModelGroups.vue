@@ -252,8 +252,8 @@ function labelFor(mm: UpstreamModel): string {
     >
       <form @submit.prevent="submitGroup">
         <div class="field span2">
-          <label>组显示名 *</label>
-          <input v-model="gForm.display_name" class="input" placeholder="DeepSeek V3" />
+          <label for="cgw-lModelGroups-1">组显示名 *</label>
+          <input v-model="gForm.display_name" class="input" placeholder="DeepSeek V3" id="cgw-lModelGroups-1"/>
           <span class="tip">统计页与模型名会显示成这个名字，全库唯一</span>
         </div>
         <div class="form-actions">
@@ -287,7 +287,7 @@ function labelFor(mm: UpstreamModel): string {
           <div v-if="availableModels.length === 0" class="dim gm-empty">没有未归组的模型可添加</div>
           <div v-for="mm in availableModels" :key="mm.id" class="gm-row">
             <label class="gm-pick">
-              <input type="checkbox" :checked="mForm.addIds.has(mm.id)" @change="toggleAdd(mm.id)" />
+              <input type="checkbox" :checked="mForm.addIds.has(mm.id)" @change="toggleAdd(mm.id)"/>
               <span class="mono gm-name">{{ labelFor(mm) }}</span>
             </label>
           </div>

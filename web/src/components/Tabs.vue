@@ -30,7 +30,7 @@
  * 这样将来若有更多状态（disabled / hovered / focus-visible），
  * 命名规则是现成的，不用重新发明。
  */
-import { computed, nextTick, onBeforeUnmount, ref, watch } from 'vue'
+import { computed, nextTick, onBeforeUnmount, ref, useId, watch } from 'vue'
 
 export type TabItem = { key: string; label: string }
 
@@ -49,6 +49,16 @@ const emit = defineEmits<{ 'update:modelValue': [key: string] }>()
 // 指示器定位：记录每个 tab 按钮的位置，指示器据此移动。
 const listRef = ref<HTMLElement | null>(null)
 const indicator = ref({ left: 0, width: 0 })
+
+// 每个 Tabs 实例一个 id 前缀：tab 的 id / aria-controls 与宿主面板的
+// id / aria-labelledby 成对。此前只发 role="tab" + aria-selected，却没有任何
+// tabpanel 与 id 配对，辅助技术无法把「当前页签」和「下面这块内容」关联起来
+// —— 页签语义实际上不可解析。
+const listId = `tabs-${useId()}`
+
+// 供宿主把面板挂上 role="tabpanel" + aria-labelledby，与上面的 aria-controls
+// 配对（面板 id 用 panelIdFor(tabKey)）。
+defineExpose({ panelIdFor: (key: string) => `${listId}-panel-${key}`, tabIdFor: (key: string) => `${listId}-tab-${key}` })
 
 function measure() {
   const el = listRef.value
@@ -111,12 +121,14 @@ watch(listRef, (el) => {
       <div ref="listRef" class="tabs__list" role="tablist" :aria-label="props.ariaLabel" data-orientation="horizontal">
         <button
           v-for="t in props.tabs"
+          :id="`${listId}-tab-${t.key}`"
           :key="t.key"
           class="tabs__tab"
           type="button"
           role="tab"
           :data-selected="t.key === props.modelValue"
           :aria-selected="t.key === props.modelValue"
+          :aria-controls="`${listId}-panel-${t.key}`"
           :tabindex="t.key === props.modelValue ? 0 : -1"
           @keydown="onTabKey($event, t.key)"
           @click="emit('update:modelValue', t.key)"
