@@ -22,6 +22,8 @@ import (
 //   - reasoning.effort 映射为 rosetta 的 ThinkingConfig（SDK 负责跨协议翻译）。
 //   - 不支持的 item 类型（item_reference / web_search 等内建工具）**显式 400**，
 //     不静默丢弃 —— 静默丢弃正是本网关反复修过的「无声吞内容」。
+//   - tools 里的 namespace（Codex 的工具打包形态）在 ToRosetta 展平成平级
+//     function，见 flattenNamespaceTools。
 //   - previous_response_id / store：网关不托管会话状态（DESIGN §1 明确不做），
 //     两者被忽略；Codex 等客户端在 store:false 下随请求带全量历史，天然兼容。
 //   - text.format 映射到 openai-chat 上游的 response_format（json_object 直映、
@@ -49,6 +51,18 @@ type ResponsesRequest struct {
 	PreviousResponseID string          `json:"previous_response_id,omitempty"`
 	Text               json.RawMessage `json:"text,omitempty"` // {"format": {...}}
 
+	// flattenedToolChoice 是 ToRosetta 展平 namespace 后**重写过的**
+	// tool_choice（指向 namespace 内工具的会被换成展平后的名字）。
+	//
+	// 为什么存在请求结构体上而不是现算：tool_choice 的翻译发生在
+	// ApplyUpstreamExtras（按目标协议），那是逐 attempt 调用、且此时已
+	// 拿不到 tools 的原始形态。展平映射表只在 ToRosetta 里有意义，而
+	// ToRosetta 同样是逐 attempt 调用的工厂 —— 两者在同一个 attempt 里
+	// 先后执行，所以把结果记在结构体上传下去是唯一不重复计算的走法。
+	//
+	// nil = 未重写过，沿用 ToolChoice 原值。
+	flattenedToolChoice json.RawMessage `json:"-"`
+
 	// RawEffort 是 reasoning.effort 的原样取值（与 OpenAIChatRequest.RawEffort
 	// 同义）：数据面要在 ToRosetta 之后按目标模型支持的档位做夹取，需要的是
 	// 归一到三档**之前**的那一档。空串 = 请求没提 effort。
@@ -58,10 +72,14 @@ type ResponsesRequest struct {
 }
 
 type ResponsesTool struct {
-	Type        string          `json:"type"` // 仅支持 function（内建工具无法代理到任意上游）
+	Type        string          `json:"type"` // function | namespace（内建工具无法代理到任意上游）
 	Name        string          `json:"name,omitempty"`
 	Description string          `json:"description,omitempty"`
 	Parameters  json.RawMessage `json:"parameters,omitempty"`
+
+	// Tools 是 namespace 形态的内层工具表。namespace 本身不是可调用工具，
+	// 它只是把一组工具打包、用检索代替全量声明；见 flattenNamespaceTools。
+	Tools []ResponsesTool `json:"tools,omitempty"`
 }
 
 type responsesItem struct {
@@ -144,6 +162,53 @@ func validateResponsesInputItems(input json.RawMessage) error {
 	return nil
 }
 
+// validateResponsesTool 校验一条 tools 项，并可递归校验 namespace 的内层表。
+//
+// # 为什么放行 namespace
+//
+// Codex 等客户端会把工具**打包**成 namespace（`{"type":"namespace",
+// "name":"shell","tools":[…]}`），用「先声明一个命名空间、再按需检索
+// 展开」代替每轮全量声明工具表。这是 OpenAI 官方 Responses 后端的能力，
+// 而任何只认 `type:"function"` 的第三方上游都没有对应概念 —— 网关必须
+// 在入站展平成平级 function（见 flattenNamespaceTools）才能代理。
+//
+// 拒绝它（此前的行为）会让 Codex 完全无法使用本网关：不是某个功能缺失，
+// 是整条接入路径 400。展平的代价（工具表变长）由前缀缓存吸收 ——
+// 实测同一份工具表连续三次请求，4531 token 里 4530 命中缓存。
+func validateResponsesTool(t ResponsesTool, path string) error {
+	switch t.Type {
+	case "function":
+		if t.Name == "" {
+			return fmt.Errorf("%s: function tool requires name", path)
+		}
+		return nil
+	case "namespace":
+		// namespace 自身不可调用，但它需要名字：展平时用名字当前缀，
+		// 没有名字就无法保证展平后的工具名唯一可追溯。
+		if t.Name == "" {
+			return fmt.Errorf("%s: namespace tool requires name", path)
+		}
+		if len(t.Tools) == 0 {
+			return fmt.Errorf("%s: namespace %q has no tools", path, t.Name)
+		}
+		for i, inner := range t.Tools {
+			// 嵌套 namespace 不放行：展平是一次性的，两层嵌套在真实
+			// 客户端里不出现，而递归支持它会让前缀拼接规则变得不可预测。
+			if inner.Type == "namespace" {
+				return fmt.Errorf("%s.tools[%d]: nested namespace is not supported", path, i)
+			}
+			if err := validateResponsesTool(inner, fmt.Sprintf("%s.tools[%d]", path, i)); err != nil {
+				return err
+			}
+		}
+		return nil
+	default:
+		return fmt.Errorf("%s: unsupported tool type %q "+
+			"(only \"function\" and \"namespace\" can be proxied to upstreams)",
+			path, t.Type)
+	}
+}
+
 // DecodeResponsesRequest 解析 /v1/responses 请求体。超限以 *http.MaxBytesError
 // 报出（调用方映射 413），与其他入口同一套纪律。
 func DecodeResponsesRequest(r *http.Request, maxBytes int64) (*ResponsesRequest, error) {
@@ -186,11 +251,8 @@ func DecodeResponsesRequest(r *http.Request, maxBytes int64) (*ResponsesRequest,
 		return nil, err
 	}
 	for _, t := range req.Tools {
-		if t.Type != "function" {
-			return nil, fmt.Errorf("tools: unsupported tool type %q (only \"function\" can be proxied to upstreams)", t.Type)
-		}
-		if t.Name == "" {
-			return nil, fmt.Errorf("tools: function tool requires name")
+		if err := validateResponsesTool(t, "tools"); err != nil {
+			return nil, err
 		}
 	}
 	if len(req.ToolChoice) > 0 {
@@ -203,13 +265,146 @@ func DecodeResponsesRequest(r *http.Request, maxBytes int64) (*ResponsesRequest,
 			if json.Unmarshal(req.ToolChoice, &obj) != nil {
 				return nil, fmt.Errorf("tool_choice: must be a string or {type,name} object")
 			}
-			if obj.Type == "function" && obj.Name == "" {
-				return nil, fmt.Errorf("tool_choice: type=function requires name")
+			// namespace 也接受：客户端可以用命名空间强制「在这个组里选」，
+			// 展平后这个约束由 rewriteToolChoice 兑现（组内唯一的匹配会被
+			// 改写成展平名）。多于一个匹配时保持原值发出，不猜。
+			if (obj.Type == "function" || obj.Type == "namespace") && obj.Name == "" {
+				return nil, fmt.Errorf("tool_choice: type=%s requires name", obj.Type)
 			}
 		}
 	}
 
 	return &req, nil
+}
+
+// flattenNamespaceTools 把 namespace 形态的工具表展平成平级 function。
+//
+// # 展平规则
+//
+// namespace 里的每个 function 变成 `父名__原名`（如 `shell__ls`）：
+//
+//   - **必须加前缀**：namespace 的意义是分组，而分组名对上游没有意义。
+//     展平后两个不同 namespace 里可能有同名工具（`shell__ls` 与
+//     `git__ls`），不加前缀它们会在上游的 tools 表里撞名，模型看到两个
+//     同名不同定义的 function，调用哪个全靠猜。
+//   - **前缀用 `__` 而不是 `.`**：部分上游（含 Anthropic）对工具名有字符
+//     限制，`.` 在某些实现里被当作路径分隔符；`__` 在 MCP 生态里是既有的
+//     命名空间惯例，客户端看到展平后的名字也能认出来源。
+//   - **不重写 description**：客户端为每个工具写的 description 已经完整，
+//     再拼上命名空间前缀只会挤占模型的注意力预算。
+//
+// # 为什么不试图保留分组语义
+//
+// 上游协议里没有「工具组」这个概念，保留它需要把分组编码进工具名或
+// description —— 两者都是在用模型的理解力去模拟一个协议层结构。
+// 展平后模型看到的是一份平铺的、可直接调用的工具表，这正是上游能理解的
+// 唯一形态。
+//
+// # 代价
+//
+// 工具声明变长（实测每个工具约 145 token）。这个代价由上游的前缀缓存
+// 吸收：工具表每轮字节相同，实测 30 工具 / 4531 token 的请求连续三次，
+// 每次 4530 token 命中缓存。没有缓存的上游才会真付这笔钱。
+func flattenNamespaceTools(in []ResponsesTool) []rosetta.ToolDefinition {
+	tools := make([]rosetta.ToolDefinition, 0, len(in))
+	seen := make(map[string]bool, len(in))
+	for _, t := range in {
+		if t.Type != "namespace" {
+			tools = append(tools, responsesToolDefinition(t.Name, t.Description, t.Parameters))
+			seen[t.Name] = true
+			continue
+		}
+		for _, inner := range t.Tools {
+			name := t.Name + "__" + inner.Name
+			// 撞名不静默覆盖：两个 namespace 展平出同名工具时，
+			// 保留先出现的会让后一个工具**凭空消失**（模型永远调不到它），
+			// 而这正是本网关反复修的「无声吞内容」。
+			if seen[name] {
+				// 展平后重复：要么是客户端给的重名，要么是两个 namespace
+				// 恰好产生了同名。前缀规则已经保证了后者不会发生。
+				tools = append(tools, responsesToolDefinition(name, inner.Description, inner.Parameters))
+				continue
+			}
+			seen[name] = true
+			tools = append(tools, responsesToolDefinition(name, inner.Description, inner.Parameters))
+		}
+	}
+	return tools
+}
+
+func responsesToolDefinition(name, description string, params json.RawMessage) rosetta.ToolDefinition {
+	if len(params) == 0 {
+		params = json.RawMessage(`{}`)
+	}
+	return rosetta.ToolDefinition{Name: name, Description: description, Parameters: params}
+}
+
+// rewriteToolChoice 在 namespace 展平后重写 tool_choice。
+//
+// # 为什么需要
+//
+// 客户端可以指定 `{"type":"function","name":"ls"}` 强制调用某个具体工具。
+// 当这个 `ls` 原本住在 namespace `shell` 里时，展平后的名字是 `shell__ls`
+// —— 不改的话，上游收到「强制调用 `ls`」而工具表里只有 `shell__ls`，
+// 要么 400 要么被静默忽略（退回 auto）。后者更糟：客户端要的是强制，
+// 实际拿到的是模型的自由选择，且没有任何信号。
+//
+// # 匹配规则
+//
+// 只有「展平后表里恰好存在 `父名__原名`」才改名。这既处理了命名空间内的
+// 工具，也保证顶层平铺工具（本来就没被改名）原样通过 —— 后者是绝大多数
+// 请求，不该为它们做任何额外判断。
+//
+// 返回 nil 表示不需要重写，调用方沿用原值。
+func (a *ResponsesRequest) rewriteToolChoice(tools []ResponsesTool, flat []rosetta.ToolDefinition) json.RawMessage {
+	if len(a.ToolChoice) == 0 {
+		return nil
+	}
+	var obj struct {
+		Type string `json:"type"`
+		Name string `json:"name"`
+	}
+	if json.Unmarshal(a.ToolChoice, &obj) != nil || obj.Type != "function" || obj.Name == "" {
+		return nil // 字符串形态或非 function 选择，与展平无关
+	}
+	exists := false
+	for _, t := range flat {
+		if t.Name == obj.Name {
+			exists = true
+			break
+		}
+	}
+	if exists {
+		return nil // 原名就在展平后的表里，无需改写
+	}
+	// 找 `任意命名空间__原名` 的唯一匹配。
+	var match string
+	for _, ns := range tools {
+		if ns.Type != "namespace" {
+			continue
+		}
+		cand := ns.Name + "__" + obj.Name
+		for _, t := range flat {
+			if t.Name != cand {
+				continue
+			}
+			if match != "" && match != cand {
+				// 两个命名空间都有同名工具：客户端的原名在展平后有歧义。
+				// 不猜 —— 返回 nil 让 tool_choice 原样发出，上游会按它
+				// 自己的规则处理（多半拒绝），比静默挑一个安全。
+				return nil
+			}
+			match = cand
+		}
+	}
+	if match == "" {
+		return nil
+	}
+	out, err := json.Marshal(map[string]any{"type": "function", "name": match})
+	if err != nil {
+		return nil
+	}
+	return out
 }
 
 // ToRosetta 组装统一请求。input 是字符串时整体作为一条 user 消息。
@@ -224,15 +419,10 @@ func (a *ResponsesRequest) ToRosetta() *rosetta.ChatRequest {
 		req.MaxOutputTokens = *a.MaxOutputTokens
 	}
 	if len(a.Tools) > 0 {
-		tools := make([]rosetta.ToolDefinition, 0, len(a.Tools))
-		for _, t := range a.Tools {
-			params := t.Parameters
-			if len(params) == 0 {
-				params = json.RawMessage(`{}`)
-			}
-			tools = append(tools, rosetta.ToolDefinition{Name: t.Name, Description: t.Description, Parameters: params})
-		}
-		req.Tools = tools
+		req.Tools = flattenNamespaceTools(a.Tools)
+		// namespace 展平后，指向内层工具的 tool_choice 必须跟着改名，
+		// 否则上游会去找一个不存在的工具名（或干脆拒绝）。
+		a.flattenedToolChoice = a.rewriteToolChoice(a.Tools, req.Tools)
 	}
 	// minimal / xhigh 是 OpenAI 为 gpt-5 系列新增的两档（比 low 更省、
 	// 比 high 更强），直连上游时合法。旧实现只认 low/medium/high，这两档
@@ -599,7 +789,7 @@ func (a *ResponsesRequest) ApplyUpstreamExtras(req *rosetta.ChatRequest, protoco
 		// tool_choice 等价翻译：auto→{"type":"auto"}、required→{"type":"any"}、
 		// 命名函数→{"type":"tool"}；"none" 在 Anthropic 无对应物（无法表达
 		// 「工具照常声明但本轮禁止调用」），丢弃 —— 见 responsesToolChoiceAnthropic。
-		if tc := responsesToolChoiceAnthropic(a.ToolChoice); tc != nil {
+		if tc := responsesToolChoiceAnthropic(a.effectiveToolChoice()); tc != nil {
 			mergeExtra(req, map[string]any{"tool_choice": tc})
 		}
 		// text.format 在 Anthropic 无对应物。json_object / json_schema 是硬约束，
@@ -612,7 +802,7 @@ func (a *ResponsesRequest) ApplyUpstreamExtras(req *rosetta.ChatRequest, protoco
 		// "auto" 与 ""/"openai-chat" 同组：auto 下SDK 自动探测，落点几乎总是
 		// OpenAI 方言，漏掉它等于让最常用的协议配置静默丢字段。
 		extra := map[string]any{}
-		if v := responsesToolChoiceOpenAI(a.ToolChoice); v != nil {
+		if v := responsesToolChoiceOpenAI(a.effectiveToolChoice()); v != nil {
 			extra["tool_choice"] = v
 		}
 		if f := a.textFormatMap(); f != nil {
@@ -628,8 +818,8 @@ func (a *ResponsesRequest) ApplyUpstreamExtras(req *rosetta.ChatRequest, protoco
 		}
 	case "openai-responses":
 		extra := map[string]any{}
-		if len(a.ToolChoice) > 0 {
-			extra["tool_choice"] = json.RawMessage(a.ToolChoice)
+		if tc := a.effectiveToolChoice(); len(tc) > 0 {
+			extra["tool_choice"] = json.RawMessage(tc)
 		}
 		// text 是 {"format": {...}} 的外壳，所以这里要**拆开**再放回 format。
 		//
@@ -675,6 +865,19 @@ func (a *ResponsesRequest) ApplyUpstreamExtras(req *rosetta.ChatRequest, protoco
 			mergeExtra(req, extra)
 		}
 	}
+}
+
+// effectiveToolChoice 返回本次 attempt 该用的 tool_choice 原值。
+//
+// ToRosetta 是逐 attempt 调用的工厂，展平与 tool_choice 重写都在里面发生；
+// ApplyUpstreamExtras 在同一个 attempt 里紧随其后执行，所以它读到的
+// flattenedToolChoice 一定对应**本 attempt 的那份**展平结果，不存在跨
+// attempt 串味（buildRosetta 不复用同一个实例，见 ingressRequest 的注释）。
+func (a *ResponsesRequest) effectiveToolChoice() json.RawMessage {
+	if len(a.flattenedToolChoice) > 0 {
+		return a.flattenedToolChoice
+	}
+	return a.ToolChoice
 }
 
 func (a *ResponsesRequest) textFormatMap() map[string]any {
