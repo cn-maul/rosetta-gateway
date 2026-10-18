@@ -2571,6 +2571,9 @@ func attemptStream(w http.ResponseWriter, r *http.Request, client *rosetta.Clien
 	upstreamReq.Model = cand.UpstreamModel.ModelID
 	ing.applyUpstreamExtras(upstreamReq, cand.Provider.Protocol)
 	ing.applyThinkingCapability(upstreamReq, cand.UpstreamModel, cand.Provider.Protocol)
+	// 剥掉目标协议回放不了的思考块（chat 全剥 / anthropic 剥无签名的），
+	// 否则 harness 回传 thinking 后的第二轮必然 400。详见 replay_gate.go。
+	applyReplayGate(upstreamReq, cand.Provider.Protocol)
 
 	// 首字预算只覆盖「等首个事件」这一段；建立连接那段交给 ResponseHeaderTimeout
 	// 与下面的总请求预算（2026-10-10 修复的 P2）。
@@ -2866,6 +2869,8 @@ func attemptNonStream(w http.ResponseWriter, r *http.Request, client *rosetta.Cl
 	upstreamReq.Model = cand.UpstreamModel.ModelID
 	ing.applyUpstreamExtras(upstreamReq, cand.Provider.Protocol)
 	ing.applyThinkingCapability(upstreamReq, cand.UpstreamModel, cand.Provider.Protocol)
+	// 与 attemptStream 同一刀，理由见 replay_gate.go。
+	applyReplayGate(upstreamReq, cand.Provider.Protocol)
 
 	// 绑定 r.Context() 而非 context.Background()：客户端断开时上游调用应随之取消，
 	// 否则断连请求会一直占用上游连接与配额直到超时（默认 120s）。
