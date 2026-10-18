@@ -194,7 +194,14 @@ jobs:
       # 前端单测此前不在任何 runner 里：tests/routeTrace.test.mjs 有真实断言
       # （转发轨迹解析、单价格式化），但 package.json 没有 test 脚本、
       # 本 job 也不调它 —— 改坏 parseRouteStep 只能等运行时才发现。
-      # 这里接进 CI，Node 26 的类型剥离直接跑 .ts import。
+      #
+      # 这里接进 CI。测试直接 import **.ts 源文件**（src/routeTrace.ts、
+      # src/modelPrice.ts），所以跑它必须开类型剥离 —— 否则报
+      # ERR_UNKNOWN_FILE_EXTENSION。该能力在 22.6.0 引入、22.18+ 才默认开启，
+      # 而本 job 的 Node 固定在 22.12（见上面 setup-node 的注释），恰好落在
+      # 「有但默认关」的区间，必须显式加 --experimental-strip-types。
+      # 第一版就是漏了它：本地 Node 26 默认开启于是全绿，CI 上直接红。
+      # flag 写在 package.json 的 test 脚本里，本地与 CI 走同一条命令。
       - name: 前端单测
         run: npm test
 
