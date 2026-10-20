@@ -489,6 +489,12 @@ resolve(model):
 | 其余 | `Authorization: Bearer <会话令牌>`，查 users 表比对 `auth_version` |
 
 ```
+GET    /admin/api/networks                      出站网络（代理地址）清单；直连是保留 id
+                                               "direct"，不在此列表里（2026-10-20）
+POST   /admin/api/networks                      新建
+PATCH  /admin/api/networks/{id}
+DELETE /admin/api/networks/{id}                 引用它的上游回到直连（ON DELETE SET NULL），
+                                               **不删上游**
 GET    /admin/api/providers                     列表
 POST   /admin/api/providers                     新建
 GET    /admin/api/providers/{id}                单个详情（编辑表单回显）
@@ -1265,7 +1271,8 @@ users 表 + 会话一条通道后，管理员只是一个 `role='admin'` 的普�
         "name": "DeepSeek 官方",
         "protocol": "auto",
         "endpoint": "https://api.deepseek.com/v1",
-        "proxy_url": "",
+        "proxy_url": "",   // 空 = 直连。非空则启动时按 URL 自动建出 networks 行
+                          // 并让这些上游引用它（同 URL 共用一条，见 internal/config）
         "credentials": [{ "label": "主号", "api_key_env": "DEEPSEEK_API_KEY" }],
         "models": ["deepseek-chat", "deepseek-reasoner"]
       }
@@ -1433,7 +1440,8 @@ vue-router 的 `insertMatcher` 按路径得分二分插入（`findInsertionIndex
 | `/models` | 可用模型 | 全体 | **只读**清单：`GET /admin/api/model-names` 按身份收窄后的模型名（普通用户 = 所属组白名单 ∩ 全部路由名）+ 输入/输出/缓存命中三项单价；`restricted=true` 时显式提示「已被分组收窄」。每张模型卡同时画**连通率曲线**（探测数据，2026-10-14 并表）。刻意不给勾选控件 —— 白名单的写入口在 `/keys`（只能收紧）与 `/groups`（管理员按组收紧），且**空清单一律解释为「一个模型都调不了」而非 ModelPicker 的「一个都不选 = 不限制」**（后者只属于配置态）。未配置的单价显示「未配置」并弱化，**不显示 0.00**（会被读成「确认免费」） |
 | `/wallet` | 钱包与充值 | 全体 | **按身份分两种形态的同一页**：管理员看到全站的用户消费汇总 + 全部充值流水 + 充值入口（没有消耗记录，明细在「用量统计」页）；普通用户看到自己的余额、按天消耗与充值记录。自改密码已迁到「设置」页（2026-10-13）。余额（`balance_cents`）在 `balance_unlimited` 时显示「不限」而非 0.00 元，为 0 时显式提示「余额已用尽，请联系管理员充值」，对应数据面真实的 402 |
 | `/users` | 用户与分组 | 全体 | 组件是 `AccessControl.vue`，三个页签：**用户**与**分组**（都是 `UsersGroups.vue`，由宿主按 tab 分发）、**访问密钥**（`Keys.vue`，原 `/keys` 页内容）。用户页含 CRUD、角色、启停、密码重置、**余额充值** —— `delta_cents` 是相对调整，填 100 是「加 100 元」而非「设为 100 元」，误操作不会清零；给不限额用户充值会把它切成有限额，界面上必须写明；admin 账号必须带初始密码。余额列区分「不限」与「0.00 元」。分组页含增删改、成员增删、**组级模型白名单** `PUT /admin/api/groups/{id}/models`。路由刻意**不带 `adminOnly`** —— 普通用户看得到这一项、进来落在密钥页签，后端按会话身份强制收窄每个操作的数据面 |
-| `/providers` | 上游与模型 | admin | 组件是 `Upstream.vue`，三个页签顺序即数据面配置链的顺序（上游 → 路由 → 归组）：**上游与模型**（`Providers.vue`，列表、协议/端点/**per-provider 代理 `proxy_url`**、余额查询配置、连通性测试、模型管理与批量改价）、**路由**（`Routes.vue`，公开名 → 有序上游链，PUT 整体换链）、**模型归组**（`ModelGroups.vue`，跨上游同名模型的统计身份，不影响转发）。原 `/routes`、`/model-groups` 已并入本页 |
+| `/networks` | 出站网络 | admin | 组件是 `Networks.vue`：可复用的代理地址清单（2026-10-20）。provider 只存 `network_id`，实际地址由读路径 JOIN 派生。直连是保留 id `direct`，不是一行记录。删网络让引用它的上游回到直连，不删上游 |
+| `/providers` | 上游与模型 | admin | 组件是 `Upstream.vue`，三个页签顺序即数据面配置链的顺序（上游 → 路由 → 归组）：**上游与模型**（`Providers.vue`，列表、协议/端点、**出站网络下拉（引用 `/networks`，默认直连）**、余额查询配置、连通性测试、模型管理与批量改价）、**路由**（`Routes.vue`，公开名 → 有序上游链，PUT 整体换链）、**模型归组**（`ModelGroups.vue`，跨上游同名模型的统计身份，不影响转发）。原 `/routes`、`/model-groups` 已并入本页 |
 | `/settings` | 设置 | admin | 五个页签：模型默认、运行时、模型价格、修改密码、导入导出（§13.3）。**审计日志页签已移除**（用户要求）—— 后端 `GET /admin/api/audit` 端点与 `api.ts` 的 `api.audit()` 都保留，那是运维取证的正路，删的只是界面那一块 |
 
 「用量看板」不是独立页 —— 按天 / 按 Key / 按模型 / 按 provider 的汇总以

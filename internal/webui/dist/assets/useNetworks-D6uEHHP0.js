@@ -1,0 +1,1 @@
+import{$ as e,n as t}from"./api-C_zxyA-W.js";var n=`direct`,r=e([]),i=e(!1),a=e(!1);function o(){async function e(e=!1){if(!a.value&&(!i.value||e)){a.value=!0;try{r.value=await t.networks(),i.value=!0}catch{r.value=[]}finally{a.value=!1}}}async function o(){i.value=!1,await e(!0)}return{networks:r,loading:a,load:e,reload:o,NETWORK_DIRECT_ID:n}}export{o as n,n as t};
