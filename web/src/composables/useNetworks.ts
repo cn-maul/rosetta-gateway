@@ -19,34 +19,37 @@ export const NETWORK_DIRECT_ID = 'direct'
 // 模块级单例：两个表单是同一份数据的两个视图，各自查一次网络清单
 // 只会多打两次同样的请求，且两份数据可能不同步。
 const networks = ref<Network[]>([])
-const loaded = ref(false)
 const loading = ref(false)
+let loadSeq = 0
 
 export function useNetworks() {
-  async function load(force = false) {
-    if (loading.value) return
-    // 增量场景（新建了一个网络之后）必须能刷新，所以留 force；
-    // 但已经加载过就不重复请求 —— 网络清单几乎不变，而两个表单各查一次
-    // 是纯粹的浪费。
-    if (loaded.value && !force) return
+  /**
+   * 重新读取网络清单。
+   *
+   * 这里刻意**不做跨页面永久缓存**：网络可以在「出站网络」页、另一个
+   * 浏览器标签页或别的管理员会话里新增，缓存住首份快照会让上游表单的
+   * 下拉永久停在旧列表上。清单只有几行，进入页面和打开表单时各查一次
+   * 远比拿到一份过期选项便宜。
+   *
+   * loadSeq 只负责防止并发请求乱序：先发的旧请求晚返回时不能覆盖后发的
+   * 新结果。
+   */
+  async function load(): Promise<string | null> {
+    const seq = ++loadSeq
     loading.value = true
     try {
-      networks.value = await api.networks()
-      loaded.value = true
-    } catch {
-      // 读失败不抛：下拉退化成「只有直连」，用户仍能建上游 ——
-      // 而一个读不到网络清单就让「新建上游」整体不可用，是把一个次要
-      // 功能失败升级成主流程阻塞。
-      networks.value = []
+      const result = await api.networks()
+      if (seq === loadSeq) networks.value = result
+      return null
+    } catch (e) {
+      // 下拉场景不该被清单读取失败阻塞（退化成「只有直连」即可）；但管理页
+      // 需要把错误显示出来。统一返回错误文案，由调用方决定是否呈现。
+      if (seq === loadSeq) networks.value = []
+      return e instanceof Error ? e.message : String(e)
     } finally {
-      loading.value = false
+      if (seq === loadSeq) loading.value = false
     }
   }
 
-  async function reload() {
-    loaded.value = false
-    await load(true)
-  }
-
-  return { networks, loading, load, reload, NETWORK_DIRECT_ID }
+  return { networks, loading, load, reload: load, NETWORK_DIRECT_ID }
 }

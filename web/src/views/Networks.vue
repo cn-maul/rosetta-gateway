@@ -30,30 +30,27 @@ import { toast, confirmBox } from '../ui'
 import AppModal from '../components/AppModal.vue'
 import DataTable from '../components/DataTable.vue'
 import type { Network } from '../types'
+import { useNetworks } from '../composables/useNetworks'
 
 const err = ref('')
-const loading = ref(true)
-const networks = ref<Network[]>([])
+const { networks, loading, load } = useNetworks()
+// 首次进入时 useNetworks 默认是空闲态；管理页一进来就要显示加载态，
+// 失败时空态也不能被误读成「确实没有网络」。
+loading.value = true
 
 /** 401 由 api 层统一处理（清令牌 + 跳登录），这里不再提示。 */
 function is401(e: unknown): boolean {
   return (e as { status?: number }).status === 401
 }
 
-async function load() {
-  loading.value = true
+async function loadWithError() {
   err.value = ''
-  try {
-    networks.value = await api.networks()
-  } catch (e) {
-    if (is401(e)) return
-    err.value = '加载网络失败：' + (e as Error).message
-    toast('加载网络失败：' + (e as Error).message, 'err')
-  } finally {
-    loading.value = false
-  }
+  const message = await load()
+  if (!message) return
+  err.value = '加载网络失败：' + message
+  toast('加载网络失败：' + message, 'err')
 }
-onMounted(load)
+onMounted(loadWithError)
 
 // ---------- 建 / 改 ----------
 
@@ -102,7 +99,7 @@ async function submit() {
       toast('网络已创建')
     }
     nForm.open = false
-    await load()
+    await loadWithError()
   } catch (e) {
     if (!is401(e)) toast('保存失败：' + (e as Error).message, 'err')
   } finally {
@@ -125,7 +122,7 @@ async function remove(n: Network) {
   try {
     await api.deleteNetwork(n.id)
     toast('网络已删除')
-    await load()
+    await loadWithError()
   } catch (e) {
     if (!is401(e)) toast('删除失败：' + (e as Error).message, 'err')
   }
@@ -145,7 +142,7 @@ const rows = computed(() => networks.value)
         <div class="sub">可复用的代理地址清单：填一次，各上游从下拉里选 · 新建上游默认直连</div>
       </div>
       <div class="head-actions">
-        <button class="btn" :disabled="loading" @click="load">刷新</button>
+        <button class="btn" :disabled="loading" @click="loadWithError">刷新</button>
         <button class="btn btn-primary" @click="openCreate">新建网络</button>
       </div>
     </div>
@@ -161,7 +158,7 @@ const rows = computed(() => networks.value)
       <span class="dim">不经过代理（读进程环境变量里的 <code>HTTP_PROXY</code> / <code>HTTPS_PROXY</code>）—— 保留选项，不是可编辑的网络。</span>
     </div>
 
-    <DataTable class="panel" label="网络列表" :loading="loading" :error="err" :has-data="!!rows.length" :empty="!rows.length" @retry="load">
+    <DataTable class="panel" label="网络列表" :loading="loading" :error="err" :has-data="!!rows.length" :empty="!rows.length" @retry="loadWithError">
       <template #empty>
         <template v-if="!rows.length">还没有自建网络 —— 全部上游走「直连」即可。需要代理时点上方「新建网络」。</template>
       </template>
