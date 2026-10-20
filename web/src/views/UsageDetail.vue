@@ -109,7 +109,15 @@ const parsedTrace = computed(() => parseRouteTrace(selected.value?.route_trace))
 function duration(h: UsageHistoryEntry) {
   const first = h.ttfb_ms > 0 ? fmtSec(h.ttfb_ms) + 's' : '—'
   const total = h.latency_ms > 0 ? fmtSec(h.latency_ms) + 's' : '—'
-  return first + ' / ' + total
+  return first + '/' + total
+}
+
+/**
+ * 速度格：tps = 0 表示没有可计算样本（上游未报 usage / 错误请求），
+ * 不是「速度为零」。所以显示 —，不能把 0 直接印出来。
+ */
+function speedText(h: UsageHistoryEntry): string {
+  return h.tps > 0 ? fmtSpeed(h.tps) : '—'
 }
 const exporting = ref(false)
 const exportNotice = ref('')
@@ -143,13 +151,14 @@ async function exportCSV() {
     <p v-if="exportNotice" class="notice-warn" role="alert">{{ exportNotice }}</p>
     <DataTable class="panel table-panel" label="请求日志" :loading="loading" :error="err ? err + (rows.length ? '（近 ' + loadedDays + ' 天，第 ' + loadedPage + ' 页）' : '') : ''" :has-data="!!rows.length" :empty="!rows.length" empty-text="当前条件下没有调用记录" loading-text="正在加载请求日志…" @retry="load">
         <table class="tbl logs-table">
-          <thead><tr><th>时间</th><th>状态</th><th>调用模型 / 实际模型</th><th class="key-column">调用密钥</th><th class="num-h usage-column">Tokens / 费用</th><th class="num-h timing-column">首字 / 总耗时</th><th>详情</th></tr></thead>
+          <thead><tr><th>时间</th><th>状态</th><th>调用模型 / 实际模型</th><th class="key-column">调用密钥</th><th class="num-h usage-column">Tokens / 费用</th><th class="num-h speed-column">速度(t/s)</th><th class="num-h timing-column">首字 / 总耗时</th><th>详情</th></tr></thead>
           <tbody><tr v-for="(h, i) in rows" :key="h.ts + ':' + i">
             <td class="mono time-column">{{ fmtTimeMs(h.ts) }}</td>
             <td><button class="status-button" :aria-label="'查看' + statusLabel(h.status) + '请求详情'" @click="selected = h"><span class="badge" :class="statusBadge(h.status)">{{ statusLabel(h.status) }}</span></button></td>
-            <td class="model-column"><div class="mobile-log-time dim">{{ fmtTimeMs(h.ts) }}</div><button class="text-link mono model-name" @click="selected = h">{{ h.public_model || '—' }}</button><div class="sub-line mono dim">{{ h.upstream_model || '实际模型未记录' }}</div></td>
-            <td class="key-column"><div class="key-name">{{ h.key_name || h.key_id || '—' }}</div><span class="sub-line dim">{{ h.stream ? '流式' : '非流式' }}</span></td>
-            <td class="num usage-column">{{ fmtTokens(h.total_tokens) }}<div class="sub-line dim">¥{{ fmtMoney(h.cost) }}</div></td>
+            <td class="model-column"><span class="mobile-log-time dim">{{ fmtTimeMs(h.ts) }}</span><button class="text-link mono model-name" @click="selected = h">{{ h.public_model || '—' }}</button><span class="cell-meta mono" :title="h.upstream_model || '实际模型未记录'"> / {{ h.upstream_model || '实际模型未记录' }}</span></td>
+            <td class="key-column"><span class="key-name" :title="h.key_name || h.key_id || '—'">{{ h.key_name || h.key_id || '—' }}</span><span class="cell-meta"> · {{ h.stream ? '流式' : '非流式' }}</span></td>
+            <td class="num usage-column">{{ fmtTokens(h.total_tokens) }}<span class="cell-meta"> · ¥{{ fmtMoney(h.cost) }}</span></td>
+            <td class="num speed-column">{{ speedText(h) }}</td>
             <td class="num timing-column">{{ duration(h) }}</td>
             <td><button class="btn btn-act" :aria-label="'查看 ' + (h.public_model || '请求') + ' 详情'" @click="selected = h">详情</button></td>
           </tr></tbody>
@@ -201,12 +210,20 @@ async function exportCSV() {
 .log-toolbar { margin-bottom: 16px; }
 .log-actions, .request-heading { display: flex; justify-content: space-between; align-items: center; gap: 12px; flex-wrap: wrap; font-size: 12px; margin-bottom: 16px; }
 .w-auto { width: auto; }
-.logs-table { min-width: 890px; }
+.logs-table { min-width: 980px; }
+.logs-table th, .logs-table td { white-space: nowrap; }
+/* 请求日志是逐条扫描为主，行密度优先。全局 .table-panel td 给 16px
+   上下内边距是按「每格有副标题」的形态定的；本表已把副标题折进主行，
+   仍沿用会让每行 ~60px，一屏少看近一半记录。 */
+.logs-table td { padding-top: 6px; padding-bottom: 6px; vertical-align: middle; }
 .mobile-log-time { display: none; }
-.logs-table .time-column { width: 135px; white-space: normal; line-height: 1.8; }
-.model-column { min-width: 200px; max-width: 300px; overflow-wrap: anywhere; }
-.model-name { text-align: left; font-weight: 600; overflow-wrap: anywhere; }
-.key-name { max-width: 160px; overflow-wrap: anywhere; }
+.logs-table .time-column { width: 142px; white-space: nowrap; }
+.model-column { min-width: 0; max-width: 360px; }
+.model-name { text-align: left; font-weight: 600; overflow-wrap: normal; }
+.key-name { max-width: 160px; overflow: hidden; text-overflow: ellipsis; display: inline-block; vertical-align: bottom; }
+.cell-meta { color: var(--muted); font-size: 12px; overflow: hidden; text-overflow: ellipsis; display: inline-block; max-width: 190px; vertical-align: bottom; }
+.speed-column { width: 86px; }
+.timing-column { width: 112px; }
 .status-button { border: 0; background: transparent; padding: 0; cursor: pointer; }
 .request-facts { margin: 20px 0; }
 .request-facts > div { display: grid; grid-template-columns: 120px minmax(0, 1fr); gap: 16px; padding: 12px 0; border-bottom: 1px solid var(--border); }
@@ -229,14 +246,15 @@ async function exportCSV() {
 .trace-raw code { display: block; margin-top: 6px; }
 .error-detail { white-space: pre-wrap; overflow-wrap: anywhere; border-radius: 10px; padding: 14px; font-size: 12px; line-height: 1.7; background: var(--danger-soft); color: var(--danger-soft-foreground); }
 .notice-warn { margin: 12px 0; padding: 12px; display: flex; flex-wrap: wrap; align-items: center; gap: 12px; border-radius: 10px; background: var(--warning-soft); color: var(--warning-soft-foreground); font-size: 12px; }
-@media (max-width: 1100px) { .logs-table { min-width: 760px; } .key-column { display: none; } }
+@media (max-width: 1100px) { .logs-table { min-width: 850px; } .key-column { display: none; } }
 @media (max-width: 640px) {
   .logs-table { min-width: 0; table-layout: fixed; }
-  .usage-column, .timing-column { display: none; }
+  .usage-column, .speed-column, .timing-column { display: none; }
   .logs-table th:first-child, .logs-table .time-column, .logs-table th:last-child, .logs-table td:last-child { display: none; }
   .logs-table th:nth-child(2), .logs-table td:nth-child(2) { width: 76px; }
   .model-column { min-width: 0; max-width: none; }
-  .mobile-log-time { display: block; font-size: 11px; margin-bottom: 8px; }
+  .mobile-log-time { display: block; font-size: 11px; margin-bottom: 3px; }
+  .logs-table .model-column { white-space: normal; }
   .logs-table .mono { white-space: normal; overflow-wrap: anywhere; }
   .log-actions > .head-actions { flex-wrap: wrap; }
   .request-facts > div { grid-template-columns: 90px minmax(0, 1fr); gap: 10px; }
