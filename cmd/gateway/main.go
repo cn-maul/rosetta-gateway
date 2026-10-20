@@ -320,6 +320,9 @@ func main() {
 	}
 
 	providerHandler := admin.NewProviderHandler(db, masterKey, cfg)
+	// 出站网络（代理地址的共享清单）。provider 的下拉从它取值，
+	// 管理入口与 provider 同级 —— 见 admin/network_handler.go 的注释。
+	networkHandler := admin.NewNetworkHandler(db)
 	credentialHandler := admin.NewCredentialHandler(db, masterKey)
 	modelHandler := admin.NewModelHandler(db, masterKey, cfg)
 	modelGroupHandler := admin.NewModelGroupHandler(db)
@@ -379,6 +382,12 @@ func main() {
 	adminMux.HandleFunc("PATCH /admin/api/providers/{id}", func(w http.ResponseWriter, r *http.Request) { providerHandler.Update(w, r, r.PathValue("id")) })
 	adminMux.HandleFunc("DELETE /admin/api/providers/{id}", func(w http.ResponseWriter, r *http.Request) { providerHandler.Delete(w, r, r.PathValue("id")) })
 	adminMux.HandleFunc("POST /admin/api/providers/{id}/test", func(w http.ResponseWriter, r *http.Request) { providerHandler.Test(w, r, r.PathValue("id")) })
+	// 出站网络（2026-10-20）：代理地址的共享清单。直连不是一条记录，
+	// 而是保留 id store.NetworkDirectID，不在此处出现。
+	adminMux.HandleFunc("GET /admin/api/networks", networkHandler.List)
+	adminMux.HandleFunc("POST /admin/api/networks", networkHandler.Create)
+	adminMux.HandleFunc("PATCH /admin/api/networks/{id}", func(w http.ResponseWriter, r *http.Request) { networkHandler.Update(w, r, r.PathValue("id")) })
+	adminMux.HandleFunc("DELETE /admin/api/networks/{id}", func(w http.ResponseWriter, r *http.Request) { networkHandler.Delete(w, r, r.PathValue("id")) })
 	// 上游余额查询：逐条凭据打上游的余额端点（见 internal/upstream/balance.go）。
 	// 纯读操作，不改任何配置，因此不触发 AutoReload（挂 reload 的写操作判据
 	// 看的是方法/路径白名单，这里是 POST 却明确不参与，理由见 handler 注释）。
@@ -1094,8 +1103,27 @@ func bootstrapDB(db *store.Store, cfg *config.Config, logger *slog.Logger, maste
 	// 记录 provider slug + 上游模型名 -> 实际写入 upstream_models.id 的映射。
 	// routes.upstream_model_id 是外键，必须引用真实主键，不能自行拼接。
 	modelIDByKey := make(map[string]string)
+	// bootstrap 的代理地址 → networks.id。一条配置里的多个上游可能共用
+	// 同一个代理，所以按 URL 归并成**一条**网络，而不是每个上游建一条
+	// 同名（会被 UNIQUE(name) 拒）或各写一份（回到本次改造前的老问题）。
+	networkByURL := make(map[string]string)
 
 	for _, bp := range cfg.Bootstrap.Providers {
+		// 先解析网络再建 provider：providers.network_id 是 FK，指向的行
+		// 必须在它之前存在。
+		networkID := ""
+		if proxyURL := strings.TrimSpace(bp.ProxyURL); proxyURL != "" {
+			id, ok := networkByURL[proxyURL]
+			if !ok {
+				id = "net-" + generateID()
+				if err := db.CreateNetwork(ctx, &store.Network{ID: id, Name: proxyURL, ProxyURL: proxyURL}); err != nil {
+					logger.Error("bootstrap: create network failed", "proxy_url", proxyURL, "error", err)
+					continue
+				}
+				networkByURL[proxyURL] = id
+			}
+			networkID = id
+		}
 		p := &store.Provider{
 			ID:         bp.Slug,
 			Slug:       bp.Slug,
@@ -1104,6 +1132,7 @@ func bootstrapDB(db *store.Store, cfg *config.Config, logger *slog.Logger, maste
 			Endpoint:   bp.Endpoint,
 			Enabled:    true,
 			MaxRetries: cfg.Defaults.MaxRetries,
+			NetworkID:  networkID,
 		}
 		if err := db.CreateProvider(ctx, p); err != nil {
 			logger.Error("bootstrap: create provider failed", "slug", bp.Slug, "error", err)
