@@ -80,7 +80,7 @@ func TestAnthropicSink_MultiPartToolArgsStayInOneBlock(t *testing.T) {
 
 func TestResponsesSink_MultiPartToolArgsStayInOneItem(t *testing.T) {
 	var sb strings.Builder
-	s := NewResponsesSSE(nopWriter{&sb}, nopWriter{&sb}, "resp_1", "m1")
+	s := NewResponsesSSE(nopWriter{&sb}, nopWriter{&sb}, "resp_1", "m1", nil)
 
 	s.Event(&rosetta.Event{Type: rosetta.EventToolCall, ToolIndex: 0, ToolID: "call_1", ToolName: "f"})
 	s.Event(&rosetta.Event{Type: rosetta.EventToolCall, ToolIndex: 0, ArgumentsDelta: `{"a":`})

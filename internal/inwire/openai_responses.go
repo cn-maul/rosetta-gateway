@@ -63,6 +63,22 @@ type ResponsesRequest struct {
 	// nil = 未重写过，沿用 ToolChoice 原值。
 	flattenedToolChoice json.RawMessage `json:"-"`
 
+	// downgradedTools 记录被降级成 function 的工具：工具名 → 原生类型
+	// （"custom" / "local_shell"）。出站据此把模型对它的调用还原成
+	// custom_tool_call / local_shell_call，否则 Codex 收到的是一个
+	// 它不认识的普通 function_call（参数还套着 JSON 外壳），执行器
+	// 找不到对应的实现。
+	//
+	// 只记降级过的：普通 function 不进表，出站零开销地走原路径。
+	//
+	// 在 **decode** 阶段算好（而不是 ToRosetta 里）：出站的 sink 与
+	// 非流式编码器在第一次 attempt 之前就被构造好，那一刻还没人调过
+	// ToRosetta，于是表必须是 nil —— 而 nil 表会让所有降级工具以普通
+	// function_call 的形态发出去，Codex 按 item.type 分派时找不到自己的
+	// 执行器。这个映射只由 tools 的字面内容决定，与目标上游无关，因此
+	// 「每个 attempt 重算」没有理由，decode 时算一次即可。
+	downgradedTools map[string]string `json:"-"`
+
 	// RawEffort 是 reasoning.effort 的原样取值（与 OpenAIChatRequest.RawEffort
 	// 同义）：数据面要在 ToRosetta 之后按目标模型支持的档位做夹取，需要的是
 	// 归一到三档**之前**的那一档。空串 = 请求没提 effort。
@@ -80,6 +96,11 @@ type ResponsesTool struct {
 	// Tools 是 namespace 形态的内层工具表。namespace 本身不是可调用工具，
 	// 它只是把一组工具打包、用检索代替全量声明；见 flattenNamespaceTools。
 	Tools []ResponsesTool `json:"tools,omitempty"`
+
+	// Format 是 custom 工具的语法声明（{"type":"text"} 等）。本网关把
+	// custom 降级成「接受一个字符串参数的 function」，所以只记下它存在，
+	// 不解释其内容 —— 未知形态也不该让请求失败，见 validateResponsesTool。
+	Format json.RawMessage `json:"format,omitempty"`
 }
 
 type responsesItem struct {
@@ -93,6 +114,16 @@ type responsesItem struct {
 	Output    json.RawMessage `json:"output,omitempty"` // function_call_output
 
 	ID string `json:"id,omitempty"` // item_reference
+
+	// Input 是 custom_tool_call 的自由文本入参（与 function_call 的
+	// arguments 字符串是同一个位置上的两种形态：前者是无 schema 的裸文本，
+	// 后者是 JSON 字符串）。
+	Input string `json:"input,omitempty"`
+
+	// Action 是 local_shell_call 的调用动作（{"type":"exec","command":[…]}）。
+	// 与 Input 分开建模：两者是不同 item 类型的不同字段，共用一个结构体
+	// 时只能并列声明。
+	Action json.RawMessage `json:"action,omitempty"`
 
 	// reasoning item 的续接载体。EncryptedContent 是 OpenAI 要求原样回传的
 	// 不透明载荷；Summary 是它在 Responses 上的可读文本。ID 是 item 自身的
@@ -122,15 +153,31 @@ type responsesContentPart struct {
 
 // responsesSupportedItemTypes 是 input 数组里能代理到上游的 item 类型。
 //
-// 内建工具调用（web_search_call / file_search_call / code_interpreter_call …）
-// **不在其中**：它们由 OpenAI 服务端执行，结果不是可转译的消息内容，
-// 任何第三方上游都无法承接。客户端应改用 function tool 自己实现。
+// 两类不在其中，各有明确理由：
+//
+//   - **服务端内建工具**（web_search_call / file_search_call /
+//     code_interpreter_call …）：它们由 OpenAI **服务端**执行，结果不是
+//     可转译的消息内容，任何第三方上游都无法承接。客户端应改用
+//     function tool 自己实现。
+//   - reasoning 之外的 thinking 变体（部分客户端的私有形态）：无法验证
+//     续接语义，宁可明确失败也不猜。
+//
+// Codex 的一族在这里全部放行（local_shell_call / custom_tool_call …）：
+// 它们的执行方始终是**客户端自己**，与 web_search 相反，第三方上游只需
+// 看到「模型想调用某个工具」即可，转译成普通工具调用/结果即可承接。
 var responsesSupportedItemTypes = map[string]bool{
 	"":                     true, // type 缺失的裸 {role, content} 简写
 	"message":              true,
 	"function_call":        true,
 	"function_call_output": true,
 	"reasoning":            true,
+	// Codex 的 local_shell：客户端执行 shell，网关转成 function_call /
+	// function_call_output 走同一套。
+	"local_shell_call":        true,
+	"local_shell_call_output": true,
+	// Codex 的 custom（自由文本工具，如 apply_patch / exec）。
+	"custom_tool_call":        true,
+	"custom_tool_call_output": true,
 }
 
 // validateResponsesInputItems 检查 input 数组里的 item 类型是否可代理。
@@ -181,6 +228,26 @@ func validateResponsesTool(t ResponsesTool, path string) error {
 		if t.Name == "" {
 			return fmt.Errorf("%s: function tool requires name", path)
 		}
+		return nil
+	case "custom":
+		// Codex 的自由文本工具（apply_patch / exec 等）。它没有 parameters，
+		// 入参是一段原始文本，所以降级成「接受一个字符串参数的 function」。
+		// 必须有名字：展平成 function 后名字就是模型唯一的调用凭据。
+		if t.Name == "" {
+			return fmt.Errorf("%s: custom tool requires name", path)
+		}
+		return nil
+	case "local_shell":
+		// Codex 的本地 shell 工具。同理降级成一个 function，参数是
+		// {"command":["…"]}（exec 形态）与 timeout_ms。
+		//
+		// # 为什么放行
+		//
+		// 它与 web_search 不同：web_search 由 OpenAI **服务端**执行，第三方
+		// 上游无法承接；而 local_shell 的执行方始终是客户端自己 —— 网关只需
+		// 把「模型想跑 shell」这件事表达成上游认识的工具调用形状。此前把它
+		// 当内建工具 400 掉，整条 Codex 接入路径就断了（用户实测：其他
+		// 编程工具都能用，只有 Codex 起不来）。
 		return nil
 	case "namespace":
 		// namespace 自身不可调用，但它需要名字：展平时用名字当前缀，
@@ -255,6 +322,9 @@ func DecodeResponsesRequest(r *http.Request, maxBytes int64) (*ResponsesRequest,
 			return nil, err
 		}
 	}
+	// 降级表在这里就建好（而不是 ToRosetta 里）：出站的 sink 与非流式编码器
+	// 在第一次 attempt 之前构造，那一刻还没人调过 ToRosetta。
+	req.downgradedTools = responsesDowngradedTools(req.Tools)
 	if len(req.ToolChoice) > 0 {
 		var s string
 		if json.Unmarshal(req.ToolChoice, &s) != nil {
@@ -277,7 +347,8 @@ func DecodeResponsesRequest(r *http.Request, maxBytes int64) (*ResponsesRequest,
 	return &req, nil
 }
 
-// flattenNamespaceTools 把 namespace 形态的工具表展平成平级 function。
+// flattenNamespaceTools 把 namespace 形态的工具表展平成平级 function，
+// 并把 Codex 的两种内建调用工具降级成上游认识的 function。
 //
 // # 展平规则
 //
@@ -310,8 +381,9 @@ func flattenNamespaceTools(in []ResponsesTool) []rosetta.ToolDefinition {
 	seen := make(map[string]bool, len(in))
 	for _, t := range in {
 		if t.Type != "namespace" {
-			tools = append(tools, responsesToolDefinition(t.Name, t.Description, t.Parameters))
-			seen[t.Name] = true
+			def, name := responsesPlainTool(t)
+			tools = append(tools, def)
+			seen[name] = true
 			continue
 		}
 		for _, inner := range t.Tools {
@@ -332,11 +404,159 @@ func flattenNamespaceTools(in []ResponsesTool) []rosetta.ToolDefinition {
 	return tools
 }
 
+// responsesPlainTool 把一条非 namespace 的工具项变成 function 定义，
+// 并返回它在工具表里的最终名字。
+//
+// 三种情形：
+//
+//   - function：原样通过，名字就是客户端给的名字。
+//   - custom（Codex 的自由文本工具，如 apply_patch）：降级成一个接受
+//     **单个字符串参数** 的 function，参数名固定为 "input"。这是
+//     OpenAI 自己描述 freeform 工具的等价形态，也是 new-api 等网关的
+//     通行做法：上游协议里没有「无 schema 的自由文本参数」这个概念，
+//     把它包装成单字符串参数是唯一既不失真又能被模型调用的表达。
+//   - local_shell（Codex 的本地 shell）：降级成一个接受
+//     {"command": ["…"], "timeout_ms": 毫秒} 的 function。
+//
+// # 为什么不静默丢弃这些工具
+//
+// 丢弃的后果不是「少一个功能」，而是模型**看不到 shell 工具**却仍被要求
+// 干活，于是改用文本解释「你应该运行 ls」——用户看到的是一台不会用工具的
+// 模型。降级有损（自由文本被套上 JSON 外壳），但对话仍然成立。
+func responsesPlainTool(t ResponsesTool) (rosetta.ToolDefinition, string) {
+	switch t.Type {
+	case "custom":
+		desc := t.Description
+		if desc == "" {
+			desc = "Send a freeform text input."
+		}
+		// 说明参数形态。客户端写的 description 面向的是懂它的模型，
+		// 而降级后的参数名 "input" 是本网关起的名字，不说的话模型只能靠猜。
+		desc += " Provide the raw text as the value of the \"input\" argument."
+		return responsesToolDefinition(t.Name, desc, customToolParameters()), t.Name
+
+	case "local_shell":
+		// Codex 用这个名字声明它的 shell 工具，展平后必须沿用：
+		// 客户端按名字把自己的工具实现与模型的调用对上。
+		return responsesToolDefinition(localShellToolName,
+			"Run a shell command on the client and return its output. "+
+				"Provide the full command line as a single-element \"command\" array.",
+			localShellToolParameters()), localShellToolName
+
+	default:
+		return responsesToolDefinition(t.Name, t.Description, t.Parameters), t.Name
+	}
+}
+
+// customToolParameters 是 custom 工具降级后的参数 schema：单个字符串。
+func customToolParameters() json.RawMessage {
+	return json.RawMessage(`{"type":"object","properties":{"input":{"type":"string","description":` +
+		`"The raw freeform input for this tool."}},"required":["input"]}`)
+}
+
+// localShellToolParameters 是 local_shell 降级后的参数 schema。
+//
+// command 用数组而非字符串：Codex 自己的 local_shell_call 用
+// {"type":"exec","command":["ls","-la"]} 的数组形态，参数 schema 与实际
+// 调用形态对齐，模型少一次形态转换，出的 JSON 也更稳。
+func localShellToolParameters() json.RawMessage {
+	return json.RawMessage(`{"type":"object","properties":{"command":{"type":"array",` +
+		`"items":{"type":"string"},"description":"The command and its arguments."},` +
+		`"timeout_ms":{"type":"number","description":"Optional timeout in milliseconds."}},` +
+		`"required":["command"]}`)
+}
+
+// localShellToolName 是 local_shell 降级后在工具表里的名字。
+//
+// 必须与客户端自己声明的 shell 工具名一致才有意义 —— 但客户端并没有给
+// local_shell 起名字（它是 Responses 的内建类型，{"type":"local_shell"}
+// 就是全部声明）。所以名字由本网关定；Codex 侧按响应里的 name 找到自己的
+// shell 实现。
+const localShellToolName = "local_shell"
+
+// customToolInputArg 是 custom 工具降级后的参数名。写成一个常量是因为
+// schema 与历史回放两处必须用同一个值。
+const customToolInputArg = "input"
+
+// responsesLocalShellArgs 把 local_shell_call 的 action 对象转成降级工具
+// 的参数 JSON。
+//
+// action 的形态是 {"type":"exec","command":["ls","-la"],"timeout_ms":5000}，
+// 与降级后 schema 的属性名一一对应，所以只需剥掉 "type" 判别字段。
+// 解析不出来时返回 "{}"：一个空参数的 tool_call 仍是合法历史（模型能看到
+// 「这里调过 shell」），而空字符串会让 rosetta validate 拒掉整个请求。
+func responsesLocalShellArgs(action json.RawMessage) string {
+	if len(action) == 0 {
+		return "{}"
+	}
+	var obj map[string]any
+	if json.Unmarshal(action, &obj) != nil {
+		return "{}"
+	}
+	delete(obj, "type")
+	if len(obj) == 0 {
+		return "{}"
+	}
+	out, err := json.Marshal(obj)
+	if err != nil {
+		return "{}"
+	}
+	return string(out)
+}
+
+// responsesCustomToolArgs 把 custom_tool_call 的裸文本包成降级工具的参数。
+//
+// 与 responsesLocalShellArgs 同一个道理：降级后的 schema 声明了
+// {"input": "…"}，历史回放就必须用同一形状，否则模型看到上一轮传的是
+// 字符串、这一轮工具要对象。
+func responsesCustomToolArgs(input string) string {
+	if input == "" {
+		return "{}"
+	}
+	out, err := json.Marshal(map[string]any{customToolInputArg: input})
+	if err != nil {
+		return "{}"
+	}
+	return string(out)
+}
+
 func responsesToolDefinition(name, description string, params json.RawMessage) rosetta.ToolDefinition {
 	if len(params) == 0 {
 		params = json.RawMessage(`{}`)
 	}
 	return rosetta.ToolDefinition{Name: name, Description: description, Parameters: params}
+}
+
+// responsesDowngradedTools 收集被降级的工具名与其原生类型。
+//
+// 与 flattenNamespaceTools 走同一份输入、同一套命名规则，但只关心
+// 「哪些工具不是原生 function」。namespace 内的项已是 function，不进表。
+func responsesDowngradedTools(in []ResponsesTool) map[string]string {
+	var out map[string]string
+	for _, t := range in {
+		if t.Type == "custom" || t.Type == "local_shell" {
+			if out == nil {
+				out = make(map[string]string, len(in))
+			}
+			// 键必须是**展平后的名字**，与工具表里的名字一致 —— 出站按
+			// 模型返回的 name 反查这张表。local_shell 的声明里没有 name
+			// （{"type":"local_shell"} 就是全部），展平时才定下
+			// localShellToolName；用 t.Name 会把映射落到空串键上，
+			// 出站查不到，调用就以普通 function_call 的形态发出去。
+			_, name := responsesPlainTool(t)
+			out[name] = t.Type
+		}
+	}
+	return out
+}
+
+// DowngradedTools 返回被降级过的工具表（工具名 → 原生 Responses 类型
+// "custom" / "local_shell"），供出站还原 item 形态。
+//
+// 返回内部 map 而非副本：调用方（codec.Decode）只读一次填进
+// ingressRequest，之后不再改。
+func (a *ResponsesRequest) DowngradedTools() map[string]string {
+	return a.downgradedTools
 }
 
 // rewriteToolChoice 在 namespace 展平后重写 tool_choice。
@@ -459,6 +679,44 @@ func (a *ResponsesRequest) ToRosetta() *rosetta.ChatRequest {
 				Role:   rosetta.RoleAssistant,
 				Blocks: []rosetta.Block{rosetta.ToolCall(item.CallID, item.Name, args)},
 			})
+		case "local_shell_call":
+			// Codex 让模型直接发起 shell 调用。与 function_call 的区别只在
+			// 入参形态：local_shell_call 用 {"type":"exec","command":["…"]}
+			// 的 action 对象，而不是 {"command":[…]}。展平成与降级后的
+			// local_shell 工具（localShellToolParameters）完全一致的参数形状，
+			// 模型下一轮看到自己的工具 schema 与历史调用就能对上。
+			req.Messages = append(req.Messages, rosetta.Message{
+				Role:   rosetta.RoleAssistant,
+				Blocks: []rosetta.Block{rosetta.ToolCall(item.CallID, localShellToolName, responsesLocalShellArgs(item.Action))},
+			})
+		case "custom_tool_call":
+			// custom 工具降级成「接受一个 input 字符串参数的 function」，
+			// 所以回放历史时要把裸文本包成同一个外壳，否则上一轮模型看到
+			// 的是 freeform 文本、这一轮工具 schema 却要一个对象。
+			req.Messages = append(req.Messages, rosetta.Message{
+				Role: rosetta.RoleAssistant,
+				Blocks: []rosetta.Block{rosetta.ToolCall(item.CallID, item.Name,
+					responsesCustomToolArgs(item.Input))},
+			})
+		case "local_shell_call_output", "custom_tool_call_output":
+			// 与 function_call_output 同一条路径：客户端执行完工具，把结果
+			// 喂回来。三者的区别只在 output 的内部形态（local_shell 是
+			// {"stdout":…} 对象、custom 是裸文本），而 responsesItemToolOutput
+			// 对字符串与分块数组都处理，结构对象交给 JSON 兜底。
+			text, media := responsesItemToolOutput(item)
+			if text != "" || len(media) == 0 {
+				req.Messages = append(req.Messages, rosetta.ToolResult(item.CallID, "", text))
+			}
+			if len(media) > 0 {
+				blocks := append([]rosetta.Block{{
+					Type: rosetta.BlockText,
+					Text: responsesToolMediaNotice(len(media)),
+				}}, media...)
+				req.Messages = append(req.Messages, rosetta.Message{
+					Role: rosetta.RoleUser, Blocks: blocks,
+				})
+			}
+
 		case "function_call_output":
 			// 工具结果可能带**媒体块**（截图、PDF、音频）—— agent 的典型用法：
 			// 让模型读一张图、读一份文档、听一段录音。
@@ -673,6 +931,13 @@ func responsesItemToolOutput(item responsesItem) (string, []rosetta.Block) {
 	// 字符串形态：整体就是文本，没有媒体可拆。
 	if s, ok := plainContentText(item.Output); ok {
 		return s, nil
+	}
+	// local_shell_call_output 的形态是 {"stdout":"…","stderr":"…",
+	// "metadata":{"exit_code":0}} 这类结构对象：它没有分块数组，展平成
+	// JSON 文本喂给模型。若按分块数组解会得到空串，模型的工具结果就成了
+	// 「执行成功但没有输出」。
+	if len(item.Output) > 0 && item.Output[0] == '{' {
+		return string(item.Output), nil
 	}
 	var text strings.Builder
 	var media []rosetta.Block

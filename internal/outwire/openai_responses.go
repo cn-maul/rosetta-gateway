@@ -78,6 +78,18 @@ type ResponsesSSE struct {
 	toolIdx  int
 	toolArgs strings.Builder
 	fcSeq    int
+	// seq 是事件序号。Responses 协议里每个事件都带 sequence_number，
+	// 客户端（Codex CLI）用它检测丢帧与乱序；本网关此前不发，Codex 侧
+	// 只能退化成「按到达顺序处理」，中间丢一个事件也察觉不到。
+	// 从 0 开始（response.created 是第一个事件，序号 0），与 OpenAI 一致。
+	seq int
+
+	// downgraded 是入站降级过的工具：工具名 → 原生类型（"custom" /
+	// "local_shell"）。模型对它们的调用要还原成 custom_tool_call /
+	// local_shell_call，并把降级时套上的 JSON 外壳剥掉 ——
+	// Codex 拿到一个参数是 {"input":"…"} 的普通 function_call，
+	// 找不到自己的执行器。
+	downgraded map[string]string
 
 	wroteContent bool
 	sawTerminal  bool
@@ -85,8 +97,8 @@ type ResponsesSSE struct {
 	output []map[string]any
 }
 
-func NewResponsesSSE(w io.Writer, flusher http.Flusher, id, model string) *ResponsesSSE {
-	return &ResponsesSSE{w: w, flusher: flusher, id: id, model: model}
+func NewResponsesSSE(w io.Writer, flusher http.Flusher, id, model string, downgraded map[string]string) *ResponsesSSE {
+	return &ResponsesSSE{w: w, flusher: flusher, id: id, model: model, downgraded: downgraded}
 }
 
 // WithResponseWriter 绑定底层 ResponseWriter，用于设置单次写截止时间。
@@ -99,10 +111,19 @@ func (s *ResponsesSSE) WithResponseWriter(rw http.ResponseWriter) {
 	s.rw = rw
 }
 
+// WithDowngradedTools 接收入站降级过的工具表（见 BindDowngradedTools）。
+func (s *ResponsesSSE) WithDowngradedTools(tools map[string]string) {
+	s.downgraded = tools
+}
+
 func (s *ResponsesSSE) writeEvent(event string, payload map[string]any) {
 	setWriteDeadline(s.rw)
 	defer clearWriteDeadline(s.rw)
 	payload["type"] = event
+	// 序号在 payload 建好之后、序列化之前分配，且只由 writeEvent 一处
+	// 发放 —— 任何绕过它直接写的路径都拿不到序号，也就不会出现重号。
+	payload["sequence_number"] = s.seq
+	s.seq++
 	data, err := json.Marshal(payload)
 	if err != nil {
 		return
@@ -174,18 +195,85 @@ func (s *ResponsesSSE) closeTool() {
 	if strings.TrimSpace(args) == "" {
 		args = "{}"
 	}
-	s.writeEvent("response.function_call_arguments.done", map[string]any{
-		"item_id": s.id + "-fc-" + itoa(idx), "output_index": idx, "arguments": args,
-	})
-	item := map[string]any{
-		"type": "function_call", "id": s.id + "-fc-" + itoa(idx), "call_id": s.toolID,
-		"name": s.toolName, "arguments": args, "status": "completed",
+	// done 事件与 delta 用同一个判据：custom 走 custom_tool_call_input.done，
+	// 且载荷是裸文本而不是 JSON 字符串 —— 与 added / delta 同形，客户端
+	// 才能把三段拼成完整输入。
+	if s.downgraded[s.toolName] == "custom" {
+		s.writeEvent("response.custom_tool_call_input.done", map[string]any{
+			"item_id": s.id + "-fc-" + itoa(idx), "output_index": idx,
+			"input": unwrapCustomInput(args),
+		})
+	} else {
+		s.writeEvent("response.function_call_arguments.done", map[string]any{
+			"item_id": s.id + "-fc-" + itoa(idx), "output_index": idx, "arguments": args,
+		})
 	}
+	item := s.toolCallItem(idx, args)
 	s.writeEvent("response.output_item.done", map[string]any{
 		"output_index": idx, "item": item,
 	})
 	s.output = append(s.output, item)
 	s.toolOpen = false
+}
+
+// toolCallItem 造出当前工具调用的 output item。
+//
+// 入站被降级过的工具（custom / local_shell）在这里还原成客户端认识的
+// 原生形态：Codex 收到 custom_tool_call 时去执行自己的 apply_patch，
+// 收到一个名叫 apply_patch 的普通 function_call 则不会执行 ——
+// 它按 item 的 type 分派，参数外壳对它也没有意义。
+func (s *ResponsesSSE) toolCallItem(idx int, args string) map[string]any {
+	itemID := s.id + "-fc-" + itoa(idx)
+	switch s.downgraded[s.toolName] {
+	case "custom":
+		// custom_tool_call 的入参是裸文本，没有 JSON 外壳。
+		return map[string]any{
+			"type": "custom_tool_call", "id": itemID, "call_id": s.toolID,
+			"name": s.toolName, "input": unwrapCustomInput(args), "status": "completed",
+		}
+	case "local_shell":
+		// local_shell_call 的入参是 action 对象：{"type":"exec","command":[…]}。
+		return map[string]any{
+			"type": "local_shell_call", "id": itemID, "call_id": s.toolID,
+			"name": s.toolName, "action": localShellAction(args), "status": "completed",
+		}
+	default:
+		return map[string]any{
+			"type": "function_call", "id": itemID, "call_id": s.toolID,
+			"name": s.toolName, "arguments": args, "status": "completed",
+		}
+	}
+}
+
+// unwrapCustomInput 从降级后的 {"input":"…"} 参数里取回裸文本。
+//
+// 形状不是预期时返回原串：模型偶尔会不按 schema 输出（把文本直接当参数、
+// 或者参数本身是对象）。原样透传至少让 Codex 的执行器看到模型真正写了
+// 什么，比换成空串或 "{}" 更有用。
+func unwrapCustomInput(args string) string {
+	var obj struct {
+		Input string `json:"input"`
+	}
+	if json.Unmarshal([]byte(args), &obj) != nil || obj.Input == "" {
+		return args
+	}
+	return obj.Input
+}
+
+// localShellAction 把降级后的 {"command":[…],"timeout_ms":N} 参数还原成
+// local_shell_call 的 action 对象。
+//
+// 补 "type":"exec"：降级时它被剥掉了（那是 Responses 的判别字段，上游
+// 不认），但 Codex 的执行器按它决定怎么跑命令。
+func localShellAction(args string) any {
+	var obj map[string]any
+	if json.Unmarshal([]byte(args), &obj) != nil {
+		return map[string]any{"type": "exec"}
+	}
+	if _, ok := obj["type"]; !ok {
+		obj["type"] = "exec"
+	}
+	return obj
 }
 
 // thinkingDelta 把统一模型的 thinking 增量编码为 reasoning item。
@@ -341,19 +429,25 @@ func (s *ResponsesSSE) Event(ev *rosetta.Event) {
 				s.toolName = ev.ToolName
 			}
 			s.toolArgs.Reset()
-			itemID := s.id + "-fc-" + itoa(idx)
 			s.writeEvent("response.output_item.added", map[string]any{
 				"output_index": idx,
-				"item": map[string]any{
-					"type": "function_call", "id": itemID, "call_id": ev.ToolID,
-					"name": ev.ToolName, "arguments": "", "status": "in_progress",
-				},
+				"item":         s.toolCallItem(idx, ""),
 			})
 		}
 		s.wroteContent = true
 		if ev.ArgumentsDelta != "" {
 			s.toolArgs.WriteString(ev.ArgumentsDelta)
-			s.writeEvent("response.function_call_arguments.delta", map[string]any{
+			// custom 工具的入参是自由文本，Codex 听的是
+			// custom_tool_call_input.delta；发成 function_call_arguments.delta
+			// 等于把带 JSON 外壳的增量喂给一个按 type 分派的执行器。
+			// local_shell 与普通 function 共用 arguments.delta：它的 action
+			// 对象本身就是 JSON，拆成 custom 那样的裸文本事件反而对不上
+			// Codex 侧的 action 累积逻辑。
+			event := "response.function_call_arguments.delta"
+			if s.downgraded[s.toolName] == "custom" {
+				event = "response.custom_tool_call_input.delta"
+			}
+			s.writeEvent(event, map[string]any{
 				"item_id": s.id + "-fc-" + itoa(s.outputIndex-1), "output_index": s.outputIndex - 1,
 				"delta": ev.ArgumentsDelta,
 			})
@@ -427,6 +521,13 @@ func (s *ResponsesSSE) SawTerminal() bool {
 
 // WriteResponsesResponse 编码 Responses 非流式响应对象。
 func WriteResponsesResponse(w http.ResponseWriter, resp *rosetta.ChatResponse, model string) {
+	WriteResponsesResponseWithTools(w, resp, model, nil)
+}
+
+// WriteResponsesResponseWithTools 是 WriteResponsesResponse 的带降级表版本：
+// downgraded 把降级过的工具名映射回原生类型，输出的 item 相应地写成
+// custom_tool_call / local_shell_call 而非普通 function_call。
+func WriteResponsesResponseWithTools(w http.ResponseWriter, resp *rosetta.ChatResponse, model string, downgraded map[string]string) {
 	id := resp.ID
 	if id == "" {
 		id = fmt.Sprintf("resp_%d", time.Now().UnixNano())
@@ -474,10 +575,24 @@ func WriteResponsesResponse(w http.ResponseWriter, resp *rosetta.ChatResponse, m
 			if strings.TrimSpace(args) == "" {
 				args = "{}"
 			}
-			output = append(output, map[string]any{
-				"type": "function_call", "id": id + "-fc-" + blk.ToolCallID, "call_id": blk.ToolCallID,
-				"name": blk.ToolName, "arguments": args, "status": "completed",
-			})
+			itemID := id + "-fc-" + blk.ToolCallID
+			switch downgraded[blk.ToolName] {
+			case "custom":
+				output = append(output, map[string]any{
+					"type": "custom_tool_call", "id": itemID, "call_id": blk.ToolCallID,
+					"name": blk.ToolName, "input": unwrapCustomInput(args), "status": "completed",
+				})
+			case "local_shell":
+				output = append(output, map[string]any{
+					"type": "local_shell_call", "id": itemID, "call_id": blk.ToolCallID,
+					"name": blk.ToolName, "action": localShellAction(args), "status": "completed",
+				})
+			default:
+				output = append(output, map[string]any{
+					"type": "function_call", "id": itemID, "call_id": blk.ToolCallID,
+					"name": blk.ToolName, "arguments": args, "status": "completed",
+				})
+			}
 		}
 	}
 

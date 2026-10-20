@@ -33,7 +33,7 @@ func TestBindWriteDeadline_AllSinksImplementBinder(t *testing.T) {
 	sinks := map[string]StreamSink{
 		"openai_chat":      NewOpenAISink(NewSSEWriter(rec, nopFlusher{}, "chatcmpl-x", "m", 0)),
 		"anthropic":        NewAnthropicSSE(rec, nopFlusher{}, "msg_x", "m"),
-		"openai_responses": NewResponsesSSE(rec, nopFlusher{}, "resp_x", "m"),
+		"openai_responses": NewResponsesSSE(rec, nopFlusher{}, "resp_x", "m", nil),
 	}
 	for name, s := range sinks {
 		if _, ok := s.(deadlineBinder); !ok {

@@ -48,6 +48,19 @@ func BindWriteDeadline(s StreamSink, w http.ResponseWriter) {
 	}
 }
 
+// BindDowngradedTools 把入站降级过的工具表交给 sink，让它把模型对这些工具
+// 的调用还原成客户端认识的原生形态（custom_tool_call / local_shell_call）。
+//
+// 与 BindWriteDeadline 一样用能力探测而不是加进 StreamSink：只有 Responses
+// sink 需要这个状态，chat / anthropic 两条路径完全无关。
+// 工具名 → 原生类型（"custom" / "local_shell"）；nil 或空表表示无需还原。
+func BindDowngradedTools(s StreamSink, tools map[string]string) {
+	type binder interface{ WithDowngradedTools(map[string]string) }
+	if b, ok := s.(binder); ok {
+		b.WithDowngradedTools(tools)
+	}
+}
+
 // openaiSink 把统一事件流编码为 OpenAI chat.completion.chunk 序列。
 // 编码本体在 SSEWriter，这里只做事件分发与状态留痕。
 type openaiSink struct {

@@ -13,7 +13,7 @@ import (
 // part.done → item.done) → completed（带 usage 与完整文本）。
 func TestResponsesSSE_TextFlow(t *testing.T) {
 	rec := httptest.NewRecorder()
-	s := NewResponsesSSE(rec, nil, "resp_1", "gw-model")
+	s := NewResponsesSSE(rec, nil, "resp_1", "gw-model", nil)
 
 	s.Event(&rosetta.Event{Type: rosetta.EventMessageStart, ID: "up-1"})
 	s.Event(&rosetta.Event{Type: rosetta.EventTextDelta, Text: "你好"})
@@ -71,7 +71,7 @@ func TestResponsesSSE_TextFlow(t *testing.T) {
 // 修复前 thinking 增量整个不出事件，客户端拿不到续接状态。
 func TestResponsesSSE_ReasoningSealed(t *testing.T) {
 	rec := httptest.NewRecorder()
-	s := NewResponsesSSE(rec, nil, "resp_1", "gw-model")
+	s := NewResponsesSSE(rec, nil, "resp_1", "gw-model", nil)
 
 	s.Event(&rosetta.Event{Type: rosetta.EventMessageStart, ID: "up-1"})
 	s.Event(&rosetta.Event{Type: rosetta.EventThinkingDelta, Text: "先想一下", Sealed: "gAAAAA-secret", SealedBy: "openai-responses", ReasoningID: "rs_abc"})
@@ -133,7 +133,7 @@ func TestResponsesSSE_ReasoningSealed(t *testing.T) {
 // 别家协议族封的载荷不得出现在 Responses 事件里 —— 那是跨协议的异物。
 func TestResponsesSSE_ReasoningForeignSealDropped(t *testing.T) {
 	rec := httptest.NewRecorder()
-	s := NewResponsesSSE(rec, nil, "resp_1", "gw-model")
+	s := NewResponsesSSE(rec, nil, "resp_1", "gw-model", nil)
 
 	s.Event(&rosetta.Event{Type: rosetta.EventMessageStart, ID: "up-1"})
 	s.Event(&rosetta.Event{Type: rosetta.EventThinkingDelta, Text: "anthropic 的思考", Sealed: "sig-abc", SealedBy: "anthropic"})
@@ -153,7 +153,7 @@ func TestResponsesSSE_ReasoningForeignSealDropped(t *testing.T) {
 // 工具调用：function_call item + arguments delta/done；断流发 response.failed。
 func TestResponsesSSE_ToolCallAndFailure(t *testing.T) {
 	rec := httptest.NewRecorder()
-	s := NewResponsesSSE(rec, nil, "resp_1", "gw-model")
+	s := NewResponsesSSE(rec, nil, "resp_1", "gw-model", nil)
 	s.Event(&rosetta.Event{Type: rosetta.EventMessageStart, ID: "up-1"})
 	// 续片只带 ToolIndex（SDK 的 function_call_arguments.delta 不填 ToolID/Name）。
 	s.Event(&rosetta.Event{Type: rosetta.EventToolCall, ToolIndex: 0, ToolID: "c1", ToolName: "f"})

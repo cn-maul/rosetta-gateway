@@ -1360,9 +1360,13 @@ type ingressCodec interface {
 	// WriteError 把网关内部 code 渲染成协议的错误形状。
 	WriteError(w http.ResponseWriter, status int, code, message string)
 	// WriteNonStream 编码非流式成功响应。
-	WriteNonStream(w http.ResponseWriter, resp *rosetta.ChatResponse, model string)
+	//
+	// 带上 ingressRequest 是为了 openai-responses：它要把入站降级过的工具
+	// 还原成原生 item 形态（custom_tool_call / local_shell_call）。其他协议
+	// 不需要，忽略即可。
+	WriteNonStream(w http.ResponseWriter, resp *rosetta.ChatResponse, model string, ing *ingressRequest)
 	// NewSink 构造流式编码器；调用前 SSE 响应头已写出。
-	NewSink(w http.ResponseWriter, model string) outwire.StreamSink
+	NewSink(w http.ResponseWriter, model string, ing *ingressRequest) outwire.StreamSink
 }
 
 // ingressRequest 是解码后的协议无关请求视图。
@@ -1388,6 +1392,12 @@ type ingressRequest struct {
 	// 会把 minimal 合并进 low、xhigh 合并进 high，而模型档位配置可能恰好只支持
 	// xhigh 或 minimal —— 归一之后再夹取就会选错档，等于这个功能没做。
 	rawEffort string
+
+	// downgradedTools 是入站降级过的工具（工具名 → 原生 Responses 类型
+	// "custom" / "local_shell"）。出站据此把模型对这些工具的调用还原成
+	// custom_tool_call / local_shell_call，否则 Codex 按 item 的 type
+	// 分派时找不到自己的执行器。只有 openai-responses codec 会填。
+	downgradedTools map[string]string
 }
 
 // applyThinkingCapability 按**目标模型**配好的思考能力调整请求的思考设置。
@@ -1612,11 +1622,11 @@ func (openaiChatCodec) WriteError(w http.ResponseWriter, status int, code, messa
 	outwire.WriteOpenAIError(w, status, code, message)
 }
 
-func (openaiChatCodec) WriteNonStream(w http.ResponseWriter, resp *rosetta.ChatResponse, model string) {
+func (openaiChatCodec) WriteNonStream(w http.ResponseWriter, resp *rosetta.ChatResponse, model string, _ *ingressRequest) {
 	outwire.WriteNonStreamResponse(w, resp, model)
 }
 
-func (openaiChatCodec) NewSink(w http.ResponseWriter, model string) outwire.StreamSink {
+func (openaiChatCodec) NewSink(w http.ResponseWriter, model string, _ *ingressRequest) outwire.StreamSink {
 	flusher, _ := w.(http.Flusher)
 	return outwire.NewOpenAISink(outwire.NewSSEWriter(w, flusher, "chatcmpl-"+generateID(), model, time.Now().Unix()))
 }
@@ -1650,11 +1660,11 @@ func (anthropicMessagesCodec) WriteError(w http.ResponseWriter, status int, code
 	outwire.WriteAnthropicError(w, status, code, message)
 }
 
-func (anthropicMessagesCodec) WriteNonStream(w http.ResponseWriter, resp *rosetta.ChatResponse, model string) {
+func (anthropicMessagesCodec) WriteNonStream(w http.ResponseWriter, resp *rosetta.ChatResponse, model string, _ *ingressRequest) {
 	outwire.WriteAnthropicResponse(w, resp, model)
 }
 
-func (anthropicMessagesCodec) NewSink(w http.ResponseWriter, model string) outwire.StreamSink {
+func (anthropicMessagesCodec) NewSink(w http.ResponseWriter, model string, _ *ingressRequest) outwire.StreamSink {
 	flusher, _ := w.(http.Flusher)
 	return outwire.NewAnthropicSSE(w, flusher, "msg_"+generateID(), model)
 }
@@ -1679,6 +1689,7 @@ func (openaiResponsesCodec) Decode(r *http.Request, maxBytes int64) (*ingressReq
 		requiresStructuredOutput: req.RequiresStructuredOutput(),
 		applyUpstreamExtras:      req.ApplyUpstreamExtras,
 		rawEffort:                req.RawEffort,
+		downgradedTools:          req.DowngradedTools(),
 	}, nil
 }
 
@@ -1686,13 +1697,13 @@ func (openaiResponsesCodec) WriteError(w http.ResponseWriter, status int, code, 
 	outwire.WriteOpenAIError(w, status, code, message)
 }
 
-func (openaiResponsesCodec) WriteNonStream(w http.ResponseWriter, resp *rosetta.ChatResponse, model string) {
-	outwire.WriteResponsesResponse(w, resp, model)
+func (openaiResponsesCodec) WriteNonStream(w http.ResponseWriter, resp *rosetta.ChatResponse, model string, ing *ingressRequest) {
+	outwire.WriteResponsesResponseWithTools(w, resp, model, ing.downgradedTools)
 }
 
-func (openaiResponsesCodec) NewSink(w http.ResponseWriter, model string) outwire.StreamSink {
+func (openaiResponsesCodec) NewSink(w http.ResponseWriter, model string, ing *ingressRequest) outwire.StreamSink {
 	flusher, _ := w.(http.Flusher)
-	return outwire.NewResponsesSSE(w, flusher, "resp_"+generateID(), model)
+	return outwire.NewResponsesSSE(w, flusher, "resp_"+generateID(), model, ing.downgradedTools)
 }
 
 func handleIngress(pool *upstream.Pool, cfg *config.Config, usage *usageRecorder, limiter *ratelimit.Limiter, codec ingressCodec) http.HandlerFunc {
@@ -2661,7 +2672,7 @@ func attemptStream(w http.ResponseWriter, r *http.Request, client *rosetta.Clien
 	w.WriteHeader(http.StatusOK)
 
 	// 流式编码器由 codec 构造：OpenAI 走 SSEWriter，Anthropic 走块状态机。
-	sink := codec.NewSink(w, publicModel)
+	sink := codec.NewSink(w, publicModel, ing)
 	// 单次写截止时间（2026-10-17）：下游挂死不读时让 Write 自己返回超时，
 	// 而不是让 handler 永久阻塞、连带把上游流与 token 一起耗着。
 	// 用法是能力探测，测试替身等无底层连接的实现会静默跳过。
@@ -2886,7 +2897,7 @@ func attemptNonStream(w http.ResponseWriter, r *http.Request, client *rosetta.Cl
 	latency := time.Since(start).Milliseconds()
 	ttfbMs := latency
 
-	codec.WriteNonStream(w, resp, publicModel)
+	codec.WriteNonStream(w, resp, publicModel, ing)
 
 	usage.record(&store.UsageRecord{
 		ID:              generateID(),
