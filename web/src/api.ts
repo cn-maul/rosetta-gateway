@@ -394,6 +394,7 @@ import type {
   UpstreamModel,
   UpstreamModelUpdate,
   ModelGroup,
+  Network,
   ProbeHealth,
   ProbeTimelineBucket,
   DiscoveredModel,
@@ -465,6 +466,15 @@ export const api = {
    */
   providerBalance: (id: string, timeoutMs = 60_000) =>
     post<ProviderBalance>(`/providers/${id}/balance`, undefined, timeoutMs),
+
+  // 出站网络（代理地址的共享清单）。直连不在这里 —— 它是保留 id
+  // 'direct'，由界面作为下拉第一项硬编码（见 types.ts 的 Network）。
+  networks: () => get<Network[]>('/networks'),
+  createNetwork: (b: { name: string; proxy_url: string }) =>
+    mutate(() => post<Network>('/networks', b)),
+  updateNetwork: (id: string, b: { name: string; proxy_url: string }) =>
+    mutate(() => patch<Network>(`/networks/${id}`, b)),
+  deleteNetwork: (id: string) => mutate(() => del(`/networks/${id}`)),
 
   // credentials（挂在 provider 下）
   credentials: (providerId: string) => get<Credential[]>(`/providers/${providerId}/credentials`),

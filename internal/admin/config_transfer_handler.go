@@ -124,12 +124,25 @@ func (h *ConfigTransferHandler) buildExport(ctx context.Context) (configExport, 
 		groupName[g.ID] = g.DisplayName
 		out.ModelGroups = append(out.ModelGroups, modelGroupExport{DisplayName: g.DisplayName})
 	}
+	// 出站网络同样先读出来建 id→name 映射：导出体里用名字关联（跨库 id
+	// 无意义），一次查询而不是每个 provider 现取，避免 N+1。
+	networks, err := h.store.ListNetworks(ctx)
+	if err != nil {
+		return out, err
+	}
+	networkName := make(map[string]string, len(networks))
+	for _, n := range networks {
+		networkName[n.ID] = n.Name
+		out.Networks = append(out.Networks, networkExport{Name: n.Name, ProxyURL: n.ProxyURL})
+	}
 
 	for _, p := range providers {
 		out.Providers = append(out.Providers, providerExport{
 			Slug: p.Slug, Name: p.Name, Protocol: p.Protocol, Endpoint: p.Endpoint,
 			Enabled: p.Enabled, TimeoutMs: p.TimeoutMs, MaxRetries: p.MaxRetries,
-			QuirksJSON: p.QuirksJSON, ProxyURL: p.ProxyURL,
+			QuirksJSON: p.QuirksJSON,
+			// p.NetworkID 为空 → 查表得空串 → omitempty 不写出，语义是直连。
+			NetworkName: networkName[p.NetworkID],
 		})
 		for _, m := range byProvider[p.ID] {
 			out.Models = append(out.Models, modelExport{
@@ -247,6 +260,90 @@ func (h *ConfigTransferHandler) apply(ctx context.Context, in *configExport, dry
 		taken[slug] = true
 	}
 
+	// 出站网络：按名字对齐（跨库 id 无意义，同 provider 靠 slug 对齐）。
+	// 已存在的同名网络直接复用 —— 导出的地址多半与本库一致，而新建一条
+	// 同名网络会被 UNIQUE(name) 拒掉，反而让整个导入失败。
+	//
+	// 干跑时**不写库**：这里只把「文件里引用了哪些名字」记下来，写库发生在
+	// 下面真正 apply 的分支里。
+	networkByName := make(map[string]string)
+	existingNetworks, err := h.store.ListNetworks(ctx)
+	if err != nil {
+		return nil, err
+	}
+	for _, n := range existingNetworks {
+		networkByName[n.Name] = n.ID
+	}
+	for _, ne := range in.Networks {
+		name := strings.TrimSpace(ne.Name)
+		if name == "" {
+			resp.Warnings = append(resp.Warnings, "跳过一个既无名称也无代理地址的网络")
+			continue
+		}
+		if _, ok := networkByName[name]; ok {
+			continue
+		}
+		if err := validateProxyURL(strings.TrimSpace(ne.ProxyURL)); err != nil {
+			resp.Warnings = append(resp.Warnings,
+				fmt.Sprintf("网络 %s 的 proxy_url 非法（%v），未导入", name, err))
+			continue
+		}
+		id := "net-" + generateID()
+		networkByName[name] = id
+		if dryRun {
+			resp.Notes = append(resp.Notes, fmt.Sprintf("将新建网络 %s", name))
+			continue
+		}
+		if err := h.store.CreateNetwork(ctx, &store.Network{ID: id, Name: name, ProxyURL: strings.TrimSpace(ne.ProxyURL)}); err != nil {
+			return nil, err
+		}
+	}
+	// v1/v2 文件里每个 provider 各带一份 proxy_url（无 networks 切片）。
+	// 那些地址在旧形态下就是「每个上游各存一份」，这里同样按 URL 归并成
+	// 网络并复用 —— 导入完自动就整理成了新形态，而不是留一份永远改不动的
+	// 影子配置。
+	legacyNetworks := make(map[string]string) // 代理地址 → 网络 id
+	for _, pe := range in.Providers {
+		rawURL := strings.TrimSpace(pe.ProxyURL)
+		if rawURL == "" {
+			continue
+		}
+		if _, ok := legacyNetworks[rawURL]; ok {
+			continue
+		}
+		if err := validateProxyURL(rawURL); err != nil {
+			resp.Warnings = append(resp.Warnings,
+				fmt.Sprintf("供应商 %s 的 proxy_url 非法（%v），该条目按直连导入", pe.Slug, err))
+			continue
+		}
+		// 优先复用本库已有的同名/同址网络：地址一致就是同一条网络。
+		var reused string
+		for _, n := range existingNetworks {
+			if n.ProxyURL == rawURL {
+				reused = n.ID
+				break
+			}
+		}
+		if reused != "" {
+			legacyNetworks[rawURL] = reused
+			continue
+		}
+		name := rawURL
+		if _, taken := networkByName[name]; taken {
+			name = name + " (" + pe.Slug + ")"
+		}
+		id := "net-" + generateID()
+		networkByName[name] = id
+		legacyNetworks[rawURL] = id
+		if dryRun {
+			resp.Notes = append(resp.Notes, fmt.Sprintf("将由旧版 proxy_url 建出网络 %s", name))
+			continue
+		}
+		if err := h.store.CreateNetwork(ctx, &store.Network{ID: id, Name: name, ProxyURL: rawURL}); err != nil {
+			return nil, err
+		}
+	}
+
 	newProviders := make([]pendingProvider, 0, len(in.Providers))
 	// 每个待建provider 连同它在**导出文件里的原 slug** 一起记下来。
 	// 模型与凭据都按原 slug 引用，重命名后必须靠它找到归属。
@@ -269,6 +366,13 @@ func (h *ConfigTransferHandler) apply(ctx context.Context, in *configExport, dry
 				fmt.Sprintf("供应商 %s 已存在，导入的这条改名为 %s", slug, target))
 		}
 		taken[target] = true
+		// network_name 指向的文件里没有那条网络时（手工编辑过、或那部分被
+		// 删了）必须说出来：静默按直连导入会让人以为「代理配好了」，
+		// 实际那条上游从此不走代理，且症状是 504 而非任何导入期错误。
+		if name := strings.TrimSpace(pe.NetworkName); name != "" && networkByName[name] == "" {
+			resp.Warnings = append(resp.Warnings, fmt.Sprintf(
+				"供应商 %s 引用的网络 %q 不在文件里，该条按直连导入", target, name))
+		}
 
 		p := store.Provider{
 			// ID 必须现生成：导出体里刻意不带 id（跨库无意义），而
@@ -278,11 +382,14 @@ func (h *ConfigTransferHandler) apply(ctx context.Context, in *configExport, dry
 			Slug: target, Name: strings.TrimSpace(pe.Name), Protocol: strings.TrimSpace(pe.Protocol),
 			Endpoint: strings.TrimSpace(pe.Endpoint), Enabled: pe.Enabled,
 			TimeoutMs: pe.TimeoutMs, MaxRetries: pe.MaxRetries, QuirksJSON: pe.QuirksJSON,
-			// 代理跟着一起搬。注意它指向的是**本机**的代理地址
+			// 出站网络：v3 按名字引用，v1/v2 回落到按地址归并出来的网络。
+			// 两者都没给 = 直连。
+			//
+			// 代理地址跟着一起搬。注意它指向的是**本机**的代理地址
 			// （如 127.0.0.1:7897），换一台机器导入时该端口未必相同 ——
 			// 但那是运维该判断的事，导入侧原样搬运、不做「猜一个新地址」
 			// 这种自作聪明。
-			ProxyURL:  strings.TrimSpace(pe.ProxyURL),
+			NetworkID: resolveImportedNetworkID(pe, networkByName, legacyNetworks),
 			CreatedAt: time.Now().UnixMilli(), UpdatedAt: time.Now().UnixMilli(),
 		}
 		// 与手工创建保持同一套兜底：缺协议/端点的记录导进来就 unusable，
@@ -367,6 +474,26 @@ func (h *ConfigTransferHandler) apply(ctx context.Context, in *configExport, dry
 		return nil, err
 	}
 	return resp, nil
+}
+
+// resolveImportedNetworkID 决定导入的一个 provider 引用哪条网络。
+//
+// 优先级：network_name（v3）> proxy_url（v1/v2）> 直连。
+//
+// 为什么 network_name 排在前面：它是 v3 的权威字段，而 v1/v2 文件里它必然
+// 是空串 —— 顺序反了不会出错（两者不会同时非空），但显式写出优先级是为了
+// 让「手工编辑过的文件」（两个字段都被填了且不一致）有确定的解读。
+//
+// 名字在 networks 切片里找不到时返回空串（直连）并由调用方告警：宁可让
+// 这一条退回直连，也不要因为一个引用名对不上就中断整份导入。
+func resolveImportedNetworkID(pe providerExport, byName, legacyByURL map[string]string) string {
+	if name := strings.TrimSpace(pe.NetworkName); name != "" {
+		return byName[name]
+	}
+	if rawURL := strings.TrimSpace(pe.ProxyURL); rawURL != "" {
+		return legacyByURL[rawURL]
+	}
+	return ""
 }
 
 // pendingProvider 记住「文件里的原 slug → 实际要落库的 Provider」。

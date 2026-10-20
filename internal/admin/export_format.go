@@ -37,7 +37,11 @@ import (
 // v2（2026-10-14）：新增 model_groups 切片与 modelExport.group_name。
 // 若加这些字段却不升版本，**老版本网关会成功导入并静默丢掉全部分组**
 // —— 正是下面的版本校验要拦的那类失败。
-const exportFormatVersion = 2
+//
+// v3（2026-10-20）：新增 networks 切片与 providerExport.network_name。
+// 代理地址从「每个上游各存一份 URL」改成「按名字引用一份共享清单」，
+// 不升版本的话老网关会把 network_name 读成空 —— 导入成功、代理静默失效。
+const exportFormatVersion = 3
 
 // exportFormatMinVersion 是仍接受导入的最老版本。
 //
@@ -79,6 +83,16 @@ type configExport struct {
 	// ModelGroups 是模型归组（v2）。组内成员通过 modelExport.group_name
 	// 按显示名关联 —— 跨库靠名字对齐，与 provider 靠 slug 对齐同理。
 	ModelGroups []modelGroupExport `json:"model_groups,omitempty"`
+	// Networks 是出站网络清单（v3）。成员通过 providerExport.network_name
+	// 按**网络名**关联：跨库 id 无意义（与 provider 靠 slug、模型组靠显示名
+	// 同一理由），而名字本来就是管理员给它的。
+	Networks []networkExport `json:"networks,omitempty"`
+}
+
+// networkExport 是一条出站网络（代理配置）。只带名字与地址。
+type networkExport struct {
+	Name     string `json:"name"`
+	ProxyURL string `json:"proxy_url"`
 }
 
 // modelGroupExport 是一个模型归组。只带显示名：组的 id 是本库内部主键，
@@ -96,8 +110,16 @@ type providerExport struct {
 	TimeoutMs  int    `json:"timeout_ms"`
 	MaxRetries int    `json:"max_retries"`
 	QuirksJSON string `json:"quirks_json,omitempty"`
-	// 出站代理。omitempty：不代理的 provider 不该在导出体里多出一行空值，
-	// 那会让「这个文件配过代理吗」在肉眼上变得难判。
+	// 出站网络。v3 起按**名字**引用 networks 切片（跨库 id 无意义），
+	// 空串 = 直连。字段名与之前不同是有意的：老版本网关读 v3 文件会拒
+	// （版本号已升），而 v1/v2 文件缺该字段 → 空串 → 直连，向后兼容。
+	NetworkName string `json:"network_name,omitempty"`
+	// ProxyURL 是 v1/v2 的出站代理字段（每个上游各存一份 URL）。v3 起只在
+	// **导入**侧读取：老文件里它非空时按地址建一条网络并引用，导出的新文件
+	// 不再写这个字段（否则同一份代理会在文件里出现两次，且两者可能不一致）。
+	//
+	// 保留它不是为了兼容新写新读，而是 v1/v2 备份仍必须能导入 —— 那是自用
+	// 部署最需要的向后兼容（见 exportFormatMinVersion）。
 	ProxyURL string `json:"proxy_url,omitempty"`
 }
 
@@ -159,6 +181,7 @@ func sealExport(body configExport, passphrase string) (configExport, error) {
 		Credentials: body.Credentials,
 		Models:      body.Models,
 		ModelGroups: body.ModelGroups,
+		Networks:    body.Networks,
 	}
 	raw, err := json.Marshal(inner)
 	if err != nil {

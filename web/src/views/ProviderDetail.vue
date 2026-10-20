@@ -15,7 +15,7 @@
  * 状态从路由参数拿 provider id，因此刷新与分享链接都成立。
  */
 import { computed, onMounted, reactive, ref, watch } from 'vue'
-import { useRoute, useRouter } from 'vue-router'
+import { RouterLink, useRoute, useRouter } from 'vue-router'
 import { api } from '../api'
 import { toast, confirmBox } from '../ui'
 import type {
@@ -29,6 +29,7 @@ import type {
 import AppModal from '../components/AppModal.vue'
 import CredentialPanel from '../components/CredentialPanel.vue'
 import UpstreamModelPanel from '../components/UpstreamModelPanel.vue'
+import { useNetworks, NETWORK_DIRECT_ID } from '../composables/useNetworks'
 
 const route = useRoute()
 const router = useRouter()
@@ -121,10 +122,20 @@ const pForm = reactive({
   slug: '',
   timeout_ms: 0,
   max_retries: 0,
-  proxy_url: '',
+  network_id: '',
   balance_spec_json: '',
   saving: false,
 })
+
+const { networks, load: loadNetworks } = useNetworks()
+
+// network_id → 显示名。只在有引用的行上用到（直连那一支不调它），
+// 查不到就退回短 id：那说明网络刚被删而快照还没重建，硬显示「直连」
+// 会把「正在直连」与「引用已失效」混成同一个说法。
+const networkLabel = (id: string): string => {
+  const n = networks.value.find((x) => x.id === id)
+  return n ? n.name : id.slice(0, 8)
+}
 
 function fillForm(p: Provider) {
   pForm.name = p.name
@@ -133,7 +144,7 @@ function fillForm(p: Provider) {
   pForm.slug = p.slug
   pForm.timeout_ms = p.timeout_ms
   pForm.max_retries = p.max_retries
-  pForm.proxy_url = p.proxy_url
+  pForm.network_id = p.network_id || NETWORK_DIRECT_ID
   pForm.balance_spec_json = p.balance_spec_json
 }
 
@@ -144,7 +155,7 @@ function isFormDirty(p: Provider): boolean {
     pForm.endpoint !== p.endpoint ||
     pForm.timeout_ms !== p.timeout_ms ||
     pForm.max_retries !== p.max_retries ||
-    pForm.proxy_url !== p.proxy_url ||
+    pForm.network_id !== (p.network_id || NETWORK_DIRECT_ID) ||
     pForm.balance_spec_json !== p.balance_spec_json
   )
 }
@@ -167,10 +178,10 @@ async function saveProvider() {
       endpoint: pForm.endpoint.trim(),
       timeout_ms: Number(pForm.timeout_ms) || 0,
       max_retries: Number(pForm.max_retries) || 0,
-      // 代理与余额查询配置**每次都发**，空串 = 清空。省略字段的语义是
-      // 「保持原值」，那会让「卸掉代理」「删掉自定义余额脚本」这两个动作
+      // 网络与余额查询配置**每次都发**，空串 = 清空。省略字段的语义是
+      // 「保持原值」，那会让「换回直连」「删掉自定义余额脚本」这两个动作
       // 永远发不出去 —— 必须显式把空串写回去。
-      proxy_url: pForm.proxy_url.trim(),
+      network_id: pForm.network_id,
       balance_spec_json: pForm.balance_spec_json.trim(),
     })
     toast('上游已更新')
@@ -206,6 +217,7 @@ function openEdit() {
   if (!p) return
   fillForm(p)
   pForm.open = true
+  void loadNetworks()
 }
 
 /**
@@ -792,9 +804,13 @@ function goBack() {
                 <div class="kv-row"><span class="kv-k">协议</span><span class="kv-v"><span class="badge">{{ provider.protocol }}</span></span></div>
                 <div class="kv-row"><span class="kv-k">Endpoint</span><span class="kv-v mono kv-ep" :title="provider.endpoint">{{ provider.endpoint }}</span></div>
                 <div class="kv-row">
-                  <span class="kv-k">出站</span>
+                  <span class="kv-k">出站网络</span>
                   <span class="kv-v dim" :title="provider.proxy_url || '直连（不经过代理）'">
-                    {{ provider.proxy_url ? `代理 ${provider.proxy_url}` : '直连（不经过代理）' }}
+                    <template v-if="provider.network_id">
+                      {{ networkLabel(provider.network_id) }}
+                      <span class="mono kv-sub">（{{ provider.proxy_url }}）</span>
+                    </template>
+                    <template v-else>直连（不经过代理）</template>
                   </span>
                 </div>
                 <div class="kv-row"><span class="kv-k">Slug</span><span class="kv-v mono dim">{{ provider.slug }}</span></div>
@@ -907,18 +923,16 @@ function goBack() {
           </div>
 
           <div class="field span2">
-            <label for="cgw-lProviderDetail-7">代理（可选）</label>
-            <input v-model="pForm.proxy_url" class="input mono" placeholder="http://127.0.0.1:7897" autocomplete="off" id="cgw-lProviderDetail-7"/>
+            <label for="cgw-lProviderDetail-7">出站网络</label>
+            <select v-model="pForm.network_id" class="select" id="cgw-lProviderDetail-7">
+              <option :value="NETWORK_DIRECT_ID">直连（不经过代理）</option>
+              <option v-for="n in networks" :key="n.id" :value="n.id">{{ n.name }} — {{ n.proxy_url }}</option>
+            </select>
             <span class="tip">
-              只对这个上游生效，其它上游不受影响。支持 http / https / socks5 /
-              socks5h（<code>socks5h</code> 让 DNS 也走代理，本地 DNS 被污染时用它）。
-              留空表示不代理。填错不会阻断请求，但该上游会<strong>退回直连</strong>，
-              网关日志里会留一条告警。
-              <br/>
-              <strong>网关跑在 Docker 里时注意</strong>：<code>127.0.0.1</code>
-              指的是网关容器自己，不是宿主机。代理也在容器里的话，填
-              <code>http://代理容器名:端口</code>（同一 Docker 网络内用容器名互访）；
-              代理在宿主机上时才用 <code>host.docker.internal</code>。
+              只对这个上游生效，其它上游不受影响；选「直连」表示不代理。
+              地址在 <RouterLink to="/networks">出站网络</RouterLink> 里维护 ——
+              同一个代理被多个上游共用时填一次，改一处全部生效，也不用手打
+              URL（打错不会报错，只是连不上）。
             </span>
           </div>
 
@@ -1180,6 +1194,10 @@ function goBack() {
 /* Endpoint 例外：URL 的可辨识信息在路径尾巴上，掐尾省略（…）会把
    「chat/completions」这半截丢掉。所以换行而不是省略，完整可见。 */
 .kv-ep { white-space: normal; word-break: break-all; }
+
+/* 概览「出站网络」那一行：网络名是主体，地址是括注。地址比名字长得多，
+   不压成 dim 括注的话，这一行会被地址顶掉而读不出「走的是哪条网络」。 */
+.kv-sub { font-size: 12px; color: var(--muted); }
 
 /* 两列并排的「概览 / 凭据」，下方模型表整行占满。沿用全局 .expand-grid。
    窄屏塌成一列：两张表挤在半屏宽时，模型名会被压到只剩省略号，

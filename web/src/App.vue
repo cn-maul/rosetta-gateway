@@ -68,6 +68,7 @@ const icons = {
   usage: 'M4 20V10 M12 20V4 M20 20v-7',
   routes: 'M3 12h7 M10 12l5-7h6 M10 12l5 7h6 M17 3l4 2-4 2 M17 17l4 2-4 2',
   providers: 'M3 3h18v7H3z M3 14h18v7H3z M7 7h.01 M7 18h.01',
+  networks: 'M12 3a9 9 0 1 0 0 18 9 9 0 1 0 0-18 M3 12h18 M12 3c3 4 3 14 0 18 M12 3c-3 4-3 14 0 18',
   users: 'M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2 M9 3a4 4 0 1 0 0 8 4 4 0 0 0 0-8 M17 4a4 4 0 0 1 0 7 M22 21v-2a4 4 0 0 0-3-3.87',
   wallet: 'M3 5h17v15H3z M3 5V3h14 M15 11h6v5h-6z',
   settings: 'M12 3v3 M12 18v3 M3 12h3 M18 12h3 M5.6 5.6l2.1 2.1 M16.3 16.3l2.1 2.1 M5.6 18.4l2.1-2.1 M16.3 7.7l2.1-2.1 M12 8a4 4 0 1 0 0 8 4 4 0 0 0 0-8',
@@ -81,6 +82,7 @@ const navigation = computed(() => isAdmin() ? [
     { to: '/usage', label: '用量与费用', icon: icons.usage },
   ] },
   { label: '网关配置', items: [
+    { to: '/networks', label: '出站网络', icon: icons.networks },
     { to: '/routes', label: '模型与路由', icon: icons.routes },
     { to: '/providers', label: '上游服务', icon: icons.providers },
     { to: '/users', label: '用户与权限', icon: icons.users },

@@ -2,12 +2,13 @@
 import DataTable from '../components/DataTable.vue'
 // 列表仅取摘要，凭据、模型与余额请求留在上游详情页。
 import { computed, onMounted, reactive, ref } from 'vue'
-import { useRoute, useRouter } from 'vue-router'
+import { RouterLink, useRoute, useRouter } from 'vue-router'
 import { api } from '../api'
 import { toast, confirmBox } from '../ui'
 import type { Provider } from '../types'
 import AppModal from '../components/AppModal.vue'
 import { useQueryText } from '../composables/useQueryText'
+import { useNetworks, NETWORK_DIRECT_ID } from '../composables/useNetworks'
 
 const router = useRouter()
 const route = useRoute()
@@ -52,9 +53,15 @@ async function load() {
 }
 
 // ---------- 新建表单 ----------
-// 新建只填 显示名称 / 协议 / Endpoint（+ 可选 api_key）。
-// slug、启用、超时与重试由后端给默认值；代理与余额查询可以事后在详情页改，
-// 但它们不在这里问 —— 新建时这两个对大多数上游是空的。
+// 新建只填 显示名称 / 协议 / Endpoint（+ 可选 api_key + 可选网络）。
+// slug、启用、超时与重试由后端给默认值；余额查询可以事后在详情页改，
+// 但它不在这里问 —— 新建时它对大多数上游是空的。
+//
+// 网络却在新建时就问：它是**默认值**（直连），不是可留空的空值。
+// 「默认直连、不用管」的人看得到下拉停在第一项；需要代理的人当场就能
+// 选，不必先建完上游再跳去详情页改一遍。
+
+const { networks, load: loadNetworks } = useNetworks()
 
 const pForm = reactive({
   open: false,
@@ -62,6 +69,10 @@ const pForm = reactive({
   protocol: 'openai-chat',
   endpoint: '',
   api_key: '',
+  // 默认直连：绝大多数上游不需要代理。存 NETWORK_DIRECT_ID 而不是空串，
+  // 是为了让「下拉停在哪一项」与「提交的值」是同一个东西 —— 空串在下拉里
+  // 找不到对应 option，会显示成第一项却提交另一个值。
+  network_id: NETWORK_DIRECT_ID,
 })
 
 function openCreate() {
@@ -69,7 +80,9 @@ function openCreate() {
   pForm.protocol = 'openai-chat'
   pForm.endpoint = ''
   pForm.api_key = ''
+  pForm.network_id = NETWORK_DIRECT_ID
   pForm.open = true
+  void loadNetworks()
 }
 
 async function submitProvider() {
@@ -85,6 +98,7 @@ async function submitProvider() {
       protocol: pForm.protocol,
       endpoint: pForm.endpoint.trim(),
       api_key: pForm.api_key.trim() || undefined,
+      network_id: pForm.network_id,
     })
     toast('上游已创建')
     pForm.open = false
@@ -136,7 +150,21 @@ async function removeProvider(p: Provider) {
   }
 }
 
-onMounted(load)
+// 网络清单不参与 load() 的成败判定：它只是展示辅助（行内的网络名与
+// 新建表单的下拉），读不到时那两处退化即可，不该让整页变成错误态。
+onMounted(() => {
+  void load()
+  void loadNetworks()
+})
+
+// network_id → 显示名。只在**有引用**的行上被用到（直连不显示这一行），
+// 所以查不到就退回短 id —— 那说明网络刚被删掉而 provider 还没重载，
+// 显示「直连」会是错的（它其实还没回到直连）。
+const networkLabel = computed(() => {
+  const map: Record<string, string> = {}
+  for (const n of networks.value) map[n.id] = n.name
+  return (id: string) => map[id] ?? id.slice(0, 8)
+})
 </script>
 
 <template>
@@ -157,7 +185,7 @@ onMounted(load)
           <thead><tr><th>上游 / Endpoint</th><th>协议</th><th>配置状态</th><th class="num-h">模型 / 凭据</th><th class="c-act">操作</th></tr></thead>
           <tbody>
             <tr v-for="p in filtered" :key="p.id">
-              <td class="provider-identity"><button class="text-link name-link" @click="goDetail(p)">{{ p.name || p.slug }}</button><div class="sub-line mono endpoint">{{ p.endpoint }}</div><span v-if="p.proxy_url" class="sub-line">经代理转发</span></td>
+              <td class="provider-identity"><button class="text-link name-link" @click="goDetail(p)">{{ p.name || p.slug }}</button><div class="sub-line mono endpoint">{{ p.endpoint }}</div><span v-if="p.network_id" class="sub-line">经网络「{{ networkLabel(p.network_id) }}」转发</span></td>
               <td><span class="badge">{{ p.protocol }}</span></td>
               <td class="provider-state"><span class="badge" :class="!p.enabled ? 'badge-off' : p.ready === false ? 'badge-st-error' : p.ready === true ? 'badge-live' : 'badge-dim'">{{ readyLabel(p) }}</span><div v-if="p.enabled && p.ready !== true" class="sub-line state-reason">{{ p.ready_reason || (p.ready === false ? '未建立可用凭据池，请检查凭据' : '暂未取得运行时状态') }}</div></td>
               <td class="num"><span>{{ p.model_count ?? '—' }}</span><span class="dim"> / </span><span>{{ p.cred_count ?? '—' }}</span></td>
@@ -195,7 +223,19 @@ onMounted(load)
             <input v-model="pForm.api_key" class="input mono" type="password" placeholder="sk-...（可留空，稍后在详情页添加）" autocomplete="new-password" id="cgw-lProviders-4"/>
             <span class="tip">
               添加即启用；slug、超时与重试将自动使用默认值。
-              代理与余额查询可在创建后到详情页设置。
+              余额查询可在创建后到详情页设置。
+            </span>
+          </div>
+          <div class="field span2">
+            <label for="cgw-lProviders-5">出站网络</label>
+            <select v-model="pForm.network_id" class="select" id="cgw-lProviders-5">
+              <option :value="NETWORK_DIRECT_ID">直连（默认，不经过代理）</option>
+              <option v-for="n in networks" :key="n.id" :value="n.id">{{ n.name }} — {{ n.proxy_url }}</option>
+            </select>
+            <span class="tip">
+              默认<b>直连</b>，大多数上游不用改。要走代理就先去
+              <RouterLink to="/networks">出站网络</RouterLink> 建一条（地址填一次到处可用），
+              再回来从下拉里选 —— 不用在这里手填 URL，写错不会报错只是连不上。
             </span>
           </div>
         </div>

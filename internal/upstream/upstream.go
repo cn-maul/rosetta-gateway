@@ -79,8 +79,11 @@ type ProviderEntry struct {
 	Timeout     time.Duration
 	MaxRetries  int
 	Credentials []*CredentialEntry
-	// ProxyURL 是该 provider 独享的出站代理（http/https/socks5）。
-	// 空 = 不代理，走进程环境变量。见 store.go 里 proxy_url 列的注释。
+	// ProxyURL 是该 provider 实际要用的出站代理（http/https/socks5）。
+	// 空 = 不代理，走进程环境变量。
+	//
+	// 它是**派生**的：provider 行上只存 network_id，实际地址由 networks 表
+	// 在读路径 JOIN 出来（见 store.Provider 的 ProxyURL 注释）。
 	ProxyURL string
 	// ProxyConfigError 记录该 provider 的代理配置为什么没生效（URL 非法）。
 	// 非空时请求仍会发 —— 走直连 —— 但管理面据此把「代理没生效」说出来，
@@ -187,7 +190,7 @@ func (p *Pool) BuildFromConfig(cfg *config.Config) error {
 			// 全站断粮），但必须说出来。bootstrap 路径同样要 —— 它是零配置
 			// 部署的入口，配错代理时的症状与库路径一模一样。
 			if prov.ProxyConfigError != nil {
-				p.logger.Warn("provider proxy_url invalid; falling back to direct connection",
+				p.logger.Warn("provider network proxy_url invalid; falling back to direct connection",
 					"provider", bp.Slug, "error", prov.ProxyConfigError)
 			}
 
@@ -384,7 +387,7 @@ func (p *Pool) PrepareFromStore(ctx context.Context, st *store.Store, masterKey 
 		// 时会朝着完全错误的方向猜（代理挂了？IP 被封了？）。日志记一次，
 		// 且带上 provider 与那个非法值 —— 前者定位是哪家，后者让人看出错在哪。
 		if prov.ProxyConfigError != nil {
-			p.logger.Warn("provider proxy_url invalid; falling back to direct connection",
+			p.logger.Warn("provider network proxy_url invalid; falling back to direct connection",
 				"provider", sp.Slug, "error", prov.ProxyConfigError)
 		}
 
@@ -1310,8 +1313,9 @@ var upstreamHTTPClient = &http.Client{
 // 每个 Transport 自带一套连接池。同一个 provider 下 N 把凭据若各建一个，
 // 就是 N 套到同一个代理的连接池 —— MaxIdleConnsPerHost=64 会被 N 等分，
 // 且代理侧同时维持 N 倍的空闲连接。而「同一 provider 的凭据共享代理配置」
-// 是既定事实（proxy_url 在 provider 行上，不在凭据行上），所以按 URL 缓存
-// 恰好命中这个粒度。
+// 是既定事实（出站网络挂在 provider 上，不在凭据行上），所以按 URL 缓存
+// 恰好命中这个粒度。多个 provider 选同一条网络时也共享同一个 client ——
+// 那正是「共享清单」想达成的效果。
 //
 // # 为什么值里放 *http.Client 而不是 *http.Transport
 //
@@ -1338,7 +1342,7 @@ func proxyHTTPClientFor(proxyURL string) (*http.Client, error) {
 	u, err := url.Parse(proxyURL)
 	if err != nil || u.Host == "" || (u.Scheme != "http" && u.Scheme != "https" &&
 		u.Scheme != "socks5" && u.Scheme != "socks5h") {
-		return upstreamHTTPClient, fmt.Errorf("proxy_url %q 不是合法的代理地址（支持 http/https/socks5，如 http://127.0.0.1:7897）", proxyURL)
+		return upstreamHTTPClient, fmt.Errorf("网络 %q 的代理地址不合法（支持 http/https/socks5，如 http://127.0.0.1:7897）", proxyURL)
 	}
 
 	upstreamProxyMu.Lock()

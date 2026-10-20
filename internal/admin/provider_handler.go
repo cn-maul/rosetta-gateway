@@ -31,10 +31,12 @@ func NewProviderHandler(st *store.Store, masterKey []byte, cfg *config.Config) *
 // slug 由系统生成、enabled 固定 true、超时与重试取「设置」里的全局默认，
 // 三者都不接受客户端指定 —— 所以不与 PATCH 共用结构体。
 type providerCreateRequest struct {
-	Name            string `json:"name"`
-	Protocol        string `json:"protocol"`
-	Endpoint        string `json:"endpoint"`
-	ProxyURL        string `json:"proxy_url"`
+	Name     string `json:"name"`
+	Protocol string `json:"protocol"`
+	Endpoint string `json:"endpoint"`
+	// NetworkID 指向 networks 表里的一条出站网络（代理配置）。
+	// 空串或 store.NetworkDirectID = 直连（默认），见 createProviderNetwork。
+	NetworkID       string `json:"network_id"`
 	QuirksJSON      string `json:"quirks_json"`
 	BalanceSpecJSON string `json:"balance_spec_json"`
 	APIKey          string `json:"api_key"`
@@ -56,24 +58,30 @@ type providerUpdateRequest struct {
 	TimeoutMs  *int    `json:"timeout_ms"`
 	MaxRetries *int    `json:"max_retries"`
 	QuirksJSON *string `json:"quirks_json"`
-	// ProxyURL 是**指针**而非 string：空串是合法值（= 不代理，清掉已配的
-	// 代理）。用 string 的话，未提供时会被序列化成 ""，与「显式清空」不可分辨，
-	// 于是「只想改个名字」会把代理悄悄抹掉。
-	ProxyURL *string `json:"proxy_url"`
-	// BalanceSpecJSON 与 ProxyURL 同为指针：空串是「不配余额查询」的显式值。
+	// NetworkID 是**指针**而非 string：空串是合法值（= 回到直连，清掉已选的
+	// 网络）。用 string 的话，未提供时会被序列化成 ""，与「显式清空」不可分辨，
+	// 于是「只想改个名字」会把网络悄悄抹掉。
+	NetworkID *string `json:"network_id"`
+	// BalanceSpecJSON 与 NetworkID 同为指针：空串是「不配余额查询」的显式值。
 	BalanceSpecJSON *string `json:"balance_spec_json"`
 }
 
 type providerResponse struct {
-	ID              string `json:"id"`
-	Slug            string `json:"slug"`
-	Name            string `json:"name"`
-	Protocol        string `json:"protocol"`
-	Endpoint        string `json:"endpoint"`
-	Enabled         bool   `json:"enabled"`
-	TimeoutMs       int    `json:"timeout_ms"`
-	MaxRetries      int    `json:"max_retries"`
-	QuirksJSON      string `json:"quirks_json"`
+	ID         string `json:"id"`
+	Slug       string `json:"slug"`
+	Name       string `json:"name"`
+	Protocol   string `json:"protocol"`
+	Endpoint   string `json:"endpoint"`
+	Enabled    bool   `json:"enabled"`
+	TimeoutMs  int    `json:"timeout_ms"`
+	MaxRetries int    `json:"max_retries"`
+	QuirksJSON string `json:"quirks_json"`
+	// NetworkID 是该上游选择的出站网络。空串 = 直连。
+	//
+	// 响应同时带上 ProxyURL（派生值，即所选网络的地址）—— 那是**只读**的
+	// 展示用字段：前端填表只认 NetworkID，ProxyURL 存在只是让「这个网络
+	// 到底指向哪个地址」不必再发一次请求就能显示。
+	NetworkID       string `json:"network_id"`
 	ProxyURL        string `json:"proxy_url"`
 	BalanceSpecJSON string `json:"balance_spec_json"`
 	CreatedAt       int64  `json:"created_at"`
@@ -130,6 +138,27 @@ func writeProviderWriteError(w http.ResponseWriter, action string, err error) {
 	writeServerError(w, action, err)
 }
 
+// resolveNetworkID 校验请求给出的 network_id 并归一成库里的形态。
+//
+// 空串 / store.NetworkDirectID = 直连，返回空串（库里落 NULL）。
+// 其余取值必须**真的存在**：一个指向不存在网络的 network_id 若照写，
+// 该上游会在池构建时安静地退回直连 —— 界面显示「走代理 A」、实际直连，
+// 而症状是「连不上」。在入口挡住，那才是能立刻定位的错误。
+func resolveNetworkID(ctx context.Context, st *store.Store, id string) (string, error) {
+	trimmed := strings.TrimSpace(id)
+	if trimmed == "" || trimmed == store.NetworkDirectID {
+		return "", nil
+	}
+	n, err := st.GetNetwork(ctx, trimmed)
+	if err != nil {
+		return "", err
+	}
+	if n == nil {
+		return "", fmt.Errorf("network_id %q 指向的网络不存在（可能已被删除）", trimmed)
+	}
+	return n.ID, nil
+}
+
 // List 列出全部 provider，并附带**运行时**就绪状态。
 //
 // 就绪状态来自当前快照而不是库：库只记录配了什么，快照才反映「池实际建出了什么」。
@@ -184,6 +213,11 @@ func (h *ProviderHandler) Create(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
+	networkID, err := resolveNetworkID(r.Context(), h.store, req.NetworkID)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
 
 	now := time.Now().UnixMilli()
 	// 创建时就校验余额配置：与 PATCH 同一份 parseBalanceSpec，保证
@@ -210,7 +244,7 @@ func (h *ProviderHandler) Create(w http.ResponseWriter, r *http.Request) {
 		TimeoutMs:       h.cfg.Defaults.UpstreamTimeoutMs,
 		MaxRetries:      h.cfg.Defaults.MaxRetries,
 		QuirksJSON:      req.QuirksJSON,
-		ProxyURL:        req.ProxyURL,
+		NetworkID:       networkID,
 		BalanceSpecJSON: balanceSpec,
 		CreatedAt:       now,
 		UpdatedAt:       now,
@@ -337,10 +371,15 @@ func (h *ProviderHandler) Update(w http.ResponseWriter, r *http.Request, id stri
 	if req.QuirksJSON != nil {
 		existing.QuirksJSON = *req.QuirksJSON
 	}
-	// 代理同样可清空：留空 = 不代理。与 QuirksJSON 同一档处理，
-	// 因为「卸掉代理」和「从没配过代理」在使用上没有任何区别。
-	if req.ProxyURL != nil {
-		existing.ProxyURL = strings.TrimSpace(*req.ProxyURL)
+	// 出站网络同样可清空：留空 = 回到直连。与 QuirksJSON 同一档处理，
+	// 因为「换成直连」和「从没选过网络」在使用上没有任何区别。
+	if req.NetworkID != nil {
+		networkID, err := resolveNetworkID(r.Context(), h.store, *req.NetworkID)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		existing.NetworkID = networkID
 	}
 	// 余额查询配置同样可清空（留空 = 回到按端点特征的自动判定）。
 	//
@@ -532,6 +571,7 @@ func toProviderResponse(p store.Provider) providerResponse {
 		TimeoutMs:       p.TimeoutMs,
 		MaxRetries:      p.MaxRetries,
 		QuirksJSON:      p.QuirksJSON,
+		NetworkID:       p.NetworkID,
 		ProxyURL:        p.ProxyURL,
 		BalanceSpecJSON: p.BalanceSpecJSON,
 		CreatedAt:       p.CreatedAt,

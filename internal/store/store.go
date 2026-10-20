@@ -101,6 +101,24 @@ func (s *Store) Ping(ctx context.Context) error {
 
 func (s *Store) migrate() error {
 	migrations := []string{
+		// networks：出站网络选项（2026-10-20）。
+		//
+		// 为什么建表而不是继续在 providers.proxy_url 里手填 URL：代理地址是
+		// **多个上游共用**的（同一个 clash / 公司代理），而 URL 串在每个上游
+		// 上各存一份，改一次要改 N 处、且手写容易打错（少个斜杠、端口写错
+		// 都不报错，只是连不上 → 504）。建表后「有哪些网络」是一份可枚举的
+		// 清单，新建上游从下拉里选，要新增点「新建网络」，填一次到处可用。
+		//
+		// 必须排在 providers 之前：providers.network_id 的 FK 指向本表，
+		// 而 ALTER TABLE ADD COLUMN ... REFERENCES 要求目标表已存在。
+		//
+		// 直连不是行，而是一个保留的 id —— 见 NetworkDirectID 的注释。
+		`CREATE TABLE IF NOT EXISTS networks (
+			id         TEXT PRIMARY KEY,
+			name       TEXT NOT NULL UNIQUE,
+			proxy_url  TEXT NOT NULL,
+			created_at INTEGER NOT NULL
+		)`,
 		`CREATE TABLE IF NOT EXISTS providers (
 			id            TEXT PRIMARY KEY,
 			slug          TEXT NOT NULL UNIQUE,
@@ -111,18 +129,18 @@ func (s *Store) migrate() error {
 			timeout_ms    INTEGER NOT NULL DEFAULT 0,
 			max_retries   INTEGER NOT NULL DEFAULT 2,
 			quirks_json   TEXT,
-			-- 该 provider 独享的出站代理（HTTP/HTTPS/SOCKS5 的 URL）。
-			-- 空串 = 直连，读进程环境变量里的 HTTP_PROXY / HTTPS_PROXY。
+			-- 该 provider 走的出站网络，指向 networks(id)（2026-10-20）。
+			-- NULL / '' = 直连，等价于保留 id NetworkDirectID。
 			--
-			-- 为什么要 per-provider 而不是全局：上游服务商的网络位置差异很大
-			-- —— 有的要翻墙（api.openai.com）、有的国内直连即可（deepseek）、
-			-- 有的只能走公司内网代理。一个全局开关会让「能直连的那些」也平白
-			-- 多绕一跳，延迟和故障面都上去。
+			-- 为什么用外键而不是继续在每行手填代理 URL：同一个 clash / 公司
+			-- 代理会被多个上游共用，URL 各存一份意味着改一次要改 N 处，且
+			-- 手写容易打错（少个斜杠、端口写错都不报错，只是连不上 → 504）。
+			-- 建 networks 表后「有哪些网络」是一份可枚举的清单，新建上游从
+			-- 下拉里选，要新增点「新建网络」，填一次到处可用。
 			--
-			-- 为什么可空而不带 DEFAULT：空串是「不代理」的显式值，与 NULL 必须
-			-- 可区分 —— 老库迁移后 NULL 表示「从没配过」，语义上等价于不代理，
-			-- 于是这里不设 DEFAULT，读取时靠 COALESCE 兜。
-			proxy_url     TEXT,
+			-- ON DELETE SET NULL：删掉一个网络只让引用它的上游回到直连，
+			-- 而不是级联删掉上游（后者是灾难性的）。
+			network_id    TEXT REFERENCES networks(id) ON DELETE SET NULL,
 			-- 余额查询的显式配置（JSON）。空串 = 不配，回落到按端点特征的
 			-- 自动判定（OpenAI 官方 billing / DeepSeek user/balance）。
 			--
@@ -584,6 +602,12 @@ func (s *Store) migrate() error {
 	if err := s.ensureColumns(); err != nil {
 		return err
 	}
+	// 老库的 providers.proxy_url → networks 的迁移（2026-10-20）。
+	// 必须在 ensureColumns 之后（network_id 那列是它刚补的），且必须在
+	// dropDeadColumns 之前（那时 proxy_url 列还在，读得到旧数据）。
+	if err := s.backfillProxyNetworks(context.Background()); err != nil {
+		return err
+	}
 	// 扣费幂等表的主键修复（2026-10-10 P0）：单列 request_id 主键会让两个用户
 	// 撞同一个 request_id 时第二个人的扣费被静默跳过 —— 一次真正的扣费凭空消失。
 	// 必须排在任何扣费写入之前，且要逐行搬运老数据（那里面是已发生的账目）。
@@ -674,6 +698,11 @@ func (s *Store) dropDeadColumns() error {
 		// 「界面能配但不生效」，正是本函数存在的目的所反对的那类状态。
 		{"access_keys", "last_used_at"},
 		// rpm_limit / tpm_limit 已随限速功能加回（见 ensureColumns），不再摘除。
+		// providers.proxy_url 已于 2026-10-20 被 network_id 取代：老库的
+		// 非空值先由 backfillProxyNetworks 搬进 networks 行再摘掉这列。
+		// 保留它等于让「代理地址」有两种存放位置 —— 改了 network 指向的
+		// 网络却仍被这列的值覆盖（或者反过来），且没有任何地方会提示。
+		{"providers", "proxy_url"},
 		{"routes", "priority"},
 		{"routes", "extra_json"},
 		{"routes", "fallback_route_id"},
@@ -809,12 +838,12 @@ func (s *Store) ensureColumns() error {
 		// 这条验收失守 —— 而那正是归档表存在的全部理由。
 		{"usage_daily_rollups", "ok_output_tokens", "INTEGER NOT NULL DEFAULT 0"},
 		{"usage_daily_rollups", "ok_latency_sum_ms", "INTEGER NOT NULL DEFAULT 0"},
-		// 该 provider 独享的出站代理（2026-10-16）。
+		// 该 provider 走的出站网络（2026-10-20）。可空 = 直连。
 		//
-		// **刻意可空、不带 DEFAULT**：老库没有「代理」这个概念，迁移后为 NULL
-		// 才是诚实的「从没配过」。填 '' 会让「配了空串」与「没配过」不可分辨，
-		// 而前者在界面上要显示成「不代理」、后者要显示成占位提示。
-		{"providers", "proxy_url", "TEXT"},
+		// 老库从 proxy_url 迁过来：proxy_url 非空的那些 provider 会被
+		// backfillProxyNetworks 按 URL 建出 networks 行并回填 network_id；
+		// 不会凭空丢失已有的代理配置。
+		{"providers", "network_id", "TEXT REFERENCES networks(id) ON DELETE SET NULL"},
 		// 余额查询的显式配置（2026-10-17）。可空、不带 DEFAULT：NULL 是
 		// 「从没配过」的诚实状态，与显式清空成 '' 可区分。
 		{"providers", "balance_spec_json", "TEXT"},

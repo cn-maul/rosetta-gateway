@@ -156,8 +156,12 @@ type BootstrapProvider struct {
 	Name     string `json:"name"`
 	Protocol string `json:"protocol"`
 	Endpoint string `json:"endpoint"`
-	// ProxyURL 是该上游独享的出站代理（http/https/socks5）。空 = 不代理。
-	// 与 providers 表里的 proxy_url 同义，bootstrap 路径才能配到它。
+	// ProxyURL 是该上游的出站代理（http/https/socks5）。空 = 直连。
+	//
+	// 库里存的是 network_id（见 store.Provider），而 bootstrap 走配置文件 ——
+	// 那里没有「先建一条网络再引用」的时机可依赖（一条配置里的多个上游
+	// 可能共用同一个代理）。所以配置侧保留直填地址，启动时按 URL 自动建出
+	// 网络并让这些上游引用它：配置侧保持「填一次」，运行时仍是共享清单。
 	ProxyURL    string                `json:"proxy_url"`
 	Credentials []BootstrapCredential `json:"credentials"`
 	Models      []string              `json:"models"`

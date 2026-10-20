@@ -11,11 +11,18 @@ export interface Provider {
   max_retries: number
   quirks_json: string
   /**
-   * 该上游独享的出站代理（http/https/socks5）。空串 = 不代理。
+   * 该上游选择的出站网络（networks.id）。空串 = 直连。
    *
-   * 为什么是 per-provider 而不是全局：上游的网络位置差异很大 ——
-   * 有的要翻墙、有的国内直连即可、有的只能走公司内网代理。
-   * 全局开关会让能直连的那些也平白多绕一跳。
+   * 代理地址是多个上游共用的一份配置，所以放在 networks 表里而不是每个
+   * 上游各存一份 URL —— 改一次要改 N 处，且手写 URL 极易打错。
+   */
+  network_id: string
+  /**
+   * 所选网络实际指向的代理地址（**只读派生值**）。
+   *
+   * 前端只往回写 network_id；这个字段只用来在界面上显示「这条网络
+   * 到底指向哪个地址」，不必再发一次请求去查网络清单。
+   * 直连时为空串。
    */
   proxy_url: string
   /**
@@ -53,8 +60,8 @@ export interface ProviderCreatePayload {
   name: string
   protocol: string
   endpoint: string
-  /** 出站代理；留空 = 不代理。 */
-  proxy_url?: string
+  /** 出站网络（networks.id）；留空或 "direct" = 直连（新建的默认值）。 */
+  network_id?: string
   /**
    * 余额查询的显式配置（JSON 字符串，不是对象 —— 后端整串存、整串校验）。
    * 留空 = 不配，回落到内置的自动判定（OpenAI 官方 / DeepSeek）。
@@ -79,8 +86,11 @@ export interface ProviderUpdatePayload {
   timeout_ms?: number
   max_retries?: number
   quirks_json?: string
-  /** 出站代理。传空串是**清空**，不是「不改」—— 卸载代理必须能表达。 */
-  proxy_url?: string
+  /**
+   * 出站网络。传空串或 "direct" 是**换回直连**，不是「不改」——
+   * 把上游从代理切回直连必须能表达。
+   */
+  network_id?: string
   /** 余额查询配置。传空串是**清空**（回到自动判定），与 proxy_url 同语义。 */
   balance_spec_json?: string
 }
@@ -213,6 +223,25 @@ export interface ModelGroup {
   id: string
   display_name: string
   member_count: number
+  created_at?: number
+}
+
+/**
+ * 一条出站网络（可复用的代理配置）。
+ *
+ * 代理地址天然是多个上游共用的，所以它是一份**清单**而不是每个上游各填
+ * 一次 URL：改一次要改 N 处，且手写 URL 极易打错（少个斜杠、端口写错都
+ * 不报错，只是连不上）。
+ *
+ * 直连不是一条 Network —— 它是保留 id 'direct'，由前端作为下拉第一项
+ * 硬编码（后端 ListNetworks 不返回它，因为它没有可配置的内容）。
+ */
+export interface Network {
+  id: string
+  name: string
+  proxy_url: string
+  /** 引用该网络的上游数（派生值）。删网络前用它提示影响面。 */
+  provider_count: number
   created_at?: number
 }
 
