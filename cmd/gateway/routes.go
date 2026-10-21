@@ -16,6 +16,7 @@ import (
 	"github.com/cn-maul/rosetta-gateway/internal/billinghttp"
 	"github.com/cn-maul/rosetta-gateway/internal/config"
 	"github.com/cn-maul/rosetta-gateway/internal/dataplane"
+	"github.com/cn-maul/rosetta-gateway/internal/gatewayapp"
 	"github.com/cn-maul/rosetta-gateway/internal/ingress"
 	"github.com/cn-maul/rosetta-gateway/internal/ratelimit"
 	"github.com/cn-maul/rosetta-gateway/internal/server"
@@ -96,6 +97,22 @@ func (m *routeMux) HandleFunc(pattern string, h func(http.ResponseWriter, *http.
 // buildHandler 注册生产路由并套上生产中间件。
 func buildHandler(d routeDeps) http.Handler {
 	return buildApp(d).Handler
+}
+
+// buildHandlerFromApp adapts the lifecycle-owned dependencies to the command
+// package's routeDeps without making gatewayapp depend on cmd/gateway.
+func buildHandlerFromApp(d gatewayapp.HandlerDeps) http.Handler {
+	return buildHandler(routeDeps{
+		db:          d.DB,
+		cfg:         d.Config,
+		logger:      d.Logger,
+		masterKey:   d.MasterKey,
+		pool:        d.Pool,
+		reloader:    d.Reloader,
+		sessionMgr:  d.SessionManager,
+		rateLimiter: d.RateLimiter,
+		usage:       d.Usage,
+	})
 }
 
 // buildApp 与 buildHandler 是同一套生产装配；额外返回真实 mux 与路由清单

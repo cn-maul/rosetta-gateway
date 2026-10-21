@@ -35,6 +35,14 @@ type bootstrapTokenStore interface {
 // 引导会跳过并记 WARN，绝不覆盖别人的账号。
 const bootstrapAdminUsername = "admin"
 
+// initializeAdminBootstrap is the startup hook injected into gatewayapp.Run.
+// The implementation stays in this package so the existing fail-closed
+// bootstrap tests continue to exercise the exact production functions.
+func initializeAdminBootstrap(ctx context.Context, db *store.Store, logger *slog.Logger) error {
+	ensureBootstrapAdmin(ctx, db, logger)
+	return ensureBootstrapToken(ctx, db, logger)
+}
+
 // ensureBootstrapAdmin 在 users 表为空时建出一个待初始化的 admin 账号。
 //
 // # 它解决的是什么问题
