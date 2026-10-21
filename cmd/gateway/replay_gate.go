@@ -47,7 +47,7 @@ import (
 // applyReplayGate 按目标上游协议剥掉无法回放的思考块，并丢弃剥空后的
 // assistant turn。幂等、可重复调用。
 //
-// 与 applyUpstreamExtras / applyThinkingCapability 一样，必须在每个
+// 与 ingress.Request.ApplyUpstreamExtras / ApplyThinkingCapability 一样，必须在每个
 // attempt 内部调（协议是「发给谁」这一层的属性）。
 func applyReplayGate(req *rosetta.ChatRequest, protocol string) {
 	// keepThinking 表达「这个协议能原样回放哪一类思考块」。

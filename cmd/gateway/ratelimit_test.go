@@ -7,6 +7,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/cn-maul/rosetta-gateway/internal/ingress"
 	"github.com/cn-maul/rosetta-gateway/internal/snapshot"
 )
 
@@ -17,7 +18,7 @@ func TestRateLimit_RPMRejectsThirdRequest(t *testing.T) {
 	h, db, _ := buildHarnessFull(t, []struct {
 		slug, url string
 		fail      bool
-	}{{slug: "good", url: up.URL}}, false, openaiChatCodec{})
+	}{{slug: "good", url: up.URL}}, false, ingress.NewOpenAIChat())
 
 	// 给 k1 配 RPM=2，并从 DB 重建快照（快照是限速额度的下发通道）。
 	k, err := db.GetAccessKey(context.Background(), "k1")

@@ -15,6 +15,7 @@ import (
 	"github.com/cn-maul/rosetta-gateway/internal/admin"
 	"github.com/cn-maul/rosetta-gateway/internal/billinghttp"
 	"github.com/cn-maul/rosetta-gateway/internal/config"
+	"github.com/cn-maul/rosetta-gateway/internal/ingress"
 	"github.com/cn-maul/rosetta-gateway/internal/ratelimit"
 	"github.com/cn-maul/rosetta-gateway/internal/server"
 	"github.com/cn-maul/rosetta-gateway/internal/store"
@@ -126,9 +127,9 @@ func buildApp(d routeDeps) *gatewayApp {
 	userHandler := admin.NewUserHandler(db, sessionMgr).WithReload(reloader.Reload)
 	records := make(map[string]registeredRoute)
 	mux := newRouteMux(false, records)
-	mux.HandleFunc("POST /v1/chat/completions", handleIngress(pool, cfg, usage, rateLimiter, openaiChatCodec{}))
-	mux.HandleFunc("POST /v1/messages", handleIngress(pool, cfg, usage, rateLimiter, anthropicMessagesCodec{}))
-	mux.HandleFunc("POST /v1/responses", handleIngress(pool, cfg, usage, rateLimiter, openaiResponsesCodec{}))
+	mux.HandleFunc("POST /v1/chat/completions", handleIngress(pool, cfg, usage, rateLimiter, ingress.NewOpenAIChat()))
+	mux.HandleFunc("POST /v1/messages", handleIngress(pool, cfg, usage, rateLimiter, ingress.NewAnthropicMessages()))
+	mux.HandleFunc("POST /v1/responses", handleIngress(pool, cfg, usage, rateLimiter, ingress.NewResponses()))
 	// D9：/v1/models 在两种协议下路径相同、响应形状不同 —— 按认证头分流，
 	// 显式别名路径永远优先。
 	mux.HandleFunc("GET /v1/models", handleListModels(""))

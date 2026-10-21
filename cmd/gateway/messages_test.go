@@ -9,6 +9,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/cn-maul/rosetta-gateway/internal/ingress"
 	"github.com/cn-maul/rosetta-gateway/internal/routing"
 	"github.com/cn-maul/rosetta-gateway/internal/snapshot"
 )
@@ -31,7 +32,7 @@ func TestMessages_NonStream(t *testing.T) {
 	h, _, _ := buildHarnessFull(t, []struct {
 		slug, url string
 		fail      bool
-	}{{slug: "good", url: up.URL}}, false, anthropicMessagesCodec{})
+	}{{slug: "good", url: up.URL}}, false, ingress.NewAnthropicMessages())
 
 	rec := postMessages(h, `{"model":"flash","max_tokens":1024,"messages":[{"role":"user","content":"hi"}]}`)
 	if rec.Code != http.StatusOK {
@@ -74,7 +75,7 @@ func TestMessages_Stream(t *testing.T) {
 	h, _, _ := buildHarnessFull(t, []struct {
 		slug, url string
 		fail      bool
-	}{{slug: "good", url: up.URL}}, false, anthropicMessagesCodec{})
+	}{{slug: "good", url: up.URL}}, false, ingress.NewAnthropicMessages())
 
 	rec := postMessages(h, `{"model":"flash","max_tokens":1024,"stream":true,
 		"messages":[{"role":"user","content":"hi"}]}`)
@@ -105,7 +106,7 @@ func TestMessages_AuthErrorShape(t *testing.T) {
 	h, _, _ := buildHarnessFull(t, []struct {
 		slug, url string
 		fail      bool
-	}{{slug: "good", url: up.URL}}, false, anthropicMessagesCodec{})
+	}{{slug: "good", url: up.URL}}, false, ingress.NewAnthropicMessages())
 
 	req := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(`{}`))
 	rec := httptest.NewRecorder()
@@ -135,7 +136,7 @@ func TestMessages_ModelNotFoundShape(t *testing.T) {
 	h, _, _ := buildHarnessFull(t, []struct {
 		slug, url string
 		fail      bool
-	}{{slug: "good", url: up.URL}}, false, anthropicMessagesCodec{})
+	}{{slug: "good", url: up.URL}}, false, ingress.NewAnthropicMessages())
 
 	rec := postMessages(h, `{"model":"nope","max_tokens":8,"messages":[{"role":"user","content":"hi"}]}`)
 	if rec.Code != http.StatusNotFound {

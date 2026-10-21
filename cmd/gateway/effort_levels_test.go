@@ -9,6 +9,7 @@ import (
 
 	"github.com/cn-maul/rosetta"
 	"github.com/cn-maul/rosetta-gateway/internal/effort"
+	"github.com/cn-maul/rosetta-gateway/internal/ingress"
 	"github.com/cn-maul/rosetta-gateway/internal/inwire"
 	"github.com/cn-maul/rosetta-gateway/internal/routing"
 	"github.com/cn-maul/rosetta-gateway/internal/snapshot"
@@ -212,7 +213,7 @@ func TestApplyThinkingCapability_档位处理(t *testing.T) {
 
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			ing := &ingressRequest{rawEffort: c.raw}
+			ing := &ingress.Request{RawEffort: c.raw}
 			req := &rosetta.ChatRequest{
 				Model:    "public",
 				Thinking: &rosetta.ThinkingConfig{Effort: c.initial},
@@ -221,7 +222,7 @@ func TestApplyThinkingCapability_档位处理(t *testing.T) {
 			if proto == "" {
 				proto = "openai-chat"
 			}
-			ing.applyThinkingCapability(req, c.m, proto)
+			ing.ApplyThinkingCapability(req, c.m, proto)
 
 			if req.Thinking.EffortRaw != c.wantRaw {
 				t.Fatalf("EffortRaw = %q，期望 %q", req.Thinking.EffortRaw, c.wantRaw)
@@ -242,7 +243,7 @@ func TestApplyThinkingCapability_档位处理(t *testing.T) {
 // 在只断言 Effort 的测试里完全不可见。
 //
 // 本测试改为断言**最终发往上游的 budget_tokens**，即整条链路真正的落点：
-// 入站预算 → 折算档位（rawEffort）→ 网关夹取 → SDK 三档折算 → 实发预算。
+// 入站预算 → 折算档位（RawEffort）→ 网关夹取 → SDK 三档折算 → 实发预算。
 //
 // # 2026-10-21 修 A2-P1-3 后的口径变化
 //
@@ -250,9 +251,9 @@ func TestApplyThinkingCapability_档位处理(t *testing.T) {
 // 「折算档位」驱动的那一支），而 Anthropic→Anthropic 现在走**原样透传**
 // （预算不折算，见 TestApplyThinkingCapability_Anthropic预算原样透传）。
 //
-// 两条路的区分点是 ingressRequest.anthropicBudget：它 > 0 表示
+// 两条路的区分点是 ingress.Request.AnthropicBudget：它 > 0 表示
 // 「客户端给的是 Anthropic token 预算」，此时网关不折算；本测试构造的
-// ingressRequest 只有 rawEffort（anthropicBudget = 0），走的正是
+// ingress.Request 只有 RawEffort（AnthropicBudget = 0），走的正是
 // 「只有档位可用」的那一支 —— 也就是跨协议时会发生的情形。
 func TestApplyThinkingCapability_Anthropic预算与夹取一致(t *testing.T) {
 	cases := []struct {
@@ -301,8 +302,8 @@ func TestApplyThinkingCapability_Anthropic预算与夹取一致(t *testing.T) {
 					BudgetTokens: int(c.budget),
 				},
 			}
-			ing := &ingressRequest{rawEffort: c.raw}
-			ing.applyThinkingCapability(req, &routing.UpstreamModel{
+			ing := &ingress.Request{RawEffort: c.raw}
+			ing.ApplyThinkingCapability(req, &routing.UpstreamModel{
 				ModelID: "claude", EffortLevels: c.levels,
 			}, "anthropic")
 
@@ -360,8 +361,8 @@ func TestApplyThinkingCapability_Anthropic预算原样透传(t *testing.T) {
 					BudgetTokens: c.budget,
 				},
 			}
-			ing := &ingressRequest{rawEffort: "high", anthropicBudget: c.budget}
-			ing.applyThinkingCapability(req, &routing.UpstreamModel{
+			ing := &ingress.Request{RawEffort: "high", AnthropicBudget: c.budget}
+			ing.ApplyThinkingCapability(req, &routing.UpstreamModel{
 				ModelID: "claude", EffortLevels: c.levels,
 			}, "anthropic")
 
@@ -392,8 +393,8 @@ func TestApplyThinkingCapability_OpenAI系不动预算(t *testing.T) {
 					BudgetTokens: 5000,
 				},
 			}
-			ing := &ingressRequest{rawEffort: "medium"}
-			ing.applyThinkingCapability(req, &routing.UpstreamModel{
+			ing := &ingress.Request{RawEffort: "medium"}
+			ing.ApplyThinkingCapability(req, &routing.UpstreamModel{
 				ModelID: "gpt-5", EffortLevels: []effort.Level{effort.High},
 			}, proto)
 
@@ -419,8 +420,8 @@ func TestApplyThinkingCapability_不支持思考时剥掉(t *testing.T) {
 		Model:    "public",
 		Thinking: &rosetta.ThinkingConfig{EffortRaw: "high"},
 	}
-	ing := &ingressRequest{rawEffort: "high"}
-	ing.applyThinkingCapability(req, &routing.UpstreamModel{
+	ing := &ingress.Request{RawEffort: "high"}
+	ing.ApplyThinkingCapability(req, &routing.UpstreamModel{
 		ModelID: "gpt-4o", SupportsThinking: &no,
 	}, "openai-chat")
 
@@ -439,8 +440,8 @@ func TestApplyThinkingCapability_未配置不等于不支持(t *testing.T) {
 			Model:    "public",
 			Thinking: &rosetta.ThinkingConfig{EffortRaw: "high"},
 		}
-		ing := &ingressRequest{rawEffort: "high"}
-		ing.applyThinkingCapability(req, &routing.UpstreamModel{
+		ing := &ingress.Request{RawEffort: "high"}
+		ing.ApplyThinkingCapability(req, &routing.UpstreamModel{
 			ModelID: "gpt-5", SupportsThinking: sup,
 		}, "openai-chat")
 
@@ -458,8 +459,8 @@ func TestApplyThinkingCapability_未配置不等于不支持(t *testing.T) {
 // 那等于替所有请求打开了思考。
 func TestApplyThinkingCapability_未请求思考不新建Thinking(t *testing.T) {
 	req := &rosetta.ChatRequest{Model: "public"}
-	ing := &ingressRequest{rawEffort: "high"}
-	ing.applyThinkingCapability(req, &routing.UpstreamModel{
+	ing := &ingress.Request{RawEffort: "high"}
+	ing.ApplyThinkingCapability(req, &routing.UpstreamModel{
 		ModelID: "gpt-5", EffortLevels: []effort.Level{effort.Low},
 	}, "openai-chat")
 
@@ -485,7 +486,7 @@ func TestApplyThinkingCapability_未请求思考不新建Thinking(t *testing.T) 
 // 上游定」，两个字段组合起来正好覆盖三种配置。
 //
 // 注意这条只管**披露**：数据面仍然只在显式 false 时才剥掉思考
-// （见 applyThinkingCapability 与 TestApplyThinkingCapability_显式不支持才剥）。
+// （见 ingress.Request.ApplyThinkingCapability 与 TestApplyThinkingCapability_显式不支持才剥）。
 // 若这里改成发 false 而数据面也照做，全部未配置模型会静默失去思考能力。
 func TestListModels_披露思考开关(t *testing.T) {
 	sup := func(b bool) *bool { return &b }
@@ -546,12 +547,12 @@ func TestListModels_披露思考开关(t *testing.T) {
 func TestApplyThinkingCapability_未配置仍然不干预(t *testing.T) {
 	for _, proto := range []string{"openai-chat", "openai-responses", "anthropic"} {
 		t.Run(proto, func(t *testing.T) {
-			ing := &ingressRequest{}
+			ing := &ingress.Request{}
 			req := &rosetta.ChatRequest{}
 			req.Thinking = &rosetta.ThinkingConfig{}
 
 			// SupportsThinking 为 nil（未配置），且没有任何 effort_levels。
-			ing.applyThinkingCapability(req, &routing.UpstreamModel{
+			ing.ApplyThinkingCapability(req, &routing.UpstreamModel{
 				ModelID: "cn:space-bunny", // 未配置态
 			}, proto)
 

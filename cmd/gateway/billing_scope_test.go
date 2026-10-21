@@ -8,6 +8,7 @@ import (
 	"testing"
 
 	"github.com/cn-maul/rosetta-gateway/internal/billinghttp"
+	"github.com/cn-maul/rosetta-gateway/internal/ingress"
 	"github.com/cn-maul/rosetta-gateway/internal/store"
 )
 
@@ -26,7 +27,7 @@ func TestOrgEndpoints_ScopedToCallerUser(t *testing.T) {
 	_, db, _ := buildHarnessFull(t, []struct {
 		slug, url string
 		fail      bool
-	}{{slug: "good", url: up.URL}}, false, openaiChatCodec{})
+	}{{slug: "good", url: up.URL}}, false, ingress.NewOpenAIChat())
 	ctx := context.Background()
 
 	if err := db.CreateProvider(ctx, &store.Provider{
@@ -85,7 +86,7 @@ func TestBillingUsage_BadDateRangeIsRejected(t *testing.T) {
 	_, db, _ := buildHarnessFull(t, []struct {
 		slug, url string
 		fail      bool
-	}{{slug: "good", url: up.URL}}, false, openaiChatCodec{})
+	}{{slug: "good", url: up.URL}}, false, ingress.NewOpenAIChat())
 
 	for _, q := range []string{
 		"/v1/dashboard/billing/usage?start_date=garbage",

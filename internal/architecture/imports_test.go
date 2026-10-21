@@ -152,6 +152,18 @@ func checkRules(packages map[string]packageImports) []string {
 			},
 			message: "billing 是纯计价/预检策略，不得依赖 HTTP、全局快照、usage 状态机或进程入口",
 		},
+		{
+			from: modulePath + "/internal/ingress",
+			forbid: []string{
+				modulePath + "/internal/admin",
+				modulePath + "/internal/server",
+				modulePath + "/internal/snapshot",
+				modulePath + "/internal/usage",
+				modulePath + "/internal/billing",
+				modulePath + "/cmd/gateway",
+			},
+			message: "ingress 只做下游协议编解码，不得依赖管理面、运行时状态、计费状态机或进程入口",
+		},
 	}
 
 	var violations []string

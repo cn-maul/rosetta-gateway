@@ -35,7 +35,7 @@ func IsBalanceExempt(role string) bool { return role == store.RoleAdmin }
 
 // estimateBalanceCost 估算「本次请求大概要花多少钱」（单位：**分**）。
 //
-// 输入侧与 estimateRequestTokens 同思路（文本/思考/工具参数/工具定义的字符
+// 输入侧与 ingress.EstimateRequestTokens 同思路（文本/思考/工具参数/工具定义的字符
 // 估算），输出侧按 max_tokens **全额计上界** —— 输出长度事前不可知，流式更是
 // 边生成边计费，取上界是唯一诚实的做法：宁可高估把请求挡在门外（用户充值后
 // 重试），也不要低估放行后才发现钱不够。

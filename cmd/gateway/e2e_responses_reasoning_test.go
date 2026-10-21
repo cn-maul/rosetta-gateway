@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"github.com/cn-maul/rosetta-gateway/internal/ingress"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -47,7 +48,7 @@ func TestE2E_Responses_ReasoningSealedRoundTrip(t *testing.T) {
 
 	h := buildHarnessProtocols(t, []harnessChain{
 		{slug: "good", url: up.URL, protocol: "openai-responses"},
-	}, false, openaiResponsesCodec{})
+	}, false, ingress.NewResponses())
 
 	// --- 第一轮：拿到 reasoning item ---
 	rec := e2ePost(h, "/v1/responses", testAccessKey, `{
@@ -158,7 +159,7 @@ func TestE2E_Responses_ReasoningSealedStream(t *testing.T) {
 
 	h := buildHarnessProtocols(t, []harnessChain{
 		{slug: "good", url: up.URL, protocol: "openai-responses"},
-	}, false, openaiResponsesCodec{})
+	}, false, ingress.NewResponses())
 
 	rec := e2ePost(h, "/v1/responses", testAccessKey, `{
 		"model":"flash","stream":true,

@@ -266,7 +266,7 @@ func ToRosettaLevel(l Level) string {
 		return "low"
 	// XHigh 与 Max 都落到 rosetta 的 high：rosetta 只认三档，这个接缝处
 	// 必然有损。真实档位靠 EffortRaw 原样透传（见 main.go 的
-	// applyThinkingCapability），所以「客户端要 max、上游收 max」这条
+	// ingress.Request.ApplyThinkingCapability），所以「客户端要 max、上游收 max」这条
 	// 路径不受这里的折叠影响 —— 折叠只发生在 anthropic 那种没有 effort
 	// 字段、必须用 token 预算表达的协议上。
 	case High, XHigh, Max:

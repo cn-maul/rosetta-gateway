@@ -14,6 +14,7 @@ import (
 	"testing"
 
 	"github.com/cn-maul/rosetta-gateway/internal/config"
+	"github.com/cn-maul/rosetta-gateway/internal/ingress"
 	"github.com/cn-maul/rosetta-gateway/internal/ratelimit"
 	"github.com/cn-maul/rosetta-gateway/internal/routing"
 	"github.com/cn-maul/rosetta-gateway/internal/snapshot"
@@ -33,7 +34,7 @@ type harnessChain struct {
 // buildHarnessProtocols 组一套「pool + 快照 + 临时库」，链顺序由 providers
 // 入参决定（第一个=链首），protocol 逐 provider 生效。结构复制自
 // buildHarnessFull（它的匿名入参结构被十几个既有用例内联声明，不便改签名）。
-func buildHarnessProtocols(t *testing.T, chain []harnessChain, failover bool, codec ingressCodec) http.HandlerFunc {
+func buildHarnessProtocols(t *testing.T, chain []harnessChain, failover bool, codec ingress.Codec) http.HandlerFunc {
 	t.Helper()
 
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
@@ -133,7 +134,7 @@ func TestStructuredOutput_AnthropicOnlyChainRejected(t *testing.T) {
 	anth := fakeAnthropic(t, &hits)
 	defer anth.Close()
 
-	h := buildHarnessProtocols(t, []harnessChain{{slug: "claude", url: anth.URL, protocol: "anthropic"}}, false, openaiChatCodec{})
+	h := buildHarnessProtocols(t, []harnessChain{{slug: "claude", url: anth.URL, protocol: "anthropic"}}, false, ingress.NewOpenAIChat())
 
 	rec := postRaw(h, `{"model":"flash","messages":[{"role":"user","content":"hi"}],"stream":false,
 		"response_format":{"type":"json_schema","json_schema":{"name":"out","strict":true,"schema":{"type":"object"}}}}`)
@@ -160,7 +161,7 @@ func TestStructuredOutput_FailoverSkipsAnthropicCandidate(t *testing.T) {
 	h := buildHarnessProtocols(t, []harnessChain{
 		{slug: "openai", url: bad.URL, protocol: "openai-chat"},
 		{slug: "claude", url: anth.URL, protocol: "anthropic"},
-	}, true, openaiChatCodec{})
+	}, true, ingress.NewOpenAIChat())
 
 	rec := postRaw(h, `{"model":"flash","messages":[{"role":"user","content":"hi"}],"stream":false,
 		"response_format":{"type":"json_schema","json_schema":{"name":"out","schema":{"type":"object"}}}}`)
@@ -186,7 +187,7 @@ func TestStructuredOutput_OpenAIChatTargetStillServes(t *testing.T) {
 	up := recordingUpstream(t, ch, false)
 	defer up.Close()
 
-	h := buildHarnessProtocols(t, []harnessChain{{slug: "openai", url: up.URL, protocol: "openai-chat"}}, false, openaiChatCodec{})
+	h := buildHarnessProtocols(t, []harnessChain{{slug: "openai", url: up.URL, protocol: "openai-chat"}}, false, ingress.NewOpenAIChat())
 
 	rec := postRaw(h, `{"model":"flash","messages":[{"role":"user","content":"hi"}],"stream":false,
 		"response_format":{"type":"json_schema","json_schema":{"name":"out","schema":{"type":"object"}}}}`)
@@ -207,7 +208,7 @@ func TestStructuredOutput_ResponsesIngressAnthropicChainRejected(t *testing.T) {
 	anth := fakeAnthropic(t, &hits)
 	defer anth.Close()
 
-	h := buildHarnessProtocols(t, []harnessChain{{slug: "claude", url: anth.URL, protocol: "anthropic"}}, false, openaiResponsesCodec{})
+	h := buildHarnessProtocols(t, []harnessChain{{slug: "claude", url: anth.URL, protocol: "anthropic"}}, false, ingress.NewResponses())
 
 	body := `{"model":"flash","input":"hi","text":{"format":{"type":"json_schema","name":"out","schema":{"type":"object"}}}}`
 	req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(body))
@@ -233,7 +234,7 @@ func TestStructuredOutput_AnthropicIngressNotFiltered(t *testing.T) {
 	anth := fakeAnthropic(t, &hits)
 	defer anth.Close()
 
-	h := buildHarnessProtocols(t, []harnessChain{{slug: "claude", url: anth.URL, protocol: "anthropic"}}, false, anthropicMessagesCodec{})
+	h := buildHarnessProtocols(t, []harnessChain{{slug: "claude", url: anth.URL, protocol: "anthropic"}}, false, ingress.NewAnthropicMessages())
 
 	rec := postMessages(h, `{"model":"flash","max_tokens":64,"messages":[{"role":"user","content":"hi"}]}`)
 	if rec.Code != http.StatusOK {

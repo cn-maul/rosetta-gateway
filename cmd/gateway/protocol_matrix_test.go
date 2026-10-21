@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"github.com/cn-maul/rosetta-gateway/internal/ingress"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -15,7 +16,7 @@ import (
 // 这是整个网关的核心价值主张：「/v1/responses 进、openai-chat 上游」这种
 // 组合必须可用，否则 Codex CLI 之类只说 responses 的客户端就没法接
 // DeepSeek / 大部分国产 chat 上游。三条入站路径共享一个 handleIngress，
-// 协议差异收在 ingressCodec 里，转换本体由 rosetta SDK 承担。
+// 协议差异收在 ingress.Codec 里，转换本体由 rosetta SDK 承担。
 //
 // 假上游按**自己的**协议回一个最小成功响应，测试只断言两件事：
 //  1. 网关返回 200（转换没炸）；
@@ -34,14 +35,14 @@ func TestProtocolMatrix_AnyIngressToAnyUpstream(t *testing.T) {
 		name    string
 		path    string
 		body    string
-		codec   ingressCodec
+		codec   ingress.Codec
 		extract func(t *testing.T, body []byte) string
 	}{
 		{
 			name:  "chat",
 			path:  "/v1/chat/completions",
 			body:  `{"model":"flash","stream":false,"messages":[{"role":"user","content":"hi"}]}`,
-			codec: openaiChatCodec{},
+			codec: ingress.NewOpenAIChat(),
 			extract: func(t *testing.T, body []byte) string {
 				var v struct {
 					Choices []struct {
@@ -63,7 +64,7 @@ func TestProtocolMatrix_AnyIngressToAnyUpstream(t *testing.T) {
 			name:  "responses",
 			path:  "/v1/responses",
 			body:  `{"model":"flash","stream":false,"input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"hi"}]}]}`,
-			codec: openaiResponsesCodec{},
+			codec: ingress.NewResponses(),
 			extract: func(t *testing.T, body []byte) string {
 				var v struct {
 					Output []struct {
@@ -92,7 +93,7 @@ func TestProtocolMatrix_AnyIngressToAnyUpstream(t *testing.T) {
 			name:  "anthropic",
 			path:  "/v1/messages",
 			body:  `{"model":"flash","stream":false,"max_tokens":64,"messages":[{"role":"user","content":"hi"}]}`,
-			codec: anthropicMessagesCodec{},
+			codec: ingress.NewAnthropicMessages(),
 			extract: func(t *testing.T, body []byte) string {
 				var v struct {
 					Content []struct {
@@ -182,17 +183,17 @@ func TestProtocolMatrix_Streaming(t *testing.T) {
 		name  string
 		path  string
 		body  string
-		codec ingressCodec
+		codec ingress.Codec
 	}{
 		{"chat", "/v1/chat/completions",
 			`{"model":"flash","stream":true,"messages":[{"role":"user","content":"hi"}],"stream_options":{"include_usage":true}}`,
-			openaiChatCodec{}},
+			ingress.NewOpenAIChat()},
 		{"responses", "/v1/responses",
 			`{"model":"flash","stream":true,"input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"hi"}]}]}`,
-			openaiResponsesCodec{}},
+			ingress.NewResponses()},
 		{"anthropic", "/v1/messages",
 			`{"model":"flash","stream":true,"max_tokens":64,"messages":[{"role":"user","content":"hi"}]}`,
-			anthropicMessagesCodec{}},
+			ingress.NewAnthropicMessages()},
 	}
 
 	for _, up := range upstreams {

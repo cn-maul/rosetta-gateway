@@ -14,6 +14,7 @@ import (
 
 	"github.com/cn-maul/rosetta-gateway/internal/admin"
 	"github.com/cn-maul/rosetta-gateway/internal/billinghttp"
+	"github.com/cn-maul/rosetta-gateway/internal/ingress"
 	"github.com/cn-maul/rosetta-gateway/internal/routing"
 	"github.com/cn-maul/rosetta-gateway/internal/server"
 	"github.com/cn-maul/rosetta-gateway/internal/snapshot"
@@ -122,7 +123,7 @@ func TestBillingEndpoints(t *testing.T) {
 	_, db, _ := buildHarnessFull(t, []struct {
 		slug, url string
 		fail      bool
-	}{{slug: "good", url: up.URL}}, false, openaiChatCodec{})
+	}{{slug: "good", url: up.URL}}, false, ingress.NewOpenAIChat())
 	ctx := context.Background()
 
 	// key 配额 200 万 token，已用 50 万（插一条 usage 记录驱动触发器）。
@@ -273,7 +274,7 @@ func TestResponsesIngress_NonStream(t *testing.T) {
 	h, _, _ := buildHarnessFull(t, []struct {
 		slug, url string
 		fail      bool
-	}{{slug: "good", url: up.URL}}, false, openaiResponsesCodec{})
+	}{{slug: "good", url: up.URL}}, false, ingress.NewResponses())
 
 	body := `{"model":"flash","input":"hi","max_output_tokens":256}`
 	req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(body))
@@ -314,7 +315,7 @@ func TestResponsesIngress_Stream(t *testing.T) {
 	h, _, _ := buildHarnessFull(t, []struct {
 		slug, url string
 		fail      bool
-	}{{slug: "good", url: up.URL}}, false, openaiResponsesCodec{})
+	}{{slug: "good", url: up.URL}}, false, ingress.NewResponses())
 
 	body := `{"model":"flash","input":"hi","stream":true}`
 	req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(body))

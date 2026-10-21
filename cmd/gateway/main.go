@@ -26,8 +26,7 @@ import (
 	"github.com/cn-maul/rosetta-gateway/internal/authhttp"
 	"github.com/cn-maul/rosetta-gateway/internal/config"
 	"github.com/cn-maul/rosetta-gateway/internal/crypto"
-	"github.com/cn-maul/rosetta-gateway/internal/effort"
-	"github.com/cn-maul/rosetta-gateway/internal/inwire"
+	"github.com/cn-maul/rosetta-gateway/internal/ingress"
 	"github.com/cn-maul/rosetta-gateway/internal/outwire"
 	"github.com/cn-maul/rosetta-gateway/internal/probe"
 	"github.com/cn-maul/rosetta-gateway/internal/ratelimit"
@@ -1125,177 +1124,6 @@ func denyAdminKeyCreate(next http.HandlerFunc) http.HandlerFunc {
 	}
 }
 
-// ---- 下游协议编解码（DESIGN §6.1 / §7）----
-//
-// ingressCodec 抽象「下游协议」的差异：解码请求、写错误、编码非流式响应、
-// 构造流式 sink。转发的骨架（鉴权、配额、路由、故障转移、看门狗、落库）
-// 是协议无关的，只有 handleIngress 一个实现 —— 新增下游协议不再复制循环。
-type ingressCodec interface {
-	// Name 是 usage_records.ingress_protocol 的取值。
-	Name() string
-	// Decode 读取并解析请求体；错误由调用方映射成 400/413。
-	Decode(r *http.Request, maxBytes int64) (*ingressRequest, error)
-	// WriteError 把网关内部 code 渲染成协议的错误形状。
-	WriteError(w http.ResponseWriter, status int, code, message string)
-	// WriteNonStream 编码非流式成功响应。
-	//
-	// 带上 ingressRequest 是为了 openai-responses：它要把入站降级过的工具
-	// 还原成原生 item 形态（custom_tool_call / local_shell_call）。其他协议
-	// 不需要，忽略即可。
-	WriteNonStream(w http.ResponseWriter, resp *rosetta.ChatResponse, model string, ing *ingressRequest)
-	// NewSink 构造流式编码器；调用前 SSE 响应头已写出。
-	NewSink(w http.ResponseWriter, model string, ing *ingressRequest) outwire.StreamSink
-}
-
-// ingressRequest 是解码后的协议无关请求视图。
-//
-// buildRosetta 是**每次 attempt 调一次**的工厂而不是建好的请求：链上各目标的
-// 上游协议可能不同，applyUpstreamExtras 会往 req.Extra 挂不同形状的协议私有
-// 字段，跨 attempt 复用同一个实例会把 A 目标的 Extra 泄漏给 B 目标。
-type ingressRequest struct {
-	buildRosetta     func() *rosetta.ChatRequest
-	stream           bool
-	model            string // 对外的公开模型名（解析前原样）
-	wantsStreamUsage bool
-	// requiresStructuredOutput 表示请求带**硬性**结构化输出约束（chat 的
-	// response_format 或 responses 的 text.format 为 json_object / json_schema）。
-	// 这类约束打到 anthropic 上游等于「200 但约束静默丢失」，不能放行 ——
-	// handleIngress 据此把 anthropic 候选从链上滤掉，全被滤空则 400。
-	requiresStructuredOutput bool
-	applyUpstreamExtras      func(req *rosetta.ChatRequest, upstreamProtocol string)
-
-	// rawEffort 是客户端**原样**请求的思考挡位（归一到三档之前），空串 = 未指定。
-	//
-	// 为什么要单独带一路而不复用 buildRosetta 之后的 Thinking.Effort：三档归一
-	// 会把 minimal 合并进 low、xhigh 合并进 high，而模型档位配置可能恰好只支持
-	// xhigh 或 minimal —— 归一之后再夹取就会选错档，等于这个功能没做。
-	rawEffort string
-
-	// anthropicBudget 是 Anthropic 入站时客户端给的**原始 token 预算**
-	// （thinking.budget_tokens），0 = 未请求思考。
-	//
-	// 为什么单独带一路而不复用 rawEffort：rawEffort 是**档位**，而
-	// Anthropic 的旋钮是**预算**。两者不可逆互转（一段预算区间对应一档），
-	// 压过去再折回来必然失真，且两个方向的失真还不一致（见
-	// applyThinkingCapability 里 2026-10-21 修 A2-P1-3 的说明）。
-	//
-	// 只有 Anthropic→Anthropic 这条「不跨协议」的路径才用它原样透传；
-	// 跨到 OpenAI 系时预算必须折成档位，那条路走 rawEffort。
-	anthropicBudget int
-
-	// downgradedTools 是入站降级过的工具（工具名 → 原生 Responses 类型
-	// "custom" / "local_shell"）。出站据此把模型对这些工具的调用还原成
-	// custom_tool_call / local_shell_call，否则 Codex 按 item 的 type
-	// 分派时找不到自己的执行器。只有 openai-responses codec 会填。
-	downgradedTools map[string]string
-}
-
-// applyThinkingCapability 按**目标模型**配好的思考能力调整请求的思考设置。
-//
-// 每个 attempt 都要调一次（而不是解析后只调一次）：故障转移链上各目标的模型
-// 可能不同、能力也可能不同 —— 调整必须在「实际要发给谁」这个粒度上做。
-// 这与 applyUpstreamExtras 必须在 attempt 内部做的理由完全一致。
-//
-// 三件事，顺序不可换：
-//
-//  1. **不支持思考**（supports_thinking 显式为 false）：剥掉整个 Thinking。
-//     放在最前面，因为它是唯一会让「思考」这个动作**彻底消失**的分支，
-//     而下面两步都只在「还要思考」的前提下才有意义。
-//
-//  2. **夹紧挡位**（effort_levels 已配）：客户端要的那一档不在模型支持集里
-//     时，就近取一档，而不是丢弃整个意图。
-//
-//  3. **写回原值**（支持集内或未配置）：把客户端的原始档位原样交给 SDK。
-//     走 ThinkingConfig.EffortRaw 而不是 Effort —— 后者只认三档，会把
-//     xhigh 静默压成 high，那正是本功能要消灭的行为。
-//
-// 客户端没指定挡位（Unset）时不写 EffortRaw：那既可能来自未配置（网关不
-// 该干预），也可能来自「思考但不要档位」；两种都不该被网关替它选一档。
-func (ing *ingressRequest) applyThinkingCapability(req *rosetta.ChatRequest, m *routing.UpstreamModel, protocol string) {
-	if m == nil || req.Thinking == nil {
-		return
-	}
-
-	// 1. 模型明确不支持思考：剥掉，而不是让请求带着思考配置打过去。
-	//
-	// 为什么不留给 SDK 的闸门（它已经能报 ErrThinkingUnsupported）：故障转移
-	// 链上换一个目标可能就换成了支持思考的模型，而闸门的作用域只到单个
-	// client。在网关这一层处理，才能「剥掉思考」与「换个目标」同时成立。
-	// 剥而不是 400：思考强度是**请求偏好**，为一个偏好让整个请求失败，
-	// 比退化成不思考更糟 —— 客户端拿到的仍是完整答案。
-	//
-	// nil（未配置）不进来：那不是「不支持」，是「不知道」，而「不知道」
-	// 绝不能被当成「确定不支持」。
-	if m.SupportsThinking != nil && !*m.SupportsThinking {
-		req.Thinking = nil
-		return
-	}
-
-	// Anthropic→Anthropic：预算原样透传（2026-10-21 修 A2-P1-3）。
-	//
-	// 这一步必须**在**下面的「档位夹取」之前：预算与档位不可逆互转，
-	// 折过去再折回来必然失真（详见本函数末尾分支内注释）。
-	//
-	// 放在 rawEffort=="" 的早退之前，是为了不依赖「inwire 一定把预算折成了
-	// 档位」这个跨文件假设 —— 预算本身就是完整信息，不需要档位。
-	if protocol == "anthropic" && ing.anthropicBudget > 0 {
-		req.Thinking.EffortRaw = ""
-		req.Thinking.Effort = rosetta.EffortUnset
-		req.Thinking.BudgetTokens = ing.anthropicBudget
-		return
-	}
-
-	if ing.rawEffort == "" {
-		return
-	}
-
-	// 2. 夹紧到模型支持的子集。
-	wanted := effort.Parse(ing.rawEffort)
-	if wanted == effort.Unset {
-		return
-	}
-	applied := wanted
-	if len(m.EffortLevels) > 0 && !effort.Supports(wanted, m.EffortLevels) {
-		applied = effort.Clamp(wanted, m.EffortLevels)
-		// 降级必须留痕：没有它，「实际强度和我要的不一样」这个现象与本
-		// 功能落地前完全同形（都是强度不对），没有人能分辨是客户端没配好、
-		// 还是网关夹的。
-		slog.Warn("clamped reasoning effort to the model's supported set",
-			"model", m.ModelID, "provider", m.ProviderID,
-			"requested", string(wanted), "applied", string(applied))
-	}
-
-	// 3. 原样写回。Anthropic 例外：那个协议没有 effort 字段，发上去会被
-	// 拒，而它的思考旋钮是 token 预算 —— 走 SDK 的三档折算（细节见分支内注释）。
-	if protocol == "anthropic" {
-		req.Thinking.EffortRaw = ""
-		req.Thinking.Effort = rosetta.Effort(effort.ToRosettaLevel(applied))
-		// 必须清零，否则上面整段夹取是空转：rosetta 的 plan() 只认
-		// BudgetTokens（provider_anthropic.go「b := req.Thinking.BudgetTokens;
-		// if b <= 0 { b = anthropicBudget(...) }」），Effort 在那条路径上
-		// 完全不参与。而 Anthropic 入站时 BudgetTokens 已被 inwire 按客户端
-		// 的原始预算填好（见 inwire/anthropic.go ToRosetta）。不清零就会：
-		// 客户端发 budget_tokens=5000 → 夹到 high、日志打「clamped to high」
-		// → 上游实收 5000（medium 档）。强度与计费档位双双对不上，且无任何报错。
-		//
-		// 置 0 而不是自己算预算：折算表在 SDK 那边（low=2048 / medium=8192 /
-		// high=32768），网关再维护一份必然随 SDK 漂移。
-		//
-		// # 走到这里说明这是**跨协议**（Anthropic 入站 → OpenAI 系上游）
-		//
-		// 那边只有档位没有预算，所以「预算→档位→预算」这条折返链是**必要的**
-		//（Anthropic→Anthropic 的那条已在函数开头短路掉，理由见那里的注释：
-		// 折返必然失真，且两个方向不一致 —— budget=5000 被放大成 8192、
-		// budget=100000 被压成 32768，还会连带把 max_tokens 放大 122 倍）。
-		//
-		// 预算是多少无所谓 —— 反正要被丢掉。
-		req.Thinking.BudgetTokens = 0
-		return
-	}
-	req.Thinking.EffortRaw = string(applied)
-	req.Thinking.Effort = rosetta.EffortUnset
-}
-
 // rateCommit 把一次请求的两种预占（TPM 窗口 + 终身配额）在请求终结时收尾。
 // nil 接收者安全：TPM 未启用（额度 0）时调用方可以放一个 nil ——
 // 现在主路径在 TPMLimit==0 时干脆不建这个结构，commit 就是纯 no-op。
@@ -1386,181 +1214,7 @@ func setRetryAfter(w http.ResponseWriter, d time.Duration) {
 	w.Header().Set("Retry-After", strconv.Itoa(seconds))
 }
 
-// estimateRequestTokens 粗估一次请求的输入 token —— TPM 限速的预占依据。
-// 不追求精确（精确值在请求终结时经 CommitTPM 以真实 usage 校正），
-// 只需落在同一数量级，避免预占远小于真实值令 TPM 形同虚设、或反之误拒。
-// 口径：文本/思考/工具参数/工具定义的字符估算 + max_tokens（输出侧按上限全额
-// 预占，宁可先多占后退还，也不先少占再超发）。
-func estimateRequestTokens(req *rosetta.ChatRequest) int64 {
-	return estimateInputTokensOnly(req) + int64(req.MaxOutputTokens)
-}
-
-// estimateInputTokensOnly 估一次请求的**输入** token 数（不含 max_tokens）。
-//
-// 与 estimateRequestTokens 的输出侧分开，是为了让「客户端中断时的用量兜底」
-// 能只取输入部分：输出侧在那条路径上另有依据（已收到的字符数），
-// 不能也按 max_tokens 上界算 —— 那是按上限收钱，不是按事实记账。
-//
-// 拆分同时也让两处的口径**必然一致**：估算公式只有这一份，
-// 不会出现「TPM 用一种估法、落库用另一种估法」的分叉。
-func estimateInputTokensOnly(req *rosetta.ChatRequest) int64 {
-	var b strings.Builder
-	b.WriteString(req.System)
-	for _, m := range req.Messages {
-		for _, blk := range m.Blocks {
-			b.WriteString(blk.Text)
-			b.WriteString(blk.Thinking)
-			b.WriteString(blk.Content)
-			b.WriteString(blk.Arguments)
-		}
-	}
-	for _, t := range req.Tools {
-		b.WriteString(t.Name)
-		b.WriteString(t.Description)
-		b.WriteString(string(t.Parameters))
-	}
-	return int64(rosetta.EstimateTokens(b.String()))
-}
-
-// partialOutTokens 把「已收到的输出字符数」折成 token 数的**保守下界**。
-//
-// # 为什么是下界而不是估值
-//
-// 客户端断开时上游到底生成了多少 token 无从得知（SDK 的 usage 只从终止事件
-// 派生，abort 路径不产生该事件）。我们唯一有依据的事实是
-// 「上游已经吐出了这些字符」—— 它一定被计过费了。
-//
-// 折算口径：ASCII 按 4 字符/token（与 rosetta.EstimateTokens 的 (ascii+3)/4
-// 同源），非 ASCII 按 1 字符/token（中文/emoji 的实际压缩比更接近 1，
-// 而 rosetta 对非 ASCII 也是按 1 算）。两者都**偏保守**（往少了折），
-// 因为我们宁可少记也不能多记 —— 多记就是凭空收用户钱。
-//
-// 有内容就至少 1 个 token：0 会让触发器不累加、配额不涨，
-// 那正是这次要修的缺陷本身。
-func partialOutTokens(runes int) int64 {
-	if runes <= 0 {
-		return 0
-	}
-	// 按「最坏情况全是中文」估：1 字符 = 1 token。
-	// 对 ASCII 内容这会高估（4 字符才 1 token），而高估意味着多扣配额 ——
-	// 宁可高估也不能低估（低估 = 绕过配额这条通道还在）。
-	// 但也不能拿上限充数：1 个字符就是 1 个 token 上下界。
-	return int64(runes)
-}
-
-// openaiChatCodec 服务 POST /v1/chat/completions。
-type openaiChatCodec struct{}
-
-func (openaiChatCodec) Name() string { return "openai-chat" }
-
-func (openaiChatCodec) Decode(r *http.Request, maxBytes int64) (*ingressRequest, error) {
-	req, err := inwire.DecodeOpenAIChatRequest(r, maxBytes)
-	if err != nil {
-		return nil, err
-	}
-	return &ingressRequest{
-		buildRosetta:             req.ToRosetta,
-		stream:                   req.Stream,
-		model:                    req.Model,
-		wantsStreamUsage:         wantsStreamUsage(req),
-		requiresStructuredOutput: req.RequiresStructuredOutput(),
-		applyUpstreamExtras:      req.ApplyProtocolPrivateExtra,
-		rawEffort:                req.RawEffort,
-	}, nil
-}
-
-func (openaiChatCodec) WriteError(w http.ResponseWriter, status int, code, message string) {
-	outwire.WriteOpenAIError(w, status, code, message)
-}
-
-func (openaiChatCodec) WriteNonStream(w http.ResponseWriter, resp *rosetta.ChatResponse, model string, _ *ingressRequest) {
-	outwire.WriteNonStreamResponse(w, resp, model)
-}
-
-func (openaiChatCodec) NewSink(w http.ResponseWriter, model string, _ *ingressRequest) outwire.StreamSink {
-	flusher, _ := w.(http.Flusher)
-	return outwire.NewOpenAISink(outwire.NewSSEWriter(w, flusher, "chatcmpl-"+generateID(), model, time.Now().Unix()))
-}
-
-// anthropicMessagesCodec 服务 POST /v1/messages（Anthropic Messages 协议，
-// Claude Code 等客户端的接入点）。
-type anthropicMessagesCodec struct{}
-
-func (anthropicMessagesCodec) Name() string { return "anthropic" }
-
-func (anthropicMessagesCodec) Decode(r *http.Request, maxBytes int64) (*ingressRequest, error) {
-	req, err := inwire.DecodeAnthropicMessagesRequest(r, maxBytes)
-	if err != nil {
-		return nil, err
-	}
-	return &ingressRequest{
-		buildRosetta: req.ToRosetta,
-		stream:       req.Stream,
-		model:        req.Model,
-		// Anthropic 的 message_delta 恒带 usage，没有 include_usage 开关。
-		wantsStreamUsage: false,
-		// Anthropic 入站协议没有结构化输出概念（无 response_format 对应物），
-		// 恒为 false —— 不参与硬约束过滤。
-		requiresStructuredOutput: false,
-		applyUpstreamExtras:      req.ApplyUpstreamExtras,
-		rawEffort:                req.RawEffort,
-		// Anthropic 入站的**原始 token 预算**：目标上游也是 Anthropic 时
-		// 原样透传，不经「预算→档位→预算」的有损折算（2026-10-21 修 A2-P1-3）。
-		anthropicBudget: req.ThinkingBudget(),
-	}, nil
-}
-
-func (anthropicMessagesCodec) WriteError(w http.ResponseWriter, status int, code, message string) {
-	outwire.WriteAnthropicError(w, status, code, message)
-}
-
-func (anthropicMessagesCodec) WriteNonStream(w http.ResponseWriter, resp *rosetta.ChatResponse, model string, _ *ingressRequest) {
-	outwire.WriteAnthropicResponse(w, resp, model)
-}
-
-func (anthropicMessagesCodec) NewSink(w http.ResponseWriter, model string, _ *ingressRequest) outwire.StreamSink {
-	flusher, _ := w.(http.Flusher)
-	return outwire.NewAnthropicSSE(w, flusher, "msg_"+generateID(), model)
-}
-
-// openaiResponsesCodec 服务 POST /v1/responses（OpenAI Responses 协议，
-// Codex CLI 等客户端的接入点）。错误形状与 openai-chat 同一套信封。
-type openaiResponsesCodec struct{}
-
-func (openaiResponsesCodec) Name() string { return "openai-responses" }
-
-func (openaiResponsesCodec) Decode(r *http.Request, maxBytes int64) (*ingressRequest, error) {
-	req, err := inwire.DecodeResponsesRequest(r, maxBytes)
-	if err != nil {
-		return nil, err
-	}
-	return &ingressRequest{
-		buildRosetta: req.ToRosetta,
-		stream:       req.Stream,
-		model:        req.Model,
-		// Responses 的 response.completed 恒带 usage，没有 include_usage 开关。
-		wantsStreamUsage:         false,
-		requiresStructuredOutput: req.RequiresStructuredOutput(),
-		applyUpstreamExtras:      req.ApplyUpstreamExtras,
-		rawEffort:                req.RawEffort,
-		downgradedTools:          req.DowngradedTools(),
-	}, nil
-}
-
-func (openaiResponsesCodec) WriteError(w http.ResponseWriter, status int, code, message string) {
-	outwire.WriteOpenAIError(w, status, code, message)
-}
-
-func (openaiResponsesCodec) WriteNonStream(w http.ResponseWriter, resp *rosetta.ChatResponse, model string, ing *ingressRequest) {
-	outwire.WriteResponsesResponseWithTools(w, resp, model, ing.downgradedTools)
-}
-
-func (openaiResponsesCodec) NewSink(w http.ResponseWriter, model string, ing *ingressRequest) outwire.StreamSink {
-	flusher, _ := w.(http.Flusher)
-	return outwire.NewResponsesSSE(w, flusher, "resp_"+generateID(), model, ing.downgradedTools)
-}
-
-func handleIngress(pool *upstream.Pool, cfg *config.Config, usage *usageRecorder, limiter *ratelimit.Limiter, codec ingressCodec) http.HandlerFunc {
+func handleIngress(pool *upstream.Pool, cfg *config.Config, usage *usageRecorder, limiter *ratelimit.Limiter, codec ingress.Codec) http.HandlerFunc {
 	db, logger := usage.Store(), usage.Logger()
 	return func(w http.ResponseWriter, r *http.Request) {
 		start := time.Now()
@@ -1608,10 +1262,10 @@ func handleIngress(pool *upstream.Pool, cfg *config.Config, usage *usageRecorder
 		// 所以按「请求前估算预占 + 请求后按真实 usage 校正」两段执行。
 		// 被拒的请求不预占（没放行就不该消耗窗口额度），也不预扣任何东西。
 		//
-		// TPMLimit==0（未启用，也是主流配置）时**整段跳过**：estimateRequestTokens
+		// TPMLimit==0（未启用，也是主流配置）时**整段跳过**：ingress.EstimateRequestTokens
 		// 会遍历全部消息与工具定义拼出一个与请求体同量级的字符串再估算，
 		// 是一次纯浪费的全量分配；而它算出的 est 随后必然被丢弃。
-		// 同一个请求在 attempt* 里还会再 buildRosetta 一次，估算那次是多余的第 N 次。
+		// 同一个请求在 attempt* 里还会再 BuildRosetta 一次，估算那次是多余的第 N 次。
 		// 两种预占共用同一个 est 与同一个 rateCommit 收尾 —— 分开放两次
 		// 估算/两次收尾只会让两边在某条路径上被漏掉一处（且配额那条漏掉是
 		// **终身**偏差，不像 TPM 窗口会自愈）。
@@ -1622,7 +1276,7 @@ func handleIngress(pool *upstream.Pool, cfg *config.Config, usage *usageRecorder
 		var est int64
 		needEstimate := authCtx.TPMLimit > 0
 		if needEstimate {
-			est = estimateRequestTokens(ing.buildRosetta())
+			est = ingress.EstimateRequestTokens(ing.BuildRosetta())
 			if ok, retry := limiter.ReserveTPM(authCtx.KeyID, authCtx.TPMLimit, est); !ok {
 				logger.Warn("rate limited (tpm)", "key_id", authCtx.KeyID,
 					"estimated_tokens", est, "retry_after", retry.String(),
@@ -1666,7 +1320,7 @@ func handleIngress(pool *upstream.Pool, cfg *config.Config, usage *usageRecorder
 			logger.Error("quota lookup failed (fail-open)", "error", qerr, "key_id", authCtx.KeyID)
 		} else if quota > 0 {
 			if !needEstimate {
-				est = estimateRequestTokens(ing.buildRosetta())
+				est = ingress.EstimateRequestTokens(ing.BuildRosetta())
 			}
 			reserved, rok, rerr := db.ReserveQuota(r.Context(), authCtx.KeyID, est)
 			switch {
@@ -1726,7 +1380,7 @@ func handleIngress(pool *upstream.Pool, cfg *config.Config, usage *usageRecorder
 		// 配置了额度」—— 与 key 级用 GetKeyQuota 判 quota>0 完全对称。
 		if u := snapshot.Get().UsersByID[authCtx.UserID]; u != nil && u.QuotaTokens > 0 {
 			if !needEstimate {
-				est = estimateRequestTokens(ing.buildRosetta())
+				est = ingress.EstimateRequestTokens(ing.BuildRosetta())
 			}
 			reserved, rok, rerr := db.ReserveUserQuota(r.Context(), authCtx.UserID, est)
 			switch {
@@ -1756,10 +1410,10 @@ func handleIngress(pool *upstream.Pool, cfg *config.Config, usage *usageRecorder
 		}
 
 		snap := snapshot.Get()
-		res, err := snap.Routes.Resolve(ing.model)
+		res, err := snap.Routes.Resolve(ing.Model)
 		if err != nil {
 			rate.commit(0)
-			codec.WriteError(w, http.StatusNotFound, "model_not_found", modelNotFoundMessage(snap, ing.model))
+			codec.WriteError(w, http.StatusNotFound, "model_not_found", modelNotFoundMessage(snap, ing.Model))
 			return
 		}
 		route := res.Route
@@ -1787,7 +1441,7 @@ func handleIngress(pool *upstream.Pool, cfg *config.Config, usage *usageRecorder
 				"model", route.PublicName, "key_id", authCtx.KeyID, "user_id", authCtx.UserID,
 				"request_id", server.RequestIDFromContext(r.Context()))
 			codec.WriteError(w, http.StatusForbidden, "model_not_allowed",
-				fmt.Sprintf("model %q is not available for this API key", ing.model))
+				fmt.Sprintf("model %q is not available for this API key", ing.Model))
 			return
 		}
 
@@ -1813,7 +1467,7 @@ func handleIngress(pool *upstream.Pool, cfg *config.Config, usage *usageRecorder
 		r = r.WithContext(ctx)
 		logger.Debug("request total budget armed",
 			"budget_ms", budget.Milliseconds(),
-			"model", ing.model,
+			"model", ing.Model,
 			"request_id", server.RequestIDFromContext(r.Context()))
 
 		// 余额预检（Lead 与用户确认的口径：预检拒绝，不做预占/退款）。
@@ -1884,7 +1538,7 @@ func handleIngress(pool *upstream.Pool, cfg *config.Config, usage *usageRecorder
 		// 都能表达这两类约束（inwire 层已做等价翻译）。放在熔断筛选之后、预算
 		// 截断之前：先剔除服务不了的目标，让 failover_max_targets 的预算花在
 		// 真正可服务的候选上。
-		if ing.requiresStructuredOutput {
+		if ing.RequiresStructuredOutput {
 			var serviceable []routing.Candidate
 			for _, c := range active {
 				if c.Provider != nil && c.Provider.Protocol != "anthropic" {
@@ -1894,7 +1548,7 @@ func handleIngress(pool *upstream.Pool, cfg *config.Config, usage *usageRecorder
 			if len(serviceable) == 0 {
 				rate.commit(0)
 				logger.Warn("no upstream can serve structured output request",
-					"model", ing.model, "key_id", authCtx.KeyID,
+					"model", ing.Model, "key_id", authCtx.KeyID,
 					"candidates", len(active),
 					"request_id", server.RequestIDFromContext(r.Context()))
 				codec.WriteError(w, http.StatusBadRequest, "invalid_request_error",
@@ -1930,7 +1584,7 @@ func handleIngress(pool *upstream.Pool, cfg *config.Config, usage *usageRecorder
 			// 此处还没领探测名额，不存在归还义务。
 			if cerr := r.Context().Err(); cerr != nil {
 				logger.Info("client disconnected, aborting failover",
-					"model", ing.model, "attempt", i+1, "error", cerr,
+					"model", ing.Model, "attempt", i+1, "error", cerr,
 					"request_id", server.RequestIDFromContext(r.Context()))
 				rate.commit(0)
 				return
@@ -1963,7 +1617,7 @@ func handleIngress(pool *upstream.Pool, cfg *config.Config, usage *usageRecorder
 					routeTrace = appendRouteTrace(routeTrace, i+1, cand, "skip", "probe_busy_or_cooling")
 					if !isLast {
 						logger.Warn("failover: target not claiming a probe slot, switching target",
-							"model", ing.model, "provider", cand.Provider.Slug, "attempt", i+1,
+							"model", ing.Model, "provider", cand.Provider.Slug, "attempt", i+1,
 							"request_id", server.RequestIDFromContext(r.Context()))
 						continue
 					}
@@ -1992,13 +1646,13 @@ func handleIngress(pool *upstream.Pool, cfg *config.Config, usage *usageRecorder
 				routeTrace = appendRouteTrace(routeTrace, i+1, cand, "fail", "no_healthy_credential")
 				if !isLast {
 					logger.Warn("failover: no healthy credential, switching target",
-						"model", ing.model, "provider", cand.Provider.Slug, "request_id", server.RequestIDFromContext(r.Context()))
+						"model", ing.Model, "provider", cand.Provider.Slug, "request_id", server.RequestIDFromContext(r.Context()))
 					continue
 				}
 				break
 			}
 
-			if ing.stream {
+			if ing.Stream {
 				out = attemptStream(w, r, client, ing, cand, authCtx, codec, rate, cfg, snap, usage, start, routeTrace)
 			} else {
 				out = attemptNonStream(w, r, client, ing, cand, authCtx, codec, rate, cfg, snap, usage, start, routeTrace)
@@ -2077,7 +1731,7 @@ func handleIngress(pool *upstream.Pool, cfg *config.Config, usage *usageRecorder
 				break
 			}
 			logger.Warn("failover: switching to next target",
-				"model", ing.model, "from_provider", cand.Provider.Slug,
+				"model", ing.Model, "from_provider", cand.Provider.Slug,
 				"error_code", out.code, "attempt", i+1, "route_trace", strings.Join(routeTrace, "; "),
 				"request_id", server.RequestIDFromContext(r.Context()))
 		}
@@ -2122,7 +1776,7 @@ func handleIngress(pool *upstream.Pool, cfg *config.Config, usage *usageRecorder
 		if clientGone {
 			status = "canceled"
 			logger.Info("client disconnected before any response was written",
-				"model", ing.model, "request_id", server.RequestIDFromContext(r.Context()))
+				"model", ing.Model, "request_id", server.RequestIDFromContext(r.Context()))
 		}
 		errorCode := code
 		errorDetail := out.detail
@@ -2135,11 +1789,11 @@ func handleIngress(pool *upstream.Pool, cfg *config.Config, usage *usageRecorder
 			AccessKeyID:     keyID,
 			UserID:          authCtx.UserID,
 			RequestID:       server.RequestIDFromContext(r.Context()),
-			PublicModel:     ing.model,
+			PublicModel:     ing.Model,
 			ProviderID:      provID,
 			UpstreamModel:   upstreamModel,
 			IngressProtocol: codec.Name(),
-			Stream:          ing.stream,
+			Stream:          ing.Stream,
 			UsageState:      "none",
 			Status:          status,
 			HTTPStatus:      statusCode,
@@ -2425,16 +2079,6 @@ const (
 	perAttemptSlack = 5 * time.Second
 )
 
-// wantsStreamUsage reports whether the caller asked for a trailing usage
-// chunk, i.e. OpenAI's {"stream_options":{"include_usage":true}}. The flag
-// only controls what the gateway forwards downstream: the SDK already asks
-// the upstream for usage on every stream.
-func wantsStreamUsage(req *inwire.OpenAIChatRequest) bool {
-	return req.StreamOptions != nil &&
-		req.StreamOptions.IncludeUsage != nil &&
-		*req.StreamOptions.IncludeUsage
-}
-
 // attemptStream 尝试在当前目标上完成一次流式响应。
 //
 // 关键：SSE 头与状态码**推迟到拿到第一个上游事件之后才写**。这样「建立失败」
@@ -2447,19 +2091,19 @@ func wantsStreamUsage(req *inwire.OpenAIChatRequest) bool {
 // 可转移」）。它必须带进来：本 attempt 一旦提交（写下首字节），usage 就在
 // 这里落库且不会再回到外层 —— 只写当前一跳会丢掉「为什么走到备用上游」，
 // 而那恰恰是这条记录最有价值的部分。
-func attemptStream(w http.ResponseWriter, r *http.Request, client *rosetta.Client, ing *ingressRequest, cand routing.Candidate, authCtx *auth.Context, codec ingressCodec, rate *rateCommit, cfg *config.Config, snap *snapshot.Snapshot, usage *usageRecorder, start time.Time, priorTrace []string) attemptOutcome {
+func attemptStream(w http.ResponseWriter, r *http.Request, client *rosetta.Client, ing *ingress.Request, cand routing.Candidate, authCtx *auth.Context, codec ingress.Codec, rate *rateCommit, cfg *config.Config, snap *snapshot.Snapshot, usage *usageRecorder, start time.Time, priorTrace []string) attemptOutcome {
 	ctx := r.Context()
 	logger := usage.Logger()
-	publicModel := ing.model
+	publicModel := ing.Model
 
 	// 每个 attempt 现造一份请求，并把公共别名换成该目标的上游 model_id、
 	// 挂上该上游协议的私有透传字段。必须在 attempt 内部做（而不是在调用点
 	// 造好传进来）：链上各目标的协议不同，Extra 形状也不同，复用同一实例
 	// 会把 A 目标的字段泄漏给 B 目标。
-	upstreamReq := ing.buildRosetta()
+	upstreamReq := ing.BuildRosetta()
 	upstreamReq.Model = cand.UpstreamModel.ModelID
-	ing.applyUpstreamExtras(upstreamReq, cand.Provider.Protocol)
-	ing.applyThinkingCapability(upstreamReq, cand.UpstreamModel, cand.Provider.Protocol)
+	ing.ApplyUpstreamExtras(upstreamReq, cand.Provider.Protocol)
+	ing.ApplyThinkingCapability(upstreamReq, cand.UpstreamModel, cand.Provider.Protocol)
 	// 剥掉目标协议回放不了的思考块（chat 全剥 / anthropic 剥无签名的），
 	// 否则 harness 回传 thinking 后的第二轮必然 400。详见 replay_gate.go。
 	applyReplayGate(upstreamReq, cand.Provider.Protocol)
@@ -2635,7 +2279,7 @@ func attemptStream(w http.ResponseWriter, r *http.Request, client *rosetta.Clien
 
 	// partialOutRunes 累计本次流里**已经收到**的输出侧字符数（正文 + 思考）。
 	//
-	// 它的唯一用途是「客户端中途断开」这一条路径：见 partialOutTokens 的注释。
+	// 它的唯一用途是「客户端中途断开」这一条路径：见 ingress.PartialOutTokens 的注释。
 	partialOutRunes := 0
 
 	// consume 消费一个上游事件（首个 + 后续走同一套逻辑）：看门狗续期与
@@ -2758,7 +2402,7 @@ func attemptStream(w http.ResponseWriter, r *http.Request, client *rosetta.Clien
 	// 终止序列由 sink 按协议收尾：ok 时发终止事件（finish_reason+[DONE] 或
 	// message_delta+message_stop），断流按 DESIGN §8.2 不发终止（OpenAI）/
 	// 发 error 事件（Anthropic），canceled 不写任何东西。
-	sink.Finish(status, stopReason, lastUsage, ing.wantsStreamUsage)
+	sink.Finish(status, stopReason, lastUsage, ing.WantsStreamUsage)
 
 	latency := time.Since(start).Milliseconds()
 
@@ -2807,8 +2451,8 @@ func attemptStream(w http.ResponseWriter, r *http.Request, client *rosetta.Clien
 	// 一个字符都没收到（partialOutRunes==0）→ 兜底也兜不出什么，
 	// 保持 missing —— 这时「什么都没生成」是事实，不该编一个数字。
 	if lastUsage.IsZero() && partialOutRunes > 0 {
-		estOut := partialOutTokens(partialOutRunes)
-		estIn := estimateInputTokensOnly(ing.buildRosetta())
+		estOut := ingress.PartialOutTokens(partialOutRunes)
+		estIn := ingress.EstimateInputTokensOnly(ing.BuildRosetta())
 		lastUsage = rosetta.Usage{
 			InputTokens:  estIn,
 			OutputTokens: estOut,
@@ -2879,14 +2523,14 @@ func attemptStream(w http.ResponseWriter, r *http.Request, client *rosetta.Clien
 
 // priorTrace 的含义与 attemptStream 相同：提交后的落库在这里发生，
 // 必须把此前目标的失败决策一并带上。
-func attemptNonStream(w http.ResponseWriter, r *http.Request, client *rosetta.Client, ing *ingressRequest, cand routing.Candidate, authCtx *auth.Context, codec ingressCodec, rate *rateCommit, cfg *config.Config, snap *snapshot.Snapshot, usage *usageRecorder, start time.Time, priorTrace []string) attemptOutcome {
-	publicModel := ing.model
+func attemptNonStream(w http.ResponseWriter, r *http.Request, client *rosetta.Client, ing *ingress.Request, cand routing.Candidate, authCtx *auth.Context, codec ingress.Codec, rate *rateCommit, cfg *config.Config, snap *snapshot.Snapshot, usage *usageRecorder, start time.Time, priorTrace []string) attemptOutcome {
+	publicModel := ing.Model
 	// 同attemptStream：别名 → 上游 model_id 的映射与协议私有字段的透传
 	// 必须在本次 attempt 内完成，不能由调用方造好传入。
-	upstreamReq := ing.buildRosetta()
+	upstreamReq := ing.BuildRosetta()
 	upstreamReq.Model = cand.UpstreamModel.ModelID
-	ing.applyUpstreamExtras(upstreamReq, cand.Provider.Protocol)
-	ing.applyThinkingCapability(upstreamReq, cand.UpstreamModel, cand.Provider.Protocol)
+	ing.ApplyUpstreamExtras(upstreamReq, cand.Provider.Protocol)
+	ing.ApplyThinkingCapability(upstreamReq, cand.UpstreamModel, cand.Provider.Protocol)
 	// 与 attemptStream 同一刀，理由见 replay_gate.go。
 	applyReplayGate(upstreamReq, cand.Provider.Protocol)
 
@@ -3102,7 +2746,7 @@ func appendModelMetadata(entry map[string]any, snap *snapshot.Snapshot, modelID 
 	//
 	// 关键：这里**只影响披露**，数据面不动。数据面仍然只在
 	// supports_thinking 显式为 false 时才剥掉思考（见
-	// applyThinkingCapability）—— 把「不知道」当成「不支持」会让全部未配置
+	// ingress.Request.ApplyThinkingCapability）—— 把「不知道」当成「不支持」会让全部未配置
 	// 模型（包括 anthropic 协议的）静默失去思考能力，而那正是本函数
 	// 下面那段旧注释警告过的事。
 	if m := modelThinkingCapability(snap, modelID); m != nil {
@@ -3127,7 +2771,7 @@ func appendModelMetadata(entry map[string]any, snap *snapshot.Snapshot, modelID 
 // modelThinkingCapability 取对外模型名解析后**链首**上游模型的思考能力。
 //
 // 只看链首：故障转移到别的目标时数据面会按那个目标的能力重新处理（见
-// ingressRequest.applyThinkingCapability），所以这里披露的是「默认会落到
+// ingress.Request.ApplyThinkingCapability），所以这里披露的是「默认会落到
 // 哪一档」，而不是「这条链所有可能的档位集合」—— 后者是个会误导客户端的并集。
 func modelThinkingCapability(snap *snapshot.Snapshot, modelID string) *routing.UpstreamModel {
 	res, err := snap.Routes.Resolve(modelID)

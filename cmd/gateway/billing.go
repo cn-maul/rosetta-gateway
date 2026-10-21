@@ -12,6 +12,7 @@ import (
 
 	"github.com/cn-maul/rosetta-gateway/internal/auth"
 	"github.com/cn-maul/rosetta-gateway/internal/billing"
+	"github.com/cn-maul/rosetta-gateway/internal/ingress"
 	"github.com/cn-maul/rosetta-gateway/internal/routing"
 	"github.com/cn-maul/rosetta-gateway/internal/server"
 	"github.com/cn-maul/rosetta-gateway/internal/snapshot"
@@ -128,8 +129,8 @@ func balanceExempt(userID string) bool {
 // 不可达，**保留**是为了纵深防御（万一某个入口绕过 auth 直达预检，管理员
 // 也不会因余额查询被误拒或读库抖动而受影响）。详见 balanceExempt 的注释。
 func precheckBalance(w http.ResponseWriter, r *http.Request, db *store.Store, logger *slog.Logger,
-	authCtx *auth.Context, ing *ingressRequest, cands []routing.Candidate,
-	codec ingressCodec) bool {
+	authCtx *auth.Context, ing *ingress.Request, cands []routing.Candidate,
+	codec ingress.Codec) bool {
 
 	if balanceExempt(authCtx.UserID) {
 		return true // 纵深防御：管理员不读库、不估算、不判定（数据面上不可达，见 balanceExempt）
@@ -152,7 +153,7 @@ func precheckBalance(w http.ResponseWriter, r *http.Request, db *store.Store, lo
 	//     地板线见 billing.MinSubcentSpendableCents 的说明。
 	//
 	// 区分方式：链上是否存在**已配价**的模型（而不是估算值是否大于 0）。
-	est := billing.EstimateBalanceCostChain(ing.buildRosetta(), cands)
+	est := billing.EstimateBalanceCostChain(ing.BuildRosetta(), cands)
 	chainPriced := billing.ChainHasPricedModel(cands)
 	if est <= 0 && !chainPriced {
 		return true // 整条链都没配价：本次真的不计费，不读库

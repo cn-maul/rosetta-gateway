@@ -19,6 +19,7 @@ import (
 
 	"github.com/cn-maul/rosetta-gateway/internal/admin"
 	"github.com/cn-maul/rosetta-gateway/internal/billinghttp"
+	"github.com/cn-maul/rosetta-gateway/internal/ingress"
 	"github.com/cn-maul/rosetta-gateway/internal/server"
 	"github.com/cn-maul/rosetta-gateway/internal/snapshot"
 	"github.com/cn-maul/rosetta-gateway/internal/store"
@@ -105,7 +106,7 @@ func TestAdminLockout_ErrorTypeIsTerminalNotAuth(t *testing.T) {
 // 每个 codec 单独建一套 harness：handleIngress 把 codec 编进了闭包，
 // 复用同一个 handler 换个 codec 是测不到东西的。
 func TestAdminLockout_AllIngressProtocolsRejectAdmin(t *testing.T) {
-	for _, codec := range []ingressCodec{openaiChatCodec{}, anthropicMessagesCodec{}, openaiResponsesCodec{}} {
+	for _, codec := range []ingress.Codec{ingress.NewOpenAIChat(), ingress.NewAnthropicMessages(), ingress.NewResponses()} {
 		t.Run(codec.Name(), func(t *testing.T) {
 			var hits int64
 			up := fakeCountingGood(&hits)
@@ -160,7 +161,7 @@ func TestAdminLockout_QueryEndpointsAlsoRejectAdmin(t *testing.T) {
 	_, db, _ := buildHarnessFull(t, []struct {
 		slug, url string
 		fail      bool
-	}{{slug: "good", url: up.URL}}, false, openaiChatCodec{})
+	}{{slug: "good", url: up.URL}}, false, ingress.NewOpenAIChat())
 	adminSnapRole(t, store.RoleAdmin)
 
 	for _, tc := range []struct {
@@ -216,7 +217,7 @@ func TestAdminLockout_AdminCannotCreateKey(t *testing.T) {
 	_, db, _ := buildHarnessFull(t, []struct {
 		slug, url string
 		fail      bool
-	}{{slug: "good", url: up.URL}}, false, openaiChatCodec{})
+	}{{slug: "good", url: up.URL}}, false, ingress.NewOpenAIChat())
 
 	before, err := db.ListAccessKeys(context.Background())
 	if err != nil {
@@ -254,7 +255,7 @@ func TestAdminLockout_NormalUserCanStillCreateKey(t *testing.T) {
 	_, db, _ := buildHarnessFull(t, []struct {
 		slug, url string
 		fail      bool
-	}{{slug: "good", url: up.URL}}, false, openaiChatCodec{})
+	}{{slug: "good", url: up.URL}}, false, ingress.NewOpenAIChat())
 
 	h := denyAdminKeyCreate(admin.NewKeyHandler(db).Create)
 	req := httptest.NewRequest(http.MethodPost, "/admin/api/keys",
@@ -282,7 +283,7 @@ func TestAdminLockout_MissingIdentityIsRejected(t *testing.T) {
 	_, db, _ := buildHarnessFull(t, []struct {
 		slug, url string
 		fail      bool
-	}{{slug: "good", url: up.URL}}, false, openaiChatCodec{})
+	}{{slug: "good", url: up.URL}}, false, ingress.NewOpenAIChat())
 
 	h := denyAdminKeyCreate(admin.NewKeyHandler(db).Create)
 	req := httptest.NewRequest(http.MethodPost, "/admin/api/keys",

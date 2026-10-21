@@ -14,6 +14,7 @@ import (
 	"testing"
 
 	"github.com/cn-maul/rosetta-gateway/internal/config"
+	"github.com/cn-maul/rosetta-gateway/internal/ingress"
 	"github.com/cn-maul/rosetta-gateway/internal/ratelimit"
 	"github.com/cn-maul/rosetta-gateway/internal/routing"
 	"github.com/cn-maul/rosetta-gateway/internal/snapshot"
@@ -92,7 +93,7 @@ func buildHarness(t *testing.T, chain []struct {
 	fail      bool
 }, failover bool, ttftMs ...int) (http.HandlerFunc, *store.Store) {
 	t.Helper()
-	h, db, _ := buildHarnessFull(t, chain, failover, openaiChatCodec{}, ttftMs...)
+	h, db, _ := buildHarnessFull(t, chain, failover, ingress.NewOpenAIChat(), ttftMs...)
 	return h, db
 }
 
@@ -101,7 +102,7 @@ func buildHarness(t *testing.T, chain []struct {
 func buildHarnessFull(t *testing.T, chain []struct {
 	slug, url string
 	fail      bool
-}, failover bool, codec ingressCodec, ttftMs ...int) (http.HandlerFunc, *store.Store, *upstream.Pool) {
+}, failover bool, codec ingress.Codec, ttftMs ...int) (http.HandlerFunc, *store.Store, *upstream.Pool) {
 	t.Helper()
 
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
@@ -386,7 +387,7 @@ func TestFailover_ClientDisconnectMidFlightDoesNotPoisonCredential(t *testing.T)
 		fail      bool
 	}{
 		{"slow", srv.URL, false},
-	}, true, openaiChatCodec{})
+	}, true, ingress.NewOpenAIChat())
 
 	ctx, cancel := context.WithCancel(context.Background())
 	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions",
@@ -506,7 +507,7 @@ func TestFailover_NonTransferableErrorReleasesProbeSlot(t *testing.T) {
 	}{
 		{"p1", leak.URL, true},
 		{"p2", bad.URL, true},
-	}, true, openaiChatCodec{})
+	}, true, ingress.NewOpenAIChat())
 
 	if rec := postChat(h, "flash"); rec.Code != http.StatusBadGateway {
 		t.Fatalf("req1: want 502 (both upstreams fail), got %d body=%s", rec.Code, rec.Body.String())

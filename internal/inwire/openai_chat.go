@@ -273,7 +273,7 @@ func (r *OpenAIChatRequest) ToRosetta() *rosetta.ChatRequest {
 //   - anthropic：tool_choice 翻译（auto→{"type":"auto"}、required→{"type":"any"}、
 //     命名函数→{"type":"tool"}；"none" 无对应物，见 chatToolChoiceAnthropic）。
 //     response_format 是**硬约束**，Anthropic 无对应物 —— 它不允许静默降级，
-//     由 ingressRequest.requiresStructuredOutput 在网关层把「只余 anthropic
+//     由 ingress.Request.RequiresStructuredOutput 在网关层把「只余 anthropic
 //     候选」的这类请求整体 400（见 handleIngress），到不了本函数。penalty /
 //     seed / user / parallel_tool_calls 同为软偏好或无效开关，丢弃不破坏正确性。
 //
@@ -322,7 +322,7 @@ func (r *OpenAIChatRequest) ApplyProtocolPrivateExtra(req *rosetta.ChatRequest, 
 		}
 		// response_format 在 Anthropic 无对应物。json_object / json_schema 是
 		// **硬约束**：静默丢弃会让客户端拿到「200 但约束失效」的响应，且故障
-		// 转移前后行为不一致 —— 这类请求不会走到这里（requiresStructuredOutput
+		// 转移前后行为不一致 —— 这类请求不会走到这里（RequiresStructuredOutput
 		// 已在 handleIngress 把 anthropic 候选过滤掉，全被滤空则 400）。
 		// penalty / seed / user 是软偏好，parallel_tool_calls 是 Anthropic
 		// 没有开关表达的控制位 —— 丢弃均不改变请求的正确性。

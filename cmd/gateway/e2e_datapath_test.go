@@ -50,6 +50,7 @@ import (
 	"github.com/cn-maul/rosetta-gateway/internal/admin"
 	"github.com/cn-maul/rosetta-gateway/internal/config"
 	"github.com/cn-maul/rosetta-gateway/internal/crypto"
+	"github.com/cn-maul/rosetta-gateway/internal/ingress"
 	"github.com/cn-maul/rosetta-gateway/internal/ratelimit"
 	"github.com/cn-maul/rosetta-gateway/internal/server"
 	"github.com/cn-maul/rosetta-gateway/internal/snapshot"
@@ -918,7 +919,7 @@ func TestE2E_D2_RPMExceededRejectsWithoutTouchingUpstream(t *testing.T) {
 	h, db, _ := buildHarnessFull(t, []struct {
 		slug, url string
 		fail      bool
-	}{{slug: "good", url: up.URL()}}, false, openaiChatCodec{})
+	}{{slug: "good", url: up.URL()}}, false, ingress.NewOpenAIChat())
 
 	// RPM 额度经快照下发（与既有 ratelimit_test 同一手法：
 	// harness 的路由只在手工快照里，不能整体 RebuildFromDB）。
@@ -1499,7 +1500,7 @@ func e2eDBHarness(t *testing.T, endpoint string) (http.Handler, *store.Store, *r
 	mux := http.NewServeMux()
 	rl := ratelimit.New()
 	mux.HandleFunc("POST /v1/chat/completions",
-		handleIngress(pool, cfg, newUsageRecorder(db, logger), rl, openaiChatCodec{}))
+		handleIngress(pool, cfg, newUsageRecorder(db, logger), rl, ingress.NewOpenAIChat()))
 	return server.Middleware(mux, logger), db, reloader
 }
 
@@ -2171,7 +2172,7 @@ func TestE2E_Adv9_RateLimitSharedAcrossIngressPaths(t *testing.T) {
 	h, db, _ := buildHarnessFull(t, []struct {
 		slug, url string
 		fail      bool
-	}{{slug: "good", url: up.URL()}}, false, openaiChatCodec{})
+	}{{slug: "good", url: up.URL()}}, false, ingress.NewOpenAIChat())
 	_ = db
 
 	// RPM=1，然后一个 chat 请求用掉额度，紧接着一个 messages 请求应被拒。

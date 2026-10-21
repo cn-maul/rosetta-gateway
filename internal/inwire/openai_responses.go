@@ -309,7 +309,7 @@ func DecodeResponsesRequest(r *http.Request, maxBytes int64) (*ResponsesRequest,
 		return nil, fmt.Errorf("max_output_tokens: must be a positive integer")
 	}
 	// input 里的 item 类型白名单。放在 decode 而不是 ToRosetta：
-	// ToRosetta 是逐 attempt 调用的工厂（见 main.go 的 buildRosetta），
+	// ToRosetta 是逐 attempt 调用的工厂（见 ingress.Request.BuildRosetta），
 	// 而类型不支持是**请求本身**的问题，第一次就该报，不该等走到某个
 	// 上游才由 rosetta validate 说出来。
 	//
@@ -556,7 +556,7 @@ func responsesDowngradedTools(in []ResponsesTool) map[string]string {
 // "custom" / "local_shell"），供出站还原 item 形态。
 //
 // 返回内部 map 而非副本：调用方（codec.Decode）只读一次填进
-// ingressRequest，之后不再改。
+// ingress.Request.DowngradedTools，之后不再改。
 func (a *ResponsesRequest) DowngradedTools() map[string]string {
 	return a.downgradedTools
 }
@@ -1217,7 +1217,7 @@ func (a *ResponsesRequest) ApplyUpstreamExtras(req *rosetta.ChatRequest, protoco
 // ToRosetta 是逐 attempt 调用的工厂，展平与 tool_choice 重写都在里面发生；
 // ApplyUpstreamExtras 在同一个 attempt 里紧随其后执行，所以它读到的
 // flattenedToolChoice 一定对应**本 attempt 的那份**展平结果，不存在跨
-// attempt 串味（buildRosetta 不复用同一个实例，见 ingressRequest 的注释）。
+// attempt 串味（BuildRosetta 不复用同一个实例，见 ingress.Request 的注释）。
 func (a *ResponsesRequest) effectiveToolChoice() json.RawMessage {
 	if len(a.flattenedToolChoice) > 0 {
 		return a.flattenedToolChoice
