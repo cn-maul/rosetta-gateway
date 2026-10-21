@@ -23,11 +23,10 @@ import (
 type UserHandler struct {
 	store *store.Store
 	mgr   *userauth.Manager
-	// reload 是运行时快照重建的注入点。**重建的唯一所有者是外层
-	// server.AutoReload**（写操作成功后触发；失败置脏，交 cmd/gateway 的
-	// 后台重试兜底）—— 本 handler 的端点不再自行调用重建：handler 内的
-	// 同步重建一旦失败，响应变 500，恰好绕过 AutoReload 的审计与置脏路径。
-	// 字段与 WithReload 仅为兼容 cmd/gateway 的构造注入面保留，留 nil 无副作用。
+	// reload 只为测试注入计数桩：现有回归测试用它证明 handler 内部不再
+	// 重建快照。**重建的唯一所有者是外层 server.AutoReload**（写操作成功后
+	// 触发；失败置脏，交 runtime.Reloader 的后台重试兜底）。生产装配不注入，
+	// 留 nil 无副作用。
 	reload func(context.Context) error
 	// thr 惰性初始化（构造时不建，登录路径上才用）。
 	// mu 保护它：登录端点是并发入口，裸读裸写会造出多个限速器，
@@ -102,8 +101,8 @@ func NewUserHandler(st *store.Store, mgr *userauth.Manager) *UserHandler {
 	return &UserHandler{store: st, mgr: mgr}
 }
 
-// WithReload 注入运行时重建函数（仅为兼容 cmd/gateway 的构造注入面保留；
-// 重建统一由外层 server.AutoReload 负责，见 reload 字段的注释）。
+// WithReload 为“handler 不自行重建”的回归测试注入计数桩。重建统一由
+// 外层 server.AutoReload 负责；生产装配不调用本方法。
 func (h *UserHandler) WithReload(fn func(context.Context) error) *UserHandler {
 	h.reload = fn
 	return h

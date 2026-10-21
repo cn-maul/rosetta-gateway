@@ -182,8 +182,7 @@ func BuildApp(d Deps) *App {
 	// 供应商 + 模型的导入导出。写在 settings 附近是因为它在界面上的入口
 	// 也在「设置」页里，与设置项同一层级。
 	configTransferHandler := admin.NewConfigTransferHandler(db, masterKey, cfg)
-	// WithReload：禁用账号/改角色后必须立刻重建快照，否则数据面仍放行。
-	userHandler := admin.NewUserHandler(db, sessionMgr).WithReload(reloader.Reload)
+	userHandler := admin.NewUserHandler(db, sessionMgr)
 	records := make(map[string]Route)
 	mux := newRouteMux(false, records)
 	adminMux := newRouteMux(false, records)

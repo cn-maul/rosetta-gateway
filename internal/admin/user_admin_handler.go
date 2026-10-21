@@ -359,18 +359,6 @@ func (h *UserHandler) CreateUser(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusCreated, toUserResponse(u, "", 0))
 }
 
-// reloadNow 保留但已无调用点：运行时快照的重建统一由外层 server.AutoReload
-// 负责（成功触发一次；失败置脏，交 cmd/gateway 的后台重试兜底收敛）。
-// 此前各 handler 自己同步重建，失败即回 500，恰好绕过 AutoReload 的
-// 兜底路径。函数与 reload 字段仅为兼容构造注入面保留（cmd/gateway/main.go
-// 仍经 WithReload 注入），新代码不要再调用。
-func (h *UserHandler) reloadNow(ctx context.Context) error {
-	if h.reload == nil {
-		return nil
-	}
-	return h.reload(ctx)
-}
-
 type updateUserRequest struct {
 	DisplayName *string `json:"display_name"`
 	Role        *string `json:"role"`
