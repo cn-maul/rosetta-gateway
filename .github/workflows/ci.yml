@@ -129,9 +129,13 @@ jobs:
         # -count=1 禁用缓存：改契约后只跑 -run TestXxx 的老坑（cmd/gateway
         # 整包红一轮）就是这么漏进主干的。
         # ./... 而非手列 ./internal/... ./cmd/gateway/：手列的清单每次新增
-        # 命令目录都要记得改这里，漏改就是「整包不进测试范围」且无人察觉
-        # （cmd/migrate-legacy 就曾不在清单里）。
-        run: go test -count=1 -timeout 300s ./...
+        # 命令目录都要记得改这里，漏改就是「整包不进测试范围」且无人察觉。
+      #
+      # -short 让 perf/leak/stress 这些自带 testing.Short() 守卫的用例跳过
+      # （2026-10-21 修 A11-P2-4）。它们跑的是压测与固定 sleep，在共享
+      # runner 上是时序敏感的：偶发红很难归因到「性能抖动」还是「真回归」，
+      # 于是红色开始贬值。慢测改由 nightly-long 触发，见下。
+      run: go test -short -count=1 -timeout 300s ./...
 
       # 竞态检测单独一轮（2026-10-10 新增）。
       #
@@ -158,7 +162,45 @@ jobs:
       #  p.mu 下写同一字段 —— 测试侧的竞争，已修）。
       # 所以本机不要因为默认报错就跳过竞态检测；那是环境问题，有解。
       - name: 竞态检测（-race）
-        run: go test -race -count=1 -timeout 900s ./...
+        # 同样带 -short：与上面的全量 job 保持同一套用例集，
+        # 否则「race 过了但那批用例其实没跑」会变成另一处盲区。
+        run: go test -race -short -count=1 -timeout 900s ./...
+
+  # 慢测/压测专用轮次（2026-10-21 修 A11-P2-4）。
+  #
+  # 为什么单独一个 job 而不是塞回默认流程：这些用例（perf_*.go、
+  # perf_leak_test.go、perf_batch_test.go、perf_split_test.go 里的
+  # testing.Short() 守卫分支）跑的是吞吐、goroutine 泄漏与并发交叉，
+  # 天然依赖机器当时的负载。放在每次 push 的默认门禁里，
+  # 一次 runner 抖动就会让主干变红，而人学会的第一件事是忽略红色。
+  #
+  # 这里用 push 而不是 schedule：慢测必须仍在「改动之后」跑，
+  # 推到 main 就触发比等到某个整点更能把回归指回具体的 commit。
+  # 没有 -skip：默认 job 已经用 -short 把它们排除了，这里不带 -short
+  # 才是「全套用例」。
+  nightly-long:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+
+      - name: Set up Go
+        # 与上面 test job 同一版且同样从 go.mod 取版本（单一来源），
+        # 不在这儿另写一个 '1.27.1'：两处写死就会漂移，
+        # 而漂移的表现是「同一个 PR 两个 job 用不同工具链」。
+        uses: actions/setup-go@7b8cf10d4e4a01d4992d18a89f4d7dc5a3e6d6f4
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: 慢测 / 压测 / 竞态全量
+        # 超时放到 1800s：这一轮刻意包含固定 sleep 与压测，
+        # 用 300s 的默认预算砍它是本末倒置。
+        run: go test -count=1 -timeout 1800s ./...
+
+      - name: 慢测（-race）
+        run: go test -race -count=1 -timeout 1800s ./...
 
   webui-sync:
     runs-on: ubuntu-latest
@@ -184,6 +226,30 @@ jobs:
           node-version: '22.12'
           cache: npm
           cache-dependency-path: web/package-lock.json
+
+      # 版本号一致性（2026-10-21 修 A11-P2-2）。
+      #
+      # 版本号有两处副本且读者不同：npm ci 读 package-lock.json，
+      # Docker 的版本解析与页脚读 package.json。两边漂移时 Go 侧的内嵌
+      # 版本测试（只比 package.json 与 embed 产物）全绿，本 job 的
+      # typecheck / test / build 也全绿，直到镜像 tag 与页脚对不上才被发现。
+      #
+      # 这里用最直白的比较，不引 node 脚本：漂移是提交时就该挡住的事，
+      # 不值得为一个两行比较加运行时依赖。
+      - name: 版本号与 lockfile 一致
+        working-directory: web
+        run: |
+          set -euo pipefail
+          pkg=$(node -p "require('./package.json').version")
+          lock=$(node -p "require('./package-lock.json').version")
+          lockroot=$(node -p "require('./package-lock.json').packages[''].version")
+          if [ "$pkg" != "$lock" ] || [ "$pkg" != "$lockroot" ]; then
+            echo "::error::版本号不一致：package.json=$pkg package-lock.json=$lock packages[\"\"]=$lockroot"
+            echo "package.json 是唯一来源；本仓曾经漂移过一次（1.6.5 / 1.6.0）且无任何关卡报错。"
+            echo "请以 package.json 的版本号同步 web/package-lock.json 的根 version 与根 packages 条目。"
+            exit 1
+          fi
+          echo "版本号一致：$pkg"
 
       - name: 安装依赖
         run: npm ci

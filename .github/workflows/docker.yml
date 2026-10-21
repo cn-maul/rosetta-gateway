@@ -33,18 +33,66 @@ jobs:
       # 所以它必须与测试之间有这道闸。
       #
       # 这里不能写 needs: ci（两个 workflow 在不同文件，彼此不可见），
-      # 所以把最小门禁就地复跑一遍。ci.yml 里的 webui-sync
-      # （「入库产物 == 最新构建」）同样重要，但它依赖 npm 与前端构建，
-      # 放在发布路径上会让 tag 流程慢很多；那条防的是「忘 sync」，
-      # 由 main 分支上的 ci 拦住足够 —— 真要在这里也拦，就把 npm ci &&
-      # npm run build && node sync-embed.mjs && git diff --exit-code 一并加上。
+      # 所以把发布所需的门禁就地复跑一遍。前端构建与 embed 同步也必须在这里，
+      # 不能依赖 main 上的 ci：tag 可以指向任意历史提交，发布路径必须自证
+      # 镜像里的 UI 与同一提交的 web/src 一致。
       - name: Set up Go
         uses: actions/setup-go@7b8cf10d4e4a01d4992d18a89f4d7dc5a3e6d6f4
         with:
           go-version-file: go.mod
           cache: true
 
-      - name: 发布前门禁（gofmt / build / vet / 全量测试）
+      - name: Set up Node
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: '22.12'
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      # lockfile 与 package.json 同版本（2026-10-21 修 A11-P2-2）。
+      #
+      # 发布路径**只读 package.json** 取版本号（见下面「解析版本号」一步），
+      # 而 npm ci 读的是 lockfile。两边漂移时镜像 tag 用的是新版本、
+      # 装进来的依赖树却是旧的 —— 而发布路径此前没有任何一处会发现这件事。
+      # 与 ci.yml 的 webui-sync 用同一组比较，避免两处口径不同。
+      - name: 校验 lockfile 与 package.json 版本一致
+        working-directory: web
+        run: |
+          set -euo pipefail
+          pkg=$(node -p "require('./package.json').version")
+          lock=$(node -p "require('./package-lock.json').version")
+          lockroot=$(node -p "require('./package-lock.json').packages[''].version")
+          if [ "$pkg" != "$lock" ] || [ "$pkg" != "$lockroot" ]; then
+            echo "::error::版本号不一致：package.json=$pkg package-lock.json=$lock packages[\"\"]=$lockroot"
+            echo "镜像 tag 取自 package.json，依赖树取自 lockfile；漂移会发出名不副实的镜像。"
+            exit 1
+          fi
+          echo "版本号一致：$pkg"
+
+      - name: 安装前端依赖
+        working-directory: web
+        run: npm ci
+
+      - name: 前端门禁（typecheck / test / build / embed sync）
+        working-directory: web
+        run: |
+          set -euo pipefail
+          npm run typecheck
+          npm test
+          npm run build
+          node sync-embed.mjs
+
+      - name: 校验 embed UI 与源码一致
+        run: |
+          set -euo pipefail
+          if ! git diff --exit-code --stat -- internal/webui/dist; then
+            git diff --numstat -- internal/webui/dist || true
+            echo "::error::internal/webui/dist 与 web/src 的最新构建不一致，拒绝发布旧 UI。"
+            echo "请执行 cd web && npm run build && node sync-embed.mjs 并提交产物。"
+            exit 1
+          fi
+
+      - name: 发布前门禁（gofmt / build / vet / 全量测试 / race）
         run: |
           set -euo pipefail
           unformatted=$(gofmt -l cmd/ internal/)
@@ -54,7 +102,12 @@ jobs:
           fi
           go build ./...
           go vet ./...
-          go test -count=1 -timeout 300s ./...
+          # -short 与 ci.yml 的默认门禁保持同一套用例集：不带 -short 会
+          # 让发布路径比日常 CI 多跑一批压测（更慢、更易受 runner 抖动影响），
+          # 而那不是发布门禁该管的事 —— 慢测由 ci.yml 的 nightly-long 负责。
+          # 少跑比多跑一致：两处跑不同的用例集，等于哪一处都不能代表主干状态。
+          go test -short -count=1 -timeout 300s ./...
+          go test -race -short -count=1 -timeout 900s ./...
 
       - name: 解析版本号（唯一来源：web/package.json）
         id: ver
