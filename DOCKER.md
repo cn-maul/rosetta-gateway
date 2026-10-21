@@ -293,7 +293,7 @@ docker run -d \
 
 **没有日志文件 —— 应用日志就是容器的标准输出。**
 
-网关用 `slog` 的 JSON handler 直接写 stdout（`cmd/gateway/main.go`），配置里的 `log_level`
+网关用 `slog` 的 JSON handler 直接写 stdout（`internal/gatewayapp/run.go`），配置里的 `log_level`
 只调级别、不改去向。所以 `docker logs` 就是全部日志，`/data` 里不会出现任何 `.log`。
 
 ```bash

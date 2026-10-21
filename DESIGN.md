@@ -606,7 +606,7 @@ POST   /admin/api/reload                        从 DB 重建内存快照（前�
 
 所有写操作的事务边界：**先写 DB，提交成功后再重建快照**。DB 写失败则快照不动。
 
-**重建由服务端自动执行**（2026-10-01 起）：管理写请求成功（2xx）后，`server.AutoReload` 中间件就地调用 `runtimeReloader.Reload`（池重建 + 快照重建，`sync.Mutex` 串行化，两边都构建成功才原子替换，任一步失败运行时保持旧状态）。**重建失败有后台兜底**（2026-10-07 起）：失败即置 `dirty` 标志，后台循环按 30s 起步、指数退避（封顶 10 分钟）反复重试直至收敛，避免「响应已 200 +『已禁用』而数据面仍在放行」的分叉无限期存在（健康检查可读 `IsDirty`）。此前生效路径完全依赖前端写完自觉调 `POST /admin/api/reload`——任何绕过前端的调用方（curl/脚本）写完不调 reload 就是静默分叉，最敏感的是**禁用下游 Key 后 auth 读旧快照照常放行**。前端 `mutate()` 里的 reload 调用保留为兜底。
+**重建由服务端自动执行**（2026-10-01 起）：管理写请求成功（2xx）后，`server.AutoReload` 中间件就地调用 `internal/runtime.Reloader.Reload`（池重建 + 快照重建，`sync.Mutex` 串行化，两边都构建成功才原子替换，任一步失败运行时保持旧状态）。**重建失败有后台兜底**（2026-10-07 起）：失败即置 `dirty` 标志，`Reloader.WatchRetry` 按 30s 起步、指数退避（封顶 10 分钟）反复重试直至收敛，避免「响应已 200 +『已禁用』而数据面仍在放行」的分叉无限期存在（健康检查可读 `IsDirty`）。此前生效路径完全依赖前端写完自觉调 `POST /admin/api/reload`——任何绕过前端的调用方（curl/脚本）写完不调 reload 就是静默分叉，最敏感的是**禁用下游 Key 后 auth 读旧快照照常放行**。前端 `mutate()` 里的 reload 调用保留为兜底。
 
 ### 6.4 额度/费用查询（2026-10-04）
 
@@ -1186,7 +1186,7 @@ users 表 + 会话一条通道后，管理员只是一个 `role='admin'` 的普�
 
 所有相对路径默认按**可执行文件所在目录**解析（与进程 CWD 无关）；设了
 `ROSETTA_GW_HOME` 则整体重定向到该目录（容器部署就是这么把状态指到挂载卷的）。
-两个规则的事实来源是 `cmd/gateway/main.go` 的 `resolveHome`：`exeDir` 兜底、
+两个规则的事实来源是 `internal/gatewayapp/run.go` 的 `resolveHome`：`exeDir` 兜底、
 环境变量优先且过 `filepath.Abs`。部署形态是「一个目录装下全部状态」：
 
 ```
@@ -1383,7 +1383,7 @@ Docker 侧对齐，且避开浏览器的保留端口表（6666 是 IRC 段，浏
 
 **鉴权**：管理 API 由 `adminGuarded` 鉴权链保护，凭据逻辑在 `internal/userauth` +
 `internal/admin`（users 表 + JWT 会话，见 §6.3）。**恰好 4 条路由免鉴权**，且必须显式
-注册到根 mux（`cmd/gateway/main.go`）—— 它们不进 `adminAuto`（那会走鉴权链），但也不能
+注册到根 mux（`cmd/gateway/routes.go` 的 `adminRouteSpecs` 表）—— 它们不进 `adminAuto`（那会走鉴权链），但也不能
 因为「没注册」而落到 `/admin/api/` 前缀上被鉴权拦掉，那样会得到 401 而非功能缺失，
 症状是「登录页一直转圈」：
 
@@ -1529,7 +1529,7 @@ vue-router 的 `insertMatcher` 按路径得分二分插入（`findInsertionIndex
 
 ## 15. 目录结构
 
-> **2026-10-17 按实际仓库核实重写。** 上一次（2026-10-06）改写时原版本列的是 P1 时期的规划结构，
+> **2026-10-17 按实际仓库核实重写；2026-10-21 完成生命周期/目录迁移后再校正。** 上一次（2026-10-06）改写时原版本列的是 P1 时期的规划结构，
 > 与代码已严重脱节：`quota/` 包从未存在（配额逻辑最终落在 `cmd/gateway/main.go` 的请求热路径里）、
 > `examples/curl.md` 从未创建、`inwire`/`outwire` 下标注「P3」的三个文件早已实现、
 > 缺了后来新增的 `userauth` 与 `ratelimit`。
@@ -1538,7 +1538,7 @@ vue-router 的 `insertMatcher` 按路径得分二分插入（`findInsertionIndex
 > `build.ps1`、`gateway.ps1`、`CONTRIBUTING.md`）与 `internal/` 下新增的
 > `effort`（思考挡位唯一口径）、`probe`（上游模型定时探测），以及 2026-10-21
 > 重构拆出的 `httpx / identity / guard / access / usage / billing / billinghttp /
-> authhttp / ingress / dataplane`。
+> authhttp / ingress / dataplane / runtime / gatewayapp / catalog`。
 > 核对方式：`Get-ChildItem -Directory` + 逐个 `internal/*/` 的包注释。
 
 ```
@@ -1565,7 +1565,7 @@ rosetta-gateway/
 │       ├── ci.yml                  go / webui-sync / -race / repo-hygiene 四道门禁
 │       └── docker.yml               tag 触发构建推送 GHCR（发布前复跑最小门禁）
 ├── cmd/
-│   ├── gateway/                    进程入口、装配与生命周期；数据面热路径已移至 internal/dataplane
+│   ├── gateway/                    进程入口与 HTTP 路由表；启动/关停和依赖装配在 internal/gatewayapp
 ├── internal/
 │   ├── config/                     启动配置加载、校验、时区应用、端口占用检查
 │   ├── store/                      SQLite 连接、canonical schema、各表 DAO、归档与对账、探测记录
@@ -1583,6 +1583,9 @@ rosetta-gateway/
 │   ├── ingress/                    下游协议 codec、协议无关 Request、token 估算
 │   ├── dataplane/                  数据面处理器：鉴权后限速、配额预占、余额预检、
 │   │                               故障转移链、流式/非流式 attempt、用量落库
+│   ├── runtime/                    上游池 + 快照的原子重建与失败重试
+│   ├── gatewayapp/                 配置/密钥/Store/bootstrap、HTTP 生命周期与健康检查
+│   ├── catalog/                    /v1/models 列表、详情与模型元数据
 │   ├── usage/                      异步用量落库、扣费、关停 drain
 │   ├── billing/                    纯计价与余额预检策略
 │   ├── billinghttp/                subscription / usage / costs 查询接口
