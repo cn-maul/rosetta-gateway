@@ -172,12 +172,20 @@ func (ri *RouteIndex) AddRoute(r *Route) {
 	ri.byID[r.ID] = r
 }
 
-// AddRouteTarget 追加一个链成员。快照重建按 route_id, position 顺序喂进来，
-// 故这里 append 即为有序；调用方保证 position 递增。
+// AddRouteTarget 追加一个链成员，并按 position 稳定排序。
+//
+// 快照重建目前确实按 route_id, position 顺序喂进来，但「调用方保证有序」
+// 只是一条口头约定：任何新的装载路径（测试、增量刷新、未来的导入工具）
+// 一旦乱序，故障转移就会按错误优先级打上游。排序放在这里，约定变成机制；
+// 同 position 时 SliceStable 保留插入顺序，行为可预测。
 func (ri *RouteIndex) AddRouteTarget(t *Target) {
 	ri.mu.Lock()
 	defer ri.mu.Unlock()
-	ri.targetsByRoute[t.RouteID] = append(ri.targetsByRoute[t.RouteID], t)
+	targets := append(ri.targetsByRoute[t.RouteID], t)
+	sort.SliceStable(targets, func(i, j int) bool {
+		return targets[i].Position < targets[j].Position
+	})
+	ri.targetsByRoute[t.RouteID] = targets
 }
 
 // AddProvider 登记一个上游。

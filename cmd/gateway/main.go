@@ -671,8 +671,11 @@ func main() {
 	// 而原实现是静默 return，日志上一片祥和、实际最多 50 条用量凭空消失，
 	// 用户因此免单且配额被放宽。
 	if !usage.wait(drainCtx) {
+		// drain 超时：让仍在退避重试的 worker 立刻退出，避免它与随后的
+		// db.Close() 并发写（"database is closed"）并拖过进程退出。
+		usage.abort()
 		logger.Error("usage drain incomplete: records were lost during shutdown",
-			"hint", "check earlier 'usage record lost' errors for request_id")
+			"hint", "check earlier 'usage record lost' / 'usage recorder aborted' errors for request_id")
 	}
 	logger.Info("server stopped")
 }
@@ -3052,6 +3055,14 @@ type usageRecorder struct {
 	queue  chan *store.UsageRecord
 	wg     sync.WaitGroup
 
+	// stop 让「关停超时后仍在重试」的 worker 立刻退出（2026-10-21 修 *X0）。
+	// 原来 worker 的重试退避是裸 time.Sleep，wait 超时返回后它仍会在后台
+	// 无限重试；main 返回时 db.Close() 与它并发，日志被 "database is closed"
+	// 刷屏，而且进程随时可能退出、手上那批记录既没落库也没留下可对账的痕迹。
+	// stop 只打断**退避等待**，不打断正在进行的 flush —— 那一次写可能本来能成功。
+	stop     chan struct{}
+	stopOnce sync.Once
+
 	// mu 保护 closed，且**把「发送」纳入临界区**（2026-10-10 修复的 P1）。
 	//
 	// 为什么需要它：`record` 里的 `select { case ch <- rec: default: }`
@@ -3139,6 +3150,7 @@ func newUsageRecorder(db *store.Store, logger *slog.Logger) *usageRecorder {
 		db:     db,
 		logger: logger,
 		queue:  make(chan *store.UsageRecord, usageQueueSize),
+		stop:   make(chan struct{}),
 	}
 	for i := 0; i < usageWorkers; i++ {
 		u.wg.Add(1)
@@ -3206,8 +3218,18 @@ func (u *usageRecorder) worker() {
 			} else {
 				// 又失败：留到下一轮，且**不再从队列取新记录**，
 				// 免得失败批越攒越多、最终占满整个队列。
+				//
+				// *X0 配套修复：这一分支原来只 markFlushFailed 就 continue，
+				// 而上面已经把 stillPending 清空、记录只在 batch 里；下一轮
+				// 开头用空的 stillPending 覆盖 batch，整批就静默丢了。
+				// 队列关闭后 worker 还会直接走「无待处理记录」的退出路径。
+				// 必须在 continue 前把整批放回 stillPending。
+				stillPending = append(stillPending[:0], batch...)
 				u.markFlushFailed()
-				time.Sleep(usageFlushRetryDelay)
+				if !u.retryPause(usageFlushRetryDelay) {
+					u.logPendingAbandoned(stillPending)
+					return
+				}
 				continue
 			}
 		}
@@ -3253,10 +3275,53 @@ func (u *usageRecorder) worker() {
 			// 已成功的部分下次会被幂等键挡掉，不会重复计费。
 			stillPending = append(stillPending[:0], batch...)
 			u.markFlushFailed()
-			time.Sleep(usageFlushRetryDelay)
+			if !u.retryPause(usageFlushRetryDelay) {
+				u.logPendingAbandoned(stillPending)
+				return
+			}
 		}
 		batch = batch[:0]
 	}
+}
+
+// retryPause 等待一段退避时间；stop 关闭时立刻返回 false。
+// 返回 false 表示关停已经放弃 drain，调用方应记录未落库记录后退出。
+func (u *usageRecorder) retryPause(d time.Duration) bool {
+	timer := time.NewTimer(d)
+	defer timer.Stop()
+	select {
+	case <-timer.C:
+		return true
+	case <-u.stop:
+		return false
+	}
+}
+
+// abort 让仍在重试退避中的 worker 退出。仅由关停流程在 drain 超时后调用。
+// 幂等：多次调用只关一次 channel。
+func (u *usageRecorder) abort() {
+	u.stopOnce.Do(func() { close(u.stop) })
+}
+
+// logPendingAbandoned 把放弃 drain 时仍留在 worker 手里的记录打成一条
+// 可对账的 ERROR。逐条 "usage record lost" 只在单条写失败时出现；
+// 关停超时可能发生在整批重试阶段，那些记录还没有逐条尝试过，若不在这里
+// 汇总，日志里就只剩下一句「records were lost」，无法知道丢了哪几次调用。
+func (u *usageRecorder) logPendingAbandoned(recs []*store.UsageRecord) {
+	if len(recs) == 0 {
+		return
+	}
+	const maxSample = 10
+	sample := make([]string, 0, maxSample)
+	for _, rec := range recs {
+		if len(sample) == maxSample {
+			break
+		}
+		sample = append(sample, rec.RequestID)
+	}
+	u.logger.Error("usage recorder aborted with unpersisted records",
+		"count", len(recs), "request_id_sample", sample,
+		"hint", "persistent write failure or shutdown deadline; reconcile these request_ids manually")
 }
 
 // flush 把一批记录落库，然后**逐条**扣费。

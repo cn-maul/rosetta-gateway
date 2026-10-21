@@ -50,6 +50,28 @@ func TestResolve_OrderedChain(t *testing.T) {
 	}
 }
 
+// *X16：链顺序不能依赖调用方的喂入顺序。
+// 乱序注册（position 1 先于 0）后，Resolve 仍必须按 position 升序返回。
+func TestResolve_TargetOrderIndependentOfInsertion_X16(t *testing.T) {
+	ri := newFixture()
+	ri.AddRouteTarget(&Target{ID: "t1", RouteID: "r1", ProviderID: "pB", UpstreamModelID: "mB", Position: 1, Enabled: true})
+	ri.AddRouteTarget(&Target{ID: "t0", RouteID: "r1", ProviderID: "pA", UpstreamModelID: "mA", Position: 0, Enabled: true})
+
+	res, err := ri.Resolve("flash")
+	if err != nil {
+		t.Fatalf("resolve: %v", err)
+	}
+	if len(res.Candidates) != 2 {
+		t.Fatalf("want 2 candidates, got %d", len(res.Candidates))
+	}
+	if res.Candidates[0].Provider.ID != "pA" || res.Candidates[0].Position != 0 {
+		t.Fatalf("position 0 must be first, got %s (position %d)", res.Candidates[0].Provider.ID, res.Candidates[0].Position)
+	}
+	if res.Candidates[1].Provider.ID != "pB" || res.Candidates[1].Position != 1 {
+		t.Fatalf("position 1 must be second, got %s (position %d)", res.Candidates[1].Provider.ID, res.Candidates[1].Position)
+	}
+}
+
 // 链上 disabled 的 target、以及指向被禁 provider 的 target 都要被过滤掉。
 func TestResolve_FiltersDisabled(t *testing.T) {
 	ri := newFixture()
