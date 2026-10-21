@@ -196,13 +196,14 @@ CREATE TABLE upstream_models (
 
 -- 对外虚拟模型名（D2 的轨道一）
 -- 一条 route 背后是一条「有序上游链」（见 route_targets）。
--- provider_id / upstream_model_id 是链首（position 0）的向后兼容列：
--- 老代码、config bootstrap、以及「尚未建目标行」的场景仍以它们为准。
+-- provider_id / upstream_model_id 是链首（position 0）的镜像列：
+-- 创建 route 时与目标行在同一事务写入，PATCH 时同步到链首；
+-- 运行时路由以 route_targets 为准，而不是历史兼容分支。
 CREATE TABLE routes (
   id                TEXT PRIMARY KEY,
   public_name       TEXT NOT NULL UNIQUE,   -- 对外 model 名
-  provider_id       TEXT NOT NULL REFERENCES providers(id) ON DELETE RESTRICT,        -- 链首（兼容列）
-  upstream_model_id TEXT NOT NULL REFERENCES upstream_models(id) ON DELETE RESTRICT,  -- 链首（兼容列）
+  provider_id       TEXT NOT NULL REFERENCES providers(id) ON DELETE RESTRICT,        -- 链首镜像
+  upstream_model_id TEXT NOT NULL REFERENCES upstream_models(id) ON DELETE RESTRICT,  -- 链首镜像
   enabled           INTEGER NOT NULL DEFAULT 1,
   -- 没有 priority：曾规划为「同名多路由择优」，但 public_name 是 UNIQUE，
   -- 该语义在数据层不可能成立，界面却写着「按 priority 升序择优」→ 2026-09-24 摘除。
@@ -218,7 +219,7 @@ CREATE TABLE routes (
 );
 
 -- route 的有序上游链：对外同一个 public_name 挂多个 (provider, model)，按 position 升序尝试。
--- 迁移期幂等回填：为「尚无任何目标行」的老 route 补一条 position 0（取 route 的兼容列）。
+-- 每条 route 创建时原子种下 position 0；不存在「先建 route、以后再补链首」的路径。
 CREATE TABLE route_targets (
   id                TEXT PRIMARY KEY,
   route_id          TEXT NOT NULL REFERENCES routes(id) ON DELETE CASCADE,
@@ -234,8 +235,8 @@ CREATE INDEX idx_route_targets_route ON route_targets(route_id, position);
 CREATE TABLE access_keys (
   id              TEXT PRIMARY KEY,
   user_id         TEXT REFERENCES users(id) ON DELETE CASCADE,
-                  -- NULL = 无归属：迁移期存量 key 已被 retireOrphanKeys 禁用，
-                  -- 鉴权直接 401（ErrKeyUnowned），见 MULTIUSER.md §5.1
+                  -- 当前写入路径必须提供归属用户；NULL 不是受支持的业务状态，
+                  -- 鉴权遇到它 fail-closed（ErrKeyUnowned）
   key_hash        TEXT NOT NULL UNIQUE,      -- SHA-256(明文)，不存明文
   key_prefix      TEXT NOT NULL,             -- 形如 "sk-gw-a1b2"，用于界面展示
   name            TEXT NOT NULL,
@@ -295,7 +296,7 @@ CREATE TABLE user_group_models (
   PRIMARY KEY (group_id, public_model)
 );
 
--- 逐请求用量（user_id / cost_total 由迁移补列；归档与累计见表后说明）
+-- 逐请求用量（归档与累计见表后说明）
 CREATE TABLE usage_records (
   id                TEXT PRIMARY KEY,
   ts                INTEGER NOT NULL,
@@ -444,8 +445,8 @@ resolve(model):
 失败返回 401；Key 被停用、过期、来源 IP 不在白名单均返回 **403**
 （`invalid_api_key` / `key_expired` / `ip_not_allowed`）；配额耗尽返回
 429 `insufficient_quota`；模型不在该 key 的白名单内返回 403 `model_not_allowed`。
-无归属的 key 返回 401（`ErrKeyUnowned`）—— 历史存量数据的形态，迁移时已被
-`retireOrphanKeys` 禁用，见 §6.3 的 PATCH `user_id` 说明。
+无归属的 key 返回 401（`ErrKeyUnowned`）。当前创建路径必须提供归属用户；
+NULL 只作为损坏数据的 fail-closed 状态处理，不再提供迁移或自动退役逻辑。
 
 ### 6.3 管理接口
 
@@ -684,8 +685,8 @@ PATCH 端点一律「只看请求体里出现了哪些字段」：
   处置的永远是「用户发的 key 归错了人」。
   落库走独立的 `store.ReassignAccessKey`；`UpdateAccessKey` 刻意不写 `user_id`
   （归属不该由一个 PATCH 随手改写，见 `user_dao_test.go` 的断言）。指向不存在的
-  用户 → 400。历史数据里仍可能存在 `user_id:""` 的无归属 key：鉴权时得到
-  `ErrKeyUnowned` → 401，且会被 `store.retireOrphanKeys` 在迁移时退役。
+  用户 → 400。当前 schema 不支持无归属 key；若库中被人为写入 `user_id:""`，
+  鉴权会得到 `ErrKeyUnowned` → 401，这是 fail-closed，不是兼容路径。
 - **模型白名单 `allowed_models`（key 与组）**：出现**空白条目**（trim 后为空）→ 400。
   静默丢弃会把「收紧到某模型」变成「完全不限制」（归一后为空 → 落库 NULL →
   读回 `nil` → `AllowAll()`），而界面看不出任何区别。清空白名单用**显式的空数组 `[]`**。
@@ -1007,7 +1008,7 @@ Client 是 goroutine 安全的，进程内单例复用（内含连接池）。
 
 **自动故障转移**（已实现，取代旧的 `fallback_route_id` 单跳兜底）：
 
-一条 route 背后是 `route_targets` 承载的**有序上游链**——对外同一个 `public_name` 可挂多个 `(provider, model)`，按 `position` 升序尝试。`routes.provider_id / upstream_model_id` 退化为链首兼容列。
+一条 route 背后是 `route_targets` 承载的**有序上游链**——对外同一个 `public_name` 可挂多个 `(provider, model)`，按 `position` 升序尝试。`routes.provider_id / upstream_model_id` 是链首的镜像列，创建与 PATCH 都和链首保持原子同步；运行时只以 `route_targets` 为准。
 
 请求热路径（`handleIngress` 的转移循环）语义：
 
@@ -1031,9 +1032,9 @@ Client 是 goroutine 安全的，进程内单例复用（内含连接池）。
 
 **健康态与池重建**：`upstream.Pool` 的目标熔断表与凭据冷却在每次重建池（`BuildFromStore` / `BuildFromConfig`，即每个管理写操作触发的 reload）时一并清零——两层语义一致，配置变更本就是重新探测的正当理由（代价：管理员改配置会重置 ≤60s 的冷却/熔断）。这也堵住「每次保存链重生成 `target_id` → 旧熔断条目在表里单调堆积」的泄漏。重建是**先完整构建、后原子替换**（`PrepareFromStore` 构建局部表 → `Install` 锁内换入）：构建失败时旧池/旧快照原样保留，绝不出现「清空后查库失败」留下的空池——那会让全站 /v1 选不到上游，直到下一次成功的 reload。
 
-**健康态是纯运行时的，不落库、重启即清零**：冷却与熔断只活在 `upstream.Pool` 的内存里。`provider_credentials.cooldown_until / status` 与 `routes` 上的旧策略列**不是**事实来源（后者的策略列已整体删除，见 `store.dropDeadColumns`）。理由：这些状态生命周期极短（熔断 60s、冷却 ≤30min），冷启动一律「全健康」再由真实失败快速收敛，比持久化更简单也更快收敛；反之一旦落库，就要处理「重启后读到一批早已过期的冷却」这种伪状态。运维影响：**重启网关会清空全部健康态**（表现为故障目标立刻又被试一次），这是预期行为，不是故障。
+**健康态的持久化边界**：目标熔断表只活在 `upstream.Pool` 内存里，池重建时重置；凭据冷却则持久化在 `provider_credentials.cooldown_until / status`，池重建会读回尚未到期的冷却。这样同一 provider 的错误钥匙不会因为一次 reload 或重启立刻被重试，而目标级熔断仍可由配置变更触发重新探测。两套状态服务不同粒度，不能合并成一张表。
 
-**参数落点**：故障转移与超时策略**统一是全局的**，由「设置」页写入 `app_settings` 的 `runtime_defaults`，经快照（`snapshot.Snapshot.Runtime`）在转发热路径读取；DB 未配置的字段回落 `config.json` 的 `defaults`（这样老部署升级后原配置继续生效，直到在后台显式保存）。
+**参数落点**：故障转移与超时策略**统一是全局的**，由「设置」页写入 `app_settings` 的 `runtime_defaults`，经快照（`snapshot.Snapshot.Runtime`）在转发热路径读取；DB 未配置的字段回落 `config.json` 的 `defaults`，保存设置后以数据库值为准。
 
 | 设置项 | 含义 | config 兜底键 |
 |---|---|---|
@@ -1101,7 +1102,7 @@ Client 是 goroutine 安全的，进程内单例复用（内含连接池）。
 - **查询抖动 fail-open**：预检读库出错时记 error 日志并放行，不因一次读失败拒绝正常流量。
 - **自愈入口**：`POST /admin/api/keys/{id}/recompute-usage`（`RecomputeUsedTokens`）从
   用量来源重算 `used_tokens`，是派生值漂移的唯一修正手段。
-- **语义**：终身累计、不自动重置；`quota_tokens=0` = 不限（默认，向后兼容存量 key）。
+- **语义**：终身累计、不自动重置；`quota_tokens=0` = 不限（默认值）。
 
 ### 11.3 并发安全
 
@@ -1162,7 +1163,7 @@ per-model 配额、per-provider 配额仍不做，记入后续路线。
 | 配置类别 | 存放位置 | 可否运行时改 |
 |---|---|---|
 | Provider / 模型 / Route / Key / **用户与管理员账号** | **数据库** | 是（管理 API / Web 界面） |
-| 监听地址、DB 路径、日志级别、加密主密钥、**主密钥强度校验（`require_strong_master_key`）**、**日界时区（`timezone`）**、**用量保留天数（`usage_retention_days`）**、**审计日志行数上限（`audit_log_keep_rows`）**、**连通率探测（`probes`）**、全局默认超时与重试、body 大小上限 | **配置文件** | 否（改后重启） |
+| 监听地址、DB 路径、日志级别、加密主密钥、**主密钥强度校验（`require_strong_master_key`）**、**公开源（`public_origin`）**、**可信代理网段（`trusted_proxy_cidrs`）**、**日界时区（`timezone`）**、**用量保留天数（`usage_retention_days`）**、**审计日志行数上限（`audit_log_keep_rows`）**、**连通率探测（`probes`）**、全局默认超时与重试、body 大小上限 | **配置文件** | 否（改后重启） |
 | 首次 bootstrap 的 provider/route | 配置文件（仅当 DB 为空时生效） | 否 |
 
 **关键纪律**：DB 非空时，配置文件里的 `providers` / `routes` 段落被**忽略并打印 warning**。这防止出现「界面改完、重启被配置文件覆盖」这类经典事故。
@@ -1230,10 +1231,9 @@ users 表 + 会话一条通道后，管理员只是一个 `role='admin'` 的普�
 后来改成设环境变量启动，两把密钥不同 → 先前加密的凭据解不开。
 `gateway.ps1` 写的正是 `bin/master.key`，与 Go 侧路径一致，所以脚本与双击天然对齐。
 
-**历史明文数据的兼容**：解密走 `crypto.DecryptWithFallback` —— 主密钥存在但解不开时，
-只有数据看起来是可打印文本才按明文返回，密文形态仍报错。
-这样老库（明文）升级后立刻可用，不会被新密钥打死；但明文依旧躺在库里，
-要彻底消除得把每条凭据**重新保存一次**。
+**凭据格式只支持当前版本**：`provider_credentials.api_key_enc` 必须是
+AES-256-GCM 密文。无主密钥、密文损坏、主密钥不匹配或历史明文行都直接报错，
+不存在明文回退；启动主密钥失败也会拒绝启动。
 
 ### 12.2 配置文件示例
 
@@ -1243,6 +1243,8 @@ users 表 + 会话一条通道后，管理员只是一个 `role='admin'` 的普�
   "db_path": "./data/gateway.db",
   "log_level": "info",
   "master_key_env": "ROSETTA_GW_MASTER_KEY",
+  "public_origin": "",
+  "trusted_proxy_cidrs": [],
   "timezone": "Asia/Shanghai",
   "usage_retention_days": 30,
   "probes": {
@@ -1471,7 +1473,7 @@ vue-router 的 `insertMatcher` 按路径得分二分插入（`findInsertionIndex
 - **导出必加密、必带凭据**（2026-10-07 收敛，此前是「明文默认不带凭据 + 勾选带凭据 +
   口令可选」的四种组合）：凭据是这份文件里唯一「泄了就能花钱」的东西，明文带凭据的
   文件又恰恰是最容易顺手导出的那种；且单一产物格式让导入侧不用兼容两套形态。
-  无口令请求一律 400，产物统一是 `.json.enc`；导入对**旧版明文文件**仍兼容。
+  无口令请求一律 400，产物统一是当前版本的 `.json.enc`；明文文件与旧格式一律拒绝。
 - **导入语义是「只增不改」**：已存在的 slug 原样保留，新来的改名加 `-2`/`-3` 后缀。
   覆盖要先删、删错了就没了；加后缀最坏只是库里多一个重复供应商，用户自己能看出来。
 - 导入**必须先干跑**（`dry_run`），界面先展示预览再确认写入。
@@ -1479,16 +1481,14 @@ vue-router 的 `insertMatcher` 按路径得分二分插入（`findInsertionIndex
   通用 `request<T>` —— 后者会 `JSON.parse` 一整个配置清单。
 - **导入与手工创建同一套校验**（2026-10-07）：超时/重试/上下文窗口/单价等数值字段
   不再绕过 provider/model handler 的非负与上界校验，违例跳过并进 warnings；
-  凭据的 `enabled` 跟随导出文件（旧版文件缺该字段按启用处理），
-  不再硬编码复活为启用。
+  凭据的 `enabled` 必须由当前导出格式显式给出，缺字段的条目跳过并告警，
+  不再猜测为启用。
 - 两个端点都在 handler 内 `requireAdmin`：路径虽在 `/admin/api/` 前缀下（白名单管不到），
   但导出体可能含全部上游凭据，绝不能落到普通用户手里。
 
-配套的**跨版本数据迁移**是一次性工具 `cmd/migrate-legacy`（把 v1.4.1 旧库的
-provider / 模型 / 路由搬进当前版本空库），不能简单复制 db 文件 —— master.key 不同，
-凭据是 AES-256-GCM 加密的（密钥 = sha256(master.key 文件内容)），直接搬密文会导致
-全部 provider 解不开凭据、表现为 `/v1` 全站 404 且无任何告警；且 v1.4.1 → 当前版之间
-`routes`/`access_keys` 有过 ALTER，列顺序不同，故按列名显式 INSERT。
+配置迁移只认**当前 schema**：导出/导入格式是唯一受支持的跨环境搬运方式。
+项目不再维护旧版本数据库的原地迁移工具，也不为历史 schema 保留第二套建表、
+列补丁或回填逻辑 —— 那会让同一份数据语义在两条路径上各自演化。
 
 ### 13.4 安全
 
@@ -1536,8 +1536,7 @@ provider / 模型 / 路由搬进当前版本空库），不能简单复制 db �
 >
 > 本轮补上的是 2026-10-06 之后新增的根级资产（`scripts/`、`docker/`、`.github/`、
 > `build.ps1`、`gateway.ps1`、`CONTRIBUTING.md`）与 `internal/` 下新增的
-> `effort`（思考挡位唯一口径）和 `probe`（上游模型定时探测），并把
-> `migrate-legacy` 的版本描述改成「旧库 → 当前版本」（它搬的不只 v1.4.1 一种形态）。
+> `effort`（思考挡位唯一口径）和 `probe`（上游模型定时探测）。
 > 核对方式：`Get-ChildItem -Directory` + 逐个 `internal/*/` 的包注释。
 
 ```
@@ -1566,10 +1565,9 @@ rosetta-gateway/
 ├── cmd/
 │   ├── gateway/                    装配与启动；**配额预占、限速、故障转移链、usage 记账
 │   │                               都在这里**（请求热路径，非独立包）
-│   └── migrate-legacy/             一次性工具：旧库 → 当前版本（见 §13.3）
 ├── internal/
 │   ├── config/                     启动配置加载、校验、时区应用、端口占用检查
-│   ├── store/                      SQLite 连接、迁移、各表 DAO、归档与对账、探测记录
+│   ├── store/                      SQLite 连接、canonical schema、各表 DAO、归档与对账、探测记录
 │   ├── snapshot/                   运行时快照：路由索引、Provider 池，atomic.Pointer 热替换
 │   ├── routing/                    模型名解析（§5）
 │   ├── upstream/                   凭证池、健康与冷却、Client 生命周期、故障转移、出站代理
@@ -1609,7 +1607,7 @@ rosetta-gateway/
 
 ### P1 — 管起来 ✅
 
-**做**：SQLite + 迁移；Provider / 模型 / Route / Key 的 CRUD 管理 API；管理鉴权；内存快照热更新；Web 界面（Providers、模型、Routes、Keys、用量总览、系统页）；连通性测试。
+**做**：SQLite + canonical schema；Provider / 模型 / Route / Key 的 CRUD 管理 API；管理鉴权；内存快照热更新；Web 界面（Providers、模型、Routes、Keys、用量总览、系统页）；连通性测试。
 
 **验收**：
 1. 浏览器里加一个 provider、加模型、建 route、发一把 key，**全程不改配置文件、不重启**

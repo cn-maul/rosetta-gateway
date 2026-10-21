@@ -19,22 +19,79 @@
 ```bash
 docker run -d \
   --name rosetta-gateway \
-  -p 8666:8666 \
+  -p 127.0.0.1:8666:8666 \
   -v rosetta-gateway-data:/data \
   --restart unless-stopped \
   ghcr.io/cn-maul/rosetta-gateway:1.6.5
 ```
 
-然后打开 `http://<主机>:8666/admin/` —— 首次进入会显示「首次设置密码」表单，
+然后打开 `http://127.0.0.1:8666/admin/` —— 首次进入会显示「首次设置密码」表单，
 为自动创建的 `admin` 账号设一个密码，设完直接进入后台。
 
-表单里多了一个**引导令牌**输入框，值从容器日志里取：
+表单里多了一个**引导令牌**输入框。推荐用环境变量预先指定（值只有部署者持有）：
 
 ```bash
-docker logs rosetta-gateway 2>&1 | grep 引导令牌
+docker run -d \
+  --name rosetta-gateway \
+  -e ROSETTA_GW_BOOTSTRAP_TOKEN="$(openssl rand -hex 32)" \
+  -p 127.0.0.1:8666:8666 \
+  -v rosetta-gateway-data:/data \
+  --restart unless-stopped \
+  ghcr.io/cn-maul/rosetta-gateway:1.6.5
 ```
 
-> 局域网里别的机器访问，要用宿主机的**局域网 IP**，不是 `localhost`。
+没设环境变量时网关会生成一枚随机令牌，**不打印到日志**（日志会轮转、会被聚合
+到集中式日志平台，等于把「谁还没完成引导」这条信息的攻击面从「能连到端口」
+扩大到「能读日志」）。取用方式是从数据库读回：
+
+```bash
+docker exec rosetta-gateway sqlite3 /data/data/gateway.db \
+  "SELECT value FROM app_settings WHERE key='bootstrap_token'"
+```
+
+> **为什么端口映射绑回环**（2026-10-21 修 A10-P0-1）
+>
+> 网关自身不做 TLS：管理会话 cookie、JWT、上游凭据、下游 `Authorization` 头
+> 全部走明文。默认写 `-p 8666:8666` 等于把这条**推荐**部署路径直接放在
+> 同网段可被动监听的明文网络上。
+>
+> 需要跨主机访问时：先在宿主机上装 TLS 反代（nginx / Caddy / Traefik），
+> 让反代做 HTTPS 终止并回连 `127.0.0.1:8666`，对外只暴露 443。
+> 容器内仍保持 `listen 0.0.0.0:8666`（容器只听回环会让端口映射不可达），
+> 边界由**宿主机的端口映射**承担。
+>
+> **反代部署必须配置 `public_origin`**（审计 A7-13）：
+>
+> ```json
+> { "public_origin": "https://gw.example.com" }
+> ```
+>
+> 网关自身只看到明文 HTTP（`r.TLS=nil`）。配置后，同源校验以这个值为
+> 浏览器侧 scheme+host 的基准，会话 Cookie 也会自动带 `Secure`。
+> 不配置时同源校验会保守地拒绝浏览器从 HTTPS 页面发来的写请求（403）。
+> **不要**依赖 `X-Forwarded-Proto`：该头可被客户端伪造，而同一个校验
+> 还保护免鉴权的首次引导入口。
+>
+> 若你的部署里反代与网关不同机，那么 `-p 127.0.0.1:8666:8666` 就不可用 ——
+> 这种情况请在宿主机上用防火墙把 8666 只放行给反代机的地址，
+> 并接受「到反代这一跳仍是明文」的现实（跨机的第一跳需要网络层保证）。
+>
+> 反代还要把真实客户端地址交给网关，否则 key 的 IP 白名单与登录限速会把
+> **代理地址**当成所有用户。显式配置可信代理网段后才采信 `Forwarded` /
+> `X-Forwarded-For`，未配置时这两个头一律忽略：
+>
+> ```json
+> {
+>   "public_origin": "https://gw.example.com",
+>   "trusted_proxy_cidrs": ["172.18.0.0/16", "::1/128"]
+> }
+> ```
+>
+> 网段要填**容器实际看到的直连对端**，不要为了省事写 `0.0.0.0/0`。
+> 反代必须覆盖或追加 `X-Forwarded-For`（nginx：
+> `proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;`），不能把
+> 客户端自带的同名头原样透传。网关从右向左跳过可信代理，取第一个不可信
+> 地址，因此客户端在链首伪造的 IP 不会覆盖代理追加的真实来源。
 
 ## 端口为什么是 8666，不是 6666
 
@@ -143,7 +200,9 @@ services:
     # 表现为「最后几次调用的用量查不到」（这些请求因此免单且配额被放宽）。
     stop_grace_period: 30s
     ports:
-      - "8666:8666"
+      # 绑回环：网关自身不做 TLS，对外访问请走宿主机上的 TLS 反代
+      # （反代回连 127.0.0.1:8666）。详见「快速开始」的说明。
+      - "127.0.0.1:8666:8666"
     volumes:
       - ./rosetta/config.json:/data/config.json   # 配置文件
       - ./rosetta/data:/data/data                 # 数据库目录（旧模板路径为 /data/db）
@@ -184,16 +243,25 @@ services:
 
 ### 引导令牌
 
-启动日志里会有一条 WARN 打印本次使用的令牌：
+启动日志里会有一条 WARN 说明令牌**已布置**，但**不打印令牌值**
+（2026-10-21 修 A10-P1-1）：
 
 ```bash
 docker logs rosetta-gateway 2>&1 | grep 引导令牌
 ```
 
 - 未设置 `ROSETTA_GW_BOOTSTRAP_TOKEN` 时，网关在启动时生成 32 字节随机值（64 位 hex）；
-- 令牌**只进日志**，不会出现在任何 HTTP 响应里 —— `/admin/api/bootstrap` 免鉴权，
+- 令牌**不进日志**，只从数据库读回：
+
+  ```bash
+  docker exec rosetta-gateway sqlite3 /data/data/gateway.db \
+    "SELECT value FROM app_settings WHERE key='bootstrap_token'"
+  ```
+
+  裸机部署把 `/data/data/gateway.db` 换成 `<home>/data/gateway.db` 即可。
+- 令牌不会出现在任何 HTTP 响应里 —— `/admin/api/bootstrap` 免鉴权，
   把令牌放进去等于取消令牌；
-- 重启不会覆盖已有令牌，也不会重复打印。日志若已轮转丢失，删除该部署的
+- 重启不会覆盖已有令牌。令牌若已丢失，删除该部署的
   `app_settings.bootstrap_token` 后重启即可重新生成；
 - 令牌在「写密码 + 置完成标记 + 清令牌」**同一个事务**里消耗，不存在中间态。
 
@@ -203,14 +271,14 @@ docker logs rosetta-gateway 2>&1 | grep 引导令牌
 docker run -d \
   --name rosetta-gateway \
   -e ROSETTA_GW_BOOTSTRAP_TOKEN="$(openssl rand -hex 32)" \
-  -p 8666:8666 \
+  -p 127.0.0.1:8666:8666 \
   -v rosetta-gateway-data:/data \
   --restart unless-stopped \
   ghcr.io/cn-maul/rosetta-gateway:latest
 ```
 
-理由与自动生成的令牌同类：日志会随轮转和日志聚合平台留存，那等于把「谁还没完成
-引导」这条信息的攻击面从「能连到端口」扩大到「能读日志」。指定令牌时长度必须
+理由与自动生成的令牌同类：值只由部署者持有，备份与日志体系都不需要承载它。
+指定令牌时长度必须
 **至少 32 字节**，过短会被拒绝并在日志里报 ERROR（此时不会写入任何令牌，引导窗口
 回到无令牌保护状态）。
 
@@ -218,7 +286,7 @@ docker run -d \
 > 引导令牌明文。备份文件要按凭据级别保护，别丢进公开的对象存储或代码库。
 
 所以：**容器起来后第一时间去 `/admin/` 完成首次设置密码**。
-若要挂在公网，建议只绑回环（`-p 127.0.0.1:8666:8666`）再加反代鉴权，
+默认的端口映射已经是回环（`-p 127.0.0.1:8666:8666`）；对外访问请走 TLS 反代，
 或至少先在本机完成密码设置再放开端口。
 
 ## 日志
@@ -300,20 +368,45 @@ docker run -e TZ=Asia/Tokyo ...
 
 ```bash
 docker run --rm -v rosetta-gateway-data:/data -v "$PWD:/backup" alpine sh -c '
+  set -eu
   # 一致性快照：VACUUM INTO 在事务内产出一个完整副本，
   # 不受 -wal / -shm 与主库不同步的影响。
   apk add --no-cache sqlite >/dev/null
-  sqlite3 /data/data/gateway.db "VACUUM INTO /backup/gateway-$(date +%F).db"
-  tar czf /backup/rosetta-gateway-$(date +%F).tar.gz -C /backup gateway-$(date +%F).db
-  rm -f /backup/gateway-$(date +%F).db
+  stamp=$(date +%F-%H%M%S)
+  out=/backup/rosetta-gateway-$stamp
+  mkdir -p "$out"
+
+  # 配置与两把密钥缺一不可：只有数据库无法恢复可用的部署。
+  for f in config.json master.key session_secret; do
+    [ ! -e "/data/$f" ] || cp -a "/data/$f" "$out/$f"
+  done
+
+  # db_path 可能被改过，从当前配置解析；相对路径锚定 /data。
+  db=$(sed -n '\''s/.*"db_path"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p'\'' /data/config.json | head -n 1)
+  case "$db" in
+    /*) db_path=$db ;;
+    *)  db_path=/data/${db#./} ;;
+  esac
+  sqlite3 "$db_path" "VACUUM INTO '\''$out/gateway.db'\''"
+
+  tar czf "$out.tar.gz" -C /backup "$(basename "$out")"
+  echo "备份完成：$out.tar.gz"
 '
 ```
 
-> **不要直接 `tar -C /data .`**。本项目用 WAL（`synchronous=NORMAL`），
+备份包必须包含 **`config.json`、`master.key`、`session_secret` 和 SQLite 数据库**。
+上面的 `VACUUM INTO` 已把 WAL 中已提交的事务合并进单文件快照；若选择停机后
+手工复制，则必须同时复制 `gateway.db`、`gateway.db-wal`、`gateway.db-shm`
+三个文件，缺 WAL 会丢掉最近已提交的用量与余额变更。
+
+> `ROSETTA_GW_MASTER_KEY` 或 `ROSETTA_GW_SESSION_SECRET` 用环境变量覆盖时，
+> `/data` 里不会有对应文件，备份系统必须另外保存环境变量/密钥管理系统中的值。
+
+> **不要在运行中直接 `tar -C /data .`**。本项目用 WAL（`synchronous=NORMAL`），
 > 已提交但尚未 checkpoint 的事务只存在于 `gateway.db-wal` 里。把主库与
 > `-wal`/`-shm` 当三个普通文件分别拷走，它们取自不同时刻 —— 恢复出来
 > 可能**丢掉最近若干笔已提交用量**（表现为额度、余额与报表对不上）。
-> 停机拷贝三个文件、或用上面的 `VACUUM INTO` 都安全。
+> 停机后一次性复制三个文件、或用上面的 `VACUUM INTO` 都安全。
 
 升级就是换镜像标签后重建容器 —— `/data` 原样保留：
 
@@ -330,20 +423,20 @@ docker compose pull && docker compose up -d
 宿主机目录属主与容器内 uid 不一致时（bind mount 很常见），显式传：
 
 ```bash
-docker run -d --name rosetta-gw -p 8666:8666 \
+docker run -d --name rosetta-gw -p 127.0.0.1:8666:8666 \
   -v /srv/rosetta-gw:/data \
   -e ROSETTA_GW_UID=$(id -u) -e ROSETTA_GW_GID=$(id -g) \
   ghcr.io/cn-maul/rosetta-gateway:latest
 ```
 
-若属主改不动（NFS、只读根文件系统等），entrypoint **不会放开目录权限**（回退是
-`chmod 0700` 收紧，而不是曾经的世界可写），会在 **stderr 明确告警**后以 root 继续运行
-—— 不静默降级，否则运维会以为容器已加固。以 root 运行意味着进程被攻破即持容器 root，
-请优先修复属主问题。
+若属主改不动（NFS、只读根文件系统等），entrypoint **拒绝启动**并在 stderr
+说明原因，不再回退到 root。把 UID/GID 配成 0 也会被拒绝。以 root 运行意味着
+进程被攻破即持容器 root，部署应修正宿主机目录属主，而不是降级安全边界。
 
 ## 健康检查
 
-镜像自带 `HEALTHCHECK`，探 `127.0.0.1:8666/healthz`：
+镜像自带 `HEALTHCHECK`，从 `/data/config.json` 的 `listen` 解析端口后探
+`127.0.0.1:<port>/healthz`。改过容器内监听端口时不需要重做镜像：
 
 ```
 --interval=30s --timeout=5s --start-period=10s --retries=3
@@ -379,7 +472,8 @@ docker inspect --format '{{.State.Health.Status}}' rosetta-gw
 **端口没监听 / 浏览器连不上**
 先看 `docker ps` 的 `PORTS` 列：
 - 空的 → 没发布端口（漏了 `-p`，或写成了 `expose:`）
-- `127.0.0.1:8666->8666/tcp` → 只绑回环，局域网访问不了
+- `127.0.0.1:8666->8666/tcp` → 只绑回环，局域网访问不了（**这是刻意的默认**，
+  跨主机访问请走宿主机上的 TLS 反代）
 - `0.0.0.0:32768->8666/tcp` → 宿主端口被随机分配了，`-p` 要写 `8666:8666`
 
 映射正确却连不上，再看 `config.json` 里的 `listen`：容器内必须是 `0.0.0.0:8666`，
