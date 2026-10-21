@@ -54,24 +54,24 @@ function is401(e: unknown): boolean {
   return (e as { status?: number }).status === 401
 }
 
+function is404(e: unknown): boolean {
+  return (e as { status?: number }).status === 404
+}
+
 async function loadProvider() {
   const id = providerId.value
   try {
-    const all = await api.providers()
-    // 列表接口是唯一按 id 取单个 provider 的入口（后端没有 GET
-    // /providers/{id}）。十几个上游一次全取的成本可以接受，且顺带保证
-    // 这里的 ready/enable 状态与列表页看到的是同一份数据。
+    const found = await api.provider(id)
     if (id !== providerId.value) return
-    const found = all.find((p) => p.id === id)
-    if (!found) {
-      notFound.value = true
-      provider.value = null
-      return
-    }
     notFound.value = false
     provider.value = found
   } catch (e) {
     if (id !== providerId.value) return
+    if (is404(e)) {
+      notFound.value = true
+      provider.value = null
+      return
+    }
     if (!is401(e)) err.value = '加载上游失败：' + (e as Error).message
   }
 }

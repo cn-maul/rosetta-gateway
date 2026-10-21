@@ -188,14 +188,17 @@ export async function bootstrapSetup(password: string, token?: string) {
   return r
 }
 
-/** logout 清除本地会话。后端清 cookie，失败也不阻塞前端登出。 */
+/**
+ * logout 清除本地会话。
+ *
+ * 审计 A7-03：服务端吊销失败时必须保留本地凭据。后端现在会回 500 表示
+ * 「会话没有失效」，此时清 token 只会让界面显示已登出，而复制出去的
+ * Bearer token 仍在自然过期前可用。调用方收到异常后应提示用户重试。
+ */
 export async function logout() {
-  try {
-    await post('/logout')
-  } finally {
-    saveToken('')
-    session.me = null
-  }
+  await post('/logout')
+  saveToken('')
+  session.me = null
 }
 
 export class ApiFail extends Error {
@@ -447,6 +450,7 @@ function usageHistoryQuery(days: number, filters?: HistoryFilters): string {
 export const api = {
   // providers
   providers: () => get<Provider[]>('/providers'),
+  provider: (id: string) => get<Provider>(`/providers/${id}`),
   createProvider: (b: ProviderCreatePayload) => mutate(() => post<Provider>('/providers', b)),
   updateProvider: (id: string, b: ProviderUpdatePayload) => mutate(() => patch<Provider>(`/providers/${id}`, b)),
   deleteProvider: (id: string) => mutate(() => del(`/providers/${id}`)),

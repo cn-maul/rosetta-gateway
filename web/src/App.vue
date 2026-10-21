@@ -1,8 +1,8 @@
 <script setup lang="ts">
 import { computed, onMounted, onUnmounted, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
-import { toasts, confirmState, settleConfirm } from './ui'
-import { isAdmin, loadSession, session, logout as apiLogout } from './api'
+import { toasts, confirmState, settleConfirm, toast } from './ui'
+import { ApiFail, isAdmin, loadSession, session, logout as apiLogout } from './api'
 import { reapplyGuard } from './router'
 import AppModal from './components/AppModal.vue'
 
@@ -218,9 +218,13 @@ const showShell = computed(() => {
 async function doLogout() {
   try {
     await apiLogout()
-  } finally {
-    void router.push({ name: 'login' })
+  } catch (e) {
+    // 服务端吊销失败时本地会话必须保留：否则界面看起来已退出，而复制出去的
+    // Bearer token 在自然过期前仍可用（审计 A7-03）。
+    toast(e instanceof ApiFail ? e.message : '登出失败，请重试', 'err')
+    return
   }
+  void router.push({ name: 'login' })
 }
 
 onMounted(async () => {

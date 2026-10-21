@@ -212,15 +212,34 @@ async function exportCSV() {
 .w-auto { width: auto; }
 .logs-table { min-width: 980px; }
 .logs-table th, .logs-table td { white-space: nowrap; }
+/* 表格内的 mono 文本**必须**在这里重新钉成 nowrap。
+   全局 styles.css 有一条 `.table-panel .tbl .mono { white-space: normal;
+   overflow-wrap: anywhere }`（3 个 class），而本组件 scoped 的
+   `.cell-meta` / `.model-name` 只带 2 个 class + 1 个 data-v 属性，
+   特异性打成平手 —— 谁生效取决于 chunk CSS 的插入顺序，而懒加载 chunk
+   是**后插** <link> 的，看起来能用，实际是顺序碰巧。一旦上游模型名够长
+   （实测 `nvidia/nemotron-3.5-lightning:free`，34 字符），
+   `.cell-meta` 就按 normal 折成两行：省略号永远不出现（先换行再溢出），
+   行高从 38px 撑到 50px —— 「单行」在长名字上直接失效。
+   多带一个 class 把特异性抬到 (0,4,0)，就不必再赌注入顺序。 */
+.logs-table .model-name.mono,
+.logs-table .cell-meta.mono { white-space: nowrap; }
 /* 请求日志是逐条扫描为主，行密度优先。全局 .table-panel td 给 16px
    上下内边距是按「每格有副标题」的形态定的；本表已把副标题折进主行，
    仍沿用会让每行 ~60px，一屏少看近一半记录。 */
 .logs-table td { padding-top: 6px; padding-bottom: 6px; vertical-align: middle; }
 .mobile-log-time { display: none; }
 .logs-table .time-column { width: 142px; white-space: nowrap; }
-.model-column { min-width: 0; max-width: 360px; }
+.model-column { min-width: 0; max-width: 300px; }
 .model-name { text-align: left; font-weight: 600; overflow-wrap: normal; }
 .key-name { max-width: 160px; overflow: hidden; text-overflow: ellipsis; display: inline-block; vertical-align: bottom; }
+/* max-width 只做「上限」，实际宽度由 table 布局分配；它同时是省略号的生效条件
+   （inline-block + overflow:hidden + text-overflow:ellipsis 缺一不可）。
+   这两个上限是一对约束，改一个必须重量另一个：1280px 视口下表格可用宽 ~997px，
+   各定宽列（时间 142 + 状态 85 + 密钥 ~107 + Tokens 126 + 速度 86 + 耗时 112
+   + 详情 84）已占 ~742px，留给「模型 / 实际模型」的只有 ~255px。
+   实测 model-column 360 + meta 190 时，1280 视口溢出 47px（整表被推到
+   980px 的 min-width 上，出现横向滚动条）；改成 300 + 190 后溢出为 0。 */
 .cell-meta { color: var(--muted); font-size: 12px; overflow: hidden; text-overflow: ellipsis; display: inline-block; max-width: 190px; vertical-align: bottom; }
 .speed-column { width: 86px; }
 .timing-column { width: 112px; }
