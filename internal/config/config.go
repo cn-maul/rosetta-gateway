@@ -314,9 +314,9 @@ func (c *Config) setDefaults() {
 	// 故障转移两项维持 3/3：链上第 4 个目标几乎不提升成功率却把最坏耗时再乘一截；
 	// 连续失败 3 次已足够判定目标有问题。
 	//
-	// 三处必须同步：这里、config.example.json、web 的设置页 RUNTIME_DEFAULTS。
-	// 界面回显的是生效值，DB 未配置时生效值就来自这里 ——
-	// 三处不一致会让运维照着界面推理出错误的预期。
+	// config.example.json / docker 默认文件由 defaults_consistency_test.go
+	// 校验，前端 RUNTIME_DEFAULTS 由 defaultsgen 直接生成。这里的 setDefaults
+	// 仍是唯一的作者源：界面回显的生效值在 DB 未配置时就来自这里。
 	if c.Defaults.UpstreamTimeoutMs == 0 {
 		c.Defaults.UpstreamTimeoutMs = 300000
 	}
