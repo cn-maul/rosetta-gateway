@@ -8,6 +8,8 @@ import (
 	"strings"
 
 	"github.com/cn-maul/rosetta"
+
+	"github.com/cn-maul/rosetta-gateway/internal/effort"
 )
 
 // OpenAI Responses 协议的入站解码（POST /v1/responses）。
@@ -584,8 +586,14 @@ func (a *ResponsesRequest) rewriteToolChoice(tools []ResponsesTool, flat []roset
 		Type string `json:"type"`
 		Name string `json:"name"`
 	}
-	if json.Unmarshal(a.ToolChoice, &obj) != nil || obj.Type != "function" || obj.Name == "" {
+	if json.Unmarshal(a.ToolChoice, &obj) != nil || obj.Name == "" {
 		return nil // 字符串形态或非 function 选择，与展平无关
+	}
+	if obj.Type == "namespace" {
+		return a.rewriteNamespaceToolChoice(obj.Name, flat)
+	}
+	if obj.Type != "function" {
+		return nil
 	}
 	exists := false
 	for _, t := range flat {
@@ -627,6 +635,52 @@ func (a *ResponsesRequest) rewriteToolChoice(tools []ResponsesTool, flat []roset
 	return out
 }
 
+// rewriteNamespaceToolChoice 兑现 `{"type":"namespace","name":"shell"}`
+// 形态的 tool_choice（2026-10-21 修 A2-P1-6）。
+//
+// # 为什么要单独处理
+//
+// decode 阶段**明确接受** namespace 形态（见 ToolChoice 字段的注释：
+// 「namespace 也接受：客户端可以用命名空间强制『在这个组里选』，
+// 展平后这个约束由 rewriteToolChoice 兑现」）。但修复前 rewriteToolChoice
+// 只处理 `obj.Type == "function"`，namespace 落进 `return nil` ——
+// **约束从未被兑现**，原始 `{"type":"namespace","name":"shell"}` 被原样
+// 发给上游，而上游的工具表里只有展平后的 `shell__ls`，没有名为 `shell`
+// 的工具。
+//
+// 结果要么 400，要么**静默退回 auto** —— 后者正是 DESIGN §7.3 明令要避免的
+// 「客户端要强制，实际拿到模型自由选择，且无任何信号」。
+//
+// # 兑现规则
+//
+// 在展平后的表里找所有 `ns.Name + "__"` 前缀的候选：
+//   - 恰好一个 → 改写成 `{"type":"function","name":"<展平名>"}`；
+//   - 多于一个 → 保持原值（歧义不猜，多半会被上游拒绝）；
+//   - 一个都没有 → 保持原值（约束无对应物，原样发出让上游自己决定）。
+func (a *ResponsesRequest) rewriteNamespaceToolChoice(nsName string, flat []rosetta.ToolDefinition) json.RawMessage {
+	prefix := nsName + "__"
+	var match string
+	for _, t := range flat {
+		if !strings.HasPrefix(t.Name, prefix) {
+			continue
+		}
+		if match != "" && match != t.Name {
+			// 命名空间内不止一个工具：无法确定「强制哪一个」，
+			// 不猜 —— 原样发出。
+			return nil
+		}
+		match = t.Name
+	}
+	if match == "" {
+		return nil
+	}
+	out, err := json.Marshal(map[string]any{"type": "function", "name": match})
+	if err != nil {
+		return nil
+	}
+	return out
+}
+
 // ToRosetta 组装统一请求。input 是字符串时整体作为一条 user 消息。
 func (a *ResponsesRequest) ToRosetta() *rosetta.ChatRequest {
 	req := &rosetta.ChatRequest{
@@ -644,13 +698,13 @@ func (a *ResponsesRequest) ToRosetta() *rosetta.ChatRequest {
 		// 否则上游会去找一个不存在的工具名（或干脆拒绝）。
 		a.flattenedToolChoice = a.rewriteToolChoice(a.Tools, req.Tools)
 	}
-	// minimal / xhigh 是 OpenAI 为 gpt-5 系列新增的两档（比 low 更省、
-	// 比 high 更强），直连上游时合法。旧实现只认 low/medium/high，这两档
+	// minimal / xhigh / max 是 OpenAI 为 gpt-5 系列新增的档位（比 low 更省、
+	// 比 high 更强），直连上游时合法。旧实现只认 low/medium/high，这些档位
 	// 落空 → req.Thinking 保持 nil → 客户端以为自己开了推理模式，实际静默
-	// 不思考。归一逻辑见 inwire.parseEffort。
+	// 不思考。归一口径由 internal/effort 单一提供（2026-10-21 修 P0-12）。
 	if a.Reasoning != nil && a.Reasoning.Effort != "" {
-		if eff := parseEffort(a.Reasoning.Effort); eff != rosetta.EffortUnset {
-			req.Thinking = &rosetta.ThinkingConfig{Effort: eff}
+		if lvl, ok := effort.ToThinkingLevel(effort.Parse(a.Reasoning.Effort)); ok {
+			req.Thinking = &rosetta.ThinkingConfig{Effort: rosetta.Effort(lvl)}
 		}
 	}
 
@@ -968,8 +1022,35 @@ func responsesItemToolOutput(item responsesItem) (string, []rosetta.Block) {
 // 内联 base64（可带 data: 前缀）、provider 侧已上传的 file id。
 // 三者皆空时返回 false —— 那一项什么都没说，造一个空 file 块会被
 // rosetta validate 拒掉，把本来能跑的请求变成 400。
+//
+// # 三种形态互斥（2026-10-21 修 A2-P1-5）
+//
+// 修复前这里用 firstNonEmpty 三选一取值，然后**同时**写
+// `FileData: data` 与 `FileID: p.FileID`。当载荷只带 `file_id`（OpenAI 官方
+// Responses 的合法形态：文件已在 provider 侧上传、这里只引用其 id）时，
+// data == p.FileID == "file-abc"，于是产生一个「两个源都有」的块，
+// 被 rosetta 的 validate 拒掉：
+//
+//	file block has both FileData and FileID; set exactly one source
+//
+// 症状特别难查：入站解码**静默通过**，400 来自 SDK 内部的措辞，
+// 客户端无从知道自己少发了 file_data。
+//
+// 现在按形态**互斥**赋值，与 rosetta.Block.validate() 的
+// 「exactly one source」对齐：
+//   - file_id 形态 → 只填 FileID（FileData 留空）；
+//   - file_data / file_url 形态 → 只填 FileData（FileID 留空）。
 func responsesFileBlock(p responsesContentPart) (rosetta.Block, bool) {
-	data := firstNonEmpty(p.FileData, p.FileURL, p.FileID)
+	// file_id 形态最优先：它是「引用 provider 侧已存在的文件」，
+	// 与 file_data / file_url 是两种不同语义，不能互相顶替。
+	if p.FileID != "" {
+		return rosetta.Block{
+			Type:     rosetta.BlockFile,
+			FileName: p.Filename,
+			FileID:   p.FileID,
+		}, true
+	}
+	data := firstNonEmpty(p.FileData, p.FileURL)
 	if data == "" {
 		return rosetta.Block{}, false
 	}
@@ -983,7 +1064,6 @@ func responsesFileBlock(p responsesContentPart) (rosetta.Block, bool) {
 		Type:     rosetta.BlockFile,
 		FileName: p.Filename,
 		FileData: data,
-		FileID:   p.FileID,
 	}, true
 }
 

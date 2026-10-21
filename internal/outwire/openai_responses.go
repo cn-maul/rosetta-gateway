@@ -38,12 +38,34 @@ type ResponsesSSE struct {
 	model string
 	mu    sync.Mutex
 
-	id          string
-	started     bool // response.created 已发出
-	outputIndex int
+	id      string
+	started bool // response.created 已发出
 	// 打开中的 message item（content_index 恒 0：一个 message 一个 text part）。
 	msgOpen bool
 	text    strings.Builder
+	// msgSourceIdx 是「当前打开的 message item 对应的上游 output_index」。
+	//
+	// # 为什么需要它（2026-10-21 修 A3-P1-3 / 汇总 O3）
+	//
+	// 此前 s.text 这个 builder **跨 item 共享且从不清空**：开第二个
+	// message item 时，第二个的 output_text.done 文本是
+	// 「第一个的文本 + 第二个的文本」（实测 "AAABBB"）。客户端若按
+	// output_text.done 而非按 delta 累积，第二段文本就被污染成累计值；
+	// response.completed 内嵌的 output 数组同样带这个错值。
+	//
+	// 修法有两个层次：
+	//   1. **开新 item 时清空 s.text**（下面 Event 里的 s.text.Reset()）
+	//      —— 这修的是「第二个 item 的文本包含第一个 item 的内容」；
+	//   2. **按上游 output_index 切 item** —— 这修的是「两个 item 被
+	//      合并成一个」。Responses 协议允许一条回复里有多个 message
+	//      item（工具调用循环里就会出现），上游会用不同的
+	//      output_index 区分它们。
+	//
+	// 只有当上游给了 output_index 时才按它切；没给（别的协议族、极简
+	// 上游）则退回「靠 tool 事件切换」的老行为。
+	msgSourceIdx int
+	// msgSourceKnown 标记 msgSourceIdx 是否有效（上游给了 output_index）。
+	msgSourceKnown bool
 	// 打开中的 function_call item。
 	toolOpen bool
 	toolID   string
@@ -70,14 +92,41 @@ type ResponsesSSE struct {
 	// delta/done 事件里复用同一个值：added 用 A、done 用 B 会让客户端
 	// 认不出这是同一个 item。
 	reasonItemID string
+	// reasonSourceID 是「当前打开的 reasoning item 对应的上游 ReasoningID」。
+	//
+	// # 为什么需要它（2026-10-21 修 A3-P1-2 / 汇总 O2）
+	//
+	// 此前 item 边界完全押在「Sealed 非空」上：没有 sealed 载荷的
+	// reasoning item 永远不收尾，于是**第二个** reasoning item 的思考
+	// 文本被写进**第一个** item —— 实测输出是 rs_1 的 summary 变成
+	// "A1B1"、rs_2 从未被创建（没有自己的 added/done）、rs_2 的 sealed
+	// 载荷被挂到 rs_1 的 id 上（跨轮 reasoning 续接状态被错配）。
+	//
+	// SDK 侧其实**给了** item 边界：每个 reasoning item 有自己的
+	// ReasoningID（rosetta@v1.2.0 的 provider_openai_responses.go 在
+	// reasoning_summary_text.delta 与 finalize 时都带 ReasoningID）。
+	// 出站层此前只是没用它。
+	//
+	// 现在用 ReasoningID 变化切 item：有 id 且与当前 item 不同 → 先收尾
+	// 旧 item 再开新 item；没有 id（别的协议族或极简上游）→ 退回
+	// 「靠 sealed 收尾」的旧行为。
+	reasonSourceID string
 	// toolIdx 是当前开放 function_call item 对应的 ToolIndex。
 	// 同项判据必须是它而不是 toolID：rosetta 的续片（Responses 侧的
 	// function_call_arguments.delta）只带 ToolIndex+ArgumentsDelta，ToolID 为空。
 	// 用 ToolID 判会把一个工具调用的参数分片拆成多个 item，客户端按 call_id
 	// 分发工具执行时拿到的是空参数 + 空call_id 的幽灵项。
-	toolIdx  int
-	toolArgs strings.Builder
-	fcSeq    int
+	toolIdx int
+	// toolMapper 把上游的 ToolIndex 重编号成「第几个工具调用」
+	// （2026-10-21 修 A3-P1-1 / 汇总 O1）。理由见 toolindex.go。
+	//
+	// Responses 上游的 ToolIndex 恰好就是 output_index（同一序号空间），
+	// 而 Anthropic 上游的 ToolIndex 是 content block 序号 —— 后者会让
+	// 「同一个工具」的判据与 output index 的语义混淆。重编号后判据统一
+	// 成「第几个工具调用」。
+	toolMapper *toolIndexMapper
+	toolArgs   strings.Builder
+	fcSeq      int
 	// seq 是事件序号。Responses 协议里每个事件都带 sequence_number，
 	// 客户端（Codex CLI）用它检测丢帧与乱序；本网关此前不发，Codex 侧
 	// 只能退化成「按到达顺序处理」，中间丢一个事件也察觉不到。
@@ -93,12 +142,44 @@ type ResponsesSSE struct {
 
 	wroteContent bool
 	sawTerminal  bool
+	// writeErr 是第一次写失败（2026-10-21 修 *X12）。见 write_error.go。
+	writeErr error
 	// output 累积已收尾的 output item（response.completed 内嵌完整对象）。
 	output []map[string]any
+	// pendingIndex 是「下一个 item 应当占的 output_index」。
+	//
+	// # 为什么需要它（2026-10-21 修 A3-P1-4 / 汇总 O4）
+	//
+	// 此前 output_index 是网关按**到达顺序**自己分配的（三个 s.outputIndex++
+	// 处分发），完全忽略上游给的 ev.OutputIndex。后果有两类：
+	//
+	//   - **错位**：上游 item 的相对顺序与下游 output_index 不一致
+	//     （上游先发 message 再发 function_call，网关把先到的 reasoning
+	//     排到 0，message 与 function_call 的相对次序被对调）。
+	//   - **不连续**：上游跳号（0、2）时下游变成 0、1。Responses 规范
+	//     要求 output_index 是**严格递增的分配序**，连续性本身是协议
+	//     要求，不是美观问题。
+	//
+	// 现在优先采用上游的 output_index；上游没给（nil）才按到达顺序
+	// 分配，并保证下一个可用值严格大于已用过的最大值。
+	pendingIndex int
+	// msgOutIdx 是当前打开的 message item 占的 output_index。
+	// toolOutIdx 是当前打开的 function_call item 占的 output_index。
+	//
+	// 此前 closeMessage/closeTool 用 `s.outputIndex - 1` 反推「当前 item
+	// 的下标」—— 那只在「打开的 item 恰好是最后分配的那个」时成立。
+	// 采纳上游 output_index 后这个前提不成立了（上游给的 index 可以跳过
+	// 若干位置），所以必须显式记住每个打开 item 自己的下标。
+	msgOutIdx  int
+	toolOutIdx int
 }
 
 func NewResponsesSSE(w io.Writer, flusher http.Flusher, id, model string, downgraded map[string]string) *ResponsesSSE {
-	return &ResponsesSSE{w: w, flusher: flusher, id: id, model: model, downgraded: downgraded}
+	return &ResponsesSSE{
+		w: w, flusher: flusher, id: id, model: model,
+		downgraded: downgraded,
+		toolMapper: newToolIndexMapper(),
+	}
 }
 
 // WithResponseWriter 绑定底层 ResponseWriter，用于设置单次写截止时间。
@@ -128,7 +209,10 @@ func (s *ResponsesSSE) writeEvent(event string, payload map[string]any) {
 	if err != nil {
 		return
 	}
-	fmt.Fprintf(s.w, "event: %s\ndata: %s\n\n", event, data)
+	if _, err := fmt.Fprintf(s.w, "event: %s\ndata: %s\n\n", event, data); err != nil {
+		s.noteWriteErr(err)
+		return
+	}
 	if s.flusher != nil {
 		s.flusher.Flush()
 	}
@@ -160,12 +244,38 @@ func (s *ResponsesSSE) ensureStarted(id string) {
 	s.writeEvent("response.created", map[string]any{"response": s.responseSkeleton("in_progress")})
 }
 
+// allocIndex 为下一个 output item 分配 output_index。
+//
+// # 规则（2026-10-21 修 A3-P1-4 / 汇总 O4）
+//
+//   - 上游给了 output_index（up != nil）→ **用它**。这样下游的
+//     output_index 与上游的 item 位置一一对应，客户端拿它对齐
+//     item 与 delta 时不会错位。
+//   - 上游没给 → 用到达顺序分配的下一个值（pendingIndex），
+//     并保证它严格大于此前用过的任何值。
+//
+// 上游给的值不连续时（0、2）不重排：那会打乱客户端按 output_index
+// 建立的对应关系。此时后续未指定的下标从 maxUsedIndex+1 继续，
+// 至少保证「不与上游已有的下标相撞」。
+func (s *ResponsesSSE) allocIndex(up *int) int {
+	if up != nil && *up >= 0 {
+		idx := *up
+		if idx >= s.pendingIndex {
+			s.pendingIndex = idx + 1
+		}
+		return idx
+	}
+	idx := s.pendingIndex
+	s.pendingIndex++
+	return idx
+}
+
 // closeMessage 收尾打开中的 message item（part.done + item.done）。
 func (s *ResponsesSSE) closeMessage() {
 	if !s.msgOpen {
 		return
 	}
-	idx := s.outputIndex - 1
+	idx := s.msgOutIdx
 	done := strings.Clone(s.text.String())
 	s.writeEvent("response.output_text.done", map[string]any{
 		"item_id": s.id + "-msg-" + itoa(idx), "output_index": idx, "content_index": 0, "text": done,
@@ -190,7 +300,7 @@ func (s *ResponsesSSE) closeTool() {
 	if !s.toolOpen {
 		return
 	}
-	idx := s.outputIndex - 1
+	idx := s.toolOutIdx
 	args := s.toolArgs.String()
 	if strings.TrimSpace(args) == "" {
 		args = "{}"
@@ -301,6 +411,20 @@ func (s *ResponsesSSE) thinkingDelta(ev *rosetta.Event) {
 		return
 	}
 
+	// # item 边界：按上游 ReasoningID 切换（2026-10-21 修 A3-P1-2 / 汇总 O2）
+	//
+	// 上游给了 ReasoningID 且它与当前打开的 item 不同 → 说明这是
+	// **另一个** reasoning item。先把旧 item 收尾（output_item.done），
+	// 再开新 item。否则第二个 item 的思考文本会写进第一个 item，
+	// 它的 sealed 载荷也会挂到错误的 id 上。
+	//
+	// 为什么不能只看 Sealed：sealed 只在 item 末尾出现，没有 sealed 的
+	// item 就永远不收尾，下一个 item 的内容会全部串进第一个。
+	if ev.ReasoningID != "" && s.reasonOpen && s.reasonSourceID != "" &&
+		ev.ReasoningID != s.reasonSourceID {
+		s.closeReason(nil)
+	}
+
 	// encrypted_content 只在 output_item.done 出现（OpenAI 不在任何
 	// *.delta 事件里发它），所以这里不发 reasoning_summary_part.* 的
 	// added/done 配对 —— 规范的流式形状里 reasoning item 不是分块容器。
@@ -314,9 +438,9 @@ func (s *ResponsesSSE) thinkingDelta(ev *rosetta.Event) {
 		s.closeMessage()
 		s.closeTool()
 		s.reasonOpen = true
-		s.reasonIdx = s.outputIndex
-		s.outputIndex++
+		s.reasonIdx = s.allocIndex(ev.OutputIndex)
 		s.thinkText.Reset()
+		s.reasonSourceID = ev.ReasoningID
 		if ev.ReasoningID != "" {
 			s.reasonItemID = ev.ReasoningID
 		} else {
@@ -354,6 +478,7 @@ func (s *ResponsesSSE) closeReason(ev *rosetta.Event) {
 		return
 	}
 	s.reasonOpen = false
+	s.reasonSourceID = ""
 	done := map[string]any{
 		"type":   "reasoning",
 		"status": "completed",
@@ -389,14 +514,33 @@ func (s *ResponsesSSE) Event(ev *rosetta.Event) {
 			return
 		}
 		s.ensureStarted("")
+		// 上游的 output_index 变了 → 这是**另一个** message item
+		// （2026-10-21 修 A3-P1-3 / 汇总 O3）。Responses 协议允许一条
+		// 回复里有多个 message item（工具调用循环里就会出现），
+		// 上游用不同的 output_index 区分它们。
+		//
+		// 不切的后果：两个 item 被合并成一个，第二个 item 的文本里
+		// 混着第一个的内容（"AAABBB"），且两个 item 拿到同一个 id。
+		if ev.OutputIndex != nil && s.msgOpen && s.msgSourceKnown &&
+			*ev.OutputIndex != s.msgSourceIdx {
+			s.closeMessage()
+		}
 		// output_index 是严格递增的分配序：思考 item 还没 done 就开新的
 		// message item，客户端会看到交错的半开 item。
 		s.closeReason(nil)
 		if !s.msgOpen {
 			s.closeTool()
-			idx := s.outputIndex
-			s.outputIndex++
+			idx := s.allocIndex(ev.OutputIndex)
 			itemID := s.id + "-msg-" + itoa(idx)
+			// 新 item 的文本从空开始：s.text 跨 item 共享，不清就会让
+			// 第二个 item 的文本带上第一个的内容（2026-10-21 修 A3-P1-3）。
+			s.text.Reset()
+			if ev.OutputIndex != nil {
+				s.msgSourceIdx = *ev.OutputIndex
+				s.msgSourceKnown = true
+			} else {
+				s.msgSourceKnown = false
+			}
 			s.writeEvent("response.output_item.added", map[string]any{
 				"output_index": idx,
 				"item":         map[string]any{"type": "message", "id": itemID, "status": "in_progress", "role": "assistant", "content": []any{}},
@@ -406,23 +550,30 @@ func (s *ResponsesSSE) Event(ev *rosetta.Event) {
 				"part": map[string]any{"type": "output_text", "text": "", "annotations": []any{}},
 			})
 			s.msgOpen = true
+			s.msgOutIdx = idx
 		}
 		s.wroteContent = true
 		s.text.WriteString(ev.Text)
 		s.writeEvent("response.output_text.delta", map[string]any{
-			"item_id": s.id + "-msg-" + itoa(s.outputIndex-1), "output_index": s.outputIndex - 1,
+			"item_id": s.id + "-msg-" + itoa(s.msgOutIdx), "output_index": s.msgOutIdx,
 			"content_index": 0, "delta": ev.Text,
 		})
 	case rosetta.EventToolCall:
 		s.ensureStarted("")
 		s.closeReason(nil)
-		if !s.toolOpen || s.toolIdx != ev.ToolIndex {
+		// 工具判据用**重编号后**的「第几个工具调用」，不是上游的
+		// ToolIndex（2026-10-21 修 A3-P1-1 / 汇总 O1）：
+		// Anthropic 上游的 ToolIndex 是 content block 序号，
+		// Responses 上游的是 output_index —— 两套语义混用会让
+		// 「同一个工具」被误判成不同工具（或反过来）。
+		toolIdx := s.toolMapper.to(ev.ToolIndex)
+		if !s.toolOpen || s.toolIdx != toolIdx {
 			s.closeMessage()
 			s.closeTool()
-			idx := s.outputIndex
-			s.outputIndex++
+			idx := s.allocIndex(ev.OutputIndex)
 			s.toolOpen = true
-			s.toolIdx = ev.ToolIndex
+			s.toolIdx = toolIdx
+			s.toolOutIdx = idx
 			// 首片带 call_id/name；续片两者皆空，沿用上一次的值。
 			if ev.ToolID != "" {
 				s.toolID = ev.ToolID
@@ -448,7 +599,7 @@ func (s *ResponsesSSE) Event(ev *rosetta.Event) {
 				event = "response.custom_tool_call_input.delta"
 			}
 			s.writeEvent(event, map[string]any{
-				"item_id": s.id + "-fc-" + itoa(s.outputIndex-1), "output_index": s.outputIndex - 1,
+				"item_id": s.id + "-fc-" + itoa(s.toolOutIdx), "output_index": s.toolOutIdx,
 				"delta": ev.ArgumentsDelta,
 			})
 		}
@@ -493,6 +644,21 @@ func (s *ResponsesSSE) Finish(status string, stop rosetta.StopReason, usage rose
 		"output_tokens": usage.OutputTokens,
 		"total_tokens":  usage.TotalTokens,
 	}
+	// 思考 token 必须报出（2026-10-21 修 A3-P1-6 / 汇总 O6）。
+	//
+	// Codex / Responses 客户端按 output_tokens_details.reasoning_tokens
+	// 区分「思考 token」与「回答 token」做计费与展示。拿不到该字段时
+	// 客户端只能把全部 output token 当作回答 token —— **思考型模型的
+	// 成本统计与展示系统性失真**。
+	//
+	// 同一份 usage 在「Responses 非流式」侧早已带
+	// input_tokens_details.cached_tokens，只有思考 token 两侧都缺 ——
+	// 那正是本条缺陷的形状：字段是逐个补的，漏的那个没人注意。
+	if usage.ReasoningTokens > 0 {
+		resp["usage"].(map[string]any)["output_tokens_details"] = map[string]any{
+			"reasoning_tokens": usage.ReasoningTokens,
+		}
+	}
 	s.writeEvent("response.completed", map[string]any{"response": resp})
 }
 
@@ -501,10 +667,28 @@ func (s *ResponsesSSE) Keepalive() {
 	defer s.mu.Unlock()
 	setWriteDeadline(s.rw)
 	defer clearWriteDeadline(s.rw)
-	fmt.Fprintf(s.w, ": %s\n\n", "keepalive")
+	if _, err := fmt.Fprintf(s.w, ": %s\n\n", "keepalive"); err != nil {
+		s.noteWriteErr(err)
+		return
+	}
 	if s.flusher != nil {
 		s.flusher.Flush()
 	}
+}
+
+// noteWriteErr 记下第一次写失败（2026-10-21 修 *X12）。
+// 调用方持有 s.mu（writeEvent / Keepalive 都在锁内）。
+func (s *ResponsesSSE) noteWriteErr(err error) {
+	if s.writeErr == nil && err != nil {
+		s.writeErr = err
+	}
+}
+
+// WriteError 见 WriteErrorReporter（2026-10-21 修 *X12）。
+func (s *ResponsesSSE) WriteError() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.writeErr
 }
 
 func (s *ResponsesSSE) WroteContent() bool {
@@ -613,6 +797,14 @@ func WriteResponsesResponseWithTools(w http.ResponseWriter, resp *rosetta.ChatRe
 	if resp.Usage.CachedInputTokens > 0 {
 		usage["input_tokens_details"] = map[string]any{
 			"cached_tokens": resp.Usage.CachedInputTokens,
+		}
+	}
+	// 思考 token 同理（2026-10-21 修 A3-P1-6 / 汇总 O6）：客户端要靠
+	// output_tokens_details.reasoning_tokens 区分思考与回答，
+	// 缺了它思考型模型的成本统计系统性失真。
+	if resp.Usage.ReasoningTokens > 0 {
+		usage["output_tokens_details"] = map[string]any{
+			"reasoning_tokens": resp.Usage.ReasoningTokens,
 		}
 	}
 

@@ -600,3 +600,76 @@ func TestResponses_AssistantRoleStillReadsOutputText(t *testing.T) {
 		t.Fatalf("assistant 的 output_text 丢了：%+v", req.Messages[0].Blocks)
 	}
 }
+
+// input_file 只带 file_id 时，块里**只能有 FileID**（2026-10-21 修 A2-P1-5）。
+//
+// 回归风险：修复前用 firstNonEmpty 三选一取值，然后**同时**写
+// FileData 与 FileID。只带 file_id 时 data == FileID == "file-abc"，
+// 于是造出一个「两个源都有」的块，被 rosetta 的 validate 拒掉：
+//
+//	file block has both FileData and FileID; set exactly one source
+//
+// 症状特别难查：入站解码**静默通过**，400 来自 SDK 内部的措辞，
+// 客户端无从知道自己少发了 file_data。
+func TestDecodeResponses_FileIDOnlyNotDoubleFilled(t *testing.T) {
+	got := decodeResponses(t, `{"model":"m","input":[
+		{"type":"message","role":"user","content":[
+			{"type":"input_file","file_id":"file-abc"}
+		]}
+	]}`)
+	req := got.ToRosetta()
+	if len(req.Messages) != 1 {
+		t.Fatalf("message count = %d, want 1: %+v", len(req.Messages), req.Messages)
+	}
+	blk := req.Messages[0].Blocks[0]
+	if blk.Type != rosetta.BlockFile {
+		t.Fatalf("block type = %q, want file: %+v", blk.Type, blk)
+	}
+	if blk.FileID != "file-abc" {
+		t.Fatalf("FileID = %q, want \"file-abc\": %+v", blk.FileID, blk)
+	}
+	if blk.FileData != "" {
+		t.Fatalf("FileData = %q, 必须为空 —— 同时填两个源会被 rosetta 拒掉"+
+			"（file block has both FileData and FileID）", blk.FileData)
+	}
+}
+
+// tool_choice 指向 namespace 时，约束**必须被兑现**（2026-10-21 修 A2-P1-6）。
+//
+// 回归风险：decode 阶段明确接受 {"type":"namespace","name":"shell"}
+// （注释说「展平后这个约束由 rewriteToolChoice 兑现」），但实现只处理
+// obj.Type == "function"，namespace 落进 return nil —— 约束从未兑现，
+// 原始载荷被原样发给上游，而上游的工具表里只有展平后的 shell__ls。
+//
+// 结果要么 400，要么**静默退回 auto** —— 后者正是 DESIGN §7.3 明令要避免的
+// 「客户端要强制，实际拿到模型自由选择，且无任何信号」。
+func TestDecodeResponses_NamespaceToolChoiceHonored(t *testing.T) {
+	got := decodeResponses(t, `{"model":"m","input":"hi","tools":[
+		{"type":"namespace","name":"shell","tools":[
+			{"type":"function","name":"ls","description":"列目录","parameters":{"type":"object"}}
+		]}
+	],"tool_choice":{"type":"namespace","name":"shell"}}`)
+	req := got.ToRosetta()
+	if len(req.Tools) != 1 {
+		t.Fatalf("tool count = %d, want 1: %+v", len(req.Tools), req.Tools)
+	}
+	if req.Tools[0].Name != "shell__ls" {
+		t.Fatalf("展平后的工具名 = %q, want shell__ls", req.Tools[0].Name)
+	}
+	// tool_choice 挂在 req.Extra 上（ApplyUpstreamExtras 的事），
+	// 断言的是**重写后的值**而不是原始载荷。
+	got.ApplyUpstreamExtras(req, "openai-responses")
+	choice := req.Extra["tool_choice"]
+	raw, ok := choice.(json.RawMessage)
+	if !ok {
+		t.Fatalf("tool_choice = %#v, want json.RawMessage", choice)
+	}
+	var m map[string]any
+	if err := json.Unmarshal(raw, &m); err != nil {
+		t.Fatalf("tool_choice 不是 JSON 对象: %v", err)
+	}
+	if m["type"] != "function" || m["name"] != "shell__ls" {
+		t.Fatalf("tool_choice = %#v —— namespace 约束没被兑现，"+
+			"原样发给上游会指向不存在的工具", m)
+	}
+}

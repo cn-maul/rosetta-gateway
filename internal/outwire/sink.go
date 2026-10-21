@@ -67,11 +67,14 @@ type openaiSink struct {
 	sse          *SSEWriter
 	wroteContent bool
 	sawTerminal  bool
+	// toolIdx 把上游的 ToolIndex 重编号成 OpenAI 的 tool_calls[].index
+	// （2026-10-21 修 A3-P1-1 / 汇总 O1）。理由见 toolindex.go。
+	toolIdx *toolIndexMapper
 }
 
 // NewOpenAISink 用现有的 SSEWriter 组装 OpenAI 下游 sink。
 func NewOpenAISink(sse *SSEWriter) StreamSink {
-	return &openaiSink{sse: sse}
+	return &openaiSink{sse: sse, toolIdx: newToolIndexMapper()}
 }
 
 func (s *openaiSink) Event(ev *rosetta.Event) {
@@ -93,7 +96,7 @@ func (s *openaiSink) Event(ev *rosetta.Event) {
 		}
 	case rosetta.EventToolCall:
 		s.wroteContent = true
-		s.sse.WriteToolCallDelta(ev.ToolIndex, ev.ToolID, ev.ToolName, ev.ArgumentsDelta)
+		s.sse.WriteToolCallDelta(s.toolIdx.to(ev.ToolIndex), ev.ToolID, ev.ToolName, ev.ArgumentsDelta)
 	case rosetta.EventMessageEnd:
 		s.sawTerminal = true
 	}
@@ -131,3 +134,7 @@ func (s *openaiSink) WroteContent() bool {
 func (s *openaiSink) SawTerminal() bool {
 	return s.sawTerminal
 }
+
+// WriteError 转发底层 SSEWriter 的第一次写失败（2026-10-21 修 *X12）。
+// openaiSink 自己不写字节，真正的写与失败捕获都在 SSEWriter 里。
+func (s *openaiSink) WriteError() error { return s.sse.WriteError() }

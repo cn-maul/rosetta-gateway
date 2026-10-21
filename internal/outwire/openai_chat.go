@@ -60,10 +60,22 @@ type OpenAIUsage struct {
 	// 一个数量级**（把全部 prompt token 按全价计费）。这种不一致尤其刺眼：
 	// 用户切到非流式模式后账单突然变高，而响应里没有任何线索说明为什么。
 	PromptTokensDetails *PromptTokensDetails `json:"prompt_tokens_details,omitempty"`
+	// CompletionTokensDetails 承载思考 token 数（OpenAI 官方口径
+	// completion_tokens_details.reasoning_tokens）。
+	//
+	// 缺了它的后果与缺 prompt_tokens_details 同样严重，只是方向相反：
+	// 客户端把全部 completion_tokens 当成「回答 token」，于是思考型
+	// 模型的成本统计与上下文占用评估都系统性失真
+	// （2026-10-21 修 A3-P1-6 / 汇总 O6）。
+	CompletionTokensDetails *CompletionTokensDetails `json:"completion_tokens_details,omitempty"`
 }
 
 type PromptTokensDetails struct {
 	CachedTokens int64 `json:"cached_tokens"`
+}
+
+type CompletionTokensDetails struct {
+	ReasoningTokens int64 `json:"reasoning_tokens"`
 }
 
 type SSEWriter struct {
@@ -83,6 +95,9 @@ type SSEWriter struct {
 	// 半个 `data:` 行，下游只会报「流式响应中没有内容」。
 	mu       sync.Mutex
 	roleSent bool
+	// writeErr 是**第一次**写失败的原因（2026-10-21 修 *X12）。
+	// 见 write_error.go 的 WriteErrorReporter。
+	writeErr error
 }
 
 func NewSSEWriter(w io.Writer, flusher http.Flusher, id, model string, created int64) *SSEWriter {
@@ -117,9 +132,15 @@ func (sw *SSEWriter) WriteEvent(event, data string) error {
 	setWriteDeadline(sw.rw)
 	defer clearWriteDeadline(sw.rw)
 	if event != "" {
-		fmt.Fprintf(sw.w, "event: %s\n", event)
+		if _, err := fmt.Fprintf(sw.w, "event: %s\n", event); err != nil {
+			sw.noteWriteErr(err)
+			return err
+		}
 	}
-	fmt.Fprintf(sw.w, "data: %s\n\n", data)
+	if _, err := fmt.Fprintf(sw.w, "data: %s\n\n", data); err != nil {
+		sw.noteWriteErr(err)
+		return err
+	}
 	if sw.flusher != nil {
 		sw.flusher.Flush()
 	}
@@ -133,11 +154,29 @@ func (sw *SSEWriter) WriteComment(text string) error {
 	defer sw.mu.Unlock()
 	setWriteDeadline(sw.rw)
 	defer clearWriteDeadline(sw.rw)
-	fmt.Fprintf(sw.w, ": %s\n\n", text)
+	if _, err := fmt.Fprintf(sw.w, ": %s\n\n", text); err != nil {
+		sw.noteWriteErr(err)
+		return err
+	}
 	if sw.flusher != nil {
 		sw.flusher.Flush()
 	}
 	return nil
+}
+
+// noteWriteErr 记下第一次写失败（后续的失败不覆盖第一次的原因：
+// 第一次才是根因，后面的多半是它的连锁反应）。调用方持有 sw.mu。
+func (sw *SSEWriter) noteWriteErr(err error) {
+	if sw.writeErr == nil && err != nil {
+		sw.writeErr = err
+	}
+}
+
+// WriteError 见 WriteErrorReporter（2026-10-21 修 *X12）。
+func (sw *SSEWriter) WriteError() error {
+	sw.mu.Lock()
+	defer sw.mu.Unlock()
+	return sw.writeErr
 }
 
 // writeChunk 组装一个标准的 chat.completion.chunk 信封（含 id/object/created/model），
@@ -280,6 +319,18 @@ func (sw *SSEWriter) WriteUsage(u rosetta.Usage) error {
 	if u.CachedInputTokens > 0 {
 		usage["prompt_tokens_details"] = map[string]any{"cached_tokens": u.CachedInputTokens}
 	}
+	// 思考 token 走 completion_tokens_details.reasoning_tokens
+	// （2026-10-21 修 A3-P1-6 / 汇总 O6）。
+	//
+	// DeepSeek / OpenRouter 一系的客户端按这个字段把「思考 token」与
+	// 「回答 token」分开计价与展示。缺了它，客户端只能把全部
+	// completion_tokens 当成回答 token —— 思考型模型的成本统计与
+	// 上下文占用评估都系统性失真。
+	if u.ReasoningTokens > 0 {
+		usage["completion_tokens_details"] = map[string]any{
+			"reasoning_tokens": u.ReasoningTokens,
+		}
+	}
 	chunk := map[string]any{
 		"id":      sw.id,
 		"object":  "chat.completion.chunk",
@@ -355,6 +406,12 @@ func WriteNonStreamResponse(w http.ResponseWriter, resp *rosetta.ChatResponse, m
 	if resp.Usage.CachedInputTokens > 0 {
 		usage.PromptTokensDetails = &PromptTokensDetails{
 			CachedTokens: resp.Usage.CachedInputTokens,
+		}
+	}
+	// 思考 token 同样要与流式路径对齐（2026-10-21 修 A3-P1-6 / 汇总 O6）。
+	if resp.Usage.ReasoningTokens > 0 {
+		usage.CompletionTokensDetails = &CompletionTokensDetails{
+			ReasoningTokens: resp.Usage.ReasoningTokens,
 		}
 	}
 

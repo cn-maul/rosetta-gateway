@@ -271,6 +271,28 @@ func (a *AnthropicMessagesRequest) ToRosetta() *rosetta.ChatRequest {
 	return req
 }
 
+// ThinkingBudget 返回客户端请求的**原始 token 预算**（thinking.budget_tokens），
+// 0 = 未请求思考。
+//
+// # 为什么单独开一个取数口（2026-10-21 修 A2-P1-3）
+//
+// RawEffort 是**档位**（预算被折算过的结果），而预算与档位不可逆互转：
+// 一个预算区间对应一档，反过来一档只能代表一个代表值。于是
+// 「预算 → 档位 → 预算」这条折返链必然失真，且两个方向不一致：
+//
+//	budget=5000   → medium → 折回 8192   （↑ 客户端要省，网关多花）
+//	budget=100000 → high   → 折回 32768  （↓ 客户端要深思考，网关给浅了）
+//
+// 而 Anthropic→Anthropic（不跨协议）本该**零损耗**：客户端给的就是
+// token 预算，上游收的也该是同一个预算。数据面要原样透传，就必须能拿到
+// 原始预算 —— 而 RawEffort 这条路上它已经被折算掉了。
+func (a *AnthropicMessagesRequest) ThinkingBudget() int {
+	if a.Thinking == nil || a.Thinking.Type != "enabled" {
+		return 0
+	}
+	return a.Thinking.BudgetTokens
+}
+
 // ApplyUpstreamExtras 把 Anthropic 入口的协议私有字段挂到 req.Extra。
 // 门的开口方向与 OpenAI 入口相反：anthropic 上游拿原样字段，openai-chat /
 // openai-responses 拿翻译后的 tool_choice，top_k 谁都拿不到（只有 Anthropic
@@ -459,11 +481,20 @@ func convertUserMessage(raw json.RawMessage) []rosetta.Message {
 	}
 
 	var toolResults []rosetta.Block
+	// toolMedia 是从 tool_result 里搬出来的媒体块（2026-10-21 修 A2-P1-4）。
+	//
+	// 为什么要搬出去而不是塞进 tool_result：rosetta 的 tool_result 块的
+	// Content 是**纯文本**语义（ToolResult 只收字符串），硬塞媒体会让上游
+	// 解不出结构。所以拆成紧随其后的 user 消息，并在文本里留一行说明它被
+	// 搬去了哪 —— 不丢内容，也不假装它还在原来的位置。
+	// 与 Responses 入口的处置完全同构（见 openai_responses.go）。
+	var toolMedia []rosetta.Block
 	var rest []rosetta.Block
 	for _, b := range blocks {
 		switch b.Type {
 		case "tool_result":
-			text := toolResultText(b)
+			text, media := toolResultContent(b)
+			toolMedia = append(toolMedia, media...)
 			tb := rosetta.Block{Type: rosetta.BlockToolResult, ToolCallID: b.ToolUseID, Content: text}
 			if b.IsError != nil {
 				tb.IsError = *b.IsError
@@ -494,6 +525,13 @@ func convertUserMessage(raw json.RawMessage) []rosetta.Message {
 	var out []rosetta.Message
 	if len(toolResults) > 0 {
 		out = append(out, rosetta.Message{Role: rosetta.RoleTool, Blocks: toolResults})
+	}
+	if len(toolMedia) > 0 {
+		blocks := append([]rosetta.Block{{
+			Type: rosetta.BlockText,
+			Text: anthropicToolMediaNotice(len(toolMedia)),
+		}}, toolMedia...)
+		out = append(out, rosetta.Message{Role: rosetta.RoleUser, Blocks: blocks})
 	}
 	if len(rest) > 0 {
 		out = append(out, rosetta.Message{Role: rosetta.RoleUser, Blocks: rest})
@@ -533,7 +571,7 @@ var ErrContentSingleObject = errors.New("messages[].content: must be a string or
 // 数组与纯字符串都返回 ok=true（后者 blocks 为 nil，交由调用方按文本处理）。
 //
 // 之所以另开一个函数而不是改 decodeBlocks 的签名：decodeBlocks 有 5 个调用点
-// （contentString / assistantBlocks / convertUserMessage / toolResultText 内层），
+// （contentString / assistantBlocks / convertUserMessage / toolResultContent 内层），
 // 其中多处处理的是**已知是数组**的内层 content（如 tool_result 的嵌套内容），
 // 给它们全部加错误分支只会让代码更绕。判别逻辑集中在真正的入口处。
 func decodeContentBlocks(raw json.RawMessage) (blocks []anthropicBlock, ok bool) {
@@ -619,20 +657,61 @@ func fileBlock(b anthropicBlock) (rosetta.Block, bool) {
 	return rosetta.Block{}, false
 }
 
-// toolResultText 展平 tool_result 的 content（string 或块数组）为文本。
-func toolResultText(b anthropicBlock) string {
+// toolResultContent 展平 tool_result 的 content（string 或块数组）为
+// 「文本」与「媒体块」两份。
+//
+// # 为什么必须拆出媒体（2026-10-21 修 A2-P1-4）
+//
+// Anthropic 协议允许 `tool_result.content` 是块数组，块里可以有 image /
+// document。修复前这里只抽 text 块，**媒体块被静默丢弃**：
+//
+//	入站: {"type":"tool_result","tool_use_id":"t1","content":[
+//	        {"type":"image","source":{"type":"base64",...,"data":"aGk="}},
+//	        {"type":"text","text":"caption"}]}
+//	解出: role=tool type=tool_result content="caption"   ← 图片消失
+//
+// 危害在于**完全无声**：agent 场景下「工具返回了一张截图，模型应该看这张
+// 截图」是极常见的用法，图片被丢后模型只看到 caption 文字，请求 200、
+// 回答正常，客户端与模型都察觉不到。
+//
+// 对比：Responses 入口早就实现了同一需求（responsesItemToolOutput 把媒体
+// 搬进紧随其后的 user 消息，见 openai_responses.go）—— Anthropic 入口是
+// 同一个需求的漏网之鱼。
+//
+// 文本部分保持原口径（只认 text 块），媒体部分转成 rosetta 的 image / file
+// 块，由调用方搬去紧随其后的 user 消息。
+func toolResultContent(b anthropicBlock) (string, []rosetta.Block) {
 	if len(b.Content) == 0 {
-		return ""
+		return "", nil
 	}
 	var s string
 	if err := json.Unmarshal(b.Content, &s); err == nil {
-		return s
+		return s, nil
 	}
 	var sb strings.Builder
+	var media []rosetta.Block
 	for _, inner := range decodeBlocks(b.Content) {
-		if inner.Type == "text" {
+		switch inner.Type {
+		case "text":
 			sb.WriteString(inner.Text)
+		case "image":
+			if u := imageURL(inner); u != "" {
+				media = append(media, rosetta.Block{Type: rosetta.BlockImage, ImageURL: u})
+			}
+		case "document":
+			if blk, ok := fileBlock(inner); ok {
+				media = append(media, blk)
+			}
 		}
 	}
-	return sb.String()
+	return sb.String(), media
+}
+
+// anthropicToolMediaNotice 是搬走媒体块后留在 tool_result 前的那行说明。
+//
+// 与 Responses 入口的 responsesToolMediaNotice 同一句式与同一理由：
+// 模型要知道「有东西被搬走了」。不留的话，它看到一条只有文字的工具结果，
+// 会以为工具什么都没返回 —— 而真相是内容在紧跟着的下一条消息里。
+func anthropicToolMediaNotice(n int) string {
+	return fmt.Sprintf("[工具结果中的 %d 个附件已移至下一条消息]", n)
 }

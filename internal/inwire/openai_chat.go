@@ -8,6 +8,8 @@ import (
 	"strings"
 
 	"github.com/cn-maul/rosetta"
+
+	"github.com/cn-maul/rosetta-gateway/internal/effort"
 )
 
 type OpenAIChatRequest struct {
@@ -229,9 +231,14 @@ func (r *OpenAIChatRequest) ToRosetta() *rosetta.ChatRequest {
 	// （request.go 的 validate 会拒其它值），OpenAI 官方也是这三档。
 	// 未知值静默忽略而不是报错：客户端可能是按更新的模型能力发的，
 	// 直接 400 会让整个请求不可用，而忽略只是退回默认强度。
+	//
+	// 归一口径由 internal/effort 单一提供（2026-10-21 修 P0-12）：
+	// 此前这里是本包自己的一张 switch，它漏掉了 max / very_high / min /
+	// mid / default 等写法 —— 漏掉的那些落进 default 分支返回 Unset，
+	// 于是「客户端要最高档思考」变成「完全不思考」，且日志无痕。
 	if r.ReasoningEffort != nil {
-		if eff := parseEffort(*r.ReasoningEffort); eff != rosetta.EffortUnset {
-			req.Thinking = &rosetta.ThinkingConfig{Effort: eff}
+		if lvl, ok := effort.ToThinkingLevel(effort.Parse(*r.ReasoningEffort)); ok {
+			req.Thinking = &rosetta.ThinkingConfig{Effort: rosetta.Effort(lvl)}
 		}
 	}
 
@@ -616,30 +623,4 @@ func userMessage(raw json.RawMessage) rosetta.Message {
 		blocks = append(blocks, rosetta.Block{Type: rosetta.BlockImage, ImageURL: u})
 	}
 	return rosetta.Message{Role: rosetta.RoleUser, Blocks: blocks}
-}
-
-// parseEffort 把各协议的各种思考强度写法归一到 rosetta 的三档。
-//
-// 入口不止 OpenAI Chat 的 reasoning_effort：Responses 的 reasoning.effort
-// 还会有 minimal（gpt-5 系列新增，比 low 更省）与 xhigh（比 high 更强），
-// 直连上游时这两档是合法值。rosetta 侧只认 low/medium/high，所以做映射：
-//
-//	minimal → low（都属"少想一点"这一侧）
-//	xhigh   → high
-//
-// 未知值返回 EffortUnset，调用方据此不设 Thinking —— 退回上游默认强度，
-// 而不是把整个请求 400 掉（客户端可能按更新的模型能力在发请求）。
-func parseEffort(s string) rosetta.Effort {
-	switch strings.ToLower(strings.TrimSpace(s)) {
-	case "minimal":
-		return rosetta.EffortLow
-	case "low":
-		return rosetta.EffortLow
-	case "medium":
-		return rosetta.EffortMedium
-	case "high", "xhigh":
-		return rosetta.EffortHigh
-	default:
-		return rosetta.EffortUnset
-	}
 }

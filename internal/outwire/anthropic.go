@@ -4,7 +4,9 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
+	"strings"
 	"sync"
 	"time"
 
@@ -145,12 +147,26 @@ func WriteAnthropicResponse(w http.ResponseWriter, resp *rosetta.ChatResponse, m
 		case rosetta.BlockRedactedThinking:
 			content = append(content, map[string]any{"type": "redacted_thinking", "data": blk.Thinking})
 		case rosetta.BlockToolCall:
-			// input 必须是 JSON 对象；rosetta 校验已保证非空时是合法 JSON 对象，
-			// 空 input 补 {} —— Anthropic 的 input 字段不可缺省。
-			input := json.RawMessage(blk.Arguments)
-			if len(input) == 0 {
-				input = json.RawMessage(`{}`)
-			}
+			// input 必须是 JSON **对象**。
+			//
+			// # 为什么不信任上游给的 arguments（2026-10-21 修 A3-P1-5 / 汇总 O5）
+			//
+			// 旧实现的注释断言「rosetta 校验已保证非空时是合法 JSON 对象」——
+			// 这个前提只对**入站请求**成立，对上游**返回**的 arguments 不成立。
+			// rosetta 的 jsonx.FlexJSONString 对任意形状都「不失败」，
+			// 会把 "not-json" 原样塞进 Value。
+			//
+			// 后果不是「参数有点怪」，而是**整条响应报废**：json.RawMessage
+			// 带着非法 JSON 进 json.Encoder.Encode → 编码报错 → 客户端
+			// 收到 **HTTP 200 + 零字节响应体**。这比报错更糟：客户端拿到
+			// 200 却解析不出任何东西，无法区分「上游返回了空答案」与
+			// 「网关坏了」；而编码错误还被完全丢弃，服务端没有任何日志。
+			//
+			// 现在先验一遍：不是合法 JSON 对象就退化成 "{}"，
+			// 保证响应**总能编码成功**。退化而不是报错，是因为这一个
+			// 工具的参数坏了，不该让整条回复变成空响应 —— 客户端拿到的
+			// 仍是完整答案，只是这个工具调用没有参数。
+			input := json.RawMessage(anthropicToolInput(blk.Arguments))
 			content = append(content, map[string]any{
 				"type": "tool_use", "id": blk.ToolCallID, "name": blk.ToolName, "input": input,
 			})
@@ -167,7 +183,11 @@ func WriteAnthropicResponse(w http.ResponseWriter, resp *rosetta.ChatResponse, m
 	}
 
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]any{
+	// 编码错误**不能丢**：丢了就是「200 + 空响应体」且服务端无日志
+	// （2026-10-21 修 A3-P1-5 / 汇总 O5）。到这一步载荷已经全部
+	// 规范化过（每个字段都是可序列化的基本类型），所以真失败只可能是
+	// 底层 writer 出错 —— 那时客户端已经断了，日志留痕就够了。
+	if err := json.NewEncoder(w).Encode(map[string]any{
 		"id":            id,
 		"type":          "message",
 		"role":          "assistant",
@@ -176,7 +196,29 @@ func WriteAnthropicResponse(w http.ResponseWriter, resp *rosetta.ChatResponse, m
 		"stop_reason":   AnthropicStopReason(resp.StopReason),
 		"stop_sequence": nil,
 		"usage":         usage,
-	})
+	}); err != nil {
+		slog.Error("anthropic non-stream response encode failed",
+			"response_id", id, "model", model, "error", err)
+	}
+}
+
+// anthropicToolInput 把上游给的工具参数规范化成 Anthropic 的 input 对象。
+//
+// 返回的**永远是**一个合法的 JSON 对象字面量：空、非法、或不是对象的
+// 参数一律退化成 "{}"。理由见 WriteAnthropicResponse 里 BlockToolCall
+// 分支的注释（2026-10-21 修 A3-P1-5 / 汇总 O5）。
+func anthropicToolInput(args string) string {
+	trimmed := strings.TrimSpace(args)
+	if trimmed == "" {
+		return "{}"
+	}
+	// 必须是 JSON **对象**：Anthropic 的 input 字段语义是参数映射，
+	// 数组/字符串/数字都不是合法形状。
+	var obj map[string]json.RawMessage
+	if err := json.Unmarshal([]byte(trimmed), &obj); err != nil || obj == nil {
+		return "{}"
+	}
+	return trimmed
 }
 
 // AnthropicStopReason 把 rosetta 统一停止原因映射为 Anthropic 的 stop_reason。
@@ -222,6 +264,18 @@ type AnthropicSSE struct {
 	openType   string // "" | "text" | "thinking" | "tool_use"
 	// openToolIdx 是当前开放 tool_use 块对应的 ToolIndex（同块判据，见 ensureBlock）。
 	openToolIdx int
+	// toolIdx 把上游的 ToolIndex 重编号成「第几个工具调用」
+	// （2026-10-21 修 A3-P1-1 / 汇总 O1）。理由见 toolindex.go。
+	//
+	// Anthropic 下游的 content block 序号是**出站层自己分配**的
+	// （s.blockIndex），所以这里重编号的目的不是「对齐 Anthropic 的
+	// block 序号」—— 那个序号本来就是我们自己发的。真正的目的是
+	// **同块判据**：上游的 ToolIndex 在 Anthropic 语义下是「整条消息的
+	// content block 序号」，用它判「是不是同一个 tool_use」在跨协议
+	// 时会错（OpenAI 上游的 tool index 0、1 与 Anthropic 的 block index
+	// 恰好撞上同一个数字但指不同的东西）。重编号后判据统一成
+	// 「第几个工具调用」，与协议无关。
+	toolIdx *toolIndexMapper
 	// pendingToolID/pendingToolName 只在首片（ToolID 非空）有意义，
 	// 由 EventToolCall 在切块前填入。
 	pendingToolID   string
@@ -229,6 +283,8 @@ type AnthropicSSE struct {
 
 	wroteContent bool
 	sawTerminal  bool
+	// writeErr 是第一次写失败（2026-10-21 修 *X12）。见 write_error.go。
+	writeErr error
 }
 
 // NewAnthropicSSE 构造 sink。id 是网关生成的兜底响应 id：message_start 若等
@@ -236,7 +292,11 @@ type AnthropicSSE struct {
 func NewAnthropicSSE(w io.Writer, flusher http.Flusher, id, model string) *AnthropicSSE {
 	// openToolIdx 初始为 -1（而非零值 0）：否则「还没开过块」与
 	//「开了 ToolIndex=0 的块」不可区分，首片会被误判为同块而复用。
-	return &AnthropicSSE{w: w, flusher: flusher, id: id, model: model, openToolIdx: -1}
+	return &AnthropicSSE{
+		w: w, flusher: flusher, id: id, model: model,
+		openToolIdx: -1,
+		toolIdx:     newToolIndexMapper(),
+	}
 }
 
 // WithResponseWriter 绑定底层 ResponseWriter，用于设置单次写截止时间。
@@ -252,7 +312,10 @@ func (s *AnthropicSSE) WithResponseWriter(rw http.ResponseWriter) {
 func (s *AnthropicSSE) writeRaw(event, data string) {
 	setWriteDeadline(s.rw)
 	defer clearWriteDeadline(s.rw)
-	fmt.Fprintf(s.w, "event: %s\ndata: %s\n\n", event, data)
+	if _, err := fmt.Fprintf(s.w, "event: %s\ndata: %s\n\n", event, data); err != nil {
+		s.noteWriteErr(err)
+		return
+	}
 	if s.flusher != nil {
 		s.flusher.Flush()
 	}
@@ -274,10 +337,28 @@ func (s *AnthropicSSE) Keepalive() {
 	defer s.mu.Unlock()
 	setWriteDeadline(s.rw)
 	defer clearWriteDeadline(s.rw)
-	fmt.Fprintf(s.w, ": %s\n\n", "keepalive")
+	if _, err := fmt.Fprintf(s.w, ": %s\n\n", "keepalive"); err != nil {
+		s.noteWriteErr(err)
+		return
+	}
 	if s.flusher != nil {
 		s.flusher.Flush()
 	}
+}
+
+// noteWriteErr 记下第一次写失败（2026-10-21 修 *X12）。
+// 调用方持有 s.mu（writeRaw 的所有调用点都在锁内）。
+func (s *AnthropicSSE) noteWriteErr(err error) {
+	if s.writeErr == nil && err != nil {
+		s.writeErr = err
+	}
+}
+
+// WriteError 见 WriteErrorReporter（2026-10-21 修 *X12）。
+func (s *AnthropicSSE) WriteError() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.writeErr
 }
 
 // ensureStarted 补发 message_start。正常情况下上游首个事件就是 message_start
@@ -392,7 +473,7 @@ func (s *AnthropicSSE) Event(ev *rosetta.Event) {
 		if ev.ToolID != "" {
 			s.pendingToolID, s.pendingToolName = ev.ToolID, ev.ToolName
 		}
-		s.ensureBlock("tool_use", ev.ToolIndex)
+		s.ensureBlock("tool_use", s.toolIdx.to(ev.ToolIndex))
 		s.wroteContent = true
 		s.writeEvent("content_block_delta", map[string]any{
 			"type": "content_block_delta", "index": s.blockIndex - 1,

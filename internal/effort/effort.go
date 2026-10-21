@@ -275,3 +275,59 @@ func ToRosettaLevel(l Level) string {
 		return "medium"
 	}
 }
+
+// ToThinkingLevel 把挡位映射成「要不要思考 + 用哪一档」。
+//
+// # 为什么需要它（2026-10-21 修 P0-12）
+//
+// inwire 曾自己维护一张 "原始写法 → rosetta 三档" 的 switch
+// （inwire.parseEffort），而本包已经有一份更完整的别名表
+// （normalizeAlias）。两张表对同一输入给出**相反**答案：
+//
+//	"max"       → inwire 判为 Unset（不设 Thinking = 完全不思考）
+//	             → effort.Parse 判为 Max（刻度上最高档）
+//	"very_high" → inwire 判为 Unset
+//	             → effort.Parse 判为 XHigh
+//	"min" / "mid" / "default" → inwire 判为 Unset
+//	             → effort.Parse 判为 Minimal / Medium / Medium
+//
+// 后果不是「降一档」而是**把用户的显式意图整个抹掉**：网关在
+// /v1/models 里向客户端披露了 max 这一档，转头却把客户端发的 max 丢成
+// 「不思考」，且日志无痕。
+//
+// 与 ToRosettaLevel 的区别是**保留「不思考」这个语义**：
+//   - None（off / disabled）→ enabled=false（显式不思考）；
+//   - 其它已识别档位        → enabled=true + 三档之一；
+//   - Unset（不认识）        → enabled=false（退回上游默认强度）。
+//
+// 之所以要有「None → 不思考」这一档：客户端显式说「这次别思考」，
+// 网关把它当成「未知挡位」而退回上游默认强度，恰好与请求相反。
+//
+// 返回的 level 是 rosetta 认得的 low/medium/high 三档之一 —— 与
+// ToRosettaLevel 同源（都走 Clamp 到 KnownLevels），只是这里额外
+// 把「不思考」与「未知」区分开。
+//
+// ok=false 表示「不要设 Thinking」：调用方收到它时必须**不建** Thinking
+// 配置（而不是建一个空的），否则 rosetta 会认为「请求思考但没给档位」
+// 并按 EffortMedium 兜底 —— 那正是「客户端要 max 却变成 medium」的
+// 另一种形态。
+//
+// 刻意不返回 rosetta.Effort：本包不 import rosetta（rosetta 是
+// 外部依赖，而 internal/store 也依赖本包 —— 把 rosetta 拖进存储层
+// 的依赖图没有好处）。调用方（inwire）做最后一次字符串 → 枚举的转换。
+func ToThinkingLevel(l Level) (level string, ok bool) {
+	switch l {
+	case None:
+		// 显式「不思考」：不映射成任何思考档位。
+		return "", false
+	case Minimal, Low:
+		return "low", true
+	case Medium:
+		return "medium", true
+	case High, XHigh, Max:
+		return "high", true
+	default:
+		// Unset = 不认识的写法：退回上游默认强度（不干预）。
+		return "", false
+	}
+}

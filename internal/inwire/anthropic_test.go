@@ -308,3 +308,66 @@ func TestDecodeAnthropicMessages_LegalContentShapesStillPass(t *testing.T) {
 		})
 	}
 }
+
+// tool_result 里的**媒体块**不得被静默丢弃（2026-10-21 修 A2-P1-4）。
+//
+// 回归风险：agent 场景下「工具返回了一张截图，模型应该看这张截图」是极常见
+// 的用法。修复前 toolResultText 只抽 text 块，image/document 被静默丢掉 ——
+// 请求 200、回答正常，客户端与模型都察觉不到（内容就这么没了）。
+//
+// 处置与 Responses 入口同构：媒体不能塞进 tool_result（它的 Content 是纯
+// 文本语义），而是搬进紧随其后的 user 消息，并留一行说明它被搬去了哪。
+func TestAnthropicToolResult_MediaNotDropped(t *testing.T) {
+	got := decodeAnthropic(t, `{
+		"model":"claude-sonnet-4-5",
+		"max_tokens":2048,
+		"messages":[{
+			"role":"user",
+			"content":[{
+				"type":"tool_result",
+				"tool_use_id":"t1",
+				"content":[
+					{"type":"image","source":{"type":"base64","media_type":"image/png","data":"aGk="}},
+					{"type":"text","text":"caption"}
+				]
+			}]
+		}]
+	}`)
+	req := got.ToRosetta()
+
+	var toolMsg, mediaMsg *rosetta.Message
+	for i := range req.Messages {
+		m := &req.Messages[i]
+		switch m.Role {
+		case rosetta.RoleTool:
+			toolMsg = m
+		case rosetta.RoleUser:
+			if mediaMsg == nil {
+				mediaMsg = m
+			}
+		}
+	}
+	if toolMsg == nil {
+		t.Fatalf("没有 tool 消息：%+v", req.Messages)
+	}
+	if toolMsg.Blocks[0].Content != "caption" {
+		t.Fatalf("tool_result 文本 = %q，期望 \"caption\"", toolMsg.Blocks[0].Content)
+	}
+	if mediaMsg == nil {
+		t.Fatalf("媒体被静默丢弃了（没有紧随其后的 user 消息）：%+v", req.Messages)
+	}
+	var sawImage bool
+	for _, b := range mediaMsg.Blocks {
+		if b.Type == rosetta.BlockImage {
+			sawImage = true
+		}
+	}
+	if !sawImage {
+		t.Fatalf("搬过去的 user 消息里没有 image 块：%+v", mediaMsg.Blocks)
+	}
+	// 留痕：模型要知道「有东西被搬走了」。
+	if len(mediaMsg.Blocks) == 0 || mediaMsg.Blocks[0].Type != rosetta.BlockText ||
+		!strings.Contains(mediaMsg.Blocks[0].Text, "附件") {
+		t.Fatalf("缺少「媒体已移至下一条消息」的说明：%+v", mediaMsg.Blocks)
+	}
+}
