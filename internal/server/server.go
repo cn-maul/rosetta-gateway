@@ -31,16 +31,12 @@ func NewFailureThrottle(limit int, cooldown time.Duration) *FailureThrottle {
 
 type contextKey string
 
-const requestIDKey contextKey = "request_id"
 const publicOriginKey contextKey = "public_origin"
 const trustedProxiesKey contextKey = "trusted_proxies"
 const resolvedClientIPKey contextKey = "resolved_client_ip"
 
 func RequestIDFromContext(ctx context.Context) string {
-	if id, ok := ctx.Value(requestIDKey).(string); ok {
-		return id
-	}
-	return ""
+	return httpx.RequestIDFromContext(ctx)
 }
 
 func generateRequestID() string {
@@ -53,7 +49,7 @@ func Middleware(next http.Handler, logger *slog.Logger) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		start := time.Now()
 		reqID := generateRequestID()
-		ctx := context.WithValue(r.Context(), requestIDKey, reqID)
+		ctx := httpx.WithRequestID(r.Context(), reqID)
 		r = r.WithContext(ctx)
 
 		w.Header().Set("X-Request-Id", reqID)

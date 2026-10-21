@@ -21,6 +21,18 @@ type contextKey string
 const publicOriginKey contextKey = "public_origin"
 const trustedProxiesKey contextKey = "trusted_proxies"
 const resolvedClientIPKey contextKey = "resolved_client_ip"
+const requestIDKey contextKey = "request_id"
+
+// WithRequestID stores the request correlation ID in the request context.
+func WithRequestID(ctx context.Context, id string) context.Context {
+	return context.WithValue(ctx, requestIDKey, id)
+}
+
+// RequestIDFromContext returns the request correlation ID, or an empty string.
+func RequestIDFromContext(ctx context.Context) string {
+	id, _ := ctx.Value(requestIDKey).(string)
+	return id
+}
 
 // WithPublicOrigin 把配置里的公开源注入请求 context，供同源判定与
 // 会话 Cookie 的 Secure 属性共同使用。

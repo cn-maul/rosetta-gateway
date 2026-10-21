@@ -15,9 +15,11 @@ import (
 	"github.com/cn-maul/rosetta-gateway/internal/admin"
 	"github.com/cn-maul/rosetta-gateway/internal/billinghttp"
 	"github.com/cn-maul/rosetta-gateway/internal/config"
+	"github.com/cn-maul/rosetta-gateway/internal/dataplane"
 	"github.com/cn-maul/rosetta-gateway/internal/ingress"
 	"github.com/cn-maul/rosetta-gateway/internal/ratelimit"
 	"github.com/cn-maul/rosetta-gateway/internal/server"
+	"github.com/cn-maul/rosetta-gateway/internal/snapshot"
 	"github.com/cn-maul/rosetta-gateway/internal/store"
 	"github.com/cn-maul/rosetta-gateway/internal/upstream"
 	"github.com/cn-maul/rosetta-gateway/internal/userauth"
@@ -103,6 +105,10 @@ func buildApp(d routeDeps) *gatewayApp {
 	masterKey, sessionMgr := d.masterKey, d.sessionMgr
 	pool, reloader := d.pool, d.reloader
 	rateLimiter, usage := d.rateLimiter, d.usage
+	dataPlane := dataplane.NewHandler(dataplane.Deps{
+		Pool: pool, Config: cfg, Usage: usage, Limiter: rateLimiter,
+		Snapshot: snapshot.Get,
+	})
 
 	providerHandler := admin.NewProviderHandler(db, masterKey, cfg)
 	// 出站网络（代理地址的共享清单）。provider 的下拉从它取值，
@@ -127,9 +133,9 @@ func buildApp(d routeDeps) *gatewayApp {
 	userHandler := admin.NewUserHandler(db, sessionMgr).WithReload(reloader.Reload)
 	records := make(map[string]registeredRoute)
 	mux := newRouteMux(false, records)
-	mux.HandleFunc("POST /v1/chat/completions", handleIngress(pool, cfg, usage, rateLimiter, ingress.NewOpenAIChat()))
-	mux.HandleFunc("POST /v1/messages", handleIngress(pool, cfg, usage, rateLimiter, ingress.NewAnthropicMessages()))
-	mux.HandleFunc("POST /v1/responses", handleIngress(pool, cfg, usage, rateLimiter, ingress.NewResponses()))
+	mux.HandleFunc("POST /v1/chat/completions", dataPlane.Handle(ingress.NewOpenAIChat()))
+	mux.HandleFunc("POST /v1/messages", dataPlane.Handle(ingress.NewAnthropicMessages()))
+	mux.HandleFunc("POST /v1/responses", dataPlane.Handle(ingress.NewResponses()))
 	// D9：/v1/models 在两种协议下路径相同、响应形状不同 —— 按认证头分流，
 	// 显式别名路径永远优先。
 	mux.HandleFunc("GET /v1/models", handleListModels(""))

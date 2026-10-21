@@ -847,7 +847,7 @@ CC Switch 透传，网关 400；Magpie 静默丢弃（200 但 output 无 `web_se
 
 这两条报错是 SDK **故意**写清楚的（宁可报错也不发畸形空消息出去），但它
 没有退路可选 —— 客户端无法为别人的协议重造签名，剥掉是唯一走法。网关在
-`attemptStream` / `attemptNonStream` 各调一次 `applyReplayGate`（必须在 attempt
+`internal/dataplane` 的 `attemptStream` / `attemptNonStream` 各调一次 `applyReplayGate`（必须在 attempt
 内：故障转移链上换一个目标就换一个协议）。
 
 | 目标协议 | thinking | redacted_thinking |
@@ -1010,7 +1010,7 @@ Client 是 goroutine 安全的，进程内单例复用（内含连接池）。
 
 一条 route 背后是 `route_targets` 承载的**有序上游链**——对外同一个 `public_name` 可挂多个 `(provider, model)`，按 `position` 升序尝试。`routes.provider_id / upstream_model_id` 是链首的镜像列，创建与 PATCH 都和链首保持原子同步；运行时只以 `route_targets` 为准。
 
-请求热路径（`handleIngress` 的转移循环）语义：
+请求热路径（`internal/dataplane.Handler.Handle` 的转移循环）语义：
 
 - 仅当 `failover_enabled=1` 才进入多目标循环；否则只打链首，上游错误原样透出。
 - 单次请求最多尝试 `failover_max_targets` 个候选（**全局设置**，见下方「参数落点」），按链顺序推进。
@@ -1129,7 +1129,7 @@ UPDATE access_keys SET used_tokens = used_tokens + NEW.total_tokens WHERE id = N
 |---|---|
 | RPM | 内存固定窗口计数器（每分钟一个桶，`internal/ratelimit`），Key 维度；**被拒的请求同样计数** |
 | TPM | 同桶按 token 计数：请求前按 `estimateRequestTokens` 预占（输入估算 + max_tokens 全额），请求终结时按真实 usage 校正（`CommitTPM`）；被拒的请求不预占 |
-| 执行点 | `handleIngress` 骨架层（鉴权后 RPM、解码后 TPM），两个入口共享；额度随 `KeySnapshot` 从快照下发（0 = 不限），热路径不查库 |
+| 执行点 | `internal/dataplane.Handler.Handle` 骨架层（鉴权后 RPM、解码后 TPM），两个入口共享；额度随 `KeySnapshot` 从快照下发（0 = 不限），热路径不查库 |
 | 拒绝响应 | 429 `rate_limit_exceeded` + `Retry-After`（窗口剩余秒数，两个协议同语义、各按自己的错误形状） |
 | 窗口实现 | 单锁守护的 map（key 数量由管理员管理、有界，不需清扫）；不用 `golang.org/x/time/rate`（避免依赖） |
 | 重启 | 计数归零，接受（DESIGN 既定取舍） |
@@ -1536,7 +1536,9 @@ vue-router 的 `insertMatcher` 按路径得分二分插入（`findInsertionIndex
 >
 > 本轮补上的是 2026-10-06 之后新增的根级资产（`scripts/`、`docker/`、`.github/`、
 > `build.ps1`、`gateway.ps1`、`CONTRIBUTING.md`）与 `internal/` 下新增的
-> `effort`（思考挡位唯一口径）和 `probe`（上游模型定时探测）。
+> `effort`（思考挡位唯一口径）、`probe`（上游模型定时探测），以及 2026-10-21
+> 重构拆出的 `httpx / identity / guard / access / usage / billing / billinghttp /
+> authhttp / ingress / dataplane`。
 > 核对方式：`Get-ChildItem -Directory` + 逐个 `internal/*/` 的包注释。
 
 ```
@@ -1563,8 +1565,7 @@ rosetta-gateway/
 │       ├── ci.yml                  go / webui-sync / -race / repo-hygiene 四道门禁
 │       └── docker.yml               tag 触发构建推送 GHCR（发布前复跑最小门禁）
 ├── cmd/
-│   ├── gateway/                    装配与启动；**配额预占、限速、故障转移链、usage 记账
-│   │                               都在这里**（请求热路径，非独立包）
+│   ├── gateway/                    进程入口、装配与生命周期；数据面热路径已移至 internal/dataplane
 ├── internal/
 │   ├── config/                     启动配置加载、校验、时区应用、端口占用检查
 │   ├── store/                      SQLite 连接、canonical schema、各表 DAO、归档与对账、探测记录
@@ -1579,9 +1580,20 @@ rosetta-gateway/
 │   ├── inwire/                     下游 → 统一模型（openai_chat / openai_responses / anthropic
 │   │                               + 跨协议字段翻译与硬约束判定）
 │   ├── outwire/                    统一模型 → 下游（响应 + SSE + 错误映射 §9）
+│   ├── ingress/                    下游协议 codec、协议无关 Request、token 估算
+│   ├── dataplane/                  数据面处理器：鉴权后限速、配额预占、余额预检、
+│   │                               故障转移链、流式/非流式 attempt、用量落库
+│   ├── usage/                      异步用量落库、扣费、关停 drain
+│   ├── billing/                    纯计价与余额预检策略
+│   ├── billinghttp/                subscription / usage / costs 查询接口
+│   ├── authhttp/                   数据面鉴权错误到各协议错误信封的映射
 │   ├── admin/                      管理 API handlers（含配置导入导出）
 │   ├── crypto/                     上游 key 加解密（AES-256-GCM）
 │   ├── webui/                      embed 静态资源（dist 由 web/ 构建同步而来）
+│   ├── httpx/                      HTTP 横切能力：客户端 IP、同源、Cookie、请求 ID
+│   ├── identity/                   用户/会话 context 与 Cookie
+│   ├── guard/                      登录失败限速
+│   ├── access/                     普通用户路由白名单与 AdminGateGuard
 │   └── server/                     HTTP 装配、中间件、请求 ID、访问日志、管理面授权门
 └── web/                            Vue 3 + Vite + TS 工程（npm run build && npm run sync）
 ```
