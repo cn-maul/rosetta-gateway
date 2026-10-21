@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"sync/atomic"
 	"testing"
 
 	"github.com/cn-maul/rosetta-gateway/internal/crypto"
@@ -100,7 +101,7 @@ func TestQueryProviderBalance_OpenAI(t *testing.T) {
 	st, pid, master := balanceFixture(t)
 	setEndpoint(t, st, pid, srv.URL)
 	asDialect(t, func(ctx context.Context, p *store.Provider, key string) (float64, string, string, error) {
-		return fetchOpenAIBalance(ctx, srv.URL, key)
+		return fetchOpenAIBalance(ctx, p, key)
 	})
 
 	res := balanceFor(t, st, pid, master)
@@ -141,7 +142,7 @@ func TestQueryProviderBalance_DeepSeek(t *testing.T) {
 	st, pid, master := balanceFixture(t)
 	setEndpoint(t, st, pid, srv.URL)
 	asDialect(t, func(ctx context.Context, p *store.Provider, key string) (float64, string, string, error) {
-		return fetchDeepSeekBalance(ctx, srv.URL, key)
+		return fetchDeepSeekBalance(ctx, p, key)
 	})
 
 	r := balanceFor(t, st, pid, master).Results[0]
@@ -188,7 +189,7 @@ func TestQueryProviderBalance_凭据级失败互不影响(t *testing.T) {
 	st, pid, master := balanceFixture(t)
 	setEndpoint(t, st, pid, srv.URL)
 	asDialect(t, func(ctx context.Context, p *store.Provider, key string) (float64, string, string, error) {
-		return fetchOpenAIBalance(ctx, srv.URL, key)
+		return fetchOpenAIBalance(ctx, p, key)
 	})
 
 	enc, err := crypto.Encrypt([]byte("sk-other"), master)
@@ -230,7 +231,7 @@ func TestQueryProviderBalance_停用凭据不查(t *testing.T) {
 	st, pid, master := balanceFixture(t)
 	setEndpoint(t, st, pid, srv.URL)
 	asDialect(t, func(ctx context.Context, p *store.Provider, key string) (float64, string, string, error) {
-		return fetchOpenAIBalance(ctx, srv.URL, key)
+		return fetchOpenAIBalance(ctx, p, key)
 	})
 
 	cred, _ := st.GetCredential(context.Background(), "c1")
@@ -263,7 +264,7 @@ func TestQueryProviderBalance_不跟随重定向(t *testing.T) {
 	st, pid, master := balanceFixture(t)
 	setEndpoint(t, st, pid, redir.URL)
 	asDialect(t, func(ctx context.Context, p *store.Provider, key string) (float64, string, string, error) {
-		return fetchOpenAIBalance(ctx, redir.URL, key)
+		return fetchOpenAIBalance(ctx, p, key)
 	})
 
 	res := balanceFor(t, st, pid, master)
@@ -272,5 +273,107 @@ func TestQueryProviderBalance_不跟随重定向(t *testing.T) {
 	}
 	if res.Results[0].Status != "error" {
 		t.Fatalf("302 应被报成失败而不是跟随，实际 %+v", res.Results[0])
+	}
+}
+
+// TestQueryProviderBalance_UsesProviderProxy 钉住余额查询与数据面共用
+// provider 的出站网络。只看 Transport.Proxy 是否被设上不够：这里让 proxy
+// 真正接收请求、并让上游直连必然失败，才能证明流量确实经过代理。
+func TestQueryProviderBalance_UsesProviderProxy(t *testing.T) {
+	var proxyHits atomic.Int32
+	proxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		proxyHits.Add(1)
+		_, _ = io.WriteString(w, `{"hard_limit_usd":12}`)
+	}))
+	defer proxy.Close()
+
+	// 这个 URL 不可解析/不可连接；只有流量真的走 proxy 时请求才会成功。
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Errorf("余额查询绕过代理直连了上游: %s", r.URL.Path)
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	defer up.Close()
+
+	st, pid, master := balanceFixture(t)
+	p, err := st.GetProvider(context.Background(), pid)
+	if err != nil || p == nil {
+		t.Fatalf("get provider: %v", err)
+	}
+	if err := st.CreateNetwork(context.Background(), &store.Network{
+		ID: "net-balance-proxy", Name: "balance proxy", ProxyURL: proxy.URL,
+	}); err != nil {
+		t.Fatalf("create network: %v", err)
+	}
+	p.Endpoint = up.URL
+	p.NetworkID = "net-balance-proxy"
+	if err := st.UpdateProvider(context.Background(), pid, p); err != nil {
+		t.Fatalf("update provider: %v", err)
+	}
+	asDialect(t, func(ctx context.Context, p *store.Provider, key string) (float64, string, string, error) {
+		return fetchOpenAIBalance(ctx, p, key)
+	})
+
+	res := balanceFor(t, st, pid, master)
+	if res.Status != "ok" || res.Results[0].Amount != 12 {
+		t.Fatalf("余额查询未成功走代理: %+v", res)
+	}
+	if proxyHits.Load() == 0 {
+		t.Fatal("代理一次请求都没收到 —— 余额查询仍绕过了 provider 出站网络")
+	}
+}
+
+// seedNetworkProxy 把 provider 的出站网络指向 proxy。
+func seedNetworkProxy(t *testing.T, st *store.Store, providerID, proxyURL string) {
+	t.Helper()
+	ctx := context.Background()
+	p, err := st.GetProvider(ctx, providerID)
+	if err != nil || p == nil {
+		t.Fatalf("get provider: %v", err)
+	}
+	if err := st.CreateNetwork(ctx, &store.Network{
+		ID: "net-" + providerID, Name: "test proxy", ProxyURL: proxyURL,
+	}); err != nil {
+		t.Fatalf("create network: %v", err)
+	}
+	p.NetworkID = "net-" + providerID
+	if err := st.UpdateProvider(ctx, providerID, p); err != nil {
+		t.Fatalf("update provider: %v", err)
+	}
+}
+
+// TestDiscoverUpstreamModels_UsesProviderProxy 钉住模型发现也走 provider 的
+// 出站网络。模型发现与余额查询都是辅助功能，过去各自持有全局 client，
+// 于是「数据面走代理、发现模型却直连」在界面上表现为同一个上游时而可达、
+// 时而不可达，且切换网络后不会生效。
+func TestDiscoverUpstreamModels_UsesProviderProxy(t *testing.T) {
+	var proxyHits atomic.Int32
+	proxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		proxyHits.Add(1)
+		// 代理收到的 path 是完整上游 URL 的路径，模型候选是 /models 与
+		// /v1/models；两者都返回同一份列表即可。
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"data":[{"id":"proxied-model","context_length":128000}]}`)
+	}))
+	defer proxy.Close()
+
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Errorf("模型发现绕过代理直连了上游: %s", r.URL.Path)
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	defer up.Close()
+
+	st, pid, master := balanceFixture(t)
+	setEndpoint(t, st, pid, up.URL)
+	seedNetworkProxy(t, st, pid, proxy.URL)
+
+	cands, err := DiscoverUpstreamModels(context.Background(), st, pid, master, newTestConfig())
+	if err != nil {
+		t.Fatalf("discover: %v", err)
+	}
+	if len(cands) != 1 || cands[0].ID != "proxied-model" {
+		t.Fatalf("unexpected candidates: %+v", cands)
+	}
+	if proxyHits.Load() == 0 {
+		t.Fatal("代理一次请求都没收到 —— 模型发现仍绕过了 provider 出站网络")
 	}
 }

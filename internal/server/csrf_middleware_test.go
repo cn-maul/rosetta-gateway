@@ -201,6 +201,27 @@ func TestCSRF_SameOriginCookieWritePasses(t *testing.T) {
 	}
 }
 
+// 审计 A7-13：Origin 与 Host 相同但 scheme 不同，不是同源。
+//
+// 旧实现只比 Host，http://127.0.0.1:8080 会被当成 https://127.0.0.1:8080
+// 的同源请求；该判据同时守卫免鉴权的 bootstrap 写端点，错误放行就是
+// 一个跨协议写入口。
+func TestCSRF_SameHostDifferentSchemeIsRejected(t *testing.T) {
+	h := newCSRFHarness(t)
+	req := newRequest(http.MethodPost, "/admin/api/usage/prune", nil)
+	req = withCookie(req, h.tok)
+	// httptest 请求默认是明文 HTTP（r.TLS == nil），这里伪造 https Origin。
+	req.Header.Set("Origin", "https://"+req.Host)
+
+	reached, code := h.run(t, req)
+	if reached {
+		t.Error("同 host 不同 scheme 的请求触达了 handler")
+	}
+	if code != http.StatusForbidden {
+		t.Fatalf("状态码 = %d, want %d（scheme 不一致必须判为跨源）", code, http.StatusForbidden)
+	}
+}
+
 // Bearer 凭据不拦：脚本化运维（curl / SDK）必须继续可用。
 //
 // 浏览器侧的安全由「/admin 从不设 Access-Control-Allow-Origin」保证：

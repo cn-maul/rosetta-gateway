@@ -44,7 +44,7 @@ func TestPoolBuildDropsHealthOfDeletedTargets(t *testing.T) {
 	p := newTestPool()
 
 	// threshold=1：一次失败即熔断，TargetAvailable 转 false。
-	p.RecordTargetFailure("ghost#t0", 1)
+	p.RecordTargetFailure("ghost#t0", 0, 1)
 	if p.TargetAvailable("ghost#t0") {
 		t.Fatalf("expected target circuit-open after threshold reached")
 	}
@@ -67,13 +67,13 @@ func TestInstall_PreservesHealthOfLiveTargets(t *testing.T) {
 	if err := p.BuildFromConfig(newTestConfig()); err != nil {
 		t.Fatalf("build: %v", err)
 	}
-	p.RecordTargetFailure("live#t0", 1)
+	p.RecordTargetFailure("live#t0", 0, 1)
 	if p.TargetAvailable("live#t0") {
 		t.Fatalf("前置条件不成立：目标未熔断")
 	}
 
 	// 模拟 admin 写操作后的重建，且该 target 仍在库中。
-	p.Install(p.ProvidersSnapshot(), map[string]bool{"live#t0": true})
+	p.Install(p.ProvidersSnapshot(), LiveTargets{IDs: map[string]bool{"live#t0": true}, Known: true})
 
 	if p.TargetAvailable("live#t0") {
 		t.Errorf("重建把仍在配置中的目标的熔断态清掉了：改一个无关设置就能让坏上游复活")
@@ -91,13 +91,13 @@ func TestInstall_PreservesHealthOfLiveTargets(t *testing.T) {
 // 查询与领名额必须是两个动作。
 func TestTargetAvailable_IsPureQuery(t *testing.T) {
 	p := newTestPool()
-	p.RecordTargetFailure("t#0", 1) // 熔断
+	p.RecordTargetFailure("t#0", 0, 1) // 熔断
 
 	// 未到冷却期：不可用，且不该留下任何「探测在途」痕迹
 	if p.TargetAvailable("t#0") {
 		t.Fatalf("熔断期内应不可用")
 	}
-	if p.ClaimTargetProbe("t#0") {
+	if _, ok := p.ClaimTargetProbe("t#0"); ok {
 		t.Fatalf("熔断期内不应领到探测名额")
 	}
 }
@@ -105,7 +105,7 @@ func TestTargetAvailable_IsPureQuery(t *testing.T) {
 // ClaimTargetProbe 的 half-open 语义本身必须保留：冷却到期后只放一个。
 func TestClaimTargetProbe_AllowsOnlyOneAfterCooldown(t *testing.T) {
 	p := newTestPool()
-	p.RecordTargetFailure("t#0", 1)
+	p.RecordTargetFailure("t#0", 0, 1)
 	// 熔断期内：查询与领名额都应拒绝
 	if p.TargetAvailable("t#0") {
 		t.Fatalf("熔断期内应不可用")
@@ -115,16 +115,17 @@ func TestClaimTargetProbe_AllowsOnlyOneAfterCooldown(t *testing.T) {
 	p.targets["t#0"].until = time.Now().Add(-time.Second)
 	p.mu.Unlock()
 
-	if !p.ClaimTargetProbe("t#0") {
+	token, ok := p.ClaimTargetProbe("t#0")
+	if !ok {
 		t.Fatalf("冷却刚到期时应放行第一个探测请求")
 	}
-	if p.ClaimTargetProbe("t#0") {
+	if _, ok := p.ClaimTargetProbe("t#0"); ok {
 		t.Errorf("探测名额已被占用，不应放行第二个（否则熔断-惊群重现）")
 	}
 
 	// 结果记账后名额释放
-	p.RecordTargetSuccess("t#0")
-	if !p.ClaimTargetProbe("t#0") {
+	p.RecordTargetSuccess("t#0", token)
+	if _, ok := p.ClaimTargetProbe("t#0"); !ok {
 		t.Errorf("探测成功后名额应释放，下一个请求仍能打")
 	}
 }
@@ -136,18 +137,18 @@ func TestInstall_ClearsStaleHalfOpen(t *testing.T) {
 	if err := p.BuildFromConfig(newTestConfig()); err != nil {
 		t.Fatalf("build: %v", err)
 	}
-	p.RecordTargetFailure("live#t0", 1)
+	p.RecordTargetFailure("live#t0", 0, 1)
 	p.mu.Lock()
 	p.targets["live#t0"].until = time.Now().Add(-time.Second)
 	p.mu.Unlock()
-	if !p.ClaimTargetProbe("live#t0") {
+	if _, ok := p.ClaimTargetProbe("live#t0"); !ok {
 		t.Fatalf("前置条件不成立：应能领到探测名额")
 	}
 
 	// 一次 admin 写操作触发的重建，target 仍在配置中。
-	p.Install(p.ProvidersSnapshot(), map[string]bool{"live#t0": true})
+	p.Install(p.ProvidersSnapshot(), LiveTargets{IDs: map[string]bool{"live#t0": true}, Known: true})
 
-	if !p.ClaimTargetProbe("live#t0") {
+	if _, ok := p.ClaimTargetProbe("live#t0"); !ok {
 		t.Errorf("重建继承了 halfOpen：探测名额被永久占住，目标再也无法被尝试")
 	}
 }
@@ -180,7 +181,7 @@ func TestBuildFromStore_ErrorKeepsOldPool(t *testing.T) {
 		t.Fatalf("pool must keep serving after failed rebuild: %v", err)
 	}
 	// 目标熔断表也不得被失败重建清掉（Install 未执行）。
-	p.RecordTargetFailure("t#x", 1)
+	p.RecordTargetFailure("t#x", 0, 1)
 	if p.TargetAvailable("t#x") {
 		t.Fatalf("failed rebuild must not reset target health")
 	}

@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/url"
+	"path"
 	"strconv"
 	"strings"
 	"time"
@@ -216,9 +217,9 @@ func detectBalanceDialect() func(context.Context, *store.Provider, string) (floa
 		// 子域名（api.openai.com 自身）是需要的，故用 EqualFold 或
 		// 后缀 `.openai.com` 判定。
 		case hostIs(base, "api.openai.com"):
-			return fetchOpenAIBalance(ctx, base, apiKey)
+			return fetchOpenAIBalance(ctx, p, apiKey)
 		case hostIs(base, "api.deepseek.com"):
-			return fetchDeepSeekBalance(ctx, base, apiKey)
+			return fetchDeepSeekBalance(ctx, p, apiKey)
 		case p.Protocol == "anthropic":
 			// Anthropic 至今没有公开的余额查询 API（组织用量要走管理后台/
 			// 合同）。如实说「不支持」而不是去猜一个端点打过去：猜出来的 404
@@ -232,18 +233,6 @@ func detectBalanceDialect() func(context.Context, *store.Provider, string) (floa
 			}
 		}
 	}
-}
-
-// balanceHTTPClient 与 DiscoverUpstreamModels 同一纪律：不跟随重定向。
-//
-// 理由相同且更重要 —— 这里带着 API key。一次 302 就能把 key 与账户余额信息
-// 送到管理员填的 endpoint 之外的主机上。ErrUseLastResponse 让 3xx 原样返回，
-// 由调用方按状态码报错。
-var balanceHTTPClient = &http.Client{
-	Timeout: balanceTimeout,
-	CheckRedirect: func(req *http.Request, via []*http.Request) error {
-		return http.ErrUseLastResponse
-	},
 }
 
 // hostIs 判断 base URL 的主机名是否等于 want（不区分大小写）。
@@ -308,6 +297,33 @@ func ParseBalanceSpec(raw string) (*BalanceSpec, error) {
 	if !strings.HasPrefix(spec.Path, "/") {
 		return nil, fmt.Errorf("path 必须以 / 开头（只允许相对路径，避免把请求打到别的域名）")
 	}
+	// 路径规范化与「不许穿越」校验（2026-10-21 修 A5-P1-1）。
+	//
+	// 旧实现只查前缀，于是这些都被放行：
+	//
+	//	"//evil.example/x"   → 拼接后 base+path = "https://good.example//evil.example/x"
+	//	                      → 主机仍是 good.example（逃逸不可达），但路径含义模糊
+	//	"/\evil.example/x"  → 反斜杠在 Go 的 URL 解析与各框架间语义不一致
+	//	"/a/../b"            → 归一后是 /b，但在某些上游的 /admin/../ 语义下
+	//	                      可打到未授权路径
+	//
+	// 审计 U1（2026-10-21）：必须在 path.Clean **之前**检查原始段。
+	// Clean 会消掉能消掉的 ".."，因此 "/a/../../etc" 会被归一成
+	// "/etc"，旧的后置判断看不到穿越意图而放行。这里按 / 切分原始路径，
+	// 任一段等于 ".." 就拒绝；"." 与重复斜杠仍可安全归一。
+	for _, segment := range strings.Split(spec.Path, "/") {
+		if segment == ".." {
+			return nil, fmt.Errorf("path 不允许包含 ..（它会越过 provider endpoint 的路径前缀）")
+		}
+	}
+	spec.Path = path.Clean(spec.Path)
+	if strings.Contains(spec.Path, "\\") {
+		return nil, fmt.Errorf("path 不允许包含反斜杠（各框架对它的解析不一致）")
+	}
+	// 归一后可能不再是绝对路径（如 "a/../.." 归一成 "."），再判一次。
+	if !strings.HasPrefix(spec.Path, "/") {
+		return nil, fmt.Errorf("path 必须以 / 开头（只允许相对路径，避免把请求打到别的域名）")
+	}
 	if spec.Field == "" {
 		spec.Field = "balance"
 	}
@@ -329,7 +345,7 @@ func ParseBalanceSpec(raw string) (*BalanceSpec, error) {
 // 用途就是长尾，而长尾的共同点正是「响应形状各不相同」。
 func fetchCustomBalance(ctx context.Context, p *store.Provider, apiKey string, spec *BalanceSpec) (float64, string, string, error) {
 	base := strings.TrimRight(p.Endpoint, "/")
-	body, err := doBalanceGET(ctx, base+spec.Path, apiKey, spec.Auth == "anthropic")
+	body, err := doBalanceGET(ctx, p, base+spec.Path, apiKey, spec.Auth == "anthropic")
 	if err != nil {
 		return 0, "", "", err
 	}
@@ -388,7 +404,11 @@ func lookupNumber(v any, path string) (float64, bool) {
 // 这些端点的错误页里常有内部主机名、路径、框架版本，而本错误经管理 API
 // 原样回显给管理员 —— 而管理员本来就有权配任意 endpoint，风险不在这里，
 // 但把上游的内部细节摊给终端用户没有任何好处。
-func doBalanceGET(ctx context.Context, url, apiKey string, anthropic bool) ([]byte, error) {
+func doBalanceGET(ctx context.Context, p *store.Provider, url, apiKey string, anthropic bool) ([]byte, error) {
+	client, err := probeHTTPClientFor(p.ProxyURL, balanceTimeout)
+	if err != nil {
+		return nil, err
+	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
 		return nil, err
@@ -399,7 +419,7 @@ func doBalanceGET(ctx context.Context, url, apiKey string, anthropic bool) ([]by
 	} else {
 		req.Header.Set("Authorization", "Bearer "+apiKey)
 	}
-	resp, err := balanceHTTPClient.Do(req)
+	resp, err := client.Do(req)
 	if err != nil {
 		return nil, err
 	}
@@ -422,8 +442,9 @@ func doBalanceGET(ctx context.Context, url, apiKey string, anthropic bool) ([]by
 // 取「总额度 − 已用」而不是只报总额度：管理员的问题是「还能花多少」，
 // 报一个更大的数字会让他以为比实际宽裕。优先用 hard_limit_usd，退回
 // hard_limit（早期字段没有货币单位）；两者都没有就报错而不是编一个值。
-func fetchOpenAIBalance(ctx context.Context, base, apiKey string) (float64, string, string, error) {
-	body, err := doBalanceGET(ctx, base+"/dashboard/billing/subscription", apiKey, false)
+func fetchOpenAIBalance(ctx context.Context, p *store.Provider, apiKey string) (float64, string, string, error) {
+	base := strings.TrimRight(p.Endpoint, "/")
+	body, err := doBalanceGET(ctx, p, base+"/dashboard/billing/subscription", apiKey, false)
 	if err != nil {
 		return 0, "", "", err
 	}
@@ -450,7 +471,7 @@ func fetchOpenAIBalance(ctx context.Context, base, apiKey string) (float64, stri
 	// 「可用」在跨月时会偏大。detail 里把两个原始值都带出，让管理员自己
 	// 判断，界面上不该出现一个看起来精确、实际有口径问题的可用余额。
 	used := 0.0
-	if b, err := doBalanceGET(ctx, base+"/dashboard/billing/usage", apiKey, false); err == nil {
+	if b, err := doBalanceGET(ctx, p, base+"/dashboard/billing/usage", apiKey, false); err == nil {
 		var usage struct {
 			TotalUsage *float64 `json:"total_usage"`
 		}
@@ -469,8 +490,9 @@ func fetchOpenAIBalance(ctx context.Context, base, apiKey string) (float64, stri
 // 两种都试：取不到数值时按 is_available=false 报「已无可用余额」，
 // 而不是返回「查不到」—— 前者是真实答案，后者是网关的失败，混为一谈会让
 // 管理员以为要换 key 而其实只是该充值了。
-func fetchDeepSeekBalance(ctx context.Context, base, apiKey string) (float64, string, string, error) {
-	body, err := doBalanceGET(ctx, base+"/user/balance", apiKey, false)
+func fetchDeepSeekBalance(ctx context.Context, p *store.Provider, apiKey string) (float64, string, string, error) {
+	base := strings.TrimRight(p.Endpoint, "/")
+	body, err := doBalanceGET(ctx, p, base+"/user/balance", apiKey, false)
 	if err != nil {
 		return 0, "", "", err
 	}

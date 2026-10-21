@@ -397,7 +397,11 @@ func sessionToken(r *http.Request) string {
 }
 
 // SetSessionCookie 写出会话 cookie。
-func SetSessionCookie(w http.ResponseWriter, token string, exp time.Time) {
+//
+// secure 由调用方从 SessionCookieSecure(r) 推导：配置了 https 的
+// public_origin 时浏览器实际走 HTTPS，Cookie 必须带 Secure；纯 HTTP
+// 局域网部署则不能带，否则浏览器会直接丢弃它。
+func SetSessionCookie(w http.ResponseWriter, token string, exp time.Time, secure bool) {
 	http.SetCookie(w, &http.Cookie{
 		Name:     SessionCookieName,
 		Value:    token,
@@ -405,9 +409,8 @@ func SetSessionCookie(w http.ResponseWriter, token string, exp time.Time) {
 		Expires:  exp,
 		MaxAge:   int(time.Until(exp).Seconds()),
 		HttpOnly: true,
+		Secure:   secure,
 		SameSite: http.SameSiteStrictMode,
-		// 刻意不设 Secure：局域网是 HTTP，设了浏览器直接丢弃 cookie。
-		// 这是「不上 HTTPS」的已知代价，§6.1 已记录。
 	})
 }
 

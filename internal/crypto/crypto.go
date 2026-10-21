@@ -12,10 +12,8 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
-	"sync/atomic"
-	"unicode"
-	"unicode/utf8"
 )
 
 const (
@@ -58,27 +56,28 @@ func LoadMasterKey(envName, dir string) (key []byte, generated bool, weak bool, 
 	content, readErr := os.ReadFile(path)
 	switch {
 	case readErr == nil:
-		raw := strings.TrimSpace(string(content))
-		if raw == "" {
-			// 文件存在但为空 —— 只可能是「上次写被截断」（旧实现用 O_TRUNC
-			// 非原子写，进程在写入中途被 kill 就会留下 0 字节）。绝不能静默
-			// 当作「没有密钥」而重新生成一把：库里全部凭据都是用旧密钥加密的，
-			// 换密钥等于全部永久解不开，PrepareFromStore 会逐条 continue，
-			// 结果是所有 provider 变成零凭据、/v1 全站 404，且无任何告警。
+		key, err := LoadKeyFile(path)
+		if err != nil {
+			// 文件存在但为空/格式非法 —— 只可能是「上次写被截断」或损坏。
+			// 绝不能静默当作「没有密钥」而重新生成一把：库里全部凭据都是用
+			// 旧密钥加密的，换密钥等于全部永久解不开。
 			return nil, false, false, fmt.Errorf(
-				"%s 存在但内容为空：上次写入可能被截断。用旧密钥（环境变量 %s）启动；"+
-					"若确已丢失，需手动删除该文件并重新配置全部上游凭据", path, envName)
+				"%s：%w（用旧密钥（环境变量 %s）启动；若确已丢失，需手动删除该文件并重新配置全部上游凭据）",
+				path, err, envName)
 		}
-		if !validKeyFormat(raw) {
-			// 自动生成的密钥恒为 base64url(32B) = 44 字符；环境变量可以是任意
-			// 长度。文件路径只走这条分支，所以格式不符 = 文件损坏或被手工截断。
-			return nil, false, false, fmt.Errorf(
-				"%s 内容格式非法（长度 %d，自动生成的密钥应为 44 字符 base64url）："+
-					"文件很可能已损坏。库里凭据依赖此密钥，请勿删除；"+
-					"若确需更换，先用环境变量 %s 指定旧密钥启动", path, len(raw), envName)
-		}
-		sum := sha256.Sum256([]byte(raw))
-		return sum[:], false, WeakMaterial(raw), nil
+		// 既有文件的权限检查（2026-10-21 修 A10-P1-3）。
+		//
+		// writeKeyAtomic 写出来的是 0600，但**既有部署**的文件可能是
+		// 更早的版本写的（0644），或者被运维/备份工具复制时放宽过。
+		// 「密钥文件是安全的」这句话只对**新建**的文件成立 —— 而
+		// master.key 保护着全部上游 API key，它被同机其他账号读到 =
+		// 全部凭据可解密。
+		//
+		// 处置：**收紧**而不是告警。理由与目录不同 —— 这个文件是我们
+		// 自己的产物、只被本进程读、且收紧它不会打断任何外部读者
+		// （外部读者读这个文件本来就是要紧的）。改权限失败才告警。
+		warnWeakPermissions(path)
+		return key, false, WeakMaterial(strings.TrimSpace(string(content))), nil
 	case !os.IsNotExist(readErr):
 		return nil, false, false, fmt.Errorf("read %s: %w", path, readErr)
 	}
@@ -90,6 +89,30 @@ func LoadMasterKey(envName, dir string) (key []byte, generated bool, weak bool, 
 	}
 	sum := sha256.Sum256([]byte(raw))
 	return sum[:], true, false, nil
+}
+
+// LoadKeyFile 读取并校验一个 master.key 文件，返回运行时使用的 32 字节密钥。
+//
+// 迁移工具必须与网关走同一条校验路径：旧工具只查 `len(raw)==44`，会把
+// 「44 个字母但 base64 解不出 32 字节」的损坏文件当成合法密钥使用，
+// 最终表现为凭据一条都解不开而错误信息指向别处。这里把格式校验与
+// sha256 派生收敛成唯一实现（审计 A6-P1-4）。
+func LoadKeyFile(path string) ([]byte, error) {
+	content, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	raw := strings.TrimSpace(string(content))
+	if raw == "" {
+		return nil, errors.New("内容为空：上次写入可能被截断")
+	}
+	if !validKeyFormat(raw) {
+		return nil, fmt.Errorf(
+			"内容格式非法（长度 %d，自动生成的密钥应为 44 字符 base64url）",
+			len(raw))
+	}
+	sum := sha256.Sum256([]byte(raw))
+	return sum[:], nil
 }
 
 // validKeyFormat 报告一段密钥材料是否符合自动生成的格式。
@@ -150,53 +173,6 @@ func writeKeyAtomic(path string, data []byte) error {
 		_ = d.Close()
 	}
 	return nil
-}
-
-// plaintextFallbackWarned 节流「命中明文回退」的告警：解密发生在每次池重建
-// 与管理面读凭据时，逐条打会刷爆日志，而「库里存在明文凭据」这一事实
-// 说一遍就够。进程级一次性，代价是重启后才会再提醒 —— 可接受。
-var plaintextFallbackWarned atomic.Bool
-
-// DecryptWithFallback 用 masterKey 解密。masterKey 为空时直接按明文返回；
-// 解密失败时，只有当数据看起来是可打印文本才退化为明文
-// —— 兼容早期「无主密钥 → 明文落库」的历史数据，同时避免把密文当 API Key 发出去。
-//
-// 兼容不等于无声：命中文本回退说明库里有一条**未加密**的凭据（主密钥存在
-// 却解不开 = 数据不是本密钥加密的，而是明文落库的历史行/手工插入行）。
-// 此时数据库备份等于该凭据泄露，且这条数据永远不会自己升级成密文 ——
-// 必须 WARN 让运维知道去重新保存一次凭据完成加密迁移。日志只记长度，
-// 不记内容：那是明文密钥本身。
-func DecryptWithFallback(data, masterKey []byte) (string, error) {
-	if len(masterKey) == 0 {
-		return string(data), nil
-	}
-	plain, err := Decrypt(data, masterKey)
-	if err == nil {
-		return string(plain), nil
-	}
-	if looksLikeText(data) {
-		if plaintextFallbackWarned.CompareAndSwap(false, true) {
-			slog.Warn("credential accepted as PLAINTEXT by fallback decryption; "+
-				"database backups expose it and it will never self-encrypt — "+
-				"re-save the credential to migrate it into encrypted form",
-				"bytes", len(data))
-		}
-		return string(data), nil
-	}
-	return "", err
-}
-
-// looksLikeText 判断字节序列是否像可打印文本（用于区分明文与密文）。
-func looksLikeText(b []byte) bool {
-	if len(b) == 0 || !utf8.Valid(b) {
-		return false
-	}
-	for _, r := range string(b) {
-		if r == utf8.RuneError || (!unicode.IsPrint(r) && r != '\n' && r != '\t') {
-			return false
-		}
-	}
-	return true
 }
 
 func Encrypt(plaintext []byte, masterKey []byte) ([]byte, error) {
@@ -260,4 +236,40 @@ func GenerateKey() string {
 // 存量密文全部解不开，锁死代价高于收益。
 func WeakMaterial(raw string) bool {
 	return len(strings.TrimSpace(raw)) < 32
+}
+
+// warnWeakPermissions 把一个密钥文件的权限收紧到 0600。
+//
+// # 为什么是「收紧」而不是「告警」
+//
+// 对 master.key / session_secret 这类文件：它们是**本进程独占读取**的产物，
+// 收紧权限不会打断任何正当的外部读者（外部读者读它本来就是要紧的事）。
+// 而放着 0644 不管 = 同机任何账号都能拷走它 —— master.key 泄漏 = 全部
+// 上游凭据可解密。
+//
+// 与目录的差别（见 store.Open 的注释）：目录可能有意让备份服务读，
+// 密钥文件不会。
+//
+// # Windows
+//
+// NTFS 的权限模型是 ACL，Chmod 只能改只读位 —— 强改只读位会让后续
+// 写入失败。所以 Windows 上跳过整个检查。
+func warnWeakPermissions(path string) {
+	if runtime.GOOS == "windows" {
+		return
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		return
+	}
+	if perm := info.Mode().Perm(); perm&0o077 != 0 {
+		if err := os.Chmod(path, 0o600); err != nil {
+			slog.Warn("cannot tighten secret file permissions; "+
+				"other users on this host may be able to read it",
+				"path", path, "mode", fmt.Sprintf("%04o", perm), "error", err)
+			return
+		}
+		slog.Warn("tightened secret file permissions (was readable by other users)",
+			"path", path, "was", fmt.Sprintf("%04o", perm))
+	}
 }

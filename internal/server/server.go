@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"net/netip"
 	"net/url"
 	"strconv"
 	"strings"
@@ -18,6 +19,9 @@ import (
 type contextKey string
 
 const requestIDKey contextKey = "request_id"
+const publicOriginKey contextKey = "public_origin"
+const trustedProxiesKey contextKey = "trusted_proxies"
+const resolvedClientIPKey contextKey = "resolved_client_ip"
 
 func RequestIDFromContext(ctx context.Context) string {
 	if id, ok := ctx.Value(requestIDKey).(string); ok {
@@ -50,8 +54,58 @@ func Middleware(next http.Handler, logger *slog.Logger) http.Handler {
 			"status", wrapped.StatusCode(),
 			"duration_ms", time.Since(start).Milliseconds(),
 			"request_id", reqID,
-			"remote", r.RemoteAddr,
+			"remote", clientIP(r),
 		)
+	})
+}
+
+// WithPublicOrigin 把配置里的公开源注入请求 context，供同源判定与
+// 会话 Cookie 的 Secure 属性共同使用。
+//
+// 只在配置非空时注入。空串表示「未声明反代后的公开源」，此时 sameOrigin
+// 回落到进程实际观察到的 TLS 状态（见 sameOrigin 的注释）。
+//
+// 这里刻意不读取 X-Forwarded-*：反向代理后面的客户端可以伪造这些头，
+// 而 SameOrigin 同时保护免鉴权的 bootstrap 写入口。公开源只能来自
+// 部署配置，不能来自请求本身。
+func WithPublicOrigin(next http.Handler, origin string) http.Handler {
+	origin = strings.TrimSpace(origin)
+	if origin == "" {
+		return next
+	}
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		ctx := context.WithValue(r.Context(), publicOriginKey, origin)
+		next.ServeHTTP(w, r.WithContext(ctx))
+	})
+}
+
+// PublicOriginFromContext 返回配置的公开源；未配置时为空串。
+func PublicOriginFromContext(ctx context.Context) string {
+	v, _ := ctx.Value(publicOriginKey).(string)
+	return v
+}
+
+// WithTrustedProxies 把可信反向代理网段注入请求 context。
+//
+// 只有这个显式配置存在时，clientIP 才会解析 Forwarded / X-Forwarded-For。
+// 空配置保持旧行为：转发头一律不可信。
+func WithTrustedProxies(next http.Handler, prefixes []netip.Prefix) http.Handler {
+	if len(prefixes) == 0 {
+		return next
+	}
+	copied := make([]netip.Prefix, len(prefixes))
+	copy(copied, prefixes)
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		ctx := context.WithValue(r.Context(), trustedProxiesKey, copied)
+		resolved := resolveClientIP(r, copied)
+		ctx = context.WithValue(ctx, resolvedClientIPKey, resolved)
+		// 数据面 auth 包读取 RemoteAddr 做 key 级 IP 白名单。把解析后的地址
+		// 回写到这里，保证管理限速、审计、数据面白名单使用同一来源；原始
+		// 对端地址不再参与后续判定。
+		if addr, err := netip.ParseAddr(resolved); err == nil {
+			r.RemoteAddr = net.JoinHostPort(addr.String(), "0")
+		}
+		next.ServeHTTP(w, r.WithContext(ctx))
 	})
 }
 
@@ -167,10 +221,48 @@ func sameOrigin(r *http.Request) bool {
 		return true
 	}
 	u, err := url.Parse(origin)
-	if err != nil || u.Host == "" {
+	if err != nil || u.Host == "" || u.User != nil ||
+		(u.Path != "" && u.Path != "/") || u.RawQuery != "" || u.Fragment != "" {
+		return false
+	}
+	// 审计 A7-13：原先只比 Host，所以 http://gw.example 与 https://gw.example
+	// 被当成同源。该函数同时守卫免鉴权的 bootstrap 写端点与 Cookie 写请求，
+	// 只比 Host 就漏掉了协议降级这一维。
+	//
+	originScheme := strings.ToLower(u.Scheme)
+	// 配置了 public_origin 时，它就是浏览器侧 scheme+host 的唯一基准。
+	// 网关自身只监听明文 HTTP；若前面有 TLS 反代，浏览器看到的 scheme 是
+	// https，而 r.TLS 在进程内仍为 nil。用 X-Forwarded-Proto 会引入可伪造头，
+	// 所以反代部署必须显式配置这个值，而不是相信请求头。
+	if publicOrigin := PublicOriginFromContext(r.Context()); publicOrigin != "" {
+		base, err := url.Parse(publicOrigin)
+		if err != nil || base.Host == "" {
+			return false
+		}
+		return originScheme == strings.ToLower(base.Scheme) &&
+			strings.EqualFold(u.Host, base.Host)
+	}
+	// 未配置公开源：只接受进程实际观察到的 TLS 状态。这样纯 HTTP 局域网
+	// 部署保持原行为，反代部署若忘记配置则保守拒绝（而不是静默放行）。
+	requestScheme := "http"
+	if r.TLS != nil {
+		requestScheme = "https"
+	}
+	if originScheme != requestScheme {
 		return false
 	}
 	return strings.EqualFold(u.Host, r.Host)
+}
+
+// SessionCookieSecure 报告当前请求对应的会话 Cookie 是否应带 Secure。
+//
+// 配置了 https 的 public_origin 时必须带；未配置时按进程实际是否终止 TLS
+// 判断。两者都不看 X-Forwarded-Proto。
+func SessionCookieSecure(r *http.Request) bool {
+	if origin := PublicOriginFromContext(r.Context()); origin != "" {
+		return strings.HasPrefix(strings.ToLower(origin), "https://")
+	}
+	return r.TLS != nil
 }
 
 // WriteForbidden 导出给 admin 包的引导端点复用：免鉴权写接口被跨站调用时，
@@ -184,23 +276,160 @@ func writeForbidden(w http.ResponseWriter) {
 	w.Write([]byte(`{"error":{"message":"拒绝跨站请求","type":"invalid_request_error"}}`))
 }
 
-// ClientIPOf 取请求来源地址。
+// ClientIPOf 取请求来源地址（已按 trusted_proxy_cidrs 解析可信转发链）。
 //
-// 导出给admin 包的登录限速用：它必须和鉴权中间件按同一口径计数，
-// 否则两处限速各算各的，攻击者可以从较松的那处撞进来。
+// 鉴权、登录限速、审计与数据面 IP 白名单必须共用这一口径；各处自行解析
+// 转发头会让同一个请求在不同安全边界上被识别成不同客户端。
 func ClientIPOf(r *http.Request) string { return clientIP(r) }
 
 // clientIP 取请求来源地址。
 //
-// 刻意不看 X-Forwarded-For：那是客户端可以随意伪造的头，采信它等于把限速交给攻击者
-// 开关。代价是本网关若部署在反向代理之后，计数会退化成「按代理 IP 计」——
-// 挡不住分布式爆破，但至少不会被伪造头绕过。
+// 默认只信 r.RemoteAddr。配置 trusted_proxy_cidrs 后，仅当直接对端命中
+// 可信网段才解析 Forwarded / X-Forwarded-For；从右向左跳过可信代理，
+// 返回第一个不可信地址。这样攻击者预先塞入链首的伪 IP 不会覆盖代理追加
+// 在右侧的真实来源。
 func clientIP(r *http.Request) string {
-	host, _, err := net.SplitHostPort(r.RemoteAddr)
-	if err != nil {
-		return r.RemoteAddr
+	if resolved, ok := r.Context().Value(resolvedClientIPKey).(string); ok && resolved != "" {
+		return resolved
 	}
-	return host
+	return resolveClientIP(r, trustedProxiesFromContext(r.Context()))
+}
+
+func resolveClientIP(r *http.Request, trusted []netip.Prefix) string {
+	remote := remoteHost(r.RemoteAddr)
+	if len(trusted) == 0 {
+		return remote
+	}
+	remoteAddr, ok := parseProxyAddr(remote)
+	if !ok || !isTrustedProxy(remoteAddr, trusted) {
+		return remote
+	}
+
+	chain, ok := forwardedChain(r)
+	if !ok || len(chain) == 0 {
+		return remote
+	}
+	for i := len(chain) - 1; i >= 0; i-- {
+		if !isTrustedProxy(chain[i], trusted) {
+			return chain[i].String()
+		}
+	}
+	return chain[0].String()
+}
+
+func trustedProxiesFromContext(ctx context.Context) []netip.Prefix {
+	prefixes, _ := ctx.Value(trustedProxiesKey).([]netip.Prefix)
+	return prefixes
+}
+
+func remoteHost(remoteAddr string) string {
+	host, _, err := net.SplitHostPort(remoteAddr)
+	if err == nil {
+		return host
+	}
+	return strings.Trim(remoteAddr, "[]")
+}
+
+func forwardedChain(r *http.Request) ([]netip.Addr, bool) {
+	if values := r.Header.Values("Forwarded"); len(values) > 0 {
+		return parseForwarded(values)
+	}
+	if values := r.Header.Values("X-Forwarded-For"); len(values) > 0 {
+		return parseXForwardedFor(values)
+	}
+	return nil, false
+}
+
+func parseForwarded(values []string) ([]netip.Addr, bool) {
+	var out []netip.Addr
+	for _, value := range values {
+		for _, element := range strings.Split(value, ",") {
+			var forValue string
+			for _, part := range strings.Split(element, ";") {
+				name, raw, ok := strings.Cut(strings.TrimSpace(part), "=")
+				if ok && strings.EqualFold(strings.TrimSpace(name), "for") {
+					forValue = strings.TrimSpace(raw)
+					break
+				}
+			}
+			if forValue == "" {
+				return nil, false
+			}
+			addr, ok := parseProxyAddr(forValue)
+			if !ok {
+				return nil, false
+			}
+			out = append(out, addr)
+		}
+	}
+	return out, len(out) > 0
+}
+
+func parseXForwardedFor(values []string) ([]netip.Addr, bool) {
+	var out []netip.Addr
+	for _, value := range values {
+		for _, raw := range strings.Split(value, ",") {
+			addr, ok := parseProxyAddr(strings.TrimSpace(raw))
+			if !ok {
+				return nil, false
+			}
+			out = append(out, addr)
+		}
+	}
+	return out, len(out) > 0
+}
+
+func parseProxyAddr(raw string) (netip.Addr, bool) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" || strings.EqualFold(raw, "unknown") || strings.HasPrefix(raw, "_") {
+		return netip.Addr{}, false
+	}
+	if strings.HasPrefix(raw, `"`) {
+		unquoted, err := strconv.Unquote(raw)
+		if err != nil {
+			return netip.Addr{}, false
+		}
+		raw = strings.TrimSpace(unquoted)
+	}
+
+	if addr, err := netip.ParseAddr(raw); err == nil {
+		return normalizeProxyAddr(addr), true
+	}
+	if host, _, err := net.SplitHostPort(raw); err == nil {
+		raw = host
+	} else if strings.HasPrefix(raw, "[") && strings.HasSuffix(raw, "]") {
+		raw = raw[1 : len(raw)-1]
+	}
+	addr, err := netip.ParseAddr(raw)
+	if err != nil {
+		return netip.Addr{}, false
+	}
+	return normalizeProxyAddr(addr), true
+}
+
+func normalizeProxyAddr(addr netip.Addr) netip.Addr {
+	if addr.Is4In6() {
+		return addr.Unmap()
+	}
+	return addr
+}
+
+func isTrustedProxy(addr netip.Addr, prefixes []netip.Prefix) bool {
+	addr = normalizeProxyAddr(addr)
+	for _, prefix := range prefixes {
+		p := prefix
+		if p.Addr().Is4In6() {
+			bits := p.Bits() - 96
+			if bits < 0 {
+				continue
+			}
+			p = netip.PrefixFrom(p.Addr().Unmap(), bits)
+		}
+		if p.Contains(addr) {
+			return true
+		}
+	}
+	return false
 }
 
 // LoginFailLimit / LoginCooldown 是登录失败的限速参数，导出给

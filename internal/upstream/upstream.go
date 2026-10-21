@@ -44,6 +44,7 @@ type Pool struct {
 	providers   map[string]*ProviderEntry
 	credIndex   map[string]*CredentialEntry
 	targets     map[string]*targetHealth
+	probeToken  ProbeToken
 	cooldownSto CooldownStore
 	logger      *slog.Logger
 }
@@ -59,11 +60,55 @@ type CooldownStore interface {
 type targetHealth struct {
 	consecutiveFails int
 	until            time.Time
-	// halfOpen 标记「冷却刚到期、已放一个探测请求进去」。
+	// halfOpenToken 标记「冷却刚到期、已放哪一个探测请求进去」。
 	// 没有它，冷却到期瞬间所有在途请求会同时打向刚恢复（或仍坏）的目标，
 	// 形成惊群 —— 要么瞬时并发尖峰，要么全体真实失败各自计一次。
-	halfOpen bool
+	//
+	// # 它只对**冷却到期后的恢复期**有意义（2026-10-21 修 P0-11）
+	//
+	// 此前 halfOpen 是一个**全局互斥位**：ClaimTargetProbe 无论目标是否
+	// 处于冷却，都先查 halfOpen。于是任何时刻一个目标最多只允许 1 个
+	// 在途请求 —— 熔断器的「故障期间限流」被误植成了「常态限流」。
+	//
+	// 后果：开启 failover 后健康路由的并发能力被压成 1，其余请求静默
+	// 改投链上下一个目标（route_trace 记 skip/probe_busy_or_cooling）。
+	// 链上第二个目标是另一家供应商时，这就是**在健康状态下把流量送往
+	// 另一家供应商并按另一家计费**，而界面上熔断状态显示「正常」。
+	//
+	// 现在它的含义收紧为「这个目标正在半开恢复期，且已放一个探针进去」，
+	// 由 recovering 标志划定边界（见 claimTargetProbeLocked）。
+	//
+	// 这里存令牌而不是 bool：熔断前已经发出的旧请求会在恢复期才返回，
+	// 它的 success/failure/release 不能清掉恢复期里**另一个**新探针的名额。
+	halfOpenToken ProbeToken
+	// halfOpenCycle 记录占用名额的探针属于哪一次熔断周期。
+	// 新一轮熔断会把 breakerCycle 加一，于是上一周期遗留的探针即使
+	// 还没返回，也不会永久堵住新周期的探针名额。
+	halfOpenCycle uint64
+	// breakerCycle 每进入一次冷却期加一，用于识别跨周期的迟到结果。
+	breakerCycle uint64
+	// recovering 标记「这个目标正在半开恢复期」。
+	//
+	// 它把「健康的目标」与「冷却刚到期、正在半开恢复的目标」区分开 ——
+	// 这两种状态在 until 上无法区分（健康目标的 until 是零值，而零值
+	// 也可能是「已到期」）。没有这个标志，半开名额要么对健康目标生效
+	// （吞吐塌成 1），要么对恢复期失效（惊群重现）。
+	//
+	// 它的生命周期严格对应「冷却到期 → 探针裁决」这一段：
+	//   - RecordTargetFailure 触发熔断时置位（进入冷却）；
+	//   - 冷却到期、第一次 ClaimTargetProbe 时仍置位（半开，限一个探针）；
+	//   - RecordTargetSuccess（探针成功）清位 —— 目标已确认健康，
+	//     回到「健康目标无限并发」；
+	//   - RecordTargetFailure（探针失败）重新置位并推入新一轮冷却。
+	//
+	// 于是「曾经坏过但现在健康」与「从未坏过」在**放行行为上完全一致** ——
+	// 区别只在熔断计数（consecutiveFails）上，而它本来就该记着历史失败。
+	recovering bool
 }
+
+// ProbeToken 标识一次半开探针 claim。0 表示本次请求没有占用探针名额
+// （健康目标、未开启故障转移，或目标级熔断被关闭）。
+type ProbeToken uint64
 
 // targetBreakerCooldown 是目标达阈值后的熔断时长。与 5xx 凭据冷却同量级：
 // 短到能较快自愈，长到不会让一个坏目标在每个请求上都被重新试一遍。
@@ -211,7 +256,7 @@ func (p *Pool) BuildFromConfig(cfg *config.Config) error {
 	// config bootstrap 路径不存在 route_targets（路由只能来自 DB），
 	// 所以存活 target 集合是**空集**（不是 nil）：先前留下的任何熔断条目
 	// 都对应一个不存在的目标，应当丢弃。
-	p.Install(newProviders, map[string]bool{})
+	p.Install(newProviders, LiveTargets{IDs: map[string]bool{}, Known: true})
 	return nil
 }
 
@@ -234,20 +279,33 @@ func (p *Pool) BuildFromStore(ctx context.Context, st *store.Store, masterKey []
 }
 
 // liveTargetIDsFromStore 读出全部 route target 的 ID 集合。
-// 失败时返回**空集**而非 nil：Install 的语义是「集合外的条目一律丢弃」，
-// 而调用方能走到这里说明 PrepareFromStore 已经成功查过库了，此处再失败
-// 只可能是目标表本身为空。此时把熔断全清的后果（坏上游短暂复活），
-// 远小于把已删目标的状态永远留在内存里的后果（单调堆积）。
-func liveTargetIDsFromStore(ctx context.Context, st *store.Store) map[string]bool {
+//
+// # 读失败不能当成「集合为空」（2026-10-21 修 A5-P1-2）
+//
+// 旧实现在读失败时返回空集，而 Install 的语义是「集合外的条目一律丢弃」
+// —— 于是一次读取失败就把**全站熔断状态**清空了。
+//
+// 后果：一次短暂的读池抖动（SQLITE_BUSY / 磁盘瞬时故障）就让所有正在熔断的
+// 坏上游立刻复活。它们会被再次打满、再次触发熔断、再次熔断——
+// 而这一轮重复对上游的真实压力，在故障期内恰好放大。
+//
+// 更还有一层：Reload 的路径里「重建成功」与「熔断状态被主动清空」是两件事。
+// 旧实现让它们同时发生，而管理面上的状态仍显示「已重建」——没人知道熔断被静默清了。
+//
+// 正确的区分是三态：
+//   - Known=true 且集合非空 → 按集合过滤（正常路径）；
+//   - Known=true 且集合为空 → 目标表里真的没了目标，清空熔断状态正确；
+//   - Known=false       → 集合未知，**保留**全部既有熔断状态。
+func liveTargetIDsFromStore(ctx context.Context, st *store.Store) LiveTargets {
 	targets, err := st.ListAllRouteTargets(ctx)
 	if err != nil {
-		return map[string]bool{}
+		return LiveTargets{Known: false}
 	}
 	ids := make(map[string]bool, len(targets))
 	for _, t := range targets {
 		ids[t.ID] = true
 	}
-	return ids
+	return LiveTargets{IDs: ids, Known: true}
 }
 
 // PrepareFromStore 从数据库构建一份完整的 provider 表（含解密、建 client），
@@ -396,6 +454,27 @@ func (p *Pool) PrepareFromStore(ctx context.Context, st *store.Store, masterKey 
 	return newProviders, failures, nil
 }
 
+// LiveTargets 是「当前库里还存在的 route target」这个信息的完整表达。
+//
+// # 为什么不是一个纯集合（2026-10-21 修 A5-P1-2）
+//
+// 旧接口只传一个 map[string]bool，而下面的 Install 以「集合外一律丢弃」为语义。
+// 这个接口无法区分「目标确实没了」与「我读失败了」——而两者的处置
+// 完全不同：
+//   - 目标确实没了 → 旧熔断状态应当丢掉（它们已无对应的目标）；
+//   - 我读失败了   → 旧熔断状态应当**保留**（目标可能还在，只是我不知道）。
+//
+// 旧实现在读失败时返回空集 → 一次短暂的读池抖动就把全站熔断状态清空，
+// 让正在熔断的坏上游立刻复活。
+//
+// Known=false 表示「集合未知」，Install 就保留全部既有熔断状态。
+type LiveTargets struct {
+	// IDs 是当前存在的 target ID 集合。Known=false 时无意义。
+	IDs map[string]bool
+	// Known 表示 IDs 是否可信（即「我成功读到了」。
+	Known bool
+}
+
 // Install 以构建好的新表原子替换运行状态。
 //
 // **熔断状态跨重建保留**：任何 admin 写操作都会触发一次重建，而熔断状态与
@@ -405,23 +484,32 @@ func (p *Pool) PrepareFromStore(ctx context.Context, st *store.Store, masterKey 
 //
 // liveTargetIDs 是重建后仍然存在的 target ID 全集（来自 route_targets）。
 // 不在其中的旧条目被丢弃：targetID 每次保存链都重新生成，留着会单调堆积。
-func (p *Pool) Install(providers map[string]*ProviderEntry, liveTargetIDs map[string]bool) {
+func (p *Pool) Install(providers map[string]*ProviderEntry, live LiveTargets) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	p.providers = providers
 	p.reindexLocked()
 
-	kept := make(map[string]*targetHealth, len(liveTargetIDs))
-	for tid := range liveTargetIDs {
+	// 集合未知（读库失败）→ 保留**全部**既有熔断状态。
+	//
+	// 原因见 LiveTargets 的注释：一次读池抖动就把全站熔断状态清空，
+	// 会让正在熔断的坏上游立刻复活。而旧实现的“返回空集”恰好导致这一点。
+	if !live.Known {
+		return
+	}
+
+	kept := make(map[string]*targetHealth, len(live.IDs))
+	for tid := range live.IDs {
 		if h, ok := p.targets[tid]; ok {
-			// 沿用旧的健康状态（含未到期的 until），但**清掉 halfOpen**。
+			// 沿用旧的健康状态（含未到期的 until），但**清掉 halfOpenToken**。
 			//
 			// halfOpen 的含义是「有一个探测请求正在途」，只对该请求所在的
 			// 进程实例有效。重建时上一个在途请求要么已完成（结果已记账、
 			// 名额已释放），要么随旧池一起作废 —— 两种情况下把它继承下来
 			// 都是错的，而错的方向是「永久不可用」：没有任何东西会再来
 			// 释放它。until 没到期时本来就该熔断，保留它即可。
-			h.halfOpen = false
+			h.halfOpenToken = 0
+			h.halfOpenCycle = 0
 			kept[tid] = h
 		} else {
 			kept[tid] = &targetHealth{}
@@ -559,33 +647,81 @@ func (p *Pool) TargetAvailable(targetID string) bool {
 // 周期性循环。成败由 RecordTargetSuccess / RecordTargetFailure 收敛：
 // 成功清零计数并释放名额，失败立刻重新熔断。
 //
-// 返回 false 表示「此刻不打」：仍在冷却中，或探测名额已被别的请求领走。
-// 调用方应当把该目标当作本次不可用并继续沿链转移。
-func (p *Pool) ClaimTargetProbe(targetID string) bool {
+// 返回 (0, true) 表示健康目标可以直接打，但没有占用半开名额；
+// 返回 (token, true) 表示领到了一次半开探针名额；
+// 返回 (0, false) 表示「此刻不打」：仍在冷却中，或探测名额已被别的请求领走。
+// 调用方应当把后者当作本次不可用并继续沿链转移。
+func (p *Pool) ClaimTargetProbe(targetID string) (ProbeToken, bool) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	return p.claimTargetProbeLocked(targetID)
+}
+
+// claimTargetProbeLocked 是 ClaimTargetProbe 的加锁实现。
+//
+// # 三种状态，三种处置（2026-10-21 修 P0-11）
+//
+//  1. **健康目标**（!recovering）：
+//     无限并发地放行。熔断器不该在健康期限流 —— 那不是熔断器的职责，
+//     而是把「故障期间限流」误植成「常态限流」。
+//
+//  2. **仍在冷却中**（now < until）：
+//     拒绝。冷却未到期，本来就不该打。
+//
+//  3. **半开恢复期**（recovering && 冷却已到期）：
+//     只放**一个**探测请求。惊群只发生在这个瞬间：所有在途请求同时
+//     打向刚恢复（或仍坏）的目标。要么瞬时并发尖峰，要么全体真实失败
+//     各自计一次，把「冷却到期」变成周期性惊群。
+//
+// 第 3 种的「半开期」边界由 recovering 标志给出，而不是靠 until 判断 ——
+// 因为 until 过期后会一直留着（过期），靠它判断会导致「过期即永久限流」。
+// recovering 在探针成功时清掉（目标确认健康，回到第 1 种），在探针失败
+// 时重新推入冷却（回到第 2 种）。
+func (p *Pool) claimTargetProbeLocked(targetID string) (ProbeToken, bool) {
 	h, ok := p.targets[targetID]
 	if !ok {
-		return true // 从未见过的目标没有熔断状态，直接可打
+		return 0, true // 从未见过的目标没有熔断状态，直接可打
 	}
 	if time.Now().Before(h.until) {
-		return false
+		return 0, false
 	}
-	if h.halfOpen {
-		return false // 探测请求已在途，不放第二个
+	if !h.recovering {
+		// 从未熔断：健康目标不参与半开限流。
+		return 0, true
 	}
-	h.halfOpen = true
-	return true
+	// 冷却已过期，且仍在恢复期 —— 这才是「半开」。
+	//
+	// halfOpenToken 记的是「已放哪个探针进去、结果还没回来」。
+	// 探针回来之后（成功或失败）它会被清掉；这里不设过期时间，
+	// 因为「探针在途」这件事本身有明确的结束点（记账路径），
+	// 与「冷却何时到期」是两件事。
+	if h.halfOpenToken != 0 && h.halfOpenCycle == h.breakerCycle {
+		return 0, false // 探测请求已在途，不放第二个
+	}
+	p.probeToken++
+	if p.probeToken == 0 {
+		p.probeToken++
+	}
+	h.halfOpenToken = p.probeToken
+	h.halfOpenCycle = h.breakerCycle
+	return h.halfOpenToken, true
 }
 
 // RecordTargetFailure 给目标累计一次失败；达到 threshold 则熔断 targetBreakerCooldown。
 // threshold<=0 表示不启用目标级熔断（仅凭据级冷却生效）。
-func (p *Pool) RecordTargetFailure(targetID string, threshold int) {
+func (p *Pool) RecordTargetFailure(targetID string, token ProbeToken, threshold int) {
 	if threshold <= 0 {
-		// 名额仍要归还：ClaimTargetProbe 不看 threshold，只看冷却是否到期，
-		// 所以即便关了目标级熔断，探测名额照样被领走。此处提前 return 而不
-		// 清 halfOpen，目标会被永久占死 —— 直到下一次池重建才恢复。
-		p.ReleaseTargetProbe(targetID)
+		p.ReleaseTargetProbe(targetID, token)
+		// 熔断被显式关闭 → 这个目标**不进入恢复期**。
+		// 不清它的话，targetHealth.recovering 会一直挂着，而调用方
+		// （cmd/gateway）在 threshold=0 时仍会调 ClaimTargetProbe ——
+		// 于是「运维以为已关闭熔断」的目标仍被限成一个探针，且余下的
+		// 请求静默改投链上下一个目标（见 A5 P1-3）。
+		p.mu.Lock()
+		if h, ok := p.targets[targetID]; ok {
+			h.recovering = false
+		}
+		p.mu.Unlock()
 		return
 	}
 	p.mu.Lock()
@@ -597,10 +733,21 @@ func (p *Pool) RecordTargetFailure(targetID string, threshold int) {
 		p.targets[targetID] = h
 	}
 	h.consecutiveFails++
-	h.halfOpen = false // 探测名额已消耗，无论成败都由本次结果裁决
+	// 进入「恢复期」：这个目标坏过，冷却到期后要走一次半开探测。
+	// 健康目标（recovering=false）不受半开名额限制 —— 见
+	// claimTargetProbeLocked 的三态说明。
+	h.recovering = true
+	if token != 0 && h.halfOpenToken == token {
+		h.halfOpenToken = 0 // 当前探针已被本次结果消耗
+		h.halfOpenCycle = 0
+	}
 	if h.consecutiveFails >= threshold {
 		h.until = time.Now().Add(targetBreakerCooldown)
 		h.consecutiveFails = 0
+		// 新冷却周期：上一代探针即便仍在途，也属于旧周期。这里不清
+		// halfOpenToken —— 它的迟到结果必须能按令牌被忽略；新周期
+		// 的 claim 会通过 halfOpenCycle 判定它已失效并替换。
+		h.breakerCycle++
 		p.logger.Warn("target circuit opened",
 			"target", targetID, "threshold", threshold, "until", h.until)
 	}
@@ -612,12 +759,28 @@ func (p *Pool) RecordTargetFailure(targetID string, threshold int) {
 // （非流式默认超时 120s，远长于 60s 熔断），拿它解除熔断等于让陈旧响应
 // 推翻新判定的故障。只有冷却期真正结束后的成功才允许清零计数 ——
 // 而那本来就由 TargetAvailable 的时间比较负责，无需显式动作。
-func (p *Pool) RecordTargetSuccess(targetID string) {
+func (p *Pool) RecordTargetSuccess(targetID string, token ProbeToken) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if h, ok := p.targets[targetID]; ok {
 		h.consecutiveFails = 0
-		h.halfOpen = false // 探测成功，目标确认健康，释放名额
+		// 只有当前探针自己的结果才能释放名额。熔断前发出的旧请求 token=0，
+		// 或恢复期里上一代探针的过期 token，都不能误清新探针。
+		if token == 0 || h.halfOpenToken != token {
+			return
+		}
+		h.halfOpenToken = 0
+		// 目标确认健康 → 退出恢复期。**必须**清掉它：否则这个目标
+		// 在下一次冷却到期时仍会被当作「半开中」而限成一个探针 ——
+		// 而它早就被证明是好的，那正是 P0-11 那个 bug 的残留形态。
+		//
+		// 注意这只在「冷却已过期」时才真正回到健康态：熔断期内的成功
+		// 可能来自熔断之前就已发出的在途请求，拿它解除恢复期等于让
+		// 陈旧响应推翻新判定的故障（见本函数上方关于 until 的说明）。
+		// 因此这里只在 until 已过期时才清 recovering。
+		if !time.Now().Before(h.until) {
+			h.recovering = false
+		}
 	}
 }
 
@@ -629,17 +792,22 @@ func (p *Pool) RecordTargetSuccess(targetID string) {
 //  2. 客户端中断：刻意不记失败（把用户点「停止」算成目标故障会把健康目标
 //     误熔断），同样直接返回。
 //
-// 两种形态若不显式归还，halfOpen 永久卡在 true，该目标被 ClaimTargetProbe
+// 两种形态若不显式归还，halfOpenToken 永久非零，该目标被 ClaimTargetProbe
 // 恒拒绝 —— 一次 400 就把链上的目标废到下一次 Install 为止，且这正发生在
 // 上游故障期间（本来就在频繁转移）。
 //
-// 不得在已调用 Record* 之后再调：halfOpen 是共享 bool 而非计数，重复归还会
-// 错清并发请求刚领到的名额。调用方用「已记账则不归还」的本地标志保证这一点。
-func (p *Pool) ReleaseTargetProbe(targetID string) {
+// 不得在已调用 Record* 之后再调。调用方用「已记账则不归还」的本地标志
+// 保证这一点；令牌比较则保证迟到的旧请求不会误清新探针。
+func (p *Pool) ReleaseTargetProbe(targetID string, token ProbeToken) {
+	if token == 0 {
+		return
+	}
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if h, ok := p.targets[targetID]; ok {
-		h.halfOpen = false
+		if h.halfOpenToken == token {
+			h.halfOpenToken = 0
+		}
 	}
 }
 
@@ -1084,17 +1252,11 @@ func DiscoverUpstreamModels(ctx context.Context, st *store.Store, providerID str
 	base := strings.TrimRight(p.Endpoint, "/")
 	urls := modelListURLs(base)
 
-	// 不跟随重定向。默认的 10 跳 + 跨主机跟随意味着：一个 302 就能把
-	// 探测面从「管理员填的那个 endpoint」扩大到「任意主机」—— 包括
-	// 169.254.169.254 这类元数据地址。API key 也会被带去新主机
-	//（Go 在跨主机跳转时会剥离敏感头，但 URL 里的东西不会）。
-	// ErrUseLastResponse 让 3xx 原样作为响应返回，fetchModels 走非-200
-	// 分支把状态码报给管理员 —— 信息足够排障，探测能力被切断。
-	client := &http.Client{
-		Timeout: 15 * time.Second,
-		CheckRedirect: func(req *http.Request, via []*http.Request) error {
-			return http.ErrUseLastResponse
-		},
+	// 与数据面使用同一个 provider 出站网络，同时禁止重定向：一个 302
+	// 就能把带 API key 的探测扩大到任意主机，包括云元数据地址。
+	client, err := probeHTTPClientFor(p.ProxyURL, 15*time.Second)
+	if err != nil {
+		return nil, err
 	}
 	var lastErr error
 	// triedErrs 按候选顺序留痕：全部候选都失败时，管理员需要知道网关
@@ -1373,6 +1535,23 @@ func proxyHTTPClientFor(proxyURL string) (*http.Client, error) {
 	return c, nil
 }
 
+// probeHTTPClientFor 为模型发现、余额等辅助查询构造 client。
+//
+// 它与数据面共用 provider 的出站网络和连接池，但额外设置短超时并禁止
+// 重定向 —— 这些请求携带 API key，且不该因为辅助功能拖住管理页面。
+func probeHTTPClientFor(proxyURL string, timeout time.Duration) (*http.Client, error) {
+	base, err := proxyHTTPClientFor(proxyURL)
+	if err != nil {
+		return nil, err
+	}
+	c := *base
+	c.Timeout = timeout
+	c.CheckRedirect = func(req *http.Request, via []*http.Request) error {
+		return http.ErrUseLastResponse
+	}
+	return &c, nil
+}
+
 func buildClient(prov *ProviderEntry, apiKey string, cfg *config.Config, modelInfos ...rosetta.ModelInfo) (*rosetta.Client, error) {
 	opts := []rosetta.Option{
 		rosetta.WithEndpoint(prov.Endpoint),
@@ -1493,5 +1672,12 @@ func resolveEnv(name string) string {
 }
 
 func decryptCredentialKey(enc []byte, masterKey []byte) (string, error) {
-	return crypto.DecryptWithFallback(enc, masterKey)
+	if len(masterKey) == 0 {
+		return "", crypto.ErrNoMasterKey
+	}
+	plain, err := crypto.Decrypt(enc, masterKey)
+	if err != nil {
+		return "", err
+	}
+	return string(plain), nil
 }

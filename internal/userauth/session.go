@@ -6,8 +6,10 @@ import (
 	"encoding/base64"
 	"errors"
 	"fmt"
+	"log/slog"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"time"
@@ -123,6 +125,16 @@ func LoadOrCreateSecret(path string) (secret string, generated bool, err error) 
 		if s == "" {
 			return "", false, fmt.Errorf("会话密钥文件 %s 为空：删除该文件后重启可自动重建", path)
 		}
+		// 既有文件的权限收紧（2026-10-21 修 A10-P1-3）。
+		//
+		// writeSecretFile 写出来的是 0600，但**既有部署**的文件可能是
+		// 更早版本写的（0644），或被运维/备份流程复制时放宽过。
+		// session_secret 泄漏 = 任何人都能伪造管理员会话。
+		//
+		// 为什么对文件**收紧**而不对目录收紧：这个文件只被本进程读，
+		// 收紧不影响任何正当的外部读者；而目录可能有意让备份服务读。
+		// （见 internal/crypto 的同名函数与 internal/store.Open 的注释。）
+		tightenSecretFilePermissions(path)
 		return s, false, nil
 	}
 	if !os.IsNotExist(readErr) {
@@ -339,4 +351,31 @@ func (s *Session) Fingerprint() string {
 	}
 	sum := sha256.Sum256([]byte(s.UserID))
 	return base64.RawURLEncoding.EncodeToString(sum[:6])
+}
+
+// tightenSecretFilePermissions 把会话密钥文件的权限收紧到 0600。
+//
+// 与 crypto 包的同名函数同源（那里有完整论证）：密钥文件只被本进程读，
+// 收紧权限不会打断正当的外部读者，而放任 0644 等于让同机任何账号
+// 伪造管理员会话。
+//
+// Windows 上跳过：NTFS 的权限模型是 ACL，Chmod 只能改只读位 ——
+// 强改只读位会让后续写入失败。
+func tightenSecretFilePermissions(path string) {
+	if runtime.GOOS == "windows" {
+		return
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		return
+	}
+	if perm := info.Mode().Perm(); perm&0o077 != 0 {
+		if err := os.Chmod(path, 0o600); err != nil {
+			slog.Warn("无法收紧会话密钥文件权限：同机其他账号可能能读它",
+				"path", path, "mode", fmt.Sprintf("%04o", perm), "error", err)
+			return
+		}
+		slog.Warn("已收紧会话密钥文件权限（此前同机其他账号可读）",
+			"path", path, "was", fmt.Sprintf("%04o", perm))
+	}
 }

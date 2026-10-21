@@ -4,6 +4,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/netip"
+	"net/url"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -16,6 +18,29 @@ type Config struct {
 	DBPath       string `json:"db_path"`
 	LogLevel     string `json:"log_level"`
 	MasterKeyEnv string `json:"master_key_env"`
+	// PublicOrigin 是浏览器实际访问网关时看到的 scheme://host[:port]。
+	//
+	// 审计 A7-13 / A10-P1-3：网关自身监听明文 HTTP，通常由 TLS 反代终止
+	// HTTPS。此时浏览器发出的 Origin 是 https://gw.example，而进程内
+	// r.TLS 恒为 nil；只按 r.TLS 推导请求 scheme 会把**正常的管理面写请求**
+	// 判成跨源（403），Cookie 也因此无法带 Secure。
+	//
+	// 不能改用 X-Forwarded-Proto：那是客户端可伪造的头，而 SameOrigin 同时
+	// 守着免鉴权的 bootstrap 写入口 —— 采信它等于把同源校验交给攻击者。
+	// 所以反代部署必须由运维显式声明这个公开源，并保证反代只接受该源的流量。
+	//
+	// 空串 = 未配置，保持原有行为（按进程实际观察到 r.TLS 推导，Cookie
+	// 不带 Secure），适配纯 IP/HTTP 的局域网部署。
+	PublicOrigin string `json:"public_origin"`
+	// TrustedProxyCIDRs 是允许提供客户端转发链的可信反向代理地址段。
+	//
+	// 为空时完全不采信 Forwarded / X-Forwarded-For，来源 IP 始终取
+	// r.RemoteAddr。配置后，只有 RemoteAddr 命中这些前缀才解析转发链；
+	// 再从右向左跳过可信代理，取第一个不可信地址作为真实客户端。
+	//
+	// 反代必须覆盖或追加这两个头，不能把客户端自带的同名头原样透传；
+	// 否则「可信代理」仍然会把攻击者伪造的链交给网关。
+	TrustedProxyCIDRs []string `json:"trusted_proxy_cidrs,omitempty"`
 	// RequireStrongMasterKey 让「低熵主密钥」从告警升级为拒绝启动。
 	//
 	// 缺省 false = 只 WARN（保持既有行为）：大量部署点确实是有意用口令
@@ -84,6 +109,10 @@ type Config struct {
 	// usage_recorder），**不扣任何网关用户的钱**，但确实产生上游侧计费
 	// （每个模型每天约 3 token 量级）。默认开 —— 用户明确要这个功能。
 	Probes ProbeConfig `json:"probes"`
+
+	// trustedProxies 是 TrustedProxyCIDRs 校验、去重后的运行时形态。
+	// 不参与 JSON 编解码；调用方通过 TrustedProxyPrefixes 取只读副本。
+	trustedProxies []netip.Prefix
 }
 
 // ProbeConfig 是定时探测的参数。
@@ -358,6 +387,12 @@ func (c *Config) validate() error {
 	if c.Listen == "" {
 		return errors.New("listen address is required")
 	}
+	if err := c.validatePublicOrigin(); err != nil {
+		return err
+	}
+	if err := c.validateTrustedProxyCIDRs(); err != nil {
+		return err
+	}
 
 	// defaults 的区间校验。这些值会直接喂给 time.NewTicker / time.AfterFunc /
 	// context.WithTimeout / http.MaxBytesReader —— 负值不只是「配置没生效」，
@@ -510,6 +545,99 @@ func (c *Config) validate() error {
 		}
 	}
 	return nil
+}
+
+// validatePublicOrigin 严格校验 public_origin，并把它规范化成
+// scheme://host[:port]（无尾斜杠）。
+//
+// 只允许 http/https、必须有 host，且不能带 userinfo/query/fragment。
+// 路径只接受空串或 "/" —— public_origin 是「源」，不是 URL 前缀；允许
+// /admin 之类的路径会让 sameOrigin 与 Cookie 的语义含糊，且很容易被误读
+// 成部署在子路径下（网关实际并不支持）。
+func (c *Config) validatePublicOrigin() error {
+	raw := strings.TrimSpace(c.PublicOrigin)
+	if raw == "" {
+		c.PublicOrigin = ""
+		return nil
+	}
+	u, err := url.Parse(raw)
+	if err != nil {
+		return fmt.Errorf("public_origin: invalid URL %q: %w", raw, err)
+	}
+	u.Scheme = strings.ToLower(u.Scheme)
+	if u.Scheme != "http" && u.Scheme != "https" {
+		return fmt.Errorf("public_origin: scheme must be http or https, got %q", u.Scheme)
+	}
+	if u.Host == "" {
+		return fmt.Errorf("public_origin: host is required, got %q", raw)
+	}
+	if u.User != nil {
+		return fmt.Errorf("public_origin: userinfo is not allowed")
+	}
+	if u.RawQuery != "" || u.Fragment != "" {
+		return fmt.Errorf("public_origin: query and fragment are not allowed")
+	}
+	if u.Path != "" && u.Path != "/" {
+		return fmt.Errorf("public_origin: path must be empty or '/', got %q", u.Path)
+	}
+	c.PublicOrigin = u.Scheme + "://" + strings.ToLower(u.Host)
+	return nil
+}
+
+// validateTrustedProxyCIDRs 校验并规范化可信代理网段。
+//
+// 只接受 IP 或 CIDR，不做 DNS 解析：启动时解析域名会让安全边界随 DNS
+// 应答变化，也无法解释「配置里写的是 hostname，实际信任了哪个网段」。
+// 裸 IP 归一成 /32 或 /128；带 host bits 的 CIDR 归一成网络地址。
+func (c *Config) validateTrustedProxyCIDRs() error {
+	c.trustedProxies = nil
+	if len(c.TrustedProxyCIDRs) == 0 {
+		c.TrustedProxyCIDRs = nil
+		return nil
+	}
+
+	normalized := make([]string, 0, len(c.TrustedProxyCIDRs))
+	seen := make(map[netip.Prefix]struct{}, len(c.TrustedProxyCIDRs))
+	for i, raw := range c.TrustedProxyCIDRs {
+		s := strings.TrimSpace(raw)
+		if s == "" {
+			return fmt.Errorf("trusted_proxy_cidrs[%d]: must not be empty", i)
+		}
+
+		var p netip.Prefix
+		if strings.Contains(s, "/") {
+			parsed, err := netip.ParsePrefix(s)
+			if err != nil {
+				return fmt.Errorf("trusted_proxy_cidrs[%d]: invalid CIDR %q: %w", i, s, err)
+			}
+			p = parsed
+		} else {
+			addr, err := netip.ParseAddr(s)
+			if err != nil {
+				return fmt.Errorf("trusted_proxy_cidrs[%d]: %q is neither an IP nor a CIDR", i, s)
+			}
+			p = netip.PrefixFrom(addr, addr.BitLen())
+		}
+		p = p.Masked()
+		if _, ok := seen[p]; ok {
+			continue
+		}
+		seen[p] = struct{}{}
+		c.trustedProxies = append(c.trustedProxies, p)
+		normalized = append(normalized, p.String())
+	}
+	c.TrustedProxyCIDRs = normalized
+	return nil
+}
+
+// TrustedProxyPrefixes 返回可信反向代理网段的只读副本。
+func (c *Config) TrustedProxyPrefixes() []netip.Prefix {
+	if c == nil || len(c.trustedProxies) == 0 {
+		return nil
+	}
+	out := make([]netip.Prefix, len(c.trustedProxies))
+	copy(out, c.trustedProxies)
+	return out
 }
 
 func (c *Config) UpstreamTimeout() time.Duration {

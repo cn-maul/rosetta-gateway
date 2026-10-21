@@ -32,6 +32,13 @@ func TestParseBalanceSpec(t *testing.T) {
 		{name: "path非斜杠开头", raw: `{"path":"credits"}`, wantErr: "必须以 / 开头"},
 		{name: "path是绝对URL", raw: `{"path":"https://evil.com/x"}`, wantErr: "必须以 / 开头"},
 		{name: "auth非法", raw: `{"path":"/x","auth":"cookie"}`, wantErr: "auth 只支持"},
+		// 路径规范化与「不许穿越」（2026-10-21 修 A5-P1-1）。
+		{name: "path含..要拒绝", raw: `{"path":"/a/../../etc"}`, wantErr: "不允许包含 .."},
+		{name: "path含反斜杠要拒绝", raw: `{"path":"/a\\b"}`, wantErr: "反斜杠"},
+		{name: "path里的..要拒绝而不是归一", raw: `{"path":"/v1/dashboard/../balance"}`,
+			wantErr: "不允许包含 .."},
+		{name: "path末尾..要拒绝", raw: `{"path":"/v1/.."}`,
+			wantErr: "不允许包含 .."},
 		{name: "最小配置", raw: `{"path":"/credits"}`,
 			check: func(t *testing.T, s *BalanceSpec) {
 				if s.Field != "balance" || s.Currency != "USD" || s.Auth != "bearer" {

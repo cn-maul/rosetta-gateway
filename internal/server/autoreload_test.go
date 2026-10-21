@@ -109,6 +109,67 @@ func TestAutoReload_AuditCapturesFieldNames(t *testing.T) {
 	}
 }
 
+// 审计 A7-16：不可逆 prune 的 keep_days 在 query string 里，必须连同值
+// 进入审计；其他 query 参数不采集，避免把 token/api_key 之类敏感值落库。
+func TestAutoReload_AuditCapturesKeepDaysQueryValue(t *testing.T) {
+	var audited []string
+	audit := func(method, path string, status int, remote, fields string) {
+		audited = append(audited, fields)
+	}
+	reload := func(context.Context) error { return nil }
+	base := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {})
+	h := AutoReload(base, reload, audit, newTestLogger(), nil)
+
+	rec := httptest.NewRecorder()
+	sw := &statusResponseWriter{ResponseWriter: rec, statusCode: http.StatusOK}
+	req := httptest.NewRequest(http.MethodPost,
+		"/admin/api/usage/prune?keep_days=45&token=should-not-be-audited", nil)
+	h.ServeHTTP(sw, req)
+
+	if len(audited) != 1 {
+		t.Fatalf("audit should fire once, got %v", audited)
+	}
+	if audited[0] != "keep_days=45" {
+		t.Fatalf("audit fields = %q, want keep_days=45 and no unrelated query values", audited[0])
+	}
+}
+
+// 审计 A7-15：bootstrap 的失败必须留痕（错误令牌/重复初始化是攻击信号）。
+func TestAuditOnly_RecordsBootstrapFailure(t *testing.T) {
+	var audited []struct {
+		status int
+		fields string
+	}
+	audit := func(method, path string, status int, remote, fields string) {
+		audited = append(audited, struct {
+			status int
+			fields string
+		}{status, fields})
+	}
+	base := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusForbidden)
+	})
+	h := AuditOnly(base, audit)
+
+	req := httptest.NewRequest(http.MethodPost, "/admin/api/bootstrap",
+		strings.NewReader(`{"password":"pw","token":"bad"}`))
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("handler status = %d, want 403", rec.Code)
+	}
+	if len(audited) != 1 {
+		t.Fatalf("bootstrap failure must be audited, got %d entries", len(audited))
+	}
+	if audited[0].status != http.StatusForbidden {
+		t.Errorf("audit status = %d, want 403", audited[0].status)
+	}
+	if audited[0].fields != "password,token" {
+		t.Errorf("audit fields = %q, want field names only", audited[0].fields)
+	}
+}
+
 // reload 失败只留日志、不向上传播 —— 此时响应已发出，无法改写；
 // 调用方（runtimeReloader）保证失败不改变运行状态。
 func TestAutoReload_ReloadFailureIsLoggedNotPanicked(t *testing.T) {

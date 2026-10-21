@@ -94,10 +94,11 @@ func Authenticate(r *http.Request) (*Context, error) {
 	// 所以这里不需要分支；为省一次 map 查找而重复「是否配置了限制」的判断，
 	// 反而会引入两处语义漂移的风险。
 	//
-	// 取值只用 RemoteAddr（直连对端），**刻意不读 X-Forwarded-For**：
-	// 那个头由客户端随意填写，采信它等于让 allowed_ips 形同虚设
-	// （任何人都能伪造一个白名单内的来源 IP）。代价是网关前面有反向代理时，
-	// 判定的是代理的地址 —— 这一点必须在文档与界面提示里讲明。
+	// 这里读取 RemoteAddr，而不在 auth 包内自行解析转发头。外层
+	// server.WithTrustedProxies 只在直接对端命中 trusted_proxy_cidrs 时
+	// 解析 Forwarded / X-Forwarded-For，并把可信结果回写到 RemoteAddr；
+	// 未配置可信代理时它保持原值。这样 allowed_ips 与登录限速、审计
+	// 共用同一个来源口径，客户端也无法单靠伪造请求头绕过白名单。
 	addr, _ := netip.ParseAddr(peerHost(r))
 	if !matched.AllowsIP(addr) {
 		return nil, ErrIPNotAllowed
@@ -109,8 +110,7 @@ func Authenticate(r *http.Request) (*Context, error) {
 	u := snap.UsersByID[matched.UserID]
 	if u == nil {
 		// 查不到归属用户 → 拒绝。两种成因都不该放行：
-		//   - user_id 为空：迁移前的无归属 key。多用户改造决定「不发新 key
-		//     就不给用」（MULTIUSER.md §5.1 的修订），它必须失效到有人接手为止；
+		//   - user_id 为空：损坏或人工写入的无归属 key；当前写入路径不允许该状态；
 		//   - user_id 指向一个不存在的行：数据不一致，放行等于绕过归属约束。
 		//
 		// 明确 401 好过静默放行：后者会让「谁的 key 在用」彻底无从追查。

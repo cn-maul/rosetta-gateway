@@ -84,6 +84,7 @@ func AutoReload(next http.Handler, reload func(context.Context) error, audit Wri
 				}
 			}
 		}
+		auditFields = appendQueryAuditFields(auditFields, r)
 
 		next.ServeHTTP(w, r)
 
@@ -155,6 +156,50 @@ func extractFieldNames(body []byte) string {
 	return strings.Join(names, ",")
 }
 
+// auditQueryFields 是允许进入审计的 query 参数白名单。
+//
+// 审计 A7-16：usage prune 的 keep_days 在 query string 里，而旧实现只记录
+// 请求体顶层字段名，导致「删了多久以前的数据」这个不可逆参数无法从审计
+// 还原。不能把所有 query 值都落库：query 里可能有 token、api_key 等形式
+// 的敏感值；这里只显式列出确实需要留痕的运维参数。
+var auditQueryFields = map[string]bool{
+	"keep_days": true,
+}
+
+// appendQueryAuditFields 把白名单 query 参数追加到字段名列表。
+//
+// 审计 A7-16：只有 keep_days 需要值（不可逆删除的边界），其余参数只登记
+// 名称也无法回答「删了多少天」，因此白名单项写成 name=value；值先做长度
+// 截断并去掉换行，避免异常输入把审计表撑大或破坏单行展示。
+func appendQueryAuditFields(fields string, r *http.Request) string {
+	q := r.URL.Query()
+	if len(q) == 0 {
+		return fields
+	}
+	details := make([]string, 0, len(auditQueryFields))
+	for name := range auditQueryFields {
+		values, ok := q[name]
+		if !ok || len(values) == 0 {
+			continue
+		}
+		value := strings.TrimSpace(values[0])
+		if len(value) > 64 {
+			value = value[:64]
+		}
+		value = strings.NewReplacer("\r", "", "\n", "").Replace(value)
+		details = append(details, name+"="+value)
+	}
+	if len(details) == 0 {
+		return fields
+	}
+	sort.Strings(details)
+	detail := strings.Join(details, ",")
+	if fields == "" {
+		return detail
+	}
+	return fields + "," + detail
+}
+
 // AuditOnly 给免鉴权的 bootstrap 端点单独挂审计。
 //
 // 为什么需要它：POST /admin/api/bootstrap 走 publicAdminMux，**不经过**
@@ -187,11 +232,9 @@ func AuditOnly(next http.Handler, audit WriteAuditor) http.Handler {
 		sw := &statusResponseWriter{ResponseWriter: w, statusCode: http.StatusOK}
 		next.ServeHTTP(sw, r)
 
-		// 只审计成功：失败的那次没有改变任何状态，记下来只会淹没真正的变更。
-		// 但 bootstrap 的失败要留痕 —— 它意味着有人反复在猜管理员密码，
-		// 属于攻击信号。因此这里放宽到 >= 200 即记录（2xx 与 4xx 都记）。
-		if sw.StatusCode() < 400 {
-			audit(r.Method, r.URL.Path, sw.StatusCode(), clientIP(r), fields)
-		}
+		// 审计 A7-15：bootstrap 的成功和失败都要留痕。失败意味着有人在猜
+		// 管理员密码或重复尝试初始化，是安全事件而不是「没有状态变化就忽略」
+		// 的普通写失败。旧实现的 status < 400 让 403/409 全部消失。
+		audit(r.Method, r.URL.Path, sw.StatusCode(), clientIP(r), fields)
 	})
 }

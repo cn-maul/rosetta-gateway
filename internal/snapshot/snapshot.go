@@ -189,8 +189,8 @@ type KeySnapshot struct {
 	Name    string
 	Enabled bool
 	// UserID 是归属用户（多用户改造 P0）。热路径上**必然非空**：
-	// 无归属 key 已被启动迁移 retireOrphanKeys 禁用，且鉴权查不到归属用户
-	// 即返回 ErrKeyUnowned（401），不会走到这里之后的分支。
+	// 无归属 key 在鉴权时查不到归属用户即返回 ErrKeyUnowned（401），
+	// 不会走到这里之后的分支。
 	UserID string
 	// RPMLimit / TPMLimit 是 Key 维度每分钟限速（DESIGN §11.4），0 = 不限。
 	// 随快照下发：热路径取额度不查库，管理改动经 reload 生效。

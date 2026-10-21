@@ -20,7 +20,8 @@ type Route struct {
 	Enabled         bool
 
 	// 是否启用自动故障转移。链成员见 RouteIndex.targetsByRoute；
-	// ProviderID/UpstreamModelID 保留为「主目标」的向后兼容视图（等价 position 0）。
+	// ProviderID/UpstreamModelID 是「主目标」的镜像视图（等价 position 0），
+	// 由写入路径与 route_targets 原子同步。
 	//
 	// 注意：故障转移的**策略参数**（最多尝试几个目标、熔断阈值、各类超时）是全局的，
 	// 由「设置」页写入 app_settings 并在运行时经快照读取 —— 不在这里按 route 覆盖，

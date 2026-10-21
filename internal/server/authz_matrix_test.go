@@ -14,12 +14,12 @@ package server_test
 //   - 本文件把**真实**的 UserAuth → AdminGateGuard → 真实 handler 串起来，
 //     身份靠**真实签发的 JWT**取得（不是手工塞 context），于是测的是真链路。
 //
-// # 为什么路由表从 cmd/gateway/main.go **源码**里读
+// # 为什么路由表来自真实生产 mux
 //
 // 手抄一份路由清单 = 抄漏一条就静默少测一条，而漏掉的那条恰好可能是唯一
-// 有问题的那条。所以本文件用正则从 main.go 的注册处提取全部
-// `adminMux.HandleFunc(...)` / `publicAdminMux.HandleFunc(...)` / `mux.Handle("METHOD /path", ...)`，
-// 与源码**逐条对齐**。将来有人加一条路由而没更新本文件，也不会被漏测。
+// 有问题的那条。本文件通过 package main 的 route_contract_test.go 把
+// buildApp 实际注册的 pattern 导出成 JSON，再由独立进程测试读取；这样既
+// 执行了真实生产 mux，又不依赖源码文本正则。
 //
 // # 三层判定：区分「网关层拒绝」与「handler 层拒绝」
 //
@@ -42,9 +42,8 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
-	"os"
+	"os/exec"
 	"path/filepath"
-	"regexp"
 	"sort"
 	"strings"
 	"testing"
@@ -74,7 +73,7 @@ const (
 const adminAPIBase = "/admin/api/"
 
 // ---------------------------------------------------------------------------
-// 从 main.go 读路由
+// 从生产 buildApp 读路由契约
 // ---------------------------------------------------------------------------
 
 type adminRoute struct {
@@ -85,67 +84,65 @@ type adminRoute struct {
 	Public bool
 }
 
-// routeRe 提取 main.go 里的管理面路由注册。
-//
-// 两个来源：
-//  1. `adminMux.HandleFunc("GET /admin/api/x", ...)` —— 需要鉴权的管理面；
-//  2. `mux.Handle("POST /admin/api/login", publicAdminMux)` —— 免鉴权端点
-//     挂到根 mux 上（main.go 里就是这么写的，不是 publicAdminMux.HandleFunc）。
-//
-// 不匹配 `mux.Handle("GET /admin/api/", adminAuto)` 这类**前缀兜底**：
-// 它们不是具体路由，且路径以 "/" 结尾 —— 用 `[^"]*[^/"]` 结尾锚定即可排除。
-var routeRe = regexp.MustCompile(`(?m)(adminMux|publicAdminMux)\.HandleFunc\("([A-Z]+)\s+(/admin/api/[^"]*)"`)
+type routeContract struct {
+	Pattern string `json:"pattern"`
+	Public  bool   `json:"public"`
+}
 
-var publicMuxRe = regexp.MustCompile(`(?m)mux\.Handle\("([A-Z]+)\s+(/admin/api/[^"]*)",\s*publicAdminMux`)
-
-// parseAdminRoutes 从 main.go 源码提取全部管理面路由（唯一真相）。
+// parseAdminRoutes 读取生产 buildApp 导出的真实路由契约。
 func parseAdminRoutes(t *testing.T) []adminRoute {
 	t.Helper()
-	src, err := os.ReadFile(filepath.Join("..", "..", "cmd", "gateway", "main.go"))
+	cmd := exec.Command("go", "test", "./cmd/gateway", "-run", "TestExportRouteContract", "-count=1", "-v")
+	cmd.Dir = filepath.Join("..", "..")
+	out, err := cmd.Output()
 	if err != nil {
-		t.Fatalf("读 main.go 失败（路由真相来源）: %v", err)
+		t.Fatalf("运行生产路由契约导出失败（路由真相来源）: %v\n%s", err, out)
 	}
-	text := string(src)
+	const marker = "ROUTE_CONTRACT:"
+	idx := strings.LastIndex(string(out), marker)
+	if idx < 0 {
+		t.Fatalf("生产路由契约导出没有输出标记:\n%s", out)
+	}
+	line := strings.TrimSpace(string(out)[idx+len(marker):])
+	if end := strings.IndexByte(line, '\n'); end >= 0 {
+		line = line[:end]
+	}
+	var contracts []routeContract
+	if err := json.Unmarshal([]byte(line), &contracts); err != nil {
+		t.Fatalf("解析生产路由契约: %v\n%s", err, line)
+	}
 
 	seen := map[string]adminRoute{}
-	add := func(m, p string, public bool) {
-		key := m + " " + p
-		if prev, ok := seen[key]; ok {
-			// 同一路径同时出现在两处时以「免鉴权」为准：那是最宽松的注册，
-			// 也正是最需要被验证的一种（漏在 publicAdminMux 上 = 越权入口）。
-			if public {
-				seen[key] = adminRoute{m, p, true}
-			}
-			_ = prev
-			return
+	for _, c := range contracts {
+		method, path, ok := strings.Cut(c.Pattern, " ")
+		if !ok || !strings.HasPrefix(path, adminAPIBase) {
+			continue
 		}
-		seen[key] = adminRoute{m, p, public}
+		// 前缀兜底不是具体端点，不能进入逐端点矩阵。
+		if strings.HasSuffix(path, "/") {
+			continue
+		}
+		key := method + " " + path
+		seen[key] = adminRoute{Method: method, Path: path, Public: c.Public}
 	}
 
-	for _, mm := range routeRe.FindAllStringSubmatch(text, -1) {
-		add(mm[2], mm[3], mm[1] == "publicAdminMux")
-	}
-	for _, mm := range publicMuxRe.FindAllStringSubmatch(text, -1) {
-		add(mm[1], mm[2], true)
-	}
-
-	out := make([]adminRoute, 0, len(seen))
+	routes := make([]adminRoute, 0, len(seen))
 	for _, r := range seen {
-		out = append(out, r)
+		routes = append(routes, r)
 	}
-	sort.Slice(out, func(i, j int) bool {
-		if out[i].Path != out[j].Path {
-			return out[i].Path < out[j].Path
+	sort.Slice(routes, func(i, j int) bool {
+		if routes[i].Path != routes[j].Path {
+			return routes[i].Path < routes[j].Path
 		}
-		return out[i].Method < out[j].Method
+		return routes[i].Method < routes[j].Method
 	})
 
-	// 源码解析失败会静默给出 0 条 —— 那样整个矩阵会「全绿通过」。
-	// 所以对条数设一个下界，让解析失效立刻显形。
-	if len(out) < 50 {
-		t.Fatalf("只解析出 %d 条管理面路由，明显偏少：路由正则可能已与 main.go 脱节", len(out))
+	// 契约导出失败会静默给出 0 条 —— 那样整个矩阵会「全绿通过」。
+	// 所以对条数设一个下界，让导出失效立刻显形。
+	if len(routes) < 50 {
+		t.Fatalf("只拿到 %d 条管理面路由，明显偏少：生产 buildApp 可能漏注册", len(routes))
 	}
-	return out
+	return routes
 }
 
 // probePath 把路由模式里的 {id} 换成具体值，以便真实发起请求。
@@ -1292,7 +1289,7 @@ func TestAuthzCSRF_CookieAuthWriteRequiresJSONContentType(t *testing.T) {
 // 就已经没有凭据了。Content-Type 门禁是第二道。
 func TestAuthzCSRF_SameSiteStrictOnSessionCookie(t *testing.T) {
 	rec := httptest.NewRecorder()
-	server.SetSessionCookie(rec, "tok", timeNowPlusHour())
+	server.SetSessionCookie(rec, "tok", timeNowPlusHour(), false)
 	cookies := rec.Result().Cookies()
 	if len(cookies) != 1 {
 		t.Fatalf("期望 1 个 cookie，得到 %d", len(cookies))

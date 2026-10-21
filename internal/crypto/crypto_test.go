@@ -1,11 +1,24 @@
 package crypto
 
 import (
+	"bytes"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 )
+
+func TestCredentialFormat_NoPlaintextCompatibility(t *testing.T) {
+	key := bytes.Repeat([]byte{0x42}, 32)
+	plain := []byte("sk-plaintext-must-not-be-accepted")
+
+	if _, err := Decrypt(plain, key); err == nil {
+		t.Fatal("当前格式不得把可打印明文当作密文接受")
+	}
+	if _, err := Encrypt(plain, nil); err == nil {
+		t.Fatal("无主密钥时不得退化为明文写入")
+	}
+}
 
 // TestLoadMasterKey_TruncatedFileIsRejected 坐实一个会静默摧毁全部存量凭据
 // 的缺陷：旧实现用 os.WriteFile（O_TRUNC）写 master.key，进程在写入中途被

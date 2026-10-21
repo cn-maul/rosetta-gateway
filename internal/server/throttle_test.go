@@ -1,8 +1,10 @@
 package server
 
 import (
+	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/netip"
 	"strconv"
 	"testing"
 	"time"
@@ -197,5 +199,92 @@ func TestClientIPIgnoresForwardedFor(t *testing.T) {
 	req.Header.Set("X-Forwarded-For", "1.2.3.4")
 	if got := clientIP(req); got != "198.51.100.6" {
 		t.Fatalf("clientIP = %q，不应采信 X-Forwarded-For", got)
+	}
+}
+
+func clientIPThroughTrustedProxy(t *testing.T, remote string, headers map[string]string, prefixes ...string) string {
+	t.Helper()
+	parsed := make([]netip.Prefix, 0, len(prefixes))
+	for _, raw := range prefixes {
+		parsed = append(parsed, netip.MustParsePrefix(raw))
+	}
+	req := httptest.NewRequest(http.MethodGet, "/admin/api/stats", nil)
+	req.RemoteAddr = remote
+	for name, value := range headers {
+		req.Header.Set(name, value)
+	}
+	var got string
+	WithTrustedProxies(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		got = clientIP(r)
+	}), parsed).ServeHTTP(httptest.NewRecorder(), req)
+	return got
+}
+
+// TestClientIP_TrustedProxyUsesFirstUntrustedFromRight 是可信代理契约的核心：
+// 链首可能由客户端伪造，代理追加在右侧的来源才是真正边界。必须从右向左
+// 跳过可信代理，取第一个不可信地址。
+func TestClientIP_TrustedProxyUsesFirstUntrustedFromRight(t *testing.T) {
+	got := clientIPThroughTrustedProxy(t,
+		"10.0.0.5:443",
+		map[string]string{"X-Forwarded-For": "203.0.113.9, 198.51.100.24, 10.0.0.6"},
+		"10.0.0.0/8",
+	)
+	if got != "198.51.100.24" {
+		t.Fatalf("clientIP=%q, want 198.51.100.24", got)
+	}
+}
+
+func TestClientIP_TrustedProxyParsesForwarded(t *testing.T) {
+	got := clientIPThroughTrustedProxy(t,
+		"[2001:db8::10]:443",
+		map[string]string{
+			"Forwarded": `for=203.0.113.8;proto=https, for="[2001:db8::11]:8443";proto=https, for="[2001:db8::10]"`,
+		},
+		"2001:db8::10/128",
+	)
+	if got != "2001:db8::11" {
+		t.Fatalf("clientIP=%q, want 2001:db8::11", got)
+	}
+}
+
+func TestClientIP_UntrustedPeerCannotSpoofForwardedHeaders(t *testing.T) {
+	got := clientIPThroughTrustedProxy(t,
+		"198.51.100.6:9999",
+		map[string]string{
+			"Forwarded":       "for=1.2.3.4",
+			"X-Forwarded-For": "1.2.3.4",
+		},
+		"10.0.0.0/8",
+	)
+	if got != "198.51.100.6" {
+		t.Fatalf("不可信对端伪造转发头后 clientIP=%q", got)
+	}
+}
+
+func TestClientIP_MalformedTrustedChainFailsClosed(t *testing.T) {
+	got := clientIPThroughTrustedProxy(t,
+		"10.0.0.5:443",
+		map[string]string{"X-Forwarded-For": "198.51.100.24, definitely-not-an-ip"},
+		"10.0.0.0/8",
+	)
+	if got != "10.0.0.5" {
+		t.Fatalf("损坏的转发链应回退到 RemoteAddr，得到 %q", got)
+	}
+}
+
+// 数据面 auth 包用 RemoteAddr 执行 key 级 IP 白名单。可信代理中间件必须
+// 把解析结果回写，否则管理面和数据面会对同一个请求得出不同客户端 IP。
+func TestWithTrustedProxies_RewritesRemoteAddrForDataPlane(t *testing.T) {
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+	req.RemoteAddr = "10.0.0.5:443"
+	req.Header.Set("X-Forwarded-For", "198.51.100.24")
+
+	var peer string
+	h := WithTrustedProxies(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		peer, _, _ = net.SplitHostPort(r.RemoteAddr)
+	}), []netip.Prefix{netip.MustParsePrefix("10.0.0.0/8")})
+	h.ServeHTTP(httptest.NewRecorder(), req)
+	if peer != "198.51.100.24" {
+		t.Fatalf("数据面 RemoteAddr host=%q, want 198.51.100.24", peer)
 	}
 }
