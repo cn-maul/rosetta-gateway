@@ -10,6 +10,7 @@ import (
 
 	"github.com/cn-maul/rosetta"
 	"github.com/cn-maul/rosetta-gateway/internal/config"
+	"github.com/cn-maul/rosetta-gateway/internal/dataplane"
 	"github.com/cn-maul/rosetta-gateway/internal/snapshot"
 )
 
@@ -33,7 +34,7 @@ func TestTotalRequestBudget_DefaultsCoverWorstCase(t *testing.T) {
 	// 显式给默认值，避免依赖 config 的兜底常量变动。
 	snap := newBudgetSnapshot(30_000, 120_000, 3)
 
-	b := totalRequestBudget(snap, cfg)
+	b := dataplane.TotalRequestBudget(snap, cfg)
 
 	// 每跳上界 = max(120s, 30s+60s) + 5s = 125s；次数 = 3+1 = 4 → 500s。
 	want := 500 * time.Second
@@ -51,16 +52,16 @@ func TestTotalRequestBudget_DefaultsCoverWorstCase(t *testing.T) {
 func TestTotalRequestBudget_FollowsConfig(t *testing.T) {
 	cfg := &config.Config{}
 	base := newBudgetSnapshot(30_000, 120_000, 3)
-	baseBudget := totalRequestBudget(base, cfg)
+	baseBudget := dataplane.TotalRequestBudget(base, cfg)
 
 	// 目标数翻倍 → 总预算翻倍
-	fewer := totalRequestBudget(newBudgetSnapshot(30_000, 120_000, 1), cfg)
+	fewer := dataplane.TotalRequestBudget(newBudgetSnapshot(30_000, 120_000, 1), cfg)
 	if fewer >= baseBudget {
 		t.Errorf("目标数减少后总预算没有下降：%v vs %v", fewer, baseBudget)
 	}
 
 	// 非流式超时翻倍 → 总预算跟着涨
-	longer := totalRequestBudget(newBudgetSnapshot(30_000, 240_000, 3), cfg)
+	longer := dataplane.TotalRequestBudget(newBudgetSnapshot(30_000, 240_000, 3), cfg)
 	if longer <= baseBudget {
 		t.Errorf("非流式超时翻倍后总预算没有上升：%v vs %v", longer, baseBudget)
 	}
@@ -73,7 +74,7 @@ func TestTotalRequestBudget_FollowsConfig(t *testing.T) {
 		{"全部最小", newBudgetSnapshot(1, 1, 1)},
 		{"全部最大", newBudgetSnapshot(3_600_000, 86_400_000, 100)},
 	} {
-		b := totalRequestBudget(c.snap, cfg)
+		b := dataplane.TotalRequestBudget(c.snap, cfg)
 		if b < 30*time.Second {
 			t.Errorf("%s：总预算 %v 小于地板 30s —— 会把正常请求直接掐死", c.name, b)
 		}
@@ -85,7 +86,7 @@ func TestTotalRequestBudget_FollowsConfig(t *testing.T) {
 
 // nil snapshot（尚未装载）不得 panic —— 热路径上它可能为 nil。
 func TestTotalRequestBudget_NilSnapshot(t *testing.T) {
-	if b := totalRequestBudget(nil, &config.Config{}); b <= 0 {
+	if b := dataplane.TotalRequestBudget(nil, &config.Config{}); b <= 0 {
 		t.Fatalf("nil snapshot 时总预算 = %v，应回落到 config 默认并为正", b)
 	}
 }

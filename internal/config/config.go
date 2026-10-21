@@ -304,7 +304,7 @@ func (c *Config) setDefaults() {
 	//
 	//	upstream_timeout_ms 120s → 300s：非流式没有增量输出可看，只能干等；
 	//	  2 分钟连 8K tokens 的回复都跑不完（按 ~40 tok/s）。5 分钟覆盖绝大多数
-	//	  非流式生成；再往上会让派生的总预算（cmd/gateway 的 totalRequestBudget）
+	//	  非流式生成；再往上会让派生的总预算（dataplane.TotalRequestBudget）
 	//	  直接撞上 30 分钟上限，推导值就永远显示同一个数，失去意义。
 	//	stream_first_token_timeout_ms 30s → 60s：bootstrap 里的 deepseek-reasoner
 	//	  这类带思考的上游，首字本来就要几十秒。

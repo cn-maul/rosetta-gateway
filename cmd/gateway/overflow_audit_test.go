@@ -1,6 +1,7 @@
 package main
 
 import (
+	"github.com/cn-maul/rosetta-gateway/internal/dataplane"
 	"testing"
 	"time"
 )
@@ -37,13 +38,13 @@ func TestSafeMillis_ClampsBeforeOverflow(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			got := safeMillis(tc.ms)
+			got := dataplane.SafeMillis(tc.ms)
 			if got != tc.want {
-				t.Fatalf("safeMillis(%d) = %v，期望 %v", tc.ms, got, tc.want)
+				t.Fatalf("dataplane.SafeMillis(%d) = %v，期望 %v", tc.ms, got, tc.want)
 			}
 			// 无论输入多大，输出必须始终为正 —— 这是不变式。
 			if tc.ms > 0 && got <= 0 {
-				t.Fatalf("safeMillis(%d) 返回了非正 Duration %v，会让超时立即触发", tc.ms, got)
+				t.Fatalf("dataplane.SafeMillis(%d) 返回了非正 Duration %v，会让超时立即触发", tc.ms, got)
 			}
 		})
 	}
@@ -53,12 +54,12 @@ func TestSafeMillis_ClampsBeforeOverflow(t *testing.T) {
 // 在整个 int32 正数区间内扫描，输出不得为负、不得溢出。
 func TestSafeMillis_NeverExceedsInt32Range(t *testing.T) {
 	for ms := 1; ms <= 1<<31-1; ms += 4093 { // 质数步长，覆盖整个区间
-		got := safeMillis(ms)
+		got := dataplane.SafeMillis(ms)
 		if got < 0 {
-			t.Fatalf("safeMillis(%d) = %v：负 Duration 会让 context deadline 立即过期", ms, got)
+			t.Fatalf("dataplane.SafeMillis(%d) = %v：负 Duration 会让 context deadline 立即过期", ms, got)
 		}
 		if got > 24*time.Hour {
-			t.Fatalf("safeMillis(%d) = %v：未被钳制到 24h 上界", ms, got)
+			t.Fatalf("dataplane.SafeMillis(%d) = %v：未被钳制到 24h 上界", ms, got)
 		}
 	}
 }

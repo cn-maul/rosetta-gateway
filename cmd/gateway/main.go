@@ -26,6 +26,7 @@ import (
 	"github.com/cn-maul/rosetta-gateway/internal/authhttp"
 	"github.com/cn-maul/rosetta-gateway/internal/config"
 	"github.com/cn-maul/rosetta-gateway/internal/crypto"
+	"github.com/cn-maul/rosetta-gateway/internal/dataplane"
 	"github.com/cn-maul/rosetta-gateway/internal/ingress"
 	"github.com/cn-maul/rosetta-gateway/internal/outwire"
 	"github.com/cn-maul/rosetta-gateway/internal/probe"
@@ -1124,83 +1125,6 @@ func denyAdminKeyCreate(next http.HandlerFunc) http.HandlerFunc {
 	}
 }
 
-// rateCommit 把一次请求的两种预占（TPM 窗口 + 终身配额）在请求终结时收尾。
-// nil 接收者安全：TPM 未启用（额度 0）时调用方可以放一个 nil ——
-// 现在主路径在 TPMLimit==0 时干脆不建这个结构，commit 就是纯 no-op。
-type rateCommit struct {
-	limiter  *ratelimit.Limiter
-	keyID    string
-	limit    int // 预占时的 tpmLimit；0 = 未启用，CommitTPM 据此直接返回
-	reserved int64
-
-	// store 用于**终身配额**的预占退回；为 nil 时跳过（不限额或测试）。
-	store  *store.Store
-	logger *slog.Logger
-	// quotaReserved 是本次请求预占的 token 数（0 = 未预占，或已释放）。
-	quotaReserved int64
-	// userQuotaReserved 是本次请求在**用户级**配额上预占的 token 数
-	// （0 = 未预占，或已释放）。
-	//
-	// 与 quotaReserved 分列而不是合并成一个计数：两级配额的判定口径不同
-	// （key 级是 access_keys.quota_tokens，用户级是 users.quota_tokens），
-	// 且**可能只命中一级** —— 只配了用户额度的用户，key 级预占恒为 0。
-	// 合并成一个数会在「用户配了额度、key 没配」时把用户级预占错记成
-	// key 级，退预占时去动一张不该动的表，或反之。
-	userQuotaReserved int64
-	// userID 是 userQuotaReserved 的归属用户；退预占时必须用它定位行。
-	userID string
-}
-
-// commit 用量已知时的**全量**收尾：TPM 按真实用量校正 + 退配额预占。
-//
-// 正常路径一律走这里，别为单一预占另起入口 —— 两种预占共用同一个 est 与
-// 同一个收尾，分头调用时容易只改一处而漏掉另一处，且配额那条漏掉是
-// **终身**偏差，不像 TPM 窗口会自愈。唯一允许绕开 commit 的路径是
-// usage missing（见 releaseQuota 的说明）。
-func (rc *rateCommit) commit(actual int64) {
-	if rc == nil {
-		return
-	}
-	rc.limiter.CommitTPM(rc.keyID, rc.limit, rc.reserved, actual)
-	rc.releaseQuota()
-}
-
-// releaseQuota 只退终身配额的预占，**不碰 TPM 窗口**。
-//
-// 独立成方法是因为有一条真实路径必须拆开收尾：上游没报 usage
-// （usage_state="missing"）时，TPM 预占要**故意保留**——commit(0) 会全额退还
-// 预占，等于不报用量的上游完全绕过 TPM；保留估算值让限速继续约束这类流量，
-// 估算值随窗口翻转自然清零。但配额预占必须退掉：它是终身累计，预占按
-// max_tokens 全额计，不退就等于每次 missing 请求永久吃掉数万 token 额度
-// （2026-10-07 修复的 P1-3 —— 修复前 missing 时整个 commit 被跳过）。
-func (rc *rateCommit) releaseQuota() {
-	if rc == nil || rc.store == nil {
-		return
-	}
-	// 两级预占各自「先取后清零」，让释放天然幂等：任何路径重复收尾（或未来
-	// 重构引入第二次调用）时第二次是空操作，不会把别的请求刚立起来的预占退掉。
-	if rc.quotaReserved > 0 {
-		reserved := rc.quotaReserved
-		rc.quotaReserved = 0
-		if err := rc.store.ReleaseQuota(context.Background(), rc.keyID, reserved); err != nil {
-			if rc.logger != nil {
-				rc.logger.Warn("release quota reservation failed",
-					"key_id", rc.keyID, "reserved", reserved, "error", err)
-			}
-		}
-	}
-	if rc.userQuotaReserved > 0 {
-		reserved := rc.userQuotaReserved
-		rc.userQuotaReserved = 0
-		if err := rc.store.ReleaseUserQuota(context.Background(), rc.userID, reserved); err != nil {
-			if rc.logger != nil {
-				rc.logger.Warn("release user quota reservation failed",
-					"user_id", rc.userID, "reserved", reserved, "error", err)
-			}
-		}
-	}
-}
-
 // setRetryAfter 写 Retry-After 响应头（向上取整秒，至少 1）。
 //
 // 必须向上取整而不是截断：windowRemaining 已经带了 +1s 余量，若这里再用
@@ -1266,13 +1190,13 @@ func handleIngress(pool *upstream.Pool, cfg *config.Config, usage *usageRecorder
 		// 会遍历全部消息与工具定义拼出一个与请求体同量级的字符串再估算，
 		// 是一次纯浪费的全量分配；而它算出的 est 随后必然被丢弃。
 		// 同一个请求在 attempt* 里还会再 BuildRosetta 一次，估算那次是多余的第 N 次。
-		// 两种预占共用同一个 est 与同一个 rateCommit 收尾 —— 分开放两次
+		// 两种预占共用同一个 est 与同一个 dataplane.RateCommit 收尾 —— 分开放两次
 		// 估算/两次收尾只会让两边在某条路径上被漏掉一处（且配额那条漏掉是
 		// **终身**偏差，不像 TPM 窗口会自愈）。
 		//
 		// est 的计算按需触发：TPMLimit==0 且 key 未配quota 时整个函数跳过，
 		// 不做那次「遍历全部消息与工具定义拼出请求体同量级字符串」的估算。
-		var rate *rateCommit
+		var rate *dataplane.RateCommit
 		var est int64
 		needEstimate := authCtx.TPMLimit > 0
 		if needEstimate {
@@ -1286,10 +1210,7 @@ func handleIngress(pool *upstream.Pool, cfg *config.Config, usage *usageRecorder
 					"token rate limit exceeded for this API key")
 				return
 			}
-			rate = &rateCommit{
-				limiter: limiter, keyID: authCtx.KeyID, limit: authCtx.TPMLimit,
-				reserved: est, store: db, logger: logger,
-			}
+			rate = dataplane.NewRateCommit(limiter, authCtx.KeyID, authCtx.TPMLimit, est, db, logger)
 		}
 
 		// 终身 token 配额**原子预占**（DESIGN §11.2）。
@@ -1303,7 +1224,7 @@ func handleIngress(pool *upstream.Pool, cfg *config.Config, usage *usageRecorder
 		// SQLite 写锁串行化，第二个进来时读到的 used+reserved 已含第一个的预占。
 		// 预占落在独立的 reserved_tokens 列（不动 used_tokens —— 真实用量由
 		// usage 落库触发器累加，混写会让一次请求被记两次），收尾时由
-		// rateCommit 原额退回（commit → releaseQuota）。
+		// dataplane.RateCommit 原额退回（Commit → ReleaseQuota）。
 		//
 		// 这里只借 GetKeyQuota 判「是否配置了额度」（quota>0，决定要不要做
 		// 估算与预占），真正的额度判定（used+reserved+est<=quota）在
@@ -1333,7 +1254,7 @@ func handleIngress(pool *upstream.Pool, cfg *config.Config, usage *usageRecorder
 					"request_id", server.RequestIDFromContext(r.Context()))
 				// 拒绝前必须退回 TPM 预占（2026-10-21 修 P0-8）。
 				//
-				// 这条早退路径此前**漏了** rate.commit(0)：key 级配额已满
+				// 这条早退路径此前**漏了** rate.Commit(0)：key 级配额已满
 				// 时直接 return，TPM 窗口里的 est 预占就永远留在那儿。
 				// 配额已耗尽的 key 可以反复触发这个拒绝，每次留下一笔含
 				// max_tokens 上界的 est —— 几十次就能吃光该 key 整分钟的
@@ -1342,15 +1263,15 @@ func handleIngress(pool *upstream.Pool, cfg *config.Config, usage *usageRecorder
 				//
 				// 注意退的是 **TPM 窗口**，不是终身配额：终身配额根本没
 				// 预占成功（rok=false 时 reserved=0），没有东西要退。
-				rate.commit(0)
+				rate.Commit(0)
 				codec.WriteError(w, http.StatusTooManyRequests, "insufficient_quota",
 					"this API key has exhausted its token quota")
 				return
 			default:
 				if rate == nil {
-					rate = &rateCommit{limiter: limiter, keyID: authCtx.KeyID, store: db, logger: logger}
+					rate = dataplane.NewRateCommit(limiter, authCtx.KeyID, 0, 0, db, logger)
 				}
-				rate.quotaReserved = reserved
+				rate.SetKeyQuotaReserved(reserved)
 			}
 		}
 
@@ -1396,23 +1317,22 @@ func handleIngress(pool *upstream.Pool, cfg *config.Config, usage *usageRecorder
 					"request_id", server.RequestIDFromContext(r.Context()))
 				// 拒绝前必须退回 key 级预占：它已经在同一请求里立起来了，
 				// 直接 return 会让这把 key 的额度被这次被拒的请求永久吃掉一块。
-				rate.commit(0)
+				rate.Commit(0)
 				codec.WriteError(w, http.StatusTooManyRequests, "insufficient_quota",
 					"this account has exhausted its token quota")
 				return
 			default:
 				if rate == nil {
-					rate = &rateCommit{limiter: limiter, keyID: authCtx.KeyID, store: db, logger: logger}
+					rate = dataplane.NewRateCommit(limiter, authCtx.KeyID, 0, 0, db, logger)
 				}
-				rate.userQuotaReserved = reserved
-				rate.userID = authCtx.UserID
+				rate.SetUserQuotaReserved(authCtx.UserID, reserved)
 			}
 		}
 
 		snap := snapshot.Get()
 		res, err := snap.Routes.Resolve(ing.Model)
 		if err != nil {
-			rate.commit(0)
+			rate.Commit(0)
 			codec.WriteError(w, http.StatusNotFound, "model_not_found", modelNotFoundMessage(snap, ing.Model))
 			return
 		}
@@ -1436,7 +1356,7 @@ func handleIngress(pool *upstream.Pool, cfg *config.Config, usage *usageRecorder
 		// 而不是 429，掩盖更该先解决的配额问题。两者都不打上游，
 		// 顺序只影响错误码优先级。
 		if !authCtx.AllowsModel(route.PublicName) {
-			rate.commit(0)
+			rate.Commit(0)
 			logger.Warn("model not allowed for caller",
 				"model", route.PublicName, "key_id", authCtx.KeyID, "user_id", authCtx.UserID,
 				"request_id", server.RequestIDFromContext(r.Context()))
@@ -1461,7 +1381,7 @@ func handleIngress(pool *upstream.Pool, cfg *config.Config, usage *usageRecorder
 		// 到期后表现：由上游 ctx 传播为 error，各 attempt 的错误映射会把它
 		// 归类为传输层失败（可转移），链耗尽后回 504。已提交的流此时靠
 		// idle 看门狗收尾，不会出现「写了头却没有终止信号」。
-		budget := totalRequestBudget(snap, cfg)
+		budget := dataplane.TotalRequestBudget(snap, cfg)
 		ctx, cancelBudget := context.WithTimeout(r.Context(), budget)
 		defer cancelBudget()
 		r = r.WithContext(ctx)
@@ -1486,11 +1406,11 @@ func handleIngress(pool *upstream.Pool, cfg *config.Config, usage *usageRecorder
 		// 必然不等，预占了就得退款（等于把 ReserveQuota/ReleaseQuota 那套再
 		// 实现一遍，而那正是 2026-10-07 的 P0-2 教训）。所以这里是纯查询。
 		if bal := precheckBalance(w, r, db, logger, authCtx, ing, res.Candidates, codec); !bal {
-			// 余额预检已写回 402/500。rate.commit(0) 不能省：走到这里说明
+			// 余额预检已写回 402/500。rate.Commit(0) 不能省：走到这里说明
 			// TPM/配额预占可能已经立起来了（needEstimate 为真时），不退的话
 			// 它们会一直占着窗口/终身额度直到过期。与上面 model_not_allowed
 			// 的收尾同口径。
-			rate.commit(0)
+			rate.Commit(0)
 			return
 		}
 
@@ -1501,7 +1421,7 @@ func handleIngress(pool *upstream.Pool, cfg *config.Config, usage *usageRecorder
 		limit := len(cands)
 		if !route.FailoverEnabled {
 			limit = 1
-		} else if budget := failoverMaxTargets(snap, cfg); budget < limit {
+		} else if budget := dataplane.FailoverMaxTargets(snap, cfg); budget < limit {
 			limit = budget
 		}
 
@@ -1546,7 +1466,7 @@ func handleIngress(pool *upstream.Pool, cfg *config.Config, usage *usageRecorder
 				}
 			}
 			if len(serviceable) == 0 {
-				rate.commit(0)
+				rate.Commit(0)
 				logger.Warn("no upstream can serve structured output request",
 					"model", ing.Model, "key_id", authCtx.KeyID,
 					"candidates", len(active),
@@ -1562,10 +1482,10 @@ func handleIngress(pool *upstream.Pool, cfg *config.Config, usage *usageRecorder
 			active = active[:limit]
 		}
 
-		threshold := failoverFailureThreshold(snap, cfg)
+		threshold := dataplane.FailoverFailureThreshold(snap, cfg)
 		keyID := authCtx.KeyID
 
-		var out attemptOutcome
+		var out dataplane.Outcome
 		// lastTried 记录实际尝试到哪个候选（链耗尽时据此归因，不猜链上最后一个）。
 		// triedAny 与之配对：Candidate 是值类型，「没试过」与「试过零值」无法
 		// 从 lastTried 本身区分，必须有独立布尔。
@@ -1573,7 +1493,7 @@ func handleIngress(pool *upstream.Pool, cfg *config.Config, usage *usageRecorder
 		var triedAny bool
 		// routeTrace 记录链上的失败决策（2026-10-17）。只在真的发生过转移时
 		// 才有内容 —— 单目标成功、首跳成功都不写，避免给每条记录加噪声。
-		// 由 appendRouteTrace 统一格式化，保证「第几个目标」与失败原因成对出现。
+		// 由 dataplane.AppendRouteTrace 统一格式化，保证「第几个目标」与失败原因成对出现。
 		var routeTrace []string
 		for i, cand := range active {
 			isLast := i == len(active)-1
@@ -1586,7 +1506,7 @@ func handleIngress(pool *upstream.Pool, cfg *config.Config, usage *usageRecorder
 				logger.Info("client disconnected, aborting failover",
 					"model", ing.Model, "attempt", i+1, "error", cerr,
 					"request_id", server.RequestIDFromContext(r.Context()))
-				rate.commit(0)
+				rate.Commit(0)
 				return
 			}
 
@@ -1614,15 +1534,15 @@ func handleIngress(pool *upstream.Pool, cfg *config.Config, usage *usageRecorder
 				if !claimed {
 					// 仍在冷却中，或探测名额已被同链的并发请求领走 —— 沿链继续。
 					// 没领到名额，也就没有归还义务。
-					routeTrace = appendRouteTrace(routeTrace, i+1, cand, "skip", "probe_busy_or_cooling")
+					routeTrace = dataplane.AppendRouteTrace(routeTrace, i+1, cand, "skip", "probe_busy_or_cooling")
 					if !isLast {
 						logger.Warn("failover: target not claiming a probe slot, switching target",
 							"model", ing.Model, "provider", cand.Provider.Slug, "attempt", i+1,
 							"request_id", server.RequestIDFromContext(r.Context()))
 						continue
 					}
-					out = attemptOutcome{eligible: true, statusCode: http.StatusBadGateway,
-						code: "upstream_error", message: "no available upstream provider"}
+					out = dataplane.Outcome{Eligible: true, StatusCode: http.StatusBadGateway,
+						Code: "upstream_error", Message: "no available upstream provider"}
 					break
 				}
 				probeClaimed = true
@@ -1641,9 +1561,9 @@ func handleIngress(pool *upstream.Pool, cfg *config.Config, usage *usageRecorder
 					pool.ReleaseTargetProbe(cand.TargetID, probeToken)
 				}
 				probeRecorded = true // 名额已在上方显式归还
-				out = attemptOutcome{eligible: true, statusCode: http.StatusBadGateway,
-					code: "upstream_error", message: "no available upstream provider"}
-				routeTrace = appendRouteTrace(routeTrace, i+1, cand, "fail", "no_healthy_credential")
+				out = dataplane.Outcome{Eligible: true, StatusCode: http.StatusBadGateway,
+					Code: "upstream_error", Message: "no available upstream provider"}
+				routeTrace = dataplane.AppendRouteTrace(routeTrace, i+1, cand, "fail", "no_healthy_credential")
 				if !isLast {
 					logger.Warn("failover: no healthy credential, switching target",
 						"model", ing.Model, "provider", cand.Provider.Slug, "request_id", server.RequestIDFromContext(r.Context()))
@@ -1664,24 +1584,24 @@ func handleIngress(pool *upstream.Pool, cfg *config.Config, usage *usageRecorder
 			lastTried = cand
 			triedAny = true
 
-			if out.committed {
+			if out.Committed {
 				// 只有真成功才记成功 —— 断流/溢出/上游错误虽已提交，却是失败，
 				// 必须让目标熔断计数与凭据健康照常累计，否则故障永不转移。
-				if out.success {
+				if out.Success {
 					pool.RecordCredentialSuccess(credID)
 					pool.RecordTargetSuccess(cand.TargetID, probeToken)
-					routeTrace = appendRouteTrace(routeTrace, i+1, cand, "ok", "")
-				} else if out.clientGone {
+					routeTrace = dataplane.AppendRouteTrace(routeTrace, i+1, cand, "ok", "")
+				} else if out.ClientGone {
 					// 客户端自己走了（用户点停止 / 进程退出 / 网络切换）。
 					// 这既不是上游故障也不该罚凭据：照记的话，连续三次
 					// 取消就会把健康目标熔断一整个冷却窗口，期间该路由
 					// 全量 502。凭据同样不冷却 —— key 本身没问题。
-					routeTrace = appendRouteTrace(routeTrace, i+1, cand, "committed_fail", "client_canceled")
+					routeTrace = dataplane.AppendRouteTrace(routeTrace, i+1, cand, "committed_fail", "client_canceled")
 					pool.RecordTargetSuccess(cand.TargetID, probeToken)
 					pool.RecordCredentialSuccess(credID)
 				} else {
 					pool.RecordTargetFailure(cand.TargetID, probeToken, threshold)
-					routeTrace = appendRouteTrace(routeTrace, i+1, cand, "committed_fail", out.code)
+					routeTrace = dataplane.AppendRouteTrace(routeTrace, i+1, cand, "committed_fail", out.Code)
 				}
 				probeRecorded = true // 名额由记账释放
 				return
@@ -1699,27 +1619,27 @@ func handleIngress(pool *upstream.Pool, cfg *config.Config, usage *usageRecorder
 			// （凭据冷却期内不再被选中，也就没有任何请求能成功以触发复苏）。
 			// r.Context() 只在客户端断开/服务关停时取消（上游超时用的是派生 ctx），
 			// 因此这个判据能精确区分「客户端跑了」与「上游真的坏了」。
-			// 判据只认 Canceled：请求 ctx 上还挂着 totalRequestBudget 的超时，
+			// 判据只认 Canceled：请求 ctx 上还挂着 dataplane.TotalRequestBudget 的超时，
 			// 用 ctx.Err()==nil 会把「预算到期」也一起放过去 —— 那是网关侧的
 			// 事件，但请求确实已经打到了这个目标，用它当「上游健康」的证据
 			// 同样不成立，所以这里只排除真正的客户端取消。
-			if out.eligible && !isClientGone(r.Context(), nil) {
+			if out.Eligible && !dataplane.IsClientGone(r.Context(), nil) {
 				pool.RecordTargetFailure(cand.TargetID, probeToken, threshold)
 				probeRecorded = true // 名额由记账释放
-				if out.credCooldown > 0 {
-					pool.MarkCredentialCooldown(credID, out.credCooldown)
+				if out.CredentialCooldown > 0 {
+					pool.MarkCredentialCooldown(credID, out.CredentialCooldown)
 				}
 			}
 
 			// 未提交的失败：记下「哪个目标、什么原因、是否可转移」。
 			// 不可转移同样要记 —— 运维最常问的正是「为什么这次没换上游」。
-			if out.eligible {
-				routeTrace = appendRouteTrace(routeTrace, i+1, cand, "fail_switch", out.code)
+			if out.Eligible {
+				routeTrace = dataplane.AppendRouteTrace(routeTrace, i+1, cand, "fail_switch", out.Code)
 			} else {
-				routeTrace = appendRouteTrace(routeTrace, i+1, cand, "fail_terminal", out.code)
+				routeTrace = dataplane.AppendRouteTrace(routeTrace, i+1, cand, "fail_terminal", out.Code)
 			}
 
-			// 没走到记账的两种形态 —— 不可转移错误（out.eligible==false）与
+			// 没走到记账的两种形态 —— 不可转移错误（out.Eligible==false）与
 			// 客户端中断（ctx 已取消）—— 在此归还探测名额，否则 halfOpen 卡死、
 			// 该目标被跳到下一次 Install 才复位。已记账的绝不能再还；
 			// ReleaseTargetProbe 按令牌比较，迟到的旧请求也清不掉新探针。
@@ -1727,12 +1647,12 @@ func handleIngress(pool *upstream.Pool, cfg *config.Config, usage *usageRecorder
 				pool.ReleaseTargetProbe(cand.TargetID, probeToken)
 			}
 
-			if !out.eligible || isLast {
+			if !out.Eligible || isLast {
 				break
 			}
 			logger.Warn("failover: switching to next target",
 				"model", ing.Model, "from_provider", cand.Provider.Slug,
-				"error_code", out.code, "attempt", i+1, "route_trace", strings.Join(routeTrace, "; "),
+				"error_code", out.Code, "attempt", i+1, "route_trace", strings.Join(routeTrace, "; "),
 				"request_id", server.RequestIDFromContext(r.Context()))
 		}
 
@@ -1741,18 +1661,18 @@ func handleIngress(pool *upstream.Pool, cfg *config.Config, usage *usageRecorder
 		// 客户端已经断开时它根本收不到这个响应（写了只会撞 broken pipe），
 		// 且这次失败与上游无关，按 canceled 记账，与流式路径同一口径。
 		// 只把「客户端真的走了」算作 clientGone：ctx 上还挂着
-		// totalRequestBudget 的超时（DeadlineExceeded），那是网关侧事件，
+		// dataplane.TotalRequestBudget 的超时（DeadlineExceeded），那是网关侧事件，
 		// 记成 canceled 会让网关自己的超时在报表里与用户主动取消混为一谈，
 		// 并让「写不写错误响应」这个决定被预算到期误触发。
-		clientGone := isClientGone(r.Context(), r.Context().Err())
+		clientGone := dataplane.IsClientGone(r.Context(), r.Context().Err())
 
-		statusCode, code, message := out.statusCode, out.code, out.message
+		statusCode, code, message := out.StatusCode, out.Code, out.Message
 		// 兜底：不许把 200 或 0 当作「失败结果」发出去。
 		//
 		// statusCode==0 是「没有候选目标」的哨兵，一直有 502 兜底。
 		// statusCode==200 则是**本该不可能**的状态：这条路径只在链已耗尽、
 		// 响应尚未提交时到达，任何失败都必须用 >=400 表达。修复前它真的发生过
-		// （见 outcomeFromErr 的注释：流式哨兵被映射成 200），客户端于是拿到
+		// （见 dataplane.OutcomeFromErr 的注释：流式哨兵被映射成 200），客户端于是拿到
 		// 一个「成功但内容为空」的响应。把这一并归入 502，是为了让这条不变量
 		// 在**写出响应**这个最后一关口上也有牙齿 —— 将来谁再引入一个返回 200
 		// 的失败分支，症状会是「这里莫名其妙变成 502」，而不是「客户端拿到
@@ -1763,7 +1683,7 @@ func handleIngress(pool *upstream.Pool, cfg *config.Config, usage *usageRecorder
 		if !clientGone {
 			codec.WriteError(w, statusCode, code, message)
 		}
-		rate.commit(0)
+		rate.Commit(0)
 		provID, upstreamModel := "", ""
 		// 归因到**实际尝试过**的目标，而不是 active 的最后一个：
 		// failover_max_targets=1、或前面的候选被跳过时，两者不是同一个。
@@ -1779,7 +1699,7 @@ func handleIngress(pool *upstream.Pool, cfg *config.Config, usage *usageRecorder
 				"model", ing.Model, "request_id", server.RequestIDFromContext(r.Context()))
 		}
 		errorCode := code
-		errorDetail := out.detail
+		errorDetail := out.Detail
 		if clientGone {
 			errorCode = ""
 			errorDetail = ""
@@ -1834,251 +1754,6 @@ func modelNotFoundMessage(snap *snapshot.Snapshot, requested string) string {
 	return fmt.Sprintf("%s。可用的相似模型：%s", base, strings.Join(sugg, ", "))
 }
 
-// appendRouteTrace 记录一次链上决策：第几个目标、谁、结果、原因。
-//
-// 格式固定为 "N:provider/model -> outcome[:reason]"，按发生顺序用 "; " 连接。
-// 固定格式是为了让运维能在调用明细里直接读，也方便将来需要时用简单切分做统计；
-// 不引入 JSON 是为了不为一次排障增加 schema 与查询复杂度。
-func appendRouteTrace(trace []string, attempt int, cand routing.Candidate, outcome, reason string) []string {
-	provider, model := "?", "?"
-	if cand.Provider != nil {
-		provider = cand.Provider.Slug
-	}
-	if cand.UpstreamModel.ModelID != "" {
-		model = cand.UpstreamModel.ModelID
-	}
-	entry := fmt.Sprintf("%d:%s/%s -> %s", attempt, provider, model, outcome)
-	if reason != "" {
-		entry += ":" + reason
-	}
-	return append(trace, entry)
-}
-
-// streamCommitOutcome 把已提交流式的终态映射成轨迹里的结果词。
-// 用 "ok" / "committed_fail" 与未提交路径保持同一套词汇，避免同一种
-// 「流断了」在不同路径里出现两种叫法（status 本身只用于计费判读）。
-func streamCommitOutcome(status string) string {
-	if status == "ok" {
-		return "ok"
-	}
-	return "committed_fail"
-}
-
-// attemptOutcome 是一次「对某个链目标发起上游调用」的结果。
-//
-// committed=true 表示已向下游写出内容（非流式的完整响应、或流式已发首字并写完整个流），
-// 此时 usage 已由该次 attempt 落库，请求终结，绝不能回退去换目标（半条流收不回）。
-// committed=false 时 attempt 未碰过 ResponseWriter，由外层循环决定「换下一个目标」还是
-// 「把这次错误写回客户端」。eligible 告诉外层这次失败值不值得转移。
-type attemptOutcome struct {
-	committed bool
-	// success 表示本次 attempt 真的成功抵达上游（流式仅 status=="ok" 为真）。
-	// committed 只说明「字节已写出、不能回退」，断流/溢出同样是 committed
-	// 却是失败 —— 熔断与凭据健康必须看success，不能看 committed。
-	success bool
-	// clientGone 标记「这次 attempt 是客户端自己走了」，不是上游故障。
-	//
-	// 必须显式带出来而不能靠外层看 r.Context().Err()：请求的 ctx 身上还挂着
-	// totalRequestBudget 的超时（见 handleIngress），所以预算到期时
-	// ctx.Err() 也是 DeadlineExceeded —— 与用户点「停止」在那一刻无法区分。
-	// 旧实现只按「committed 且非 ok」一律记目标失败，于是连点三次停止就把
-	// 健康目标熔断 60 秒；预算到期同样被误记成上游故障。
-	clientGone   bool
-	eligible     bool
-	credCooldown time.Duration
-	statusCode   int
-	code         string
-	message      string
-	// detail 是上游失败详情（脱敏 + 截断），落进 usage_records.error_detail
-	// 供调用历史排查。与 message 不同：message 是给客户端的固定文案，
-	// detail 是给运维的上游原文。空串 = 无正文可截（TransportError 等）。
-	detail string
-}
-
-// outcomeFromErr 把一次上游 err 归类成「未提交」的结果。
-//
-// # 流式哨兵必须在**这里**单独处理（2026-10-10 修复的 P1）
-//
-// outwire.MapUpstreamError 把 ErrStreamTruncated / ErrStreamOverflow 映射成
-// (200, "", "")，理由是「内容已经写到线上去了，没什么可补的」。这个前提
-// **只在已提交时成立**，而本函数的每一个调用点都是**未提交**路径
-// （见 attemptStream 的 !gotFirst 分支：SSE 头要等到第一个事件到达才写）。
-//
-// 于是修复前：上游在首个事件前硬失败 → 拿到 (200,"","") → statusCode 非 0
-// 所以 main 的 502 兜底不生效 → 客户端收到
-// `{"error":{"message":"","type":"api_error"}}` 且 **HTTP 200**。
-// 两个后果叠加：
-//   - OpenAI/Anthropic SDK 只在 >=400 时抛错，于是调用方拿到一个空字符串和
-//     「成功」；按状态码记账的监控把它记成一条成功调用。
-//   - FailoverEligible 对这两个哨兵返回 false，故障转移链直接 break ——
-//     一个本该被链吸收的失败，反而被伪造成成功返回。
-//
-// 所以在这里改判：既给出真实的状态码，也让链继续尝试下一个目标。
-// MapUpstreamError 本身**保持原样** —— 它服务的已提交路径（「如实 truncated
-// 收尾，不追加错误体」）那个语义是对的，不该为迁就未提交路径而改掉。
-func outcomeFromErr(err error) attemptOutcome {
-	if errors.Is(err, rosetta.ErrStreamTruncated) || errors.Is(err, rosetta.ErrStreamOverflow) {
-		return attemptOutcome{
-			// 首批事件之前就断流 = 这次尝试什么也没产出，值得换目标再试。
-			eligible:     true,
-			credCooldown: 60 * time.Second,
-			statusCode:   http.StatusBadGateway,
-			code:         "upstream_error",
-			message:      "upstream stream failed before the first event",
-		}
-	}
-	eligible := outwire.FailoverEligible(err)
-	statusCode, code, message := outwire.MapUpstreamError(err)
-	return attemptOutcome{
-		eligible:     eligible,
-		credCooldown: outwire.CredentialCooldown(err),
-		statusCode:   statusCode,
-		code:         code,
-		message:      message,
-		detail:       outwire.UpstreamErrorDetail(err),
-	}
-}
-
-// failoverMaxTargets 解析「一次请求最多尝试链上几个目标」：
-// 设置页写入的全局默认优先，未配置（0）回落 config。
-func failoverMaxTargets(snap *snapshot.Snapshot, cfg *config.Config) int {
-	if snap != nil && snap.Runtime.FailoverMaxTargets > 0 {
-		return snap.Runtime.FailoverMaxTargets
-	}
-	return cfg.FailoverMaxTargets()
-}
-
-// failoverFailureThreshold 解析「某目标连续失败几次即熔断」：设置页优先，回落 config。
-func failoverFailureThreshold(snap *snapshot.Snapshot, cfg *config.Config) int {
-	if snap != nil && snap.Runtime.FailoverFailureThreshold > 0 {
-		return snap.Runtime.FailoverFailureThreshold
-	}
-	return cfg.FailoverFailureThreshold()
-}
-
-// safeMillis 把毫秒数转成 time.Duration，并钳制在不会整数回绕的范围内。
-//
-// 为什么要钳制而不只是校验：校验（config.validate + settings_handler）挡住的是
-// **新写入**的脏值，挡不住数据库里已经存在的、或在别的部署路径下写进去的。
-// 而回绕的后果是灾难性的 —— time.Duration 是 int64 纳秒，
-// `time.Duration(ms) * time.Millisecond` 在 ms > 9.223e12 时得到**负数**：
-//
-//	context.WithTimeout(ctx, 负值)  → deadline 立即过期 → 非流式请求全挂
-//	time.AfterFunc(负值, ...)      → 立即开火 → 流刚发头就被自己关掉
-//
-// 而 UI 上显示的是一个「巨大但合法」的超时值，没有任何异常信号。
-// 24 小时足够任何网关用，且离溢出点有 380 倍余量。
-func safeMillis(ms int) time.Duration {
-	const maxMillis = 86_400_000 // 24h
-	if ms <= 0 {
-		return 0
-	}
-	if ms > maxMillis {
-		slog.Warn("runtime millisecond setting exceeds safe range, clamping",
-			"ms", ms, "clamped_to_ms", maxMillis)
-		return time.Duration(maxMillis) * time.Millisecond
-	}
-	return time.Duration(ms) * time.Millisecond
-}
-
-// nonStreamTimeout：设置页的全局默认优先，其次 config 的上游超时。
-func nonStreamTimeout(snap *snapshot.Snapshot, cfg *config.Config) time.Duration {
-	if snap != nil && snap.Runtime.UpstreamTimeoutMs > 0 {
-		return safeMillis(snap.Runtime.UpstreamTimeoutMs)
-	}
-	return cfg.UpstreamTimeout()
-}
-
-// firstTokenTimeout：设置页的全局默认优先，其次 config 的首字超时。
-func firstTokenTimeout(snap *snapshot.Snapshot, cfg *config.Config) time.Duration {
-	if snap != nil && snap.Runtime.StreamFirstTokenTimeoutMs > 0 {
-		return safeMillis(snap.Runtime.StreamFirstTokenTimeoutMs)
-	}
-	return cfg.StreamFirstTokenTimeout()
-}
-
-// streamIdleTimeout：设置页的全局默认优先，其次 config 的流式空闲超时。
-func streamIdleTimeout(snap *snapshot.Snapshot, cfg *config.Config) time.Duration {
-	if snap != nil && snap.Runtime.StreamIdleTimeoutMs > 0 {
-		return safeMillis(snap.Runtime.StreamIdleTimeoutMs)
-	}
-	return cfg.StreamIdleTimeout()
-}
-
-// totalRequestBudget 是**整个 /v1 请求**（跨所有故障转移尝试）的总上限。
-//
-// # 为什么需要它（2026-10-10 修复的 P2）
-//
-// 此前没有任何东西限制一次请求的总时长，而每个环节的超时都是**逐跳**的：
-//
-//	拨号/TLS 10s + 等响应头 60s + 首字 30s  ≈ 100s / 次尝试
-//	× (failover_max_targets 默认 3)        ≈ 300s
-//
-// 于是「一串半死的上游」可以把客户端挂住约 5 分钟。期间它一直占着：一个
-// 下游连接、一个上游连接、一条配额预占行、一个故障转移槽位。攒够几个，
-// 网关对新请求而言已经不可用，而监控上看它「还活着」——
-// 病在上游，症状却在网关自己身上。
-//
-// # 为什么由现有配置推导，而不是新增一个「总超时」开关
-//
-// 总预算必须**大于**任何单跳预算（故障转移会逐次复用单跳预算），
-// 又必须**有限**。直接推导的好处是：运维调过的 upstream_timeout_ms、
-// stream_first_token_timeout_ms、failover_max_targets 立刻反映到总预算上，
-// 不需要「调完设置还要记得同步另一个总开关」这种跨字段的隐性依赖；
-// 也不存在「总超时配得比单跳还短」这种自相矛盾的配置。
-//
-// # 公式与余量的来历
-//
-// 每次尝试的最坏上界取「非流式超时」与「首字 + 响应头等待」中较大的一个 ——
-// 二者是不同路径，取 max 才不会把流式或非流式其中一条判短了。
-// 再乘 (目标数+1)：+1 是给「最后一个目标失败后写错误响应」留的额度
-// （failover_max_targets 限制的是尝试的**成功**目标数）。
-// 每跳再加 perAttemptSlack：给「取流、解析、写头、落库」这些不计入任何
-// 看门狗的开销留余量 —— 余量不足的表现是总预算先把健康请求掐掉，
-// 那是比「慢」严重得多的事故。
-//
-// 非流式请求同样套用：它们的单跳预算就是 upstream_timeout_ms，
-// 逐跳累加的后果完全一样。
-func totalRequestBudget(snap *snapshot.Snapshot, cfg *config.Config) time.Duration {
-	// 逐跳上界：两条路径取较大者。responseHeaderWait 是等上游响应头的上限，
-	// 它在**首字看门狗启动之前**发生，所以首字预算管不到它，必须单独算。
-	perAttempt := nonStreamTimeout(snap, cfg)
-	if first := firstTokenTimeout(snap, cfg) + responseHeaderWait; first > perAttempt {
-		perAttempt = first
-	}
-	perAttempt += perAttemptSlack
-
-	attempts := failoverMaxTargets(snap, cfg) + 1
-	budget := time.Duration(attempts) * perAttempt
-
-	// 下限保护：即便所有配置都被设成极小值，也要留出一个不至于让正常请求
-	// 必然失败的地板。上限保护同理：配置被设得极大时，总预算不应该大到
-	// 「等于没有」——那正是本函数要消灭的状态。
-	const (
-		minTotalBudget = 30 * time.Second
-		maxTotalBudget = 30 * time.Minute
-	)
-	if budget < minTotalBudget {
-		return minTotalBudget
-	}
-	if budget > maxTotalBudget {
-		return maxTotalBudget
-	}
-	return budget
-}
-
-const (
-	// responseHeaderWait 镜像 internal/upstream 里 ResponseHeaderTimeout 的
-	// 60s。它出现在这里是因为总预算必须算上「拿到响应头之前」的那段 ——
-	// 而首字看门狗是在 ChatStream 返回**之后**才启动的，覆盖不到这里。
-	//
-	// 两处必须同步改：改 upstream 的同时改这里，否则总预算会算少一段。
-	responseHeaderWait = 60 * time.Second
-	// perAttemptSlack 是每跳的固定余量，覆盖不计入任何看门狗的开销：
-	// 取流、心跳、协议转换、落库。给小了会让总预算提前掐掉健康请求。
-	perAttemptSlack = 5 * time.Second
-)
-
 // attemptStream 尝试在当前目标上完成一次流式响应。
 //
 // 关键：SSE 头与状态码**推迟到拿到第一个上游事件之后才写**。这样「建立失败」
@@ -2091,7 +1766,7 @@ const (
 // 可转移」）。它必须带进来：本 attempt 一旦提交（写下首字节），usage 就在
 // 这里落库且不会再回到外层 —— 只写当前一跳会丢掉「为什么走到备用上游」，
 // 而那恰恰是这条记录最有价值的部分。
-func attemptStream(w http.ResponseWriter, r *http.Request, client *rosetta.Client, ing *ingress.Request, cand routing.Candidate, authCtx *auth.Context, codec ingress.Codec, rate *rateCommit, cfg *config.Config, snap *snapshot.Snapshot, usage *usageRecorder, start time.Time, priorTrace []string) attemptOutcome {
+func attemptStream(w http.ResponseWriter, r *http.Request, client *rosetta.Client, ing *ingress.Request, cand routing.Candidate, authCtx *auth.Context, codec ingress.Codec, rate *dataplane.RateCommit, cfg *config.Config, snap *snapshot.Snapshot, usage *usageRecorder, start time.Time, priorTrace []string) dataplane.Outcome {
 	ctx := r.Context()
 	logger := usage.Logger()
 	publicModel := ing.Model
@@ -2135,12 +1810,12 @@ func attemptStream(w http.ResponseWriter, r *http.Request, client *rosetta.Clien
 	//
 	// 「拨号 + 等响应头」这段仍由 internal/upstream 的
 	// ResponseHeaderTimeout（60s，镜像为 responseHeaderWait）兜底，
-	// 并计入 totalRequestBudget —— 它不会无限，只是比首字预算宽。
-	ttftTimeout := firstTokenTimeout(snap, cfg)
+	// 并计入 dataplane.TotalRequestBudget —— 它不会无限，只是比首字预算宽。
+	ttftTimeout := dataplane.FirstTokenTimeout(snap, cfg)
 
 	stream, err := client.ChatStream(ctx, upstreamReq)
 	if err != nil {
-		return outcomeFromErr(err)
+		return dataplane.OutcomeFromErr(err)
 	}
 	defer stream.Close()
 
@@ -2170,18 +1845,18 @@ func attemptStream(w http.ResponseWriter, r *http.Request, client *rosetta.Clien
 
 	if !gotFirst || ttftTimedOut.Load() {
 		if cerr := stream.Err(); cerr != nil {
-			return outcomeFromErr(cerr)
+			return dataplane.OutcomeFromErr(cerr)
 		}
 		if ttftTimedOut.Load() {
 			logger.Warn("stream first-token timeout", "model", publicModel,
 				"provider", cand.Provider.Slug, "ttft_timeout_ms", ttftTimeout.Milliseconds())
-			return attemptOutcome{eligible: true, credCooldown: 60 * time.Second,
-				statusCode: http.StatusGatewayTimeout, code: "upstream_timeout",
-				message: "upstream first-token timeout"}
+			return dataplane.Outcome{Eligible: true, CredentialCooldown: 60 * time.Second,
+				StatusCode: http.StatusGatewayTimeout, Code: "upstream_timeout",
+				Message: "upstream first-token timeout"}
 		}
 		// 干净 EOF 却在首个事件之前（上游返回 200 后立刻空流）—— 按可转移的空响应处理。
-		return attemptOutcome{eligible: true, statusCode: http.StatusBadGateway,
-			code: "upstream_error", message: "upstream returned empty response"}
+		return dataplane.Outcome{Eligible: true, StatusCode: http.StatusBadGateway,
+			Code: "upstream_error", Message: "upstream returned empty response"}
 	}
 
 	// —— 首个事件已到，自此提交：写 SSE 头，之后任何中断都只能如实 truncated 收尾 ——
@@ -2200,7 +1875,7 @@ func attemptStream(w http.ResponseWriter, r *http.Request, client *rosetta.Clien
 	// 用法是能力探测，测试替身等无底层连接的实现会静默跳过。
 	outwire.BindWriteDeadline(sink, w)
 
-	idleTimeout := streamIdleTimeout(snap, cfg)
+	idleTimeout := dataplane.StreamIdleTimeout(snap, cfg)
 	var idleTimedOut atomic.Bool
 	// lastEventAt 记最近一次上游事件到达的时刻，idle 回调据此**复核**后再关流。
 	//
@@ -2346,7 +2021,7 @@ func attemptStream(w http.ResponseWriter, r *http.Request, client *rosetta.Clien
 		//
 		// 归因：写失败 = 下游不可用，与「客户端主动断开」同类，
 		// 因此复用 canceled 这个取值（它已经是「不计入上游熔断」的那一类，
-		// 见 attemptOutcome.clientGone）。单独一个 errorCode 让运维能
+		// 见 dataplane.Outcome.ClientGone）。单独一个 errorCode 让运维能
 		// 区分「客户端自己走了」与「我们写不进去」。
 		status = "canceled"
 		errorCode = "downstream_write_failed"
@@ -2372,7 +2047,7 @@ func attemptStream(w http.ResponseWriter, r *http.Request, client *rosetta.Clien
 			status = "overflow"
 			errorCode = "stream_overflow"
 			logger.Error("stream overflow", "model", publicModel, "key_id", authCtx.KeyID, "error", err)
-		case isClientGone(ctx, err):
+		case dataplane.IsClientGone(ctx, err):
 			// 客户端主动断开不是上游故障。此前一律记 error，后果是：后台错误率虚高、
 			// 成功率虚低，且真故障被 ERROR 噪音淹没。单独一个取值才能把两者分开。
 			status = "canceled"
@@ -2414,7 +2089,7 @@ func attemptStream(w http.ResponseWriter, r *http.Request, client *rosetta.Clien
 	// 发出该事件 —— 于是 usage 恒为零值：
 	//   - usage_state="missing" → cost_total=0 → 网关的上游成本被完全漏记；
 	//   - trg_update_used_tokens 累加 0 → key 的终身 token 配额不涨；
-	//   - rate.releaseQuota() 把 est 预占全额退回 → 预占也不涨。
+	//   - rate.ReleaseQuota() 把 est 预占全额退回 → 预占也不涨。
 	//
 	// 三者叠加的结果是：**用户点一次「停止」，就能免费消耗已生成的全部
 	// 上游 token，并且完全绕过终身 token 配额**。可被主动利用 ——
@@ -2491,7 +2166,7 @@ func attemptStream(w http.ResponseWriter, r *http.Request, client *rosetta.Clien
 		TTFBMs:          ttfbMs,
 		// 流式已提交后的断流无法再转移，但「打到了哪个目标、为什么断」
 		// 仍需可查。成功时留 ok，断流留对应状态。
-		RouteTrace: strings.Join(appendRouteTrace(priorTrace, len(priorTrace)+1, cand, streamCommitOutcome(status), errorCode), "; "),
+		RouteTrace: strings.Join(dataplane.AppendRouteTrace(priorTrace, len(priorTrace)+1, cand, dataplane.StreamCommitOutcome(status), errorCode), "; "),
 	})
 	// 收尾按「usage 是否已知」分两条（2026-10-07 修复的 P1-3）：
 	//   - 已知：全量收尾 —— TPM 以真实 usage（输入+输出）替换估算值，
@@ -2508,22 +2183,22 @@ func attemptStream(w http.ResponseWriter, r *http.Request, client *rosetta.Clien
 	// 终身配额的预占被**消耗**掉一部分（触发器按 total_tokens 累加），
 	// 而不再全额退回 —— 那正是「点停止 = 免费刷上游 token」这条通道。
 	if !lastUsage.IsZero() {
-		rate.commit(lastUsage.TotalTokens)
+		rate.Commit(lastUsage.TotalTokens)
 	} else {
-		rate.releaseQuota()
+		rate.ReleaseQuota()
 	}
 	// committed=true（字节已写出、无法回退换目标）与「这一次算成功」是两件事：
 	// truncated / overflow / error / canceled 都已提交，但对上游而言是失败。
 	// 只有 status=="ok" 才允许外层记成功，否则「先200 再断流」这类最常见的
 	// 上游故障永远不累计失败、目标永不熔断。
 	// clientGone 只给「客户端自己走了」的那一种：它不该计入熔断计数
-	// （见 attemptOutcome.clientGone）。
-	return attemptOutcome{committed: true, success: status == "ok", clientGone: status == "canceled"}
+	// （见 dataplane.Outcome.ClientGone）。
+	return dataplane.Outcome{Committed: true, Success: status == "ok", ClientGone: status == "canceled"}
 }
 
 // priorTrace 的含义与 attemptStream 相同：提交后的落库在这里发生，
 // 必须把此前目标的失败决策一并带上。
-func attemptNonStream(w http.ResponseWriter, r *http.Request, client *rosetta.Client, ing *ingress.Request, cand routing.Candidate, authCtx *auth.Context, codec ingress.Codec, rate *rateCommit, cfg *config.Config, snap *snapshot.Snapshot, usage *usageRecorder, start time.Time, priorTrace []string) attemptOutcome {
+func attemptNonStream(w http.ResponseWriter, r *http.Request, client *rosetta.Client, ing *ingress.Request, cand routing.Candidate, authCtx *auth.Context, codec ingress.Codec, rate *dataplane.RateCommit, cfg *config.Config, snap *snapshot.Snapshot, usage *usageRecorder, start time.Time, priorTrace []string) dataplane.Outcome {
 	publicModel := ing.Model
 	// 同attemptStream：别名 → 上游 model_id 的映射与协议私有字段的透传
 	// 必须在本次 attempt 内完成，不能由调用方造好传入。
@@ -2536,12 +2211,12 @@ func attemptNonStream(w http.ResponseWriter, r *http.Request, client *rosetta.Cl
 
 	// 绑定 r.Context() 而非 context.Background()：客户端断开时上游调用应随之取消，
 	// 否则断连请求会一直占用上游连接与配额直到超时（默认 120s）。
-	ctx, cancel := context.WithTimeout(r.Context(), nonStreamTimeout(snap, cfg))
+	ctx, cancel := context.WithTimeout(r.Context(), dataplane.NonStreamTimeout(snap, cfg))
 	defer cancel()
 
 	resp, err := client.Chat(ctx, upstreamReq)
 	if err != nil {
-		return outcomeFromErr(err)
+		return dataplane.OutcomeFromErr(err)
 	}
 
 	// 非流式响应一次性返回，拿不到"首字"这一独立时刻，用响应到达时刻近似（≈总耗时）。
@@ -2570,19 +2245,19 @@ func attemptNonStream(w http.ResponseWriter, r *http.Request, client *rosetta.Cl
 		HTTPStatus:      200,
 		LatencyMs:       latency,
 		TTFBMs:          ttfbMs,
-		RouteTrace:      strings.Join(appendRouteTrace(priorTrace, len(priorTrace)+1, cand, "ok", ""), "; "),
+		RouteTrace:      strings.Join(dataplane.AppendRouteTrace(priorTrace, len(priorTrace)+1, cand, "ok", ""), "; "),
 	})
 	// 收尾口径与 attemptStream 一致（见该处的注释）：usage 已知 → 全量收尾；
 	// missing → 只退配额预占，TPM 预占保留（窗口自愈）。
 	if !resp.Usage.IsZero() {
-		rate.commit(resp.Usage.TotalTokens)
+		rate.Commit(resp.Usage.TotalTokens)
 	} else {
-		rate.releaseQuota()
+		rate.ReleaseQuota()
 	}
 	// 非流式能走到这里就意味着上游完整返回了响应 —— 一定是成功。
-	// 漏写success 会让每次非流式成功都被外层记成「目标失败」，
-	// 健康的链首目标 3 个请求后就被误熔断（详见 attemptOutcome.success）。
-	return attemptOutcome{committed: true, success: true}
+	// 漏写 Success 会让每次非流式成功都被外层记成「目标失败」，
+	// 健康的链首目标 3 个请求后就被误熔断（详见 dataplane.Outcome.Success）。
+	return dataplane.Outcome{Committed: true, Success: true}
 }
 
 // usageStateFor 区分「上游报了用量」与「上游一个 token 数都没给」。
@@ -2596,23 +2271,6 @@ func usageStateFor(u rosetta.Usage) string {
 		return "missing"
 	}
 	return "reported"
-}
-
-// isClientGone 判断一次流式中断是否源于**客户端**断开，而不是上游故障。
-//
-// 请求 context 被取消（用户点「停止生成」、客户端进程退出、网络切换）时，
-// SDK 会把 context 错误从流里透出来。这类中断既不该算进上游的成功率，
-// 也不该打成 ERROR —— 它跟路由、凭据、上游的健康状况无关。
-//
-// 只认 context.Canceled，**不认 context.DeadlineExceeded**：请求 ctx 上还挂着
-// 网关自己的 totalRequestBudget（handleIngress 里 WithTimeout 派生），
-// 预算到期同样是 DeadlineExceeded，那是网关侧事件，不能记成用户主动离开。
-func isClientGone(ctx context.Context, err error) bool {
-	if errors.Is(err, context.Canceled) {
-		return true
-	}
-	// ctx.Err() 也只认 Canceled：DeadlineExceeded 属于预算到期，见上。
-	return errors.Is(ctx.Err(), context.Canceled)
 }
 
 func handleListModels(forceShape string) http.HandlerFunc {

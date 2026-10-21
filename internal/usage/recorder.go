@@ -65,7 +65,7 @@ func New(cfg Config) *Recorder {
 // （Recorder.charge）用，既有落库处的裸字面量保持原样，避免本次改动
 // 波及热路径上每一条 usage 记录。
 const (
-	// usageStatusOK 是「这次调用真的成功」。与 attemptOutcome.success 的
+	// usageStatusOK 是「这次调用真的成功」。与 dataplane.Outcome.Success 的
 	// 判据同源：流式只有 status=="ok" 才算成功，断流/溢出/中断都不是。
 	usageStatusOK = "ok"
 )
@@ -535,7 +535,7 @@ func (u *Recorder) recordedCost(ctx context.Context, rec *store.UsageRecord) flo
 //
 // 判据是 usage_records.status == "ok"。它是「这一次调用真的成功」的既有
 // 事实来源，attemptStream/attemptNonStream 落库时就定好了，且**与熔断计数的
-// 判据是同一个**（见 attemptOutcome.success 的注释：committed 只说明字节已
+// 判据是同一个**（见 dataplane.Outcome.Success 的注释：Committed 只说明字节已
 // 写出，断流/溢出也是 committed 却是失败）。用同一个判据，余额与健康度不会
 // 各说各话。
 //
@@ -548,9 +548,9 @@ func (u *Recorder) recordedCost(ctx context.Context, rec *store.UsageRecord) flo
 // 成本），扣费**只看成功**（那是用户的应收）。同一次调用两个数相同、触发条件
 // 不同。见 billing.go 的口径说明。
 //
-// # 与 rateCommit 收尾的关系（两者互不干扰）
+// # 与 dataplane.RateCommit 收尾的关系（两者互不干扰）
 //
-// rateCommit 管的是**预占**（TPM 窗口 + 终身 token 配额），它必须在请求
+// RateCommit 管的是**预占**（TPM 窗口 + 终身 token 配额），它必须在请求
 // 结束那一刻收尾（流式是边写边收）。扣费管的是**实收**，它挂在 usage 落库
 // 之后、异步发生。两者没有共享状态：预占退回的是"还没花的额度"，扣费收的是
 // "已经花的钱"，方向相反不会互相抵消。

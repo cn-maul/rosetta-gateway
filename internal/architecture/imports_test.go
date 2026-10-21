@@ -164,6 +164,15 @@ func checkRules(packages map[string]packageImports) []string {
 			},
 			message: "ingress 只做下游协议编解码，不得依赖管理面、运行时状态、计费状态机或进程入口",
 		},
+		{
+			from: modulePath + "/internal/dataplane",
+			forbid: []string{
+				modulePath + "/internal/admin",
+				modulePath + "/internal/server",
+				modulePath + "/cmd/gateway",
+			},
+			message: "dataplane 只做请求转发策略，不得依赖管理面、HTTP 服务器装配或进程入口",
+		},
 	}
 
 	var violations []string
