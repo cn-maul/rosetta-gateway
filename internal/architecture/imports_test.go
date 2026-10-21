@@ -196,6 +196,14 @@ func checkRules(packages map[string]packageImports) []string {
 			message: "catalog 只负责模型目录响应，不得依赖管理面、HTTP 服务器装配或进程入口",
 		},
 		{
+			from: modulePath + "/internal/api",
+			forbid: []string{
+				modulePath + "/internal/gatewayapp",
+				modulePath + "/cmd/gateway",
+			},
+			message: "api 是 HTTP 装配层，不得反向依赖生命周期或进程入口",
+		},
+		{
 			from:    modulePath + "/internal/gatewayapp",
 			forbid:  []string{modulePath + "/cmd/gateway"},
 			message: "gatewayapp 是库，不得反向依赖进程入口",

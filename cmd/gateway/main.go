@@ -21,9 +21,8 @@ var buildVersion = "dev"
 
 func main() {
 	if err := gatewayapp.Run(gatewayapp.Options{
-		Version:      buildVersion,
-		BuildHandler: buildHandlerFromApp,
-		Bootstrap:    initializeAdminBootstrap,
+		Version:   buildVersion,
+		Bootstrap: initializeAdminBootstrap,
 	}); err != nil {
 		slog.Error("gateway exited", "error", err)
 		os.Exit(1)

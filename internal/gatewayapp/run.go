@@ -5,11 +5,11 @@ import (
 	"fmt"
 	"log/slog"
 	"net"
-	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
 
+	"github.com/cn-maul/rosetta-gateway/internal/api"
 	"github.com/cn-maul/rosetta-gateway/internal/billing"
 	"github.com/cn-maul/rosetta-gateway/internal/config"
 	"github.com/cn-maul/rosetta-gateway/internal/crypto"
@@ -25,29 +25,14 @@ import (
 // HomeEnvVar redirects all process state to a mounted volume.
 const HomeEnvVar = "ROSETTA_GW_HOME"
 
-// HandlerDeps contains the initialized dependencies needed to construct the
-// production HTTP handler.
-type HandlerDeps struct {
-	DB             *store.Store
-	Config         *config.Config
-	Logger         *slog.Logger
-	MasterKey      []byte
-	Pool           *upstream.Pool
-	Reloader       *runtime.Reloader
-	SessionManager *userauth.Manager
-	RateLimiter    *ratelimit.Limiter
-	Usage          *usage.Recorder
-}
-
 // BootstrapFunc initializes first-run administrator credentials. It remains an
 // injected concern so gatewayapp does not depend on the command package.
 type BootstrapFunc func(context.Context, *store.Store, *slog.Logger) error
 
 // Options are the process-level hooks supplied by cmd/gateway.
 type Options struct {
-	Version      string
-	BuildHandler func(HandlerDeps) http.Handler
-	Bootstrap    BootstrapFunc
+	Version   string
+	Bootstrap BootstrapFunc
 }
 
 // Run initializes the gateway and serves traffic until shutdown. Configuration,
@@ -196,19 +181,16 @@ func Run(opts Options) error {
 	logger.Info("user sessions enabled", "ttl", sessionMgr.TTL(),
 		"source", secretSource(secretPath))
 
-	if opts.BuildHandler == nil {
-		return fmt.Errorf("gatewayapp: BuildHandler is required")
-	}
-	handler := opts.BuildHandler(HandlerDeps{
-		DB:             db,
-		Config:         cfg,
-		Logger:         logger,
-		MasterKey:      masterKey,
-		Pool:           pool,
-		Reloader:       reloader,
-		SessionManager: sessionMgr,
-		RateLimiter:    ratelimit.New(),
-		Usage:          recorder,
+	handler := api.BuildHandler(api.Deps{
+		DB:          db,
+		Config:      cfg,
+		Logger:      logger,
+		MasterKey:   masterKey,
+		Pool:        pool,
+		Reloader:    reloader,
+		SessionMgr:  sessionMgr,
+		RateLimiter: ratelimit.New(),
+		Usage:       recorder,
 	})
 
 	return Serve(ServeDeps{
