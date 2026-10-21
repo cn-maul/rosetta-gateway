@@ -32,10 +32,12 @@ package main
 // 「同一个场景两个结论」。
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -47,6 +49,7 @@ import (
 
 	"github.com/cn-maul/rosetta-gateway/internal/admin"
 	"github.com/cn-maul/rosetta-gateway/internal/config"
+	"github.com/cn-maul/rosetta-gateway/internal/crypto"
 	"github.com/cn-maul/rosetta-gateway/internal/ratelimit"
 	"github.com/cn-maul/rosetta-gateway/internal/server"
 	"github.com/cn-maul/rosetta-gateway/internal/snapshot"
@@ -107,13 +110,16 @@ type e2eUsageRow struct {
 	ProviderID  string
 	Upstream    string
 	Stream      bool
+	HTTPStatus  int
+	ErrorCode   string
 	RequestID   string
 }
 
 func e2eUsageRows(t *testing.T, db *store.Store, keyID string) []e2eUsageRow {
 	t.Helper()
 	rows, err := db.DB().QueryContext(context.Background(),
-		`SELECT id, status, usage_state, total_tokens, cost_total, provider_id, upstream_model, stream, COALESCE(request_id,'')
+		`SELECT id, status, usage_state, total_tokens, cost_total, provider_id, upstream_model, stream,
+		        http_status, COALESCE(error_code,''), COALESCE(request_id,'')
 		   FROM usage_records WHERE access_key_id = ? ORDER BY ts DESC, id DESC`, keyID)
 	if err != nil {
 		t.Fatalf("读 usage_records: %v", err)
@@ -124,7 +130,7 @@ func e2eUsageRows(t *testing.T, db *store.Store, keyID string) []e2eUsageRow {
 		var r e2eUsageRow
 		var stream int
 		if err := rows.Scan(&r.ID, &r.Status, &r.UsageState, &r.TotalTokens, &r.CostTotal,
-			&r.ProviderID, &r.Upstream, &stream, &r.RequestID); err != nil {
+			&r.ProviderID, &r.Upstream, &stream, &r.HTTPStatus, &r.ErrorCode, &r.RequestID); err != nil {
 			t.Fatalf("scan usage_records: %v", err)
 		}
 		r.Stream = stream == 1
@@ -824,6 +830,88 @@ func TestE2E_D1_QuotaExhaustedRejectsWithoutTouchingUpstream(t *testing.T) {
 	e2eWaitReservedZero(t, db, "k1", "D1 配额拒绝")
 }
 
+// D1b：key 配额超限的**反复**触发，不得把 TPM 窗口额度吃掉。
+//
+// 回归风险（审计 P0-8 / A4-P0-1）：key 级配额超限的那条早退路径此前
+// **漏了** rate.commit(0) —— 直接 return，TPM 窗口里的 est 预占就永远留在
+// 那儿。配额已耗尽的 key 可以反复触发这个拒绝，每次留下一笔含 max_tokens
+// 上界的 est，几十次就能吃光该 key 整分钟的 TPM 额度，于是「配额满」会
+// 级联成「TPM 也满」，而客户端只看到一个 429。
+//
+// 这条用例断言的是**级联的另一半**：配额满之后，把配额放开（或用一把
+// 配额充足的 key），TPM 额度必须仍然可用。
+func TestE2E_D1b_QuotaRejectedRequestsDoNotConsumeTPMBudget(t *testing.T) {
+	up := newFakeUpstream(t, replyOK("pong"))
+	h, db := buildHarness(t, []struct {
+		slug, url string
+		fail      bool
+	}{{slug: "good", url: up.URL()}}, false)
+
+	// 快照侧给一把 key 配 TPM 限额（RPM/TPM 经快照下发，见 D2 的同一手法）。
+	old := snapshot.Get()
+	newKeys := make(map[string]*snapshot.KeySnapshot, len(old.KeysByHash))
+	for hash, ks := range old.KeysByHash {
+		cp := *ks
+		// 20 token 的窗口额度：40 次拒绝每次约预占 1 token 就足以吃光它
+		// —— 修复前这些预占都不退，窗口会被占满。
+		//
+		// 额度取得这么小是有意的：断言必须精确落在「配额拒绝」这条路径上，
+		// 不能被「TPM 拒绝」抢先（两者都是 429，不看 error code 分不出来）。
+		cp.TPMLimit = 20
+		newKeys[hash] = &cp
+	}
+	snapshot.Init(&snapshot.Snapshot{
+		Routes: old.Routes, Providers: old.Providers, KeysByHash: newKeys,
+		UsersByID: old.UsersByID, Runtime: old.Runtime,
+	})
+
+	// 库侧：配额 100，已用 100 → 剩余 0（每次请求都会被配额拒绝）。
+	if err := db.UpdateAccessKey(context.Background(), "k1", &store.AccessKey{
+		ID: "k1", Name: "t", Enabled: true, QuotaTokens: 100, UserID: testUserID,
+	}); err != nil {
+		t.Fatalf("set quota: %v", err)
+	}
+	if err := db.CreateUsageRecord(context.Background(), &store.UsageRecord{
+		ID: "seed-1", AccessKeyID: "k1", UserID: testUserID, PublicModel: "flash",
+		IngressProtocol: "openai-chat", TotalTokens: 100, UsageState: "reported", Status: "ok",
+	}); err != nil {
+		t.Fatalf("seed usage: %v", err)
+	}
+
+	// 反复触发**配额**拒绝：请求体保持极小（每次只预占约 1 token），
+	// 这样 40 次就能吃光 20 token 的 TPM 窗口，而最后一次成功请求仍需要
+	// 至少 1 token —— 修复前它会被 TPM 拒绝。
+	//
+	// 断言 error code 是 insufficient_quota 而不是 rate_limit_exceeded：
+	// 两者都是 429，不区分的话「请求被 TPM 提前拒了」会让本用例假绿。
+	const rejects = 40
+	for i := 0; i < rejects; i++ {
+		rec := e2ePost(h, "/v1/chat/completions", testAccessKey, e2eChatBody("flash", false))
+		if rec.Code != http.StatusTooManyRequests {
+			t.Fatalf("D1b 第 %d 次期望 429，实际 %d body=%s", i+1, rec.Code, rec.Body.String())
+		}
+		if !strings.Contains(rec.Body.String(), "insufficient_quota") {
+			t.Fatalf("D1b 第 %d 次期望 insufficient_quota，实际 body=%s —— "+
+				"被 TPM 抢先拒了会让本用例失去意义", i+1, rec.Body.String())
+		}
+	}
+	if up.Count() != 0 {
+		t.Fatalf("D1b 配额已尽却打了上游 %d 次", up.Count())
+	}
+
+	// 现在把配额放开：下一个请求必须**通得过**（TPM 额度没被配额拒绝吃掉）。
+	if err := db.UpdateAccessKey(context.Background(), "k1", &store.AccessKey{
+		ID: "k1", Name: "t", Enabled: true, QuotaTokens: 100_000, UserID: testUserID,
+	}); err != nil {
+		t.Fatalf("raise quota: %v", err)
+	}
+	rec := e2ePost(h, "/v1/chat/completions", testAccessKey, e2eChatBody("flash", false))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("D1b 放开配额后期望 200，实际 %d body=%s —— "+
+			"配额拒绝的请求把 TPM 额度吃掉了（P0-8 未修）", rec.Code, rec.Body.String())
+	}
+}
+
 // D2：RPM 超限 → 429 + Retry-After，且不碰上游。
 func TestE2E_D2_RPMExceededRejectsWithoutTouchingUpstream(t *testing.T) {
 	up := newFakeUpstream(t, replyOK("pong"))
@@ -930,8 +1018,41 @@ func TestE2E_D4_ReservationReleasedAfterChainExhausted(t *testing.T) {
 
 	rec := e2ePost(h, "/v1/chat/completions", testAccessKey, e2eChatBodyMaxTokens("flash", 200))
 	t.Logf("D4 status=%d body=%s", rec.Code, strings.TrimSpace(rec.Body.String()))
-	if rec.Code < 500 {
-		t.Fatalf("D4 期望 5xx（链耗尽），实际 %d", rec.Code)
+	if rec.Code != http.StatusBadGateway {
+		t.Fatalf("D4 链耗尽应以 502 写出，实际 %d body=%s", rec.Code, rec.Body.String())
+	}
+	var envelope struct {
+		Error struct {
+			Type    string `json:"type"`
+			Message string `json:"message"`
+		} `json:"error"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &envelope); err != nil {
+		t.Fatalf("D4 错误信封不是合法 JSON: %v body=%s", err, rec.Body.String())
+	}
+	if envelope.Error.Type != "api_error" || envelope.Error.Message == "" {
+		t.Fatalf("D4 错误信封 type=%q message=%q，期望非空 api_error",
+			envelope.Error.Type, envelope.Error.Message)
+	}
+	// 链耗尽确实打过上游：证明这个响应来自真实尝试失败，而不是在入口处
+	// 被别的校验挡住后「碰巧也是 502」。
+	if got := bad.Count(); got != 1 {
+		t.Fatalf("D4 上游调用次数 = %d，期望 1 次失败尝试", got)
+	}
+
+	rows := e2eWaitUsageCount(t, db, "k1", 1)
+	t.Logf("D4 usage 行: %+v", rows[0])
+	if rows[0].Status != "error" {
+		t.Errorf("D4 usage.status=%q，期望 error", rows[0].Status)
+	}
+	if rows[0].HTTPStatus != http.StatusBadGateway {
+		t.Errorf("D4 usage.http_status=%d，期望 502（与实际响应一致）", rows[0].HTTPStatus)
+	}
+	if rows[0].ErrorCode != "upstream_error" {
+		t.Errorf("D4 usage.error_code=%q，期望 upstream_error", rows[0].ErrorCode)
+	}
+	if rows[0].ProviderID != "bad" {
+		t.Errorf("D4 usage.provider_id=%q，期望归因到实际尝试的 bad", rows[0].ProviderID)
 	}
 	e2eWaitReservedZero(t, db, "k1", "D4 失败收尾")
 
@@ -1022,6 +1143,269 @@ func TestE2E_F1_ClientDisconnectReleasesUpstreamAndMarksCanceled(t *testing.T) {
 	e2eWaitReservedZero(t, db, "k1", "F1 客户端断开收尾")
 }
 
+// F1-b：客户端中断**必须占用终身 token 配额**（2026-10-21 修 A4-P1-1 / 汇总 F1）。
+//
+// # 为什么这条是「可主动利用」的缺陷
+//
+// 客户端发一个请求，收到第一个 token 后立刻断开：
+//  1. 上游已经生成了 N 个 token 并计费；
+//  2. 网关记 status="canceled"、usage_state="missing"、cost_total=0；
+//  3. trg_update_used_tokens 触发器累加 NEW.total_tokens = 0
+//     → access_keys.used_tokens 不涨；
+//  4. rate.releaseQuota() 把 est 预占全额退回 → 预占也不涨。
+//
+// 于是「点停止」= 免费消耗上游 token + 完全绕过终身 token 配额。重复 N 次即可。
+//
+// # 断言
+//
+// 中断后：usage 落库的 total_tokens > 0（不是 0），且 key 的 used_tokens 涨了。
+// 这两条合起来说明「消耗被记下来了」；缺任何一条，配额都仍可被绕过
+// （一条是账、另一条是闸）。
+func TestE2E_F1b_ClientDisconnectStillConsumesTokenQuota(t *testing.T) {
+	up := newDisconnectingUpstream(t)
+	h, db := buildHarness(t, []struct {
+		slug, url string
+		fail      bool
+	}{{slug: "slow", url: up.srv.URL}}, false)
+
+	// 配额给足，避免中途被 429 打断（这条要测的是「记不记账」，
+	// 不是「配额够不够」）。
+	if err := db.UpdateAccessKey(context.Background(), "k1", &store.AccessKey{
+		ID: "k1", Name: "t", Enabled: true, QuotaTokens: 100_000, UserID: testUserID,
+	}); err != nil {
+		t.Fatalf("set quota: %v", err)
+	}
+
+	usedBefore := e2eKeyUsedTokens(t, db, "k1")
+
+	ctx, cancel := context.WithCancel(context.Background())
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions",
+		strings.NewReader(e2eChatBody("flash", true))).WithContext(ctx)
+	req.Header.Set("Authorization", "Bearer "+testAccessKey)
+
+	// 用带信号的自定义 writer，而不是 httptest.ResponseRecorder：
+	// ResponseRecorder 的 Body 不是并发安全的，而这里要在**另一个 goroutine**
+	// 正在写的同时读「网关是否已经吐出第一片」。
+	w := newSignalingRecorder()
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		middlewareForTest(h).ServeHTTP(w, req)
+	}()
+
+	// 必须等到**网关已经把首片写给下游**才能取消。
+	//
+	// 只等「上游收到了请求」是不够的：上游写完首片只说明字节进了 socket，
+	// 网关可能还没消费到它。此时 cancel() 会让网关在「拿到首个事件之前」
+	// 就走掉 —— 那条路径根本没提交（usage_state="none"、total_tokens=0），
+	// 测的就不是「已提交后被中断」这条路径了。
+	//
+	// 等「下游收到了首片」才是正确的同步点：它证明网关已经消费了首个事件、
+	// 已经写了 SSE 头、已经进入事件循环。
+	select {
+	case <-w.wrote:
+	case <-time.After(5 * time.Second):
+		cancel()
+		wg.Wait()
+		t.Fatal("网关一直没把首片写给下游 —— harness 或链路有问题，没测到目标路径")
+	}
+	cancel()
+	wg.Wait()
+
+	rows := e2eWaitUsageCount(t, db, "k1", 1)
+	t.Logf("F1b usage 行: %+v", rows[0])
+
+	// 断言 1：落库的 token 数不是 0。
+	if rows[0].TotalTokens <= 0 {
+		t.Errorf("客户端中断后 total_tokens=%d —— 上游已生成的 token 没被记账，"+
+			"「点停止」即可免费消耗上游 token", rows[0].TotalTokens)
+	}
+	if rows[0].UsageState == "missing" {
+		t.Errorf("客户端中断后 usage_state=missing —— 有内容却报「上游没报 usage」，" +
+			"成本口径被漏记")
+	}
+	// 断言 2：key 的 used_tokens 涨了（触发器真的累加了）。
+	usedAfter := e2eWaitKeyUsedTokens(t, db, "k1", usedBefore)
+	t.Logf("F1b used_tokens: %d -> %d", usedBefore, usedAfter)
+	if usedAfter <= usedBefore {
+		t.Errorf("客户端中断后 key 的 used_tokens 没涨（%d -> %d）—— "+
+			"终身 token 配额被完全绕过", usedBefore, usedAfter)
+	}
+}
+
+// F1-c：**下游写失败**（不是客户端主动断开）也必须落成非成功终态，
+// 且只记一次账（2026-10-21 修 *X12 / A11-T3）。
+//
+// # 为什么 F1 系列之外还要单独一条
+//
+// F1 覆盖的是「客户端取消 ctx」；这一条覆盖的是「字节写不进已死的连接」。
+// 两条路径的代码位置不同：F1 由 ctx 取消驱动，这一条由 sink 记录写失败后
+// 主循环主动 Close 上游流驱动。旧实现在这条路径上把残缺流当成 status=ok
+// 收尾 —— 既不进熔断计数，用量里也无痕，而上游的 token 已经烧掉了。
+//
+// # 断言
+//
+//  1. usage.status 是 canceled（下游不可用，不是上游故障）；
+//  2. error_code 是 downstream_write_failed（运维要能区分「客户端走了」
+//     与「我们写不进去」）；
+//  3. 只有一行 usage（不能重复记账）；
+//  4. 预占归零。
+func TestE2E_F1c_DownstreamWriteFailureMarksCanceled(t *testing.T) {
+	up := newTrickleUpstream(t, 12, 10*time.Millisecond)
+	h, db := buildHarness(t, []struct {
+		slug, url string
+		fail      bool
+	}{{slug: "slow", url: up.srv.URL}}, false)
+
+	if err := db.UpdateAccessKey(context.Background(), "k1", &store.AccessKey{
+		ID: "k1", Name: "t", Enabled: true, QuotaTokens: 100_000, UserID: testUserID,
+	}); err != nil {
+		t.Fatalf("set quota: %v", err)
+	}
+
+	// 先允许几次成功写（SSE 头与首片），之后每次写都失败。
+	// 前几次必须成功，否则网关根本进不了事件循环，测的就不是这条路径。
+	w := newFailingWriterAfter(3, errors.New("write: broken pipe"))
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		middlewareForTest(h).ServeHTTP(w, streamingChatRequest("flash"))
+	}()
+
+	// 同步点：等下游确实收到了首片，证明网关已进入事件循环。
+	select {
+	case <-w.wrote:
+		t.Log("F1c 下游已收到首片，之后写入将失败")
+	case <-time.After(5 * time.Second):
+		w.failNow()
+		wg.Wait()
+		t.Fatal("F1c 网关一直没把首片写给下游 —— harness 或链路有问题")
+	}
+	w.failNow()
+	wg.Wait()
+
+	rows := e2eWaitUsageCount(t, db, "k1", 1)
+	if len(rows) != 1 {
+		t.Fatalf("F1c 写失败后 usage 行数 = %d，期望恰好 1 行（重复记账）", len(rows))
+	}
+	got := rows[0]
+	t.Logf("F1c usage 行: %+v", got)
+	if got.Status != "canceled" {
+		t.Errorf("F1c usage.status=%q，期望 canceled —— 下游写失败被当成成功收尾，"+
+			"残缺流既不进熔断也无痕", got.Status)
+	}
+	if got.ErrorCode != "downstream_write_failed" {
+		t.Errorf("F1c usage.error_code=%q，期望 downstream_write_failed —— "+
+			"运维无法区分「客户端自己走了」与「我们写不进去」", got.ErrorCode)
+	}
+	e2eWaitReservedZero(t, db, "k1", "F1c 写失败收尾")
+}
+
+// failingWriter 是一个受控失败的 ResponseWriter：failNow 之后的每次写都
+// 返回错误，之前的写正常收集。
+//
+// 需要 mutex：handler goroutine 在写，测试 goroutine 在读「写到了没有」。
+type failingWriter struct {
+	mu     sync.Mutex
+	buf    bytes.Buffer
+	code   int
+	failed bool
+	err    error
+	// after 是开始失败前允许的成功写次数（0 = 立即失败）。
+	after int
+
+	wrote     chan struct{}
+	wroteOnce sync.Once
+}
+
+func newFailingWriterAfter(after int, err error) *failingWriter {
+	return &failingWriter{after: after, err: err, wrote: make(chan struct{})}
+}
+
+// failNow 让后续所有写入失败。
+func (w *failingWriter) failNow() {
+	w.mu.Lock()
+	w.failed = true
+	w.mu.Unlock()
+}
+
+func (w *failingWriter) Header() http.Header {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.code == 0 {
+		w.code = http.StatusOK
+	}
+	return http.Header{}
+}
+
+func (w *failingWriter) Write(b []byte) (int, error) {
+	w.mu.Lock()
+	failWrite := w.failed || w.after == 0
+	err := w.err
+	if !failWrite {
+		w.after--
+		n, werr := w.buf.Write(b)
+		w.mu.Unlock()
+		w.wroteOnce.Do(func() { close(w.wrote) })
+		return n, werr
+	}
+	w.mu.Unlock()
+	return 0, err
+}
+
+func (w *failingWriter) WriteHeader(code int) {
+	w.mu.Lock()
+	if w.code == 0 {
+		w.code = code
+	}
+	w.mu.Unlock()
+}
+
+func (w *failingWriter) Body() string {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.buf.String()
+}
+
+// streamingChatRequest 组装一个流式 chat 请求（F1 系列共用）。
+func streamingChatRequest(model string) *http.Request {
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions",
+		strings.NewReader(e2eChatBody(model, true)))
+	req.Header.Set("Authorization", "Bearer "+testAccessKey)
+	return req
+}
+
+// e2eKeyUsedTokens 读 access_keys.used_tokens（终身 token 用量）。
+func e2eKeyUsedTokens(t *testing.T, db *store.Store, keyID string) int64 {
+	t.Helper()
+	var v int64
+	if err := db.DB().QueryRowContext(context.Background(),
+		`SELECT used_tokens FROM access_keys WHERE id = ?`, keyID).Scan(&v); err != nil {
+		t.Fatalf("读 used_tokens: %v", err)
+	}
+	return v
+}
+
+// e2eWaitKeyUsedTokens 轮询等待 used_tokens 超过 before。
+//
+// 落库是异步的（usage worker 批量刷），所以这是个「等一段时间后断言」的路子。
+func e2eWaitKeyUsedTokens(t *testing.T, db *store.Store, keyID string, before int64) int64 {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		v := e2eKeyUsedTokens(t, db, keyID)
+		if v > before {
+			return v
+		}
+		if time.Now().After(deadline) {
+			return v
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
 // =====================================================================
 // E. 快照生效（改配置后不重启，数据面立刻按新配置工作）
 // =====================================================================
@@ -1038,8 +1422,7 @@ func TestE2E_F1_ClientDisconnectReleasesUpstreamAndMarksCanceled(t *testing.T) {
 //
 // 所以这里把 provider / credential / 上游模型 / route / 链 / 用户 / key 全部
 // 写进 DB，再用生产同一个 snapshot.RebuildFromDB + runtimeReloader 建运行时。
-// masterKey 传 nil：DecryptWithFallback 在无主密钥时按明文返回（见其注释），
-// 省掉在测试里生成密钥的噪音，而这条路径本身也是被支持的历史兼容路径。
+// 凭据按当前版本的 AES-256-GCM 格式写入，池重建也使用同一把主密钥。
 func e2eDBHarness(t *testing.T, endpoint string) (http.Handler, *store.Store, *runtimeReloader) {
 	t.Helper()
 
@@ -1073,9 +1456,14 @@ func e2eDBHarness(t *testing.T, endpoint string) (http.Handler, *store.Store, *r
 	}); err != nil {
 		t.Fatalf("seed provider: %v", err)
 	}
+	masterKey := sha256.Sum256([]byte("e2e current-format credential key"))
+	encCredential, err := crypto.Encrypt([]byte("sk-good"), masterKey[:])
+	if err != nil {
+		t.Fatalf("encrypt seed credential: %v", err)
+	}
 	if err := db.CreateCredential(ctx, &store.Credential{
 		ID: "cred1", ProviderID: "good", Label: "k",
-		APIKeyEnc: []byte("sk-good"), Enabled: true, Weight: 1, Status: "healthy",
+		APIKeyEnc: encCredential, Enabled: true, Weight: 1, Status: "healthy",
 	}); err != nil {
 		t.Fatalf("seed credential: %v", err)
 	}
@@ -1103,7 +1491,7 @@ func e2eDBHarness(t *testing.T, endpoint string) (http.Handler, *store.Store, *r
 	}
 
 	pool := upstream.NewPool(logger)
-	reloader := &runtimeReloader{db: db, masterKey: nil, pool: pool, cfg: cfg, logger: logger}
+	reloader := &runtimeReloader{db: db, masterKey: masterKey[:], pool: pool, cfg: cfg, logger: logger}
 	if err := reloader.Reload(ctx); err != nil {
 		t.Fatalf("首次 reload: %v", err)
 	}
@@ -1887,4 +2275,57 @@ func TestE2E_Adv10_ConcurrentSameRequestIDChargesOnce(t *testing.T) {
 		t.Errorf("Adv10 并发幂等失效：实扣 ≈%.4f 元，单条 cost=%.4f 元，%d 条合计=%.4f 元 —— "+
 			"同一次调用被并发扣了多次", charged, single, n, totalCost)
 	}
+}
+
+// signalingRecorder 是一个会在**第一次写出字节**时发信号的 ResponseWriter。
+//
+// # 为什么不用 httptest.ResponseRecorder
+//
+// ResponseRecorder 的 Body 是一个 bytes.Buffer，**不是并发安全的**。
+// 而这条用例需要在 handler goroutine 正在写的同时读「写到了没有」，
+// 直接读会触发数据竞争（go test -race 会报），而 race 下的断言结果
+// 本身就是不可信的。
+//
+// 这里用一个 mutex 保护 buffer，信号用 once + channel 发出。
+type signalingRecorder struct {
+	mu        sync.Mutex
+	buf       bytes.Buffer
+	code      int
+	wrote     chan struct{}
+	wroteOnce sync.Once
+}
+
+func newSignalingRecorder() *signalingRecorder {
+	return &signalingRecorder{wrote: make(chan struct{})}
+}
+
+func (s *signalingRecorder) Header() http.Header {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.code == 0 {
+		s.code = http.StatusOK
+	}
+	return http.Header{}
+}
+
+func (s *signalingRecorder) Write(b []byte) (int, error) {
+	s.mu.Lock()
+	n, err := s.buf.Write(b)
+	s.mu.Unlock()
+	s.wroteOnce.Do(func() { close(s.wrote) })
+	return n, err
+}
+
+func (s *signalingRecorder) WriteHeader(code int) {
+	s.mu.Lock()
+	if s.code == 0 {
+		s.code = code
+	}
+	s.mu.Unlock()
+}
+
+func (s *signalingRecorder) Body() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.buf.String()
 }

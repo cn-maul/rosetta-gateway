@@ -466,10 +466,20 @@ func balanceExempt(userID string) bool {
 // 货币单位，避免「元/分」在两处各算一遍后出现舍入差（预检以为够、实际差
 // 一分钱被拒）。
 //
-// 计价公式与 store.priceUsage **同源**（同样的三项、同样的 1e6 换算）。
-// 这里不复用 store 的函数是因为 priceUsage 是包私有的，而热路径在
-// cmd/gateway 层。两处若漂移，后果比不预检更糟：用户会在「明明够钱」时被拒。
-// 故改任一侧口径都必须同步另一侧。
+// # 计价公式现在**与实扣同源**（2026-10-21 修 A4-P1-3 / 汇总 F3）
+//
+// 审计前这里是**手抄的第二份公式**，兜底规则与实扣的 store.priceUsage
+// 不同（少了缓存价这一项），后果是：只配了 price_cache_hit 的模型在预检
+// 侧被判成「完全未配价」→ 提前 return 0 → **fail-open 漏放行**（余额 1 元
+// 的用户可以持续刷到余额耗尽，而实扣照收缓存价）。
+//
+// 现在两侧都走 store.Prices / store.EstimateUpperBoundCost：
+//   - 单价来自同一份 Prices，兜底规则**逐字一致**；
+//   - 实扣用 store.PriceUsage，预检用 store.EstimateUpperBoundCost，
+//     两者共用同一份 EffectivePrices 解析结果。
+//
+// 换句话说：预检估出的值 **≥** 实扣值（保守方向仍然正确），但
+// 「哪些 token 收费」的口径不再可能分叉。
 func estimateBalanceCost(req *rosetta.ChatRequest, m *routing.UpstreamModel) int64 {
 	var b strings.Builder
 	b.WriteString(req.System)
@@ -487,29 +497,17 @@ func estimateBalanceCost(req *rosetta.ChatRequest, m *routing.UpstreamModel) int
 		b.WriteString(string(t.Parameters))
 	}
 	inTokens := int64(rosetta.EstimateTokens(b.String()))
-	inPrice := m.PriceInput
-	outPrice := m.PriceOutput
-	if inPrice <= 0 && outPrice <= 0 {
-		// 未配价模型：cost_total 恒 0，扣费也是 0。预检放行（Lead 口径：
-		// 未配价不拒绝，admin 与普通用户一样），返回 0 让判定自然放行。
-		return 0
-	}
-	// 守卫：单价可能只配了输入价或只配了输出价。缺哪一项就用另一项兜底，
-	// 避免「只配了输出价」的模型因 inPrice=0 让输入侧完全免费、严重低估
-	// 本次开销。兜底方向是「取已配价里另一个」，偏保守。
-	if inPrice <= 0 {
-		inPrice = outPrice
-	}
-	if outPrice <= 0 {
-		outPrice = inPrice
-	}
 	// 输出侧按 max_tokens 全额计上界；客户端没给（<=0）时回落模型配置的最大
 	// 输出 —— 都拿不到就只按输入算（下界，宁可不高估）。
 	maxOut := int64(req.MaxOutputTokens)
 	if maxOut <= 0 {
 		maxOut = int64(m.MaxOutputTokens)
 	}
-	cost := (float64(inTokens)*inPrice + float64(maxOut)*outPrice) / 1_000_000.0
+	cost := store.EstimateUpperBoundCost(store.Prices{
+		Input:    m.PriceInput,
+		CacheHit: m.PriceCacheHit,
+		Output:   m.PriceOutput,
+	}, inTokens, maxOut)
 	return yuanToCents(cost)
 }
 
@@ -628,8 +626,11 @@ func chainHasPricedModel(cands []routing.Candidate) bool {
 		if c.UpstreamModel == nil {
 			continue
 		}
-		if c.UpstreamModel.PriceInput > 0 || c.UpstreamModel.PriceOutput > 0 ||
-			c.UpstreamModel.PriceCacheHit > 0 {
+		if (store.Prices{
+			Input:    c.UpstreamModel.PriceInput,
+			CacheHit: c.UpstreamModel.PriceCacheHit,
+			Output:   c.UpstreamModel.PriceOutput,
+		}).Priced() {
 			return true
 		}
 	}

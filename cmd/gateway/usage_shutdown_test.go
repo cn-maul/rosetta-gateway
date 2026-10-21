@@ -161,21 +161,3 @@ func TestOutcomeFromErr_NormalErrorsUnchanged(t *testing.T) {
 		t.Fatalf("普通错误退化成空信封：code=%q msg=%q", out.code, out.message)
 	}
 }
-
-// 写出处那道兜底：即使将来有人再引入返回 200 的失败分支，
-// 最终写给客户端的也必须是 >=400（逻辑与 main 内的兜底一致）。
-func TestChainExhaustedNeverWritesOK(t *testing.T) {
-	for _, in := range []int{0, http.StatusOK} {
-		statusCode, code, message := in, "upstream_error", ""
-		if statusCode == 0 || statusCode == http.StatusOK {
-			statusCode, code, message = http.StatusBadGateway, "upstream_error",
-				"no available upstream provider"
-		}
-		if statusCode < 400 {
-			t.Fatalf("输入 %d 最终仍以 %d 写出 —— 客户端会把它当成成功", in, statusCode)
-		}
-		if code == "" || message == "" {
-			t.Fatalf("输入 %d 的兜底错误信封为空", in)
-		}
-	}
-}

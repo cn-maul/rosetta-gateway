@@ -16,6 +16,7 @@ import (
 	"github.com/cn-maul/rosetta-gateway/internal/routing"
 	"github.com/cn-maul/rosetta-gateway/internal/snapshot"
 	"github.com/cn-maul/rosetta-gateway/internal/store"
+	"github.com/cn-maul/rosetta-gateway/internal/upstream"
 )
 
 // 上游「先返 200 并发出一个事件，然后直接断流」—— 最常见的一类真实故障。
@@ -95,14 +96,13 @@ func TestCircuitBreaker_NonStreamFailureIsCounted(t *testing.T) {
 	h, _, pool := buildHarnessFull(t, []struct {
 		slug, url string
 		fail      bool
-	}{{"p1", bad.URL, true}}, false, openaiChatCodec{})
+	}{{"p1", bad.URL, true}}, true, openaiChatCodec{})
+	initFailoverRuntimeForTest(t, 1, 1)
 
 	const targetID = "p1#t0"
-	for i := 0; i < 3; i++ {
-		postChat(h, "flash")
-	}
+	postChat(h, "flash")
 	if pool.TargetAvailable(targetID) {
-		t.Errorf("连续 3 次非流式失败后目标仍可用，熔断未触发")
+		t.Errorf("非流式失败后目标仍可用，熔断未触发")
 	}
 }
 
@@ -116,22 +116,31 @@ func TestCircuitBreaker_SurvivesPoolReinstall(t *testing.T) {
 	h, _, pool := buildHarnessFull(t, []struct {
 		slug, url string
 		fail      bool
-	}{{"p1", bad.URL, true}}, false, openaiChatCodec{})
+	}{{"p1", bad.URL, true}}, true, openaiChatCodec{})
+	initFailoverRuntimeForTest(t, 1, 1)
 
 	const targetID = "p1#t0"
-	for i := 0; i < 3; i++ {
-		postChat(h, "flash")
-	}
+	postChat(h, "flash")
 	if pool.TargetAvailable(targetID) {
 		t.Fatalf("前置条件不成立：目标未熔断")
 	}
 
 	// 模拟一次 admin 写操作后的重建。liveTargetIDs 仍含该 target。
-	pool.Install(pool.ProvidersSnapshot(), map[string]bool{targetID: true})
+	pool.Install(pool.ProvidersSnapshot(), upstream.LiveTargets{IDs: map[string]bool{targetID: true}, Known: true})
 
 	if pool.TargetAvailable(targetID) {
 		t.Errorf("重建后仍在熔断期内的目标被恢复可用：熔断状态没有跨 Install 保留")
 	}
+}
+
+// initFailoverRuntimeForTest 只覆盖熔断策略，保留夹具已经装好的鉴权与路由，
+// 避免用一份残缺快照把测试失败误归因到数据面逻辑。
+func initFailoverRuntimeForTest(t *testing.T, maxTargets, threshold int) {
+	t.Helper()
+	snap := *snapshot.Get()
+	snap.Runtime.FailoverMaxTargets = maxTargets
+	snap.Runtime.FailoverFailureThreshold = threshold
+	snapshot.Init(&snap)
 }
 
 // 已从配置中删除的 target，其熔断条目必须被丢弃 —— targetID 每次保存链都
@@ -150,7 +159,7 @@ func TestCircuitBreaker_InstallDropsDeletedTargets(t *testing.T) {
 	}
 
 	// 重建且目标已从库中消失。
-	pool.Install(pool.ProvidersSnapshot(), map[string]bool{})
+	pool.Install(pool.ProvidersSnapshot(), upstream.LiveTargets{IDs: map[string]bool{}, Known: true})
 
 	// 目标不在 live 集合里 → 条目被丢弃 → 等价于「全新目标」，默认可用。
 	if !pool.TargetAvailable("p1#t0") {

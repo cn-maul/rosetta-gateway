@@ -243,6 +243,17 @@ func TestApplyThinkingCapability_档位处理(t *testing.T) {
 //
 // 本测试改为断言**最终发往上游的 budget_tokens**，即整条链路真正的落点：
 // 入站预算 → 折算档位（rawEffort）→ 网关夹取 → SDK 三档折算 → 实发预算。
+//
+// # 2026-10-21 修 A2-P1-3 后的口径变化
+//
+// 本测试覆盖的是**跨协议**路径（Anthropic 入站 → Anthropic 上游但由
+// 「折算档位」驱动的那一支），而 Anthropic→Anthropic 现在走**原样透传**
+// （预算不折算，见 TestApplyThinkingCapability_Anthropic预算原样透传）。
+//
+// 两条路的区分点是 ingressRequest.anthropicBudget：它 > 0 表示
+// 「客户端给的是 Anthropic token 预算」，此时网关不折算；本测试构造的
+// ingressRequest 只有 rawEffort（anthropicBudget = 0），走的正是
+// 「只有档位可用」的那一支 —— 也就是跨协议时会发生的情形。
 func TestApplyThinkingCapability_Anthropic预算与夹取一致(t *testing.T) {
 	cases := []struct {
 		name     string
@@ -306,6 +317,65 @@ func TestApplyThinkingCapability_Anthropic预算与夹取一致(t *testing.T) {
 			}
 			if req.Thinking.EffortRaw != "" {
 				t.Fatalf("EffortRaw = %q，Anthropic 无此字段，发上去会被拒", req.Thinking.EffortRaw)
+			}
+		})
+	}
+}
+
+// TestApplyThinkingCapability_Anthropic预算原样透传 钉住 A2-P1-3 的修复。
+//
+// 回归风险很具体：预算与档位**不可逆互转**，所以「预算 → 档位 → 预算」
+// 这条折返链必然失真，而且两个方向的失真还不一致：
+//
+//	budget=5000   → medium → 折回 8192   （↑ 客户端要省，网关多花 64%）
+//	budget=100000 → high   → 折回 32768  （↓ 客户端要深思考，网关只给 1/3）
+//
+// Anthropic→Anthropic 不跨协议、客户端给的就是 token 预算、上游收的也该是
+// 同一个预算 —— 任何折算都是纯亏损。
+//
+// 更严重的是它会连带**放大 max_tokens**：SDK 的 plan() 在
+// 「budget >= maxTokens」时把 max_tokens 涨到 budget+4096
+// （客户端 max_tokens=100 + budget=5000 → 上游收 max_tokens=12288，
+// 放大 122 倍）。max_tokens 直接决定上游输出上限与**计费**。
+func TestApplyThinkingCapability_Anthropic预算原样透传(t *testing.T) {
+	cases := []struct {
+		name   string
+		budget int
+		levels []effort.Level
+	}{
+		{"预算 2048 落在 low 档", 2048, []effort.Level{effort.Low}},
+		// 5000 落在 medium 档，但 SDK 折回 8192 —— 放大 64%。
+		{"预算 5000 落在 medium 档", 5000, []effort.Level{effort.Medium}},
+		// 100000 落在 high 档，但 SDK 折回 32768 —— 缩到 1/3。
+		{"预算 100000 落在 high 档", 100000, []effort.Level{effort.High}},
+		// 档位被夹到 low 也不该动预算：夹取描述的是「档位」，
+		// 而 Anthropic 上游根本不收档位。
+		{"档位被夹到 low 也不动预算", 40000, []effort.Level{effort.Low}},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			req := &rosetta.ChatRequest{
+				Model: "public",
+				Thinking: &rosetta.ThinkingConfig{
+					BudgetTokens: c.budget,
+				},
+			}
+			ing := &ingressRequest{rawEffort: "high", anthropicBudget: c.budget}
+			ing.applyThinkingCapability(req, &routing.UpstreamModel{
+				ModelID: "claude", EffortLevels: c.levels,
+			}, "anthropic")
+
+			if req.Thinking.BudgetTokens != c.budget {
+				t.Fatalf("BudgetTokens = %d，期望原样透传 %d —— 折算链会让预算"+
+					"被放大或缩小，且两个方向不一致", req.Thinking.BudgetTokens, c.budget)
+			}
+			if req.Thinking.Effort != rosetta.EffortUnset {
+				t.Fatalf("Effort = %q，Anthropic 路径不该留档位（它只认预算）",
+					req.Thinking.Effort)
+			}
+			if req.Thinking.EffortRaw != "" {
+				t.Fatalf("EffortRaw = %q，Anthropic 无此字段，发上去会被拒",
+					req.Thinking.EffortRaw)
 			}
 		})
 	}

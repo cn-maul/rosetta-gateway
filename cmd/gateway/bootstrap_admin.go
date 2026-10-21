@@ -190,8 +190,11 @@ func ensureBootstrapToken(ctx context.Context, db bootstrapTokenStore, logger *s
 		// 重启时令牌已存在：**不要**覆盖、不要重复打印。
 		// 覆盖会让运维手里那份失效；重复打印等于在每次重启时把同一个
 		// 凭据再往日志里摊一次。
-		logger.Info("bootstrap token already set; reuse the one printed at first start",
-			"hint", "日志若已轮转丢失，请删除该部署的 app_settings.bootstrap_token 后重启以重新生成")
+		logger.Info("bootstrap token already set; reuse the one from the environment or the database",
+			"hint", "从数据库读回："+
+				"sqlite3 <data>/gateway.db \"SELECT value FROM app_settings WHERE key='bootstrap_token'\"\u2014—"+
+				"若令牌已丢失且引导仍未完成，请删除该部署的 "+
+				"app_settings.bootstrap_token 后重启以重新生成")
 		return nil
 	}
 
@@ -237,15 +240,30 @@ func ensureBootstrapToken(ctx context.Context, db bootstrapTokenStore, logger *s
 			fmt.Errorf("persist bootstrap token: %w", err))
 	}
 
-	// 令牌只打一次、只进日志。绝不能进 HTTP 响应：BootstrapStatus 是
-	// 免鉴权端点，把令牌放进去等于取消了这个令牌。
+	// 令牌**不进日志**（2026-10-21 修 A10-P1-1）。
+	//
+	// 令牌是「尚未完成引导」这个事实的**唯一持有证明**。
+	// 它只进日志 = 把这个证明复制进了日志系统：日志会轮转、会被聚合到集中式日志平台、
+	// 甚至会进备份。任何能读这些地方的人都能在引导窗口仍开时
+	// 抢先设密码 —— 而日志本身并不是「保密」的位置。
+	//
+	// 优先级排序（从强到弱）：
+	//  1. 显式设置 ROSETTA_GW_BOOTSTRAP_TOKEN 环境变量 —— 值由部署者自己持有，
+	//     日志里不需要出现它（本条就是默认路径）；
+	//  2. 从数据库里读回（下面的命令）—— 局域、短寿命，
+	//     但要依赖不会把数据库备份到开放位置的部署规范；
+	//  3. 完全不打印（只说「已生成」）。
+	//
+	// 读回令牌的命令这里给出（下面的命令不会含日志，不会泄露到日志里）。
 	logger.Warn("首次引导令牌已生成 —— 完成首次设置密码时必须填写它",
-		"token", token,
 		"source", map[bool]string{true: "环境变量 " + bootstrapTokenEnv, false: "本次启动随机生成"}[fromEnv],
+		"how_to_read_it", "从数据库读回（不会进日志）："+
+			"sqlite3 <data>/gateway.db \"SELECT value FROM app_settings WHERE key='bootstrap_token'\"",
 		"how_to_use", "打开 /admin/ 的「首次设置密码」表单，粘贴此令牌后设置密码；"+
 			"设置成功后本令牌立即作废",
 		"recommendation", "生产环境建议显式设置 "+bootstrapTokenEnv+
-			"，避免令牌只能从日志里获取")
+			"（值由部署者自己持有，日志里不会出现）；"+
+			"若已经生成了但还没取过，可以从上面的命令读回")
 	return nil
 }
 

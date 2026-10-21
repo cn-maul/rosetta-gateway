@@ -7,7 +7,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io/fs"
 	"log/slog"
 	"math"
 	"net/http"
@@ -23,7 +22,6 @@ import (
 	"time"
 
 	"github.com/cn-maul/rosetta"
-	"github.com/cn-maul/rosetta-gateway/internal/admin"
 	"github.com/cn-maul/rosetta-gateway/internal/auth"
 	"github.com/cn-maul/rosetta-gateway/internal/config"
 	"github.com/cn-maul/rosetta-gateway/internal/crypto"
@@ -38,7 +36,6 @@ import (
 	"github.com/cn-maul/rosetta-gateway/internal/store"
 	"github.com/cn-maul/rosetta-gateway/internal/upstream"
 	"github.com/cn-maul/rosetta-gateway/internal/userauth"
-	"github.com/cn-maul/rosetta-gateway/internal/webui"
 )
 
 // homeEnvVar 是状态根目录的环境变量名。
@@ -92,6 +89,68 @@ func slogLevel(name string) slog.Level {
 		return slog.LevelError
 	default:
 		return slog.LevelInfo
+	}
+}
+
+// healthzPinger 是健康检查需要的最小存储能力。
+//
+// 抽成接口只有一个理由：**可测**。要验证「数据库不可用时响应体不得
+// 回显底层错误」，就得能造一个 ping 失败的存储 —— 真把数据库弄坏
+// 不可靠（Windows 上 SQLite 的文件锁行为与 Linux 不同），而这里要测的
+// 恰恰是错误路径。
+type healthzPinger interface {
+	Ping(ctx context.Context) error
+}
+
+// healthzDirty 是「运行时是否落后于数据库」的判据。
+//
+// 同样抽出来是为了可测：reloader 的 dirty 标志是 unexported 字段，
+// 而构造一个真的「重建失败过」的 runtimeReloader 需要整套 DB + 池。
+type healthzDirty interface {
+	IsDirty() bool
+}
+
+// healthzHandler 返回 GET /healthz 的处理器。
+//
+// # 为什么错误体不回显底层错误（2026-10-21 修 A10-P1-4）
+//
+// 这个端点是**免鉴权**的：探针要在没有会话、没有 token 的情况下可用。
+// 而 SQLite 的错误字符串可以含数据库路径、驱动内部信息、文件系统错误
+// （store.Ping 就会把写池/读池的原始错误包进来）。同网段的主动探测者
+// 能拿它做环境枚举与故障定位。
+//
+// 现在对外只有两个稳定字段：
+//   - status：ok / degraded / unhealthy；
+//   - error_code：一个不随实现漂移的机器可读代码。
+//
+// 完整错误**只进服务端日志** —— 需要诊断细节的运维看日志，
+// 而匿名探测者只能看到一个「数据库不可用」。
+//
+// # 三种状态的语义
+//
+//   - ok：两个连接池都通，且运行时没落后。200。
+//   - degraded：数据库可用，但运行时落后于数据库（上次重建失败）。
+//     报 503 让编排系统有机会介入，同时区别于「进程死了」。
+//   - unhealthy：数据库不可用。503。
+func healthzHandler(db healthzPinger, reloader healthzDirty, logger *slog.Logger) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		ctx, cancel := context.WithTimeout(r.Context(), 3*time.Second)
+		defer cancel()
+		body := map[string]any{"status": "ok"}
+		code := http.StatusOK
+		if err := db.Ping(ctx); err != nil {
+			// 完整错误只进日志，对外只给一个稳定代码。
+			logger.Error("healthz: database ping failed", "error", err)
+			body = map[string]any{"status": "unhealthy", "error_code": "database_unavailable"}
+			code = http.StatusServiceUnavailable
+		} else if reloader.IsDirty() {
+			// 数据库可用、运行时落后：进程还活着但配置未生效。
+			body = map[string]any{"status": "degraded", "error_code": "runtime_lags_behind_database"}
+			code = http.StatusServiceUnavailable
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(code)
+		_ = json.NewEncoder(w).Encode(body)
 	}
 }
 
@@ -166,10 +225,8 @@ func main() {
 	masterKey, generatedKey, weakKey, err := crypto.LoadMasterKey(cfg.MasterKeyEnv, homeDir)
 	switch {
 	case err != nil:
-		// 这里绝不能降级成「无主密钥继续跑」：encryptSecret 在没有密钥时会把
-		// 上游 API key **明文**写进数据库，而 DecryptWithFallback 之后又一直按
-		// 明文接受 —— 一次瞬态失败（目录不存在/不可写/权限异常）就换来一批
-		// 不可逆的明文凭据，且没有任何补救路径。宁可拒绝启动。
+		// 当前格式只接受 AES-256-GCM 密文。这里没有「无主密钥继续跑」
+		// 的降级路径：那会把上游 API key 明文写库，且无法再与当前格式区分。
 		logger.Error("master key unavailable, refusing to start", "error", err,
 			"hint", "确认状态目录可写，或设置 "+cfg.MasterKeyEnv)
 		os.Exit(1)
@@ -235,30 +292,6 @@ func main() {
 	go reloader.watchReloadRetry(reloadCtx)
 
 	usage := newUsageRecorder(db, logger)
-	mux := http.NewServeMux()
-	rateLimiter := ratelimit.New()
-	mux.HandleFunc("POST /v1/chat/completions", handleIngress(pool, cfg, usage, rateLimiter, openaiChatCodec{}))
-	mux.HandleFunc("POST /v1/messages", handleIngress(pool, cfg, usage, rateLimiter, anthropicMessagesCodec{}))
-	mux.HandleFunc("POST /v1/responses", handleIngress(pool, cfg, usage, rateLimiter, openaiResponsesCodec{}))
-	// D9：/v1/models 在两种协议下路径相同、响应形状不同 —— 按认证头分流，
-	// 显式别名路径永远优先。
-	mux.HandleFunc("GET /v1/models", handleListModels(""))
-	mux.HandleFunc("GET /openai/v1/models", handleListModels("openai"))
-	mux.HandleFunc("GET /anthropic/v1/models", handleListModels("anthropic"))
-	// 单模型详情：外部工具（Cherry Studio / LobeChat / 各类网关面板）按
-	// OpenRouter/LiteLLM 约定读 context_length / max_output_tokens。
-	// 额度/费用查询（官方 usage/costs + 生态兼容 dashboard billing，见 billing.go）
-	mux.HandleFunc("GET /dashboard/billing/subscription", billingSubscription(db))
-	mux.HandleFunc("GET /v1/dashboard/billing/subscription", billingSubscription(db))
-	mux.HandleFunc("GET /dashboard/billing/usage", billingUsage(db))
-	mux.HandleFunc("GET /v1/dashboard/billing/usage", billingUsage(db))
-	mux.HandleFunc("GET /v1/organization/costs", orgCosts(db))
-	mux.HandleFunc("GET /v1/organization/usage/completions", orgUsageCompletions(db))
-
-	mux.HandleFunc("GET /v1/models/{model}", handleGetModel(""))
-	mux.HandleFunc("GET /openai/v1/models/{model}", handleGetModel("openai"))
-	mux.HandleFunc("GET /anthropic/v1/models/{model}", handleGetModel("anthropic"))
-
 	// 管理端身份：**只有一种来源 —— users 表**。
 	//
 	// 2026-10-06 起移除了两条并行的运维凭据通道：
@@ -311,33 +344,14 @@ func main() {
 	} else if pending != nil && !isLoopbackListen(cfg.Listen) {
 		logger.Error("SECURITY: admin password not yet set AND listening on a non-loopback address — "+
 			"anyone who can reach this port can attempt to become the first administrator; "+
-			"only holders of the bootstrap token printed above can complete it",
+			"only holders of the bootstrap token can complete it",
 			"listen", cfg.Listen,
-			"immediate_action", "立即在浏览器打开 /admin/ 完成首次设置密码（需填上面打印的引导令牌）")
+			"immediate_action", "立即在浏览器打开 /admin/ 完成首次设置密码（需填本次部署的引导令牌）")
 	} else if pending != nil {
 		logger.Warn("admin password not set yet; open the admin UI with the bootstrap token to complete first-run setup",
 			"note", "监听地址是回环，仅本机可访问；一旦改为 0.0.0.0 暴露到网络，请立即完成设置")
 	}
 
-	providerHandler := admin.NewProviderHandler(db, masterKey, cfg)
-	// 出站网络（代理地址的共享清单）。provider 的下拉从它取值，
-	// 管理入口与 provider 同级 —— 见 admin/network_handler.go 的注释。
-	networkHandler := admin.NewNetworkHandler(db)
-	credentialHandler := admin.NewCredentialHandler(db, masterKey)
-	modelHandler := admin.NewModelHandler(db, masterKey, cfg)
-	modelGroupHandler := admin.NewModelGroupHandler(db)
-	probeHandler := admin.NewProbeHandler(db)
-	routeHandler := admin.NewRouteHandler(db)
-	routeTargetHandler := admin.NewRouteTargetHandler(db)
-	keyHandler := admin.NewKeyHandler(db)
-	statsHandler := admin.NewStatsHandler(db)
-	settingsHandler := admin.NewSettingsHandler(db, cfg)
-	reloadHandler := admin.NewReloadHandler(reloader.Reload)
-	auditHandler := admin.NewAuditHandler(db)
-	usageHandler := admin.NewUsageHandler(db, cfg)
-	// 供应商 + 模型的导入导出。写在 settings 附近是因为它在界面上的入口
-	// 也在「设置」页里，与设置项同一层级。
-	configTransferHandler := admin.NewConfigTransferHandler(db, masterKey, cfg)
 	// 会话签名密钥。**不再要求运维配环境变量**：没配就从
 	// <homeDir>/session_secret 读，文件也没有就自动生成并原子落盘。
 	//
@@ -348,9 +362,6 @@ func main() {
 	secretPath := filepath.Join(homeDir, userauth.SecretFileName)
 	sessionMgr, err := userauth.NewManager(secretPath)
 	if err != nil {
-		// 密钥配得太短、文件不可读、生成失败都属于部署错误：
-		// 直接拒绝启动，否则会让人以为配好了，实际所有登录都被挡在门外
-		// 却查不到原因。
 		logger.Error("session secret unusable; refusing to start", "error", err)
 		os.Exit(1)
 	}
@@ -358,312 +369,16 @@ func main() {
 		logger.Info("user sessions enabled", "ttl", sessionMgr.TTL(),
 			"source", secretSource(secretPath))
 	} else {
-		// 理论不可达：secretPath 非空时 NewManager 要么启用、要么报错退出。
-		// 留这条分支只为不把 nil 当成正常状态往下传。
 		logger.Error("user sessions unavailable; refusing to start",
 			"reason", "session secret could not be loaded or generated")
 		os.Exit(1)
 	}
-	// WithReload：禁用账号/改角色后必须立刻重建快照，否则数据面仍放行。
-	userHandler := admin.NewUserHandler(db, sessionMgr).WithReload(reloader.Reload)
 
-	adminMux := http.NewServeMux()
-	// 免鉴权 mux：登录与首次引导本身就是取得凭据的入口，
-	// 要求先有凭据是死循环。它们的防护是限速 + 失败原因不细分 + 同源判定。
-	publicAdminMux := http.NewServeMux()
-	publicAdminMux.HandleFunc("POST /admin/api/login", userHandler.Login)
-	publicAdminMux.HandleFunc("GET /admin/api/session", userHandler.SessionStatus)
-	// 首次登录引导：没有这两个端点，新部署的 admin（空密码）永远登不进去。
-	publicAdminMux.HandleFunc("GET /admin/api/bootstrap", userHandler.BootstrapStatus)
-	publicAdminMux.HandleFunc("POST /admin/api/bootstrap", userHandler.BootstrapSetup)
-	adminMux.HandleFunc("GET /admin/api/providers", providerHandler.List)
-	adminMux.HandleFunc("POST /admin/api/providers", providerHandler.Create)
-	adminMux.HandleFunc("GET /admin/api/providers/{id}", func(w http.ResponseWriter, r *http.Request) { providerHandler.Get(w, r, r.PathValue("id")) })
-	adminMux.HandleFunc("PATCH /admin/api/providers/{id}", func(w http.ResponseWriter, r *http.Request) { providerHandler.Update(w, r, r.PathValue("id")) })
-	adminMux.HandleFunc("DELETE /admin/api/providers/{id}", func(w http.ResponseWriter, r *http.Request) { providerHandler.Delete(w, r, r.PathValue("id")) })
-	adminMux.HandleFunc("POST /admin/api/providers/{id}/test", func(w http.ResponseWriter, r *http.Request) { providerHandler.Test(w, r, r.PathValue("id")) })
-	// 出站网络（2026-10-20）：代理地址的共享清单。直连不是一条记录，
-	// 而是保留 id store.NetworkDirectID，不在此处出现。
-	adminMux.HandleFunc("GET /admin/api/networks", networkHandler.List)
-	adminMux.HandleFunc("POST /admin/api/networks", networkHandler.Create)
-	adminMux.HandleFunc("PATCH /admin/api/networks/{id}", func(w http.ResponseWriter, r *http.Request) { networkHandler.Update(w, r, r.PathValue("id")) })
-	adminMux.HandleFunc("DELETE /admin/api/networks/{id}", func(w http.ResponseWriter, r *http.Request) { networkHandler.Delete(w, r, r.PathValue("id")) })
-	// 上游余额查询：逐条凭据打上游的余额端点（见 internal/upstream/balance.go）。
-	// 纯读操作，不改任何配置，因此不触发 AutoReload（挂 reload 的写操作判据
-	// 看的是方法/路径白名单，这里是 POST 却明确不参与，理由见 handler 注释）。
-	adminMux.HandleFunc("POST /admin/api/providers/{id}/balance", func(w http.ResponseWriter, r *http.Request) { providerHandler.Balance(w, r, r.PathValue("id")) })
-
-	adminMux.HandleFunc("GET /admin/api/providers/{id}/credentials", func(w http.ResponseWriter, r *http.Request) { credentialHandler.List(w, r, r.PathValue("id")) })
-	adminMux.HandleFunc("POST /admin/api/providers/{id}/credentials", func(w http.ResponseWriter, r *http.Request) { credentialHandler.Create(w, r, r.PathValue("id")) })
-	adminMux.HandleFunc("PATCH /admin/api/credentials/{id}", func(w http.ResponseWriter, r *http.Request) { credentialHandler.Update(w, r, r.PathValue("id")) })
-	adminMux.HandleFunc("DELETE /admin/api/credentials/{id}", func(w http.ResponseWriter, r *http.Request) { credentialHandler.Delete(w, r, r.PathValue("id")) })
-
-	adminMux.HandleFunc("GET /admin/api/providers/{id}/models", func(w http.ResponseWriter, r *http.Request) { modelHandler.List(w, r, r.PathValue("id")) })
-	adminMux.HandleFunc("POST /admin/api/providers/{id}/models", func(w http.ResponseWriter, r *http.Request) { modelHandler.Create(w, r, r.PathValue("id")) })
-	adminMux.HandleFunc("POST /admin/api/providers/{id}/models/discover", func(w http.ResponseWriter, r *http.Request) { modelHandler.Discover(w, r, r.PathValue("id")) })
-	adminMux.HandleFunc("POST /admin/api/providers/{id}/models/import", func(w http.ResponseWriter, r *http.Request) { modelHandler.ImportModels(w, r, r.PathValue("id")) })
-	adminMux.HandleFunc("PATCH /admin/api/models/{id}", func(w http.ResponseWriter, r *http.Request) { modelHandler.Update(w, r, r.PathValue("id")) })
-	adminMux.HandleFunc("DELETE /admin/api/models/{id}", func(w http.ResponseWriter, r *http.Request) { modelHandler.Delete(w, r, r.PathValue("id")) })
-	// 批量设置价格：把同一组价格写到多个模型。POST 语义是「整体替换」，
-	// 与单条 PATCH 的 nil=不改 不同 —— 见 model_handler.go 的 batchPriceRequest。
-	// AutoReload 对 POST 自动生效（审计 + 快照重建），无需额外白名单。
-	adminMux.HandleFunc("POST /admin/api/models/batch-price", modelHandler.BatchUpdatePrices)
-
-	// 模型归组：把不同上游的「同一个模型」标成一组，用量统计可按组显示。
-	// 纯统计/展示层概念，不参与数据面路由判定。
-	adminMux.HandleFunc("GET /admin/api/model-groups", modelGroupHandler.List)
-	adminMux.HandleFunc("POST /admin/api/model-groups", modelGroupHandler.Create)
-	adminMux.HandleFunc("PATCH /admin/api/model-groups/{id}", func(w http.ResponseWriter, r *http.Request) { modelGroupHandler.Update(w, r, r.PathValue("id")) })
-	adminMux.HandleFunc("DELETE /admin/api/model-groups/{id}", func(w http.ResponseWriter, r *http.Request) { modelGroupHandler.Delete(w, r, r.PathValue("id")) })
-	adminMux.HandleFunc("GET /admin/api/model-groups/{id}/members", func(w http.ResponseWriter, r *http.Request) { modelGroupHandler.GroupMembers(w, r, r.PathValue("id")) })
-	// 指派/取消指派：路径里的 {id} 是**组** id（对某个组的操作）；
-	// 移出组不属于任何组，所以单独一个 unassign 端点而不是带空 group_id 的指派。
-	adminMux.HandleFunc("POST /admin/api/model-groups/{id}/assign", func(w http.ResponseWriter, r *http.Request) { modelGroupHandler.AssignModels(w, r, r.PathValue("id")) })
-	adminMux.HandleFunc("POST /admin/api/model-groups/unassign", modelGroupHandler.UnassignModels)
-
-	// 上游模型健康探测（读 model_probes 表，不触发探测 —— 探测循环在后台跑）。
-	adminMux.HandleFunc("GET /admin/api/probes/models", probeHandler.Models)
-	adminMux.HandleFunc("GET /admin/api/probes/timeline", probeHandler.Timeline)
-	// 单模型可用性探测。与 provider 的 /providers/{id}/test 是两件事：
-	// 那个拉 /models 证明「endpoint + 凭据通」，这个发一次最小真实推理
-	// （max_tokens=1）证明「这个 model_id 现在真的能推理」—— 模型下架、
-	// 账号无权限、名字写错时前者照样绿。见 upstream.TestUpstreamModel。
-	adminMux.HandleFunc("POST /admin/api/models/{id}/test", func(w http.ResponseWriter, r *http.Request) { modelHandler.Test(w, r, r.PathValue("id")) })
-	adminMux.HandleFunc("GET /admin/api/upstream-models", modelHandler.ListAll)
-
-	adminMux.HandleFunc("GET /admin/api/routes", routeHandler.List)
-	adminMux.HandleFunc("GET /admin/api/route-catalog", routeHandler.Catalog)
-	adminMux.HandleFunc("POST /admin/api/routes", routeHandler.Create)
-	adminMux.HandleFunc("PATCH /admin/api/routes/{id}", func(w http.ResponseWriter, r *http.Request) { routeHandler.Update(w, r, r.PathValue("id")) })
-	adminMux.HandleFunc("DELETE /admin/api/routes/{id}", func(w http.ResponseWriter, r *http.Request) { routeHandler.Delete(w, r, r.PathValue("id")) })
-	adminMux.HandleFunc("GET /admin/api/routes/{id}/targets", func(w http.ResponseWriter, r *http.Request) { routeTargetHandler.List(w, r, r.PathValue("id")) })
-	adminMux.HandleFunc("PUT /admin/api/routes/{id}/targets", func(w http.ResponseWriter, r *http.Request) { routeTargetHandler.Replace(w, r, r.PathValue("id")) })
-
-	adminMux.HandleFunc("GET /admin/api/keys", keyHandler.List)
-	// 管理员不能建 key（2026-10 控制面/数据面分离）：普通用户自助建，
-	// 管理员要去建普通用户、由那个用户自己发 key。策略在路由层拦，
-	// internal/admin/key_handler.go 的 Create 保持「普通用户自助」原样。
-	// **若将来另有代码直接用 keyHandler.Create 组路由，必须同样套本包装。**
-	adminMux.HandleFunc("POST /admin/api/keys", denyAdminKeyCreate(keyHandler.Create))
-	adminMux.HandleFunc("PATCH /admin/api/keys/{id}", func(w http.ResponseWriter, r *http.Request) { keyHandler.Update(w, r, r.PathValue("id")) })
-	adminMux.HandleFunc("DELETE /admin/api/keys/{id}", func(w http.ResponseWriter, r *http.Request) { keyHandler.Delete(w, r, r.PathValue("id")) })
-	// 重算 used_tokens：触发器维护的派生值没有自愈路径，偏高后 key 会变成死 key。
-	adminMux.HandleFunc("POST /admin/api/keys/{id}/recompute-usage", func(w http.ResponseWriter, r *http.Request) { keyHandler.RecomputeUsage(w, r, r.PathValue("id")) })
-
-	adminMux.HandleFunc("GET /admin/api/stats", statsHandler.Get)
-	adminMux.HandleFunc("POST /admin/api/reload", reloadHandler.Reload)
-	adminMux.HandleFunc("GET /admin/api/audit", auditHandler.List)
-	adminMux.HandleFunc("GET /admin/api/usage", usageHandler.Query)
-	adminMux.HandleFunc("GET /admin/api/usage/by-key", usageHandler.GroupByKey)
-	adminMux.HandleFunc("GET /admin/api/usage/by-model", usageHandler.GroupByModel)
-	adminMux.HandleFunc("GET /admin/api/usage/by-provider", usageHandler.GroupByProvider)
-	adminMux.HandleFunc("GET /admin/api/usage/by-day", usageHandler.GroupByDay)
-	// 按用户汇总消费（钱包页「消费汇总」一表一行一个用户）。
-	// **admin-only 由 handler 内的 requireAdmin 把关** —— 路径在普通用户可
-	// 访问的 /admin/api/usage 前缀下，AdminGateGuard 的前缀白名单会整体放行，
-	// 管不到名单内部的单个端点。而这是全站口径（每个用户的消费金额 + 用户名），
-	// 普通用户拿到就等于看到同事的账单。与上面的 prune 是同一个坑。
-	adminMux.HandleFunc("GET /admin/api/usage/by-user", usageHandler.GroupByUser)
-	// 手动触发用量归档。admin-only 由 handler 内的 requireAdmin 把关 ——
-	// 路径在普通用户可访问的 /admin/api/usage 前缀下，白名单管不到这里。
-	adminMux.HandleFunc("POST /admin/api/usage/prune", usageHandler.Prune)
-	adminMux.HandleFunc("GET /admin/api/settings", settingsHandler.Get)
-	adminMux.HandleFunc("PUT /admin/api/settings", settingsHandler.Update)
-	// 供应商 + 模型的导入导出。admin-only 由 handler 内的 requireAdmin 把关
-	// —— 路径在 /admin/api/config- 前缀下，白名单管不到这里，而导出体里
-	// 可能含全部上游凭据，绝不能落到普通用户手里。
-	adminMux.HandleFunc("POST /admin/api/config-export/export", configTransferHandler.Export)
-	adminMux.HandleFunc("POST /admin/api/config-export/import", configTransferHandler.Import)
-	adminMux.HandleFunc("GET /admin/api/usage/history", usageHandler.History)
-	adminMux.HandleFunc("GET /admin/api/me", userHandler.Me)
-	adminMux.HandleFunc("POST /admin/api/logout", userHandler.Logout)
-	adminMux.HandleFunc("GET /admin/api/users", userHandler.ListUsers)
-	adminMux.HandleFunc("POST /admin/api/users", userHandler.CreateUser)
-	adminMux.HandleFunc("PATCH /admin/api/users/{id}", func(w http.ResponseWriter, r *http.Request) { userHandler.UpdateUser(w, r, r.PathValue("id")) })
-	adminMux.HandleFunc("DELETE /admin/api/users/{id}", func(w http.ResponseWriter, r *http.Request) { userHandler.DeleteUser(w, r, r.PathValue("id")) })
-	adminMux.HandleFunc("POST /admin/api/users/{id}/password", func(w http.ResponseWriter, r *http.Request) { userHandler.ResetPassword(w, r, r.PathValue("id")) })
-	// 余额充值：走 adminMux 即自动要求管理员 + 记审计（AutoReload 对
-	// PUT 走审计分支，字段名由 extractFieldNames 自动取，见 autoreload.go）。
-	// 审计记的是**字段名**（delta_cents）而非数值 —— 这是既有审计的粒度，
-	// 不在本端点内改变。余额变更不需要重建快照：预检与扣费直接读库。
-	adminMux.HandleFunc("PUT /admin/api/users/{id}/balance", func(w http.ResponseWriter, r *http.Request) { userHandler.AdjustBalance(w, r, r.PathValue("id")) })
-	// 充值流水查询。**唯一一个**端点，作用域由会话身份决定（不接受参数指定
-	// 查谁）：普通用户只看到自己的，管理员也只看自己的那一份 —— 钱包页是
-	// 个人账本页，不存在「看全站充值」的用例。
-	//
-	// 路径 /admin/api/topups **不在** userAccessiblePrefixes 白名单里，所以
-	// AdminGateGuard 会要求管理员 —— 而普通用户需要看自己的充值记录。所以
-	// 必须把这个前缀加进白名单，作用域收窄由 handler 自己做
-	// （与 key_handler / usage_handler 的 callerScope 同一责任分配：
-	// 白名单只管「谁能进这个端点」，进来之后看谁由 handler 判）。
-	adminMux.HandleFunc("GET /admin/api/topups", userHandler.ListTopups)
-	adminMux.HandleFunc("POST /admin/api/me/password", userHandler.ChangePassword)
-	// 分组与模型白名单（多用户改造 P1）。全部 admin-only ——
-	// server.AdminGateGuard 是**前缀白名单**，/groups 不在其中即自动要求管理员。
-	//
-	// 快照重建靠外层 AutoReload，这里不再显式调 reload（见 GroupHandler 注释）。
-	groupHandler := admin.NewGroupHandler(db)
-	adminMux.HandleFunc("GET /admin/api/groups", groupHandler.List)
-	adminMux.HandleFunc("POST /admin/api/groups", groupHandler.Create)
-	adminMux.HandleFunc("PATCH /admin/api/groups/{id}", func(w http.ResponseWriter, r *http.Request) { groupHandler.Update(w, r, r.PathValue("id")) })
-	adminMux.HandleFunc("DELETE /admin/api/groups/{id}", func(w http.ResponseWriter, r *http.Request) { groupHandler.Delete(w, r, r.PathValue("id")) })
-	// PUT 而不是 PATCH：语义是**整体替换**白名单（勾选后保存），
-	// 不是增量合并。用 PATCH 会让「取消勾选」无法表达。
-	adminMux.HandleFunc("PUT /admin/api/groups/{id}/models", func(w http.ResponseWriter, r *http.Request) { groupHandler.SetModels(w, r, r.PathValue("id")) })
-	// 模型名清单：**普通用户也要能读** —— 否则 key 级白名单对他们等于不存在
-	// （/admin/api/routes 是 admin-only，而自助收紧正是这个功能的目的）。
-	// 读到的清单已按身份收窄，见 group_handler.ModelNames。
-	adminMux.HandleFunc("GET /admin/api/model-names", groupHandler.ModelNames)
-	adminMux.HandleFunc("GET /admin/api/usage/history.csv", usageHandler.ExportCSV)
-
-	// 鉴权链：**只有用户会话一条通道**（users 表 + JWT）。
-	//
-	// 此前并行的「运维凭据」通道（admin_token / admin_auth.json）已删除。
-	// 它本来的用途是「建第一个账号」与「忘记密码时应急」，而统一认证后
-	// 这两件事都有更干净的位置：首次由 /admin/api/bootstrap 引导完成，
-	// 忘记密码由管理员在「用户管理」里重置。留着一个绕过 users 表的
-	// 管理入口，等于留一条「不产生会话、不受 auth_version 约束」的旁路。
-	adminGuarded := server.NewUserAuth(sessionMgr, db).
-		// adminMux 传了两次，这是刻意的：AdminGateGuard 用**同一个 mux**
-		// 去查「这个请求会被哪个路由模式处理」，再拿那个模式比对普通用户
-		// 白名单（见 server.userAccessibleRoutes）。复用真实路由表而不是
-		// 手抄一份路径清单，是为了让白名单与真实路由**不可能漂移**。
-		Guard(server.AdminGateGuard(adminMux, adminMux))
-
-	// 管理写操作审计（DESIGN §13.3）：谁、何时、动了哪个资源、动了哪些字段
-	// （只记字段名不记值 —— body 里有 api_key 与密码明文）。
-	// 审计在重建之前同步落库，失败只 WARN 不阻塞。
-	// actor 写死 "admin" 是已知的不精确：回调没透传会话身份，
-	// 普通用户对自己资源的写操作也会落 "admin" 记录（见 store.AuditEntry 注释）。
-	audit := func(method, path string, status int, remote, fields string) {
-		entry := &store.AuditEntry{
-			Ts:     time.Now().UnixMilli(),
-			Actor:  "admin",
-			Remote: remote,
-			Method: method,
-			Path:   path,
-			Status: status,
-			Fields: fields,
-		}
-		if err := db.CreateAuditEntry(context.Background(), entry); err != nil {
-			logger.Warn("audit entry write failed", "error", err, "path", path)
-		}
-	}
-
-	// 管理写操作成功后自动重建运行时（池 + 快照）：配置生效不再依赖前端自觉调
-	// POST /admin/api/reload，任何带凭据的调用方（curl/脚本）写完立即生效 ——
-	// 包括禁用下游 Key 这类安全敏感操作（auth 读快照，不重建就照常放行）。
-	// AutoReload 在鉴权链外侧：401/429 的失败响应不会触发重建。
-	// 前端 mutate() 里的 reload 调用保留为兜底（服务端重建失败时再给一次机会）。
-	adminAuto := server.AutoReload(adminGuarded, reloader.Reload, audit, logger, reloader.MarkDirty)
-
-	// 免鉴权端点必须显式注册到根 mux：它们不进 adminAuto（那会走鉴权链），
-	// 但也不会因为「没注册」而落到 /admin/api/ 前缀上被鉴权拦掉 ——
-	// 那样会得到 401 而不是功能缺失，症状是「登录页一直转圈」。
-	// Go 1.22 的 ServeMux 按最具体模式匹配，精确路径优先于 /admin/api/ 前缀，
-	// 与注册顺序无关；仍写明以免后人误改。
-	mux.Handle("POST /admin/api/login", publicAdminMux)
-	mux.Handle("GET /admin/api/session", publicAdminMux)
-	mux.Handle("GET /admin/api/bootstrap", publicAdminMux)
-	// bootstrap 是免鉴权写接口，挂在 publicAdminMux 上因而**绕过**了 adminAuto
-	// 里的审计 —— 而它恰恰是整个系统最敏感的一步（设置管理员密码）。
-	// 单独套 AuditOnly：只补审计，不触发快照重建（它只改密码哈希，不动快照）。
-	mux.Handle("POST /admin/api/bootstrap", server.AuditOnly(publicAdminMux, audit))
-
-	mux.Handle("GET /admin/api/", adminAuto)
-	mux.Handle("POST /admin/api/", adminAuto)
-	mux.Handle("PATCH /admin/api/", adminAuto)
-	mux.Handle("DELETE /admin/api/", adminAuto)
-	mux.Handle("PUT /admin/api/", adminAuto)
-
-	// SPA 产物在 embed FS 的 dist/ 子目录下；剥掉 /admin 前缀后交给 FileServer。
-	// hash 路由下路径只有 /admin/（入口）与 /admin/assets/*（静态资源）两类。
-	webuiFS, _ := fs.Sub(webui.StaticFS, "dist")
-	fileServer := http.FileServer(http.FS(webuiFS))
-	webHandler := func(w http.ResponseWriter, r *http.Request) {
-		// 只服务已知的几类路径，其余一律 404。虽然 http.FileServer + embed FS
-		// 本身已防路径穿越，显式白名单能避免把未知路径静默回退成 index.html
-		// 或暴露 dist 下意外多出的文件。
-		p := strings.TrimPrefix(r.URL.Path, "/admin")
-		switch {
-		case p == "" || p == "/":
-			// 入口页：直接读 index.html 内容并写出，**不能**把路径改写成
-			// "/index.html" 再交给 http.FileServer —— 后者对任何以
-			// "/index.html" 结尾的路径都会 301 重定向到 "./"（浏览器解析成
-			// /admin/），于是 /admin/ → /index.html → ./ → /admin/ 无限循环，
-			// 表现为「127.0.0.1 将您重定向的次数过多」。
-			data, err := fs.ReadFile(webuiFS, "index.html")
-			if err != nil {
-				http.NotFound(w, r)
-				return
-			}
-			w.Header().Set("Content-Type", "text/html; charset=utf-8")
-			// index.html 不缓存：它引用的是带 hash 的资源文件名，网关升级后
-			// 浏览器若启发式缓存了旧 index.html，会去请求已不存在的旧 hash 资源，
-			// 表现为「打开管理后台白屏」。no-cache 允许缓存但强制回源校验。
-			w.Header().Set("Cache-Control", "no-cache")
-			w.Write(data)
-		case p == "/theme-init.js":
-			// 主题防闪脚本。不走 FileServer 是为了拿到明确的缓存策略 ——
-			// 文件名不带 hash，内容变了必须让浏览器立刻看到。
-			data, err := fs.ReadFile(webuiFS, "theme-init.js")
-			if err != nil {
-				http.NotFound(w, r)
-				return
-			}
-			w.Header().Set("Content-Type", "text/javascript; charset=utf-8")
-			w.Header().Set("Cache-Control", "no-cache")
-			w.Write(data)
-		case strings.HasPrefix(p, "/assets/") && p != "/assets/" && !strings.HasSuffix(p, "/"):
-			// 静态资源。**排除 "/assets/" 本身**：http.FileServer 对以 / 结尾
-			// 且解析为目录的路径会生成 HTML 目录列表，把构建产物文件名全部
-			// 列出来。embed FS 下无敏感文件，但白名单既然存在就把这条堵上。
-			// 文件名带内容 hash，可以放心 immutable 长缓存。
-			r.URL.Path = p
-			w.Header().Set("Cache-Control", "public, max-age=31536000, immutable")
-			fileServer.ServeHTTP(w, r)
-		default:
-			http.NotFound(w, r)
-		}
-	}
-
-	// 注意：Go 1.22+ 的 ServeMux 会拒绝 "GET /admin/"（路径更泛、方法更窄）
-	// 与 "/admin/api/"（路径更窄、方法不限）并存——两者互不更具特异性，注册期直接 panic。
-	// 因此两侧都显式声明方法：API 按方法逐个注册，静态资源只挂 GET 子树。
-	// 于是 "GET /admin/api/" 在路径上严格更具体、方法相同，冲突消除。
-	mux.HandleFunc("GET /admin/", webHandler)
-
-	// 存活 / 就绪探针。**不放在 /admin/ 下**：那个路径只读 embed FS，
-	// 数据库写池卡死、用量写入持续失败、快照重建长期落后时它照样返回 200，
-	// 容器与编排系统因此既不重启也不告警。这里 ping 两个连接池，
-	// 并把「运行时落后于数据库」这件事报成不就绪。
-	//
-	// 免鉴权是刻意的：探针要在没有会话、没有 token 的情况下可用。
-	// 因此只返回布尔状态，不泄露任何配置或凭据。
-	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) {
-		ctx, cancel := context.WithTimeout(r.Context(), 3*time.Second)
-		defer cancel()
-		body := map[string]any{"status": "ok"}
-		code := http.StatusOK
-		if err := db.Ping(ctx); err != nil {
-			body = map[string]any{"status": "unhealthy", "error": err.Error()}
-			code = http.StatusServiceUnavailable
-		} else if reloader.IsDirty() {
-			// 数据库可用、运行时落后：进程还活着但配置未生效，
-			// 报 503 让编排系统有机会介入，同时区别于「进程死了」。
-			body = map[string]any{"status": "degraded", "error": "runtime lags behind database"}
-			code = http.StatusServiceUnavailable
-		}
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(code)
-		_ = json.NewEncoder(w).Encode(body)
+	handler := buildHandler(routeDeps{
+		db: db, cfg: cfg, logger: logger, masterKey: masterKey,
+		pool: pool, reloader: reloader, sessionMgr: sessionMgr,
+		rateLimiter: ratelimit.New(), usage: usage,
 	})
-
-	handler := server.Recovery(mux, logger)
-	handler = server.Middleware(handler, logger)
-	handler = server.SecurityHeaders(handler)
-	handler = server.CORS(handler)
-	handler = server.RequestSizeLimit(int64(cfg.Defaults.MaxRequestBodyBytes))(handler)
 
 	srv := &http.Server{
 		Addr:        cfg.Listen,
@@ -800,6 +515,75 @@ func main() {
 		}
 	}()
 
+	// 扣费对账循环（2026-10-21 修 A4-P1-4 / 汇总 F4）。
+	//
+	// # 它补的是什么洞
+	//
+	// usage 落库与余额扣费是**两个事务**（usageRecorder 先落库、再 charge）。
+	// 两者之间如果进程被杀，或扣费遇到瞬时故障且重试也全部失败，这笔费用就
+	// 永远停在「报表上有、余额没扣」的状态 —— 而且**没有任何落盘痕迹**
+	// 说明它漏了：usage_state 是 'reported'、cost_total 非 0，看起来完全正常。
+	//
+	// 修复前的扣费侧已有重试（见 retryCharge），但重试只在**进程活着**时
+	// 有用。崩溃窗口与「重试全部失败」这两条路径依然无人兜底，而全仓
+	// 此前**没有任何对账任务**比对「该扣的」与「扣了的」。
+	//
+	// # 为什么单独一个循环而不是并进 runRecompute
+	//
+	// 两者的判据不同：重算找的是「费用是 0 但应该有」（usage_state='cost_pending'
+	// 且查价失败），对账找的是「费用有但没扣」。前者要改明细与累计表，
+	// 后者只动余额。混在一起会让两个不同的失败模式共享一套重试策略。
+	//
+	// # 周期
+	//
+	// 10 分钟。这类漏扣是低频事件（要恰好在两个事务之间崩溃），但金额是
+	// 钱 —— 10 分钟的延迟远小于「永远不补」。而对账要扫 usage_records 并
+	// LEFT JOIN balance_charges，比重算贵，所以周期取得比重算长。
+	reconcileDone := make(chan struct{})
+	go func() {
+		defer close(reconcileDone)
+		runReconcile := func(reason string) {
+			// 单轮最多 500 条：漏扣是罕见事件，一轮捞不完说明有系统性问题，
+			// 剩下的交给下一轮 —— 无界扫描会把写池占死。
+			found, err := db.FindUnchargedUsage(context.Background(), 500)
+			if err != nil {
+				logger.Error("charge reconciliation scan failed", "error", err, "trigger", reason)
+				return
+			}
+			if len(found) == 0 {
+				return
+			}
+			var charged, failed int
+			for _, u := range found {
+				if cerr := db.ChargeUnchargedUsage(context.Background(), u); cerr != nil {
+					failed++
+					logger.Error("charge reconciliation failed to charge",
+						"error", cerr, "record_id", u.RecordID,
+						"user_id", u.UserID, "request_id", u.RequestID,
+						"cost_yuan", u.CostYuan)
+					continue
+				}
+				charged++
+			}
+			// 补扣成功要留痕：这是「报表与余额曾经分叉、现已收敛」的证据。
+			// 审计是唯一能看到「这个系统曾经漏收过钱」的地方 —— 漏收本身
+			// 不会在数据里留下痕迹（那正是它难查的原因）。
+			logger.Warn("reconciled uncharged usage records",
+				"trigger", reason, "found", len(found), "charged", charged, "failed", failed)
+		}
+		runReconcile("startup")
+		tk := time.NewTicker(10 * time.Minute)
+		defer tk.Stop()
+		for {
+			select {
+			case <-tk.C:
+				runReconcile("periodic")
+			case <-shutdown:
+				return
+			}
+		}
+	}()
+
 	// 上游模型定时探测（2026-10-14）。照抄 runRecompute 的骨架：周期短、
 	// 需要并发上限、有 done 等待先例。探测请求复用 upstream.TestUpstreamModel
 	// （max_tokens=1、不经 usage_recorder），**不扣任何网关用户的钱**，
@@ -843,6 +627,13 @@ func main() {
 	case <-recomputeDone:
 	case <-time.After(2 * time.Second):
 		logger.Warn("cost recompute still running at shutdown; exiting anyway")
+	}
+	// 扣费对账循环同理：它也会往写池写（补扣余额），与 db.Close() 并发会拿到
+	// "database is closed"。它的单轮上限是 500 条，正常情况下立刻返回。
+	select {
+	case <-reconcileDone:
+	case <-time.After(2 * time.Second):
+		logger.Warn("charge reconciliation still running at shutdown; exiting anyway")
 	}
 	// 探测循环同理：它往写池写 model_probes，与 db.Close() 并发会拿到
 	// "database is closed"。探测是低频写，正常情况下立刻返回。
@@ -1070,18 +861,27 @@ func (rr *runtimeReloader) Reload(ctx context.Context) error {
 }
 
 // liveTargetIDs 返回当前库里全部 route target 的 ID 集合，交给 Pool.Install
-// 决定哪些熔断状态该跨重建保留。读不到时返回空集（与 upstream 侧的兜底一致：
-// 清掉全部熔断只是让坏上游短暂复活，保留已删目标的状态则会单调堆积）。
-func liveTargetIDs(ctx context.Context, db *store.Store) map[string]bool {
+// 决定哪些熔断状态该跨重建保留。
+//
+// # 读失败不能当「集合为空」（2026-10-21 修 A5-P1-2）
+//
+// 旧实现在读失败时返回空集，而 Install 的语义是「集合外一律丢弃」
+// —— 于是一次读取失败就把**全站熔断状态**清空了，让正在熔断的坏上游
+// 立刻复活。而 Reload 仍报「成功」，管理面上的状态也不会提示任何异常。
+//
+// 正确的区分：目标确实没了（集合为空且读到了）→ 旧熔断状态应当丢掉；
+// 集合**未知**（读失败）→ 应当保留全部既有熔断状态。
+func liveTargetIDs(ctx context.Context, db *store.Store) upstream.LiveTargets {
 	targets, err := db.ListAllRouteTargets(ctx)
 	if err != nil {
-		return map[string]bool{}
+		// 读失败：集合未知。不记日志（调用方的 reload 循环会记）。
+		return upstream.LiveTargets{Known: false}
 	}
 	ids := make(map[string]bool, len(targets))
 	for _, t := range targets {
 		ids[t.ID] = true
 	}
-	return ids
+	return upstream.LiveTargets{IDs: ids, Known: true}
 }
 
 func bootstrapDB(db *store.Store, cfg *config.Config, logger *slog.Logger, masterKey []byte) {
@@ -1148,11 +948,11 @@ func bootstrapDB(db *store.Store, cfg *config.Config, logger *slog.Logger, maste
 				continue
 			}
 
-			var enc []byte
-			if masterKey != nil {
-				enc, _ = crypto.Encrypt([]byte(apiKey), masterKey)
-			} else {
-				enc = []byte(apiKey)
+			enc, err := crypto.Encrypt([]byte(apiKey), masterKey)
+			if err != nil {
+				logger.Error("bootstrap: encrypt credential failed",
+					"slug", bp.Slug, "label", bc.Label, "error", err)
+				continue
 			}
 
 			c := &store.Credential{
@@ -1422,6 +1222,18 @@ type ingressRequest struct {
 	// xhigh 或 minimal —— 归一之后再夹取就会选错档，等于这个功能没做。
 	rawEffort string
 
+	// anthropicBudget 是 Anthropic 入站时客户端给的**原始 token 预算**
+	// （thinking.budget_tokens），0 = 未请求思考。
+	//
+	// 为什么单独带一路而不复用 rawEffort：rawEffort 是**档位**，而
+	// Anthropic 的旋钮是**预算**。两者不可逆互转（一段预算区间对应一档），
+	// 压过去再折回来必然失真，且两个方向的失真还不一致（见
+	// applyThinkingCapability 里 2026-10-21 修 A2-P1-3 的说明）。
+	//
+	// 只有 Anthropic→Anthropic 这条「不跨协议」的路径才用它原样透传；
+	// 跨到 OpenAI 系时预算必须折成档位，那条路走 rawEffort。
+	anthropicBudget int
+
 	// downgradedTools 是入站降级过的工具（工具名 → 原生 Responses 类型
 	// "custom" / "local_shell"）。出站据此把模型对这些工具的调用还原成
 	// custom_tool_call / local_shell_call，否则 Codex 按 item 的 type
@@ -1470,6 +1282,20 @@ func (ing *ingressRequest) applyThinkingCapability(req *rosetta.ChatRequest, m *
 		return
 	}
 
+	// Anthropic→Anthropic：预算原样透传（2026-10-21 修 A2-P1-3）。
+	//
+	// 这一步必须**在**下面的「档位夹取」之前：预算与档位不可逆互转，
+	// 折过去再折回来必然失真（详见本函数末尾分支内注释）。
+	//
+	// 放在 rawEffort=="" 的早退之前，是为了不依赖「inwire 一定把预算折成了
+	// 档位」这个跨文件假设 —— 预算本身就是完整信息，不需要档位。
+	if protocol == "anthropic" && ing.anthropicBudget > 0 {
+		req.Thinking.EffortRaw = ""
+		req.Thinking.Effort = rosetta.EffortUnset
+		req.Thinking.BudgetTokens = ing.anthropicBudget
+		return
+	}
+
 	if ing.rawEffort == "" {
 		return
 	}
@@ -1505,6 +1331,15 @@ func (ing *ingressRequest) applyThinkingCapability(req *rosetta.ChatRequest, m *
 		//
 		// 置 0 而不是自己算预算：折算表在 SDK 那边（low=2048 / medium=8192 /
 		// high=32768），网关再维护一份必然随 SDK 漂移。
+		//
+		// # 走到这里说明这是**跨协议**（Anthropic 入站 → OpenAI 系上游）
+		//
+		// 那边只有档位没有预算，所以「预算→档位→预算」这条折返链是**必要的**
+		//（Anthropic→Anthropic 的那条已在函数开头短路掉，理由见那里的注释：
+		// 折返必然失真，且两个方向不一致 —— budget=5000 被放大成 8192、
+		// budget=100000 被压成 32768，还会连带把 max_tokens 放大 122 倍）。
+		//
+		// 预算是多少无所谓 —— 反正要被丢掉。
 		req.Thinking.BudgetTokens = 0
 		return
 	}
@@ -1608,6 +1443,18 @@ func setRetryAfter(w http.ResponseWriter, d time.Duration) {
 // 口径：文本/思考/工具参数/工具定义的字符估算 + max_tokens（输出侧按上限全额
 // 预占，宁可先多占后退还，也不先少占再超发）。
 func estimateRequestTokens(req *rosetta.ChatRequest) int64 {
+	return estimateInputTokensOnly(req) + int64(req.MaxOutputTokens)
+}
+
+// estimateInputTokensOnly 估一次请求的**输入** token 数（不含 max_tokens）。
+//
+// 与 estimateRequestTokens 的输出侧分开，是为了让「客户端中断时的用量兜底」
+// 能只取输入部分：输出侧在那条路径上另有依据（已收到的字符数），
+// 不能也按 max_tokens 上界算 —— 那是按上限收钱，不是按事实记账。
+//
+// 拆分同时也让两处的口径**必然一致**：估算公式只有这一份，
+// 不会出现「TPM 用一种估法、落库用另一种估法」的分叉。
+func estimateInputTokensOnly(req *rosetta.ChatRequest) int64 {
 	var b strings.Builder
 	b.WriteString(req.System)
 	for _, m := range req.Messages {
@@ -1623,7 +1470,33 @@ func estimateRequestTokens(req *rosetta.ChatRequest) int64 {
 		b.WriteString(t.Description)
 		b.WriteString(string(t.Parameters))
 	}
-	return int64(rosetta.EstimateTokens(b.String())) + int64(req.MaxOutputTokens)
+	return int64(rosetta.EstimateTokens(b.String()))
+}
+
+// partialOutTokens 把「已收到的输出字符数」折成 token 数的**保守下界**。
+//
+// # 为什么是下界而不是估值
+//
+// 客户端断开时上游到底生成了多少 token 无从得知（SDK 的 usage 只从终止事件
+// 派生，abort 路径不产生该事件）。我们唯一有依据的事实是
+// 「上游已经吐出了这些字符」—— 它一定被计过费了。
+//
+// 折算口径：ASCII 按 4 字符/token（与 rosetta.EstimateTokens 的 (ascii+3)/4
+// 同源），非 ASCII 按 1 字符/token（中文/emoji 的实际压缩比更接近 1，
+// 而 rosetta 对非 ASCII 也是按 1 算）。两者都**偏保守**（往少了折），
+// 因为我们宁可少记也不能多记 —— 多记就是凭空收用户钱。
+//
+// 有内容就至少 1 个 token：0 会让触发器不累加、配额不涨，
+// 那正是这次要修的缺陷本身。
+func partialOutTokens(runes int) int64 {
+	if runes <= 0 {
+		return 0
+	}
+	// 按「最坏情况全是中文」估：1 字符 = 1 token。
+	// 对 ASCII 内容这会高估（4 字符才 1 token），而高估意味着多扣配额 ——
+	// 宁可高估也不能低估（低估 = 绕过配额这条通道还在）。
+	// 但也不能拿上限充数：1 个字符就是 1 个 token 上下界。
+	return int64(runes)
 }
 
 // openaiChatCodec 服务 POST /v1/chat/completions。
@@ -1682,6 +1555,9 @@ func (anthropicMessagesCodec) Decode(r *http.Request, maxBytes int64) (*ingressR
 		requiresStructuredOutput: false,
 		applyUpstreamExtras:      req.ApplyUpstreamExtras,
 		rawEffort:                req.RawEffort,
+		// Anthropic 入站的**原始 token 预算**：目标上游也是 Anthropic 时
+		// 原样透传，不经「预算→档位→预算」的有损折算（2026-10-21 修 A2-P1-3）。
+		anthropicBudget: req.ThinkingBudget(),
 	}, nil
 }
 
@@ -1852,6 +1728,18 @@ func handleIngress(pool *upstream.Pool, cfg *config.Config, usage *usageRecorder
 				logger.Warn("quota exceeded", "key_id", authCtx.KeyID,
 					"estimated_tokens", est,
 					"request_id", server.RequestIDFromContext(r.Context()))
+				// 拒绝前必须退回 TPM 预占（2026-10-21 修 P0-8）。
+				//
+				// 这条早退路径此前**漏了** rate.commit(0)：key 级配额已满
+				// 时直接 return，TPM 窗口里的 est 预占就永远留在那儿。
+				// 配额已耗尽的 key 可以反复触发这个拒绝，每次留下一笔含
+				// max_tokens 上界的 est —— 几十次就能吃光该 key 整分钟的
+				// TPM 额度，于是「配额满」会级联成「TPM 也满」，而客户端
+				// 只看到一个 429。
+				//
+				// 注意退的是 **TPM 窗口**，不是终身配额：终身配额根本没
+				// 预占成功（rok=false 时 reserved=0），没有东西要退。
+				rate.commit(0)
 				codec.WriteError(w, http.StatusTooManyRequests, "insufficient_quota",
 					"this API key has exhausted its token quota")
 				return
@@ -2109,9 +1997,18 @@ func handleIngress(pool *upstream.Pool, cfg *config.Config, usage *usageRecorder
 			// 合法形态会把名额永久占死 —— 一次 400 就废掉一个目标。
 			//
 			// 非主目标且没开故障转移时不用熔断器管，行为与改造前一致。
+			//
+			// threshold<=0（运维显式关闭目标级熔断）时**完全跳过**：
+			// 熔断器既然不启用，就不该再拿它的半开名额去限流 ——
+			// 否则运维「关了熔断」得到的仍是「被限成一个并发 + 静默
+			// 改投次目标」（见 upstream.Pool.RecordTargetFailure 的
+			// threshold<=0 分支，那条路径已经把 recovering 清掉了）。
+			var probeToken upstream.ProbeToken
 			probeClaimed, probeRecorded := false, false
-			if route.FailoverEnabled {
-				if !pool.ClaimTargetProbe(cand.TargetID) {
+			if route.FailoverEnabled && threshold > 0 {
+				var claimed bool
+				probeToken, claimed = pool.ClaimTargetProbe(cand.TargetID)
+				if !claimed {
 					// 仍在冷却中，或探测名额已被同链的并发请求领走 —— 沿链继续。
 					// 没领到名额，也就没有归还义务。
 					routeTrace = appendRouteTrace(routeTrace, i+1, cand, "skip", "probe_busy_or_cooling")
@@ -2134,9 +2031,13 @@ func handleIngress(pool *upstream.Pool, cfg *config.Config, usage *usageRecorder
 			// 免得「一个请求把某 provider 所有 key 各打一遍」放大延迟与配额消耗。
 			client, credID, cerr := pool.GetAnyClient(cand.Provider.Slug)
 			if cerr != nil {
-				// 该目标当前无健康凭据：累计目标失败，换链上下一个。
-				pool.RecordTargetFailure(cand.TargetID, threshold)
-				probeRecorded = true // 名额由记账释放
+				// 该目标当前无健康凭据：这是 provider 的凭据状态，不是目标/上游
+				// 故障。把目标熔断与凭据冷却叠加会延长恢复时间，而且下一次
+				// 请求仍会先被目标熔断挡住，看不到“补一把 key 就好”。
+				if probeClaimed {
+					pool.ReleaseTargetProbe(cand.TargetID, probeToken)
+				}
+				probeRecorded = true // 名额已在上方显式归还
 				out = attemptOutcome{eligible: true, statusCode: http.StatusBadGateway,
 					code: "upstream_error", message: "no available upstream provider"}
 				routeTrace = appendRouteTrace(routeTrace, i+1, cand, "fail", "no_healthy_credential")
@@ -2165,7 +2066,7 @@ func handleIngress(pool *upstream.Pool, cfg *config.Config, usage *usageRecorder
 				// 必须让目标熔断计数与凭据健康照常累计，否则故障永不转移。
 				if out.success {
 					pool.RecordCredentialSuccess(credID)
-					pool.RecordTargetSuccess(cand.TargetID)
+					pool.RecordTargetSuccess(cand.TargetID, probeToken)
 					routeTrace = appendRouteTrace(routeTrace, i+1, cand, "ok", "")
 				} else if out.clientGone {
 					// 客户端自己走了（用户点停止 / 进程退出 / 网络切换）。
@@ -2173,10 +2074,10 @@ func handleIngress(pool *upstream.Pool, cfg *config.Config, usage *usageRecorder
 					// 取消就会把健康目标熔断一整个冷却窗口，期间该路由
 					// 全量 502。凭据同样不冷却 —— key 本身没问题。
 					routeTrace = appendRouteTrace(routeTrace, i+1, cand, "committed_fail", "client_canceled")
-					pool.RecordTargetSuccess(cand.TargetID)
+					pool.RecordTargetSuccess(cand.TargetID, probeToken)
 					pool.RecordCredentialSuccess(credID)
 				} else {
-					pool.RecordTargetFailure(cand.TargetID, threshold)
+					pool.RecordTargetFailure(cand.TargetID, probeToken, threshold)
 					routeTrace = appendRouteTrace(routeTrace, i+1, cand, "committed_fail", out.code)
 				}
 				probeRecorded = true // 名额由记账释放
@@ -2200,7 +2101,7 @@ func handleIngress(pool *upstream.Pool, cfg *config.Config, usage *usageRecorder
 			// 事件，但请求确实已经打到了这个目标，用它当「上游健康」的证据
 			// 同样不成立，所以这里只排除真正的客户端取消。
 			if out.eligible && !isClientGone(r.Context(), nil) {
-				pool.RecordTargetFailure(cand.TargetID, threshold)
+				pool.RecordTargetFailure(cand.TargetID, probeToken, threshold)
 				probeRecorded = true // 名额由记账释放
 				if out.credCooldown > 0 {
 					pool.MarkCredentialCooldown(credID, out.credCooldown)
@@ -2217,11 +2118,10 @@ func handleIngress(pool *upstream.Pool, cfg *config.Config, usage *usageRecorder
 
 			// 没走到记账的两种形态 —— 不可转移错误（out.eligible==false）与
 			// 客户端中断（ctx 已取消）—— 在此归还探测名额，否则 halfOpen 卡死、
-			// 该目标被跳到下一次 Install 才复位。已记账的绝不能再还：
-			// halfOpen 是共享 bool 而非计数，重复归还会错清并发请求刚领到的
-			// 名额（见 ReleaseTargetProbe 的注释）。
+			// 该目标被跳到下一次 Install 才复位。已记账的绝不能再还；
+			// ReleaseTargetProbe 按令牌比较，迟到的旧请求也清不掉新探针。
 			if probeClaimed && !probeRecorded {
-				pool.ReleaseTargetProbe(cand.TargetID)
+				pool.ReleaseTargetProbe(cand.TargetID, probeToken)
 			}
 
 			if !out.eligible || isLast {
@@ -2784,6 +2684,11 @@ func attemptStream(w http.ResponseWriter, r *http.Request, client *rosetta.Clien
 	errorDetail := ""
 	httpStatus := 200
 
+	// partialOutRunes 累计本次流里**已经收到**的输出侧字符数（正文 + 思考）。
+	//
+	// 它的唯一用途是「客户端中途断开」这一条路径：见 partialOutTokens 的注释。
+	partialOutRunes := 0
+
 	// consume 消费一个上游事件（首个 + 后续走同一套逻辑）：看门狗续期与
 	// usage/stopReason 留档是循环的职责，协议编码全部交给 sink。
 	consume := func(ev *rosetta.Event) {
@@ -2792,11 +2697,17 @@ func attemptStream(w http.ResponseWriter, r *http.Request, client *rosetta.Clien
 		lastEventAt.Store(time.Now().UnixNano())
 		idleTimer.Reset(idleTimeout)
 		heartbeatTicker.Reset(heartbeatInterval)
-		if ev.Type == rosetta.EventMessageEnd {
+		switch ev.Type {
+		case rosetta.EventMessageEnd:
 			if ev.Usage != nil {
 				lastUsage = *ev.Usage
 			}
 			stopReason = ev.StopReason
+		case rosetta.EventTextDelta, rosetta.EventThinkingDelta:
+			// 只数**正文与思考**：工具调用的参数是 JSON 片段，
+			// 混进 token 估算会让数字失去意义（半个 JSON 对象既不是
+			// 中文也不是英文，按字符数估会离谱地偏高）。
+			partialOutRunes += len([]rune(ev.Text))
 		}
 		sink.Event(ev)
 	}
@@ -2804,9 +2715,61 @@ func attemptStream(w http.ResponseWriter, r *http.Request, client *rosetta.Clien
 	consume(stream.Event())
 	for stream.Next() {
 		consume(stream.Event())
+		// 下游连接已不可用（2026-10-21 修 *X12）：继续把上游流读完只会把
+		// 字节写进一个死连接，而上游还在按 token 计费、我们还在为它付钱。
+		// 立即关流，让下面的写失败分支收尾。
+		//
+		// 关流用 Close（而非 Abort）：这是**我们**主动不看了，不是上游
+		// 出错 —— Close 保持 Err()==nil，于是终态由写失败分支给出，
+		// 不会被误记成上游故障进熔断计数。
+		if outwire.FirstWriteError(sink) != nil {
+			_ = stream.Close()
+			break
+		}
 	}
 
-	if err := stream.Err(); err != nil {
+	// 终态判定顺序（2026-10-21 修 *X12）——顺序本身就是 bug：
+	//
+	// **写失败必须先于 stream.Err() 判**，否则这条路径永远走不到：主循环
+	// 发现写失败后 Close 并 break，而 SDK 的生产 goroutine 可能已经先一步把
+	// 「EOF 却没有 [DONE]」折成 ErrStreamTruncated 写进 s.err。于是
+	// stream.Err() 非空、进 truncated 分支：残缺流被判成「上游截断」——
+	// 既进熔断计数，又让运维看不出是下游写不进去。测试 F1c 正是这一种。
+	//
+	// 另一个理由不依赖竞态：写失败意味着**我们主动放弃了这条流**，之后
+	// 发生的一切都是放弃的后果。把下游不可用记成上游故障，会让熔断器
+	// 因为自己的客户端掉线而惩罚上游。
+	//
+	// 两者同时出现时 Stream 端的错误仍要留痕：根因可能真的是上游，
+	// 只是被下游写失败抢先报了。降一级到 Debug 是为了不让每次客户端
+	// 断网都刷一条 WARN。
+	if werr := outwire.FirstWriteError(sink); werr != nil {
+		// 向下游写失败（2026-10-21 修 *X12）。
+		//
+		// 三个 sink 的 SSE 写点此前**全部**丢弃 fmt.Fprintf 的返回值，
+		// 于是下游挂死/断开后状态机照常推进、残缺的流被当成 status=ok
+		// 收尾：既不进熔断计数，用量里也无痕。sink 现在记下第一次写失败
+		// （见 outwire.WriteErrorReporter），这里把它变成终态。
+		//
+		// 归因：写失败 = 下游不可用，与「客户端主动断开」同类，
+		// 因此复用 canceled 这个取值（它已经是「不计入上游熔断」的那一类，
+		// 见 attemptOutcome.clientGone）。单独一个 errorCode 让运维能
+		// 区分「客户端自己走了」与「我们写不进去」。
+		status = "canceled"
+		errorCode = "downstream_write_failed"
+		if serr := stream.Err(); serr != nil {
+			logger.Debug("stream error observed after downstream write failure",
+				"model", publicModel, "key_id", authCtx.KeyID, "stream_error", serr)
+		}
+		if outwire.IsDownstreamWriteError(werr) {
+			logger.Info("downstream write failed mid-stream",
+				"model", publicModel, "key_id", authCtx.KeyID, "error", werr)
+		} else {
+			// 认不出来的写错误可能是网关自身的 bug，不该悄悄算到客户端头上。
+			logger.Error("unexpected response write error",
+				"model", publicModel, "key_id", authCtx.KeyID, "error", werr)
+		}
+	} else if err := stream.Err(); err != nil {
 		switch {
 		case errors.Is(err, rosetta.ErrStreamTruncated):
 			status = "truncated"
@@ -2850,6 +2813,67 @@ func attemptStream(w http.ResponseWriter, r *http.Request, client *rosetta.Clien
 
 	latency := time.Since(start).Milliseconds()
 
+	// 客户端中途断开时的用量兜底（2026-10-21 修 A4-P1-1 / 汇总 F1）。
+	//
+	// # 问题
+	//
+	// `lastUsage` 只在 EventMessageEnd 上赋值，而客户端断开时上游**不会**
+	// 发出该事件 —— 于是 usage 恒为零值：
+	//   - usage_state="missing" → cost_total=0 → 网关的上游成本被完全漏记；
+	//   - trg_update_used_tokens 累加 0 → key 的终身 token 配额不涨；
+	//   - rate.releaseQuota() 把 est 预占全额退回 → 预占也不涨。
+	//
+	// 三者叠加的结果是：**用户点一次「停止」，就能免费消耗已生成的全部
+	// 上游 token，并且完全绕过终身 token 配额**。可被主动利用 ——
+	// 收第一个 token 就断开，重复 N 次。
+	//
+	// # 为什么不能只靠「不退预占」解决
+	//
+	// 只不退预占能堵住配额绕过，但 cost_total 仍是 0：报表上的「上游成本」
+	// 依旧被系统性低估（每条 canceled 记录都是 0），而 cost_total 无论
+	// 成败都记是既有口径（那是网关的成本，不是用户的应收）。
+	//
+	// # 这里的处置
+	//
+	// 用**已经收到的输出字符数**折一个保守下界，作为本次调用的用量落库：
+	//   - 输出 token 数 = 已收字符数按 1 token/4 字符（ASCII）折算，
+	//     不足 1 个也算 1（有内容就至少 1 个 token）；
+	//   - 输入 token 数用**请求前就有的估算值**（est 的输入部分）。
+	//
+	// 为什么不精确到分毫：客户端断开时上游到底生成了多少 token **无从得知**
+	//（SDK 的 usage 只从终止事件派生，abort 路径不产生该事件）。
+	// 用「已收到的字符数」是唯一有依据的下界 —— 它不会高估（收到的就是上游
+	// 真吐出来的），也不会是 0。
+	//
+	// # 为什么不收用户钱
+	//
+	// 落库的 status 仍是 "canceled" → usageRecorder.charge 只对 status=="ok"
+	// 扣费（见该函数注释）。所以这条路径**只影响成本口径与配额**，
+	// 不会变成「用户为一次没拿到结果的调用付钱」。这与既有口径一致：
+	// 扣费只看成功，成本无论成败都记。
+	//
+	// # 什么时候不兜底
+	//
+	// 上游报了 usage（!lastUsage.IsZero()）→ 用真实值，不兜底。
+	// 一个字符都没收到（partialOutRunes==0）→ 兜底也兜不出什么，
+	// 保持 missing —— 这时「什么都没生成」是事实，不该编一个数字。
+	if lastUsage.IsZero() && partialOutRunes > 0 {
+		estOut := partialOutTokens(partialOutRunes)
+		estIn := estimateInputTokensOnly(ing.buildRosetta())
+		lastUsage = rosetta.Usage{
+			InputTokens:  estIn,
+			OutputTokens: estOut,
+			TotalTokens:  estIn + estOut,
+		}
+		logger.Warn("stream ended without upstream usage; charging a conservative lower bound",
+			"model", publicModel, "key_id", authCtx.KeyID,
+			"status", status,
+			"received_runes", partialOutRunes,
+			"estimated_output_tokens", estOut,
+			"estimated_input_tokens", estIn,
+			"note", "客户端中断时上游不发终止事件，usage 无从得知；按已收内容折算下界")
+	}
+
 	usage.record(&store.UsageRecord{
 		ID:              generateID(),
 		AccessKeyID:     authCtx.KeyID,
@@ -2885,6 +2909,11 @@ func attemptStream(w http.ResponseWriter, r *http.Request, client *rosetta.Clien
 	//     但配额预占不能跟着一起跳过 —— 它是终身累计，预占按 max_tokens 全额
 	//     计，不退就等于每次 missing 请求永久吃掉数万 token 额度（修复前整个
 	//     commit 被跳过的正是这条路径）。
+	//
+	// 客户端中断的路径在上一步已经被兜底成「有 usage 了」（partialOutRunes>0
+	// 时），所以走的是上面那条「已知」分支：TPM 按保守下界校正，
+	// 终身配额的预占被**消耗**掉一部分（触发器按 total_tokens 累加），
+	// 而不再全额退回 —— 那正是「点停止 = 免费刷上游 token」这条通道。
 	if !lastUsage.IsZero() {
 		rate.commit(lastUsage.TotalTokens)
 	} else {
@@ -3320,22 +3349,65 @@ func (u *usageRecorder) flushOneByOne(ctx context.Context, batch []*store.UsageR
 	for _, rec := range batch {
 		cost, err := u.db.CreateUsageRecordWithCost(ctx, rec)
 		if err != nil {
-			if store.IsUniqueViolation(err) {
-				// 这一条上一轮已经落库成功。不再 charge：余额扣费本身以
-				// (request_id, user_id) 幂等，再调一次是空操作，但跳过它
-				// 让「已落库」与「已扣费」这对关系保持单一发生点。
+			if !store.IsUniqueViolation(err) {
+				allOK = false
+				// 带 request_id —— 原来的批级日志不含它，事后无从对账。
+				u.logger.Error("usage record lost (per-record write also failed)",
+					"error", err, "request_id", rec.RequestID,
+					"key_id", rec.AccessKeyID, "user_id", rec.UserID)
 				continue
 			}
-			allOK = false
-			// 带 request_id —— 原来的批级日志不含它，事后无从对账。
-			u.logger.Error("usage record lost (per-record write also failed)",
-				"error", err, "request_id", rec.RequestID,
-				"key_id", rec.AccessKeyID, "user_id", rec.UserID)
-			continue
+			// 主键冲突：这条**可能**已经落库了。
+			//
+			// 旧实现在这里无条件 continue（跳过 charge），理由是
+			// 「已落库 ⇒ 已扣费」。这个推理**不成立**（2026-10-21 修 A4-P1-5）：
+			//   - 批路径在 tx.Commit() 返回 I/O 错误时可能**已经提交**了；
+			//     flush 判失败 → 降级逐条 → 每条都撞主键冲突 → 全部跳过
+			//     → 这一批全部落库了（报表有费用）而余额一分没扣；
+			//   - 更简单的可达路径：批路径因 rec.ID 重复而失败时，
+			//     库里根本没这批记录，逐条写时每条都冲突 → 全部跳过
+			//     → 全部不扣费。
+			//
+			// 幂等责任本来就该由 balance_charges 的 (request_id, user_id)
+			// 承担 —— ChargeBalance 自己是幂等的（占位行命中即返回，
+			// 不碰余额）。所以这里**继续走 charge**：重复调用是空操作，
+			// 而漏调则是永久漏收。
+			//
+			// 费用从库里读回：这条已经落库，cost_total 是**已固化**的值，
+			// 不重算（重算会按当前价，与「固化于落库时」的口径冲突）。
+			// 读不到就按 0 处理 —— 那是「取不到」而不是「算错了」。
+			cost = u.recordedCost(ctx, rec)
+			u.logger.Warn("usage record already existed; reconciling charge",
+				"request_id", rec.RequestID, "key_id", rec.AccessKeyID,
+				"cost_yuan", cost)
 		}
 		u.charge(rec, cost)
 	}
 	return allOK
+}
+
+// recordedCost 读回一条**已落库**用量的固化费用（元）。
+//
+// 只在「主键冲突 = 这条可能已经落库」时用：此时 CreateUsageRecordWithCost
+// 返回的 cost 是零值（写入失败了），而我们要扣的钱是**库里那个已固化的值**。
+//
+// 读不到（记录其实没落库、已被剪枝、或读池抖动）时返回 0：
+// 0 元在扣费侧是完全 no-op（见 ChargeBalance 的注释），而「取不到」与
+// 「算出 0」在账上的后果相同 —— 都不扣钱。相比之下猜一个数去扣，
+// 那是「按编出来的数收用户钱」。
+func (u *usageRecorder) recordedCost(ctx context.Context, rec *store.UsageRecord) float64 {
+	if rec == nil || rec.ID == "" {
+		return 0
+	}
+	var cost float64
+	err := u.db.DB().QueryRowContext(ctx,
+		`SELECT COALESCE(cost_total, 0) FROM usage_records WHERE id = ?`, rec.ID).Scan(&cost)
+	if err != nil {
+		u.logger.Error("cannot read back cost_total for an already-recorded usage row",
+			"error", err, "record_id", rec.ID, "request_id", rec.RequestID)
+		return 0
+	}
+	return cost
 }
 
 // charge 对一条**已落库**的用量记录扣余额。cost 是本次落库时固化的费用（元），
@@ -3408,18 +3480,81 @@ func (u *usageRecorder) charge(rec *store.UsageRecord, costYuan float64) {
 	err := u.db.ChargeBalance(context.Background(), rec.UserID, costYuan, rec.RequestID)
 	switch {
 	case err == nil:
+		return
 	case errors.Is(err, store.ErrInsufficientBalance):
 		// 预检在前，正常路径走不到这里。走到 = 并发透支或预检漏了。
 		// 此时上游已被调用、费用已固化进 cost_total，钱收不回，
 		// 「报欠费」比「悄悄放过」诚实。响应早已写出，改不了，只能记 ERROR。
+		//
+		// 欠费**不重试**：它不是瞬时故障，重试一万次也不会成功。
+		// ChargeBalance 已经把金额记进 balance_pending 待结算账本
+		// （见该函数的欠费分支），用户充值后会被结转 —— 这条路径是通的。
 		u.logger.Error("charge failed: insufficient balance (precheck should have prevented this)",
 			"user_id", rec.UserID, "request_id", rec.RequestID,
 			"access_key_id", rec.AccessKeyID, "public_model", rec.PublicModel)
+		return
 	default:
-		u.logger.Error("failed to charge balance",
-			"error", err, "user_id", rec.UserID, "request_id", rec.RequestID,
-			"access_key_id", rec.AccessKeyID, "public_model", rec.PublicModel)
+		// 瞬时故障（DB 抖动、磁盘忙、连接被掐）—— **必须重试**
+		// （2026-10-21 修 A4-P1-6）。
+		//
+		// 旧实现在这里只记一条 ERROR 就结束：一次 DB 抖动 = 钱款**永久漏收**，
+		// 而记录看起来完全正常（usage_state='reported'、cost_total 非 0），
+		// 事后对账都无法从数据本身发现 —— 因为「该扣多少」与「扣了没有」
+		// 分处两处，而后者没有落盘的痕迹。
+		//
+		// 重试为什么是安全的：ChargeBalance 自己幂等（balance_charges 的
+		// (request_id, user_id) 占位行），重复调用不会重复扣。
+		// 所以重试的代价只是几次 IO，收益是「漏收」变成「延迟几百毫秒收到」。
+		u.retryCharge(rec, costYuan, err)
 	}
+}
+
+// retryCharge 对一次失败的扣费做有限次重试。
+//
+// # 为什么不无限重试
+//
+// 扣费发生在 usage 落库之后的**异步**路径上，而这条路径不能拖住 worker：
+// worker 卡住 = 整条用量队列停摆 = 之后的每一次调用都不记账。
+// 所以重试必须有界，且总耗时必须短（几百毫秒量级）。
+//
+// # 为什么重试几乎必然能成功
+//
+// ChargeBalance 幂等，所以重试是安全的；而它失败的原因绝大多数是
+// 瞬时的（写锁竞争、磁盘忙、连接被掐）。有界重试足以覆盖这类。
+//
+// # 真的重试完还是失败怎么办
+//
+// 记 ERROR，并且把 request_id 记全 —— 这是「这笔钱没收回来」的唯一线索。
+// 运维据此对账。**不能**静默：静默的漏收是本次修复要消灭的东西。
+func (u *usageRecorder) retryCharge(rec *store.UsageRecord, costYuan float64, cause error) {
+	const attempts = 3
+	for i := 1; i <= attempts; i++ {
+		// 退避：第一次立刻重试（抖动常常是瞬时的），之后各等一小段。
+		// 用 time.Sleep 而不是 time.AfterFunc：这是 worker 路径，
+		// 阻塞几十毫秒是可接受的（批落库本身就要几毫秒）。
+		if i > 1 {
+			time.Sleep(time.Duration(i-1) * 20 * time.Millisecond)
+		}
+		err := u.db.ChargeBalance(context.Background(), rec.UserID, costYuan, rec.RequestID)
+		if err == nil {
+			if i > 1 {
+				u.logger.Warn("balance charge succeeded after retry",
+					"attempts", i, "user_id", rec.UserID, "request_id", rec.RequestID)
+			}
+			return
+		}
+		if errors.Is(err, store.ErrInsufficientBalance) {
+			// 欠费不是瞬时故障，重试无意义。已经在上面记过 ERROR 了。
+			return
+		}
+		cause = err
+	}
+	u.logger.Error("failed to charge balance after retries; this amount was NOT collected",
+		"error", cause, "attempts", attempts,
+		"user_id", rec.UserID, "request_id", rec.RequestID,
+		"access_key_id", rec.AccessKeyID, "public_model", rec.PublicModel,
+		"cost_cents", store.YuanToCents(costYuan),
+		"reconcile_hint", "该笔应收未实收；对账时按 request_id 核对 balance_charges 是否缺行")
 }
 
 // record 排队一条异步落库，立即返回。

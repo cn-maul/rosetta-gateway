@@ -412,6 +412,88 @@ func TestEstimateCost_PartialPricingDoesNotMakeInputFree(t *testing.T) {
 	}
 }
 
+// 只配了 **price_cache_hit** 的模型：预检**不得**把它当成「完全未配价」。
+//
+// 回归风险（审计 A4-P1-3 / 汇总 F3，方向是**漏放行**）：
+//
+//	预检（修复前）：inPrice=0 && outPrice=0 → 提前 return 0
+//	               → chainPriced=true（缓存价 > 0）→ 只走「余额 >= 1 元」地板线
+//	               → 余额 1 元的用户可以持续发请求直到余额耗尽
+//	实扣（修复前）：命中部分按 price_cache_hit 收费 → 照收不误
+//
+// 也就是说预检只拦「余额 < 1 元」，而实扣可以远超这个数 —— 预检在钱的
+// 方向上失效。修复后两侧走同一份 store.Prices，口径不再可能分叉。
+func TestEstimateCost_CacheHitOnlyPricingIsNotTreatedAsUnpriced(t *testing.T) {
+	req := &rosetta.ChatRequest{
+		Messages: []rosetta.Message{{
+			Role:   "user",
+			Blocks: []rosetta.Block{{Type: rosetta.BlockText, Text: strings.Repeat("x", 8000)}},
+		}},
+		MaxOutputTokens: 4096,
+	}
+	// 只配缓存命中价（3 元/百万 tokens），输入价与输出价都为 0。
+	onlyCache := estimateBalanceCost(req, &routing.UpstreamModel{PriceCacheHit: 3})
+	if onlyCache <= 0 {
+		t.Fatalf("只配 price_cache_hit 却估出 %d 分：预检把它当成「完全未配价」→ "+
+			"fail-open 漏放行（实扣仍按缓存价收费）", onlyCache)
+	}
+	// 预检还必须是**上界**：实扣最多是「全部输入命中缓存」的那一笔。
+	// 输入 2000 token × 3 元/百万 = 0.006 元 = 0.6 分；输出侧实扣为 0，
+	// 但预检按 max_tokens 全额计上界（3 元/百万 × 4096 = 0.012288 元）。
+	// 合计约 1.83 分。断言它落在合理区间：既不为 0，也不超过上界的 2 倍。
+	if onlyCache > 400 {
+		t.Fatalf("只配 price_cache_hit 估出 %d 分，明显超过上界（应 ≈1.8 分）", onlyCache)
+	}
+}
+
+// 预检必须是**上界**：估出的钱不得少于实扣可能收到的钱。
+//
+// 三个配置都要覆盖，因为它们的兜底路径不同：
+//   - 配全价：直算；
+//   - 只配输入价：缓存命中价回退输入价、输出价回退输入价；
+//   - 只配缓存价：输入价/输出价回退缓存价。
+func TestEstimateCost_IsUpperBoundOverActualCharge(t *testing.T) {
+	req := &rosetta.ChatRequest{
+		Messages: []rosetta.Message{{
+			Role:   "user",
+			Blocks: []rosetta.Block{{Type: rosetta.BlockText, Text: strings.Repeat("x", 8000)}},
+		}},
+		MaxOutputTokens: 1,
+	}
+	const inTokens = 2000.0
+	cases := []struct {
+		name string
+		p    store.Prices
+	}{
+		{"配全价", store.Prices{Input: 3, CacheHit: 0.1, Output: 9}},
+		{"只配输入价", store.Prices{Input: 3}},
+		{"只配缓存价", store.Prices{CacheHit: 3}},
+		{"只配输出价", store.Prices{Output: 9}},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			est := estimateBalanceCost(req, &routing.UpstreamModel{
+				PriceInput:    c.p.Input,
+				PriceCacheHit: c.p.CacheHit,
+				PriceOutput:   c.p.Output,
+			})
+			// 实扣可能的三种缓存命中比例，取**最大**的那一笔。
+			var worst float64
+			for _, cached := range []float64{0, inTokens / 2, inTokens} {
+				actual := store.PriceUsageWithPrices(c.p, inTokens, cached, 0)
+				if actual > worst {
+					worst = actual
+				}
+			}
+			// 预检单位是分，实扣单位是元。
+			if got := float64(est) / 100; got+1e-9 < worst {
+				t.Fatalf("预检估出 %.6f 元，低于实扣上界 %.6f 元 —— 预检低估，会漏放行",
+					got, worst)
+			}
+		})
+	}
+}
+
 // ---------------------------------------------------------------------
 // 端到端：402 不碰上游
 // ---------------------------------------------------------------------
