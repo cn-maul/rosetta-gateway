@@ -31,6 +31,7 @@ func NewModelHandler(st *store.Store, masterKey []byte, cfg *config.Config) *Mod
 // PATCH 语义（2026-09-21 重构）：字段为指针，nil = 未提供（保持原值）。
 // ContextWindow / MaxOutputTokens 传 0 是合法值 —— 会落回 NULL，即「未设置」，
 // 旧实现下这两个字段一旦写入就再也无法清空。
+// @ts-type UpstreamModelUpdate
 type modelRequest struct {
 	ModelID         *string `json:"model_id"`
 	DisplayName     *string `json:"display_name"`
@@ -126,6 +127,7 @@ func levelListHint() string {
 	return strings.Join(names, " / ")
 }
 
+// @ts-type UpstreamModel
 type modelResponse struct {
 	ID              string  `json:"id"`
 	ProviderID      string  `json:"provider_id"`
@@ -556,6 +558,7 @@ func (h *ModelHandler) BatchUpdatePrices(w http.ResponseWriter, r *http.Request)
 // ApiFail 里那句统一的错误文案，反而丢掉了真正的诊断信息。
 //
 // 只有「你调的 id 不存在」才用 404 —— 那是调用方用错了接口，不是模型不可用。
+// @ts-type ModelTestResult
 type modelTestResponse struct {
 	Status string `json:"status"` // "ok" | "error"
 	// ModelID 回显被探测的上游模型名。前端把它显示在结果里，
@@ -671,6 +674,7 @@ func (h *ModelHandler) Test(w http.ResponseWriter, r *http.Request, id string) {
 	writeJSON(w, http.StatusOK, resp)
 }
 
+// @ts-type DiscoveredModel
 type discoveredModel struct {
 	ModelID         string `json:"model_id"`
 	DisplayName     string `json:"display_name,omitempty"`
@@ -752,6 +756,7 @@ func (h *ModelHandler) Discover(w http.ResponseWriter, r *http.Request, provider
 }
 
 // modelImportItem 是批量导入的单条模型。
+// @ts-type ModelImportItem
 type modelImportItem struct {
 	ModelID         string `json:"model_id"`
 	DisplayName     string `json:"display_name"`

@@ -11,6 +11,7 @@ import (
 // 展示名是「用户名」，且这一行必须多带 cost 与 role。硬塞进 usageGroupEntry
 // 会让 by-key 端点下发一个恒为 0 的 cost（前端于是不得不猜「0 是还没算完还是
 // 真的没花钱」）—— 一个字段在某个端点上恒为 0，就是契约在说谎。
+// @ts-type UsageByUserEntry
 type usageUserEntry struct {
 	// Key 是 usage_records.user_id（冗余固化的归属，见 store.UsageRecord.UserID）。
 	// 空串 = 无归属异常行，前端会显示成「无归属」，不能当成正常账号。
@@ -45,6 +46,7 @@ type usageUserEntry struct {
 // 把「前 100 名」读成「全部用户」会直接得出错误的结论（「合计怎么对不上
 // 上面那张汇总卡」）。所以必须把 total 下发，让前端能说出「前 N / 共 M」。
 // 与 ExportCSV 写 X-Export-Truncated 同一个原则：**截断必须可见**。
+// @ts-type UsageByUserPage
 type usageByUserResponse struct {
 	Records []usageUserEntry `json:"records"`
 	Total   int64            `json:"total"`

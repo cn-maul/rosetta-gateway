@@ -125,6 +125,13 @@ jobs:
           go generate ./cmd/gateway
           git diff --exit-code -- web/src/generated/routes.ts
 
+      # TS 里手写的 DTO 不能靠评审记忆保持同步。Go 侧用 @ts-type 标注的
+      # response/request 结构生成字段契约，web tests 再与 types.ts 对账。
+      - name: 前端 DTO 契约一致
+        run: |
+          go generate ./internal/admin
+          git diff --exit-code -- web/src/generated/dto-contract.ts
+
       # 依赖方向是架构约束里最容易在重构中回退的一类：代码能编译、测试也绿，
       # 但 admin 又 import 回 server。单独一步让失败原因一眼可见。
       - name: 架构依赖方向

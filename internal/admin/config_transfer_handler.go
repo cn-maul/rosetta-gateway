@@ -200,6 +200,7 @@ type importRequest struct {
 // **逐项**而不是只给总数：导入是「改别人的库」的动作，用户需要知道
 // 哪几条真的进去了、哪几条被改名、哪几条被跳过。笼统的"成功导入 12 个"
 // 无法回答「我那个 meme 怎么变成 meme-2 了」。
+// @ts-type ConfigImportResult
 type importResponse struct {
 	DryRun             bool              `json:"dry_run"`
 	ProvidersCreated   int               `json:"providers_created"`

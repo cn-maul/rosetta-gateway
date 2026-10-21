@@ -10,6 +10,7 @@ import (
 // The catalog is admin-only. It contains configuration, never live health claims.
 // Four bulk reads replace per-route/per-target queries and include only the
 // provider fields needed by route selection, leaving endpoints and secrets out.
+// @ts-type RouteCatalogProvider
 type routeCatalogProvider struct {
 	ID          string `json:"id"`
 	Slug        string `json:"slug"`
@@ -25,12 +26,14 @@ type routeChainSummary struct {
 	Standby int `json:"standby"`
 }
 
+// @ts-type RouteCatalogEntry
 type routeCatalogEntry struct {
 	routeResponse
 	Targets []routeTargetResponse `json:"targets"`
 	Chain   routeChainSummary     `json:"chain"`
 }
 
+// @ts-type RouteCatalog
 type routeCatalogResponse struct {
 	Routes      []routeCatalogEntry    `json:"routes"`
 	Providers   []routeCatalogProvider `json:"providers"`

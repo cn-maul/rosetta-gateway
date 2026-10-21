@@ -18,6 +18,7 @@ func NewAuditHandler(st *store.Store) *AuditHandler {
 	return &AuditHandler{store: st}
 }
 
+// @ts-type AuditEntry
 type auditEntryResponse struct {
 	ID     int64  `json:"id"`
 	Ts     int64  `json:"ts"`

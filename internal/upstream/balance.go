@@ -48,6 +48,7 @@ import (
 const balanceTimeout = 15 * time.Second
 
 // CredentialBalance 是**一把凭据**在上游侧的余额结果。
+// @ts-type CredentialBalance
 type CredentialBalance struct {
 	CredentialID string `json:"credential_id"`
 	Label        string `json:"label"`
@@ -67,6 +68,7 @@ type CredentialBalance struct {
 }
 
 // ProviderBalance 是一个上游下全部凭据的查询结果。
+// @ts-type ProviderBalance
 type ProviderBalance struct {
 	ProviderID string              `json:"provider_id"`
 	Provider   string              `json:"provider"`

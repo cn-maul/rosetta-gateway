@@ -21,6 +21,7 @@ func NewModelGroupHandler(st *store.Store) *ModelGroupHandler {
 	return &ModelGroupHandler{store: st}
 }
 
+// @ts-type ModelGroup
 type modelGroupResponse struct {
 	ID          string `json:"id"`
 	DisplayName string `json:"display_name"`

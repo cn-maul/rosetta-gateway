@@ -52,6 +52,7 @@ func (h *ProbeHandler) probeWindowMs() int64 {
 }
 
 // modelHealthResponse 是总览健康卡的一行。
+// @ts-type ProbeHealth
 type modelHealthResponse struct {
 	ModelID    string `json:"model_id"`
 	ProviderID string `json:"provider_id"`

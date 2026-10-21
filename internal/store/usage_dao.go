@@ -338,7 +338,7 @@ func priceUsage(priceInput, priceCacheHit, priceOutput, inputTokens, cachedToken
 //
 // 与 reported / missing 的区别：那两者描述的是**上游有没有报 token 数**，
 // 本值描述的是「我们有没有算出费用」—— 两个正交维度，不冲突。
-const usageStateCostPending = "cost_pending"
+const usageStateCostPending = UsageStateCostPending
 
 // freezeUsageCost 算出一条用量的固化费用（元）。
 //
@@ -605,7 +605,7 @@ func (s *Store) RecomputeCost(ctx context.Context, recordID string) (bool, error
 	// 重算成功即复位为 reported；查价仍然失败则**保持** cost_pending，
 	// 让下一轮继续捞它（旧实现无条件写 reported，于是重算失败的那次
 	// 把这条记录永久移出待重算队列，变成一笔没被纠正的 0 元）。
-	state := "reported"
+	state := UsageStateReported
 	if costPending {
 		state = usageStateCostPending
 	}

@@ -44,6 +44,7 @@ const exportFormatVersion = 3
 // 注意这里**不含** provider 的 id：id 是本库的内部主键，跨库无意义。
 // 导入时按slug 匹配现有provider —— slug 才是对外稳定标识（路由、
 // 日志、界面都引用它）。
+// @ts-type ConfigExportFile
 type configExport struct {
 	Version    int   `json:"version"`
 	ExportedAt int64 `json:"exported_at"`
@@ -71,6 +72,7 @@ type configExport struct {
 }
 
 // networkExport 是一条出站网络（代理配置）。只带名字与地址。
+// @ts-type ConfigExportNetwork
 type networkExport struct {
 	Name     string `json:"name"`
 	ProxyURL string `json:"proxy_url"`
@@ -78,10 +80,12 @@ type networkExport struct {
 
 // modelGroupExport 是一个模型归组。只带显示名：组的 id 是本库内部主键，
 // 跨库无意义（同 provider 不带 id 的理由）。
+// @ts-type ConfigExportModelGroup
 type modelGroupExport struct {
 	DisplayName string `json:"display_name"`
 }
 
+// @ts-type ConfigExportProvider
 type providerExport struct {
 	Slug       string `json:"slug"`
 	Name       string `json:"name"`
@@ -96,6 +100,7 @@ type providerExport struct {
 	NetworkName string `json:"network_name,omitempty"`
 }
 
+// @ts-type ConfigExportCredential
 type credentialExport struct {
 	// ProviderSlug 而非 id：同上，跨库要靠 slug 关联。
 	ProviderSlug string `json:"provider_slug"`
@@ -107,6 +112,7 @@ type credentialExport struct {
 	Weight  int   `json:"weight"`
 }
 
+// @ts-type ConfigExportModel
 type modelExport struct {
 	ProviderSlug     string `json:"provider_slug"`
 	ModelID          string `json:"model_id"`

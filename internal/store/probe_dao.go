@@ -124,6 +124,7 @@ func (s *Store) ProbeHealthSummary(ctx context.Context, windowMs int64) ([]Probe
 }
 
 // ProbeTimelineBucket 是时间轴的一个分桶（某模型某时间窗的连通率）。
+// @ts-type ProbeTimelineBucket
 type ProbeTimelineBucket struct {
 	ModelID string `json:"model_id"` // 模型 id（多模型查询时必需）
 	Ts      int64  `json:"ts"`       // 桶起点（毫秒）

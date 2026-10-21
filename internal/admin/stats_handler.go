@@ -19,6 +19,7 @@ func NewStatsHandler(st *store.Store) *StatsHandler {
 	return &StatsHandler{store: st}
 }
 
+// @ts-type Stats
 type statsResponse struct {
 	ThroughputSamples       int     `json:"throughput_samples"`
 	TtfbSamples             int     `json:"ttfb_samples"`

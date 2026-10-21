@@ -21,6 +21,7 @@ func NewRouteTargetHandler(st *store.Store) *RouteTargetHandler {
 	return &RouteTargetHandler{store: st}
 }
 
+// @ts-type RouteTarget
 type routeTargetResponse struct {
 	ID              string `json:"id"`
 	RouteID         string `json:"route_id"`
@@ -34,6 +35,7 @@ type routeTargetResponse struct {
 
 // routeTargetInput 是整体替换时数组里的一个元素。
 // position 由数组下标决定，不接受客户端传入；enabled 省略即 true。
+// @ts-type RouteTargetInput
 type routeTargetInput struct {
 	ProviderID      string `json:"provider_id"`
 	UpstreamModelID string `json:"upstream_model_id"`

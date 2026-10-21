@@ -29,11 +29,21 @@ func writeIndentedJSON(w http.ResponseWriter, v any) error {
 	return enc.Encode(v)
 }
 
+// @ts-type ApiError
+type apiErrorDetail struct {
+	Message string `json:"message"`
+	Type    string `json:"type"`
+}
+
+type apiErrorResponse struct {
+	Error apiErrorDetail `json:"error"`
+}
+
 func writeError(w http.ResponseWriter, status int, message string) {
-	writeJSON(w, status, map[string]any{
-		"error": map[string]string{
-			"message": message,
-			"type":    "invalid_request_error",
+	writeJSON(w, status, apiErrorResponse{
+		Error: apiErrorDetail{
+			Message: message,
+			Type:    "invalid_request_error",
 		},
 	})
 }

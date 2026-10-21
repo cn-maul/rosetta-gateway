@@ -114,6 +114,7 @@ type loginRequest struct {
 	Password string `json:"password"`
 }
 
+// @ts-type LoginResult
 type loginResponse struct {
 	Token     string `json:"token"`
 	ExpiresAt int64  `json:"expires_at"`
@@ -124,6 +125,7 @@ type loginResponse struct {
 	MustSetPassword bool `json:"must_set_password"`
 }
 
+// @ts-type Me
 type meResponse struct {
 	Username        string `json:"username"`
 	DisplayName     string `json:"display_name"`
@@ -150,11 +152,18 @@ type meResponse struct {
 //
 // 该端点必须免鉴权：前端要先知道「这台网关有没有开多用户登录」才能决定
 // 是显示登录框还是提示去配置环境变量。响应里只有��个布尔值。
+// @ts-type SessionStatus
+type sessionStatusResponse struct {
+	Enabled bool   `json:"enabled"`
+	Env     string `json:"env"`
+	MinLen  int    `json:"min_len"`
+}
+
 func (h *UserHandler) SessionStatus(w http.ResponseWriter, r *http.Request) {
-	writeJSON(w, http.StatusOK, map[string]any{
-		"enabled": h.mgr.Enabled(),
-		"env":     userauth.SecretEnvName,
-		"min_len": 32,
+	writeJSON(w, http.StatusOK, sessionStatusResponse{
+		Enabled: h.mgr.Enabled(),
+		Env:     userauth.SecretEnvName,
+		MinLen:  32,
 	})
 }
 
@@ -378,6 +387,7 @@ func writeTooMany(w http.ResponseWriter, retryAfter time.Duration) {
 // 设完即永久关闭。
 
 // bootstrapStatusResponse 是首次登录引导的状态。
+// @ts-type BootstrapStatus
 type bootstrapStatusResponse struct {
 	// NeedsSetup 为真表示引导窗口仍然开放（本安装尚未完成过引导，且当前
 	// 存在待初始化的管理员），前端应把登录页换成「设置密码」表单。

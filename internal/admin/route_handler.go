@@ -39,6 +39,7 @@ type routeRequest struct {
 }
 
 // 没有 extra_json：它没有运行时执行点，schema 也不提供该列。
+// @ts-type Route
 type routeResponse struct {
 	ID              string `json:"id"`
 	PublicName      string `json:"public_name"`

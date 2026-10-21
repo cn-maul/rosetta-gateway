@@ -26,6 +26,7 @@ func NewSettingsHandler(st *store.Store, cfg *config.Config) *SettingsHandler {
 //
 // Get 一律回显**生效值**：DB 里没配（0）就填 config.json 的值，这样界面显示的
 // 是「真正在用的数」，而不是一个空 0 让人以为是「不限」。
+// @ts-type Settings
 type settingsResponse struct {
 	DefaultContextWindow   int `json:"default_context_window"`
 	DefaultMaxOutputTokens int `json:"default_max_output_tokens"`

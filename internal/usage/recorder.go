@@ -56,20 +56,6 @@ func New(cfg Config) *Recorder {
 	return u
 }
 
-// usage_records.status / usage_state 的取值。
-//
-// 这两个字符串是 usage 记录的**判读字段**（报表、成功率、以及余额扣费的
-// 判据都在读它们），散成裸字面量时改一处忘一处的后果很隐蔽：扣费判据一旦
-// 与落库侧写的不一致，用户就会「明明成功却被免单」或「明明失败却被扣钱」，
-// 而这两种都**没有任何报错**。故在此固定成常量 —— 只给**新增**的判读方
-// （Recorder.charge）用，既有落库处的裸字面量保持原样，避免本次改动
-// 波及热路径上每一条 usage 记录。
-const (
-	// usageStatusOK 是「这次调用真的成功」。与 dataplane.Outcome.Success 的
-	// 判据同源：流式只有 status=="ok" 才算成功，断流/溢出/中断都不是。
-	usageStatusOK = "ok"
-)
-
 // Recorder 负责把用量记录异步落库，并在关停时等它们写完。
 //
 // 异步是必须的 —— 不能让客户端为了等一次 SQLite 写多耗一个来回；但纯粹的
@@ -178,7 +164,7 @@ const (
 // Exported lifecycle/behavior constants for callers that need to describe or
 // test the recorder without reaching into package internals.
 const (
-	StatusOK  = usageStatusOK
+	StatusOK  = store.UsageStatusOK
 	QueueSize = usageQueueSize
 )
 
@@ -571,7 +557,7 @@ func (u *Recorder) charge(rec *store.UsageRecord, costYuan float64) {
 		return
 	}
 	// 非成功不扣：见本函数「只对成功的请求扣费」。
-	if rec.Status != usageStatusOK {
+	if rec.Status != store.UsageStatusOK {
 		return
 	}
 	// 空 request_id → 没有幂等键，扣费**不做**（宁可漏扣不可重复扣）。

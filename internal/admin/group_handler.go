@@ -24,6 +24,7 @@ import (
 // 全部端点都是 admin-only（由 internal/access 的精确路由白名单挡住普通用户）。
 
 // groupResponse 是分组对外的表示。
+// @ts-type Group
 type groupResponse struct {
 	ID          string `json:"id"`
 	Name        string `json:"name"`
@@ -384,6 +385,7 @@ func (h *GroupHandler) ModelNames(w http.ResponseWriter, r *http.Request) {
 // userAccessibleRoutes），多给一个字段就多一个可被枚举的信息。
 //
 // 供应商名取快照里的 slug 而非「人类填的 name」：见 metaForModel 的说明。
+// @ts-type ModelMeta
 type modelMeta struct {
 	// Name 是所属的公开模型名 —— 排序与对齐用的键，语义与 modelPrice.Name
 	// 相同（prices 与 meta 都靠它与 models 逐位对齐，见构造处的注释）。
@@ -426,6 +428,7 @@ func metaForModel(routes *routing.RouteIndex, name string) modelMeta {
 // 语义与 routing.UpstreamModel 的三个 Price 字段逐字对应，**0 = 未配置**
 // （不是「免费」）：前端据此显示「未配置」而不是 0.00（与 Settings.vue 的
 // priceCell 同口径）。
+// @ts-type ModelPrice
 type modelPrice struct {
 	Name          string  `json:"name"`
 	PriceInput    float64 `json:"price_input"`

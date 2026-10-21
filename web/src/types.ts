@@ -34,6 +34,7 @@ export interface Provider {
    */
   balance_spec_json: string
   created_at: number
+  updated_at: number
   // ready 是**运行时**状态（后端快照），不是库里的配置字段：
   // 库只记录配了什么，快照才反映「上游池实际建出了什么」。
   // ready=false 表示一条可用凭据都没有 —— 请求打过去必然失败，
@@ -60,6 +61,7 @@ export interface ProviderCreatePayload {
   name: string
   protocol: string
   endpoint: string
+  quirks_json?: string
   /** 出站网络（networks.id）；留空或 "direct" = 直连（新建的默认值）。 */
   network_id?: string
   /**
@@ -497,6 +499,7 @@ export interface BootstrapStatus {
 /** GET /admin/api/me 的响应。 */
 export interface Me {
   username: string
+  display_name: string
   role: UserRole
   status: UserStatus
   quota_tokens: number
@@ -527,6 +530,7 @@ export interface Me {
 export interface User {
   id: string
   username: string
+  display_name: string
   role: UserRole
   status: UserStatus
   /**
@@ -969,6 +973,8 @@ export interface ConfigExportFile {
   providers?: ConfigExportProvider[]
   credentials?: ConfigExportCredential[]
   models?: ConfigExportModel[]
+  model_groups?: ConfigExportModelGroup[]
+  networks?: ConfigExportNetwork[]
 }
 
 export interface ConfigExportProvider {
@@ -980,6 +986,7 @@ export interface ConfigExportProvider {
   timeout_ms: number
   max_retries: number
   quirks_json?: string
+  network_name?: string
 }
 
 export interface ConfigExportCredential {
@@ -1003,6 +1010,16 @@ export interface ConfigExportModel {
   price_input?: number
   price_cache_hit?: number
   price_output?: number
+  group_name?: string
+}
+
+export interface ConfigExportModelGroup {
+  display_name: string
+}
+
+export interface ConfigExportNetwork {
+  name: string
+  proxy_url: string
 }
 
 /**
@@ -1023,7 +1040,14 @@ export interface ConfigImportResult {
 }
 
 // Admin route catalog: provider selection needs no endpoint or credentials.
-export type RouteCatalogProvider = Pick<Provider, 'id' | 'slug' | 'name' | 'enabled' | 'ready_reason'> & { ready: boolean | null }
+export interface RouteCatalogProvider {
+  id: string
+  slug: string
+  name: string
+  enabled: boolean
+  ready: boolean | null
+  ready_reason?: string
+}
 export interface RouteCatalogEntry extends Route {
   targets: RouteTarget[]
   chain: { total: number; enabled: number; standby: number }

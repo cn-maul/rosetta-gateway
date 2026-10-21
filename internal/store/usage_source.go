@@ -26,27 +26,27 @@ type UsageFilter struct {
 const (
 	// 明细分支：1 行 = 1 次请求。bucket_ts = 真实 ts。
 	usageSourceDetailCols = `1 AS n,
-		CASE WHEN status = 'ok' THEN 1 ELSE 0 END AS n_ok,
-		CASE WHEN status NOT IN ('ok', 'canceled') THEN 1 ELSE 0 END AS n_err,
+		CASE WHEN status = '` + UsageStatusOK + `' THEN 1 ELSE 0 END AS n_ok,
+		CASE WHEN status NOT IN ('` + UsageStatusOK + `', '` + UsageStatusCanceled + `') THEN 1 ELSE 0 END AS n_err,
 		input_tokens, output_tokens, cached_tokens, reasoning_tokens, total_tokens,
 		cost_total, latency_ms AS latency_sum,
 		CASE WHEN ttfb_ms > 0 THEN ttfb_ms ELSE 0 END AS ttfb_sum,
 		CASE WHEN ttfb_ms > 0 THEN 1 ELSE 0 END AS n_ttfb,
 		-- 近期性能的独立口径：只取成功请求。ttfb_sum/n_ttfb 还要服务
 		-- 分组统计，那里包含失败请求的已测首字，不能在这里顺手改口径。
-		CASE WHEN status = 'ok' AND ttfb_ms > 0 THEN ttfb_ms ELSE 0 END AS ttfb_ok_sum,
-		CASE WHEN status = 'ok' AND ttfb_ms > 0 THEN 1 ELSE 0 END AS n_ttfb_ok,
+		CASE WHEN status = '` + UsageStatusOK + `' AND ttfb_ms > 0 THEN ttfb_ms ELSE 0 END AS ttfb_ok_sum,
+		CASE WHEN status = '` + UsageStatusOK + `' AND ttfb_ms > 0 THEN 1 ELSE 0 END AS n_ttfb_ok,
 		-- 速度的分子分母，**只取成功请求**。canceled 的 latency 是
 		-- 「断开前跑了多久」而非完整耗时，用它当分母会把平均速度压低；
 		-- truncated / error 同理（它们往往还没开始吐 token）。
-		CASE WHEN status = 'ok' THEN output_tokens ELSE 0 END AS out_ok,
-		CASE WHEN status = 'ok' THEN latency_ms ELSE 0 END AS lat_ok,
+		CASE WHEN status = '` + UsageStatusOK + `' THEN output_tokens ELSE 0 END AS out_ok,
+		CASE WHEN status = '` + UsageStatusOK + `' THEN latency_ms ELSE 0 END AS lat_ok,
 		-- 速度样本的实际条数。明细一行一个请求；归档支对应 ok_sample_count。
 		-- 与 out_ok/lat_ok 必须同口径，否则归档后「样本数」会退化成行数。
-		CASE WHEN status = 'ok' AND output_tokens > 0 AND latency_ms > 0 THEN 1 ELSE 0 END AS n_ok_speed,
+		CASE WHEN status = '` + UsageStatusOK + `' AND output_tokens > 0 AND latency_ms > 0 THEN 1 ELSE 0 END AS n_ok_speed,
 		-- 待重算的条数（2026-10-21 修 M5）。「费用还是 0、等着被纠正」
 		-- 的记录数，归档后仍然可数 —— 剪枝不该让这个信号凭空消失。
-		CASE WHEN usage_state = 'cost_pending' THEN 1 ELSE 0 END AS n_cost_pending,
+		CASE WHEN usage_state = '` + UsageStateCostPending + `' THEN 1 ELSE 0 END AS n_cost_pending,
 		` + dayExpr + ` AS day, ts AS bucket_ts,
 		COALESCE(user_id, '') AS user_id, access_key_id, public_model, upstream_model, provider_id`
 

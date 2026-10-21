@@ -392,6 +392,7 @@ func roundMillis(v sql.NullFloat64) float64 {
 
 // usageHistoryEntry 是「调用历史」表格的一行：一次真实请求的精简视图。
 // KeyName 来自 access_keys（密钥被删后为空，前端回退显示 KeyID）。
+// @ts-type UsageHistoryEntry
 type usageHistoryEntry struct {
 	Ts            int64  `json:"ts"`
 	PublicModel   string `json:"public_model"`
@@ -506,6 +507,7 @@ func tpsFor(outputTokens, latencyMs int64) float64 {
 
 // usageHistoryResponse 是「调用历史」的分页结果：当页明细 + 过滤后的总条数。
 // 前端要靠 total 才能显示「第 x / y 页」并正确禁用翻页按钮。
+// @ts-type UsageHistoryPage
 type usageHistoryResponse struct {
 	Records []usageHistoryEntry `json:"records"`
 	Total   int64               `json:"total"`
@@ -730,6 +732,7 @@ func (h *UsageHandler) History(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, usageHistoryResponse{Records: entries, Total: total})
 }
 
+// @ts-type UsageGroupEntry
 type usageGroupEntry struct {
 	Key    string `json:"key"`
 	Count  int64  `json:"count"`

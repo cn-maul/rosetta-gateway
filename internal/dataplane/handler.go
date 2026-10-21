@@ -642,9 +642,9 @@ func (h *Handler) Handle(codec ingress.Codec) http.HandlerFunc {
 		if triedAny && lastTried.Provider != nil {
 			provID, upstreamModel = lastTried.Provider.ID, lastTried.UpstreamModel.ModelID
 		}
-		status := "error"
+		status := store.UsageStatusError
 		if clientGone {
-			status = "canceled"
+			status = store.UsageStatusCanceled
 			logger.Info("client disconnected before any response was written",
 				"model", ing.Model, "request_id", httpx.RequestIDFromContext(r.Context()))
 		}
@@ -664,7 +664,7 @@ func (h *Handler) Handle(codec ingress.Codec) http.HandlerFunc {
 			UpstreamModel:   upstreamModel,
 			IngressProtocol: codec.Name(),
 			Stream:          ing.Stream,
-			UsageState:      "none",
+			UsageState:      store.UsageStateNone,
 			Status:          status,
 			HTTPStatus:      statusCode,
 			ErrorCode:       errorCode,
@@ -894,7 +894,7 @@ func (h *Handler) attemptStream(w http.ResponseWriter, r *http.Request, client *
 
 	var lastUsage rosetta.Usage
 	var stopReason rosetta.StopReason
-	status := "ok"
+	status := store.UsageStatusOK
 	errorCode := ""
 	// errorDetail 只在 default 分支（上游真的返回了错误）填 —— truncated /
 	// overflow / idle_timeout 是「流断了」而不是「上游回了错误正文」，
@@ -973,7 +973,7 @@ func (h *Handler) attemptStream(w http.ResponseWriter, r *http.Request, client *
 		// 因此复用 canceled 这个取值（它已经是「不计入上游熔断」的那一类，
 		// 见 Outcome.ClientGone）。单独一个 errorCode 让运维能
 		// 区分「客户端自己走了」与「我们写不进去」。
-		status = "canceled"
+		status = store.UsageStatusCanceled
 		errorCode = "downstream_write_failed"
 		if serr := stream.Err(); serr != nil {
 			logger.Debug("stream error observed after downstream write failure",
@@ -990,26 +990,26 @@ func (h *Handler) attemptStream(w http.ResponseWriter, r *http.Request, client *
 	} else if err := stream.Err(); err != nil {
 		switch {
 		case errors.Is(err, rosetta.ErrStreamTruncated):
-			status = "truncated"
+			status = store.UsageStatusTruncated
 			errorCode = "stream_truncated"
 			logger.Warn("stream truncated", "model", publicModel, "key_id", authCtx.KeyID, "error", err)
 		case errors.Is(err, rosetta.ErrStreamOverflow):
-			status = "overflow"
+			status = store.UsageStatusOverflow
 			errorCode = "stream_overflow"
 			logger.Error("stream overflow", "model", publicModel, "key_id", authCtx.KeyID, "error", err)
 		case IsClientGone(ctx, err):
 			// 客户端主动断开不是上游故障。此前一律记 error，后果是：后台错误率虚高、
 			// 成功率虚低，且真故障被 ERROR 噪音淹没。单独一个取值才能把两者分开。
-			status = "canceled"
+			status = store.UsageStatusCanceled
 			logger.Info("client disconnected mid-stream", "model", publicModel, "key_id", authCtx.KeyID, "error", err)
 		default:
-			status = "error"
+			status = store.UsageStatusError
 			errorCode = "upstream_error"
 			errorDetail = outwire.UpstreamErrorDetail(err)
 			logger.Error("stream error", "error", err, "model", publicModel, "key_id", authCtx.KeyID)
 		}
 	} else if idleTimedOut.Load() && !sink.SawTerminal() {
-		status = "truncated"
+		status = store.UsageStatusTruncated
 		errorCode = "stream_idle_timeout"
 		logger.Warn("stream cut by idle watchdog without terminal event",
 			"model", publicModel, "key_id", authCtx.KeyID,
@@ -1191,7 +1191,7 @@ func (h *Handler) attemptNonStream(w http.ResponseWriter, r *http.Request, clien
 		ReasoningTokens: resp.Usage.ReasoningTokens,
 		CachedTokens:    resp.Usage.CachedInputTokens,
 		UsageState:      usageStateFor(resp.Usage),
-		Status:          "ok",
+		Status:          store.UsageStatusOK,
 		HTTPStatus:      200,
 		LatencyMs:       latency,
 		TTFBMs:          ttfbMs,
@@ -1218,7 +1218,7 @@ func (h *Handler) attemptNonStream(w http.ResponseWriter, r *http.Request, clien
 // 也算「报了」，否则会丢掉真实数字（见 SDK usage.go 的注释）。
 func usageStateFor(u rosetta.Usage) string {
 	if u.IsZero() {
-		return "missing"
+		return store.UsageStateMissing
 	}
-	return "reported"
+	return store.UsageStateReported
 }

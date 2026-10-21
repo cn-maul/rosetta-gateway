@@ -32,6 +32,7 @@ import (
 //
 // 刻意**不含** password_hash：它进响应就等于把哈希交给浏览器，
 // 哪怕是 PBKDF2 也是不该发生的信息泄漏。
+// @ts-type User
 type userResponse struct {
 	ID          string `json:"id"`
 	Username    string `json:"username"`
@@ -754,9 +755,16 @@ const (
 // 是这一页独有的额外一步 —— 而这一页恰好是唯一会出现别人账号的地方。
 // 用户名在写流水那一刻固化（与 operator_username 同一理由：账号可能被改名
 // 或删除，流水不该因主体消失而失去可读性）。
+// @ts-type TopupRecord
 type topupRecordOut struct {
 	store.Topup
 	Username string `json:"username"`
+}
+
+// @ts-type TopupPage
+type topupPageResponse struct {
+	Records []topupRecordOut `json:"records"`
+	Total   int64            `json:"total"`
 }
 
 // ListTopups 查询充值流水（**唯一一个**查询端点）。
@@ -841,10 +849,7 @@ func (h *UserHandler) ListTopups(w http.ResponseWriter, r *http.Request) {
 		out = append(out, topupRecordOut{Topup: tp, Username: nameOf(tp.UserID)})
 	}
 
-	writeJSON(w, http.StatusOK, map[string]any{
-		"records": out,
-		"total":   total,
-	})
+	writeJSON(w, http.StatusOK, topupPageResponse{Records: out, Total: total})
 }
 
 // ---- 自助改密 ----

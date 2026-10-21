@@ -63,6 +63,7 @@ type keyRequest struct {
 	GroupID *string `json:"group_id"`
 }
 
+// @ts-type AccessKey
 type keyResponse struct {
 	ID        string `json:"id"`
 	KeyPrefix string `json:"key_prefix"`
@@ -88,9 +89,16 @@ type keyResponse struct {
 	CreatedAt  int64  `json:"created_at"`
 }
 
+// @ts-type KeyCreateResponse
 type keyCreateResponse struct {
 	keyResponse
 	PlaintextKey string `json:"plaintext_key"`
+}
+
+// @ts-type RecomputeUsageResult
+type recomputeUsageResponse struct {
+	Status     string `json:"status"`
+	UsedTokens int64  `json:"used_tokens"`
 }
 
 // List 返回访问密钥列表。
@@ -732,9 +740,9 @@ func (h *KeyHandler) RecomputeUsage(w http.ResponseWriter, r *http.Request, id s
 		writeNotFoundOrError(w, "recompute key usage", "密钥不存在", err)
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{
-		"status":      "ok",
-		"used_tokens": used,
+	writeJSON(w, http.StatusOK, recomputeUsageResponse{
+		Status:     store.UsageStatusOK,
+		UsedTokens: used,
 	})
 }
 

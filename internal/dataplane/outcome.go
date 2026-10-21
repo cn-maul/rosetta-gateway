@@ -11,6 +11,7 @@ import (
 	"github.com/cn-maul/rosetta"
 	"github.com/cn-maul/rosetta-gateway/internal/outwire"
 	"github.com/cn-maul/rosetta-gateway/internal/routing"
+	"github.com/cn-maul/rosetta-gateway/internal/store"
 )
 
 // AppendRouteTrace 记录一次链上决策：第几个目标、谁、结果、原因。
@@ -37,8 +38,8 @@ func AppendRouteTrace(trace []string, attempt int, cand routing.Candidate, outco
 // 用 "ok" / "committed_fail" 与未提交路径保持同一套词汇，避免同一种
 // 「流断了」在不同路径里出现两种叫法（status 本身只用于计费判读）。
 func StreamCommitOutcome(status string) string {
-	if status == "ok" {
-		return "ok"
+	if status == store.UsageStatusOK {
+		return store.UsageStatusOK
 	}
 	return "committed_fail"
 }

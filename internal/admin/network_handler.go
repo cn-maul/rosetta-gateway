@@ -26,6 +26,7 @@ func NewNetworkHandler(st *store.Store) *NetworkHandler {
 	return &NetworkHandler{store: st}
 }
 
+// @ts-type Network
 type networkResponse struct {
 	ID   string `json:"id"`
 	Name string `json:"name"`

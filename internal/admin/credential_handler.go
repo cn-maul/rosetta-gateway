@@ -36,6 +36,7 @@ type credentialRequest struct {
 	Enabled *bool   `json:"enabled"`
 }
 
+// @ts-type Credential
 type credentialResponse struct {
 	ID         string `json:"id"`
 	ProviderID string `json:"provider_id"`

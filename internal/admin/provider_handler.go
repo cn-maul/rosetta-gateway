@@ -30,6 +30,7 @@ func NewProviderHandler(st *store.Store, masterKey []byte, cfg *config.Config) *
 // providerCreateRequest 是新建上游的输入。
 // slug 由系统生成、enabled 固定 true、超时与重试取「设置」里的全局默认，
 // 三者都不接受客户端指定 —— 所以不与 PATCH 共用结构体。
+// @ts-type ProviderCreatePayload
 type providerCreateRequest struct {
 	Name     string `json:"name"`
 	Protocol string `json:"protocol"`
@@ -50,6 +51,7 @@ type providerCreateRequest struct {
 //
 // 这里**没有 slug 字段**：slug 是日志、路由与管理界面对外引用的稳定标识，
 // 创建后不可修改。客户端即使传了也会被忽略。
+// @ts-type ProviderUpdatePayload
 type providerUpdateRequest struct {
 	Name       *string `json:"name"`
 	Protocol   *string `json:"protocol"`
@@ -66,6 +68,7 @@ type providerUpdateRequest struct {
 	BalanceSpecJSON *string `json:"balance_spec_json"`
 }
 
+// @ts-type Provider
 type providerResponse struct {
 	ID         string `json:"id"`
 	Slug       string `json:"slug"`

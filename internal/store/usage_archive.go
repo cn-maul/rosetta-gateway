@@ -105,6 +105,7 @@ var nowLocal = time.Now
 const DefaultRetentionDays = 30
 
 // PruneResult 是一次剪枝的影响面，回给管理端点。
+// @ts-type PruneResult
 type PruneResult struct {
 	RollupRows    int64  `json:"rollup_rows"`        // 写进表 A 的聚合分组数
 	DeletedRows   int64  `json:"deleted_rows"`       // 从明细表删掉的行数
