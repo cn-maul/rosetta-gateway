@@ -26,13 +26,18 @@ func TestBuildApp_RegistersEveryCataloguedRoute(t *testing.T) {
 		usage: newUsageRecorder(db, discardLogger()),
 	})
 
-	if len(app.Routes) < 80 {
-		t.Fatalf("只采集到 %d 条路由，生产装配明显不完整", len(app.Routes))
+	// 103 是重构前的真实生产契约（含 5 条 /admin/api/ 方法兜底）。
+	// 端点增删必须显式更新这个数，不能靠测试里手抄第三份清单。
+	if len(app.Routes) != 103 {
+		t.Fatalf("生产路由契约应为 103 条，实际 %d 条", len(app.Routes))
 	}
 	seen := make(map[string]registeredRoute)
 	for _, r := range app.Routes {
 		if r.Pattern == "" {
 			t.Fatal("采集到空 pattern")
+		}
+		if _, ok := seen[r.Pattern]; ok {
+			t.Fatalf("生产路由重复注册: %s", r.Pattern)
 		}
 		seen[r.Pattern] = r
 	}

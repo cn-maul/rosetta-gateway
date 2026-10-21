@@ -40,13 +40,25 @@ type routeDeps struct {
 	usage       *usageRecorder
 }
 
-// adminRouteSpec is the single registration source for the admin API. Public
-// routes still pass through the same authz matrix but use the unauthenticated
-// mux.
-type adminRouteSpec struct {
-	Pattern string
-	Handler http.HandlerFunc
-	Public  bool
+// routeScope selects the production mux that owns a route. The zero value is
+// the guarded admin mux so the large admin route table stays declarative.
+type routeScope uint8
+
+const (
+	routeAdmin routeScope = iota
+	routeRoot
+	routeAdminFallback
+)
+
+// routeSpec is the single registration source for every production route.
+// Public admin routes are also mounted on the root mux; RootHandler overrides
+// the root-side handler only when that mount needs extra middleware.
+type routeSpec struct {
+	Pattern     string
+	Handler     http.HandlerFunc
+	Public      bool
+	RootHandler http.HandlerFunc
+	Scope       routeScope
 }
 
 // registeredRoute 是生产 mux 的一条注册记录。
@@ -103,13 +115,29 @@ func (m *routeMux) HandleFunc(pattern string, h func(http.ResponseWriter, *http.
 	m.ServeMux.HandleFunc(pattern, h)
 }
 
-func registerAdminRoutes(adminMux, publicAdminMux *routeMux, specs []adminRouteSpec) {
+func registerRoutes(rootMux, adminMux, publicAdminMux *routeMux, specs []routeSpec) {
 	for _, spec := range specs {
+		switch spec.Scope {
+		case routeRoot:
+			rootMux.Handle(spec.Pattern, spec.Handler)
+			continue
+		case routeAdminFallback:
+			rootMux.Handle(spec.Pattern, spec.Handler)
+			continue
+		}
+
 		mux := adminMux
 		if spec.Public {
 			mux = publicAdminMux
 		}
-		mux.HandleFunc(spec.Pattern, spec.Handler)
+		mux.Handle(spec.Pattern, spec.Handler)
+		if spec.Public {
+			handler := spec.Handler
+			if spec.RootHandler != nil {
+				handler = spec.RootHandler
+			}
+			rootMux.Handle(spec.Pattern, handler)
+		}
 	}
 }
 
@@ -169,39 +197,82 @@ func buildApp(d routeDeps) *gatewayApp {
 	userHandler := admin.NewUserHandler(db, sessionMgr).WithReload(reloader.Reload)
 	records := make(map[string]registeredRoute)
 	mux := newRouteMux(false, records)
-	mux.HandleFunc("POST /v1/chat/completions", dataPlane.Handle(ingress.NewOpenAIChat()))
-	mux.HandleFunc("POST /v1/messages", dataPlane.Handle(ingress.NewAnthropicMessages()))
-	mux.HandleFunc("POST /v1/responses", dataPlane.Handle(ingress.NewResponses()))
-	// D9：/v1/models 在两种协议下路径相同、响应形状不同 —— 按认证头分流，
-	// 显式别名路径永远优先。
-	mux.HandleFunc("GET /v1/models", handleListModels(""))
-	mux.HandleFunc("GET /openai/v1/models", handleListModels("openai"))
-	mux.HandleFunc("GET /anthropic/v1/models", handleListModels("anthropic"))
-	// 单模型详情：外部工具（Cherry Studio / LobeChat / 各类网关面板）按
-	// OpenRouter/LiteLLM 约定读 context_length / max_output_tokens。
-	// 额度/费用查询（官方 usage/costs + 生态兼容 dashboard billing，见 billing.go）
-	mux.HandleFunc("GET /dashboard/billing/subscription", billinghttp.Subscription(db))
-	mux.HandleFunc("GET /v1/dashboard/billing/subscription", billinghttp.Subscription(db))
-	mux.HandleFunc("GET /dashboard/billing/usage", billinghttp.Usage(db))
-	mux.HandleFunc("GET /v1/dashboard/billing/usage", billinghttp.Usage(db))
-	mux.HandleFunc("GET /v1/organization/costs", billinghttp.OrgCosts(db))
-	mux.HandleFunc("GET /v1/organization/usage/completions", billinghttp.OrgUsageCompletions(db))
-
-	mux.HandleFunc("GET /v1/models/{model}", handleGetModel(""))
-	mux.HandleFunc("GET /openai/v1/models/{model}", handleGetModel("openai"))
-	mux.HandleFunc("GET /anthropic/v1/models/{model}", handleGetModel("anthropic"))
-
 	adminMux := newRouteMux(false, records)
 	// 免鉴权 mux：登录与首次引导本身就是取得凭据的入口，
 	// 要求先有凭据是死循环。它们的防护是限速 + 失败原因不细分 + 同源判定。
 	publicAdminMux := newRouteMux(true, records)
 	groupHandler := admin.NewGroupHandler(db)
-	adminRouteSpecs := []adminRouteSpec{
+
+	// 鉴权链：**只有用户会话一条通道**（users 表 + JWT）。
+	//
+	// 此前并行的「运维凭据」通道（admin_token / admin_auth.json）已删除。
+	// 它本来的用途是「建第一个账号」与「忘记密码时应急」，而统一认证后
+	// 这两件事都有更干净的位置：首次由 /admin/api/bootstrap 引导完成，
+	// 忘记密码由管理员在「用户管理」里重置。留着一个绕过 users 表的
+	// 管理入口，等于留一条「不产生会话、不受 auth_version 约束」的旁路。
+	adminGuarded := server.NewUserAuth(sessionMgr, db).
+		// adminMux 传了两次，这是刻意的：AdminGateGuard 用**同一个 mux**
+		// 去查「这个请求会被哪个路由模式处理」，再拿那个模式比对普通用户
+		// 白名单（见 server.userAccessibleRoutes）。复用真实路由表而不是
+		// 手抄一份路径清单，是为了让白名单与真实路由**不可能漂移**。
+		Guard(server.AdminGateGuard(adminMux.ServeMux, adminMux.ServeMux))
+
+	// 管理写操作审计（DESIGN §13.3）：谁、何时、动了哪个资源、动了哪些字段
+	// （只记字段名不记值 —— body 里有 api_key 与密码明文）。
+	// 审计在重建之前同步落库，失败只 WARN 不阻塞。
+	// actor 写死 "admin" 是已知的不精确：回调没透传会话身份，
+	// 普通用户对自己资源的写操作也会落 "admin" 记录（见 store.AuditEntry 注释）。
+	audit := func(method, path string, status int, remote, fields string) {
+		entry := &store.AuditEntry{
+			Ts:     time.Now().UnixMilli(),
+			Actor:  "admin",
+			Remote: remote,
+			Method: method,
+			Path:   path,
+			Status: status,
+			Fields: fields,
+		}
+		if err := db.CreateAuditEntry(context.Background(), entry); err != nil {
+			logger.Warn("audit entry write failed", "error", err, "path", path)
+		}
+	}
+
+	// 管理写操作成功后自动重建运行时（池 + 快照）：配置生效不再依赖前端自觉调
+	// POST /admin/api/reload，任何带凭据的调用方（curl/脚本）写完立即生效 ——
+	// 包括禁用下游 Key 这类安全敏感操作（auth 读快照，不重建就照常放行）。
+	// AutoReload 在鉴权链外侧：401/429 的失败响应不会触发重建。
+	// 前端 mutate() 里的 reload 调用保留为兜底（服务端重建失败时再给一次机会）。
+	adminAuto := server.AutoReload(adminGuarded, reloader.Reload, audit, logger, reloader.MarkDirty)
+
+	routeSpecs := []routeSpec{
+		{Pattern: "POST /v1/chat/completions", Handler: dataPlane.Handle(ingress.NewOpenAIChat()), Scope: routeRoot},
+		{Pattern: "POST /v1/messages", Handler: dataPlane.Handle(ingress.NewAnthropicMessages()), Scope: routeRoot},
+		{Pattern: "POST /v1/responses", Handler: dataPlane.Handle(ingress.NewResponses()), Scope: routeRoot},
+		// D9：/v1/models 在两种协议下路径相同、响应形状不同 —— 按认证头分流，
+		// 显式别名路径永远优先。
+		{Pattern: "GET /v1/models", Handler: handleListModels(""), Scope: routeRoot},
+		{Pattern: "GET /openai/v1/models", Handler: handleListModels("openai"), Scope: routeRoot},
+		{Pattern: "GET /anthropic/v1/models", Handler: handleListModels("anthropic"), Scope: routeRoot},
+		// 单模型详情：外部工具（Cherry Studio / LobeChat / 各类网关面板）按
+		// OpenRouter/LiteLLM 约定读 context_length / max_output_tokens。
+		{Pattern: "GET /v1/models/{model}", Handler: handleGetModel(""), Scope: routeRoot},
+		{Pattern: "GET /openai/v1/models/{model}", Handler: handleGetModel("openai"), Scope: routeRoot},
+		{Pattern: "GET /anthropic/v1/models/{model}", Handler: handleGetModel("anthropic"), Scope: routeRoot},
+		// 额度/费用查询（官方 usage/costs + 生态兼容 dashboard billing，见 billing.go）
+		{Pattern: "GET /dashboard/billing/subscription", Handler: billinghttp.Subscription(db), Scope: routeRoot},
+		{Pattern: "GET /v1/dashboard/billing/subscription", Handler: billinghttp.Subscription(db), Scope: routeRoot},
+		{Pattern: "GET /dashboard/billing/usage", Handler: billinghttp.Usage(db), Scope: routeRoot},
+		{Pattern: "GET /v1/dashboard/billing/usage", Handler: billinghttp.Usage(db), Scope: routeRoot},
+		{Pattern: "GET /v1/organization/costs", Handler: billinghttp.OrgCosts(db), Scope: routeRoot},
+		{Pattern: "GET /v1/organization/usage/completions", Handler: billinghttp.OrgUsageCompletions(db), Scope: routeRoot},
 		{Pattern: "POST /admin/api/login", Handler: userHandler.Login, Public: true},
 		{Pattern: "GET /admin/api/session", Handler: userHandler.SessionStatus, Public: true},
 		// 首次登录引导：没有这两个端点，新部署的 admin（空密码）永远登不进去。
 		{Pattern: "GET /admin/api/bootstrap", Handler: userHandler.BootstrapStatus, Public: true},
-		{Pattern: "POST /admin/api/bootstrap", Handler: userHandler.BootstrapSetup, Public: true},
+		{
+			Pattern: "POST /admin/api/bootstrap", Handler: userHandler.BootstrapSetup, Public: true,
+			RootHandler: server.AuditOnly(http.HandlerFunc(userHandler.BootstrapSetup), audit).ServeHTTP,
+		},
 		{Pattern: "GET /admin/api/providers", Handler: providerHandler.List, Public: false},
 		{Pattern: "POST /admin/api/providers", Handler: providerHandler.Create, Public: false},
 		{Pattern: "GET /admin/api/providers/{id}", Handler: func(w http.ResponseWriter, r *http.Request) { providerHandler.Get(w, r, r.PathValue("id")) }, Public: false},
@@ -341,67 +412,15 @@ func buildApp(d routeDeps) *gatewayApp {
 		{Pattern: "GET /admin/api/model-names", Handler: groupHandler.ModelNames, Public: false},
 		{Pattern: "GET /admin/api/usage/history.csv", Handler: usageHandler.ExportCSV, Public: false},
 	}
-	registerAdminRoutes(adminMux, publicAdminMux, adminRouteSpecs)
-
-	// 鉴权链：**只有用户会话一条通道**（users 表 + JWT）。
-	//
-	// 此前并行的「运维凭据」通道（admin_token / admin_auth.json）已删除。
-	// 它本来的用途是「建第一个账号」与「忘记密码时应急」，而统一认证后
-	// 这两件事都有更干净的位置：首次由 /admin/api/bootstrap 引导完成，
-	// 忘记密码由管理员在「用户管理」里重置。留着一个绕过 users 表的
-	// 管理入口，等于留一条「不产生会话、不受 auth_version 约束」的旁路。
-	adminGuarded := server.NewUserAuth(sessionMgr, db).
-		// adminMux 传了两次，这是刻意的：AdminGateGuard 用**同一个 mux**
-		// 去查「这个请求会被哪个路由模式处理」，再拿那个模式比对普通用户
-		// 白名单（见 server.userAccessibleRoutes）。复用真实路由表而不是
-		// 手抄一份路径清单，是为了让白名单与真实路由**不可能漂移**。
-		Guard(server.AdminGateGuard(adminMux.ServeMux, adminMux.ServeMux))
-
-	// 管理写操作审计（DESIGN §13.3）：谁、何时、动了哪个资源、动了哪些字段
-	// （只记字段名不记值 —— body 里有 api_key 与密码明文）。
-	// 审计在重建之前同步落库，失败只 WARN 不阻塞。
-	// actor 写死 "admin" 是已知的不精确：回调没透传会话身份，
-	// 普通用户对自己资源的写操作也会落 "admin" 记录（见 store.AuditEntry 注释）。
-	audit := func(method, path string, status int, remote, fields string) {
-		entry := &store.AuditEntry{
-			Ts:     time.Now().UnixMilli(),
-			Actor:  "admin",
-			Remote: remote,
-			Method: method,
-			Path:   path,
-			Status: status,
-			Fields: fields,
-		}
-		if err := db.CreateAuditEntry(context.Background(), entry); err != nil {
-			logger.Warn("audit entry write failed", "error", err, "path", path)
-		}
-	}
-
-	// 管理写操作成功后自动重建运行时（池 + 快照）：配置生效不再依赖前端自觉调
-	// POST /admin/api/reload，任何带凭据的调用方（curl/脚本）写完立即生效 ——
-	// 包括禁用下游 Key 这类安全敏感操作（auth 读快照，不重建就照常放行）。
-	// AutoReload 在鉴权链外侧：401/429 的失败响应不会触发重建。
-	// 前端 mutate() 里的 reload 调用保留为兜底（服务端重建失败时再给一次机会）。
-	adminAuto := server.AutoReload(adminGuarded, reloader.Reload, audit, logger, reloader.MarkDirty)
-
-	// 免鉴权端点必须显式注册到根 mux：它们不进 adminAuto（那会走鉴权链），
-	// 但也不会因为「没注册」而落到 /admin/api/ 前缀上被鉴权拦掉 ——
-	// 那样会得到 401 而不是功能缺失，症状是「登录页一直转圈」。
-	// Go 1.22 的 ServeMux 按最具体模式匹配，精确路径优先于 /admin/api/ 前缀，
-	// 与注册顺序无关；仍写明以免后人误改。
-	mux.Handle("POST /admin/api/login", publicAdminMux)
-	mux.Handle("GET /admin/api/session", publicAdminMux)
-	mux.Handle("GET /admin/api/bootstrap", publicAdminMux)
-	// bootstrap 是免鉴权写接口，挂在 publicAdminMux 上因而**绕过**了 adminAuto
-	// 里的审计 —— 而它恰恰是整个系统最敏感的一步（设置管理员密码）。
-	// 单独套 AuditOnly：只补审计，不触发快照重建（它只改密码哈希，不动快照）。
-	mux.Handle("POST /admin/api/bootstrap", server.AuditOnly(publicAdminMux, audit))
-
-	mux.Handle("GET /admin/api/", adminAuto)
-	mux.Handle("POST /admin/api/", adminAuto)
-	mux.Handle("PATCH /admin/api/", adminAuto)
-	mux.Handle("DELETE /admin/api/", adminAuto)
-	mux.Handle("PUT /admin/api/", adminAuto)
+	// 具体管理端点由 admin mux 自己匹配；根 mux 只需按方法把未命中
+	// 精确端点的 /admin/api/ 请求交给同一套鉴权/审计链。
+	routeSpecs = append(routeSpecs,
+		routeSpec{Pattern: "GET /admin/api/", Handler: adminAuto.ServeHTTP, Scope: routeAdminFallback},
+		routeSpec{Pattern: "POST /admin/api/", Handler: adminAuto.ServeHTTP, Scope: routeAdminFallback},
+		routeSpec{Pattern: "PATCH /admin/api/", Handler: adminAuto.ServeHTTP, Scope: routeAdminFallback},
+		routeSpec{Pattern: "DELETE /admin/api/", Handler: adminAuto.ServeHTTP, Scope: routeAdminFallback},
+		routeSpec{Pattern: "PUT /admin/api/", Handler: adminAuto.ServeHTTP, Scope: routeAdminFallback},
+	)
 
 	// SPA 产物在 embed FS 的 dist/ 子目录下；剥掉 /admin 前缀后交给 FileServer。
 	// hash 路由下路径只有 /admin/（入口）与 /admin/assets/*（静态资源）两类。
@@ -458,8 +477,6 @@ func buildApp(d routeDeps) *gatewayApp {
 	// 与 "/admin/api/"（路径更窄、方法不限）并存——两者互不更具特异性，注册期直接 panic。
 	// 因此两侧都显式声明方法：API 按方法逐个注册，静态资源只挂 GET 子树。
 	// 于是 "GET /admin/api/" 在路径上严格更具体、方法相同，冲突消除。
-	mux.HandleFunc("GET /admin/", webHandler)
-
 	// 存活 / 就绪探针。**不放在 /admin/ 下**：那个路径只读 embed FS，
 	// 数据库写池卡死、用量写入持续失败、快照重建长期落后时它照样返回 200，
 	// 容器与编排系统因此既不重启也不告警。这里 ping 两个连接池，
@@ -472,7 +489,11 @@ func buildApp(d routeDeps) *gatewayApp {
 	// SQLite 的错误字符串可以含数据库路径、驱动内部信息、文件系统错误。
 	// 同网段的主动探测者能拿它做环境枚举。现在只返回稳定的
 	// error_code，完整错误只进服务端日志。
-	mux.HandleFunc("GET /healthz", healthzHandler(db, reloader, logger))
+	routeSpecs = append(routeSpecs,
+		routeSpec{Pattern: "GET /admin/", Handler: webHandler, Scope: routeRoot},
+		routeSpec{Pattern: "GET /healthz", Handler: healthzHandler(db, reloader, logger), Scope: routeRoot},
+	)
+	registerRoutes(mux, adminMux, publicAdminMux, routeSpecs)
 
 	handler := server.Recovery(mux, logger)
 	handler = server.WithPublicOrigin(handler, cfg.PublicOrigin)
