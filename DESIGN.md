@@ -1164,10 +1164,17 @@ per-model 配额、per-provider 配额仍不做，记入后续路线。
 | 配置类别 | 存放位置 | 可否运行时改 |
 |---|---|---|
 | Provider / 模型 / Route / Key / **用户与管理员账号** | **数据库** | 是（管理 API / Web 界面） |
-| 监听地址、DB 路径、日志级别、加密主密钥、**主密钥强度校验（`require_strong_master_key`）**、**公开源（`public_origin`）**、**可信代理网段（`trusted_proxy_cidrs`）**、**日界时区（`timezone`）**、**用量保留天数（`usage_retention_days`）**、**审计日志行数上限（`audit_log_keep_rows`）**、**连通率探测（`probes`）**、全局默认超时与重试、body 大小上限 | **配置文件** | 否（改后重启） |
+| 监听地址、DB 路径、日志级别、加密主密钥、**主密钥强度校验（`require_strong_master_key`）**、**公开源（`public_origin`）**、**可信代理网段（`trusted_proxy_cidrs`）**、**日界时区（`timezone`）**、**用量保留天数（`usage_retention_days`）**、**审计日志行数上限（`audit_log_keep_rows`）**、**连通率探测（`probes`）**、provider 重试默认、body 大小上限 | **配置文件** | 否（改后重启） |
+| 超时与故障转移默认（`defaults.upstream_timeout_ms` / `stream_*` / `failover_*`） | **配置文件提供首次回落值；设置页写入 `app_settings.runtime_defaults`** | 是（设置页保存后 reload） |
 | 首次 bootstrap 的 provider/route | 配置文件（仅当 DB 为空时生效） | 否 |
 
 **关键纪律**：DB 非空时，配置文件里的 `providers` / `routes` 段落被**忽略并打印 warning**。这防止出现「界面改完、重启被配置文件覆盖」这类经典事故。
+
+**配置字段真源**：`internal/config/fields.go` 逐项列出 `config.Config`
+（含嵌套的 `defaults` / `bootstrap` / `probes`）的 JSON 路径、生产读取点和
+前端入口；`internal/config/fields_test.go` 用反射与文件/符号校验它，新增、
+删除、改名或改 JSON tag 都会让测试失败。管理设置 DTO、`store.RuntimeDefaults`
+与 `snapshot.RuntimeDefaults` 也各有契约测试，避免三层字段漂移。
 
 **管理员账号为什么在数据库里**（2026-10-06 统一认证改造的决策）：管理面收敛到
 users 表 + 会话一条通道后，管理员只是一个 `role='admin'` 的普通用户，
@@ -1200,7 +1207,7 @@ users 表 + 会话一条通道后，管理员只是一个 `role='admin'` 的普�
     └── gateway.db     # SQLite：provider/模型/路由/key/用户/用量记录
 ```
 
-`db_path` 是**相对 `<home>`** 解析的（`main.go` 里非绝对路径就 `filepath.Join(homeDir, ...)`），
+`db_path` 是**相对 `<home>`** 解析的（`gatewayapp.Run` 里非绝对路径就 `filepath.Join(homeDir, ...)`），
 所以 `<home>` 整个搬走（或换 `ROSETTA_GW_HOME`）时库跟着走，不会留下一个
 「配置在这、库在那」的撕裂状态。
 
@@ -1531,7 +1538,7 @@ vue-router 的 `insertMatcher` 按路径得分二分插入（`findInsertionIndex
 ## 15. 目录结构
 
 > **2026-10-17 按实际仓库核实重写；2026-10-21 完成生命周期/目录迁移后再校正。** 上一次（2026-10-06）改写时原版本列的是 P1 时期的规划结构，
-> 与代码已严重脱节：`quota/` 包从未存在（配额逻辑最终落在 `cmd/gateway/main.go` 的请求热路径里）、
+> 与代码已严重脱节：`quota/` 包从未存在（配额逻辑最终落在 `internal/dataplane` 的请求热路径里）、
 > `examples/curl.md` 从未创建、`inwire`/`outwire` 下标注「P3」的三个文件早已实现、
 > 缺了后来新增的 `userauth` 与 `ratelimit`。
 >
