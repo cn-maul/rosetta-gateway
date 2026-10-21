@@ -654,6 +654,18 @@ func (s *ResponsesSSE) Finish(status string, stop rosetta.StopReason, usage rose
 	// 同一份 usage 在「Responses 非流式」侧早已带
 	// input_tokens_details.cached_tokens，只有思考 token 两侧都缺 ——
 	// 那正是本条缺陷的形状：字段是逐个补的，漏的那个没人注意。
+	//
+	// 缓存命中 token 同样必须在这里报出（2026-10-21 修汇总 O6 遗留：
+	// 非流式侧有 input_tokens_details.cached_tokens，流式侧一条都没有）。
+	// Codex / Agent 类客户端读的就是 response.completed 的 usage ——
+	// 拿不到 cached_tokens 时它们把命中一律算成未命中，成本展示偏离一个
+	// 数量级，而**流式才是这些客户端的默认路径**，所以实际影响比非流式更大。
+	// 与 openai_chat.go 的 WriteUsage / 非流式 usage 保持同一口径。
+	if usage.CachedInputTokens > 0 {
+		resp["usage"].(map[string]any)["input_tokens_details"] = map[string]any{
+			"cached_tokens": usage.CachedInputTokens,
+		}
+	}
 	if usage.ReasoningTokens > 0 {
 		resp["usage"].(map[string]any)["output_tokens_details"] = map[string]any{
 			"reasoning_tokens": usage.ReasoningTokens,
