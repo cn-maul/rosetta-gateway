@@ -38,8 +38,7 @@ type routeRequest struct {
 	FailoverEnabled *bool   `json:"failover_enabled"`
 }
 
-// 没有 extra_json：它存了但没有任何地方拿它构造请求，具体理由见
-// internal/store/store.go 的 dropDeadColumns 注释。
+// 没有 extra_json：它没有运行时执行点，schema 也不提供该列。
 type routeResponse struct {
 	ID              string `json:"id"`
 	PublicName      string `json:"public_name"`
@@ -133,7 +132,7 @@ func (h *RouteHandler) Create(w http.ResponseWriter, r *http.Request) {
 
 	// 新建 route 与「种一条 position 0 的目标（=主目标）」必须原子完成，
 	// 否则第二步失败就留下一条没有链的 route —— 让链从诞生起就可被后台管理，
-	// 不必等下一次冷启动迁移回填。
+	// 不存在「以后再由后台补链首」的半成品状态。
 	if err := h.store.CreateRouteWithHeadTarget(r.Context(), route); err != nil {
 		writeRouteWriteError(w, "create route", err)
 		return

@@ -58,7 +58,7 @@ func patchCred(t *testing.T, h *CredentialHandler, id, body string) credentialRe
 // 回列表点一次开关才能开始跑 —— 而那一步没有任何提示为什么不能用。
 func TestCredentialHandler_FirstCredentialAutoEnabled(t *testing.T) {
 	st := newTestStore(t)
-	h := NewCredentialHandler(st, nil) // 无主密钥 → 明文存储，测试不需要加密往返
+	h := NewCredentialHandler(st, testCredentialKey)
 
 	got := createCred(t, h, "p1", `{"label":"主号","api_key":"sk-1"}`)
 	if !got.Enabled {
@@ -73,7 +73,7 @@ func TestCredentialHandler_FirstCredentialAutoEnabled(t *testing.T) {
 // 只测其中一条的话，另一条恒会漏掉。
 func TestCredentialHandler_SecondCredentialDefaultsDisabled(t *testing.T) {
 	st := newTestStore(t)
-	h := NewCredentialHandler(st, nil)
+	h := NewCredentialHandler(st, testCredentialKey)
 
 	first := createCred(t, h, "p1", `{"label":"主号","api_key":"sk-1"}`)
 	second := createCred(t, h, "p1", `{"label":"备用","api_key":"sk-2"}`)
@@ -96,7 +96,7 @@ func enabledIDsOf(st *store.Store, t *testing.T, providerID string) map[string]b
 // 「启用 B」是一次**切换** —— A 必须同时停用，最终恰好一把启用。
 func TestCredentialHandler_EnableSwitchesOthersOff(t *testing.T) {
 	st := newTestStore(t)
-	h := NewCredentialHandler(st, nil)
+	h := NewCredentialHandler(st, testCredentialKey)
 
 	a := createCred(t, h, "p1", `{"label":"A","api_key":"sk-a"}`)
 	b := createCred(t, h, "p1", `{"label":"B","api_key":"sk-b"}`)
@@ -128,7 +128,7 @@ func TestCredentialHandler_EnableSwitchesOthersOff(t *testing.T) {
 // 影响 A（或其它 provider 的凭据）。
 func TestCredentialHandler_DisableAffectsOnlyItself(t *testing.T) {
 	st := newTestStore(t)
-	h := NewCredentialHandler(st, nil)
+	h := NewCredentialHandler(st, testCredentialKey)
 
 	a := createCred(t, h, "p1", `{"label":"A","api_key":"sk-a"}`)
 	b := createCred(t, h, "p1", `{"label":"B","api_key":"sk-b"}`)
@@ -154,7 +154,7 @@ func TestCredentialHandler_DisableAffectsOnlyItself(t *testing.T) {
 // 中间那段时间请求全打不到上游。
 func TestCredentialHandler_LabelPatchKeepsEnabled(t *testing.T) {
 	st := newTestStore(t)
-	h := NewCredentialHandler(st, nil)
+	h := NewCredentialHandler(st, testCredentialKey)
 
 	a := createCred(t, h, "p1", `{"label":"A","api_key":"sk-a"}`)
 	resp := patchCred(t, h, a.ID, `{"label":"A 改名"}`)
@@ -175,7 +175,7 @@ func TestCredentialHandler_LabelPatchKeepsEnabled(t *testing.T) {
 // 正在使用的 key 停掉，表现为另一个上游毫无征兆地不可用。
 func TestCredentialHandler_EnableOnOtherProviderIsolation(t *testing.T) {
 	st := newTestStore(t)
-	h := NewCredentialHandler(st, nil)
+	h := NewCredentialHandler(st, testCredentialKey)
 
 	p1a := createCred(t, h, "p1", `{"label":"A","api_key":"sk-a"}`)
 	p2a := createCred(t, h, "p2", `{"label":"P2A","api_key":"sk-p2a"}`)
@@ -198,7 +198,7 @@ func TestCredentialHandler_EnableOnOtherProviderIsolation(t *testing.T) {
 // 必须同样走「切换」语义（关掉原有那把），而不是插出第二把启用的。
 func TestCredentialHandler_ExplicitEnabledTrueOnCreate(t *testing.T) {
 	st := newTestStore(t)
-	h := NewCredentialHandler(st, nil)
+	h := NewCredentialHandler(st, testCredentialKey)
 
 	first := createCred(t, h, "p1", `{"label":"A","api_key":"sk-a"}`)
 	second := createCred(t, h, "p1", `{"label":"B","api_key":"sk-b","enabled":true}`)
@@ -219,7 +219,7 @@ func TestCredentialHandler_ExplicitEnabledTrueOnCreate(t *testing.T) {
 // 这类拆分最容易出的错是「第一步没带上另一个字段」，而症状是静默丢失。
 func TestCredentialHandler_UpdateKeepsOtherFields(t *testing.T) {
 	st := newTestStore(t)
-	h := NewCredentialHandler(st, nil)
+	h := NewCredentialHandler(st, testCredentialKey)
 
 	createCred(t, h, "p1", `{"label":"A","api_key":"sk-a"}`)
 	b := createCred(t, h, "p1", `{"label":"B","api_key":"sk-b"}`)
@@ -237,7 +237,7 @@ func TestCredentialHandler_UpdateKeepsOtherFields(t *testing.T) {
 // 不能报 200 —— 那会让界面以为切换成功了。
 func TestCredentialHandler_MissingCredential(t *testing.T) {
 	st := newTestStore(t)
-	h := NewCredentialHandler(st, nil)
+	h := NewCredentialHandler(st, testCredentialKey)
 
 	rec := httptest.NewRecorder()
 	req := asAdmin(jsonRequest(http.MethodPatch, "/admin/api/credentials/nope",

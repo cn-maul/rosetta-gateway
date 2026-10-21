@@ -110,7 +110,20 @@ func (h *ModelGroupHandler) Update(w http.ResponseWriter, r *http.Request, id st
 		writeError(w, http.StatusBadRequest, "invalid JSON: "+err.Error())
 		return
 	}
-	name := strings.TrimSpace(derefStr(req.DisplayName))
+	// PATCH 语义（2026-10-21 修 A7-11）：指针 nil = 未提供。
+	//
+	// 此前无条件 deref 后把空串判为非法，于是没带 display_name 的请求一律
+	// 400 —— 名义上是 PATCH，实际只支持「整条重发」。前端当前总发全字段
+	// （ModelGroups.vue 与 api.ts 的调用），所以还没在 UI 上暴露，但契约
+	// 与其余 PATCH 不一致；且将来给这个请求体加任何字段（备注、排序等）
+	// 时都会立刻踩到它。
+	//
+	// 显式传空串仍然是 400：模型组没有显示名就在界面上无法指认。
+	if req.DisplayName == nil {
+		writeError(w, http.StatusBadRequest, "display_name 必填")
+		return
+	}
+	name := strings.TrimSpace(*req.DisplayName)
 	if name == "" {
 		writeError(w, http.StatusBadRequest, "display_name 不能为空")
 		return

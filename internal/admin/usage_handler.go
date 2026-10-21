@@ -863,6 +863,10 @@ func (h *UsageHandler) GroupByDay(w http.ResponseWriter, r *http.Request) {
 	//
 	// 这一条顺带修掉了「全部」档趋势起点：合并来源后最早的一天来自表 A，
 	// 剪枝不再让图上凭空少掉 30 天以前。
+	// 按天是时间序列，必须覆盖请求区间的全部日期。四个 by-* 共用的
+	// clampLimit 默认 100、上限 1000；直接套在 by-day 上会让「近一年」
+	// 静默只剩下最早的 100 天（旧实现还是 ORDER BY day ASC，丢的正是最近数据）。
+	// 因此 by-day 不带 limit，用明确的区间过滤作为唯一的截断来源。
 	h.groupBy(w, r, "day", "", "")
 }
 
@@ -886,7 +890,10 @@ func (h *UsageHandler) groupBy(w http.ResponseWriter, r *http.Request, column, n
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	limit := clampLimit(q.Get("limit"), defaultUsageLimit, maxUsageLimit)
+	var limit int64
+	if column != "day" {
+		limit = clampLimit(q.Get("limit"), defaultUsageLimit, maxUsageLimit)
+	}
 
 	_, _, filter := groupFilter(from, to, explicit, callerScope(r))
 	src, args := store.UsageSource(filter)
@@ -897,7 +904,9 @@ func (h *UsageHandler) groupBy(w http.ResponseWriter, r *http.Request, column, n
 	if column == "day" {
 		order = "ORDER BY key ASC"
 	}
-	args = append(args, limit)
+	if limit > 0 {
+		args = append(args, limit)
+	}
 
 	withName := nameExpr != ""
 	query := `SELECT u.` + column + ` AS key, COALESCE(SUM(u.n), 0) AS count, ` +
@@ -929,7 +938,10 @@ func (h *UsageHandler) groupBy(w http.ResponseWriter, r *http.Request, column, n
 	}
 	// 聚合别名在 ORDER BY 里可直接引用（SQLite 允许），GROUP BY 不行 ——
 	// 那里必须写原列名。
-	query += ` GROUP BY u.` + column + ` ` + order + ` LIMIT ?`
+	query += ` GROUP BY u.` + column + ` ` + order
+	if limit > 0 {
+		query += ` LIMIT ?`
+	}
 
 	rows, err := h.store.Reader().Query(query, args...)
 	if err != nil {
@@ -977,8 +989,8 @@ func (h *UsageHandler) Prune(w http.ResponseWriter, r *http.Request) {
 		writeServerError(w, "prune usage", err)
 		return
 	}
-	// 走 POST：AutoReload 中间件据此触发审计（字段名会进 audit_log，
-	// 而 keep_days 就是这里最需要留痕的那个参数）。
+	// 走 POST：AutoReload 中间件据此触发审计。keep_days 在 query string 里，
+	// 由 autoreload.appendQueryAuditFields 白名单采集（审计 A7-16）。
 	writeJSON(w, http.StatusOK, res)
 }
 

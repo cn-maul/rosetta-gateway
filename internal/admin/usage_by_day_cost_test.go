@@ -214,6 +214,57 @@ func TestGroupByDay_CostMatchesStats(t *testing.T) {
 	}
 }
 
+// TestGroupByDay_DoesNotTruncateLongSeries 钉住 by-day 不受默认 Top-N
+// 分页限制影响。
+//
+// 四个 by-* 端点曾共用 clampLimit(默认 100、上限 1000)，但 by-day 是时间
+// 序列，按日期升序返回时截断掉的是**最近的数据**。前端选择「近一年」后，
+// 图上只剩最早 100 天，且没有任何截断提示。这里造 130 天连续数据，要求
+// 请求区间内的每一天都返回，尤其不能丢最后一天。
+func TestGroupByDay_DoesNotTruncateLongSeries(t *testing.T) {
+	st := newDayCostStore(t)
+	h := NewUsageHandler(st)
+	ctx := t.Context()
+
+	const days = 130
+	for back := days - 1; back >= 0; back-- {
+		ts := localDayStart(t, back) + 3_600_000
+		if err := st.CreateUsageRecord(ctx, &store.UsageRecord{
+			ID: "series-" + strconv.Itoa(back), Ts: ts, UserID: "u1",
+			AccessKeyID: "k1", PublicModel: "m", ProviderID: "p1", UpstreamModel: "priced",
+			IngressProtocol: "openai-chat",
+			InputTokens:     1, TotalTokens: 1,
+			Status: "ok", HTTPStatus: 200, UsageState: "reported",
+		}); err != nil {
+			t.Fatalf("create usage for day -%d: %v", back, err)
+		}
+	}
+
+	from := localDayStart(t, days-1)
+	to := localDayStart(t, -1) + 86_400_000
+	req := httptest.NewRequest(http.MethodGet,
+		"/admin/api/usage/by-day?from="+strconv.FormatInt(from, 10)+"&to="+strconv.FormatInt(to, 10), nil)
+	rec := httptest.NewRecorder()
+	h.GroupByDay(rec, asAdmin(req))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("code=%d body=%s", rec.Code, rec.Body.String())
+	}
+	var got []dayCostEntry
+	if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
+		t.Fatalf("unmarshal: %v body=%s", err, rec.Body.String())
+	}
+	if len(got) != days {
+		t.Fatalf("请求 %d 天必须返回 %d 天，实际 %d（说明仍在套用 Top-N 截断）", days, days, len(got))
+	}
+	if got[0].Key >= got[len(got)-1].Key {
+		t.Fatalf("日期必须升序且首尾不同，实际 first=%q last=%q", got[0].Key, got[len(got)-1].Key)
+	}
+	wantLast := time.Now().AddDate(0, 0, 0).Format("2006-01-02")
+	if got[len(got)-1].Key != wantLast {
+		t.Fatalf("序列最后一天应为今天 %s，实际 %s（最新日期被截断）", wantLast, got[len(got)-1].Key)
+	}
+}
+
 // TestGroupByDay_ScopedToCaller 钉住普通用户只看到自己那几天的费用。
 //
 // 与 usage_scope_history_test.go 是同一类断言的另一个端点：by-day 在

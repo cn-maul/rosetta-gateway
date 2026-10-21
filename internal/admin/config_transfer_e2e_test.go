@@ -80,6 +80,15 @@ func doExport(t *testing.T, h *ConfigTransferHandler, body string) configExport 
 
 func doImport(t *testing.T, h *ConfigTransferHandler, req importRequest) (*httptest.ResponseRecorder, importResponse) {
 	t.Helper()
+	if !req.Data.Encrypted {
+		const pass = "e2e-fixture-pass"
+		sealed, err := sealExport(req.Data, pass)
+		if err != nil {
+			t.Fatalf("seal fixture: %v", err)
+		}
+		req.Data = sealed
+		req.Passphrase = pass
+	}
 	raw, err := json.Marshal(req)
 	if err != nil {
 		t.Fatalf("marshal: %v", err)

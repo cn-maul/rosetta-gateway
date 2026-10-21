@@ -169,15 +169,9 @@ func (h *ProviderHandler) List(w http.ResponseWriter, r *http.Request) {
 		writeServerError(w, "list providers", err)
 		return
 	}
-	snap := snapshot.Get()
 	result := make([]providerResponse, 0, len(providers))
 	for _, p := range providers {
-		res := toProviderResponse(p)
-		if sp, ok := snap.Providers[p.Slug]; ok {
-			res.Ready = sp.Ready
-			res.ReadyReason = sp.Reason
-		}
-		result = append(result, res)
+		result = append(result, toProviderResponseWithRuntime(p))
 	}
 	writeJSON(w, http.StatusOK, result)
 }
@@ -289,7 +283,7 @@ func (h *ProviderHandler) Get(w http.ResponseWriter, r *http.Request, id string)
 		writeError(w, http.StatusNotFound, "provider not found")
 		return
 	}
-	writeJSON(w, http.StatusOK, toProviderResponse(*p))
+	writeJSON(w, http.StatusOK, toProviderResponseWithRuntime(*p))
 }
 
 func (h *ProviderHandler) Update(w http.ResponseWriter, r *http.Request, id string) {
@@ -579,6 +573,18 @@ func toProviderResponse(p store.Provider) providerResponse {
 		ModelCount:      p.ModelCount,
 		CredCount:       p.CredCount,
 	}
+}
+
+// toProviderResponseWithRuntime 把数据库配置与当前快照里的运行时状态合成
+// 管理面响应。List 与 Get 必须共用这一处：两个接口若各自读快照，详情页
+// 和列表页会对同一个 provider 显示不同的 ready / ready_reason。
+func toProviderResponseWithRuntime(p store.Provider) providerResponse {
+	res := toProviderResponse(p)
+	if sp, ok := snapshot.Get().Providers[p.Slug]; ok {
+		res.Ready = sp.Ready
+		res.ReadyReason = sp.Reason
+	}
+	return res
 }
 
 func generateID() string {

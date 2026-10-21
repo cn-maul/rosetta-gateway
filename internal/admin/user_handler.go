@@ -294,7 +294,7 @@ func (h *UserHandler) Login(w http.ResponseWriter, r *http.Request) {
 		accThr.Success(username)
 	}
 	server.TouchLogin(h.store, r.Context(), u.ID)
-	server.SetSessionCookie(w, token, exp)
+	server.SetSessionCookie(w, token, exp, server.SessionCookieSecure(r))
 
 	writeJSON(w, http.StatusOK, loginResponse{
 		Token:           token,
@@ -597,7 +597,7 @@ func (h *UserHandler) BootstrapSetup(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	server.TouchLogin(h.store, r.Context(), fresh.ID)
-	server.SetSessionCookie(w, token, exp)
+	server.SetSessionCookie(w, token, exp, server.SessionCookieSecure(r))
 	writeJSON(w, http.StatusOK, loginResponse{
 		Token:     token,
 		ExpiresAt: exp.UnixMilli(),
@@ -628,21 +628,19 @@ func (h *UserHandler) BootstrapSetup(w http.ResponseWriter, r *http.Request) {
 // 代价：同一账号的所有设备都被踢下线。对管理后台这是期望行为 —— 用户
 // 显式点了「登出」，语义就该是「这个身份不再可用」。
 func (h *UserHandler) Logout(w http.ResponseWriter, r *http.Request) {
-	server.ClearSessionCookie(w)
 	if u := server.UserFromContext(r.Context()); u != nil && u.ID != "" {
 		if err := h.store.BumpAuthVersion(r.Context(), u.ID); err != nil {
-			// 吊销失败必须让用户知道：此时令牌在自然过期前仍可用，
-			// 而界面上却显示「已登出」。属降级路径，记 ERROR 但仍回 200 ——
-			// cookie 已清，本浏览器确实登出了。
+			// 审计 A7-03：吊销失败时不可回 200。客户端（网页与脚本）都会把
+			// 2xx 当成「服务端已作废全部会话」，但复制出去的 Bearer token
+			// 在自然过期前仍然有效。此时保持 cookie 不清，让浏览器下次请求
+			// 仍然带着同一会话；清 cookie 只发生在服务端吊销成功之后。
 			slog.Error("logout: revoke sessions failed",
 				"user_id", u.ID, "error", err)
-			writeJSON(w, http.StatusOK, map[string]string{
-				"status":  "ok",
-				"message": "已登出，但未能作废其他设备上的会话",
-			})
+			writeError(w, http.StatusInternalServerError, "登出失败，会话仍未失效，请重试")
 			return
 		}
 	}
+	server.ClearSessionCookie(w)
 	writeJSON(w, http.StatusOK, map[string]string{
 		"status":  "ok",
 		"message": "已登出",

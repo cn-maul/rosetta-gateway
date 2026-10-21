@@ -27,36 +27,17 @@ import (
 // 实际使用里明文模式没有想象中安全 —— 文件已经在自己磁盘上不假，但它
 // 一旦被顺手转发/上传，凭据就裸奔了；且两种产物格式让导入侧要兼容两套
 // 形态、用户要在界面上理解两个维度的组合。现在只有一种产物：**必带凭据
-// 的 .json.enc**，导入侧对无口令的旧明文文件仍兼容。
+// 的 .json.enc**，导入侧也只接受这一种格式。
 //
 // 加密层刻意复用 PBKDF2 + AES-256-GCM（与登录口令哈希同一族）：
 // 口令由人手输，没有密钥分发问题，也没有「密钥跟文件走一起」的自欺欺人。
 
-// exportFormatVersion 是当前导出体使用的版本。
+// exportFormatVersion 是当前导出体唯一接受的版本。
 //
-// v2（2026-10-14）：新增 model_groups 切片与 modelExport.group_name。
-// 若加这些字段却不升版本，**老版本网关会成功导入并静默丢掉全部分组**
-// —— 正是下面的版本校验要拦的那类失败。
-//
-// v3（2026-10-20）：新增 networks 切片与 providerExport.network_name。
-// 代理地址从「每个上游各存一份 URL」改成「按名字引用一份共享清单」，
-// 不升版本的话老网关会把 network_name 读成空 —— 导入成功、代理静默失效。
+// 导出格式不做向后兼容：旧格式缺当前 schema 必需的结构（模型组、出站网络），
+// 部分字段缺失只会解成零值，结果是“导入成功但配置静默缩水”。发现非当前版本
+// 时必须明确拒绝，让用户重新导出，而不是尝试猜旧字段的语义。
 const exportFormatVersion = 3
-
-// exportFormatMinVersion 是仍接受导入的最老版本。
-//
-// # 为什么是「区间」而不是「== 当前版本」
-//
-// 校验的不对称在于：新代码读旧文件是安全的（v1 是 v2 的严格子集，缺的字段
-// 解出零值 = 没有分组 = 与 v1 的行为逐字一致），旧代码读新文件才危险。
-// 所以：
-//   - 低于 min → 拒（这个版本的本代码压根没见过）；
-//   - 高于当前 → **必须拒**：那是未来/更新的字段布局，本代码把 v2 的字段
-//     当 v1 读会把东西读成垃圾或静默丢失（用户 NAS 上的 v1.5.3 读到 v2
-//     文件就会走到这条，明确报错胜过丢分组）。
-//   - 区间内（含 v1）→ 接受。v1 备份能照常导入本版本，这正是自用部署最
-//     需要的向后兼容 —— 严格 == 会让升级后所有旧备份一夜之间导不进去。
-const exportFormatMinVersion = 1
 
 // configExport 是供应商 + 模型的导出体。
 //
@@ -76,14 +57,14 @@ type configExport struct {
 	Cipher     string `json:"cipher,omitempty"`
 	Salt       string `json:"salt,omitempty"`
 	Iterations int    `json:"iterations,omitempty"`
-	// 明文模式下的三组数据；加密时它们在 Body 里，这里全空。
+	// 加密体解开后的三组数据；外层包装里这些字段为空。
 	Providers   []providerExport   `json:"providers,omitempty"`
 	Credentials []credentialExport `json:"credentials,omitempty"`
 	Models      []modelExport      `json:"models,omitempty"`
-	// ModelGroups 是模型归组（v2）。组内成员通过 modelExport.group_name
+	// ModelGroups 是模型归组。组内成员通过 modelExport.group_name
 	// 按显示名关联 —— 跨库靠名字对齐，与 provider 靠 slug 对齐同理。
 	ModelGroups []modelGroupExport `json:"model_groups,omitempty"`
-	// Networks 是出站网络清单（v3）。成员通过 providerExport.network_name
+	// Networks 是出站网络清单。成员通过 providerExport.network_name
 	// 按**网络名**关联：跨库 id 无意义（与 provider 靠 slug、模型组靠显示名
 	// 同一理由），而名字本来就是管理员给它的。
 	Networks []networkExport `json:"networks,omitempty"`
@@ -110,17 +91,9 @@ type providerExport struct {
 	TimeoutMs  int    `json:"timeout_ms"`
 	MaxRetries int    `json:"max_retries"`
 	QuirksJSON string `json:"quirks_json,omitempty"`
-	// 出站网络。v3 起按**名字**引用 networks 切片（跨库 id 无意义），
-	// 空串 = 直连。字段名与之前不同是有意的：老版本网关读 v3 文件会拒
-	// （版本号已升），而 v1/v2 文件缺该字段 → 空串 → 直连，向后兼容。
+	// 出站网络按**名字**引用 networks 切片（跨库 id 无意义），空串 = 直连。
+	// 不再接受历史上的逐 provider proxy_url。
 	NetworkName string `json:"network_name,omitempty"`
-	// ProxyURL 是 v1/v2 的出站代理字段（每个上游各存一份 URL）。v3 起只在
-	// **导入**侧读取：老文件里它非空时按地址建一条网络并引用，导出的新文件
-	// 不再写这个字段（否则同一份代理会在文件里出现两次，且两者可能不一致）。
-	//
-	// 保留它不是为了兼容新写新读，而是 v1/v2 备份仍必须能导入 —— 那是自用
-	// 部署最需要的向后兼容（见 exportFormatMinVersion）。
-	ProxyURL string `json:"proxy_url,omitempty"`
 }
 
 type credentialExport struct {
@@ -128,10 +101,9 @@ type credentialExport struct {
 	ProviderSlug string `json:"provider_slug"`
 	Label        string `json:"label"`
 	APIKey       string `json:"api_key"`
-	// 指针而非 bool：导入侧要区分「文件显式写了 false」与「字段缺失」。
-	// 缺失（旧版导出体 / 手写文件）按 true 处理 —— 与该字段加入前的导入
-	// 行为一致；若用裸 bool，旧文件会把原本启用的凭据静默导成禁用。
-	Enabled *bool `json:"enabled,omitempty"`
+	// 指针只为识别字段是否出现。当前格式必须显式携带 enabled；导入侧
+	// 不接受字段缺席，也不再把它猜成 true。
+	Enabled *bool `json:"enabled"`
 	Weight  int   `json:"weight"`
 }
 
@@ -148,8 +120,7 @@ type modelExport struct {
 	PriceInput    float64 `json:"price_input,omitempty"`
 	PriceCacheHit float64 `json:"price_cache_hit,omitempty"`
 	PriceOutput   float64 `json:"price_output,omitempty"`
-	// GroupName 是该模型所属归组的显示名（v2）。空 = 未归组。
-	// v1 文件缺这个字段 → 解码得空串 → 未归组，向后兼容。
+	// GroupName 是该模型所属归组的显示名。空 = 未归组。
 	GroupName string `json:"group_name,omitempty"`
 }
 
@@ -223,10 +194,7 @@ func sealExport(body configExport, passphrase string) (configExport, error) {
 // 判断下一步的错误，而不是一律"failed to decrypt"。
 func openExport(in configExport, passphrase string) (*configExport, error) {
 	if !in.Encrypted {
-		if err := checkExportVersion(in.Version); err != nil {
-			return nil, err
-		}
-		return &in, nil
+		return nil, errors.New("不支持的导出文件：只接受当前版本生成的加密 .json.enc 文件")
 	}
 	if strings.TrimSpace(passphrase) == "" {
 		return nil, errors.New("该导出文件已加密，需要口令才能导入")
@@ -283,14 +251,11 @@ func openExport(in configExport, passphrase string) (*configExport, error) {
 	return &out, nil
 }
 
-// checkExportVersion 判定一个版本号能否被本版本导入（明文与加密两条路径共用）。
-//
-// 语义是区间 [min, current]：v1 备份（NAS 自用部署的历史导出）必须能继续
-// 导入 v2，而更新的版本本代码读不懂、必须拒 —— 理由见 exportFormatMinVersion。
+// checkExportVersion 要求导出体版本与本版本完全一致。
 func checkExportVersion(v int) error {
-	if v < exportFormatMinVersion || v > exportFormatVersion {
-		return fmt.Errorf("不支持的导出格式版本 %d（本版本接受 %d–%d）",
-			v, exportFormatMinVersion, exportFormatVersion)
+	if v != exportFormatVersion {
+		return fmt.Errorf("不支持的导出格式版本 %d（本版本只接受 %d）",
+			v, exportFormatVersion)
 	}
 	return nil
 }

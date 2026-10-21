@@ -68,8 +68,8 @@ type keyResponse struct {
 	KeyPrefix string `json:"key_prefix"`
 	Name      string `json:"name"`
 	Enabled   bool   `json:"enabled"`
-	// UserID 是归属用户。空串 = **无归属**：那把 key 会被迁移退役、
-	// 鉴权直接 401（见 store.retireOrphanKeys）。界面上必须显式标注
+	// UserID 是归属用户。空串 = **无归属**：鉴权直接 401。
+	// 界面上必须显式标注
 	// 「无归属（不可用）」，否则运维会以为它还能用。
 	UserID      string `json:"user_id"`
 	Username    string `json:"username,omitempty"`

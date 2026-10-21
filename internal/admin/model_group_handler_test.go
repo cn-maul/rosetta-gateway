@@ -249,10 +249,7 @@ func TestModelGroupHandler_DuplicateNameRejected(t *testing.T) {
 	}
 }
 
-// TestModelGroupExportRoundTrip 导出→导入的归组往返（v2 格式的验收）。
-//
-// 覆盖两个方向：v2 文件把组带过去（成员也挂回去）；v1 文件缺切片/缺字段时
-// 解成「没有组」而不是报错 —— 用户 NAS 上的历史备份必须继续可导。
+// TestModelGroupExportRoundTrip 导出→导入的归组往返。
 func TestModelGroupExportRoundTrip(t *testing.T) {
 	st := newTestStore(t)
 	ctx := t.Context()
@@ -295,9 +292,14 @@ func TestModelGroupExportRoundTrip(t *testing.T) {
 	}
 	t.Cleanup(func() { st2.Close() })
 	th2 := NewConfigTransferHandler(st2, nil, &config.Config{})
+	const pass = "group-roundtrip-pass"
+	enc, err := sealExport(file, pass)
+	if err != nil {
+		t.Fatalf("seal export: %v", err)
+	}
 	rec := httptest.NewRecorder()
 	req := asAdmin(jsonRequest(http.MethodPost, "/admin/api/config-export/import",
-		jsonBody(t, importRequest{Data: file})))
+		jsonBody(t, importRequest{Data: enc, Passphrase: pass})))
 	th2.Import(rec, req)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("import code=%d body=%s", rec.Code, rec.Body.String())

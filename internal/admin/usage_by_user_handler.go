@@ -13,7 +13,7 @@ import (
 // 真的没花钱」）—— 一个字段在某个端点上恒为 0，就是契约在说谎。
 type usageUserEntry struct {
 	// Key 是 usage_records.user_id（冗余固化的归属，见 store.UsageRecord.UserID）。
-	// 空串 = 无归属（迁移前的无主 key 产生的历史用量），前端会显示成「无归属」。
+	// 空串 = 无归属异常行，前端会显示成「无归属」，不能当成正常账号。
 	Key string `json:"key"`
 	// UserName 是 users.username；**JOIN 不到时为空**，表示该用户已被删除。
 	// 前端必须回退显示 Key，留白会被误读成「无归属」（两者是不同的事）。
@@ -22,7 +22,7 @@ type usageUserEntry struct {
 	//
 	// 这一列存在的唯一理由是**标注管理员的历史用量**：管理员现在被
 	// ErrAdminCannotCallModel 拦在模型调用之外，理论上不该出现在这张表里；
-	// 但升级前留下的用量是真实发生过的消费，静默过滤会让这张表的合计小于
+	// 但异常或人工写入的历史用量仍是真实消费，静默过滤会让这张表的合计小于
 	// 总览的全局合计（对不上账）。所以照实返回，由前端加标记。
 	Role   string `json:"role"`
 	Count  int64  `json:"count"`

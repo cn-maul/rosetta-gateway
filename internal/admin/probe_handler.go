@@ -6,6 +6,8 @@ import (
 	"strings"
 	"time"
 
+	"github.com/cn-maul/rosetta-gateway/internal/config"
+	"github.com/cn-maul/rosetta-gateway/internal/probe"
 	"github.com/cn-maul/rosetta-gateway/internal/server"
 	"github.com/cn-maul/rosetta-gateway/internal/snapshot"
 	"github.com/cn-maul/rosetta-gateway/internal/store"
@@ -17,15 +19,37 @@ import (
 // 本 handler 只负责读 model_probes 表，不触发任何探测。
 type ProbeHandler struct {
 	store *store.Store
+	cfg   *config.Config
 }
 
-func NewProbeHandler(st *store.Store) *ProbeHandler {
-	return &ProbeHandler{store: st}
+// NewProbeHandler 接收运行配置而不是把判定阈值写死。
+//
+// 探测循环按 probes.down_threshold / probes.healthy_rate 落库并判健康，
+// 管理面若继续用 3 / 0.8，配置一改就出现“同一个模型两套健康结论”。
+// nil 只用于不关心健康档位的测试构造；生产装配始终传真实 cfg。
+func NewProbeHandler(st *store.Store, cfg *config.Config) *ProbeHandler {
+	return &ProbeHandler{store: st, cfg: cfg}
 }
 
-// probeWindowMs 是健康判定的默认窗口（与配置的 window_size × interval 相当，
-// 这里用固定 1 小时：窗口内 10 次探测（10 分钟间隔）足够算成功率）。
-const probeWindowMs = int64(3600 * 1000)
+// probeWindowMs 返回健康判定窗口，口径为 probes.window_size × interval_sec。
+//
+// 旧实现固定 1 小时，默认 10 分钟间隔下只能装 6 次探测，而配置的
+// window_size 是 10 —— 管理面展示与探测器判定的窗口从一开始就不同。
+// cfg 为 nil（仅测试构造）时保留旧默认，避免把测试辅助函数全部改签名。
+func (h *ProbeHandler) probeWindowMs() int64 {
+	if h.cfg == nil {
+		return int64(time.Hour / time.Millisecond)
+	}
+	interval := h.cfg.Probes.IntervalSec
+	window := h.cfg.Probes.WindowSize
+	if interval <= 0 {
+		interval = 600
+	}
+	if window <= 0 {
+		window = 10
+	}
+	return int64(interval) * int64(window) * int64(time.Second/time.Millisecond)
+}
 
 // modelHealthResponse 是总览健康卡的一行。
 type modelHealthResponse struct {
@@ -65,7 +89,7 @@ func (h *ProbeHandler) Models(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusUnauthorized, "需要登录")
 		return
 	}
-	healths, err := h.store.ProbeHealthSummary(r.Context(), probeWindowMs)
+	healths, err := h.store.ProbeHealthSummary(r.Context(), h.probeWindowMs())
 	if err != nil {
 		writeServerError(w, "probe health summary", err)
 		return
@@ -86,7 +110,7 @@ func (h *ProbeHandler) Models(w http.ResponseWriter, r *http.Request) {
 		if hh.WindowCount > 0 {
 			resp.SuccessRate = float64(hh.WindowOK) / float64(hh.WindowCount)
 		}
-		resp.Health = string(classifyProbeHealth(hh))
+		resp.Health = string(h.classifyProbeHealth(hh))
 		if !hh.LastOK && hh.LastErrorKind != "" {
 			resp.LastError = hh.LastErrorKind
 		}
@@ -138,25 +162,16 @@ func (h *ProbeHandler) allowedModelIDs(r *http.Request) (map[string]bool, bool) 
 	return allowed, true
 }
 
-// classifyProbeHealth 是 admin 层对健康态的判定（与 probe.Classify 同口径）。
+// classifyProbeHealth 直接复用探测器的判定函数与配置阈值。
 //
-// 为什么这里再写一份而不是 import probe 包：probe 包依赖 config（Runner 构造），
-// 而 admin 的 ProbeHandler 只持 store，import 会引入不必要的依赖链。
-// 判定逻辑本身是纯函数，复制一份并加注释指向 probe.Classify，避免漂移。
-func classifyProbeHealth(h store.ProbeHealth) string {
-	if h.WindowCount == 0 {
-		return "unknown"
+// admin 与 probe 都是“读配置 + 展示/计算”的上层，admin 依赖 probe
+// 不构成循环；相比之下，复制判定逻辑会让两个页面在配置变化后给出
+// 不同健康结论，是更难发现的错误。
+func (h *ProbeHandler) classifyProbeHealth(ph store.ProbeHealth) probe.Health {
+	if h.cfg == nil {
+		return probe.Classify(ph, 3, 0.8)
 	}
-	if h.ConsecutiveFail >= 3 {
-		return "down"
-	}
-	if h.LastOK {
-		if float64(h.WindowOK)/float64(h.WindowCount) >= 0.8 {
-			return "healthy"
-		}
-		return "degraded"
-	}
-	return "degraded"
+	return probe.Classify(ph, h.cfg.Probes.DownThreshold, h.cfg.Probes.HealthyRate)
 }
 
 // Timeline 返回若干模型在时间轴上的连通率分桶。

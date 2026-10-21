@@ -190,17 +190,24 @@ func derefBool(p *bool) bool {
 	return *p
 }
 
-// encryptSecret 在有主密钥时加密，否则退化为明文存储，
-// 保证未配置主密钥时凭据仍可用。
+// encryptSecret 只接受当前版本的主密钥。凭据不允许明文落库，
+// 因而这里没有「没有密钥就存原文」的降级分支。
 func encryptSecret(plain string, masterKey []byte) ([]byte, error) {
-	if masterKey == nil {
-		return []byte(plain), nil
+	if len(masterKey) == 0 {
+		return nil, crypto.ErrNoMasterKey
 	}
 	return crypto.Encrypt([]byte(plain), masterKey)
 }
 
-// decryptSecret 与 upstream.decryptCredentialKey 共用同一套兜底：
-// 解不开时按明文处理，兼容早期无主密钥时代的落库数据。
+// decryptSecret 与 upstream.decryptCredentialKey 一样只接受当前加密格式。
+// 解密失败就是损坏或主密钥不匹配，必须显式报错。
 func decryptSecret(enc []byte, masterKey []byte) (string, error) {
-	return crypto.DecryptWithFallback(enc, masterKey)
+	if len(masterKey) == 0 {
+		return "", crypto.ErrNoMasterKey
+	}
+	plain, err := crypto.Decrypt(enc, masterKey)
+	if err != nil {
+		return "", err
+	}
+	return string(plain), nil
 }

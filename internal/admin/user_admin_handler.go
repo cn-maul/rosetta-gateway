@@ -324,8 +324,8 @@ func (h *UserHandler) CreateUser(w http.ResponseWriter, r *http.Request) {
 		//
 		// 漏掉这一行会让 Unlimited 保持 Go 零值 false，于是 balanceValue
 		// 把 0 写进库 —— 新账号一建出来就是「余额 0 分」，下一次调用立刻 402。
-		// 而存量用户经迁移是 NULL（不限额），两者行为不一致：升级前的账号
-		// 能正常用，升级后新建的账号全部欠费，且没有任何报错线索指向这里。
+		// 而不限额用户是 NULL，两者行为不一致：老账号能正常用，新建账号
+		// 全部欠费，且没有任何报错线索指向这里。
 		//
 		// 「建号时给个初始额度」是另一件事，由管理员随后调
 		// PUT /users/{id}/balance 显式做，不该由创建路径偷偷决定。
@@ -492,17 +492,21 @@ func (h *UserHandler) UpdateUser(w http.ResponseWriter, r *http.Request, id stri
 	// 这里的 u 是读库时的旧快照，若随 UPDATE 把快照里的旧版本号写回，
 	// 读库与落库之间发生的改密（auth_version 已原子递增）会被覆盖回旧值，
 	// 改密前被窃取的旧 JWT 重新通过校验。角色/状态变更需要的会话失效
-	// 由下面的 BumpAuthVersion 承担 —— 它在 SQL 里相对递增，不依赖快照。
-	if err := h.store.UpdateUser(ctx, u); err != nil {
-		writeNotFoundOrError(w, "update user", "用户不存在", err)
-		return
-	}
+	// 由 auth_version 递增承担 —— 它在 SQL 里相对递增，不依赖快照。
+	//
+	// 审计 A7-02：这两步此前是两次独立提交，第二步失败时字段已落库而响应是
+	// 500 —— 账号已禁用/已降权，旧 JWT 却在自然过期前照常可用。改走
+	// UpdateUserAndBumpAuthVersion 让「改字段」与「吊销会话」同事务，失败即
+	// 整体回滚，不会再留下「状态改了、吊销没发生」的半套结果。
 	if bumpVersion {
-		if err := h.store.BumpAuthVersion(ctx, id); err != nil {
-			writeServerError(w, "bump auth version", err)
+		if err := h.store.UpdateUserAndBumpAuthVersion(ctx, u); err != nil {
+			writeNotFoundOrError(w, "update user", "用户不存在", err)
 			return
 		}
 		u.AuthVersion++
+	} else if err := h.store.UpdateUser(ctx, u); err != nil {
+		writeNotFoundOrError(w, "update user", "用户不存在", err)
+		return
 	}
 	// 角色/状态/分组变了都需要重建快照才能对数据面生效：
 	//   - 角色/状态 → 被禁用用户的 key 在数据面还能用；

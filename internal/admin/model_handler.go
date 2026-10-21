@@ -181,14 +181,14 @@ func (h *ModelHandler) List(w http.ResponseWriter, r *http.Request, providerID s
 	stats, _ := h.store.ListModelThroughput(r.Context(), providerID)
 
 	// 路由引用关系：一次性拉全链再本地映射，不对每个模型各查一次（N+1）。
-	// 链首判定用 position=0；**不能只看它** —— routes 的兼容列在迁移期可能
-	// 指着某个不在链上的模型（与 store 层的链首判定同一口径）。
+	// 链首判定同时看 route_targets 的 position=0 与 routes 的镜像列：
+	// 正常写入路径会让两者一致，异常数据下两处都查可避免界面给出可点但必败的删除按钮。
 	refs, err := h.store.RouteReferencesByModel(r.Context())
 	if err != nil {
 		writeServerError(w, "load route references", err)
 		return
 	}
-	compatHeads, err := h.store.RouteCompatHeadsByModel(r.Context())
+	mirrorHeads, err := h.store.RouteHeadMirrorsByModel(r.Context())
 	if err != nil {
 		writeServerError(w, "load route compat heads", err)
 		return
@@ -204,7 +204,7 @@ func (h *ModelHandler) List(w http.ResponseWriter, r *http.Request, providerID s
 			resp.CallCount = st.SuccessSample
 		}
 		resp.RouteCount = refs.Count(m.ID)
-		resp.IsRouteHead = refs.IsHead(m.ID) || compatHeads[m.ID]
+		resp.IsRouteHead = refs.IsHead(m.ID) || mirrorHeads[m.ID]
 		result = append(result, resp)
 	}
 	writeJSON(w, http.StatusOK, result)
@@ -229,7 +229,7 @@ func (h *ModelHandler) ListAll(w http.ResponseWriter, r *http.Request) {
 		writeServerError(w, "load route references", err)
 		return
 	}
-	compatHeads, err := h.store.RouteCompatHeadsByModel(r.Context())
+	mirrorHeads, err := h.store.RouteHeadMirrorsByModel(r.Context())
 	if err != nil {
 		writeServerError(w, "load route compat heads", err)
 		return
@@ -238,7 +238,7 @@ func (h *ModelHandler) ListAll(w http.ResponseWriter, r *http.Request) {
 	for _, m := range models {
 		resp := toModelResponse(m)
 		resp.RouteCount = refs.Count(m.ID)
-		resp.IsRouteHead = refs.IsHead(m.ID) || compatHeads[m.ID]
+		resp.IsRouteHead = refs.IsHead(m.ID) || mirrorHeads[m.ID]
 		result = append(result, resp)
 	}
 	writeJSON(w, http.StatusOK, result)

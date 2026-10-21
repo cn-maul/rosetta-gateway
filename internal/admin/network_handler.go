@@ -103,15 +103,54 @@ func (h *NetworkHandler) Update(w http.ResponseWriter, r *http.Request, id strin
 		writeError(w, http.StatusBadRequest, "invalid JSON: "+err.Error())
 		return
 	}
+	// PATCH 语义（2026-10-21 修 A7-10）：两个字段都是指针，缺失即「不改」。
+	//
+	// 此前这里用 derefStr 取零值后立刻把空串判为非法，于是只 PATCH name 或
+	// 只 PATCH proxy_url 都会 400 —— 名义上是 PATCH，实际必须整条重发。
+	// 前端当前总同时发两个字段（Networks.vue 的表单整体提交），所以还没
+	// 在 UI 上暴露，但契约已经是错的，且下一个接入方一定会踩到。
+	//
+	// 空串不是「未提供」：proxy_url 显式传空串 = 清空代理直连上游。
 	name := strings.TrimSpace(derefStr(req.Name))
+	if req.Name != nil {
+		if name == "" {
+			writeError(w, http.StatusBadRequest, "name 不能为空")
+			return
+		}
+	}
 	proxyURL := strings.TrimSpace(derefStr(req.ProxyURL))
-	if name == "" {
-		writeError(w, http.StatusBadRequest, "name 不能为空")
+	if req.ProxyURL != nil {
+		if err := validateProxyURL(proxyURL); err != nil {
+			writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+	}
+	// 两个字段都没提供：这不是错（幂等的空 PATCH），但也没什么可改的。
+	// 返回 400 而不是 200，是为了让调用方发现自己拼错了请求体，
+	// 而不是拿到一个「成功」的假象。
+	if req.Name == nil && req.ProxyURL == nil {
+		writeError(w, http.StatusBadRequest, "没有要更新的字段（name / proxy_url 至少提供一个）")
 		return
 	}
-	if err := validateProxyURL(proxyURL); err != nil {
-		writeError(w, http.StatusBadRequest, err.Error())
-		return
+	// 部分 PATCH 要把未提供的字段从库里读回来再写：UpdateNetwork 是无条件
+	// 覆盖两列，直接把零值写进去会把没打算改的那一列清空。这不是多一次
+	// 查询的成本问题，而是「PATCH 变成清空另一个字段」的正确性问题。
+	if req.Name == nil || req.ProxyURL == nil {
+		cur, err := h.store.GetNetwork(r.Context(), id)
+		if err != nil {
+			writeServerError(w, "get network", err)
+			return
+		}
+		if cur == nil {
+			writeError(w, http.StatusNotFound, "网络不存在（可能已被并发删除）")
+			return
+		}
+		if req.Name == nil {
+			name = cur.Name
+		}
+		if req.ProxyURL == nil {
+			proxyURL = cur.ProxyURL
+		}
 	}
 	if err := h.store.UpdateNetwork(r.Context(), id, name, proxyURL); err != nil {
 		if store.IsUniqueViolation(err) {

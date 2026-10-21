@@ -161,7 +161,7 @@ func (h *ConfigTransferHandler) buildExport(ctx context.Context) (configExport, 
 				PriceCacheHit: m.PriceCacheHit,
 				PriceOutput:   m.PriceOutput,
 				// 归组用显示名（跨库靠名字对齐，同 provider 靠 slug）。
-				// m.GroupID 为空 → 查表得空串 → omitempty 不写出，向后兼容。
+				// m.GroupID 为空 → 查表得空串 → omitempty 不写出。
 				GroupName: groupName[m.GroupID],
 			})
 		}
@@ -274,6 +274,10 @@ func (h *ConfigTransferHandler) apply(ctx context.Context, in *configExport, dry
 	for _, n := range existingNetworks {
 		networkByName[n.Name] = n.ID
 	}
+	// pendingNetworks 暂存真实写入路径中要新建的网络：它们必须和 provider /
+	// 模型 / 凭据一起进下面那笔事务，否则「导入回 500 但网络已落库」正是
+	// 这次审计要消灭的半套配置。干跑只记录计划，不追加到这里。
+	pendingNetworks := make([]store.Network, 0)
 	for _, ne := range in.Networks {
 		name := strings.TrimSpace(ne.Name)
 		if name == "" {
@@ -288,60 +292,14 @@ func (h *ConfigTransferHandler) apply(ctx context.Context, in *configExport, dry
 				fmt.Sprintf("网络 %s 的 proxy_url 非法（%v），未导入", name, err))
 			continue
 		}
-		id := "net-" + generateID()
+		id := store.NewNetworkID()
 		networkByName[name] = id
 		if dryRun {
 			resp.Notes = append(resp.Notes, fmt.Sprintf("将新建网络 %s", name))
 			continue
 		}
-		if err := h.store.CreateNetwork(ctx, &store.Network{ID: id, Name: name, ProxyURL: strings.TrimSpace(ne.ProxyURL)}); err != nil {
-			return nil, err
-		}
-	}
-	// v1/v2 文件里每个 provider 各带一份 proxy_url（无 networks 切片）。
-	// 那些地址在旧形态下就是「每个上游各存一份」，这里同样按 URL 归并成
-	// 网络并复用 —— 导入完自动就整理成了新形态，而不是留一份永远改不动的
-	// 影子配置。
-	legacyNetworks := make(map[string]string) // 代理地址 → 网络 id
-	for _, pe := range in.Providers {
-		rawURL := strings.TrimSpace(pe.ProxyURL)
-		if rawURL == "" {
-			continue
-		}
-		if _, ok := legacyNetworks[rawURL]; ok {
-			continue
-		}
-		if err := validateProxyURL(rawURL); err != nil {
-			resp.Warnings = append(resp.Warnings,
-				fmt.Sprintf("供应商 %s 的 proxy_url 非法（%v），该条目按直连导入", pe.Slug, err))
-			continue
-		}
-		// 优先复用本库已有的同名/同址网络：地址一致就是同一条网络。
-		var reused string
-		for _, n := range existingNetworks {
-			if n.ProxyURL == rawURL {
-				reused = n.ID
-				break
-			}
-		}
-		if reused != "" {
-			legacyNetworks[rawURL] = reused
-			continue
-		}
-		name := rawURL
-		if _, taken := networkByName[name]; taken {
-			name = name + " (" + pe.Slug + ")"
-		}
-		id := "net-" + generateID()
-		networkByName[name] = id
-		legacyNetworks[rawURL] = id
-		if dryRun {
-			resp.Notes = append(resp.Notes, fmt.Sprintf("将由旧版 proxy_url 建出网络 %s", name))
-			continue
-		}
-		if err := h.store.CreateNetwork(ctx, &store.Network{ID: id, Name: name, ProxyURL: rawURL}); err != nil {
-			return nil, err
-		}
+		pendingNetworks = append(pendingNetworks,
+			store.Network{ID: id, Name: name, ProxyURL: strings.TrimSpace(ne.ProxyURL)})
 	}
 
 	newProviders := make([]pendingProvider, 0, len(in.Providers))
@@ -382,14 +340,13 @@ func (h *ConfigTransferHandler) apply(ctx context.Context, in *configExport, dry
 			Slug: target, Name: strings.TrimSpace(pe.Name), Protocol: strings.TrimSpace(pe.Protocol),
 			Endpoint: strings.TrimSpace(pe.Endpoint), Enabled: pe.Enabled,
 			TimeoutMs: pe.TimeoutMs, MaxRetries: pe.MaxRetries, QuirksJSON: pe.QuirksJSON,
-			// 出站网络：v3 按名字引用，v1/v2 回落到按地址归并出来的网络。
-			// 两者都没给 = 直连。
+			// 出站网络按名字引用；空串 = 直连。
 			//
 			// 代理地址跟着一起搬。注意它指向的是**本机**的代理地址
 			// （如 127.0.0.1:7897），换一台机器导入时该端口未必相同 ——
 			// 但那是运维该判断的事，导入侧原样搬运、不做「猜一个新地址」
 			// 这种自作聪明。
-			NetworkID: resolveImportedNetworkID(pe, networkByName, legacyNetworks),
+			NetworkID: networkByName[strings.TrimSpace(pe.NetworkName)],
 			CreatedAt: time.Now().UnixMilli(), UpdatedAt: time.Now().UnixMilli(),
 		}
 		// 与手工创建保持同一套兜底：缺协议/端点的记录导进来就 unusable，
@@ -459,6 +416,12 @@ func (h *ConfigTransferHandler) apply(ctx context.Context, in *configExport, dry
 	// 校验所需的数据（现有 slug、模型清单）在事务外读齐（见上方
 	// ListProviders / ListAllUpstreamModels），事务内只做写入。
 	if err := h.store.RunTx(ctx, func(ctx context.Context, tx store.Tx) error {
+		for i := range pendingNetworks {
+			n := pendingNetworks[i]
+			if err := h.store.CreateNetworkTx(ctx, tx, &n); err != nil {
+				return fmt.Errorf("创建网络 %s：%w", n.Name, err)
+			}
+		}
 		for _, n := range newProviders {
 			p := n.provider
 			if err := h.store.CreateProviderTx(ctx, tx, &p); err != nil {
@@ -474,26 +437,6 @@ func (h *ConfigTransferHandler) apply(ctx context.Context, in *configExport, dry
 		return nil, err
 	}
 	return resp, nil
-}
-
-// resolveImportedNetworkID 决定导入的一个 provider 引用哪条网络。
-//
-// 优先级：network_name（v3）> proxy_url（v1/v2）> 直连。
-//
-// 为什么 network_name 排在前面：它是 v3 的权威字段，而 v1/v2 文件里它必然
-// 是空串 —— 顺序反了不会出错（两者不会同时非空），但显式写出优先级是为了
-// 让「手工编辑过的文件」（两个字段都被填了且不一致）有确定的解读。
-//
-// 名字在 networks 切片里找不到时返回空串（直连）并由调用方告警：宁可让
-// 这一条退回直连，也不要因为一个引用名对不上就中断整份导入。
-func resolveImportedNetworkID(pe providerExport, byName, legacyByURL map[string]string) string {
-	if name := strings.TrimSpace(pe.NetworkName); name != "" {
-		return byName[name]
-	}
-	if rawURL := strings.TrimSpace(pe.ProxyURL); rawURL != "" {
-		return legacyByURL[rawURL]
-	}
-	return ""
 }
 
 // pendingProvider 记住「文件里的原 slug → 实际要落库的 Provider」。
@@ -531,8 +474,7 @@ func (h *ConfigTransferHandler) attach(
 
 	// 归组导入必须排在模型循环**之前**：模型靠 group_name 关联组，
 	// 组不存在就写不进 group_id。同名组复用现有组（导入是合并而不是
-	// 重置配置），v1 文件没有这个切片 → 循环空转 → 所有模型未归组，
-	// 与字段加入前的行为一致。
+	// 重置配置）；当前格式没有这个切片时，所有模型未归组。
 	groupByName := make(map[string]bool) // 本库已有（含本次新建）的组名
 	for _, g := range in.ModelGroups {
 		name := strings.TrimSpace(g.DisplayName)
@@ -640,7 +582,7 @@ func (h *ConfigTransferHandler) attach(
 			PriceInput: me.PriceInput, PriceCacheHit: me.PriceCacheHit, PriceOutput: me.PriceOutput,
 		}
 		// 归组：文件里的组名解析成库内组 id（组在循环前已确保存在）。
-		// 解析不到（如 dry 路径库里还没有这个组）→ 未归组，与 v1 一致。
+		// 解析不到（如 dry 路径库里还没有这个组）→ 未归组。
 		if gname := strings.TrimSpace(me.GroupName); gname != "" {
 			if gid, ok := resolveGroup[gname]; ok {
 				m.GroupID = gid
@@ -686,6 +628,12 @@ func (h *ConfigTransferHandler) attach(
 			resp.CredentialsSkipped++
 			continue
 		}
+		if ce.Enabled == nil {
+			resp.CredentialsSkipped++
+			resp.Warnings = append(resp.Warnings,
+				fmt.Sprintf("凭据 %s / %s 缺少 enabled 字段，已跳过", slug, ce.Label))
+			continue
+		}
 		apiKey := strings.TrimSpace(ce.APIKey)
 		if apiKey == "" {
 			// 导出时没带凭据是正常路径，不该报成错。
@@ -702,17 +650,10 @@ func (h *ConfigTransferHandler) attach(
 		if weight <= 0 {
 			weight = 1
 		}
-		// Enabled 跟随导出文件：导出保留原状，导入也应原样落库（CONFIG-01，
-		// 原先硬编码 true，禁用凭据导入后静默复活）。字段缺失（旧版文件）
-		// 按 true 处理，与该字段加入前的行为一致 —— 见 credentialExport 注释。
-		enabled := true
-		if ce.Enabled != nil {
-			enabled = *ce.Enabled
-		}
 		c := store.Credential{
 			ID:         generateID(),
 			ProviderID: pid, Label: strings.TrimSpace(ce.Label), APIKeyEnc: enc,
-			Enabled: enabled, Weight: weight, Status: "healthy",
+			Enabled: *ce.Enabled, Weight: weight, Status: "healthy",
 			CreatedAt: time.Now().UnixMilli(),
 		}
 		if dry {

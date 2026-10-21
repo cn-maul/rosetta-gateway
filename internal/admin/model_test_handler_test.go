@@ -103,9 +103,7 @@ func (u *probeUpstream) firstPath(t *testing.T) string {
 
 // probeTestStore 建一个指向给定 endpoint 的 provider + 一条凭据 + 一个模型。
 //
-// masterKey 传 nil：加密走 encryptSecret 的明文分支，decryptCredentialKey 的
-// DecryptWithFallback 会原样读出 —— 测试不关心加密，只关心「凭据能不能解出
-// 一把非空 key」。加密路径本身由 crypto 包的测试覆盖。
+// 凭据使用与 handler 相同的当前格式主密钥加密；测试不绕过加密路径。
 func probeTestStore(t *testing.T, endpoint string, withCredential bool) *store.Store {
 	t.Helper()
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
@@ -125,7 +123,7 @@ func probeTestStore(t *testing.T, endpoint string, withCredential bool) *store.S
 	if withCredential {
 		if err := st.CreateCredential(ctx, &store.Credential{
 			ID: "c1", ProviderID: "p1", Label: "default",
-			APIKeyEnc: []byte("sk-test"), Enabled: true, Weight: 1, Status: "healthy",
+			APIKeyEnc: encryptTestCredential(t, "sk-test"), Enabled: true, Weight: 1, Status: "healthy",
 		}); err != nil {
 			t.Fatalf("create credential: %v", err)
 		}
@@ -140,7 +138,7 @@ func probeTestStore(t *testing.T, endpoint string, withCredential bool) *store.S
 
 func probeHandler(t *testing.T, st *store.Store) *ModelHandler {
 	t.Helper()
-	return NewModelHandler(st, nil, config.Default())
+	return NewModelHandler(st, testCredentialKey, config.Default())
 }
 
 // callTest 调 handler.Test 并解出响应体。
@@ -337,7 +335,7 @@ func TestModelTest_DisabledModelIsStillProbed(t *testing.T) {
 func TestModelTest_NilConfigDoesNotPanic(t *testing.T) {
 	up := recordingProbeUpstream(t, 0, "")
 	st := probeTestStore(t, up.srv.URL, true)
-	h := NewModelHandler(st, nil, nil) // 刻意 nil cfg
+	h := NewModelHandler(st, testCredentialKey, nil) // 刻意 nil cfg
 
 	rec, resp := callTest(t, h, "m1")
 	if rec.Code != http.StatusOK {

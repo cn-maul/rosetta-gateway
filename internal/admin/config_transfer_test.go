@@ -114,6 +114,15 @@ func exportBody(t *testing.T, h *ConfigTransferHandler, body string) (configExpo
 // importInto 调一次 Import。
 func importInto(t *testing.T, h *ConfigTransferHandler, req importRequest) importResponse {
 	t.Helper()
+	if !req.Data.Encrypted {
+		const pass = "fixture-import-pass"
+		sealed, err := sealExport(req.Data, pass)
+		if err != nil {
+			t.Fatalf("seal fixture: %v", err)
+		}
+		req.Data = sealed
+		req.Passphrase = pass
+	}
 	raw, err := json.Marshal(req)
 	if err != nil {
 		t.Fatalf("marshal: %v", err)
@@ -202,7 +211,7 @@ func TestExportEncryptedRoundTrip(t *testing.T) {
 	seedSource(t, h, h.store)
 
 	const pass = "correct horse battery"
-	enc, resp := exportBody(t, h, `{"passphrase":"`+pass+`","include_credentials":true}`)
+	enc, resp := exportBody(t, h, `{"passphrase":"`+pass+`"}`)
 
 	if !enc.Encrypted {
 		t.Fatalf("给了口令就该加密")
@@ -565,8 +574,11 @@ func TestImportDryRunWritesNothing(t *testing.T) {
 func TestImportRejectsUnknownVersion(t *testing.T) {
 	dst, _ := transferFixture(t)
 
+	if err := checkExportVersion(99); err == nil {
+		t.Fatalf("不认识的版本应被 checkExportVersion 拒")
+	}
 	if _, err := openExport(configExport{Version: 99}, ""); err == nil {
-		t.Fatalf("不认识的版本应被 openExport 拒")
+		t.Fatalf("非加密格式应被 openExport 拒")
 	}
 
 	r := asAdmin(jsonRequest(http.MethodPost, "/admin/api/config-export/import",
@@ -584,6 +596,28 @@ func TestImportRejectsUnknownVersion(t *testing.T) {
 	provs, _ := dst.store.ListProviders(context.Background())
 	if len(provs) != 0 {
 		t.Fatalf("版本不认识时不该写入任何供应商，实际 %d", len(provs))
+	}
+}
+
+// TestImportRejectsPlaintextFile 钉住当前格式唯一的入口：旧明文导出
+// 即使版本号相同也不再接受。否则“加上 version 就能导入”会绕过加密约束。
+func TestImportRejectsPlaintextFile(t *testing.T) {
+	dst, _ := transferFixture(t)
+	raw := mustMarshal(t, importRequest{Data: configExport{
+		Version: exportFormatVersion,
+		Providers: []providerExport{{
+			Slug: "plain", Protocol: "openai-chat", Endpoint: "https://plain/v1", Enabled: true,
+		}},
+	}})
+	r := asAdmin(jsonRequest(http.MethodPost, "/admin/api/config-export/import", bytes.NewReader(raw)))
+	w := httptest.NewRecorder()
+	dst.Import(w, r)
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("明文导出应返回 400，实际 %d body=%s", w.Code, w.Body.String())
+	}
+	provs, _ := dst.store.ListProviders(context.Background())
+	if len(provs) != 0 {
+		t.Fatalf("明文导出不该写入任何供应商，实际 %d", len(provs))
 	}
 }
 
@@ -671,9 +705,8 @@ func TestImportValidatesNumericFieldsAndHonorsCredentialEnabled(t *testing.T) {
 		},
 		Credentials: []credentialExport{
 			{ProviderSlug: "good", Label: "off", APIKey: "sk-disabled", Enabled: &disabled},
-			{ProviderSlug: "good", Label: "legacy", APIKey: "sk-legacy", Enabled: &enabled},
-			// 旧版导出体 / 手写文件没有 enabled 字段：按 true 处理。
-			{ProviderSlug: "good", Label: "missing-field", APIKey: "sk-missing"},
+			{ProviderSlug: "good", Label: "on", APIKey: "sk-enabled", Enabled: &enabled},
+			{ProviderSlug: "good", Label: "missing-enabled", APIKey: "sk-missing"},
 		},
 	}
 
@@ -710,13 +743,16 @@ func TestImportValidatesNumericFieldsAndHonorsCredentialEnabled(t *testing.T) {
 	for _, c := range creds {
 		states[c.Label] = c.Enabled
 	}
-	if len(creds) != 3 {
-		t.Fatalf("应落库 3 条凭据，实际 %d", len(creds))
+	if len(creds) != 2 {
+		t.Fatalf("字段完整的 2 条凭据应落库，实际 %d（warnings=%v）", len(creds), resp.Warnings)
 	}
 	if states["off"] {
 		t.Errorf("文件里禁用的凭据被导入成启用（CONFIG-01 原缺陷）")
 	}
-	if !states["legacy"] || !states["missing-field"] {
-		t.Errorf("显式 true 与字段缺失都应导入为启用：%v", states)
+	if !states["on"] {
+		t.Errorf("显式 true 应导入为启用：%v", states)
+	}
+	if _, exists := states["missing-enabled"]; exists {
+		t.Errorf("缺少 enabled 的凭据不该落库：%v", states)
 	}
 }

@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/cn-maul/rosetta-gateway/internal/config"
 	"github.com/cn-maul/rosetta-gateway/internal/routing"
 	"github.com/cn-maul/rosetta-gateway/internal/snapshot"
 	"github.com/cn-maul/rosetta-gateway/internal/store"
@@ -122,7 +123,7 @@ func TestProbeModels_ScopedToGroupAllowlist(t *testing.T) {
 	seedProbe(t, st, "up/flash", true)
 	seedProbe(t, st, "up/pro", false)
 	seedProbe(t, st, "up/opus", false)
-	h := NewProbeHandler(st)
+	h := NewProbeHandler(st, nil)
 
 	got := fetchProbeHealths(t, h, asUser(httptest.NewRequest(http.MethodGet, "/admin/api/probes/models", nil), "u1"))
 	seen := map[string]bool{}
@@ -149,7 +150,7 @@ func TestProbeModels_AdminSeesEverything(t *testing.T) {
 	seedProbe(t, st, "up/flash", true)
 	seedProbe(t, st, "up/pro", true)
 	seedProbe(t, st, "up/opus", false)
-	h := NewProbeHandler(st)
+	h := NewProbeHandler(st, nil)
 
 	got := fetchProbeHealths(t, h, asAdmin(httptest.NewRequest(http.MethodGet, "/admin/api/probes/models", nil)))
 	if len(got) != 3 {
@@ -167,7 +168,7 @@ func TestProbeModels_EmptyIntersectionReturnsEmptyNotAll(t *testing.T) {
 		"u3": snapUser("u3", "g1", snapshot.AllowOnly([]string{"nonexistent"})),
 	})
 	seedProbe(t, st, "up/flash", true)
-	h := NewProbeHandler(st)
+	h := NewProbeHandler(st, nil)
 
 	got := fetchProbeHealths(t, h, asUser(httptest.NewRequest(http.MethodGet, "/admin/api/probes/models", nil), "u3"))
 	if len(got) != 0 {
@@ -180,7 +181,7 @@ func TestProbeModels_RequiresLogin(t *testing.T) {
 	st := newScopeStore(t)
 	initProbeScopedSnapshot(t, nil)
 	seedProbe(t, st, "up/flash", true)
-	h := NewProbeHandler(st)
+	h := NewProbeHandler(st, nil)
 
 	rec := httptest.NewRecorder()
 	h.Models(rec, httptest.NewRequest(http.MethodGet, "/admin/api/probes/models", nil))
@@ -196,7 +197,7 @@ func TestProbeTimeline_ScopedAndDeniedIDsAreNotSilentlyDropped(t *testing.T) {
 	initProbeScopedSnapshot(t, map[string]*snapshot.UserSnapshot{"u1": probeUser("u1")})
 	seedProbe(t, st, "up/flash", true)
 	seedProbe(t, st, "up/opus", false)
-	h := NewProbeHandler(st)
+	h := NewProbeHandler(st, nil)
 
 	// 全部越权 → 403（说清是权限问题，而不是回一个空数组让人以为「没数据」）。
 	code, _ := fetchTimeline(t, h, asUser(
@@ -234,7 +235,7 @@ func TestProbeTimeline_AdminUnrestricted(t *testing.T) {
 	st := newScopeStore(t)
 	initProbeScopedSnapshot(t, nil)
 	seedProbe(t, st, "up/opus", false)
-	h := NewProbeHandler(st)
+	h := NewProbeHandler(st, nil)
 
 	code, buckets := fetchTimeline(t, h, asAdmin(
 		httptest.NewRequest(http.MethodGet, "/admin/api/probes/timeline?model_id=up%2Fopus", nil)))
@@ -250,7 +251,7 @@ func TestProbeTimeline_FrontendJSONContract(t *testing.T) {
 	st := newScopeStore(t)
 	initProbeScopedSnapshot(t, nil)
 	seedProbe(t, st, "up/flash", true)
-	h := NewProbeHandler(st)
+	h := NewProbeHandler(st, nil)
 	rec := httptest.NewRecorder()
 	h.Timeline(rec, asAdmin(httptest.NewRequest(http.MethodGet, "/admin/api/probes/timeline?model_id=up%2Fflash", nil)))
 	if rec.Code != http.StatusOK {
@@ -280,5 +281,45 @@ func TestProbeTimeline_FrontendJSONContract(t *testing.T) {
 		if err := json.Unmarshal(rows[0][key], &got); err != nil || got != want {
 			t.Fatalf("%s=%s, want %d", key, rows[0][key], want)
 		}
+	}
+}
+
+// TestProbeHandler_UsesConfiguredThresholds 钉住管理面展示与探测器使用
+// **同一份配置**，而不是各自硬编码 3 / 0.8。
+//
+// 触发条件故意选在默认配置与自定义配置交界处：窗口内 2 次成功 1 次失败
+// （成功率 2/3），默认 0.8 判 degraded；把 healthy_rate 调到 0.6 后应为
+// healthy。连续失败 2 次在默认 down_threshold=3 时是 degraded；调到 2
+// 后应为 down。两个方向都断言，避免只测到一个阈值被读取。
+func TestProbeHandler_UsesConfiguredThresholds(t *testing.T) {
+	cfg := config.Default()
+	h := NewProbeHandler(nil, cfg)
+
+	ph := store.ProbeHealth{
+		ModelID: "up/flash", ProviderID: "p1",
+		WindowCount: 3, WindowOK: 2,
+		ConsecutiveFail: 2, LastOK: true, LastTs: time.Now().UnixMilli(),
+	}
+	if got := h.classifyProbeHealth(ph); got != "degraded" {
+		t.Fatalf("默认配置下成功率 2/3 应 degraded，实际 %s", got)
+	}
+	if got, want := h.probeWindowMs(), int64(600*10*1000); got != want {
+		t.Fatalf("默认窗口 = %dms，期望 %dms", got, want)
+	}
+
+	cfg.Probes.HealthyRate = 0.6
+	if got := h.classifyProbeHealth(ph); got != "healthy" {
+		t.Fatalf("healthy_rate=0.6 时应 healthy，实际 %s", got)
+	}
+	cfg.Probes.DownThreshold = 2
+	ph.LastOK = false
+	if got := h.classifyProbeHealth(ph); got != "down" {
+		t.Fatalf("down_threshold=2 且连续失败 2 次应 down，实际 %s", got)
+	}
+
+	cfg.Probes.IntervalSec = 60
+	cfg.Probes.WindowSize = 5
+	if got, want := h.probeWindowMs(), int64(60*5*1000); got != want {
+		t.Fatalf("配置窗口 = %dms，期望 %dms", got, want)
 	}
 }

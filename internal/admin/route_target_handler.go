@@ -101,11 +101,22 @@ func (h *RouteTargetHandler) Replace(w http.ResponseWriter, r *http.Request, rou
 	}
 
 	built := make([]store.RouteTarget, 0, len(req.Targets))
+	seen := make(map[string]struct{}, len(req.Targets))
 	for i, in := range req.Targets {
 		if err := h.validateTarget(r, in); err != nil {
 			writeError(w, http.StatusBadRequest, "targets["+strconv.Itoa(i)+"]: "+err.Error())
 			return
 		}
+		// 审计 *X13：同一条链里重复的 (provider, model) 会被运行时逐个尝试，
+		// 上游收费一次、网关记两次。数据库已有唯一约束兜底，这里先给出
+		// 能指出下标的 400，而不是把约束错误翻译成 500。
+		key := in.ProviderID + "\x00" + in.UpstreamModelID
+		if _, dup := seen[key]; dup {
+			writeError(w, http.StatusBadRequest,
+				"targets["+strconv.Itoa(i)+"]: 同一上游模型不能在一条链里重复配置")
+			return
+		}
+		seen[key] = struct{}{}
 		enabled := true
 		if in.Enabled != nil {
 			enabled = *in.Enabled

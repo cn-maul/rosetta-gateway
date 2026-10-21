@@ -101,8 +101,17 @@ func (h *GroupHandler) List(w http.ResponseWriter, r *http.Request) {
 }
 
 type groupRequest struct {
-	Name        string `json:"name"`
-	Description string `json:"description"`
+	// Name / Description 用指针表示「本次请求是否提供」（2026-10-21 修 A7-07）。
+	//
+	// 此前两者都是普通 string，于是 Update 里 name 走「非空才改」、
+	// description 却无条件赋值：`PATCH {"name":"研发二组"}` 会把原描述写成
+	// 空串。这与 helpers.go 里写明的 PATCH 三态契约（nil = 未提供、
+	// 非 nil = 显式赋值、空串是合法值）直接冲突，也让本端点成了
+	// 唯一一个「改名必须重贴描述」的 PATCH。
+	//
+	// Create 仍可用 derefStr 取零值：那里缺省即空描述，语义正确。
+	Name        *string `json:"name"`
+	Description *string `json:"description"`
 }
 
 // Create 新建分组。新组的白名单为空 = 不限制 —— 这是既有语义，
@@ -120,7 +129,9 @@ func (h *GroupHandler) Create(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "invalid JSON: "+err.Error())
 		return
 	}
-	name := strings.TrimSpace(req.Name)
+	// Create 用 derefStr：新建时缺省即空值，这正是想要的效果
+	// （没传 name 就是必填校验失败，没传 description 就是空描述）。
+	name := strings.TrimSpace(derefStr(req.Name))
 	if name == "" {
 		writeError(w, http.StatusBadRequest, "组名必填")
 		return
@@ -133,7 +144,7 @@ func (h *GroupHandler) Create(w http.ResponseWriter, r *http.Request) {
 	g := &store.Group{
 		ID:          generateID(),
 		Name:        name,
-		Description: strings.TrimSpace(req.Description),
+		Description: strings.TrimSpace(derefStr(req.Description)),
 	}
 	if err := h.store.CreateGroup(r.Context(), g); err != nil {
 		if store.IsUniqueViolation(err) {
@@ -169,14 +180,19 @@ func (h *GroupHandler) Update(w http.ResponseWriter, r *http.Request, id string)
 		writeError(w, http.StatusBadRequest, "invalid JSON: "+err.Error())
 		return
 	}
-	if name := strings.TrimSpace(req.Name); name != "" {
+	if req.Name != nil {
+		name := strings.TrimSpace(*req.Name)
 		if len(name) > 64 {
 			writeError(w, http.StatusBadRequest, "组名不能超过 64 个字符")
 			return
 		}
 		g.Name = name
 	}
-	g.Description = strings.TrimSpace(req.Description)
+	// description 只在显式提供时改动；缺失即保持原值（nil = 未提供）。
+	// 显式传空串是清空描述，那是合法操作，与「没传」不是一回事。
+	if req.Description != nil {
+		g.Description = strings.TrimSpace(*req.Description)
+	}
 
 	if err := h.store.UpdateGroup(ctx, g); err != nil {
 		if store.IsUniqueViolation(err) {
