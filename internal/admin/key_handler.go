@@ -622,8 +622,8 @@ func (h *KeyHandler) Update(w http.ResponseWriter, r *http.Request, id string) {
 	// 那把 key 之后永远 401（auth.go 的 ErrKeyUnowned）。
 	//
 	// 只能管理员改归属 —— 与 Create 同一口径；普通用户即使传了也忽略。
-	// 落库走独立的 ReassignAccessKey：UpdateAccessKey 刻意不写 user_id
-	// （归属不该由一个 PATCH 随手改写）。
+	// 落库与其余字段同事务（UpdateAccessKeyWithOwner）：归属仍不走
+	// UpdateAccessKey，但也不再是独立的第二步自动提交。
 	//
 	// # 不能认领给管理员（2026-10-10）
 	//
@@ -667,16 +667,18 @@ func (h *KeyHandler) Update(w http.ResponseWriter, r *http.Request, id string) {
 		return
 	}
 
-	if err := h.store.UpdateAccessKey(r.Context(), id, existing); err != nil {
+	// 落库走**一个事务**（2026-10-21 修 A7-P2-08）。
+	//
+	// 原来是两次自动提交：UpdateAccessKey 之后 ReassignAccessKey。第二步
+	// 失败时第一步已经落库，而响应是 404/500 —— 调用方看到失败、库里却是
+	// 新配置，重试与手工核对都会把「半截修改」当成原点。归属那一半更糟：
+	// 重命名成功、改归属失败，界面按旧响应显示新主人，下一次调用就用错了
+	// 身份计费。现在要么全成，要么全不成。
+	if err := h.store.UpdateAccessKeyWithOwner(r.Context(), id, existing, claimTo, claim); err != nil {
 		writeNotFoundOrError(w, "update key", "密钥不存在（可能已被并发删除）", err)
 		return
 	}
-	// 归属单独一步：UpdateAccessKey 刻意不写 user_id（见其注释）。
 	if claim {
-		if err := h.store.ReassignAccessKey(r.Context(), id, claimTo); err != nil {
-			writeNotFoundOrError(w, "reassign key owner", "密钥不存在（可能已被并发删除）", err)
-			return
-		}
 		existing.UserID = claimTo
 	}
 

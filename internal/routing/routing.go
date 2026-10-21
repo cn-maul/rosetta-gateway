@@ -4,9 +4,20 @@ import (
 	"errors"
 	"sort"
 	"strings"
+	"sync"
 
 	"github.com/cn-maul/rosetta-gateway/internal/effort"
 )
+
+// RouteIndex 的锁策略（2026-10-21 修 *X15）。
+//
+// 只有**公开方法**加锁；私有的 find* / buildCandidates 一律假定调用方
+// 已持锁。这样 Resolve 内部连锁查找时不会出现「同一 goroutine 嵌套
+// RLock」—— 那个写法在 Go 里本身可重入，但只要有写锁排在中间就会
+// 死锁（RLock 会让路给等待中的 Lock）。热路径上少两次加锁解锁也是
+// 净收益。
+//
+// 新增公开方法时必须自己决定加不加锁，别靠调用私有 find* 蒙混过关。
 
 var (
 	ErrModelNotFound = errors.New("model_not_found")
@@ -102,6 +113,20 @@ type UpstreamModel struct {
 }
 
 type RouteIndex struct {
+	// mu 保护下面六张 map。
+	//
+	// 为什么需要它（2026-10-21 修 *X15）：snapshot.Snapshot 的并发契约
+	// 写着「已发布的快照不可变」，但那是**纯注释**——Add* 是导出方法，
+	// 任何包都能在 Swap 之后原地改这张索引。一旦有人为了「让新配置立即
+	// 生效」这么做，热路径的 map 读写立刻变成并发 map 读写，而那是
+	// **Go 运行时 fatal error，不可恢复**（不是 panic，recover 拦不住）。
+	// 锁把「约定」变成「机制」：写路径 serialized，读路径无锁化前的过渡期
+	// 至少不会崩进程。
+	//
+	// 用 RWMutex 而不是 Mutex：Resolve 是**每个请求**都要走的热路径，
+	// 而写路径只在快照重建时发生（秒级一次）。读多写少正是 RWMutex 的
+	// 适用场景，读读之间不互斥。
+	mu           sync.RWMutex
 	byPublicName map[string]*Route
 	byID         map[string]*Route
 	providers    map[string]*ProviderRef
@@ -141,6 +166,8 @@ func NewRouteIndex() *RouteIndex {
 }
 
 func (ri *RouteIndex) AddRoute(r *Route) {
+	ri.mu.Lock()
+	defer ri.mu.Unlock()
 	ri.byPublicName[r.PublicName] = r
 	ri.byID[r.ID] = r
 }
@@ -148,6 +175,8 @@ func (ri *RouteIndex) AddRoute(r *Route) {
 // AddRouteTarget 追加一个链成员。快照重建按 route_id, position 顺序喂进来，
 // 故这里 append 即为有序；调用方保证 position 递增。
 func (ri *RouteIndex) AddRouteTarget(t *Target) {
+	ri.mu.Lock()
+	defer ri.mu.Unlock()
 	ri.targetsByRoute[t.RouteID] = append(ri.targetsByRoute[t.RouteID], t)
 }
 
@@ -160,6 +189,8 @@ func (ri *RouteIndex) AddRouteTarget(t *Target) {
 // 故不拆成两张表：多一次 map 查找换取热路径（Resolve 每次请求都调
 // findProviderBySlug）少一次分支。
 func (ri *RouteIndex) AddProvider(p *ProviderRef) {
+	ri.mu.Lock()
+	defer ri.mu.Unlock()
 	ri.providers[p.ID] = p
 	ri.providers[p.Slug] = p
 	if _, ok := ri.providerModels[p.ID]; !ok {
@@ -180,6 +211,8 @@ func (ri *RouteIndex) AddProvider(p *ProviderRef) {
 // 上游模型一多（单 provider 挂几十个模型很常见）就成 O(N)。反查表把它变成
 // 两次 O(1) 查找 —— 团队已把 Keys 从 O(N) 改成 map，只是漏了这里。
 func (ri *RouteIndex) AddUpstreamModel(m *UpstreamModel) {
+	ri.mu.Lock()
+	defer ri.mu.Unlock()
 	if _, ok := ri.providerModels[m.ProviderID]; !ok {
 		ri.providerModels[m.ProviderID] = make(map[string]*UpstreamModel)
 	}
@@ -196,10 +229,14 @@ func (ri *RouteIndex) AddUpstreamModel(m *UpstreamModel) {
 // 返回最后 Add 的那个 —— 与旧线性扫描「返回第一个匹配」的行为差异在
 // 配置层就被排除了（同一 provider 下 ModelID 唯一）。
 func (ri *RouteIndex) FindUpstreamModelByModelID(providerID, modelID string) *UpstreamModel {
+	ri.mu.RLock()
+	defer ri.mu.RUnlock()
 	return ri.modelsByModelID[providerID][modelID]
 }
 
 func (ri *RouteIndex) Resolve(model string) (*Resolution, error) {
+	ri.mu.RLock()
+	defer ri.mu.RUnlock()
 	if r, ok := ri.byPublicName[model]; ok {
 		if !r.Enabled {
 			// 命中一条被显式禁用的具名路由 → 立即否决，**不得**继续往下走
@@ -292,10 +329,17 @@ func (ri *RouteIndex) buildCandidates(r *Route) []Candidate {
 }
 
 func (ri *RouteIndex) ListRoutes() []*Route {
+	ri.mu.RLock()
+	defer ri.mu.RUnlock()
 	routes := make([]*Route, 0, len(ri.byID))
 	for _, r := range ri.byID {
 		routes = append(routes, r)
 	}
+	// 返回的是**指针副本**：切片本身是新建的，但元素仍指向索引内部的
+	// *Route。调用方改 *Route.Enabled 依然是原地改已发布快照 —— 那是
+	// 锁管不到的事（锁只保证 map 结构不被并发写坏）。
+	// 审计 *X15 记录了这个残留风险；把它彻底关掉需要 Route 变成不可变值
+	// 类型，那是另一次重构，不在本次范围。
 	return routes
 }
 
@@ -310,6 +354,8 @@ func (ri *RouteIndex) ListRoutes() []*Route {
 // 返回的是副本：调用方排序或改它都不会影响索引。刻意**不排序** ——
 // 这是索引快照的枚举，不是给人看的清单；要稳定顺序的调用方自己排。
 func (ri *RouteIndex) ListPublicNames() []string {
+	ri.mu.RLock()
+	defer ri.mu.RUnlock()
 	names := make([]string, 0, len(ri.byPublicName))
 	for name := range ri.byPublicName {
 		names = append(names, name)
@@ -408,6 +454,8 @@ type UpstreamModelRef struct {
 // 这里按 ID 去重；model 本身禁用或 provider 禁用时 Enabled=false，
 // 由调用方决定是否列出。
 func (ri *RouteIndex) ListUpstreamModels() []UpstreamModelRef {
+	ri.mu.RLock()
+	defer ri.mu.RUnlock()
 	seen := make(map[string]bool, len(ri.providers))
 	out := make([]UpstreamModelRef, 0)
 	for _, p := range ri.providers {

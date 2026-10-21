@@ -335,10 +335,72 @@ func (s *Store) UpdateAccessKey(ctx context.Context, id string, k *AccessKey) er
 // 那把 key 之后永远 401（auth.go 的 ErrKeyUnowned）。
 //
 // 权限校验（只有管理员可改归属、目标用户必须存在）在 admin 层做。
+//
+// # 现状（2026-10-21 修 A7-P2-08 之后）
+//
+// 生产已无调用点：admin 的 Key PATCH 改走 UpdateAccessKeyWithOwner
+// （字段与归属同一个事务，避免两步写的部分提交窗口）。保留本方法是因为
+// 它是「只改归属、绝不碰别的字段」的单一职责入口 —— 与 UpdateAccessKey
+// 刻意不写 user_id 是同一条口径的两半。将来若有「纯转归属」的入口
+// （例如管理界面上单独的「转移」按钮），用它而不是现场拼 SQL。
 func (s *Store) ReassignAccessKey(ctx context.Context, id, userID string) error {
 	res, err := s.db.ExecContext(ctx,
 		`UPDATE access_keys SET user_id = ? WHERE id = ?`, nullIfEmpty(userID), id)
 	return checkAffected(res, err)
+}
+
+// UpdateAccessKeyWithOwner 在**一个事务**里更新 key 的字段并改写归属
+// （2026-10-21 修 A7-P2-08）。
+//
+// # 为什么需要它
+//
+// 原先 PATCH 是两次自动提交：先 UpdateAccessKey（名称/配额/有效期/…），
+// 再 ReassignAccessKey（归属）。第二步失败时第一步**已经落库**，而响应是
+// 404/500 —— 调用方看到失败，库里却已经是新配置。此时：
+//   - 客户端重试 → 以为回到原点，实际带着上一次的半截修改继续跑；
+//   - 运维手工核对 → 「明明保存失败了，怎么限制真的变了」；
+//   - 更坏的是**归属**：重命名成功、改归属失败，这把 key 仍属于原用户，
+//     而界面按 200 的旧响应显示新主人 —— 下一次调用就用错了身份计费。
+//
+// 分两步的真实理由（「归属不该由一个 PATCH 随手改写」）在权限层已经
+// 由 handler 保证：只有管理员能改归属，且目标用户必须存在。DAO 层没有
+// 必要为此再付一次「非原子」的代价。
+//
+// # 为什么不是「把 user_id 加进 UpdateAccessKey」
+//
+// UpdateAccessKey 被 20+ 处测试与内部路径直接调用，它们的语义都是
+// 「绝不碰归属」（改配置不该顺带换主人）。给它加参数会让每一个现有调用点
+// 都要想一遍「我这次会不会顺手改了归属」。单独一个显式方法，名字就把
+// 「这会动归属」写在脸上。
+func (s *Store) UpdateAccessKeyWithOwner(ctx context.Context, id string, k *AccessKey, newUserID string, changeOwner bool) error {
+	return s.RunTx(ctx, func(ctx context.Context, ex execer) error {
+		enabled := 0
+		if k.Enabled {
+			enabled = 1
+		}
+		res, err := ex.ExecContext(ctx,
+			`UPDATE access_keys SET name = ?, enabled = ?, quota_tokens = ?, rpm_limit = ?, tpm_limit = ?,
+			        allowed_models_json = ?, expires_at = ?, allowed_ips = ?, group_id = ?
+			  WHERE id = ?`,
+			k.Name, enabled, k.QuotaTokens, k.RPMLimit, k.TPMLimit,
+			encodeAllowedModels(k.AllowedModels), k.ExpiresAt,
+			nullIfEmpty(k.AllowedIPs), nullIfEmpty(k.GroupID), id)
+		if err != nil {
+			return err
+		}
+		if err := checkAffected(res, nil); err != nil {
+			return err
+		}
+		if !changeOwner {
+			return nil
+		}
+		res2, err := ex.ExecContext(ctx,
+			`UPDATE access_keys SET user_id = ? WHERE id = ?`, nullIfEmpty(newUserID), id)
+		if err != nil {
+			return err
+		}
+		return checkAffected(res2, nil)
+	})
 }
 
 // GetKeyQuota 读单个密钥的配额与已用量，供热路径预检。
