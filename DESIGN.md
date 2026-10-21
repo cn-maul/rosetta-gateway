@@ -92,7 +92,8 @@
                               ▼
         ┌──────────── Rosetta Gateway（单进程） ────────────┐
         │                                                   │
-        │  server        路由装配 · 中间件 · 错误映射         │
+        │  api           生产路由 spec · HTTP 组装 · 健康检查 │
+        │  server        HTTP 中间件 · 鉴权门 · 错误映射      │
         │  auth          下游 Key 校验（SHA-256 索引）        │
         │  quota         配额检查 · 用量扣减 · 限速          │
         │  inwire        [下游 → 统一模型] 请求解码           │
@@ -610,7 +611,7 @@ POST   /admin/api/reload                        从 DB 重建内存快照（前�
 
 ### 6.4 额度/费用查询（2026-10-04）
 
-两套形状（实现见 `cmd/gateway/billing.go`），均需有效 sk-gw key：
+两套形状（实现见 `internal/billinghttp`），均需有效 sk-gw key：
 
 | 端点 | 形状来源 | 数据口径 |
 |---|---|---|
@@ -620,7 +621,7 @@ POST   /admin/api/reload                        从 DB 重建内存快照（前�
 | `GET /dashboard/billing/usage`（含别名） | 同上 | **per-key**：区间内已用 token 折算 `total_usage`（美分） |
 
 「组织」= 本网关整个部署，因此上面两个 `/v1/organization/*` 端点**按调用者身份收窄**
-（实现见 `cmd/gateway/billing.go` 的 `orgCostsScope` + `store.SumUsageBucketsScoped` /
+（实现见 `internal/billinghttp` 的 `orgCostsScope` + `store.SumUsageBucketsScoped` /
 `SumCostBucketsScoped`）。作用域只由服务端根据会话身份判定，绝不从 query 参数读取。
 修复前它们只做 `auth.Authenticate`，任何一把 `sk-gw` key 都能读到**别的租户**的
 模型名、用量与费用（实测普通用户的 `/admin/api/stats` 显示 `cost:0`，而同一把 key
@@ -1383,7 +1384,7 @@ Docker 侧对齐，且避开浏览器的保留端口表（6666 是 IRC 段，浏
 
 **鉴权**：管理 API 由 `adminGuarded` 鉴权链保护，凭据逻辑在 `internal/userauth` +
 `internal/admin`（users 表 + JWT 会话，见 §6.3）。**恰好 4 条路由免鉴权**，且必须显式
-注册到根 mux（`cmd/gateway/routes.go` 的 `adminRouteSpecs` 表）—— 它们不进 `adminAuto`（那会走鉴权链），但也不能
+注册到根 mux（`internal/api/api.go` 的 `routeSpecs` 表）—— 它们不进 `adminAuto`（那会走鉴权链），但也不能
 因为「没注册」而落到 `/admin/api/` 前缀上被鉴权拦掉，那样会得到 401 而非功能缺失，
 症状是「登录页一直转圈」：
 
@@ -1538,7 +1539,7 @@ vue-router 的 `insertMatcher` 按路径得分二分插入（`findInsertionIndex
 > `build.ps1`、`gateway.ps1`、`CONTRIBUTING.md`）与 `internal/` 下新增的
 > `effort`（思考挡位唯一口径）、`probe`（上游模型定时探测），以及 2026-10-21
 > 重构拆出的 `httpx / identity / guard / access / usage / billing / billinghttp /
-> authhttp / ingress / dataplane / runtime / gatewayapp / catalog`。
+> authhttp / ingress / dataplane / runtime / gatewayapp / api / catalog`。
 > 核对方式：`Get-ChildItem -Directory` + 逐个 `internal/*/` 的包注释。
 
 ```
@@ -1565,7 +1566,7 @@ rosetta-gateway/
 │       ├── ci.yml                  go / webui-sync / -race / repo-hygiene 四道门禁
 │       └── docker.yml               tag 触发构建推送 GHCR（发布前复跑最小门禁）
 ├── cmd/
-│   ├── gateway/                    进程入口与 HTTP 路由表；启动/关停和依赖装配在 internal/gatewayapp
+│   ├── gateway/                    进程入口与测试兼容桥接；HTTP 组装在 internal/api，生命周期在 internal/gatewayapp
 ├── internal/
 │   ├── config/                     启动配置加载、校验、时区应用、端口占用检查
 │   ├── store/                      SQLite 连接、canonical schema、各表 DAO、归档与对账、探测记录
@@ -1584,7 +1585,8 @@ rosetta-gateway/
 │   ├── dataplane/                  数据面处理器：鉴权后限速、配额预占、余额预检、
 │   │                               故障转移链、流式/非流式 attempt、用量落库
 │   ├── runtime/                    上游池 + 快照的原子重建与失败重试
-│   ├── gatewayapp/                 配置/密钥/Store/bootstrap、HTTP 生命周期与健康检查
+│   ├── gatewayapp/                 配置/密钥/Store/bootstrap、HTTP 生命周期
+│   ├── api/                        生产 route spec、HTTP 根入口组装、健康检查
 │   ├── catalog/                    /v1/models 列表、详情与模型元数据
 │   ├── usage/                      异步用量落库、扣费、关停 drain
 │   ├── billing/                    纯计价与余额预检策略
