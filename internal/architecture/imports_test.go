@@ -173,6 +173,33 @@ func checkRules(packages map[string]packageImports) []string {
 			},
 			message: "dataplane 只做请求转发策略，不得依赖管理面、HTTP 服务器装配或进程入口",
 		},
+		{
+			from: modulePath + "/internal/runtime",
+			forbid: []string{
+				modulePath + "/internal/admin",
+				modulePath + "/internal/server",
+				modulePath + "/internal/dataplane",
+				modulePath + "/internal/catalog",
+				modulePath + "/internal/gatewayapp",
+				modulePath + "/cmd/gateway",
+			},
+			message: "runtime 只负责池与快照重建，不得依赖 HTTP 装配或进程入口",
+		},
+		{
+			from: modulePath + "/internal/catalog",
+			forbid: []string{
+				modulePath + "/internal/admin",
+				modulePath + "/internal/server",
+				modulePath + "/internal/gatewayapp",
+				modulePath + "/cmd/gateway",
+			},
+			message: "catalog 只负责模型目录响应，不得依赖管理面、HTTP 服务器装配或进程入口",
+		},
+		{
+			from:    modulePath + "/internal/gatewayapp",
+			forbid:  []string{modulePath + "/cmd/gateway"},
+			message: "gatewayapp 是库，不得反向依赖进程入口",
+		},
 	}
 
 	var violations []string
