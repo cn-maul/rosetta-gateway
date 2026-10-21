@@ -1,7 +1,6 @@
 package admin
 
 import (
-	"context"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -141,15 +140,11 @@ func TestUpdateUser_PromotesUserWithPassword(t *testing.T) {
 //
 // 旧实现 CreateUser/UpdateUser/DeleteUser 各自同步重建，失败即 500：
 // 库里的写已提交，而 AutoReload 对 >=400 的响应直接返回，既不审计也不
-// MarkDirty，后台兜底完全不触发，数据面继续按旧快照放行。此处钉住
-// 「handler 内零重建调用」—— 注入计数桩并断言一次都不被调。
+// MarkDirty，后台兜底完全不触发，数据面继续按旧快照放行。现在 handler
+// 在编译期根本没有 reload 依赖；本测试继续覆盖三类写操作本身可正常完成。
 func TestUserHandlers_DoNotRebuildInline(t *testing.T) {
 	st := newScopeStore(t)
-	reloads := 0
-	h := NewUserHandler(st, newTestManager(t)).WithReload(func(context.Context) error {
-		reloads++
-		return nil
-	})
+	h := NewUserHandler(st, newTestManager(t))
 	ctx := t.Context()
 	// 分组必须真实存在：带分组的 CreateUser 正是旧代码触发 handler 内重建的场景。
 	if err := st.CreateGroup(ctx, &store.Group{ID: "g1", Name: "dev"}); err != nil {
@@ -182,10 +177,6 @@ func TestUserHandlers_DoNotRebuildInline(t *testing.T) {
 		t.Fatalf("delete user = %d body=%s, want 200", rec.Code, rec.Body.String())
 	}
 
-	if reloads != 0 {
-		t.Errorf("reload was called %d time(s) inside handlers; rebuild ownership belongs to server.AutoReload "+
-			"(an inline failure would return 500 and skip its audit/MarkDirty fallback)", reloads)
-	}
 }
 
 // ---- 余额充值（delta_cents 相对调整）----
@@ -357,15 +348,10 @@ func TestAdjustBalance_RequiresAdmin(t *testing.T) {
 }
 
 // 余额变更**不**重建快照：预检与扣费都直接读库（store.BalanceOf）。
-// 在 handler 内重建只会白白多一次全量 RebuildFromDB，与「重建的唯一所有者
-// 是 AutoReload」同源的原则一致。
+// handler 不再持有 reload 依赖，因此这条约束由类型边界而不是注入桩保证。
 func TestAdjustBalance_DoesNotRebuildInline(t *testing.T) {
 	st := newScopeStore(t)
-	reloads := 0
-	h := NewUserHandler(st, newTestManager(t)).WithReload(func(context.Context) error {
-		reloads++
-		return nil
-	})
+	h := NewUserHandler(st, newTestManager(t))
 	mkBalanceUser(t, st, "u1", 0, false)
 
 	rec := httptest.NewRecorder()
@@ -373,9 +359,5 @@ func TestAdjustBalance_DoesNotRebuildInline(t *testing.T) {
 		strings.NewReader(`{"delta_cents":100}`))), "u1")
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d body=%s, want 200", rec.Code, rec.Body.String())
-	}
-	if reloads != 0 {
-		t.Errorf("reload called %d time(s); balance is read from the DB on the hot path, "+
-			"so a snapshot rebuild here is pure overhead", reloads)
 	}
 }
