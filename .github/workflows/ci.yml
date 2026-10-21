@@ -111,6 +111,11 @@ jobs:
             exit 1
           fi
 
+      # 依赖方向是架构约束里最容易在重构中回退的一类：代码能编译、测试也绿，
+      # 但 admin 又 import 回 server。单独一步让失败原因一眼可见。
+      - name: 架构依赖方向
+        run: go test ./internal/architecture -count=1
+
       - name: Build 与 Vet
         run: |
           go build ./...

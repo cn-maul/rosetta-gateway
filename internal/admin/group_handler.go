@@ -7,8 +7,8 @@ import (
 	"sort"
 	"strings"
 
+	"github.com/cn-maul/rosetta-gateway/internal/identity"
 	"github.com/cn-maul/rosetta-gateway/internal/routing"
-	"github.com/cn-maul/rosetta-gateway/internal/server"
 	"github.com/cn-maul/rosetta-gateway/internal/snapshot"
 	"github.com/cn-maul/rosetta-gateway/internal/store"
 )
@@ -21,7 +21,7 @@ import (
 // 这条边界是刻意的：把「看得见什么」与「能用多少」混在一个配置项里，
 // 会让「我只是想给这组人换个模型清单」顺手改掉额度。
 //
-// 全部端点都是 admin-only（由 server.AdminGateGuard 的前缀白名单挡住普通用户）。
+// 全部端点都是 admin-only（由 internal/access 的精确路由白名单挡住普通用户）。
 
 // groupResponse 是分组对外的表示。
 type groupResponse struct {
@@ -291,7 +291,7 @@ func (h *GroupHandler) SetModels(w http.ResponseWriter, r *http.Request, id stri
 // restricted 字段告诉前端「这份清单是全集还是已经被组收窄过」，
 // 避免界面把过滤后的清单当成全集展示。
 func (h *GroupHandler) ModelNames(w http.ResponseWriter, r *http.Request) {
-	me := server.UserFromContext(r.Context())
+	me := identity.UserFromContext(r.Context())
 	if me == nil {
 		writeError(w, http.StatusUnauthorized, "需要登录")
 		return

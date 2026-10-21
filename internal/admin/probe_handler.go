@@ -7,8 +7,8 @@ import (
 	"time"
 
 	"github.com/cn-maul/rosetta-gateway/internal/config"
+	"github.com/cn-maul/rosetta-gateway/internal/identity"
 	"github.com/cn-maul/rosetta-gateway/internal/probe"
-	"github.com/cn-maul/rosetta-gateway/internal/server"
 	"github.com/cn-maul/rosetta-gateway/internal/snapshot"
 	"github.com/cn-maul/rosetta-gateway/internal/store"
 )
@@ -74,7 +74,7 @@ type modelHealthResponse struct {
 //
 // # 按身份收窄（2026-10-14 页面合并）
 //
-// 现在普通用户也读这个端点（已进 server.userAccessibleRoutes），因此必须
+// 现在普通用户也读这个端点（已进 internal/access 白名单），因此必须
 // 与 model-names 一样**按组白名单收窄**：他只该看到自己够得着的模型有多通。
 //
 // 收窄必须**同时作用在摘要与时间轴两个端点**上，否则时间轴会成为绕过
@@ -130,7 +130,7 @@ func (h *ProbeHandler) Models(w http.ResponseWriter, r *http.Request) {
 //
 // 第二返回值 false 表示未登录，调用方必须自己写 401 并直接返回。
 func (h *ProbeHandler) allowedModelIDs(r *http.Request) (map[string]bool, bool) {
-	me := server.UserFromContext(r.Context())
+	me := identity.UserFromContext(r.Context())
 	// 空 ID **不**当 admin（fail-closed），与 model-names 同一口径。
 	if me == nil || me.ID == "" {
 		return nil, false

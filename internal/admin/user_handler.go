@@ -10,7 +10,9 @@ import (
 	"sync"
 	"time"
 
-	"github.com/cn-maul/rosetta-gateway/internal/server"
+	"github.com/cn-maul/rosetta-gateway/internal/guard"
+	"github.com/cn-maul/rosetta-gateway/internal/httpx"
+	"github.com/cn-maul/rosetta-gateway/internal/identity"
 	"github.com/cn-maul/rosetta-gateway/internal/store"
 	"github.com/cn-maul/rosetta-gateway/internal/userauth"
 )
@@ -31,7 +33,7 @@ type UserHandler struct {
 	// mu 保护它：登录端点是并发入口，裸读裸写会造出多个限速器，
 	// 等于把限速打散成「每请求一个」—— 那就等于没有限速。
 	mu  sync.Mutex
-	thr *server.FailureThrottle
+	thr *guard.FailureThrottle
 	// pwThr 是**改密专用**的限速器，按用户 ID 而非 IP 归键。
 	//
 	// 为什么与登录限速分开：登录限速按 IP，保护的是「猜密码」；
@@ -41,7 +43,7 @@ type UserHandler struct {
 	//
 	// 不用另一个 mu：pwThr 只在 ChangePassword 里用，那是低频端点，
 	// 但仍可能并发（前端重复提交），故复用同一把mu 取惰性初始化。
-	pwThr *server.FailureThrottle
+	pwThr *guard.FailureThrottle
 	// loginThr 是登录的**账号维度**限速器，按「用户名」归键（2026-10-12，
 	// 修 P1-5）。
 	//
@@ -62,12 +64,12 @@ type UserHandler struct {
 	//
 	// 成功登录才清零（Success 而非仅 Fail 计数）：这样合法用户输错几次后
 	// 仍能靠一次正确登录把额度还回来，不会因为累积的错输被永久卡住。
-	loginThr *server.FailureThrottle
+	loginThr *guard.FailureThrottle
 }
 
 // loginAccountFailLimit / loginAccountCooldown 是账号维度限速的阈值。
 //
-// 刻意比 IP 维度（server.LoginFailLimit = 10）严：这一维直接锁「某一个
+// 刻意比 IP 维度（guard.LoginFailLimit = 10）严：这一维直接锁「某一个
 // 账号」，是挡住「换 IP 打同一账号」的最后一道闸，宽松就失去意义。
 // 5 次足以拦下脚本化爆破，同时给「连续手滑」留了余量。
 const (
@@ -86,11 +88,11 @@ const (
 )
 
 // throttleForPassword 按用户 ID 取改密限速器（惰性构造）。
-func (h *UserHandler) throttleForPassword() *server.FailureThrottle {
+func (h *UserHandler) throttleForPassword() *guard.FailureThrottle {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	if h.pwThr == nil {
-		h.pwThr = server.NewFailureThrottle(
+		h.pwThr = guard.NewFailureThrottle(
 			passwordChangeThrottleLimit, passwordChangeThrottleCooldown)
 	}
 	return h.pwThr
@@ -160,7 +162,7 @@ func (h *UserHandler) SessionStatus(w http.ResponseWriter, r *http.Request) {
 //
 // 失败原因**刻意不细分**（「用户不存在」vs「密码错误」都回同一句话）——
 // 细分等于给攻击者一个枚举用户名的 oracle。限速按来源 IP 做（复用
-// server.FailureThrottle），对策是拖慢而非完全阻止。
+// guard.FailureThrottle），对策是拖慢而非完全阻止。
 func (h *UserHandler) Login(w http.ResponseWriter, r *http.Request) {
 	if !h.mgr.Enabled() {
 		writeError(w, http.StatusServiceUnavailable,
@@ -194,7 +196,7 @@ func (h *UserHandler) Login(w http.ResponseWriter, r *http.Request) {
 	// 任一不过即 429。两边都 Allow 才继续，且两边都要 Release 归还并发额度。
 	th := h.throttle()
 	accThr := h.accountThrottle()
-	ip := server.ClientIPOf(r)
+	ip := httpx.ClientIPOf(r)
 	if th != nil && !th.Allow(ip) {
 		writeTooMany(w, th.RetryAfter(ip))
 		return
@@ -286,15 +288,15 @@ func (h *UserHandler) Login(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if th != nil {
-		th.Success(server.ClientIPOf(r))
+		th.Success(httpx.ClientIPOf(r))
 	}
 	// 账号维度同样清零：合法用户输错几次后，靠一次正确登录把额度还回来。
 	// 不清零的话，累积的偶发错输会把他永久卡在冷却里（账号维度不换 IP 就躲不掉）。
 	if accThr != nil {
 		accThr.Success(username)
 	}
-	server.TouchLogin(h.store, r.Context(), u.ID)
-	server.SetSessionCookie(w, token, exp, server.SessionCookieSecure(r))
+	identity.TouchLogin(h.store, r.Context(), u.ID)
+	identity.SetSessionCookie(w, token, exp, httpx.SessionCookieSecure(r))
 
 	writeJSON(w, http.StatusOK, loginResponse{
 		Token:           token,
@@ -317,11 +319,11 @@ const dummyHash = "pbkdf2-sha256$210000$AAAAAAAAAAAAAAAAAAAAAA==$AAAAAAAAAAAAAAA
 //
 // 限速状态必须**跨请求**保持，所以它挂在 handler 上而不是 context 上 ——
 // 每个请求新建一个限速器等于没有限速。
-func (h *UserHandler) throttle() *server.FailureThrottle {
+func (h *UserHandler) throttle() *guard.FailureThrottle {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	if h.thr == nil {
-		h.thr = server.NewFailureThrottle(server.LoginFailLimit, server.LoginCooldown)
+		h.thr = guard.NewFailureThrottle(guard.LoginFailLimit, guard.LoginCooldown)
 	}
 	return h.thr
 }
@@ -337,11 +339,11 @@ func (h *UserHandler) throttle() *server.FailureThrottle {
 // （NAT 池 / 云主机 / 代理池），IP 维度的额度会被放大成
 // 10 × 出口 IP 数 次/分钟 —— 而 PBKDF2 210k 迭代只能把单次尝试拖慢
 // 几十毫秒，撑不住这个量级的并行爆破。账号维度对换 IP 免疫。
-func (h *UserHandler) accountThrottle() *server.FailureThrottle {
+func (h *UserHandler) accountThrottle() *guard.FailureThrottle {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	if h.loginThr == nil {
-		h.loginThr = server.NewFailureThrottle(loginAccountFailLimit, loginAccountCooldown)
+		h.loginThr = guard.NewFailureThrottle(loginAccountFailLimit, loginAccountCooldown)
 	}
 	return h.loginThr
 }
@@ -490,8 +492,8 @@ func (h *UserHandler) BootstrapSetup(w http.ResponseWriter, r *http.Request) {
 	// 引导窗口是「无凭据可校验」时开的，必须防跨站抢注 —— 与
 	// password/set 当年的同源判定同理由。放在最前面：不同源的请求
 	// 连查库都不该做。
-	if !server.SameOrigin(r) {
-		server.WriteForbidden(w)
+	if !httpx.SameOrigin(r) {
+		httpx.WriteForbidden(w)
 		return
 	}
 
@@ -535,7 +537,7 @@ func (h *UserHandler) BootstrapSetup(w http.ResponseWriter, r *http.Request) {
 	// 限速与登录端点同源：引导接口也是无凭据的写入口。
 	th := h.throttle()
 	if th != nil {
-		ip := server.ClientIPOf(r)
+		ip := httpx.ClientIPOf(r)
 		if !th.Allow(ip) {
 			writeTooMany(w, th.RetryAfter(ip))
 			return
@@ -578,7 +580,7 @@ func (h *UserHandler) BootstrapSetup(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if th != nil {
-		th.Success(server.ClientIPOf(r))
+		th.Success(httpx.ClientIPOf(r))
 	}
 
 	// 重新读一次：SetUserPassword 已递增 auth_version，签发的令牌
@@ -596,8 +598,8 @@ func (h *UserHandler) BootstrapSetup(w http.ResponseWriter, r *http.Request) {
 		writeServerError(w, "bootstrap setup: issue token", err)
 		return
 	}
-	server.TouchLogin(h.store, r.Context(), fresh.ID)
-	server.SetSessionCookie(w, token, exp, server.SessionCookieSecure(r))
+	identity.TouchLogin(h.store, r.Context(), fresh.ID)
+	identity.SetSessionCookie(w, token, exp, httpx.SessionCookieSecure(r))
 	writeJSON(w, http.StatusOK, loginResponse{
 		Token:     token,
 		ExpiresAt: exp.UnixMilli(),
@@ -628,7 +630,7 @@ func (h *UserHandler) BootstrapSetup(w http.ResponseWriter, r *http.Request) {
 // 代价：同一账号的所有设备都被踢下线。对管理后台这是期望行为 —— 用户
 // 显式点了「登出」，语义就该是「这个身份不再可用」。
 func (h *UserHandler) Logout(w http.ResponseWriter, r *http.Request) {
-	if u := server.UserFromContext(r.Context()); u != nil && u.ID != "" {
+	if u := identity.UserFromContext(r.Context()); u != nil && u.ID != "" {
 		if err := h.store.BumpAuthVersion(r.Context(), u.ID); err != nil {
 			// 审计 A7-03：吊销失败时不可回 200。客户端（网页与脚本）都会把
 			// 2xx 当成「服务端已作废全部会话」，但复制出去的 Bearer token
@@ -640,7 +642,7 @@ func (h *UserHandler) Logout(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	server.ClearSessionCookie(w)
+	identity.ClearSessionCookie(w)
 	writeJSON(w, http.StatusOK, map[string]string{
 		"status":  "ok",
 		"message": "已登出",
@@ -649,7 +651,7 @@ func (h *UserHandler) Logout(w http.ResponseWriter, r *http.Request) {
 
 // Me 返回当前登录用户的信息。
 func (h *UserHandler) Me(w http.ResponseWriter, r *http.Request) {
-	u := server.UserFromContext(r.Context())
+	u := identity.UserFromContext(r.Context())
 	if u == nil {
 		writeError(w, http.StatusUnauthorized, "需要登录")
 		return

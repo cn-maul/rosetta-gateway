@@ -7,7 +7,7 @@ import (
 	"net/http"
 	"strconv"
 
-	"github.com/cn-maul/rosetta-gateway/internal/server"
+	"github.com/cn-maul/rosetta-gateway/internal/identity"
 	"github.com/cn-maul/rosetta-gateway/internal/store"
 )
 
@@ -170,7 +170,7 @@ func (h *StatsHandler) Get(w http.ResponseWriter, r *http.Request) { // from/to 
 	// 身份快照，不带会随扣费变化的字段（user_handler.Me 对余额的处理是
 	// 同一个理由，见那里的注释）。用快照会让余数恒为 0 ——
 	// 而那正是这个字段存在的全部意义。
-	if me := server.UserFromContext(r.Context()); me != nil && me.ID != "" {
+	if me := identity.UserFromContext(r.Context()); me != nil && me.ID != "" {
 		cents, limited, berr := h.store.BalanceOf(r.Context(), me.ID)
 		switch {
 		case berr != nil:
@@ -202,7 +202,7 @@ func (h *StatsHandler) Get(w http.ResponseWriter, r *http.Request) { // from/to 
 	//
 	// 读失败按余额的同一口径处理：只记 WARN，字段留 0。quota_tokens=0 在前端
 	// 恰好是「不限」的既有语义，所以失败时表现为「不限」而不是一个错的配额数。
-	if me := server.UserFromContext(r.Context()); me != nil && me.ID != "" {
+	if me := identity.UserFromContext(r.Context()); me != nil && me.ID != "" {
 		quota, used, qerr := h.store.UserQuotaAndUsed(r.Context(), me.ID)
 		if qerr == nil {
 			resp.QuotaTokens = quota

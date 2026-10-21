@@ -1,14 +1,13 @@
 package admin
 
 import (
-	"context"
 	"encoding/json"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"testing"
 
-	"github.com/cn-maul/rosetta-gateway/internal/server"
+	"github.com/cn-maul/rosetta-gateway/internal/identity"
 	"github.com/cn-maul/rosetta-gateway/internal/store"
 )
 
@@ -35,7 +34,7 @@ func jsonRequest(method, target string, body io.Reader) *http.Request {
 //
 // # 为什么需要它
 //
-// 多用户改造后，管理端 handler 全部通过 server.UserFromContext 判定权限：
+// 多用户改造后，管理端 handler 全部通过 identity.UserFromContext 判定权限：
 // 拿不到身份时 usage 过滤会加上「不可能匹配任何行」的哨兵条件
 // （callerScope 的设计），key 的增删改则直接 401。
 //
@@ -53,7 +52,7 @@ func asAdmin(r *http.Request) *http.Request {
 // 否则测的是「管理员改别人」而不是「管理员改自己」，防护不会触发 ——
 // 那样测试会假通过，而防护实际是坏的。
 func asAdminID(r *http.Request, id string) *http.Request {
-	ctx := context.WithValue(r.Context(), server.UserCtxKey(), &store.User{
+	ctx := identity.WithUser(r.Context(), &store.User{
 		ID: id, Username: id,
 		Role: store.RoleAdmin, Status: store.UserStatusActive, AuthVersion: 1,
 	})
@@ -62,7 +61,7 @@ func asAdminID(r *http.Request, id string) *http.Request {
 
 // asUser 给请求注入一个普通用户身份（用于验证作用域收窄）。
 func asUser(r *http.Request, id string) *http.Request {
-	ctx := context.WithValue(r.Context(), server.UserCtxKey(), &store.User{
+	ctx := identity.WithUser(r.Context(), &store.User{
 		ID: id, Username: id,
 		Role: store.RoleUser, Status: store.UserStatusActive, AuthVersion: 1,
 	})

@@ -11,7 +11,7 @@ import (
 	"time"
 
 	"github.com/cn-maul/rosetta-gateway/internal/config"
-	"github.com/cn-maul/rosetta-gateway/internal/server"
+	"github.com/cn-maul/rosetta-gateway/internal/identity"
 	"github.com/cn-maul/rosetta-gateway/internal/store"
 )
 
@@ -179,7 +179,7 @@ func usageFilter(from, to int64, explicit bool, q url.Values, scopeUserID string
 // 为什么不从 query参数里读 ?user_id=：那等于任何普通用户都能
 // 传别人的 id 来看数据。作用域只能由**服务端**根据会话身份判定。
 func callerScope(r *http.Request) string {
-	me := server.UserFromContext(r.Context())
+	me := identity.UserFromContext(r.Context())
 	if me == nil {
 		// 没有身份：给一个不可能匹配任何行的哨兵值。
 		// 刻意**不返回空串**（那是 admin 语义），否则未鉴权请求会看到全量。

@@ -8,6 +8,8 @@ import (
 	"strconv"
 	"testing"
 	"time"
+
+	"github.com/cn-maul/rosetta-gateway/internal/httpx"
 )
 
 // TestFailureThrottleAccumulates 钉住一个真实踩过的坑：计数必须能累加到阈值。
@@ -197,7 +199,7 @@ func TestClientIPIgnoresForwardedFor(t *testing.T) {
 	req := httptest.NewRequest(http.MethodGet, "/admin/api/stats", nil)
 	req.RemoteAddr = "198.51.100.6:9999"
 	req.Header.Set("X-Forwarded-For", "1.2.3.4")
-	if got := clientIP(req); got != "198.51.100.6" {
+	if got := httpx.ClientIPOf(req); got != "198.51.100.6" {
 		t.Fatalf("clientIP = %q，不应采信 X-Forwarded-For", got)
 	}
 }
@@ -215,7 +217,7 @@ func clientIPThroughTrustedProxy(t *testing.T, remote string, headers map[string
 	}
 	var got string
 	WithTrustedProxies(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		got = clientIP(r)
+		got = httpx.ClientIPOf(r)
 	}), parsed).ServeHTTP(httptest.NewRecorder(), req)
 	return got
 }

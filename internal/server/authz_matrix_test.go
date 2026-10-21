@@ -5,8 +5,8 @@ package server_test
 // # 为什么这个文件在 internal/server 而不是 internal/admin
 //
 // 本文件是 package server_test —— **外部测试包**。它在 internal/server 目录下，
-// 却能 import internal/admin（admin → server 是单向依赖，外部测试包不构成
-// 环，已实测确认）。这一点是本文件能存在的前提：
+// 却能 import internal/admin（外部测试包不参与 server 的生产依赖，admin 也不
+// 再反向依赖 server）。这一点是本文件能存在的前提：
 //
 //   - internal/admin 的测试（package admin）拿不到 server 包的私有 context key，
 //     所以那边的测试只能**直接调 handler**、身份靠 asUser/asAdmin 手工注入 ——
@@ -49,6 +49,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/cn-maul/rosetta-gateway/internal/access"
 	"github.com/cn-maul/rosetta-gateway/internal/admin"
 	"github.com/cn-maul/rosetta-gateway/internal/auth"
 	"github.com/cn-maul/rosetta-gateway/internal/server"
@@ -546,55 +547,13 @@ func itoa(n int) string {
 	return string(b)
 }
 
-// isWhitelisted 镜像 server.userAccessibleRoutes —— 按「方法 + 路由模式」精确判定。
+// isWhitelisted 直接调用生产白名单，不再维护跨包镜像。
 //
-// # 2026-10-10：从前缀镜像改成精确镜像
-//
-// 原实现镜像的是一串前缀，用 HasPrefix 判定。现在生产侧已改成精确路由匹配
-// （见 userAccessibleRoutes 的注释：前缀会**自动放行该子树下未来新增的一切
-// 端点**，/usage/by-user 就是这么静默落进来的），所以镜像也必须跟着改 ——
-// 否则这个测试自己就成了过时假设的守护者。
-//
-// 传的是 `mux.Handler(r)` 返回的**注册模式**（如 `PATCH /admin/api/keys/{id}`），
-// 不是请求的原始路径。这与生产判定完全一致。
-//
-// 仍然是**跨包镜像**：那个表是包私有变量，拿不到，只能镜像。若有人改了它，
-// 本文件的镜像会与实际不符 —— 那正是下面
-// TestAuthzMatrix_WhitelistMirrorIsAccurate 要钉住的（它用实测校验镜像）。
+// 传的是 `mux.Handler(r)` 返回的注册模式（如 `PATCH /admin/api/keys/{id}`），
+// 不是请求的原始路径。白名单移到 internal/access 后已经是导出能力，
+// 测试继续手抄一份只会制造第二个真相。
 func isWhitelisted(pattern string) bool {
-	for _, p := range []string{
-		"GET /admin/api/keys",
-		"POST /admin/api/keys",
-		"PATCH /admin/api/keys/{id}",
-		"DELETE /admin/api/keys/{id}",
-		"POST /admin/api/keys/{id}/recompute-usage",
-
-		"GET /admin/api/usage",
-		"GET /admin/api/usage/by-key",
-		"GET /admin/api/usage/by-model",
-		"GET /admin/api/usage/by-provider",
-		"GET /admin/api/usage/by-day",
-		"GET /admin/api/usage/history",
-		"GET /admin/api/usage/history.csv",
-		"GET /admin/api/stats",
-
-		"GET /admin/api/me",
-		"POST /admin/api/me/password",
-		"GET /admin/api/topups",
-		"POST /admin/api/logout",
-		"GET /admin/api/model-names",
-		// 连通率（2026-10-14 页面合并）：与「可用模型」并到同一张卡片后，
-		// 普通用户也要读得到自己够得着的那些模型的探测结果。两个 handler
-		// 都已按组白名单收窄到「组内公开名的主目标模型」，交集为空时返回
-		// 空集而不是全集（见 admin/probe_handler_test.go 的钉桩）。
-		"GET /admin/api/probes/models",
-		"GET /admin/api/probes/timeline",
-	} {
-		if pattern == p {
-			return true
-		}
-	}
-	return false
+	return access.Allowed(pattern)
 }
 
 // TestAuthzMatrix_WhitelistMirrorIsAccurate 钉住上面那份镜像与真实白名单一致。

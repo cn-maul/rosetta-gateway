@@ -10,6 +10,8 @@ import (
 	"sort"
 	"strings"
 	"time"
+
+	"github.com/cn-maul/rosetta-gateway/internal/httpx"
 )
 
 // statusGetter 由 Middleware 的 statusResponseWriter 实现，AutoReload 用它读
@@ -113,7 +115,7 @@ func AutoReload(next http.Handler, reload func(context.Context) error, audit Wri
 			return
 		}
 		if audit != nil {
-			audit(r.Method, p, status, clientIP(r), auditFields)
+			audit(r.Method, p, status, httpx.ClientIPOf(r), auditFields)
 		}
 		if isBootstrap || status >= http.StatusBadRequest {
 			return
@@ -235,6 +237,6 @@ func AuditOnly(next http.Handler, audit WriteAuditor) http.Handler {
 		// 审计 A7-15：bootstrap 的成功和失败都要留痕。失败意味着有人在猜
 		// 管理员密码或重复尝试初始化，是安全事件而不是「没有状态变化就忽略」
 		// 的普通写失败。旧实现的 status < 400 让 403/409 全部消失。
-		audit(r.Method, r.URL.Path, sw.StatusCode(), clientIP(r), fields)
+		audit(r.Method, r.URL.Path, sw.StatusCode(), httpx.ClientIPOf(r), fields)
 	})
 }

@@ -8,7 +8,7 @@ import (
 	"strings"
 
 	"github.com/cn-maul/rosetta-gateway/internal/crypto"
-	"github.com/cn-maul/rosetta-gateway/internal/server"
+	"github.com/cn-maul/rosetta-gateway/internal/identity"
 	"github.com/cn-maul/rosetta-gateway/internal/snapshot"
 	"github.com/cn-maul/rosetta-gateway/internal/store"
 )
@@ -101,10 +101,10 @@ type keyCreateResponse struct {
 // 就等于拿到了同事的 key_prefix、已用量、以及名字里可能带的项目代号。
 //
 // 所以：admin 看全部，普通用户只看自己的。
-// 这个过滤**不靠调用方自觉** —— 它由中间件注入的 server.UserFromContext 决定，
+// 这个过滤**不靠调用方自觉** —— 它由中间件注入的 identity.UserFromContext 决定，
 // 漏写在这里等于数据泄露。
 func (h *KeyHandler) List(w http.ResponseWriter, r *http.Request) {
-	me := server.UserFromContext(r.Context())
+	me := identity.UserFromContext(r.Context())
 	var keys []store.AccessKey
 	var err error
 	if me != nil && !me.IsAdmin() {
@@ -152,7 +152,7 @@ func (h *KeyHandler) Create(w http.ResponseWriter, r *http.Request) {
 	// 身份缺失一律 401：不靠「拿不到身份就当普通用户」来兜底 ——
 	// 那会让匿名请求走到封顶逻辑之外。
 
-	me := server.UserFromContext(r.Context())
+	me := identity.UserFromContext(r.Context())
 	if me == nil || me.ID == "" {
 		// 与 ownedByCaller 同一口径：空 ID 绝不放行（fail-closed）。
 		// 走这个分支意味着中间件没注入身份，此时若继续执行，归属会被
@@ -377,7 +377,7 @@ func (h *KeyHandler) applyP2(w http.ResponseWriter, r *http.Request, req keyRequ
 // guardNoLoosening 的「只能收紧」守卫。**建 key 本身不再用它判定** ——
 // 自助建 key 已对所有登录用户开放，归属一律是自己（见 Create）。
 func callerIsAdmin(r *http.Request) bool {
-	me := server.UserFromContext(r.Context())
+	me := identity.UserFromContext(r.Context())
 	return me != nil && me.IsAdmin()
 }
 
@@ -512,7 +512,7 @@ func ipAllowlistWidened(old, new string) string {
 // 注意**无归属 key（UserID 为空）对普通用户是不可见的**：
 // 放行等于让任何登录用户接管一把不属于任何人的 key。
 func (h *KeyHandler) ownedByCaller(w http.ResponseWriter, r *http.Request, k *store.AccessKey) bool {
-	me := server.UserFromContext(r.Context())
+	me := identity.UserFromContext(r.Context())
 	if me == nil {
 		writeError(w, http.StatusUnauthorized, "需要登录")
 		return false
@@ -637,7 +637,7 @@ func (h *KeyHandler) Update(w http.ResponseWriter, r *http.Request, id string) {
 	claimTo := ""
 	claim := false
 	if req.UserID != nil {
-		if me := server.UserFromContext(r.Context()); me != nil && me.IsAdmin() {
+		if me := identity.UserFromContext(r.Context()); me != nil && me.IsAdmin() {
 			claimTo = strings.TrimSpace(*req.UserID)
 			claim = true
 			if claimTo != "" {

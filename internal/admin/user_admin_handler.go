@@ -8,7 +8,7 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/cn-maul/rosetta-gateway/internal/server"
+	"github.com/cn-maul/rosetta-gateway/internal/identity"
 	"github.com/cn-maul/rosetta-gateway/internal/store"
 	"github.com/cn-maul/rosetta-gateway/internal/userauth"
 )
@@ -156,7 +156,7 @@ func toUserResponse(u *store.User, selfID string, keyCount int) userResponse {
 // 变成真实的越权路径，而且方向恰好是最危险的那一种 —— 静默放行。
 // 统一为 403 后，闸门由本函数自己保证，与全仓口径一致。
 func requireAdmin(w http.ResponseWriter, r *http.Request) (*store.User, bool) {
-	u := server.UserFromContext(r.Context())
+	u := identity.UserFromContext(r.Context())
 	if u == nil {
 		writeError(w, http.StatusUnauthorized, "需要登录")
 		return nil, false
@@ -182,7 +182,7 @@ func (h *UserHandler) ListUsers(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	self := ""
-	if u := server.UserFromContext(ctx); u != nil {
+	if u := identity.UserFromContext(ctx); u != nil {
 		self = u.ID
 	}
 	out := make([]userResponse, 0, len(users))
@@ -408,7 +408,7 @@ func (h *UserHandler) UpdateUser(w http.ResponseWriter, r *http.Request, id stri
 
 	// self 标记用于阻止「管理员把自己降级/禁用」这类把自己锁死的操作。
 	// 唯一的自锁出口是另一个管理员 —— 局域网小团队里这够用。
-	self := server.UserFromContext(ctx)
+	self := identity.UserFromContext(ctx)
 	isSelf := self != nil && self.ID == id
 
 	bumpVersion := false
@@ -523,7 +523,7 @@ func (h *UserHandler) DeleteUser(w http.ResponseWriter, r *http.Request, id stri
 	if _, ok := requireAdmin(w, r); !ok {
 		return
 	}
-	self := server.UserFromContext(r.Context())
+	self := identity.UserFromContext(r.Context())
 	if self != nil && self.ID == id {
 		writeError(w, http.StatusBadRequest, "不能删除自己的账号")
 		return
@@ -777,7 +777,7 @@ type topupRecordOut struct {
 // 渲染成「你没有充值记录」，把一次鉴权故障伪装成正常状态。引导态合成 user
 // （ID 为空）同理 —— 它没有真实身份，它的「充值记录」无从谈起。
 func (h *UserHandler) ListTopups(w http.ResponseWriter, r *http.Request) {
-	me := server.UserFromContext(r.Context())
+	me := identity.UserFromContext(r.Context())
 	if me == nil || me.ID == "" {
 		writeError(w, http.StatusUnauthorized, "需要登录")
 		return
@@ -859,7 +859,7 @@ type changePasswordRequest struct {
 // 必须验旧密码：否则一个拿到会话 cookie 的人（比如XSS 后的临时凭据）
 // 可以把账号永久锁死 —— 受害者既不知道密码被改了，也没法改回来。
 func (h *UserHandler) ChangePassword(w http.ResponseWriter, r *http.Request) {
-	u := server.UserFromContext(r.Context())
+	u := identity.UserFromContext(r.Context())
 	if u == nil || u.ID == "" {
 		writeError(w, http.StatusUnauthorized, "需要登录")
 		return
@@ -919,7 +919,7 @@ func (h *UserHandler) ChangePassword(w http.ResponseWriter, r *http.Request) {
 	}
 	// 改密后自己这个会话也失效了（auth_version 已递增），
 	// 前端应跳回登录页。
-	server.ClearSessionCookie(w)
+	identity.ClearSessionCookie(w)
 	writeJSON(w, http.StatusOK, map[string]string{
 		"status":  "ok",
 		"message": "密码已更新，请重新登录",

@@ -10,11 +10,11 @@ package admin
 //
 // # 为什么第 1 条最重要
 //
-// 这个端点的路径落在 **/admin/api/usage** 前缀下，而那个前缀在
-// server.userAccessiblePrefixes 白名单里（普通用户要能读自己的用量）。
-// AdminGateGuard 是**前缀**匹配 —— 只要前缀在名单里就整体放行。
-// 也就是说：**白名单不会保护这个端点**，唯一的防线是 handler 内的
-// requireAdmin。漏掉它，任何一个普通用户打一次这个端点就能拿到
+// 这个端点的路径落在 **/admin/api/usage** 子树下，但网关层用的是精确路由
+// 白名单（internal/access），不会因为前缀命中就放行整棵子树。
+// 即便如此，handler 内的 requireAdmin 仍是必须的第二道防线：
+// 白名单和 handler 判定各写错一处时，不能互相兜底成越权。
+// 漏掉 requireAdmin，任何一个普通用户打一次这个端点就能拿到
 // 「每个同事的用户名 + 消费金额」，即全公司的账单。
 // 而漏掉它的表现是端点照常 200、没有任何报错 —— 静默越权，
 // 所以必须有一条测试钉住它。
@@ -27,10 +27,10 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
-	"strings"
 	"testing"
 	"time"
 
+	"github.com/cn-maul/rosetta-gateway/internal/access"
 	"github.com/cn-maul/rosetta-gateway/internal/store"
 )
 
@@ -128,38 +128,21 @@ func TestUsageByUser_RequiresAdmin(t *testing.T) {
 	}
 }
 
-// TestUsageByUser_PrefixWhitelistDoesNotProtectIt 是上面那条测试的**证据**：
-// 它走真实的 AdminGateGuard，证明「/admin/api/usage 前缀对普通用户是放行的」。
+// TestUsageByUser_GatewayWhitelistDoesNotProtectIt 是上面那条测试的**证据**：
+// 它直接查生产白名单，证明全站账单端点不在普通用户的可达集合里。
 //
 // # 为什么必须把这件事单独钉住
 //
 // 如果有人误以为「这个端点不需要 requireAdmin，因为 AdminGateGuard 会拦」，
 // 那是个**错误的前提**——而这条测试把这个前提的真实取值固定下来：
-// 白名单按前缀整体放行，所以网关层**不会**拦普通用户。
-//
-// 于是防线只剩 handler 里的 requireAdmin。两条测试合起来才构成完整论证：
-//  1. 本用例：网关层放行（白名单挡不住）；
+// 精确白名单里没有它，所以网关层会拦普通用户；handler 的 requireAdmin
+// 仍是第二道防线。两条测试合起来才构成完整论证：
+//  1. 本用例：网关层不放行；
 //  2. TestUsageByUser_RequiresAdmin：handler 拦住 → 403。
-//
-// 只留第 2 条的话，将来有人「优化」掉那个 requireAdmin 并改信网关层，
-// 不会有任何测试告诉他这个前提不成立。
-//
-// 注意这里用 server.AdminGateGuard 需要注入 server 包的私有 context key，
-// admin 包的测试拿不到 —— 所以这里**只断言前缀文本**：
-// /admin/api/usage/by-user 必须以白名单里的 /admin/api/usage 开头。
-// 这个断言足以钉住「前缀匹配会命中」，而且不引入跨包的私有依赖。
-func TestUsageByUser_PrefixWhitelistDoesNotProtectIt(t *testing.T) {
+func TestUsageByUser_GatewayWhitelistDoesNotProtectIt(t *testing.T) {
 	const path = "/admin/api/usage/by-user"
-	// 与 internal/server/user_auth.go 的 userAccessiblePrefixes 逐字对应。
-	// 那个列表是纯手写字符串，本测试是它的**跨包镜像**：一旦有人把
-	// /admin/api/usage 从白名单里删掉，这条会失败，提醒他同步检查
-	// 这里的安全性推理（届时网关层就会拦住普通用户，requireAdmin 变成
-	// 第二道防线而非唯一一道）。
-	const whitelistedPrefix = "/admin/api/usage"
-
-	if !strings.HasPrefix(path, whitelistedPrefix) {
-		t.Fatalf("%s 不再以 %s 开头：网关层的假设变了，"+
-			"请重新评估本端点的权限模型（见本用例注释）", path, whitelistedPrefix)
+	if access.Allowed("GET " + path) {
+		t.Fatal("全站账单端点不应在普通用户白名单里：网关层放行会把它变成越权入口")
 	}
 }
 

@@ -62,7 +62,7 @@ type usageByUserResponse struct {
 // # 必须 admin-only，且不能只靠路径白名单（与 Prune 同一个坑）
 //
 // 本路径落在 **/admin/api/usage** 前缀下，而那个前缀在
-// server.userAccessiblePrefixes 白名单里（普通用户要能读自己的用量）。
+// internal/access 的精确路由白名单里（普通用户要能读自己的用量）。
 // 白名单只保证「能进这个端点」，不保证「有权限」。这是一个**全站**口径的
 // 端点：它按用户分组、返回每个用户的消费金额与用户名 —— 一个普通用户拿到
 // 它就是看到了同事的账单（谁在用什么模型、花了公司多少钱）。

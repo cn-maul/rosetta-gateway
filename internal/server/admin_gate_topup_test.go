@@ -13,11 +13,11 @@ package server
 // 本文件钉住当前白名单的实际可达性，防止后续改动悄悄破坏它。
 
 import (
-	"context"
 	"net/http"
 	"net/http/httptest"
 	"testing"
 
+	"github.com/cn-maul/rosetta-gateway/internal/identity"
 	"github.com/cn-maul/rosetta-gateway/internal/store"
 )
 
@@ -47,7 +47,7 @@ func gate(t *testing.T, u *store.User, method, path, pattern string) (int, bool)
 
 	req := httptest.NewRequest(method, path, nil)
 	if u != nil {
-		req = req.WithContext(context.WithValue(req.Context(), userKey, u))
+		req = req.WithContext(identity.WithUser(req.Context(), u))
 	}
 	rec := httptest.NewRecorder()
 	AdminGateGuard(mux, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -144,7 +144,7 @@ func TestAdminGate_UnlistedRouteIsDeniedByDefault(t *testing.T) {
 	mux.HandleFunc("GET /admin/api/usage/future-admin-only", func(http.ResponseWriter, *http.Request) {})
 
 	req := httptest.NewRequest(http.MethodGet, "/admin/api/usage/future-admin-only", nil)
-	req = req.WithContext(context.WithValue(req.Context(), userKey, normal))
+	req = req.WithContext(identity.WithUser(req.Context(), normal))
 	rec := httptest.NewRecorder()
 	reached := false
 	AdminGateGuard(mux, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

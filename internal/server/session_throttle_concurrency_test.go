@@ -81,12 +81,12 @@ func TestSessionAuth_StillThrottlesAfterLimit(t *testing.T) {
 // 会话鉴权的限速器构造时就不带并发上限（NewUserAuth 的约定）。
 func TestSessionAuth_ThrottleHasNoConcurrencyCap(t *testing.T) {
 	a := newSessionGate(t)
-	if a.throttle.capConcurrent {
+	if a.throttle.ConcurrencyCapped() {
 		t.Fatal("会话鉴权的限速器不应施加并发上限（它不跑 KDF，只统计失败次数）")
 	}
 	// 登录端点的限速器仍然必须带上限。
 	th := NewFailureThrottle(1, time.Second)
-	if !th.capConcurrent {
+	if !th.ConcurrencyCapped() {
 		t.Fatal("默认构造的限速器必须施加并发上限（登录/改密路径要跑 KDF）")
 	}
 }
