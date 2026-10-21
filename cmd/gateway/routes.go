@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/cn-maul/rosetta-gateway/internal/admin"
+	"github.com/cn-maul/rosetta-gateway/internal/billinghttp"
 	"github.com/cn-maul/rosetta-gateway/internal/config"
 	"github.com/cn-maul/rosetta-gateway/internal/ratelimit"
 	"github.com/cn-maul/rosetta-gateway/internal/server"
@@ -136,12 +137,12 @@ func buildApp(d routeDeps) *gatewayApp {
 	// 单模型详情：外部工具（Cherry Studio / LobeChat / 各类网关面板）按
 	// OpenRouter/LiteLLM 约定读 context_length / max_output_tokens。
 	// 额度/费用查询（官方 usage/costs + 生态兼容 dashboard billing，见 billing.go）
-	mux.HandleFunc("GET /dashboard/billing/subscription", billingSubscription(db))
-	mux.HandleFunc("GET /v1/dashboard/billing/subscription", billingSubscription(db))
-	mux.HandleFunc("GET /dashboard/billing/usage", billingUsage(db))
-	mux.HandleFunc("GET /v1/dashboard/billing/usage", billingUsage(db))
-	mux.HandleFunc("GET /v1/organization/costs", orgCosts(db))
-	mux.HandleFunc("GET /v1/organization/usage/completions", orgUsageCompletions(db))
+	mux.HandleFunc("GET /dashboard/billing/subscription", billinghttp.Subscription(db))
+	mux.HandleFunc("GET /v1/dashboard/billing/subscription", billinghttp.Subscription(db))
+	mux.HandleFunc("GET /dashboard/billing/usage", billinghttp.Usage(db))
+	mux.HandleFunc("GET /v1/dashboard/billing/usage", billinghttp.Usage(db))
+	mux.HandleFunc("GET /v1/organization/costs", billinghttp.OrgCosts(db))
+	mux.HandleFunc("GET /v1/organization/usage/completions", billinghttp.OrgUsageCompletions(db))
 
 	mux.HandleFunc("GET /v1/models/{model}", handleGetModel(""))
 	mux.HandleFunc("GET /openai/v1/models/{model}", handleGetModel("openai"))

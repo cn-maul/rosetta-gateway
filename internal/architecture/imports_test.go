@@ -131,6 +131,27 @@ func checkRules(packages map[string]packageImports) []string {
 			},
 			message: "snapshot 只做运行时视图，不得依赖管理面/HTTP/进程入口",
 		},
+		{
+			from: modulePath + "/internal/usage",
+			forbid: []string{
+				modulePath + "/internal/admin",
+				modulePath + "/internal/server",
+				modulePath + "/internal/snapshot",
+				modulePath + "/cmd/gateway",
+			},
+			message: "usage 只负责落库/扣费，不得依赖管理面、HTTP 装配、全局快照或进程入口",
+		},
+		{
+			from: modulePath + "/internal/billing",
+			forbid: []string{
+				modulePath + "/internal/admin",
+				modulePath + "/internal/server",
+				modulePath + "/internal/snapshot",
+				modulePath + "/internal/usage",
+				modulePath + "/cmd/gateway",
+			},
+			message: "billing 是纯计价/预检策略，不得依赖 HTTP、全局快照、usage 状态机或进程入口",
+		},
 	}
 
 	var violations []string

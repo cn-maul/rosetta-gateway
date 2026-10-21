@@ -13,6 +13,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/cn-maul/rosetta-gateway/internal/billinghttp"
 	"github.com/cn-maul/rosetta-gateway/internal/routing"
 	"github.com/cn-maul/rosetta-gateway/internal/snapshot"
 	"github.com/cn-maul/rosetta-gateway/internal/store"
@@ -206,8 +207,8 @@ func TestOrgBucket_TimestampsAreUnixSeconds(t *testing.T) {
 	})
 
 	for name, h := range map[string]http.HandlerFunc{
-		"usage": orgUsageCompletions(db),
-		"costs": orgCosts(db),
+		"usage": billinghttp.OrgUsageCompletions(db),
+		"costs": billinghttp.OrgCosts(db),
 	} {
 		req := httptest.NewRequest(http.MethodGet, "/v1/organization/"+name+"?bucket_width=1d", nil)
 		req.Header.Set("Authorization", "Bearer "+testAccessKey)

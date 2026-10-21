@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/cn-maul/rosetta-gateway/internal/store"
+	"github.com/cn-maul/rosetta-gateway/internal/usage"
 )
 
 // 批量落库失败必须**不丢记录**（2026-10-12 修 P1-1）。
@@ -64,8 +65,11 @@ func newFlakyRecorder(t *testing.T, failTimes int32) (*usageRecorder, *store.Sto
 	// 素材要先落进去一部分，才能验「至少写了 N 条」；这里反过来：
 	// 我们要验的是「批量失败那批最终仍落库」，所以库里初始应为空。
 	var calls atomic.Int32
-	rec := newUsageRecorder(db, discardLogger())
-	rec.batchInsert = flakyInsert(db, failTimes, &calls)
+	rec := usage.New(usage.Config{
+		DB:          db,
+		Logger:      discardLogger(),
+		BatchInsert: flakyInsert(db, failTimes, &calls),
+	})
 	return rec, db, &calls
 }
 
@@ -76,12 +80,12 @@ func TestUsageFlush_瞬时失败重试后不丢记录(t *testing.T) {
 
 	const n = 5
 	for i := 0; i < n; i++ {
-		rec.record(shutdownTestRec(uniqueRecID("retry", i)))
+		rec.Record(shutdownTestRec(uniqueRecID("retry", i)))
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	if !rec.wait(ctx) {
+	if !rec.Wait(ctx) {
 		t.Error("wait 报未排空，但故障是瞬时的，应被重试救回")
 	}
 
@@ -103,13 +107,13 @@ func TestUsageFlush_整批持久失败降级为逐条(t *testing.T) {
 
 	const n = 4
 	for i := 0; i < n; i++ {
-		rec.record(shutdownTestRec(uniqueRecID("degrade", i)))
+		rec.Record(shutdownTestRec(uniqueRecID("degrade", i)))
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	// 降级成功 → 全部落库 → wait 应报干净。
-	rec.wait(ctx)
+	rec.Wait(ctx)
 
 	if got := countUsageRecords(t, db); got != n {
 		t.Errorf("降级逐条后落库 %d 条，期望 %d —— 整批失败不该连坐", got, n)
@@ -124,19 +128,18 @@ func TestUsageFlush_整批持久失败降级为逐条(t *testing.T) {
 func TestUsageFlush_关停未落干净必须报告(t *testing.T) {
 	// 批量永久失败，且让**单条也失败** —— 构造真正无法落库的场景。
 	// 做法：关掉 store，让所有写入都报错。
-	rec, _, _ := newFlakyRecorder(t, 1<<30)
-	dbClosed := rec.db
+	rec, dbClosed, _ := newFlakyRecorder(t, 1<<30)
 	if err := dbClosed.Close(); err != nil {
 		t.Fatalf("close store: %v", err)
 	}
 
 	for i := 0; i < 3; i++ {
-		rec.record(shutdownTestRec(uniqueRecID("lost", i)))
+		rec.Record(shutdownTestRec(uniqueRecID("lost", i)))
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
 	defer cancel()
-	clean := rec.wait(ctx)
+	clean := rec.Wait(ctx)
 	if clean {
 		t.Error("★ wait 报「已排空」，但记录一条都没落库 —— 这正是原来的静默丢失\n" +
 			"  关停流程据此会以为一切正常，日志上不会有任何痕迹")
@@ -159,13 +162,13 @@ func TestUsageFlush_连续失败不丢记录(t *testing.T) {
 	const perBatch = 3
 	for b := 0; b < batches; b++ {
 		for i := 0; i < perBatch; i++ {
-			rec.record(shutdownTestRec(uniqueRecID("multi", b*perBatch+i)))
+			rec.Record(shutdownTestRec(uniqueRecID("multi", b*perBatch+i)))
 		}
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
-	rec.wait(ctx)
+	rec.Wait(ctx)
 
 	want := batches * perBatch
 	if got := countUsageRecords(t, db); got != want {

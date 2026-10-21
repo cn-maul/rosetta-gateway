@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/cn-maul/rosetta-gateway/internal/admin"
+	"github.com/cn-maul/rosetta-gateway/internal/billinghttp"
 	"github.com/cn-maul/rosetta-gateway/internal/routing"
 	"github.com/cn-maul/rosetta-gateway/internal/server"
 	"github.com/cn-maul/rosetta-gateway/internal/snapshot"
@@ -140,7 +141,7 @@ func TestBillingEndpoints(t *testing.T) {
 	}
 
 	rec := httptest.NewRecorder()
-	billingSubscription(db)(rec, authedGet("/dashboard/billing/subscription"))
+	billinghttp.Subscription(db)(rec, authedGet("/dashboard/billing/subscription"))
 	var sub struct {
 		Object       string  `json:"object"`
 		HardLimitUSD float64 `json:"hard_limit_usd"`
@@ -155,7 +156,7 @@ func TestBillingEndpoints(t *testing.T) {
 	}
 
 	rec2 := httptest.NewRecorder()
-	billingUsage(db)(rec2, authedGet("/v1/dashboard/billing/usage"))
+	billinghttp.Usage(db)(rec2, authedGet("/v1/dashboard/billing/usage"))
 	var usage struct {
 		Object     string  `json:"object"`
 		TotalUsage float64 `json:"total_usage"`
@@ -190,7 +191,7 @@ func TestBillingEndpoints(t *testing.T) {
 		t.Fatalf("seed usage 2: %v", err)
 	}
 	rec3 := httptest.NewRecorder()
-	orgCosts(db)(rec3, authedGet("/v1/organization/costs?bucket_width=1d"))
+	billinghttp.OrgCosts(db)(rec3, authedGet("/v1/organization/costs?bucket_width=1d"))
 	var costs struct {
 		Object string `json:"object"`
 		Data   []struct {

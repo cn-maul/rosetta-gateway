@@ -1780,7 +1780,7 @@ func TestE2E_Adv2_DuplicateRequestIDChargesOnce(t *testing.T) {
 	// （本轮实测踩过：第一次写这个用例时两条记录 cost_total 都是 0，
 	// 于是「没扣两次」是因为「压根没扣」，测不到幂等）。
 	for i := range 2 {
-		rec.record(&store.UsageRecord{
+		rec.Record(&store.UsageRecord{
 			ID:          fmt.Sprintf("dup-%d", i),
 			AccessKeyID: "k1", UserID: testUserID,
 			PublicModel: "flash", ProviderID: "good", UpstreamModel: "good-model",
@@ -2229,7 +2229,7 @@ func TestE2E_Adv10_ConcurrentSameRequestIDChargesOnce(t *testing.T) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			rec.record(&store.UsageRecord{
+			rec.Record(&store.UsageRecord{
 				ID:          fmt.Sprintf("conc-%d", i),
 				AccessKeyID: "k1", UserID: testUserID,
 				PublicModel: "flash", ProviderID: "good", UpstreamModel: "good-model",

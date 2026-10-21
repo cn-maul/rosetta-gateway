@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/cn-maul/rosetta"
+	"github.com/cn-maul/rosetta-gateway/internal/billing"
 	"github.com/cn-maul/rosetta-gateway/internal/routing"
 	"github.com/cn-maul/rosetta-gateway/internal/server"
 	"github.com/cn-maul/rosetta-gateway/internal/snapshot"
@@ -320,32 +321,32 @@ func TestBalancePreflight_Boundary(t *testing.T) {
 		est, balance   int64
 		unlimited, exm bool
 		priced         bool
-		want           balanceVerdict
+		want           billing.Verdict
 	}{
-		{"刚好压线", 100, 100, false, false, true, balanceAllow},
-		{"差一分", 101, 100, false, false, true, balanceReject},
-		{"余额富余", 99, 100, false, false, true, balanceAllow},
-		{"不限额直接放行", 1 << 40, 0, true, false, true, balanceAllow},
-		{"管理员不受限", 1 << 40, 0, false, true, true, balanceAllow},
+		{"刚好压线", 100, 100, false, false, true, billing.Allow},
+		{"差一分", 101, 100, false, false, true, billing.Reject},
+		{"余额富余", 99, 100, false, false, true, billing.Allow},
+		{"不限额直接放行", 1 << 40, 0, true, false, true, billing.Allow},
+		{"管理员不受限", 1 << 40, 0, false, true, true, billing.Allow},
 		// 未配价（priced=false）→ 估出 0 → 本次真的不计费 → 放行，
 		// 且**不去比余额**。这一条钉住 Lead 的第二条口径：未配价模型不拒绝。
-		{"未配价不拒绝", 0, 0, false, false, false, balanceAllow},
+		{"未配价不拒绝", 0, 0, false, false, false, billing.Allow},
 		// 已配价但本次小到四舍五入成 0 分：仍须校验余额，否则「欠费用户
 		// 靠发足够小的请求就能一直用」，预检形同虚设。
-		{"已配价估算为0且余额为0", 0, 0, false, false, true, balanceReject},
+		{"已配价估算为0且余额为0", 0, 0, false, false, true, billing.Reject},
 		// 余额低于地板线（1 元）时不允许再靠 0 分请求消耗上游（2026-10-10 P2）。
 		// 修复前这里只判 >0，于是 1 分钱余额能白嫖无限多个 0 分请求。
-		{"已配价估算为0且余额1分", 0, 1, false, false, true, balanceReject},
-		{"已配价估算为0且余额99分", 0, 99, false, false, true, balanceReject},
-		{"已配价估算为0且余额刚好1元", 0, minSubcentSpendableCents, false, false, true, balanceAllow},
-		{"已配价估算为0且余额充足", 0, 5000, false, false, true, balanceAllow},
+		{"已配价估算为0且余额1分", 0, 1, false, false, true, billing.Reject},
+		{"已配价估算为0且余额99分", 0, 99, false, false, true, billing.Reject},
+		{"已配价估算为0且余额刚好1元", 0, billing.MinSubcentSpendableCents, false, false, true, billing.Allow},
+		{"已配价估算为0且余额充足", 0, 5000, false, false, true, billing.Allow},
 		// 余额 0 且估算 >0：必须拒。这是「一分钱都没有」的判定。
-		{"零余额", 1, 0, false, false, true, balanceReject},
+		{"零余额", 1, 0, false, false, true, billing.Reject},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			if got := balancePreflight(c.est, c.balance, c.unlimited, c.exm, c.priced); got != c.want {
-				t.Fatalf("balancePreflight(%d, %d, unlimited=%v, exempt=%v, priced=%v) = %v, want %v",
+			if got := billing.Preflight(c.est, c.balance, c.unlimited, c.exm, c.priced); got != c.want {
+				t.Fatalf("billing.Preflight(%d, %d, unlimited=%v, exempt=%v, priced=%v) = %v, want %v",
 					c.est, c.balance, c.unlimited, c.exm, c.priced, got, c.want)
 			}
 		})
@@ -366,7 +367,7 @@ func TestEstimateCost_UnpricedModelIsZero(t *testing.T) {
 		// MaxOutputTokens 有值也不该改变结论：没有单价就没有可乘的数。
 		{PriceInput: 0, PriceOutput: 0, PriceCacheHit: 0, MaxOutputTokens: 4096},
 	} {
-		if got := estimateBalanceCost(req, m); got != 0 {
+		if got := billing.EstimateBalanceCost(req, m); got != 0 {
 			t.Fatalf("未配价模型估出 %d 分，want 0（否则未配价部署会被误拒）", got)
 		}
 	}
@@ -401,8 +402,8 @@ func TestEstimateCost_PartialPricingDoesNotMakeInputFree(t *testing.T) {
 		MaxOutputTokens: 1,
 	}
 	// 只配输出价，输入价缺失。
-	onlyOut := estimateBalanceCost(req, &routing.UpstreamModel{PriceOutput: 1000})
-	full := estimateBalanceCost(req, &routing.UpstreamModel{PriceInput: 1000, PriceOutput: 1000})
+	onlyOut := billing.EstimateBalanceCost(req, &routing.UpstreamModel{PriceOutput: 1000})
+	full := billing.EstimateBalanceCost(req, &routing.UpstreamModel{PriceInput: 1000, PriceOutput: 1000})
 	if onlyOut <= 0 {
 		t.Fatalf("只配输出价却估出 %d 分：输入侧被当成免费，预检形同虚设", onlyOut)
 	}
@@ -432,7 +433,7 @@ func TestEstimateCost_CacheHitOnlyPricingIsNotTreatedAsUnpriced(t *testing.T) {
 		MaxOutputTokens: 4096,
 	}
 	// 只配缓存命中价（3 元/百万 tokens），输入价与输出价都为 0。
-	onlyCache := estimateBalanceCost(req, &routing.UpstreamModel{PriceCacheHit: 3})
+	onlyCache := billing.EstimateBalanceCost(req, &routing.UpstreamModel{PriceCacheHit: 3})
 	if onlyCache <= 0 {
 		t.Fatalf("只配 price_cache_hit 却估出 %d 分：预检把它当成「完全未配价」→ "+
 			"fail-open 漏放行（实扣仍按缓存价收费）", onlyCache)
@@ -472,7 +473,7 @@ func TestEstimateCost_IsUpperBoundOverActualCharge(t *testing.T) {
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			est := estimateBalanceCost(req, &routing.UpstreamModel{
+			est := billing.EstimateBalanceCost(req, &routing.UpstreamModel{
 				PriceInput:    c.p.Input,
 				PriceCacheHit: c.p.CacheHit,
 				PriceOutput:   c.p.Output,

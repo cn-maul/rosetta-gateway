@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/cn-maul/rosetta-gateway/internal/store"
+	"github.com/cn-maul/rosetta-gateway/internal/usage"
 )
 
 // *X0：drain 超时后必须能停下仍在重试的 worker，并把未落库的 request_id
@@ -27,19 +28,22 @@ func TestUsageShutdown_AbortStopsRetryLoopAndLogsPending_X0(t *testing.T) {
 	t.Cleanup(func() { db.Close() })
 
 	var logs bytes.Buffer
-	rec := newUsageRecorder(db, slog.New(slog.NewTextHandler(&logs, nil)))
 	// 批量写永久失败；随后把库关掉，让降级逐条也失败 —— 记录只能留在
 	// worker 的 stillPending 里，复现 drain 超时的现场。
-	rec.batchInsert = func(context.Context, []*store.UsageRecord) ([]float64, error) {
-		return nil, errors.New("injected persistent write failure")
-	}
+	rec := usage.New(usage.Config{
+		DB:     db,
+		Logger: slog.New(slog.NewTextHandler(&logs, nil)),
+		BatchInsert: func(context.Context, []*store.UsageRecord) ([]float64, error) {
+			return nil, errors.New("injected persistent write failure")
+		},
+	})
 	if err := db.Close(); err != nil {
 		t.Fatalf("close store: %v", err)
 	}
 
 	usage := shutdownTestRec(uniqueRecID("abort-x0", 0))
 	usage.RequestID = "req-X0-abandoned"
-	rec.record(usage)
+	rec.Record(usage)
 
 	// 等 worker 真正进入「失败待重试」状态，否则 wait 的返回值取决于时序。
 	deadline := time.Now().Add(5 * time.Second)
@@ -52,19 +56,14 @@ func TestUsageShutdown_AbortStopsRetryLoopAndLogsPending_X0(t *testing.T) {
 
 	expired, cancel := context.WithCancel(context.Background())
 	cancel()
-	if rec.wait(expired) {
+	if rec.Wait(expired) {
 		t.Fatal("drain 已超时且记录未落库，wait 不应报告干净")
 	}
 
-	rec.abort()
+	rec.Abort()
 
-	done := make(chan struct{})
-	go func() {
-		rec.wg.Wait()
-		close(done)
-	}()
 	select {
-	case <-done:
+	case <-rec.Done():
 	case <-time.After(3 * time.Second):
 		t.Fatal("abort 后 worker 仍未退出：关停会被无限重试拖住")
 	}

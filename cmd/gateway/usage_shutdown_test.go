@@ -52,14 +52,14 @@ func TestRecordAfterWaitDoesNotPanic(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
-	u.wait(ctx) // 先关停（关闭队列）
+	u.Wait(ctx) // 先关停（关闭队列）
 
 	defer func() {
 		if r := recover(); r != nil {
 			t.Fatalf("关停后 record 触发 panic: %v", r)
 		}
 	}()
-	u.record(shutdownTestRec("after-wait"))
+	u.Record(shutdownTestRec("after-wait"))
 }
 
 // TestRecordConcurrentWithWait 压力版：一边关停一边狂记，覆盖「判关闭」与
@@ -82,7 +82,7 @@ func TestRecordConcurrentWithWait(t *testing.T) {
 							t.Errorf("并发 record 触发 panic: %v", r)
 						}
 					}()
-					u.record(shutdownTestRec(fmt.Sprintf("conc-%d-%d", worker, i)))
+					u.Record(shutdownTestRec(fmt.Sprintf("conc-%d-%d", worker, i)))
 				}()
 			}
 		}()
@@ -95,7 +95,7 @@ func TestRecordConcurrentWithWait(t *testing.T) {
 		time.Sleep(time.Millisecond)
 		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 		defer cancel()
-		u.wait(ctx)
+		u.Wait(ctx)
 	}()
 
 	close(start)
@@ -109,13 +109,13 @@ func TestWaitDoesNotDeadlockWithRecord(t *testing.T) {
 
 	done := make(chan struct{})
 	go func() {
-		u.record(shutdownTestRec("slow-path"))
+		u.Record(shutdownTestRec("slow-path"))
 		close(done)
 	}()
 
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
-	u.wait(ctx)
+	u.Wait(ctx)
 
 	select {
 	case <-done:

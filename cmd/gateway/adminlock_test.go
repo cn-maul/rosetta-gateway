@@ -18,6 +18,7 @@ import (
 	"testing"
 
 	"github.com/cn-maul/rosetta-gateway/internal/admin"
+	"github.com/cn-maul/rosetta-gateway/internal/billinghttp"
 	"github.com/cn-maul/rosetta-gateway/internal/server"
 	"github.com/cn-maul/rosetta-gateway/internal/snapshot"
 	"github.com/cn-maul/rosetta-gateway/internal/store"
@@ -166,10 +167,10 @@ func TestAdminLockout_QueryEndpointsAlsoRejectAdmin(t *testing.T) {
 		name string
 		h    http.HandlerFunc
 	}{
-		{"billing/subscription", billingSubscription(db)},
-		{"billing/usage", billingUsage(db)},
-		{"organization/costs", orgCosts(db)},
-		{"organization/usage", orgUsageCompletions(db)},
+		{"billing/subscription", billinghttp.Subscription(db)},
+		{"billing/usage", billinghttp.Usage(db)},
+		{"organization/costs", billinghttp.OrgCosts(db)},
+		{"organization/usage", billinghttp.OrgUsageCompletions(db)},
 	} {
 		rec := httptest.NewRecorder()
 		tc.h(rec, authedGet("/v1/x"))

@@ -7,6 +7,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/cn-maul/rosetta-gateway/internal/billinghttp"
 	"github.com/cn-maul/rosetta-gateway/internal/store"
 )
 
@@ -56,7 +57,7 @@ func TestOrgEndpoints_ScopedToCallerUser(t *testing.T) {
 	}
 
 	rec := httptest.NewRecorder()
-	orgUsageCompletions(db)(rec, authedGet("/v1/organization/usage/completions?bucket_width=1d"))
+	billinghttp.OrgUsageCompletions(db)(rec, authedGet("/v1/organization/usage/completions?bucket_width=1d"))
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
 	}
@@ -65,7 +66,7 @@ func TestOrgEndpoints_ScopedToCallerUser(t *testing.T) {
 	}
 
 	rec2 := httptest.NewRecorder()
-	orgCosts(db)(rec2, authedGet("/v1/organization/costs?bucket_width=1d"))
+	billinghttp.OrgCosts(db)(rec2, authedGet("/v1/organization/costs?bucket_width=1d"))
 	if rec2.Code != http.StatusOK {
 		t.Fatalf("costs status=%d body=%s", rec2.Code, rec2.Body.String())
 	}
@@ -92,7 +93,7 @@ func TestBillingUsage_BadDateRangeIsRejected(t *testing.T) {
 		"/v1/dashboard/billing/usage?start_date=2026-10-10&end_date=2026-10-01", // 反向
 	} {
 		rec := httptest.NewRecorder()
-		billingUsage(db)(rec, authedGet(q))
+		billinghttp.Usage(db)(rec, authedGet(q))
 		if rec.Code != http.StatusBadRequest {
 			t.Errorf("%s -> %d，期望 400（静默回退到近 30 天等于骗调用方）", q, rec.Code)
 		}
@@ -100,7 +101,7 @@ func TestBillingUsage_BadDateRangeIsRejected(t *testing.T) {
 
 	// 不带参数仍按「最近 30 天」正常工作 —— 别把正常路径一起拒了。
 	rec := httptest.NewRecorder()
-	billingUsage(db)(rec, authedGet("/v1/dashboard/billing/usage"))
+	billinghttp.Usage(db)(rec, authedGet("/v1/dashboard/billing/usage"))
 	if rec.Code != http.StatusOK {
 		t.Fatalf("无参数应 200，实际 %d body=%s", rec.Code, rec.Body.String())
 	}
