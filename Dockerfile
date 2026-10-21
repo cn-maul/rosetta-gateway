@@ -6,8 +6,6 @@
 # 实现，所以运行层直接用 alpine，没有 glibc/musl 依赖问题。
 # 前端产物 internal/webui/dist 已随仓库入库并由 go:embed 打包，构建阶段只需编译 Go。
 
-ARG GO_VERSION=1.27
-
 # ---- 构建阶段 -------------------------------------------------------------
 # 只构建 linux/amd64，**不使用多架构交叉编译**。
 #
@@ -19,7 +17,9 @@ ARG GO_VERSION=1.27
 #   - 每次构建还要额外解析一次目标平台。
 # 直接让 FROM / RUN 用运行器自身架构即可，语义更直白，也不给
 # 「误以为在构建 arm64」留下空间。
-FROM golang:${GO_VERSION}-alpine AS build
+# 基础镜像固定到补丁版本与多架构 manifest digest，避免 tag 漂移导致同一
+# 源码在两次发布中实际使用不同工具链/运行库。升级时两者必须一起评估。
+FROM golang:1.27.1-alpine3.24@sha256:8a5910f31396cd4d89662f56c68b3ae31d374308270a1c3bd96672ee5ed43414 AS build
 WORKDIR /src
 
 # 依赖单独成层：go.mod / go.sum 没变就命中缓存
@@ -38,7 +38,7 @@ RUN CGO_ENABLED=0 GOOS=linux \
       -o /out/gateway ./cmd/gateway
 
 # ---- 运行阶段 -------------------------------------------------------------
-FROM alpine:3.21
+FROM alpine:3.24.2@sha256:294b683cb724975bec92580e1e685676bd4b50bda910ddb8c51d4cabeaec77e6
 
 # ca-certificates：访问上游 HTTPS 必需；tzdata：日志时间戳按容器时区显示；
 # su-exec：以非 root 身份降权启动（entrypoint 用它 exec 掉 root 外壳）。
@@ -80,8 +80,10 @@ EXPOSE 8666
 #
 # 间隔 30s / 超时 5s / 宽限 10s：SQLite 启动剪枝偶发慢，宽限期别太短，
 # 否则滚动更新时新容器会被反复判死并重启。
+# 端口从 /data/config.json 的 listen 解析，不能写死 8666：模板与文档虽然
+# 默认 8666，但存量部署可以改端口，固定探针会把健康容器永久标成 unhealthy。
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
-	CMD wget -q -O /dev/null http://127.0.0.1:8666/healthz || exit 1
+	CMD /bin/sh -c 'config="${ROSETTA_GW_HOME:-/data}/config.json"; listen=$(sed -n '\''s/.*"listen"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p'\'' "$config" | head -n 1); port="${listen##*:}"; case "$port" in ""|*[!0-9]*) exit 1 ;; esac; wget -q -O /dev/null "http://127.0.0.1:${port}/healthz" || exit 1'
 
 WORKDIR /app
 ENTRYPOINT ["/usr/local/bin/docker-entrypoint.sh"]

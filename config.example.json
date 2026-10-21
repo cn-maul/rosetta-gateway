@@ -3,6 +3,8 @@
   "db_path": "./data/gateway.db",
   "log_level": "info",
   "master_key_env": "ROSETTA_GW_MASTER_KEY",
+  "public_origin": "",
+  "trusted_proxy_cidrs": [],
   "timezone": "Asia/Shanghai",
   "usage_retention_days": 30,
   "audit_log_keep_rows": 20000,

@@ -46,37 +46,47 @@ seed_config() {
 	fi
 }
 
-# 降权运行。容器以 root 起（需要 chown 状态目录），但网关本体 exec 成普通
-# 用户 —— 进程被攻破时拿到的是非特权 uid，而不是容器 root（AUDIT P2-28）。
-#
-# /data 是卷挂载点，SQLite 库、master.key、session_secret 全在里面，
-# 必须对该用户可写。属主不对时先 chown；chown 失败（NFS、只读根 fs、
-# 某些 bind mount）再退到 chmod；两者都不行就**明确告警后**才留在 root 下运行 ——
-# 静默以 root 运行会让运维以为容器是加固过的。
+# 降权运行。容器以 root 起（需要 chown 状态目录），但网关本体必须 exec 成
+# 普通用户。属主修正失败时拒绝启动：继续以 root 运行会让运维误以为容器已经
+# 加固，而一旦进程被攻破就是容器 root。
+case "${RUN_UID}:${RUN_GID}" in
+	0:*|*:0|*[!0-9:]*)
+		echo "[entrypoint] 错误：ROSETTA_GW_UID/GID 必须是非零数字，当前 ${RUN_UID}:${RUN_GID}" >&2
+		exit 1
+		;;
+esac
+
 if [ "$(id -u)" = "0" ]; then
 	mkdir -p "${STATE_DIR}"
 
 	# 只在属主确实不对时才动手：bind mount 到已有目录时 chown 可能是昂贵的
 	# 递归操作，而多数情况属主已经对了。
 	if [ "$(stat -c '%u:%g' "${STATE_DIR}")" != "${RUN_UID}:${RUN_GID}" ]; then
-		chown "${RUN_UID}:${RUN_GID}" "${STATE_DIR}" 2>/dev/null ||
-			chmod 0700 "${STATE_DIR}" 2>/dev/null || true
+		if ! chown "${RUN_UID}:${RUN_GID}" "${STATE_DIR}" 2>/dev/null; then
+			echo "[entrypoint] 错误：无法把 ${STATE_DIR} 的属主改为 ${RUN_UID}:${RUN_GID}。" >&2
+			echo "[entrypoint] 请修正宿主机目录属主，或传 ROSETTA_GW_UID/GID 匹配实际属主。" >&2
+			exit 1
+		fi
 	fi
 
-	if [ "$(stat -c '%u' "${STATE_DIR}")" = "${RUN_UID}" ]; then
-		seed_config
-		chown "${RUN_UID}:${RUN_GID}" "${CONFIG}" 2>/dev/null || true
-		echo "[entrypoint] 以非 root 运行（uid=${RUN_UID} gid=${RUN_GID}）"
-		exec su-exec "${RUN_UID}:${RUN_GID}" /app/gateway
+	if [ "$(stat -c '%u:%g' "${STATE_DIR}")" != "${RUN_UID}:${RUN_GID}" ]; then
+		echo "[entrypoint] 错误：${STATE_DIR} 属主仍是 $(stat -c '%u:%g' "${STATE_DIR}")，拒绝以 root 运行网关。" >&2
+		exit 1
 	fi
 
-	echo "[entrypoint] 警告：无法把 ${STATE_DIR} 的属主改为 ${RUN_UID}:${RUN_GID}，" >&2
-	echo "[entrypoint] 将以 root 运行 —— 进程被攻破即持容器 root。" >&2
-	echo "[entrypoint] 若宿主机目录可写，请改用：" >&2
-	echo "[entrypoint]   -e ROSETTA_GW_UID=\$(id -u) -e ROSETTA_GW_GID=\$(id -g)" >&2
 	seed_config
+	if ! chown "${RUN_UID}:${RUN_GID}" "${CONFIG}" 2>/dev/null; then
+		echo "[entrypoint] 错误：无法把 ${CONFIG} 的属主改为 ${RUN_UID}:${RUN_GID}。" >&2
+		exit 1
+	fi
+	if ! su-exec "${RUN_UID}:${RUN_GID}" test -r "${CONFIG}" -a -w "${STATE_DIR}"; then
+		echo "[entrypoint] 错误：uid=${RUN_UID} gid=${RUN_GID} 无法读写 ${STATE_DIR}。" >&2
+		exit 1
+	fi
+	echo "[entrypoint] 以非 root 运行（uid=${RUN_UID} gid=${RUN_GID}）"
+	exec su-exec "${RUN_UID}:${RUN_GID}" /app/gateway
 else
-	mkdir -p "${STATE_DIR}" 2>/dev/null || true
+	mkdir -p "${STATE_DIR}"
 	seed_config
 fi
 

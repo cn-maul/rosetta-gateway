@@ -178,7 +178,6 @@ try {
         @{ Path = 'data/gateway.db';                 ShouldIgnore = $true;  Note = 'data/ 目录' }
         @{ Path = 'cmd/gateway/main.go';             ShouldIgnore = $false; Note = '源码（不能被误伤）' }
         @{ Path = 'cmd/gateway/billing.go';          ShouldIgnore = $false; Note = '源码（曾被误伤过）' }
-        @{ Path = 'cmd/migrate-legacy/main.go';      ShouldIgnore = $false; Note = '源码（曾被漏出测试范围）' }
         @{ Path = 'internal/webui/dist/index.html';  ShouldIgnore = $false; Note = 'go:embed 数据（必须入库）' }
         @{ Path = 'config.example.json';             ShouldIgnore = $false; Note = '示例配置（必须入库）' }
     )
