@@ -52,6 +52,7 @@ import (
 	"github.com/cn-maul/rosetta-gateway/internal/crypto"
 	"github.com/cn-maul/rosetta-gateway/internal/ingress"
 	"github.com/cn-maul/rosetta-gateway/internal/ratelimit"
+	gwruntime "github.com/cn-maul/rosetta-gateway/internal/runtime"
 	"github.com/cn-maul/rosetta-gateway/internal/server"
 	"github.com/cn-maul/rosetta-gateway/internal/snapshot"
 	"github.com/cn-maul/rosetta-gateway/internal/store"
@@ -1492,7 +1493,7 @@ func e2eDBHarness(t *testing.T, endpoint string) (http.Handler, *store.Store, *r
 	}
 
 	pool := upstream.NewPool(logger)
-	reloader := &runtimeReloader{db: db, masterKey: masterKey[:], pool: pool, cfg: cfg, logger: logger}
+	reloader := gwruntime.New(db, masterKey[:], pool, cfg, logger)
 	if err := reloader.Reload(ctx); err != nil {
 		t.Fatalf("首次 reload: %v", err)
 	}

@@ -9,13 +9,8 @@ import (
 	"log/slog"
 	"net/http"
 	"os"
-	"os/signal"
 	"path/filepath"
-	"sort"
 	"strings"
-	"sync"
-	"sync/atomic"
-	"syscall"
 	"time"
 
 	"github.com/cn-maul/rosetta-gateway/internal/auth"
@@ -23,10 +18,11 @@ import (
 	"github.com/cn-maul/rosetta-gateway/internal/config"
 	"github.com/cn-maul/rosetta-gateway/internal/crypto"
 	"github.com/cn-maul/rosetta-gateway/internal/dataplane"
+	"github.com/cn-maul/rosetta-gateway/internal/gatewayapp"
 	"github.com/cn-maul/rosetta-gateway/internal/outwire"
-	"github.com/cn-maul/rosetta-gateway/internal/probe"
 	"github.com/cn-maul/rosetta-gateway/internal/ratelimit"
 	"github.com/cn-maul/rosetta-gateway/internal/routing"
+	"github.com/cn-maul/rosetta-gateway/internal/runtime"
 	"github.com/cn-maul/rosetta-gateway/internal/server"
 	"github.com/cn-maul/rosetta-gateway/internal/snapshot"
 	"github.com/cn-maul/rosetta-gateway/internal/store"
@@ -261,7 +257,7 @@ func main() {
 	// logger 必须传：Reload 在「有 provider 未就绪」时要留 WARN。
 	// 漏掉它不会在启动时报错，只会在**第一次出现凭据故障时** panic ——
 	// 恰巧是最需要那条日志的时刻。
-	reloader := &runtimeReloader{db: db, masterKey: masterKey, pool: pool, cfg: cfg, logger: logger}
+	reloader := runtime.New(db, masterKey, pool, cfg, logger)
 	if err := reloader.Reload(context.Background()); err != nil {
 		logger.Warn("failed to build runtime from DB, falling back to config", "error", err)
 		if err := pool.BuildFromConfig(cfg); err != nil {
@@ -270,22 +266,11 @@ func main() {
 		snapshot.Init(buildSnapshotFromConfig(cfg))
 	}
 
-	// 后台重建重试：任一 admin 写操作的重建失败后置脏，这里负责兜底收敛。
-	//
-	// shutdown 通道在这里声明（原先在下方 500 行处）：重试循环必须受进程
-	// 生命周期约束，否则主流程 return 后该goroutine 仍在跑，且它持有
-	// rr.mu —— 那会让进程退出时卡在一次正在进行的重建上。
-	// 下方原声明处改为复用（不重复 make）。
-	shutdown := make(chan struct{})
-
-	// 探测循环的上下文：随 shutdown 取消。探测是低频后台任务，用独立的
-	// context 而不是复用 reloadCtx（那是重建重试的，语义不同）。
-	probeCtx, stopProbe := context.WithCancel(context.Background())
-	defer stopProbe()
-
+	// The reload retry is owned by the process lifecycle; gatewayapp owns the
+	// serving and maintenance loops that share the store.
 	reloadCtx, stopReloadRetry := context.WithCancel(context.Background())
 	defer stopReloadRetry()
-	go reloader.watchReloadRetry(reloadCtx)
+	go reloader.WatchRetry(reloadCtx)
 
 	usage := newUsageRecorder(db, logger)
 	// 管理端身份：**只有一种来源 —— users 表**。
@@ -376,512 +361,20 @@ func main() {
 		rateLimiter: ratelimit.New(), usage: usage,
 	})
 
-	srv := &http.Server{
-		Addr:        cfg.Listen,
-		Handler:     handler,
-		ReadTimeout: 30 * time.Second,
-		// WriteTimeout 必须为 0：net/http 的写超时从「开始写响应」起算，覆盖整个
-		// 响应时长 —— 5 分钟一到会把仍在正常吐字的流式响应硬切（大输出的慢推理
-		// 模型恰好会撞上），下游看到的是来历不明的 truncated。流的生命周期已由
-		// TTFT/空闲看门狗约束（attemptStream），非流式由 upstream_timeout 限定
-		// handler 时长，全局写超时在这里只会误伤长流，不会多保护任何东西。
-		WriteTimeout: 0,
-		// 慢连接防护：30s 读不完请求头、空闲 2 分钟的 keep-alive 连接即回收。
-		// IdleTimeout 不设的话回落 ReadTimeout(30s)，聊天客户端「想一会儿再发
-		// 下一条」的间隔内连接被反复重建，复用率反而更低。
-		ReadHeaderTimeout: 30 * time.Second,
-		IdleTimeout:       2 * time.Minute,
-	}
-
-	go func() {
-		logger.Info("server starting", "addr", cfg.Listen)
-		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			logger.Error("server error", "error", err)
-			os.Exit(1)
-		}
-	}()
-
-	// 用量归档的每日定时剪枝（设计 §4.8：明细 30 天，累计永久）。
-	// （shutdown 通道已在 reloader 构造处声明，供此处与后台重建重试共用。）
-	//
-	// 启动后**立刻先跑一次**再进 24h 循环：只等第一个 tick 的话，长期停机后
-	// 重启的实例要等满 24h 才开始剪，而这段时间里 usage_records 还在接收新写入
-	// ——「表在涨、剪枝没跑」正是这张表当初要解决的问题。
-	//
-	// 跑在独立 goroutine 里而不是启动流程内：剪枝是全表 DELETE（首批可达
-	// 百万行），放启动路径上会让网关「起来了但还打不开页面」。
-	pruneDone := make(chan struct{})
-	go func() {
-		defer close(pruneDone)
-		// 审计日志按**行数**封顶（不是天数）：它的唯一读路径是
-		// 「最近 N 条」，更早的行没有任何下游消费者，却随写操作次数无界增长。
-		// 跟着用量剪枝同一个循环跑即可，keepRows <= 0 表示部署点显式关闭。
-		pruneAudit := func(reason string) {
-			if cfg.AuditLogKeepRows <= 0 {
-				return
-			}
-			n, err := db.PruneAuditLog(context.Background(), cfg.AuditLogKeepRows)
-			if err != nil {
-				logger.Error("audit log prune failed", "error", err, "trigger", reason)
-				return
-			}
-			if n > 0 {
-				logger.Info("audit log pruned", "trigger", reason,
-					"deleted_rows", n, "keep_rows", cfg.AuditLogKeepRows)
-			}
-		}
-		runPrune := func(reason string) {
-			// 保留期来自配置（config.UsageRetentionDays），默认 30。
-			// 此前硬编码 store.DefaultRetentionDays，用量小的部署无法调短 ——
-			// 性能审计实测：它直接决定用户级配额预检的
-			// 单次耗时（30 天 ≈ 63ms，7 天 ≈ 15ms）。
-			res, err := db.PruneOldUsage(context.Background(), cfg.UsageRetentionDays)
-			switch {
-			case err != nil:
-				// 单次失败不终止循环：下个周期重试即可，而退出循环等于
-				// 永久放弃归档，明细表会一直涨到把写池堵死。
-				logger.Error("usage prune failed", "error", err, "trigger", reason)
-			case res.Skipped:
-				logger.Debug("usage prune skipped", "reason", res.Reason, "trigger", reason)
-			default:
-				logger.Info("usage pruned into daily rollups", "trigger", reason,
-					"deleted_rows", res.DeletedRows, "rollup_rows", res.RollupRows,
-					"pruned_through_day", res.PrunedThrough)
-			}
-			pruneAudit(reason)
-		}
-		runPrune("startup")
-		t := time.NewTicker(24 * time.Hour)
-		defer t.Stop()
-		for {
-			select {
-			case <-t.C:
-				runPrune("daily")
-			case <-shutdown:
-				return
-			}
-		}
-	}()
-
-	// 费用重算循环（2026-10-12 修 P1-2）。
-	//
-	// freezeUsageCost 在读池抖动时会把 usage_state 标成 cost_pending 并记 0 元，
-	// 那个 0 会同时让报表与扣费变成「完全免单」。本循环把它捞回来自动重算，
-	// 于是「一次抖动 = 一笔永久免单」降级为「一次抖动 = 最多 5 分钟的延迟」。
-	//
-	// 周期取 5 分钟而不是并进剪枝的 24 小时：抖动是偶发的，而免单是实时的
-	// —— 每笔待重算记录都在这段时间里被当成 0 元，少收的钱随时间累积。
-	//
-	// 单次上限 500 条 + 「还有剩余就再排一轮」：长期故障（读池持续不可用）
-	// 下待重算队列会增长，无界扫描会把写池占死，反而拖垮正常流量。
-	recomputeDone := make(chan struct{})
-	go func() {
-		defer close(recomputeDone)
-		runRecompute := func(reason string) {
-			// 单轮最多循环 10 批（5000 条），避免长期积压时一轮干太久
-			// 占住写连接。剩下的留给下一轮。
-			for round := 0; round < 10; round++ {
-				fixed, remaining, err := db.RecomputePendingCosts(context.Background(), 500)
-				if err != nil {
-					// 单次失败不终止循环：下个周期重试即可。
-					logger.Error("pending cost recompute failed", "error", err, "trigger", reason)
-					return
-				}
-				if fixed > 0 {
-					logger.Info("recomputed pending usage costs",
-						"trigger", reason, "fixed", fixed, "remaining", remaining)
-				}
-				if !remaining {
-					return
-				}
-			}
-			logger.Warn("pending cost recompute backlog still large after 10 rounds",
-				"trigger", reason, "batch_size", 500)
-		}
-		runRecompute("startup")
-		tk := time.NewTicker(5 * time.Minute)
-		defer tk.Stop()
-		for {
-			select {
-			case <-tk.C:
-				runRecompute("periodic")
-			case <-shutdown:
-				return
-			}
-		}
-	}()
-
-	// 扣费对账循环（2026-10-21 修 A4-P1-4 / 汇总 F4）。
-	//
-	// # 它补的是什么洞
-	//
-	// usage 落库与余额扣费是**两个事务**（usageRecorder 先落库、再 charge）。
-	// 两者之间如果进程被杀，或扣费遇到瞬时故障且重试也全部失败，这笔费用就
-	// 永远停在「报表上有、余额没扣」的状态 —— 而且**没有任何落盘痕迹**
-	// 说明它漏了：usage_state 是 'reported'、cost_total 非 0，看起来完全正常。
-	//
-	// 修复前的扣费侧已有重试（见 retryCharge），但重试只在**进程活着**时
-	// 有用。崩溃窗口与「重试全部失败」这两条路径依然无人兜底，而全仓
-	// 此前**没有任何对账任务**比对「该扣的」与「扣了的」。
-	//
-	// # 为什么单独一个循环而不是并进 runRecompute
-	//
-	// 两者的判据不同：重算找的是「费用是 0 但应该有」（usage_state='cost_pending'
-	// 且查价失败），对账找的是「费用有但没扣」。前者要改明细与累计表，
-	// 后者只动余额。混在一起会让两个不同的失败模式共享一套重试策略。
-	//
-	// # 周期
-	//
-	// 10 分钟。这类漏扣是低频事件（要恰好在两个事务之间崩溃），但金额是
-	// 钱 —— 10 分钟的延迟远小于「永远不补」。而对账要扫 usage_records 并
-	// LEFT JOIN balance_charges，比重算贵，所以周期取得比重算长。
-	reconcileDone := make(chan struct{})
-	go func() {
-		defer close(reconcileDone)
-		runReconcile := func(reason string) {
-			// 单轮最多 500 条：漏扣是罕见事件，一轮捞不完说明有系统性问题，
-			// 剩下的交给下一轮 —— 无界扫描会把写池占死。
-			found, err := db.FindUnchargedUsage(context.Background(), 500)
-			if err != nil {
-				logger.Error("charge reconciliation scan failed", "error", err, "trigger", reason)
-				return
-			}
-			if len(found) == 0 {
-				return
-			}
-			var charged, failed int
-			for _, u := range found {
-				if cerr := db.ChargeUnchargedUsage(context.Background(), u); cerr != nil {
-					failed++
-					logger.Error("charge reconciliation failed to charge",
-						"error", cerr, "record_id", u.RecordID,
-						"user_id", u.UserID, "request_id", u.RequestID,
-						"cost_yuan", u.CostYuan)
-					continue
-				}
-				charged++
-			}
-			// 补扣成功要留痕：这是「报表与余额曾经分叉、现已收敛」的证据。
-			// 审计是唯一能看到「这个系统曾经漏收过钱」的地方 —— 漏收本身
-			// 不会在数据里留下痕迹（那正是它难查的原因）。
-			logger.Warn("reconciled uncharged usage records",
-				"trigger", reason, "found", len(found), "charged", charged, "failed", failed)
-		}
-		runReconcile("startup")
-		tk := time.NewTicker(10 * time.Minute)
-		defer tk.Stop()
-		for {
-			select {
-			case <-tk.C:
-				runReconcile("periodic")
-			case <-shutdown:
-				return
-			}
-		}
-	}()
-
-	// 上游模型定时探测（2026-10-14）。照抄 runRecompute 的骨架：周期短、
-	// 需要并发上限、有 done 等待先例。探测请求复用 upstream.TestUpstreamModel
-	// （max_tokens=1、不经 usage_recorder），**不扣任何网关用户的钱**，
-	// 结果只进 model_probes 表 —— 绝不进 UsageSource / 配额 / 余额
-	// （见 store.go model_probes 建表注释的隔离红线）。
-	//
-	// 探测循环在 cfg.Probes.Enabled 时启动。探测失败**不写**凭据冷却，
-	// 不碰 pool 的熔断状态机 —— 那是业务流量的信号，探测要回答的是
-	// 「这个 model_id 现在能不能推理」。
-	probeDone := make(chan struct{})
-	if cfg.Probes.Enabled {
-		go func() {
-			defer close(probeDone)
-			probeRunner := probe.NewRunner(db, cfg, masterKey, logger)
-			probeRunner.Run(probeCtx)
-		}()
-	} else {
-		close(probeDone)
-	}
-
-	quit := make(chan os.Signal, 1)
-	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
-	<-quit
-	// 先停剪枝循环再关库：它可能正在跑一条全表 DELETE，与 main 返回时的
-	// `defer db.Close()` 并发会拿到 "database is closed"。
-	//
-	// 等待有上限：剪枝是百万行量级的 DELETE，无界等待能把 SIGTERM 拖到几十秒，
-	// 而编排器的终止宽限期通常更短 —— 那就变成强杀，剪枝事务虽会整体回滚
-	// （聚合与删除同事务），但退出被拖长这件事本身已经不对。超时后照常退出。
-	close(shutdown)
-	stopProbe() // 让探测循环的 ctx 取消，它会在下一个 select 返回
-	select {
-	case <-pruneDone:
-	case <-time.After(5 * time.Second):
-		logger.Warn("usage prune still running at shutdown; exiting anyway")
-	}
-	// 费用重算循环同理：它会往写池写 UPDATE，与 db.Close() 并发同样会拿到
-	// "database is closed"。它的单批上限很小（500 条），正常情况下立刻返回，
-	// 所以给一个更短的上限（2s）—— 不该把关停时间主要花在这里。
-	select {
-	case <-recomputeDone:
-	case <-time.After(2 * time.Second):
-		logger.Warn("cost recompute still running at shutdown; exiting anyway")
-	}
-	// 扣费对账循环同理：它也会往写池写（补扣余额），与 db.Close() 并发会拿到
-	// "database is closed"。它的单轮上限是 500 条，正常情况下立刻返回。
-	select {
-	case <-reconcileDone:
-	case <-time.After(2 * time.Second):
-		logger.Warn("charge reconciliation still running at shutdown; exiting anyway")
-	}
-	// 探测循环同理：它往写池写 model_probes，与 db.Close() 并发会拿到
-	// "database is closed"。探测是低频写，正常情况下立刻返回。
-	select {
-	case <-probeDone:
-	case <-time.After(2 * time.Second):
-		logger.Warn("probe runner still running at shutdown; exiting anyway")
-	}
-
-	logger.Info("shutting down...")
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-	if err := srv.Shutdown(ctx); err != nil {
-		// Shutdown 到点只是**返回错误**，并不会终止仍在跑的 handler
-		// （流请求 WriteTimeout 为 0、生命周期只看 TTFT/空闲看门狗，
-		//  完全可能超过这 10s）。必须显式 Close 把在途连接掐掉：
-		// 它返回时所有 handler 都已被中断，之后不会再有人调 usage.record。
-		//
-		// 顺序不能反 —— 先 close 队列再掐 handler 的话，那条 handler 收尾时
-		// 恰好撞上「队列已关」。现在 record 侧也有 mu 兜底（双保险），
-		// 但把顺序修正过来才是它本来的意图。
-		logger.Error("graceful shutdown incomplete; forcing close of in-flight connections",
-			"error", err, "note", "streams longer than the shutdown budget are terminated")
-		if cerr := srv.Close(); cerr != nil {
-			logger.Error("forced close failed", "error", cerr)
-		}
-	}
-
-	// handler 都返回了，但在途的用量记录还在异步落库。不等它们，
-	// 进程一退这批记录就没了 —— 表现为「最后几次调用的用量查不到」。
-	drainCtx, drainCancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer drainCancel()
-	// 返回 false 表示仍有记录没落库成功（flush 反复重试仍失败，
-	// 2026-10-12 修 P1-1）。此时必须**大声报出来**：那是真丢了计费记录，
-	// 而原实现是静默 return，日志上一片祥和、实际最多 50 条用量凭空消失，
-	// 用户因此免单且配额被放宽。
-	if !usage.Wait(drainCtx) {
-		// drain 超时：让仍在退避重试的 worker 立刻退出，避免它与随后的
-		// db.Close() 并发写（"database is closed"）并拖过进程退出。
-		usage.Abort()
-		logger.Error("usage drain incomplete: records were lost during shutdown",
-			"hint", "check earlier 'usage record lost' / 'usage recorder aborted' errors for request_id")
-	}
-	logger.Info("server stopped")
-}
-
-// runtimeReloader 把「上游池重建 + 快照重建」收口成一个可串行、可复用的原子操作。
-//
-// 为什么要收口（而不是各 handler 自行重建、或只依赖前端调 reload）：
-//   - 池与快照是运行时的唯一事实视图，管理写操作落库后必须重建才生效；
-//     生效路径若只靠前端，任何绕过前端的调用方（curl/脚本）都会造成静默分叉，
-//     最敏感的是禁用下游 Key —— auth 校验读快照，不重建就照常放行。
-//   - 池与快照是两个独立的原子域，「先换一个、再建另一个」时第二步失败会两边
-//     分叉。这里先各自完整构建（PrepareFromStore / RebuildFromDB 都不触碰
-//     运行状态），两边都成功才依次替换；任一步失败则运行时保持旧状态继续服务。
-//
-// mu 串行化并发触发（管理写操作的自动 reload + 手动 POST /admin/api/reload），
-// 避免两轮重建交错执行。
-type runtimeReloader struct {
-	mu        sync.Mutex
-	db        *store.Store
-	masterKey []byte
-	pool      *upstream.Pool
-	cfg       *config.Config
-	logger    *slog.Logger
-
-	// dirty 置位表示「上一次重建失败，运行时落后于数据库」。
-	//
-	// 没有它的后果：某次 admin 写操作的重建失败后，只打一条 ERROR 就结束了 ——
-	// 而**响应早已是 200 +「已禁用」**。于是调用方看到「已禁用」，
-	// 数据面却继续放行该 key，直到下一次任意 admin 写操作碰巧成功才收敛。
-	// 「禁用下游 Key」这类安全敏感操作会**无限期失效**，而日志里只有一条
-	// 早已被淹没的 ERROR，没有任何迹象指向当前仍在放行。
-	//
-	// 用 atomic 而不是复用 mu：置位/清除是高频轻操作，而 mu 被 Reload 的
-	// 整个执行过程持有（重建是百毫秒级），后台重试绝不能被它挡住。
-	dirty atomic.Bool
-
-	// dirtySince 记录首次置位时刻，用于「持续失败」时把重试间隔逐步拉长
-	// 并在日志里报出已持续多久 —— 一个失败三天的问题不该表现得像刚发生。
-	dirtySince atomic.Int64
-}
-
-// reloadRetryInterval 是后台重试的基准间隔。
-//
-// 取30 秒：短到「禁用一个 key 后最多半分钟就真的生效」，长到不会在
-// 数据库持续故障时把日志刷爆（每次重试一条 WARN，30 秒一条 = 每小时 120 条）。
-const reloadRetryInterval = 30 * time.Second
-
-// reloadTimeout 是单次重建的时间上限。与 server.autoReloadTimeout 同值但
-// 独立定义（跨包不导出私有常量）。重建只做 DB 读与 client 构建，正常毫秒级；
-// 上限只为防一个卡死的 SQLite 读把后台重试 goroutine 永久挂住。
-const reloadTimeout = 30 * time.Second
-
-// reloadRetryMaxInterval 是退避上限。持续失败时按 2 的幂次拉长，
-// 封顶 10 分钟：再长就失去了「自动收敛」的意义 —— 那时正确的做法是
-// 让人知道（见下面的告警日志），而不是继续静默重试。
-const reloadRetryMaxInterval = 10 * time.Minute
-
-// MarkDirty 记下一次失败的重建，等待后台重试兜底。
-func (rr *runtimeReloader) MarkDirty() {
-	if rr.dirty.CompareAndSwap(false, true) {
-		rr.dirtySince.Store(time.Now().UnixMilli())
+	if err := gatewayapp.Serve(gatewayapp.ServeDeps{
+		DB: db, Config: cfg, Logger: logger, MasterKey: masterKey,
+		Reloader: reloader, Usage: usage, Handler: handler,
+	}); err != nil {
+		logger.Error("gateway exited", "error", err)
+		os.Exit(1)
 	}
 }
 
-// markClean 清脏标志。必须由 Reload 自己在**成功后**调用 ——
-// 不能放在调用方，否则「Reload 成功但调用方没记」与「Reload 失败」在
-// 标志上无法区分，那正是本缺陷的形态。
-func (rr *runtimeReloader) markClean() {
-	rr.dirty.Store(false)
-	rr.dirtySince.Store(0)
-}
-
-// IsDirty 报告运行时是否落后于数据库。供健康检查与测试读取。
-func (rr *runtimeReloader) IsDirty() bool { return rr.dirty.Load() }
-
-// watchReloadRetry 在 dirty 置位时反复重试，直到成功或 ctx 结束。
+// runtimeReloader 保留 cmd 内既有调用名；实现归 internal/runtime。
 //
-// 为什么必须有它：AutoReload 的一次性尝试失败后，若没有后续触发，
-// 「已禁用」与「仍在放行」的偏离会**无限期**存在。审计与数据面各有一条
-// 独立通道（adminAuto、bootstrap）都走 Reload，所以单一失败点会让两处
-// 同时失准。
-//
-// 退避：第 n 次失败后等 min(2^n × 30s, 10min)。数据库短暂抖动会在几秒内
-// 被自愈，而真故障不会因为高频重试变好 —— 退避让两者都得到合理对待。
-func (rr *runtimeReloader) watchReloadRetry(ctx context.Context) {
-	backoff := reloadRetryInterval
-	for {
-		// 脏标志是唯一的触发条件：干净时不轮询、不占连接、不产生日志。
-		if !rr.dirty.Load() {
-			select {
-			case <-ctx.Done():
-				return
-			case <-time.After(time.Second): // 轮询间隔：1s 足够跟手
-			}
-			continue
-		}
-
-		since := rr.dirtySince.Load()
-		if since > 0 {
-			elapsed := time.Since(time.UnixMilli(since)).Round(time.Second)
-			rr.logger.Warn("runtime still lags behind database; retrying rebuild",
-				"dirty_for", elapsed.String(),
-				"next_retry_in", backoff.String())
-		}
-
-		rctx, cancel := context.WithTimeout(ctx, reloadTimeout)
-		if err := rr.Reload(rctx); err == nil {
-			rr.logger.Info("runtime caught up with database after failed reload",
-				"dirty_for", time.Since(time.UnixMilli(since)).Round(time.Second).String())
-			backoff = reloadRetryInterval
-		} else {
-			rr.logger.Warn("runtime reload retry failed; will retry again",
-				"error", err, "next_retry_in", backoff.String())
-			backoff *= 2
-			if backoff > reloadRetryMaxInterval {
-				backoff = reloadRetryMaxInterval
-			}
-		}
-		cancel()
-
-		select {
-		case <-ctx.Done():
-			return
-		case <-time.After(backoff):
-		}
-	}
-}
-
-// Reload 串行执行一次「池 + 快照」重建；任何一步失败都不改变运行状态。
-//
-// failures 会随快照下发（P4 / 设计 §4.7）：池里没建成的 provider 在管理面
-// 标成「未就绪」并给出原因。此前这些只进日志，运维看到的是
-// 「路由配了但请求莫名 500」，查不到根因。
-func (rr *runtimeReloader) Reload(ctx context.Context) error {
-	rr.mu.Lock()
-	defer rr.mu.Unlock()
-
-	providers, poolFailures, err := rr.pool.PrepareFromStore(ctx, rr.db, rr.masterKey, rr.cfg)
-	if err != nil {
-		return fmt.Errorf("prepare upstream pool: %w", err)
-	}
-	// 把池侧的失败投影成 snapshot 的最小视图。两类情形都要让界面看见，
-	// 但语义不同：
-	//   - 零可用凭据 / 读不到凭据清单 → provider **完全不可用**（Ready=false）；
-	//   - 个别凭据失败但还有可用的 → provider 仍在服务，界面标为降级。
-	//
-	// 同一 provider 的多条凭据失败在界面上重复标没意义，按 slug 只留一条，
-	// 「完全不可用」优先于「部分降级」。
-	type proj struct {
-		reason string
-		fatal  bool
-	}
-	bySlug := make(map[string]proj, len(poolFailures))
-	for _, f := range poolFailures {
-		fatal := f.Stage == "no_credentials" || f.Stage == "list_credentials"
-		if prev, ok := bySlug[f.Slug]; ok && prev.fatal && !fatal {
-			continue
-		}
-		bySlug[f.Slug] = proj{reason: f.Reason, fatal: fatal}
-	}
-	failures := make([]snapshot.ProviderFailure, 0, len(bySlug))
-	for slug, p := range bySlug {
-		failures = append(failures, snapshot.ProviderFailure{Slug: slug, Reason: p.reason})
-	}
-	// 排序只为让日志与任何按序展示的地方稳定（map 遍历顺序是随机的）。
-	sort.Slice(failures, func(i, j int) bool { return failures[i].Slug < failures[j].Slug })
-
-	// logger 为空时不留痕也不崩：这是「有 provider 未就绪」时唯一会走到的分支，
-	// 让它 panic 等于在最需要日志的时刻把进程打挂。
-	if len(poolFailures) > 0 && rr.logger != nil {
-		rr.logger.Warn("some providers are not ready after reload",
-			"count", len(poolFailures), "providers", len(bySlug))
-	}
-
-	snap, err := snapshot.RebuildFromDB(ctx, rr.db, failures)
-	if err != nil {
-		return fmt.Errorf("rebuild snapshot: %w", err)
-	}
-	rr.pool.Install(providers, liveTargetIDs(ctx, rr.db))
-	snapshot.Swap(snap)
-	// 只有走到这里（池与快照都已换成功）才清脏标志。
-	// 上面每条 return err 的路径都保持 dirty —— 运行时确实落后于库，
-	// 后台重试循环因此知道还要再试。
-	rr.markClean()
-	return nil
-}
-
-// liveTargetIDs 返回当前库里全部 route target 的 ID 集合，交给 Pool.Install
-// 决定哪些熔断状态该跨重建保留。
-//
-// # 读失败不能当「集合为空」（2026-10-21 修 A5-P1-2）
-//
-// 旧实现在读失败时返回空集，而 Install 的语义是「集合外一律丢弃」
-// —— 于是一次读取失败就把**全站熔断状态**清空了，让正在熔断的坏上游
-// 立刻复活。而 Reload 仍报「成功」，管理面上的状态也不会提示任何异常。
-//
-// 正确的区分：目标确实没了（集合为空且读到了）→ 旧熔断状态应当丢掉；
-// 集合**未知**（读失败）→ 应当保留全部既有熔断状态。
-func liveTargetIDs(ctx context.Context, db *store.Store) upstream.LiveTargets {
-	targets, err := db.ListAllRouteTargets(ctx)
-	if err != nil {
-		// 读失败：集合未知。不记日志（调用方的 reload 循环会记）。
-		return upstream.LiveTargets{Known: false}
-	}
-	ids := make(map[string]bool, len(targets))
-	for _, t := range targets {
-		ids[t.ID] = true
-	}
-	return upstream.LiveTargets{IDs: ids, Known: true}
-}
+// Reloader itself lives in internal/runtime so routes and tests can share it
+// without depending on package main.
+type runtimeReloader = runtime.Reloader
 
 func bootstrapDB(db *store.Store, cfg *config.Config, logger *slog.Logger, masterKey []byte) {
 	ctx := context.Background()
