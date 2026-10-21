@@ -40,6 +40,15 @@ type routeDeps struct {
 	usage       *usageRecorder
 }
 
+// adminRouteSpec is the single registration source for the admin API. Public
+// routes still pass through the same authz matrix but use the unauthenticated
+// mux.
+type adminRouteSpec struct {
+	Pattern string
+	Handler http.HandlerFunc
+	Public  bool
+}
+
 // registeredRoute 是生产 mux 的一条注册记录。
 type registeredRoute struct {
 	Pattern string
@@ -92,6 +101,16 @@ func (m *routeMux) Handle(pattern string, h http.Handler) {
 func (m *routeMux) HandleFunc(pattern string, h func(http.ResponseWriter, *http.Request)) {
 	m.record(pattern)
 	m.ServeMux.HandleFunc(pattern, h)
+}
+
+func registerAdminRoutes(adminMux, publicAdminMux *routeMux, specs []adminRouteSpec) {
+	for _, spec := range specs {
+		mux := adminMux
+		if spec.Public {
+			mux = publicAdminMux
+		}
+		mux.HandleFunc(spec.Pattern, spec.Handler)
+	}
 }
 
 // buildHandler 注册生产路由并套上生产中间件。
@@ -176,150 +195,153 @@ func buildApp(d routeDeps) *gatewayApp {
 	// 免鉴权 mux：登录与首次引导本身就是取得凭据的入口，
 	// 要求先有凭据是死循环。它们的防护是限速 + 失败原因不细分 + 同源判定。
 	publicAdminMux := newRouteMux(true, records)
-	publicAdminMux.HandleFunc("POST /admin/api/login", userHandler.Login)
-	publicAdminMux.HandleFunc("GET /admin/api/session", userHandler.SessionStatus)
-	// 首次登录引导：没有这两个端点，新部署的 admin（空密码）永远登不进去。
-	publicAdminMux.HandleFunc("GET /admin/api/bootstrap", userHandler.BootstrapStatus)
-	publicAdminMux.HandleFunc("POST /admin/api/bootstrap", userHandler.BootstrapSetup)
-	adminMux.HandleFunc("GET /admin/api/providers", providerHandler.List)
-	adminMux.HandleFunc("POST /admin/api/providers", providerHandler.Create)
-	adminMux.HandleFunc("GET /admin/api/providers/{id}", func(w http.ResponseWriter, r *http.Request) { providerHandler.Get(w, r, r.PathValue("id")) })
-	adminMux.HandleFunc("PATCH /admin/api/providers/{id}", func(w http.ResponseWriter, r *http.Request) { providerHandler.Update(w, r, r.PathValue("id")) })
-	adminMux.HandleFunc("DELETE /admin/api/providers/{id}", func(w http.ResponseWriter, r *http.Request) { providerHandler.Delete(w, r, r.PathValue("id")) })
-	adminMux.HandleFunc("POST /admin/api/providers/{id}/test", func(w http.ResponseWriter, r *http.Request) { providerHandler.Test(w, r, r.PathValue("id")) })
-	// 出站网络（2026-10-20）：代理地址的共享清单。直连不是一条记录，
-	// 而是保留 id store.NetworkDirectID，不在此处出现。
-	adminMux.HandleFunc("GET /admin/api/networks", networkHandler.List)
-	adminMux.HandleFunc("POST /admin/api/networks", networkHandler.Create)
-	adminMux.HandleFunc("PATCH /admin/api/networks/{id}", func(w http.ResponseWriter, r *http.Request) { networkHandler.Update(w, r, r.PathValue("id")) })
-	adminMux.HandleFunc("DELETE /admin/api/networks/{id}", func(w http.ResponseWriter, r *http.Request) { networkHandler.Delete(w, r, r.PathValue("id")) })
-	// 上游余额查询：逐条凭据打上游的余额端点（见 internal/upstream/balance.go）。
-	// 纯读操作，不改任何配置，因此不触发 AutoReload（挂 reload 的写操作判据
-	// 看的是方法/路径白名单，这里是 POST 却明确不参与，理由见 handler 注释）。
-	adminMux.HandleFunc("POST /admin/api/providers/{id}/balance", func(w http.ResponseWriter, r *http.Request) { providerHandler.Balance(w, r, r.PathValue("id")) })
-
-	adminMux.HandleFunc("GET /admin/api/providers/{id}/credentials", func(w http.ResponseWriter, r *http.Request) { credentialHandler.List(w, r, r.PathValue("id")) })
-	adminMux.HandleFunc("POST /admin/api/providers/{id}/credentials", func(w http.ResponseWriter, r *http.Request) { credentialHandler.Create(w, r, r.PathValue("id")) })
-	adminMux.HandleFunc("PATCH /admin/api/credentials/{id}", func(w http.ResponseWriter, r *http.Request) { credentialHandler.Update(w, r, r.PathValue("id")) })
-	adminMux.HandleFunc("DELETE /admin/api/credentials/{id}", func(w http.ResponseWriter, r *http.Request) { credentialHandler.Delete(w, r, r.PathValue("id")) })
-
-	adminMux.HandleFunc("GET /admin/api/providers/{id}/models", func(w http.ResponseWriter, r *http.Request) { modelHandler.List(w, r, r.PathValue("id")) })
-	adminMux.HandleFunc("POST /admin/api/providers/{id}/models", func(w http.ResponseWriter, r *http.Request) { modelHandler.Create(w, r, r.PathValue("id")) })
-	adminMux.HandleFunc("POST /admin/api/providers/{id}/models/discover", func(w http.ResponseWriter, r *http.Request) { modelHandler.Discover(w, r, r.PathValue("id")) })
-	adminMux.HandleFunc("POST /admin/api/providers/{id}/models/import", func(w http.ResponseWriter, r *http.Request) { modelHandler.ImportModels(w, r, r.PathValue("id")) })
-	adminMux.HandleFunc("PATCH /admin/api/models/{id}", func(w http.ResponseWriter, r *http.Request) { modelHandler.Update(w, r, r.PathValue("id")) })
-	adminMux.HandleFunc("DELETE /admin/api/models/{id}", func(w http.ResponseWriter, r *http.Request) { modelHandler.Delete(w, r, r.PathValue("id")) })
-	// 批量设置价格：把同一组价格写到多个模型。POST 语义是「整体替换」，
-	// 与单条 PATCH 的 nil=不改 不同 —— 见 model_handler.go 的 batchPriceRequest。
-	// AutoReload 对 POST 自动生效（审计 + 快照重建），无需额外白名单。
-	adminMux.HandleFunc("POST /admin/api/models/batch-price", modelHandler.BatchUpdatePrices)
-
-	// 模型归组：把不同上游的「同一个模型」标成一组，用量统计可按组显示。
-	// 纯统计/展示层概念，不参与数据面路由判定。
-	adminMux.HandleFunc("GET /admin/api/model-groups", modelGroupHandler.List)
-	adminMux.HandleFunc("POST /admin/api/model-groups", modelGroupHandler.Create)
-	adminMux.HandleFunc("PATCH /admin/api/model-groups/{id}", func(w http.ResponseWriter, r *http.Request) { modelGroupHandler.Update(w, r, r.PathValue("id")) })
-	adminMux.HandleFunc("DELETE /admin/api/model-groups/{id}", func(w http.ResponseWriter, r *http.Request) { modelGroupHandler.Delete(w, r, r.PathValue("id")) })
-	adminMux.HandleFunc("GET /admin/api/model-groups/{id}/members", func(w http.ResponseWriter, r *http.Request) { modelGroupHandler.GroupMembers(w, r, r.PathValue("id")) })
-	// 指派/取消指派：路径里的 {id} 是**组** id（对某个组的操作）；
-	// 移出组不属于任何组，所以单独一个 unassign 端点而不是带空 group_id 的指派。
-	adminMux.HandleFunc("POST /admin/api/model-groups/{id}/assign", func(w http.ResponseWriter, r *http.Request) { modelGroupHandler.AssignModels(w, r, r.PathValue("id")) })
-	adminMux.HandleFunc("POST /admin/api/model-groups/unassign", modelGroupHandler.UnassignModels)
-
-	// 上游模型健康探测（读 model_probes 表，不触发探测 —— 探测循环在后台跑）。
-	adminMux.HandleFunc("GET /admin/api/probes/models", probeHandler.Models)
-	adminMux.HandleFunc("GET /admin/api/probes/timeline", probeHandler.Timeline)
-	// 单模型可用性探测。与 provider 的 /providers/{id}/test 是两件事：
-	// 那个拉 /models 证明「endpoint + 凭据通」，这个发一次最小真实推理
-	// （max_tokens=1）证明「这个 model_id 现在真的能推理」—— 模型下架、
-	// 账号无权限、名字写错时前者照样绿。见 upstream.TestUpstreamModel。
-	adminMux.HandleFunc("POST /admin/api/models/{id}/test", func(w http.ResponseWriter, r *http.Request) { modelHandler.Test(w, r, r.PathValue("id")) })
-	adminMux.HandleFunc("GET /admin/api/upstream-models", modelHandler.ListAll)
-
-	adminMux.HandleFunc("GET /admin/api/routes", routeHandler.List)
-	adminMux.HandleFunc("GET /admin/api/route-catalog", routeHandler.Catalog)
-	adminMux.HandleFunc("POST /admin/api/routes", routeHandler.Create)
-	adminMux.HandleFunc("PATCH /admin/api/routes/{id}", func(w http.ResponseWriter, r *http.Request) { routeHandler.Update(w, r, r.PathValue("id")) })
-	adminMux.HandleFunc("DELETE /admin/api/routes/{id}", func(w http.ResponseWriter, r *http.Request) { routeHandler.Delete(w, r, r.PathValue("id")) })
-	adminMux.HandleFunc("GET /admin/api/routes/{id}/targets", func(w http.ResponseWriter, r *http.Request) { routeTargetHandler.List(w, r, r.PathValue("id")) })
-	adminMux.HandleFunc("PUT /admin/api/routes/{id}/targets", func(w http.ResponseWriter, r *http.Request) { routeTargetHandler.Replace(w, r, r.PathValue("id")) })
-
-	adminMux.HandleFunc("GET /admin/api/keys", keyHandler.List)
-	// 管理员不能建 key（2026-10 控制面/数据面分离）：普通用户自助建，
-	// 管理员要去建普通用户、由那个用户自己发 key。策略在路由层拦，
-	// internal/admin/key_handler.go 的 Create 保持「普通用户自助」原样。
-	// **若将来另有代码直接用 keyHandler.Create 组路由，必须同样套本包装。**
-	adminMux.HandleFunc("POST /admin/api/keys", denyAdminKeyCreate(keyHandler.Create))
-	adminMux.HandleFunc("PATCH /admin/api/keys/{id}", func(w http.ResponseWriter, r *http.Request) { keyHandler.Update(w, r, r.PathValue("id")) })
-	adminMux.HandleFunc("DELETE /admin/api/keys/{id}", func(w http.ResponseWriter, r *http.Request) { keyHandler.Delete(w, r, r.PathValue("id")) })
-	// 重算 used_tokens：触发器维护的派生值没有自愈路径，偏高后 key 会变成死 key。
-	adminMux.HandleFunc("POST /admin/api/keys/{id}/recompute-usage", func(w http.ResponseWriter, r *http.Request) { keyHandler.RecomputeUsage(w, r, r.PathValue("id")) })
-
-	adminMux.HandleFunc("GET /admin/api/stats", statsHandler.Get)
-	adminMux.HandleFunc("POST /admin/api/reload", reloadHandler.Reload)
-	adminMux.HandleFunc("GET /admin/api/audit", auditHandler.List)
-	adminMux.HandleFunc("GET /admin/api/usage", usageHandler.Query)
-	adminMux.HandleFunc("GET /admin/api/usage/by-key", usageHandler.GroupByKey)
-	adminMux.HandleFunc("GET /admin/api/usage/by-model", usageHandler.GroupByModel)
-	adminMux.HandleFunc("GET /admin/api/usage/by-provider", usageHandler.GroupByProvider)
-	adminMux.HandleFunc("GET /admin/api/usage/by-day", usageHandler.GroupByDay)
-	// 按用户汇总消费（钱包页「消费汇总」一表一行一个用户）。
-	// **admin-only 由 handler 内的 requireAdmin 把关** —— 路径在普通用户可
-	// 访问的 /admin/api/usage 前缀下，AdminGateGuard 的前缀白名单会整体放行，
-	// 管不到名单内部的单个端点。而这是全站口径（每个用户的消费金额 + 用户名），
-	// 普通用户拿到就等于看到同事的账单。与上面的 prune 是同一个坑。
-	adminMux.HandleFunc("GET /admin/api/usage/by-user", usageHandler.GroupByUser)
-	// 手动触发用量归档。admin-only 由 handler 内的 requireAdmin 把关 ——
-	// 路径在普通用户可访问的 /admin/api/usage 前缀下，白名单管不到这里。
-	adminMux.HandleFunc("POST /admin/api/usage/prune", usageHandler.Prune)
-	adminMux.HandleFunc("GET /admin/api/settings", settingsHandler.Get)
-	adminMux.HandleFunc("PUT /admin/api/settings", settingsHandler.Update)
-	// 供应商 + 模型的导入导出。admin-only 由 handler 内的 requireAdmin 把关
-	// —— 路径在 /admin/api/config- 前缀下，白名单管不到这里，而导出体里
-	// 可能含全部上游凭据，绝不能落到普通用户手里。
-	adminMux.HandleFunc("POST /admin/api/config-export/export", configTransferHandler.Export)
-	adminMux.HandleFunc("POST /admin/api/config-export/import", configTransferHandler.Import)
-	adminMux.HandleFunc("GET /admin/api/usage/history", usageHandler.History)
-	adminMux.HandleFunc("GET /admin/api/me", userHandler.Me)
-	adminMux.HandleFunc("POST /admin/api/logout", userHandler.Logout)
-	adminMux.HandleFunc("GET /admin/api/users", userHandler.ListUsers)
-	adminMux.HandleFunc("POST /admin/api/users", userHandler.CreateUser)
-	adminMux.HandleFunc("PATCH /admin/api/users/{id}", func(w http.ResponseWriter, r *http.Request) { userHandler.UpdateUser(w, r, r.PathValue("id")) })
-	adminMux.HandleFunc("DELETE /admin/api/users/{id}", func(w http.ResponseWriter, r *http.Request) { userHandler.DeleteUser(w, r, r.PathValue("id")) })
-	adminMux.HandleFunc("POST /admin/api/users/{id}/password", func(w http.ResponseWriter, r *http.Request) { userHandler.ResetPassword(w, r, r.PathValue("id")) })
-	// 余额充值：走 adminMux 即自动要求管理员 + 记审计（AutoReload 对
-	// PUT 走审计分支，字段名由 extractFieldNames 自动取，见 autoreload.go）。
-	// 审计记的是**字段名**（delta_cents）而非数值 —— 这是既有审计的粒度，
-	// 不在本端点内改变。余额变更不需要重建快照：预检与扣费直接读库。
-	adminMux.HandleFunc("PUT /admin/api/users/{id}/balance", func(w http.ResponseWriter, r *http.Request) { userHandler.AdjustBalance(w, r, r.PathValue("id")) })
-	// 充值流水查询。**唯一一个**端点，作用域由会话身份决定（不接受参数指定
-	// 查谁）：普通用户只看到自己的，管理员也只看自己的那一份 —— 钱包页是
-	// 个人账本页，不存在「看全站充值」的用例。
-	//
-	// 路径 /admin/api/topups **不在** userAccessiblePrefixes 白名单里，所以
-	// AdminGateGuard 会要求管理员 —— 而普通用户需要看自己的充值记录。所以
-	// 必须把这个前缀加进白名单，作用域收窄由 handler 自己做
-	// （与 key_handler / usage_handler 的 callerScope 同一责任分配：
-	// 白名单只管「谁能进这个端点」，进来之后看谁由 handler 判）。
-	adminMux.HandleFunc("GET /admin/api/topups", userHandler.ListTopups)
-	adminMux.HandleFunc("POST /admin/api/me/password", userHandler.ChangePassword)
-	// 分组与模型白名单（多用户改造 P1）。全部 admin-only ——
-	// server.AdminGateGuard 是**前缀白名单**，/groups 不在其中即自动要求管理员。
-	//
-	// 快照重建靠外层 AutoReload，这里不再显式调 reload（见 GroupHandler 注释）。
 	groupHandler := admin.NewGroupHandler(db)
-	adminMux.HandleFunc("GET /admin/api/groups", groupHandler.List)
-	adminMux.HandleFunc("POST /admin/api/groups", groupHandler.Create)
-	adminMux.HandleFunc("PATCH /admin/api/groups/{id}", func(w http.ResponseWriter, r *http.Request) { groupHandler.Update(w, r, r.PathValue("id")) })
-	adminMux.HandleFunc("DELETE /admin/api/groups/{id}", func(w http.ResponseWriter, r *http.Request) { groupHandler.Delete(w, r, r.PathValue("id")) })
-	// PUT 而不是 PATCH：语义是**整体替换**白名单（勾选后保存），
-	// 不是增量合并。用 PATCH 会让「取消勾选」无法表达。
-	adminMux.HandleFunc("PUT /admin/api/groups/{id}/models", func(w http.ResponseWriter, r *http.Request) { groupHandler.SetModels(w, r, r.PathValue("id")) })
-	// 模型名清单：**普通用户也要能读** —— 否则 key 级白名单对他们等于不存在
-	// （/admin/api/routes 是 admin-only，而自助收紧正是这个功能的目的）。
-	// 读到的清单已按身份收窄，见 group_handler.ModelNames。
-	adminMux.HandleFunc("GET /admin/api/model-names", groupHandler.ModelNames)
-	adminMux.HandleFunc("GET /admin/api/usage/history.csv", usageHandler.ExportCSV)
+	adminRouteSpecs := []adminRouteSpec{
+		{Pattern: "POST /admin/api/login", Handler: userHandler.Login, Public: true},
+		{Pattern: "GET /admin/api/session", Handler: userHandler.SessionStatus, Public: true},
+		// 首次登录引导：没有这两个端点，新部署的 admin（空密码）永远登不进去。
+		{Pattern: "GET /admin/api/bootstrap", Handler: userHandler.BootstrapStatus, Public: true},
+		{Pattern: "POST /admin/api/bootstrap", Handler: userHandler.BootstrapSetup, Public: true},
+		{Pattern: "GET /admin/api/providers", Handler: providerHandler.List, Public: false},
+		{Pattern: "POST /admin/api/providers", Handler: providerHandler.Create, Public: false},
+		{Pattern: "GET /admin/api/providers/{id}", Handler: func(w http.ResponseWriter, r *http.Request) { providerHandler.Get(w, r, r.PathValue("id")) }, Public: false},
+		{Pattern: "PATCH /admin/api/providers/{id}", Handler: func(w http.ResponseWriter, r *http.Request) { providerHandler.Update(w, r, r.PathValue("id")) }, Public: false},
+		{Pattern: "DELETE /admin/api/providers/{id}", Handler: func(w http.ResponseWriter, r *http.Request) { providerHandler.Delete(w, r, r.PathValue("id")) }, Public: false},
+		{Pattern: "POST /admin/api/providers/{id}/test", Handler: func(w http.ResponseWriter, r *http.Request) { providerHandler.Test(w, r, r.PathValue("id")) }, Public: false},
+		// 出站网络（2026-10-20）：代理地址的共享清单。直连不是一条记录，
+		// 而是保留 id store.NetworkDirectID，不在此处出现。
+		{Pattern: "GET /admin/api/networks", Handler: networkHandler.List, Public: false},
+		{Pattern: "POST /admin/api/networks", Handler: networkHandler.Create, Public: false},
+		{Pattern: "PATCH /admin/api/networks/{id}", Handler: func(w http.ResponseWriter, r *http.Request) { networkHandler.Update(w, r, r.PathValue("id")) }, Public: false},
+		{Pattern: "DELETE /admin/api/networks/{id}", Handler: func(w http.ResponseWriter, r *http.Request) { networkHandler.Delete(w, r, r.PathValue("id")) }, Public: false},
+		// 上游余额查询：逐条凭据打上游的余额端点（见 internal/upstream/balance.go）。
+		// 纯读操作，不改任何配置，因此不触发 AutoReload（挂 reload 的写操作判据
+		// 看的是方法/路径白名单，这里是 POST 却明确不参与，理由见 handler 注释）。
+		{Pattern: "POST /admin/api/providers/{id}/balance", Handler: func(w http.ResponseWriter, r *http.Request) { providerHandler.Balance(w, r, r.PathValue("id")) }, Public: false},
+
+		{Pattern: "GET /admin/api/providers/{id}/credentials", Handler: func(w http.ResponseWriter, r *http.Request) { credentialHandler.List(w, r, r.PathValue("id")) }, Public: false},
+		{Pattern: "POST /admin/api/providers/{id}/credentials", Handler: func(w http.ResponseWriter, r *http.Request) { credentialHandler.Create(w, r, r.PathValue("id")) }, Public: false},
+		{Pattern: "PATCH /admin/api/credentials/{id}", Handler: func(w http.ResponseWriter, r *http.Request) { credentialHandler.Update(w, r, r.PathValue("id")) }, Public: false},
+		{Pattern: "DELETE /admin/api/credentials/{id}", Handler: func(w http.ResponseWriter, r *http.Request) { credentialHandler.Delete(w, r, r.PathValue("id")) }, Public: false},
+
+		{Pattern: "GET /admin/api/providers/{id}/models", Handler: func(w http.ResponseWriter, r *http.Request) { modelHandler.List(w, r, r.PathValue("id")) }, Public: false},
+		{Pattern: "POST /admin/api/providers/{id}/models", Handler: func(w http.ResponseWriter, r *http.Request) { modelHandler.Create(w, r, r.PathValue("id")) }, Public: false},
+		{Pattern: "POST /admin/api/providers/{id}/models/discover", Handler: func(w http.ResponseWriter, r *http.Request) { modelHandler.Discover(w, r, r.PathValue("id")) }, Public: false},
+		{Pattern: "POST /admin/api/providers/{id}/models/import", Handler: func(w http.ResponseWriter, r *http.Request) { modelHandler.ImportModels(w, r, r.PathValue("id")) }, Public: false},
+		{Pattern: "PATCH /admin/api/models/{id}", Handler: func(w http.ResponseWriter, r *http.Request) { modelHandler.Update(w, r, r.PathValue("id")) }, Public: false},
+		{Pattern: "DELETE /admin/api/models/{id}", Handler: func(w http.ResponseWriter, r *http.Request) { modelHandler.Delete(w, r, r.PathValue("id")) }, Public: false},
+		// 批量设置价格：把同一组价格写到多个模型。POST 语义是「整体替换」，
+		// 与单条 PATCH 的 nil=不改 不同 —— 见 model_handler.go 的 batchPriceRequest。
+		// AutoReload 对 POST 自动生效（审计 + 快照重建），无需额外白名单。
+		{Pattern: "POST /admin/api/models/batch-price", Handler: modelHandler.BatchUpdatePrices, Public: false},
+
+		// 模型归组：把不同上游的「同一个模型」标成一组，用量统计可按组显示。
+		// 纯统计/展示层概念，不参与数据面路由判定。
+		{Pattern: "GET /admin/api/model-groups", Handler: modelGroupHandler.List, Public: false},
+		{Pattern: "POST /admin/api/model-groups", Handler: modelGroupHandler.Create, Public: false},
+		{Pattern: "PATCH /admin/api/model-groups/{id}", Handler: func(w http.ResponseWriter, r *http.Request) { modelGroupHandler.Update(w, r, r.PathValue("id")) }, Public: false},
+		{Pattern: "DELETE /admin/api/model-groups/{id}", Handler: func(w http.ResponseWriter, r *http.Request) { modelGroupHandler.Delete(w, r, r.PathValue("id")) }, Public: false},
+		{Pattern: "GET /admin/api/model-groups/{id}/members", Handler: func(w http.ResponseWriter, r *http.Request) { modelGroupHandler.GroupMembers(w, r, r.PathValue("id")) }, Public: false},
+		// 指派/取消指派：路径里的 {id} 是**组** id（对某个组的操作）；
+		// 移出组不属于任何组，所以单独一个 unassign 端点而不是带空 group_id 的指派。
+		{Pattern: "POST /admin/api/model-groups/{id}/assign", Handler: func(w http.ResponseWriter, r *http.Request) { modelGroupHandler.AssignModels(w, r, r.PathValue("id")) }, Public: false},
+		{Pattern: "POST /admin/api/model-groups/unassign", Handler: modelGroupHandler.UnassignModels, Public: false},
+
+		// 上游模型健康探测（读 model_probes 表，不触发探测 —— 探测循环在后台跑）。
+		{Pattern: "GET /admin/api/probes/models", Handler: probeHandler.Models, Public: false},
+		{Pattern: "GET /admin/api/probes/timeline", Handler: probeHandler.Timeline, Public: false},
+		// 单模型可用性探测。与 provider 的 /providers/{id}/test 是两件事：
+		// 那个拉 /models 证明「endpoint + 凭据通」，这个发一次最小真实推理
+		// （max_tokens=1）证明「这个 model_id 现在真的能推理」—— 模型下架、
+		// 账号无权限、名字写错时前者照样绿。见 upstream.TestUpstreamModel。
+		{Pattern: "POST /admin/api/models/{id}/test", Handler: func(w http.ResponseWriter, r *http.Request) { modelHandler.Test(w, r, r.PathValue("id")) }, Public: false},
+		{Pattern: "GET /admin/api/upstream-models", Handler: modelHandler.ListAll, Public: false},
+
+		{Pattern: "GET /admin/api/routes", Handler: routeHandler.List, Public: false},
+		{Pattern: "GET /admin/api/route-catalog", Handler: routeHandler.Catalog, Public: false},
+		{Pattern: "POST /admin/api/routes", Handler: routeHandler.Create, Public: false},
+		{Pattern: "PATCH /admin/api/routes/{id}", Handler: func(w http.ResponseWriter, r *http.Request) { routeHandler.Update(w, r, r.PathValue("id")) }, Public: false},
+		{Pattern: "DELETE /admin/api/routes/{id}", Handler: func(w http.ResponseWriter, r *http.Request) { routeHandler.Delete(w, r, r.PathValue("id")) }, Public: false},
+		{Pattern: "GET /admin/api/routes/{id}/targets", Handler: func(w http.ResponseWriter, r *http.Request) { routeTargetHandler.List(w, r, r.PathValue("id")) }, Public: false},
+		{Pattern: "PUT /admin/api/routes/{id}/targets", Handler: func(w http.ResponseWriter, r *http.Request) { routeTargetHandler.Replace(w, r, r.PathValue("id")) }, Public: false},
+
+		{Pattern: "GET /admin/api/keys", Handler: keyHandler.List, Public: false},
+		// 管理员不能建 key（2026-10 控制面/数据面分离）：普通用户自助建，
+		// 管理员要去建普通用户、由那个用户自己发 key。策略在路由层拦，
+		// internal/admin/key_handler.go 的 Create 保持「普通用户自助」原样。
+		// **若将来另有代码直接用 keyHandler.Create 组路由，必须同样套本包装。**
+		{Pattern: "POST /admin/api/keys", Handler: denyAdminKeyCreate(keyHandler.Create), Public: false},
+		{Pattern: "PATCH /admin/api/keys/{id}", Handler: func(w http.ResponseWriter, r *http.Request) { keyHandler.Update(w, r, r.PathValue("id")) }, Public: false},
+		{Pattern: "DELETE /admin/api/keys/{id}", Handler: func(w http.ResponseWriter, r *http.Request) { keyHandler.Delete(w, r, r.PathValue("id")) }, Public: false},
+		// 重算 used_tokens：触发器维护的派生值没有自愈路径，偏高后 key 会变成死 key。
+		{Pattern: "POST /admin/api/keys/{id}/recompute-usage", Handler: func(w http.ResponseWriter, r *http.Request) { keyHandler.RecomputeUsage(w, r, r.PathValue("id")) }, Public: false},
+
+		{Pattern: "GET /admin/api/stats", Handler: statsHandler.Get, Public: false},
+		{Pattern: "POST /admin/api/reload", Handler: reloadHandler.Reload, Public: false},
+		{Pattern: "GET /admin/api/audit", Handler: auditHandler.List, Public: false},
+		{Pattern: "GET /admin/api/usage", Handler: usageHandler.Query, Public: false},
+		{Pattern: "GET /admin/api/usage/by-key", Handler: usageHandler.GroupByKey, Public: false},
+		{Pattern: "GET /admin/api/usage/by-model", Handler: usageHandler.GroupByModel, Public: false},
+		{Pattern: "GET /admin/api/usage/by-provider", Handler: usageHandler.GroupByProvider, Public: false},
+		{Pattern: "GET /admin/api/usage/by-day", Handler: usageHandler.GroupByDay, Public: false},
+		// 按用户汇总消费（钱包页「消费汇总」一表一行一个用户）。
+		// **admin-only 由 handler 内的 requireAdmin 把关** —— 路径在普通用户可
+		// 访问的 /admin/api/usage 前缀下，AdminGateGuard 的前缀白名单会整体放行，
+		// 管不到名单内部的单个端点。而这是全站口径（每个用户的消费金额 + 用户名），
+		// 普通用户拿到就等于看到同事的账单。与上面的 prune 是同一个坑。
+		{Pattern: "GET /admin/api/usage/by-user", Handler: usageHandler.GroupByUser, Public: false},
+		// 手动触发用量归档。admin-only 由 handler 内的 requireAdmin 把关 ——
+		// 路径在普通用户可访问的 /admin/api/usage 前缀下，白名单管不到这里。
+		{Pattern: "POST /admin/api/usage/prune", Handler: usageHandler.Prune, Public: false},
+		{Pattern: "GET /admin/api/settings", Handler: settingsHandler.Get, Public: false},
+		{Pattern: "PUT /admin/api/settings", Handler: settingsHandler.Update, Public: false},
+		// 供应商 + 模型的导入导出。admin-only 由 handler 内的 requireAdmin 把关
+		// —— 路径在 /admin/api/config- 前缀下，白名单管不到这里，而导出体里
+		// 可能含全部上游凭据，绝不能落到普通用户手里。
+		{Pattern: "POST /admin/api/config-export/export", Handler: configTransferHandler.Export, Public: false},
+		{Pattern: "POST /admin/api/config-export/import", Handler: configTransferHandler.Import, Public: false},
+		{Pattern: "GET /admin/api/usage/history", Handler: usageHandler.History, Public: false},
+		{Pattern: "GET /admin/api/me", Handler: userHandler.Me, Public: false},
+		{Pattern: "POST /admin/api/logout", Handler: userHandler.Logout, Public: false},
+		{Pattern: "GET /admin/api/users", Handler: userHandler.ListUsers, Public: false},
+		{Pattern: "POST /admin/api/users", Handler: userHandler.CreateUser, Public: false},
+		{Pattern: "PATCH /admin/api/users/{id}", Handler: func(w http.ResponseWriter, r *http.Request) { userHandler.UpdateUser(w, r, r.PathValue("id")) }, Public: false},
+		{Pattern: "DELETE /admin/api/users/{id}", Handler: func(w http.ResponseWriter, r *http.Request) { userHandler.DeleteUser(w, r, r.PathValue("id")) }, Public: false},
+		{Pattern: "POST /admin/api/users/{id}/password", Handler: func(w http.ResponseWriter, r *http.Request) { userHandler.ResetPassword(w, r, r.PathValue("id")) }, Public: false},
+		// 余额充值：走 adminMux 即自动要求管理员 + 记审计（AutoReload 对
+		// PUT 走审计分支，字段名由 extractFieldNames 自动取，见 autoreload.go）。
+		// 审计记的是**字段名**（delta_cents）而非数值 —— 这是既有审计的粒度，
+		// 不在本端点内改变。余额变更不需要重建快照：预检与扣费直接读库。
+		{Pattern: "PUT /admin/api/users/{id}/balance", Handler: func(w http.ResponseWriter, r *http.Request) { userHandler.AdjustBalance(w, r, r.PathValue("id")) }, Public: false},
+		// 充值流水查询。**唯一一个**端点，作用域由会话身份决定（不接受参数指定
+		// 查谁）：普通用户只看到自己的，管理员也只看自己的那一份 —— 钱包页是
+		// 个人账本页，不存在「看全站充值」的用例。
+		//
+		// 路径 /admin/api/topups **不在** userAccessiblePrefixes 白名单里，所以
+		// AdminGateGuard 会要求管理员 —— 而普通用户需要看自己的充值记录。所以
+		// 必须把这个前缀加进白名单，作用域收窄由 handler 自己做
+		// （与 key_handler / usage_handler 的 callerScope 同一责任分配：
+		// 白名单只管「谁能进这个端点」，进来之后看谁由 handler 判）。
+		{Pattern: "GET /admin/api/topups", Handler: userHandler.ListTopups, Public: false},
+		{Pattern: "POST /admin/api/me/password", Handler: userHandler.ChangePassword, Public: false},
+		// 分组与模型白名单（多用户改造 P1）。全部 admin-only ——
+		// server.AdminGateGuard 是**前缀白名单**，/groups 不在其中即自动要求管理员。
+		//
+		// 快照重建靠外层 AutoReload，这里不再显式调 reload（见 GroupHandler 注释）。
+		{Pattern: "GET /admin/api/groups", Handler: groupHandler.List, Public: false},
+		{Pattern: "POST /admin/api/groups", Handler: groupHandler.Create, Public: false},
+		{Pattern: "PATCH /admin/api/groups/{id}", Handler: func(w http.ResponseWriter, r *http.Request) { groupHandler.Update(w, r, r.PathValue("id")) }, Public: false},
+		{Pattern: "DELETE /admin/api/groups/{id}", Handler: func(w http.ResponseWriter, r *http.Request) { groupHandler.Delete(w, r, r.PathValue("id")) }, Public: false},
+		// PUT 而不是 PATCH：语义是**整体替换**白名单（勾选后保存），
+		// 不是增量合并。用 PATCH 会让「取消勾选」无法表达。
+		{Pattern: "PUT /admin/api/groups/{id}/models", Handler: func(w http.ResponseWriter, r *http.Request) { groupHandler.SetModels(w, r, r.PathValue("id")) }, Public: false},
+		// 模型名清单：**普通用户也要能读** —— 否则 key 级白名单对他们等于不存在
+		// （/admin/api/routes 是 admin-only，而自助收紧正是这个功能的目的）。
+		// 读到的清单已按身份收窄，见 group_handler.ModelNames。
+		{Pattern: "GET /admin/api/model-names", Handler: groupHandler.ModelNames, Public: false},
+		{Pattern: "GET /admin/api/usage/history.csv", Handler: usageHandler.ExportCSV, Public: false},
+	}
+	registerAdminRoutes(adminMux, publicAdminMux, adminRouteSpecs)
 
 	// 鉴权链：**只有用户会话一条通道**（users 表 + JWT）。
 	//
