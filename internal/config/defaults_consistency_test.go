@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"reflect"
 	"testing"
 )
 
@@ -118,7 +119,8 @@ func TestExampleConfigs_可被解析(t *testing.T) {
 	}
 }
 
-// 三处超时值（config.example.json / docker 默认 / 代码 setDefaults）必须同源。
+// 示例配置的整个 defaults 块（config.example.json / docker 默认 / 代码
+// setDefaults）必须同源。
 // 此前 docker 默认值还是旧的三档，与代码里的 300000/120000/60000 全部不一致
 // —— 容器部署的流式请求会远比裸机更容易被超时掐断，而没有任何报错提示。
 func TestRuntimeDefaults_三处一致(t *testing.T) {
@@ -133,13 +135,8 @@ func TestRuntimeDefaults_三处一致(t *testing.T) {
 			if err != nil {
 				t.Fatalf("解析 %s: %v", p, err)
 			}
-			got := c.Defaults
-			if got.UpstreamTimeoutMs != want.UpstreamTimeoutMs ||
-				got.StreamIdleTimeoutMs != want.StreamIdleTimeoutMs ||
-				got.StreamFirstTokenTimeoutMs != want.StreamFirstTokenTimeoutMs {
-				t.Errorf("超时值与 setDefaults 不一致：\n  文件: %d / %d / %d\n  代码: %d / %d / %d",
-					got.UpstreamTimeoutMs, got.StreamIdleTimeoutMs, got.StreamFirstTokenTimeoutMs,
-					want.UpstreamTimeoutMs, want.StreamIdleTimeoutMs, want.StreamFirstTokenTimeoutMs)
+			if got := c.Defaults; !reflect.DeepEqual(got, want) {
+				t.Errorf("defaults 与 setDefaults 不一致：\n  文件: %+v\n  代码: %+v", got, want)
 			}
 		})
 	}

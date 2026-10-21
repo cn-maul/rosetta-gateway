@@ -6,6 +6,7 @@ import { api, ApiFail } from '../api'
 import { toast, confirmBox } from '../ui'
 import { fmtNum } from '../fmt'
 import { unitPrice, cacheUnitPrice } from '../modelPrice'
+import { MODEL_DEFAULT_FALLBACKS, RUNTIME_DEFAULTS } from '../generated/defaults'
 import AppModal from '../components/AppModal.vue'
 import Tabs from '../components/Tabs.vue'
 import type {
@@ -185,37 +186,8 @@ const err = ref('')
 // 是不是真值」，而这件事只有成功加载过才知道。
 const loadedOnce = ref(false)
 
-// ---------- 运行时推荐默认值（本页唯一真源） ----------
-//
-// 这一组是「我们认为合适的值」，三处必须逐项一致：这里、后端
-// internal/config/config.go 的 setDefaults() 兜底、config.example.json。
-// 不是洁癖 —— 界面回显的必须是**正在生效的数**，而 DB 未配置时生效数
-// 就是 config 的兜底。界面写一个数、实际跑另一个数，运维会照着界面
-// 推理出错误的预期（与下面 derivedTotalBudgetText 同一条纪律）。
-//
-// 取值理由（2026-10-13）：
-//
-//	非流式 120s → 300s：非流式没有增量输出可看，只能干等。2 分钟连 8K
-//	  tokens 的回复都跑不完（按 ~40 tok/s），于是**正常的慢请求**被判成
-//	  超时并触发故障转移 —— 用户侧看到的是「无故变慢 + 结果不对」。
-//	  5 分钟覆盖绝大多数非流式生成；再往上派生的总预算会直接撞上
-//	  30 分钟上限，推导值就永远显示同一个数，失去意义。
-//	TTFT 30s → 60s：带思考/排队的上游（bootstrap 里的 deepseek-reasoner
-//	  就是这一类）首字本来就要几十秒，30s 会把正常响应判成超时并切目标。
-//	空闲 60s → 120s：已开始出字后，两个事件间隔超过 60s 在慢速流上并不罕见；
-//	  调大只影响「真卡死」的发现速度，不影响健康流。
-//	目标数 3 / 熔断阈值 3：维持原值。链上第 4 个目标几乎不提升成功率，
-//	  却把最坏耗时再乘一截；连续失败 3 次已足够判定目标有问题。
-//
-// 注意这只影响**兜底**：DB 里已保存过的值、config.json 里显式写过的值
-// 都不受它影响（老部署的行为因此完全不变），要换成新值在页面上点保存即可。
-const RUNTIME_DEFAULTS = {
-  upstream_timeout_ms: 300_000,
-  stream_first_token_timeout_ms: 60_000,
-  stream_idle_timeout_ms: 120_000,
-  failover_max_targets: 3,
-  failover_failure_threshold: 3,
-}
+// 运行时推荐默认值由 Go 侧生成（go generate ./internal/config）。
+// 原始定义在 internal/config/config.go；这里不再手抄一份数字。
 type RuntimeKey = keyof typeof RUNTIME_DEFAULTS
 
 // 运行时各分类的成员：模板的分组渲染与「这一类是否已偏离推荐值」共用
@@ -227,10 +199,9 @@ const RUNTIME_GROUPS: Record<'nonstream' | 'streaming' | 'failover', RuntimeKey[
 }
 
 const form = reactive({
-  // 与后端 internal/store/settings_dao.go 的兜底常量保持一致：
-  // GET 失败时界面也不该回落到明显偏小的早期值（会被误当成真实生效值）。
-  default_context_window: 131072,
-  default_max_output_tokens: 65536,
+  // 与 Go 侧 store.DefaultModelDefaults() 同源，见 generated/defaults.ts。
+  default_context_window: MODEL_DEFAULT_FALLBACKS.default_context_window,
+  default_max_output_tokens: MODEL_DEFAULT_FALLBACKS.default_max_output_tokens,
   // 运行时全局默认（超时 + 故障转移策略）。原先散落在每条路由上，现统一在此配置。
   upstream_timeout_ms: RUNTIME_DEFAULTS.upstream_timeout_ms,
   stream_idle_timeout_ms: RUNTIME_DEFAULTS.stream_idle_timeout_ms,

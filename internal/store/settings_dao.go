@@ -97,6 +97,15 @@ type ModelDefaults struct {
 	MaxOutputTokens int `json:"max_output_tokens"`
 }
 
+// DefaultModelDefaults is the authored source for the model-capacity fallbacks
+// shared with the admin UI.
+func DefaultModelDefaults() ModelDefaults {
+	return ModelDefaults{
+		ContextWindow:   defaultContextWindowFallback,
+		MaxOutputTokens: defaultMaxOutputTokensFallback,
+	}
+}
+
 func (s *Store) getSetting(ctx context.Context, key string) (string, bool, error) {
 	var v string
 	err := s.read.QueryRowContext(ctx, `SELECT value FROM app_settings WHERE key = ?`, key).Scan(&v)
@@ -152,10 +161,7 @@ func (s *Store) SaveSettings(ctx context.Context, d ModelDefaults, rt RuntimeDef
 
 // GetModelDefaults 返回默认模型容量；未配置时给出常量兜底（不回写）。
 func (s *Store) GetModelDefaults(ctx context.Context) (ModelDefaults, error) {
-	d := ModelDefaults{
-		ContextWindow:   defaultContextWindowFallback,
-		MaxOutputTokens: defaultMaxOutputTokensFallback,
-	}
+	d := DefaultModelDefaults()
 	raw, ok, err := s.getSetting(ctx, settingModelDefaultsKey)
 	if err != nil || !ok {
 		return d, err

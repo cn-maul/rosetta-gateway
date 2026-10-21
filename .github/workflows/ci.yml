@@ -111,6 +111,13 @@ jobs:
             exit 1
           fi
 
+      # 前端的模型/运行时默认值数字来自 Go 单一真源。生成物漂移时页面会
+      # 展示一套「推荐值」、后端实际跑另一套，类型检查与构建却都全绿。
+      - name: 配置默认值生成物一致
+        run: |
+          go generate ./internal/config
+          git diff --exit-code -- web/src/generated/defaults.ts
+
       # 依赖方向是架构约束里最容易在重构中回退的一类：代码能编译、测试也绿，
       # 但 admin 又 import 回 server。单独一步让失败原因一眼可见。
       - name: 架构依赖方向
