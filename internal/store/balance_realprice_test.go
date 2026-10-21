@@ -81,38 +81,5 @@ func TestRealPriceInput_SmallCallsNowGetCharged(t *testing.T) {
 	}
 }
 
-// 老库升级：balance_remainder 列必须被补上，且存量用户余数为 0。
-func TestRealPriceInput_LegacyDBGetsRemainderColumn(t *testing.T) {
-	dir := t.TempDir() + "/gw.db"
-	// 先正常建库，模拟「已上线」的库
-	st := testStore(t, dir)
-	st.Close()
-
-	// 手工删掉余数列，模拟「修复前的 schema」
-	st2 := testStore(t, dir)
-	if _, err := st2.db.Exec(`ALTER TABLE users DROP COLUMN balance_remainder`); err != nil {
-		t.Fatalf("drop column: %v", err)
-	}
-	if _, err := st2.db.Exec(`INSERT INTO users
-		(id, username, password_hash, role, status, auth_version, created_at, updated_at, balance_cents)
-		VALUES ('old','old','x','user','active',1,0,0,5000)`); err != nil {
-		t.Fatalf("seed: %v", err)
-	}
-	st2.Close()
-
-	// 重新打开：ensureColumns 应补回该列
-	st3 := testStore(t, dir)
-	var rem int64
-	if err := st3.read.QueryRowContext(context.Background(),
-		`SELECT balance_remainder FROM users WHERE id='old'`).Scan(&rem); err != nil {
-		t.Fatalf("balance_remainder 未被补上: %v", err)
-	}
-	if rem != 0 {
-		t.Errorf("存量用户余数 = %d, want 0 —— 历史上丢掉的费用不该凭空补记", rem)
-	}
-	// 余额没被动过
-	assertBalance(t, st3, "old", 5000, true)
-}
-
 var _ = slog.Default
 var _ = os.Stderr

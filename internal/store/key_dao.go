@@ -21,8 +21,7 @@ type AccessKey struct {
 	UsedTokens  int64
 	// UserID 是归属用户（多用户改造 P0）。
 	//
-	// 空串 = **无归属**。2026-10-05 定：无归属 key 一律失效 —— 启动迁移
-	// retireOrphanKeys 会把它们置为 enabled=0，且鉴权查不到归属用户时
+	// 空串 = **无归属**。无归属 key 一律失效：鉴权查不到归属用户时
 	// 直接返回 ErrKeyUnowned（401）。所以这个字段在热路径上**必然非空**，
 	// 「跳过用户级配额」的旧兼容分支已不存在（MULTIUSER.md §5.1 的修订）。
 	UserID string
@@ -66,8 +65,8 @@ type AccessKey struct {
 // Scan 目标错位（把 user_id 扫进 rpm_limit），表现为字段被莫名赋值，
 // 且编译与测试全绿。
 //
-// user_id 必须用 COALESCE 兜成空串：它是外键列，无归属 key（迁移前创建的）
-// 在 SQLite 里是真 NULL，而把 NULL 扫进 string 会报
+// user_id 必须用 COALESCE 兜成空串：它是外键列，无归属 key 在 SQLite 里
+// 是真 NULL，而把 NULL 扫进 string 会报
 // "converting NULL to string is unsupported"（见 model_dao 的同款注释）。
 const keyColumns = `id, key_hash, key_prefix, name, enabled, quota_tokens, used_tokens, COALESCE(user_id, '') AS user_id, rpm_limit, tpm_limit, allowed_models_json, expires_at, COALESCE(allowed_ips, '') AS allowed_ips, COALESCE(group_id, '') AS group_id, created_at`
 
@@ -455,34 +454,46 @@ func (s *Store) ReserveQuota(ctx context.Context, id string, est int64) (reserve
 	}
 	defer func() { _ = tx.Rollback() }() //nolint:errcheck // 已提交时是 no-op
 
-	var quota, used, reservedNow int64
-	err = tx.QueryRowContext(ctx,
-		`SELECT quota_tokens, used_tokens, reserved_tokens FROM access_keys WHERE id = ?`, id).
-		Scan(&quota, &used, &reservedNow)
-	if errors.Is(err, sql.ErrNoRows) {
-		return 0, false, nil
-	}
+	// 审计 M1：这条 UPDATE 必须是事务的**第一条语句**。
+	//
+	// 旧实现先 SELECT quota/used/reserved 再 UPDATE。SQLite 的 DEFERRED 事务
+	// 在「先读后写」时，如果读快照与第一次写之间有其它连接提交，升级写事务
+	// 会返回 SQLITE_BUSY_SNAPSHOT；_busy_timeout 对这种「快照已失效」不生效。
+	// 调用方（main.go 配额预检）是 fail-open 的，于是跨连接竞争下会静默
+	// 放行超额请求。把「检查 + 占用」压进一条条件 UPDATE，事务一开始就拿写锁。
+	//
+	// quota_tokens <= 0 表示不限额（GetKeyQuota 同口径）：此时不预占。
+	// 条件里同时判断 used + reserved + est <= quota，命中 0 行后再区分
+	// 「key 不存在」「不限额」「额度不够」三种语义。
+	res, err := tx.ExecContext(ctx,
+		`UPDATE access_keys
+		    SET reserved_tokens = reserved_tokens + ?
+		  WHERE id = ? AND quota_tokens > 0
+		    AND used_tokens + reserved_tokens + ? <= quota_tokens`,
+		est, id, est)
 	if err != nil {
 		return 0, false, err
 	}
-	// quota<=0 = 不限额，与 GetKeyQuota 的判定一致；此时不预占也不受限。
-	if quota <= 0 {
-		return 0, true, tx.Commit()
-	}
-	// 判定必须计入**在途预占**：used 只含已落库的真实用量，不含尚未终结的
-	// 请求。漏掉 reservedNow，并发的第二个请求会在第一个收尾前看到假性余量
-	// —— 正是预占要堵住的 check-then-act 窗口，只是从「读-写分离」换成了
-	// 「列分离」的形态。
-	if used+reservedNow+est > quota {
-		return 0, false, nil // 剩余额度不够本次预估
-	}
-	// 同一事务内把预占推上去：并发请求在此处被 SQLite 写锁串行化，
-	// 第二个请求进来时读到的 reserved_tokens 已含第一个的预占。
-	// 刻意**不写 used_tokens**：真实用量由触发器在 usage 落库时累加，
-	// 这里再写就是双倍记账（见上方「列分离」的说明）。
-	if _, err := tx.ExecContext(ctx,
-		`UPDATE access_keys SET reserved_tokens = reserved_tokens + ? WHERE id = ?`, est, id); err != nil {
+	n, err := res.RowsAffected()
+	if err != nil {
 		return 0, false, err
+	}
+	if n == 0 {
+		// 未命中的三种原因必须区分：不存在/不限额是 no-op 或放行，
+		// 只有「额度不足」才是拒绝。
+		var quota int64
+		qerr := tx.QueryRowContext(ctx,
+			`SELECT quota_tokens FROM access_keys WHERE id = ?`, id).Scan(&quota)
+		if errors.Is(qerr, sql.ErrNoRows) {
+			return 0, false, nil
+		}
+		if qerr != nil {
+			return 0, false, qerr
+		}
+		if quota <= 0 {
+			return 0, true, tx.Commit()
+		}
+		return 0, false, nil // 剩余额度不够本次预估
 	}
 	if err := tx.Commit(); err != nil {
 		return 0, false, err

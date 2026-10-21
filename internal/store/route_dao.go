@@ -81,7 +81,7 @@ func (s *Store) GetRoute(ctx context.Context, id string) (*Route, error) {
 }
 
 func (s *Store) CreateRoute(ctx context.Context, r *Route) error {
-	return createRoute(ctx, s.db, r)
+	return s.CreateRouteWithHeadTarget(ctx, r)
 }
 
 // createRoute 接受 execer，以便在事务里与「种链首目标」原子地一起完成。

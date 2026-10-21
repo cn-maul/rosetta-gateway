@@ -23,7 +23,7 @@ const settingModelDefaultsKey = "model_defaults"
 // 的条件 UPDATE 在**同一个事务**里（见 user_dao.go），「设密成功」与「窗口关闭」
 // 原子生效，不存在「密码设上了但窗口还开着」的中间态。
 //
-// 兼容性：老库已完成引导但缺这个标记时，窗口本来就由「无空密码 admin」关着，
+// 已完成引导但缺这个标记时，窗口本来就由「无空密码 admin」关着，
 // 行为不变；只有 bug 期间恰好留下空密码 admin 的库会再开**最后**一次窗口，
 // 设完即永久关闭。
 const settingBootstrapCompletedKey = "bootstrap_completed"
@@ -71,7 +71,7 @@ func (s *Store) SetBootstrapToken(ctx context.Context, token string) error {
 }
 
 // BootstrapCompleted 报告本安装是否已完成过首次引导。
-// 未写过标记（含老库升级）返回 false —— 此时窗口是否开放仍由
+// 未写过标记返回 false —— 此时窗口是否开放仍由
 // FindUninitializedAdmin 的旧判定兜底。
 func (s *Store) BootstrapCompleted(ctx context.Context) (bool, error) {
 	v, ok, err := s.getSetting(ctx, settingBootstrapCompletedKey)

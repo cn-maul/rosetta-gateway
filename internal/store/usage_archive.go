@@ -1,6 +1,6 @@
 package store
 
-// P1.5：用量归档（终身累计表 + 触发器 + 一次性回填 + 30 天剪枝）。见 MULTIUSER.md §4.8。
+// P1.5：用量归档（终身累计表 + 触发器 + 30 天剪枝）。见 MULTIUSER.md §4.8。
 //
 // 两层结构：
 //   - 表 B `usage_totals`：恒定单行终身累计，由触发器在明细落库时实时累加。
@@ -16,27 +16,10 @@ import (
 	"time"
 )
 
-// 一次性数据迁移的完成标记，存在 app_settings 里。
-//
-// 为什么用标记而不是「靠 SQL 自身幂等」：这两步都是全表扫，每次启动都跑
-// 会让启动时间随历史数据量线性增长；而 backfill 的谓词 `cost_total = 0`
-// 对「未配置价格的模型」恒为真，重跑永远命中同一批行，是死循环的经典形状。
-const (
-	settingUsageCostBackfillKey = "usage_cost_backfilled_v1"
-	// 2026-10-11：users.used_tokens 改为由触发器累加、供配额判定读取后，
-	// 老库里这个列的值是「上次手工 recompute 的快照」，与真实用量无关。
-	// 必须一次性重算，否则所有存量用户的配额会从真实值掉到接近 0
-	// （看起来"额度变多了"）。
-	settingUserUsedTokensBackfillKey = "user_used_tokens_backfilled_v1"
-	settingUsageTotalsSeedKey        = "usage_totals_seeded_v1"
-)
-
 // usageDailyRollupsDDL 是表 A 的建表语句。
 //
-// 抽成常量而不是写死在 migrations 里：老库这张表可能带的是**旧的 7 列主键**
-// （缺 upstream_model 维度），而 SQLite 不能 ALTER TABLE 改主键，只能整张重建 ——
-// 重建时要原样再执行一遍同一份 DDL。两处各写一份迟早漂移，而漂移的后果是
-// 「新建库与重建库的结构不同」，最难查的那类差异。
+// 它是 canonical schema（schema.go）的一部分。归档写入、查询归一化与建表
+// 共用同一份定义，避免「建表口径」与「读写口径」各写一份后静默漂移。
 const usageDailyRollupsDDL = `CREATE TABLE IF NOT EXISTS usage_daily_rollups (
 	day              TEXT NOT NULL,      -- 'YYYY-MM-DD'（本地时区）
 	user_id          TEXT NOT NULL DEFAULT '',
@@ -72,6 +55,10 @@ const usageDailyRollupsDDL = `CREATE TABLE IF NOT EXISTS usage_daily_rollups (
 	-- 请求数」，正是那个分母。
 	ttfb_sum_ms      INTEGER NOT NULL DEFAULT 0,
 	ttfb_count       INTEGER NOT NULL DEFAULT 0,
+	-- 成功请求的首字延迟累计。近期性能卡片只应该看成功样本，
+	-- 而 ttfb_* 还要服务包含失败请求的分组统计，故单独保存。
+	ok_ttfb_sum_ms   INTEGER NOT NULL DEFAULT 0,
+	ok_ttfb_count    INTEGER NOT NULL DEFAULT 0,
 	-- 成功请求的 token / 延迟累计值，单独成列而非用 success_count 去折算
 	-- 总体列。速度（output_tokens / latency）只对成功请求有意义：canceled
 	-- 的 latency 是「断开前跑了多久」，拿它当分母会把平均速度压低，而那个
@@ -79,385 +66,27 @@ const usageDailyRollupsDDL = `CREATE TABLE IF NOT EXISTS usage_daily_rollups (
 	-- 的立身之本，所以宁可多存两列。
 	ok_output_tokens INTEGER NOT NULL DEFAULT 0,
 	ok_latency_sum_ms INTEGER NOT NULL DEFAULT 0,
+	-- 同时满足「成功、正输出、正延迟」的请求数。速度样本数必须来自这里；
+	-- 用 success_count 代替会把非流式/零输出的请求也算进分母。
+	ok_sample_count INTEGER NOT NULL DEFAULT 0,
+	-- 待重算记录数（2026-10-21 修 A6-P1-4 / 汇总 M5）。
+	--
+	-- 为什么归档表需要这一列：usage_records.usage_state 有 'cost_pending'
+	-- 这个值（查价失败 → 费用记 0 → 等后台重算）。剪枝把明细搬进表 A 时，
+	-- **待重算的标记跟着明细一起消失了** —— 而那些记录的费用是 0，
+	-- 重算队列再也捞不到它们（它只扫 usage_records）。于是它们永久停留在
+	-- 「0 元」：用户免单，且没有任何痕迹说明它该被纠正。
+	--
+	-- 这一列是那个标记在归档层的**替身**：剪枝时把待重算的条数累加进来，
+	-- 报表据此能显示「有 N 条待重算」，运维也知道去查。费用本身仍归零
+	-- （重算需要明细里的 token 数，聚合后的表 A 已经没有逐条信息）。
+	--
+	-- 为什么不把「待重算的金额」也算进来：cost_total 对这些行恒为 0，
+	-- 没有可累加的金额 —— 要恢复它就得保留逐条 token，那是明细表的工作。
+	cost_pending_count INTEGER NOT NULL DEFAULT 0,
 	PRIMARY KEY (day, user_id, access_key_id, public_model, upstream_model,
 	             provider_id, ingress_protocol, stream)
 )`
-
-// ensureRollupDimensions 把「旧 7 列主键」的表 A 重建为当前的 8 列。
-//
-// 为什么必须重建而不是 ADD COLUMN：归档写入靠
-// `ON CONFLICT(day, user_id, ..., upstream_model, ...) DO UPDATE` 做幂等合并，
-// 而 SQLite 要求 ON CONFLICT 的目标列**恰好**构成主键或唯一索引。只补列不改
-// 主键 → 那条 ON CONFLICT 直接报错（"target columns for on conflict do update
-// clause do not match any PRIMARY KEY or UNIQUE constraint"）→ 剪枝永久失败；
-// 列在而主键不含它，同样是静默双计。
-//
-// 为什么判定重建不丢数据：缺列的表是「P1.5 schema 已落盘、归档逻辑还没接上」
-// 那一版建的，从来没写入过行 —— 有行就说明真跑过归档，那种库得人工处理。
-// 所以仅在该表为空时重建；非空就让启动失败，比悄悄丢历史好。
-func (s *Store) ensureRollupDimensions() error {
-	has, err := s.columnExists("usage_daily_rollups", "upstream_model")
-	if err != nil {
-		return fmt.Errorf("check rollup dimension column: %w", err)
-	}
-	if has {
-		return nil
-	}
-	var rows int64
-	if err := s.db.QueryRow(`SELECT COUNT(*) FROM usage_daily_rollups`).Scan(&rows); err != nil {
-		return fmt.Errorf("count rollup rows: %w", err)
-	}
-	if rows > 0 {
-		return fmt.Errorf("usage_daily_rollups has %d rows but lacks the upstream_model "+
-			"dimension; archived rows cannot be re-derived from pruned details - repair by hand", rows)
-	}
-	if _, err := s.db.Exec(`DROP TABLE usage_daily_rollups`); err != nil {
-		return fmt.Errorf("drop stale rollup table: %w", err)
-	}
-	if _, err := s.db.Exec(usageDailyRollupsDDL); err != nil {
-		return fmt.Errorf("recreate rollup table: %w", err)
-	}
-	// DROP TABLE 连带删掉它的全部索引（含 ensureUserIndexes 建的
-	// idx_rollup_user / idx_rollup_key），必须逐条重造。
-	// 这里刻意写成完整清单而不是复用 ensureUserIndexes：那个函数还建
-	// access_keys / users 的索引，与本表无关，而它跑在 ensureColumns 之后、
-	// 晚于本次调用。索引清单重复两处的风险是「加索引忘了同步这里」，
-	// 而症状是重建库上的归档查询全表扫 —— 慢，不报错，最难发现的那类。
-	for _, stmt := range []string{
-		`CREATE INDEX IF NOT EXISTS idx_rollup_day ON usage_daily_rollups(day)`,
-		`CREATE INDEX IF NOT EXISTS idx_rollup_user ON usage_daily_rollups(user_id)`,
-		`CREATE INDEX IF NOT EXISTS idx_rollup_key ON usage_daily_rollups(access_key_id)`,
-	} {
-		if _, err := s.db.Exec(stmt); err != nil {
-			return fmt.Errorf("recreate rollup index: %w", err)
-		}
-	}
-	s.logger.Info("recreated usage_daily_rollups with the upstream_model dimension")
-	return nil
-}
-
-// ensureUsageTotalsTrigger 建终身累计触发器。
-//
-// **必须排在 ensureColumns 之后调用**：触发器体引用 NEW.cost_total，而老库的
-// usage_records 原本没有这一列（列是 ensureColumns 补的）。塞进 migrations 列表
-// 去建，老库升级时 SQLite 直接报「no such column: cost_total」→ migrate() 失败
-// → **整个网关起不来**（与 ensureUserIndexes 同一类问题）。
-//
-// 先 DROP 再 CREATE（不用 CREATE ... IF NOT EXISTS）：后者在触发器已存在时
-// 会完全跳过，于是改过触发器体之后**老库永远保留旧体**，与新库静默分叉且不报错
-// —— totals 漂移只有在对账时才可能发现。DROP + CREATE 同样幂等。
-// ensureUserUsageTotalsTrigger 建 user_usage_totals 的累加触发器。
-//
-// # 为什么落在独立窄表而不是 users.used_tokens 列（2026-10-11）
-//
-// 直觉上「加一列 + 触发器」更简单，但它会把整条迁移链卡死：SQLite 在
-// `ALTER TABLE ... RENAME` 时会**校验并重写所有引用该表的触发器**，而
-// ensureColumns 里正有「重建 users 表补列」的逻辑。实测
-// TestMigration_BalanceColumnDefaultsExistingUsersToUnlimited 因此报
-//
-//	error in trigger trg_update_user_usage_totals: no such table: main.users
-//
-// 即：一旦 users 上挂了引用它的触发器，任何重建 users 表的操作都会失败。
-// 同理，将来若有人给 access_keys 重建表，trg_update_used_tokens 也会挡路
-// —— 只是现在还没人那么做，所以没暴露。
-//
-// user_usage_totals 窄、只由迁移创建、不参与任何 DROP/RENAME，因此不会
-// 成为任何 schema 操作的绊脚石。代价是一次 JOIN（读配额时），可忽略。
-//
-// # DROP 与 CREATE 必须在同一条写事务
-//
-// 分两次 Exec 若 DROP 成功、CREATE 失败，会留下「触发器已删没重建」的窗口：
-// 那段时间 total_tokens 完全不再累加，而它是**配额判定的数据源**，直接导致
-// 配额被低估（用户可超额使用）。
-//
-// # 先 DROP 再 CREATE（不用 IF NOT EXISTS）
-//
-// 后者在触发器已存在时会完全跳过，于是改过触发器体之后老库永远保留旧体，
-// 与新库静默分叉且不报错 —— 累计值对不上只有在对账时才可能发现。
-func (s *Store) ensureUserUsageTotalsTrigger() error {
-	tx, err := s.db.Begin()
-	if err != nil {
-		return fmt.Errorf("begin user usage totals trigger tx: %w", err)
-	}
-	defer func() { _ = tx.Rollback() }() //nolint:errcheck // 已提交时是 no-op
-
-	if _, err := tx.Exec(`DROP TRIGGER IF EXISTS trg_update_user_usage_totals`); err != nil {
-		return fmt.Errorf("drop user usage totals trigger: %w", err)
-	}
-
-	// 空串守卫：usage_records.user_id 可为空串（孤儿 key 的历史行，该列没有
-	// 外键 —— 见 store.go 里它的迁移注释）。那类行不属于任何用户，不该在
-	// 窄表里造出一条 id 为空串的记录。
-	//
-	// SELECT ... WHERE 而不是 INSERT ... SELECT ... WHERE：后者在 SQLite 里
-	// 语法非法（WHERE 只能跟在 FROM 之后，不能挂在 VALUES/SELECT 上）。
-	//
-	// ON CONFLICT DO UPDATE 而不是先 SELECT 再 UPDATE：明细是批量落库的，
-	// 同一用户的相邻行必然撞主键，逐行读写会把批量插入退化成 2N 次语句。
-	_, err = tx.Exec(`CREATE TRIGGER trg_update_user_usage_totals
-		AFTER INSERT ON usage_records
-		BEGIN
-		  INSERT INTO user_usage_totals (user_id, total_tokens)
-		    SELECT NEW.user_id, NEW.total_tokens WHERE NEW.user_id <> ''
-		  ON CONFLICT(user_id) DO UPDATE SET
-		    total_tokens = total_tokens + excluded.total_tokens;
-		END`)
-	if err != nil {
-		return fmt.Errorf("create user usage totals trigger: %w", err)
-	}
-	if err := tx.Commit(); err != nil {
-		return fmt.Errorf("commit user usage totals trigger tx: %w", err)
-	}
-	return nil
-}
-
-func (s *Store) ensureUsageTotalsTrigger() error {
-	// DROP 与 CREATE 放在**同一条写事务**里。分两次 Exec 时若 DROP 成功、
-	// CREATE 失败，就会留下「触发器已删但没重建」的窗口 —— 那段时间内
-	// usage_totals 完全不再累加，且没有任何信号（DROP 本身不报错）。
-	tx, err := s.db.Begin()
-	if err != nil {
-		return fmt.Errorf("begin usage totals trigger tx: %w", err)
-	}
-	defer func() { _ = tx.Rollback() }() //nolint:errcheck // 已提交时是 no-op
-
-	if _, err := tx.Exec(`DROP TRIGGER IF EXISTS trg_update_usage_totals`); err != nil {
-		return fmt.Errorf("drop usage totals trigger: %w", err)
-	}
-	_, err = tx.Exec(`CREATE TRIGGER trg_update_usage_totals
-		AFTER INSERT ON usage_records
-		BEGIN
-		  UPDATE usage_totals SET
-		    request_count    = request_count + 1,
-		    success_count    = success_count + CASE WHEN NEW.status = 'ok' THEN 1 ELSE 0 END,
-		    error_count      = error_count + CASE WHEN NEW.status NOT IN ('ok', 'canceled') THEN 1 ELSE 0 END,
-		    input_tokens     = input_tokens + NEW.input_tokens,
-		    output_tokens    = output_tokens + NEW.output_tokens,
-		    total_tokens     = total_tokens + NEW.total_tokens,
-		    cached_tokens    = cached_tokens + NEW.cached_tokens,
-		    reasoning_tokens = reasoning_tokens + NEW.reasoning_tokens,
-		    cost_total       = cost_total + NEW.cost_total,
-		    latency_sum_ms   = latency_sum_ms + NEW.latency_ms,
-		    first_record_at  = CASE WHEN first_record_at = 0 THEN NEW.ts
-		                           ELSE MIN(first_record_at, NEW.ts) END
-		  WHERE id = 1;
-		END`)
-	if err != nil {
-		return fmt.Errorf("create usage totals trigger: %w", err)
-	}
-	if err := tx.Commit(); err != nil {
-		return fmt.Errorf("commit usage totals trigger tx: %w", err)
-	}
-	return nil
-}
-
-// backfillUsageCost 给存量明细补固化费用。
-//
-// cost_total 是 P1.5 新增列，历史行全是 0 —— 直接切到「读 SUM(cost_total)」，
-// 昨天还在报表里的费用今早就凭空归零。所以先按**当前**单价补一遍：
-// 这是唯一一次用当前价回算历史，此后改价不再影响已落库的金额。
-//
-// 分批的原因：一条 UPDATE 覆盖百万行会长时间持有写锁；SQLite 的 UPDATE
-// 又不支持 ORDER BY / LIMIT，所以用 rowid 游标手动切批。
-//
-// 游标而不是 `WHERE cost_total = 0 LIMIT n`：后者在未配价的模型上永远成立，
-// 每批都选中同一批行 → 永不收敛。rowid 游标严格递增，必然终止。
-func (s *Store) backfillUsageCost() error {
-	ctx := context.Background()
-	if done, _, err := s.getSetting(ctx, settingUsageCostBackfillKey); err != nil {
-		return fmt.Errorf("read cost backfill marker: %w", err)
-	} else if done != "" {
-		return nil
-	}
-
-	const batch = 5000
-	var cursor int64
-	var total int64
-	for {
-		// 本批的 rowid 上界。取上界到 UPDATE 之间没有写入竞争：migrate() 跑在
-		// 网关开始接流量之前，且新写入的 cost_total 由 DAO 直接算好。
-		var next sql.NullInt64
-		if err := s.db.QueryRowContext(ctx,
-			`SELECT MAX(rowid) FROM (SELECT rowid FROM usage_records WHERE rowid > ? ORDER BY rowid LIMIT ?)`,
-			cursor, batch).Scan(&next); err != nil {
-			return fmt.Errorf("usage cost backfill cursor: %w", err)
-		}
-		if !next.Valid {
-			break
-		}
-
-		// 口径与 freezeUsageCost 逐字一致，只是搬进 SQL：NULL 价按 0，未命中输入
-		// 用 MAX(input - cached, 0) 兜住上游把 cached 算在 input 之外的情形
-		// （负数会把总额抹成负的）。模型已删除时子查询返回 NULL → COALESCE 成 0
-		// → 该行 0 元，与「未配价 = 0」同语义，不会因一行查不到价就整体失败。
-		res, err := s.db.ExecContext(ctx,
-			`UPDATE usage_records SET cost_total = COALESCE((
-					SELECT (MAX(usage_records.input_tokens - usage_records.cached_tokens, 0) * COALESCE(m.price_input, 0)
-					        + usage_records.cached_tokens * (CASE WHEN COALESCE(m.price_cache_hit, 0) > 0 THEN m.price_cache_hit ELSE COALESCE(m.price_input, 0) END)
-					        + usage_records.output_tokens * COALESCE(m.price_output, 0)) / 1000000.0
-					FROM upstream_models m
-					WHERE m.provider_id = usage_records.provider_id AND m.model_id = usage_records.upstream_model), 0)
-				WHERE rowid > ? AND rowid <= ?`,
-			cursor, next.Int64)
-		if err != nil {
-			return fmt.Errorf("usage cost backfill batch: %w", err)
-		}
-		if n, aerr := res.RowsAffected(); aerr == nil {
-			total += n
-		}
-		cursor = next.Int64
-	}
-
-	if err := s.setSetting(ctx, settingUsageCostBackfillKey, fmt.Sprintf("%d", total)); err != nil {
-		return fmt.Errorf("write cost backfill marker: %w", err)
-	}
-	if total > 0 {
-		s.logger.Info("backfilled frozen cost for historical usage rows", "rows", total)
-	}
-	return nil
-}
-
-// reconcileUsageTotals 把「触发器存在之前就已落库」的明细一次性灌进累计表。
-//
-// 需要它的理由：usage_totals 是 P1.5 新建的空表，触发器只能覆盖此后新插入的行。
-// 不补这一步，老库升级后「全部」档只剩今天的数据 —— 又一种「界面能配但不生效」。
-//
-// # 为什么是覆盖（SET = 子查询聚合）而不是累加
-//
-// 执行点在 migrate() 里、流量开始之前，此时表 B 只有 (id=1) 占位行、全为 0；
-// 覆盖与累加等价，而覆盖对「标记丢失后重跑」是安全的（累加会翻倍）。
-//
-// # 为什么先看 pruned_through_day
-//
-// 剪枝一旦跑过，明细表里已经没有全部历史，按明细重算会把已归档的部分冲掉。
-// 那种情况下表 B 已由触发器与归档共同维护，不能被「重算」倒退覆盖。
-// backfillUserUsedTokens 一次性重算 users.used_tokens。
-//
-// 2026-10-11：这个列从「展示快照」升级为**配额判定的数据源**
-// （SumUserUsedTokens 改为直接读它，见 user_dao.go）。但累加值来自
-// trg_update_user_usage_totals，**只对迁移之后新插入的明细生效** ——
-// 老库里这些值是上次手工 recompute 的快照，与真实用量可以差很远。
-//
-// 不重算的后果：存量用户的 used_tokens 接近 0，配额判定会认为
-// 「几乎没用过」，**等于凭空给所有人发了一份新额度**。这是本次改动里
-// 唯一会造成**真实资损**的路径，所以必须是迁移的一部分而不是可选优化。
-//
-// 口径与 reconcileUsageTotals 完全一致：走 UsageSource（明细 + 归档的
-// UNION ALL），不是只扫明细。理由同上 —— 剪枝跑过之后明细里已经没有
-// 全部历史，只扫明细会把终身累计重算成最近 30 天的数字。
-//
-// 一次性：靠 settings marker 标记，第二次启动直接跳过。marker 在重算**之后**
-// 才写 —— 中途失败会在下次启动重试（重算是幂等的：赋值而非累加）。
-func (s *Store) backfillUserUsedTokens() error {
-	ctx := context.Background()
-	if done, _, err := s.getSetting(ctx, settingUserUsedTokensBackfillKey); err != nil {
-		return fmt.Errorf("read user used_tokens backfill marker: %w", err)
-	} else if done != "" {
-		return nil
-	}
-
-	// 用 CASE 逐用户算，而不是一条 UPDATE ... WHERE id IN (子查询)：
-	// 后者在 users 有上千行时会对每个用户单独跑一遍子查询。
-	// 这里让 SQLite 一次扫完明细后按 user_id 聚合，写回只发生在有量的用户上。
-	//
-	// src 下面被引用两次，而 args 只整体传一次 —— 这只在零占位符下成立，
-	// 理由与 reconcileUsageTotals 里那段注释相同（那里有完整论证）。
-	src, args := UsageSource(UsageFilter{}) //nolint:staticcheck // 见 reconcileUsageTotals：args 必须零长度
-	// 一次性 GROUP BY 算出每个用户的累计值，再写回。
-	//
-	// 为什么不用 `UPDATE users SET used_tokens = (SELECT ... WHERE u.user_id = users.id)`
-	// 那种相关子查询写法：src 是 UNION ALL 的**复合 SELECT**，它的输出列名由
-	// 第一段（明细表）决定，关联时列名解析并不可靠 —— 实测那样写出来的 SQL
-	// 静默返回全 0，回填「成功」但什么都没做（见 usage_dao.go 的注释：
-	// 本包的 SQL 拼接刻意避免了子句之间的列名引用）。
-	//
-	// GROUP BY 版本多扫一次明细，但只跑一次、不在 users 的每一行上重跑，
-	// 总代价更低，且列名解析不受 UNION 影响。
-	//
-	// 一次性写入用 CASE 而非逐行 UPDATE：users 有上千行时，逐行 UPDATE
-	// 会对每行跑一遍临时表查找。
-	// 权威值先写窄表（配额判定读它），展示列 users.used_tokens 随后同步 ——
-	// 两者本轮都从「明细 + 归档」重算，结果一致；分开只是让读者看清
-	// 哪个是判定源、哪个只是显示。
-	if _, err := s.db.ExecContext(ctx,
-		`INSERT INTO user_usage_totals (user_id, total_tokens)
-		 SELECT s2.user_id, SUM(s2.total_tokens) FROM (`+src+`) AS s2
-		 WHERE s2.user_id <> '' GROUP BY s2.user_id
-		 ON CONFLICT(user_id) DO UPDATE SET total_tokens = excluded.total_tokens`, args...); err != nil {
-		return fmt.Errorf("backfill user_usage_totals: %w", err)
-	}
-	if _, err := s.db.ExecContext(ctx,
-		`UPDATE users SET used_tokens = COALESCE((
-		     SELECT SUM(s2.total_tokens) FROM (`+src+`) AS s2
-		     WHERE s2.user_id = users.id
-		   ), 0)`, args...); err != nil {
-		return fmt.Errorf("backfill users.used_tokens: %w", err)
-	}
-
-	s.logger.Info("backfilled users.used_tokens from usage details + rollups",
-		"marker", settingUserUsedTokensBackfillKey)
-	return s.setSetting(ctx, settingUserUsedTokensBackfillKey, "done")
-}
-
-func (s *Store) reconcileUsageTotals() error {
-	ctx := context.Background()
-	if done, _, err := s.getSetting(ctx, settingUsageTotalsSeedKey); err != nil {
-		return fmt.Errorf("read totals seed marker: %w", err)
-	} else if done != "" {
-		return nil
-	}
-
-	var pruned string
-	if err := s.db.QueryRowContext(ctx,
-		`SELECT pruned_through_day FROM usage_totals WHERE id = 1`).Scan(&pruned); err != nil {
-		return fmt.Errorf("read usage_totals watermark: %w", err)
-	}
-	if pruned != "" {
-		// 已有归档水位：表 B 正在被维护，不再重算。标记照写，免得每次启动白查。
-		s.logger.Warn("usage totals already archived; skipping one-time reconcile",
-			"pruned_through_day", pruned)
-		return s.setSetting(ctx, settingUsageTotalsSeedKey, "skipped")
-	}
-
-	// CASE 表达式必须与触发器、与 UsageSource 的归一化列逐字对齐：三处口径
-	// 任何一个不同，「剪枝前后同一窗口数字相等」这条验收就永久做不到。
-	// 这里直接用 UsageSource 而不是「只扫明细」：剪枝跑过之后明细里已经没有
-	// 更早的记录，只扫明细会把终身累计重算成最近 30 天的数字 ——
-	// 那是把「表 B 永久正确」这个存在理由直接推翻。
-	//
-	// pruned_through_day 为空时表 A 必然为空（归档与水位同事务写入），
-	// 所以这个来源在两种状态下都对。
-	//
-	// ⚠️ src 下面被引用**十次**，而 args 只在末尾整体传一次。
-	// 这只在 UsageFilter{} **零占位符**时正确 —— 十个子查询各自含 N 个 ?，
-	// args 却只有一份，按顺序绑定时第 k 个子查询的占位符会绑到 args 的第
-	// 1..N 位，于是**第二个及之后的子查询全部错绑**（读到别的值，或报
-	// "column index out of range"）。
-	//
-	// 当前恰好成立：UsageFilter{} 的所有字段都是零值 → usageSource 不
-	// append 任何参数。将来若给对账加过滤条件（例如只对账某 provider），
-	// 下面十处引用必须同步改成各带一份 args，否则静默算错总额。
-	// 这也是为什么不把 filter 参数化 —— 一旦参数化，这条约束立刻变成地雷。
-	// 对账的口径必须是「全部」，否则终身累计本身就错了。
-	src, args := UsageSource(UsageFilter{}) //nolint:staticcheck // 见上方：args 必须为零长度
-	if _, err := s.db.ExecContext(ctx,
-		`UPDATE usage_totals SET
-		     request_count    = (SELECT `+UsageSumExpr("n", "u")+` FROM `+src+`),
-		     success_count    = (SELECT COALESCE(SUM(u.n_ok), 0) FROM `+src+`),
-		     error_count      = (SELECT COALESCE(SUM(u.n_err), 0) FROM `+src+`),
-		     input_tokens     = (SELECT `+UsageSumExpr("input_tokens", "u")+` FROM `+src+`),
-		     output_tokens    = (SELECT `+UsageSumExpr("output_tokens", "u")+` FROM `+src+`),
-		     total_tokens     = (SELECT `+UsageSumExpr("total_tokens", "u")+` FROM `+src+`),
-		     cached_tokens    = (SELECT `+UsageSumExpr("cached_tokens", "u")+` FROM `+src+`),
-		     reasoning_tokens = (SELECT `+UsageSumExpr("reasoning_tokens", "u")+` FROM `+src+`),
-		     cost_total       = (SELECT `+UsageSumExpr("cost_total", "u")+` FROM `+src+`),
-		     latency_sum_ms   = (SELECT `+UsageSumExpr("latency_sum", "u")+` FROM `+src+`),
-		     first_record_at  = (SELECT COALESCE(MIN(u.bucket_ts), 0) FROM `+src+`)
-		   WHERE id = 1`, args...); err != nil {
-		return fmt.Errorf("reconcile usage totals: %w", err)
-	}
-	return s.setSetting(ctx, settingUsageTotalsSeedKey, fmt.Sprintf("%d", time.Now().UnixMilli()))
-}
 
 // dayExpr 是「本地时区的 YYYY-MM-DD」表达式，表 A 的 day 列与按天趋势共用。
 // 抽成常量的理由：归档写入与查询读取必须逐字同一个表达式，否则边界那天的记录
@@ -634,7 +263,8 @@ func (s *Store) PruneOldUsage(ctx context.Context, keepDays int) (*PruneResult, 
 			     request_count, success_count, error_count,
 			     input_tokens, output_tokens, cached_tokens, reasoning_tokens, total_tokens,
 			     cost_total, latency_sum_ms, ttfb_sum_ms, ttfb_count,
-			     ok_output_tokens, ok_latency_sum_ms)
+			     ok_ttfb_sum_ms, ok_ttfb_count,
+			     ok_output_tokens, ok_latency_sum_ms, ok_sample_count, cost_pending_count)
 			 SELECT `+dayExpr+` AS day,
 			       COALESCE(user_id, ''), access_key_id, public_model, upstream_model, provider_id, ingress_protocol, stream,
 			       COUNT(*),
@@ -650,8 +280,15 @@ func (s *Store) PruneOldUsage(ctx context.Context, keepDays int) (*PruneResult, 
 			       COALESCE(SUM(CASE WHEN ttfb_ms > 0 THEN ttfb_ms ELSE 0 END), 0),
 			       COUNT(CASE WHEN ttfb_ms > 0 THEN 1 END)
 			       ,
+			       COALESCE(SUM(CASE WHEN status = 'ok' AND ttfb_ms > 0 THEN ttfb_ms ELSE 0 END), 0),
+			       COUNT(CASE WHEN status = 'ok' AND ttfb_ms > 0 THEN 1 END),
 			       COALESCE(SUM(CASE WHEN status = 'ok' THEN output_tokens ELSE 0 END), 0),
-			       COALESCE(SUM(CASE WHEN status = 'ok' THEN latency_ms ELSE 0 END), 0)
+			       COALESCE(SUM(CASE WHEN status = 'ok' THEN latency_ms ELSE 0 END), 0),
+			       COUNT(CASE WHEN status = 'ok' AND output_tokens > 0 AND latency_ms > 0 THEN 1 END),
+			       -- 待重算的条数（usage_state='cost_pending'）。它是
+			   -- 「这笔费用还是 0、等着被纠正」的标记，归档时不能丢 ——
+			   -- 丢了就再也没人知道它该收钱（2026-10-21 修 M5）。
+			   COUNT(CASE WHEN usage_state = 'cost_pending' THEN 1 END)
 			  FROM usage_records
 			 WHERE rowid IN (SELECT rid FROM prune_batch)
 			 GROUP BY day, COALESCE(user_id, ''), access_key_id, public_model, upstream_model, provider_id, ingress_protocol, stream
@@ -668,8 +305,12 @@ func (s *Store) PruneOldUsage(ctx context.Context, keepDays int) (*PruneResult, 
 			       latency_sum_ms   = latency_sum_ms + excluded.latency_sum_ms,
 			       ttfb_sum_ms      = ttfb_sum_ms + excluded.ttfb_sum_ms,
 			       ttfb_count       = ttfb_count + excluded.ttfb_count,
+			       ok_ttfb_sum_ms   = ok_ttfb_sum_ms + excluded.ok_ttfb_sum_ms,
+			       ok_ttfb_count    = ok_ttfb_count + excluded.ok_ttfb_count,
 			       ok_output_tokens = ok_output_tokens + excluded.ok_output_tokens,
-			       ok_latency_sum_ms = ok_latency_sum_ms + excluded.ok_latency_sum_ms`); err != nil {
+			       ok_latency_sum_ms = ok_latency_sum_ms + excluded.ok_latency_sum_ms,
+			       ok_sample_count = ok_sample_count + excluded.ok_sample_count,
+			       cost_pending_count = cost_pending_count + excluded.cost_pending_count`); err != nil {
 		return nil, fmt.Errorf("aggregate rollups: %w", err)
 	} else if n, aerr := rollupRes.RowsAffected(); aerr == nil {
 		res.RollupRows = n

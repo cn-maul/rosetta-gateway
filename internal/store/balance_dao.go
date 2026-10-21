@@ -29,7 +29,9 @@ package store
 
 import (
 	"context"
+	"crypto/rand"
 	"database/sql"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"math"
@@ -247,7 +249,7 @@ func (s *Store) HasSufficientBalance(ctx context.Context, userID string, amountC
 //
 // 主键里带上 user_id 不是冗余：只按 request_id 去重时，**两个不同用户**撞上
 // 同一个 request_id，第二个人会被静默跳过 —— 一次真正的扣费凭空消失且无任何
-// 报错（2026-10-10 修复的 P0，见 store.fixBalanceChargesPK）。
+// 报错（2026-10-10 修复的 P0；复合主键由 canonical schema 保证）。
 //
 // 「先占位再累加、且在同一事务」是不可颠倒的：反过来（先扣后占位）时两个
 // 并发重试会各自扣一次、再各占一次位（第二次占位被主键拒绝，但**余额已经
@@ -257,8 +259,9 @@ func (s *Store) HasSufficientBalance(ctx context.Context, userID string, amountC
 // 那次并没有扣。把它提交下去会让此后**每一次**重试都走幂等快速路径、
 // 一分钱都不扣（见下方 ErrInsufficientBalance 分支的注释）。
 //
-// requestID 为空时不做幂等（每次调用都扣）。真实请求都有 request_id
-// （网关从请求头取），空串只在手工/测试路径出现。
+// requestID 为空时仍会生成一个单次调用的随机幂等键（*X17）。
+// 这不会把两次独立调用误去重，但能保证余额扣减与流水使用同一个键；
+// 真实请求恒非空，由 server.Middleware 生成。
 //
 // # 绝不扣成负数
 //
@@ -315,13 +318,95 @@ func (s *Store) ChargeBalance(ctx context.Context, userID string, amountYuan flo
 		return nil
 	}
 
+	chargeKey := requestID
+	if chargeKey == "" {
+		chargeKey = generateChargeKey()
+	}
+
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
 	}
 	defer func() { _ = tx.Rollback() }() //nolint:errcheck // 已提交时是 no-op
 
-	if requestID != "" {
+	// 审计 *X17：欠费需要在同一事务里撤销「扣费尝试」并写欠款。
+	// savepoint 正好给出这个局部回滚边界：占位、余数累加和余额更新都属于
+	// 尝试的一部分；欠款写入属于失败后的终态，不能被它一起撤掉。
+	if _, err := tx.ExecContext(ctx, `SAVEPOINT charge_attempt`); err != nil {
+		return err
+	}
+	_, err = s.chargeBalanceTx(ctx, tx, userID, amountYuan, chargeKey)
+	if errors.Is(err, ErrInsufficientBalance) {
+		if _, rerr := tx.ExecContext(ctx, `ROLLBACK TO charge_attempt`); rerr != nil {
+			return rerr
+		}
+		if _, rerr := tx.ExecContext(ctx, `RELEASE charge_attempt`); rerr != nil {
+			return rerr
+		}
+		// 占位行与余数累加已被局部回滚，充值后同 request_id 仍能重试。
+		// 欠款以同一个幂等键写入；重试成功时再删掉它，避免充值结转后
+		// 又被同一次扣费收第二遍。
+		if perr := s.recordPendingRemainderTx(ctx, tx, chargeKey, userID,
+			YuanToMicros(amountYuan)); perr != nil {
+			return perr
+		}
+		if err := tx.Commit(); err != nil {
+			return err
+		}
+		return ErrInsufficientBalance
+	}
+	if err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `RELEASE charge_attempt`); err != nil {
+		return err
+	}
+
+	// 成功扣费（或幂等命中）后，清掉同一调用留下的欠款。正常情况下这里
+	// 没有行；它覆盖的是「欠费提交 → 充值/改余额 → 同 request_id 重试成功」
+	// 这条恢复路径。若不清理，充值结转和本次补扣会把同一笔钱收两遍。
+	if _, err := tx.ExecContext(ctx,
+		`DELETE FROM balance_pending WHERE request_id = ? AND user_id = ?`,
+		chargeKey, userID); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+// chargeBalanceTx 是 ChargeBalance 的事务内实现。
+//
+// # 为什么要把它从 ChargeBalance 里拆出来（2026-10-21 修 P0-5）
+//
+// RecomputeCost 需要在**同一事务**里做三件事：改明细的 cost_total、
+// 补记累计表（表 B）、补扣余额。把扣费逻辑留在 ChargeBalance 里就做不到
+// —— 那是「开一笔自己的事务」，于是「明细改了、余额没扣」或反之都可能发生。
+//
+// # chargeKey 是**幂等键**，不是业务上的 request_id（2026-10-21 修 P0-5 的第二层成因）
+//
+// 落库时的正常扣费用 request_id 当幂等键（同一 request_id 只扣一次）。
+// 但「重算补扣」必须用**另一个**键 —— 否则补扣会撞上落库时那次扣费的占位行，
+// 命中「已扣过」而直接返回，**一分钱都补不上**。
+//
+// 实测（2026-10-21 修复前的探针）：落库时按 cost=0.0006 扣过一次（占位行已写），
+// 重算把费用改成 0.1004，差额 0.0998 元本该补扣，
+// 但因为幂等键相同，chargeBalanceTx 直接返回「已扣过」——
+// 余额分文未动，而明细与报表都说这笔该收 0.1004 元。
+// 这正是 P0-5「重算只修报表不修余额」的**第二层**成因：既便补扣逻辑
+// 写对了，幂等键选错也让它变成空操作。
+//
+// 补扣的键由 recomputeChargeKey 生成（见那里的说明），它编码了
+// 「目标费用」—— 于是：
+//   - 同一笔重算重复执行 → 同键 → 幂等命中 → 不重复扣；
+//   - 费用再次变化（管理员改价）→ 不同的目标费用 → 不同的键 → 补扣新的差额。
+//
+// 欠费时本函数**不**回滚、**不**记账，只返回 ErrInsufficientBalance：
+// 回滚与 balance_pending 记账都由持有事务的调用方在连接释放后决定
+// （理由见函数体内「为什么本函数不自己回滚」）。
+// 注意：幂等命中时**不报错、不改余额**，但占位行本身已经写进事务 ——
+// 调用方若在同事务里做了别的事，这些事要一并提交还是回滚由调用方决定。
+func (s *Store) chargeBalanceTx(ctx context.Context, tx *sql.Tx, userID string, amountYuan float64, chargeKey string) (charged bool, err error) {
+
+	if chargeKey != "" {
 		// 先占位：主键冲突 = 已扣过，幂等返回。
 		//
 		// amount_cents 的初值写死 0，且**它就是最终值**（除非本次费用够一分，
@@ -331,12 +416,13 @@ func (s *Store) ChargeBalance(ctx context.Context, userID string, amountYuan flo
 		res, err := tx.ExecContext(ctx,
 			`INSERT OR IGNORE INTO balance_charges (request_id, user_id, amount_cents, ts)
 			 VALUES (?, ?, 0, ?)`,
-			requestID, userID, time.Now().UnixMilli())
+			chargeKey, userID, time.Now().UnixMilli())
 		if err != nil {
-			return err
+			return false, err
 		}
 		if n, aerr := res.RowsAffected(); aerr == nil && n == 0 {
-			return tx.Commit()
+			// 幂等命中：已经扣过，本次不重复扣。
+			return false, nil
 		}
 	}
 
@@ -362,15 +448,17 @@ func (s *Store) ChargeBalance(ctx context.Context, userID string, amountYuan flo
 		if perr := tx.QueryRowContext(ctx,
 			`SELECT balance_cents FROM users WHERE id = ?`, userID).Scan(&probe); perr != nil {
 			if errors.Is(perr, sql.ErrNoRows) {
-				return ErrNotFound
+				return false, ErrNotFound
 			}
-			return perr
+			return false, perr
 		}
 		// 行存在但 balance_cents 为 NULL = 不限额：正常 no-op。
-		return tx.Commit()
+		// 余额无限、这笔钱不用扣 —— 但**占位行已经写了**，它表达的是
+		// 「这次已经处理过」，对账需要它。
+		return true, nil
 	}
 	if err != nil {
-		return err
+		return false, err
 	}
 	// 未够一分：余数已攒下，余额不动，流水行的 amount_cents **保持占位时的 0**。
 	// 这是正常状态而不是「没扣到钱」——下次凑够时一起收。
@@ -389,7 +477,9 @@ func (s *Store) ChargeBalance(ctx context.Context, userID string, amountYuan flo
 	// 而唯一会写非 0 的地方是后者（下面的 UPDATE）。两条路径互斥，所以
 	// 不足一分时该列恒为占位时的 0。行为完全不变，只是少一次写。
 	if remainder < MicrosPerCent {
-		return tx.Commit()
+		// 余数已攒下，余额不动。占位行已写（本次已处理），返回 charged=true
+		// 表示「这一笔已入账（金额 0 分，进了余数）」。
+		return true, nil
 	}
 
 	// 够扣的钱：整分部分从余额扣掉，零头留在余数里继续攒。
@@ -402,13 +492,13 @@ func (s *Store) ChargeBalance(ctx context.Context, userID string, amountYuan flo
 	if _, err := tx.ExecContext(ctx,
 		`UPDATE users SET balance_remainder = ?, updated_at = ? WHERE id = ?`,
 		newRemainder, time.Now().UnixMilli(), userID); err != nil {
-		return err
+		return false, err
 	}
 	// 流水行记**本次实际从余额扣掉的分数**，让对账有据可依。
 	if _, err := tx.ExecContext(ctx,
 		`UPDATE balance_charges SET amount_cents = ? WHERE request_id = ? AND user_id = ?`,
-		cents, requestID, userID); err != nil {
-		return err
+		cents, chargeKey, userID); err != nil {
+		return false, err
 	}
 
 	// 扣费：**一条 UPDATE 原子完成「判余额 + 扣减」**。
@@ -434,12 +524,12 @@ func (s *Store) ChargeBalance(ctx context.Context, userID string, amountYuan flo
 		  WHERE id = ? AND balance_cents IS NOT NULL AND balance_cents >= ?`,
 		cents, now, userID, cents)
 	if err != nil {
-		return err
+		return false, err
 	}
-	charged, err := res.RowsAffected()
+	rows, err := res.RowsAffected()
 	if err != nil {
 		// 无法确认影响行数时不谎报成功：宁可让调用方把这次扣费当失败。
-		return err
+		return false, err
 	}
 
 	// UPDATE 命中 0 行有三种原因，语义完全相反，必须区分后再报错。
@@ -491,42 +581,34 @@ func (s *Store) ChargeBalance(ctx context.Context, userID string, amountYuan flo
 		`SELECT balance_cents FROM users WHERE id = ?`, userID).Scan(&balance)
 	switch {
 	case errors.Is(err, sql.ErrNoRows):
-		return ErrNotFound
+		return false, ErrNotFound
 	case err != nil:
-		return err
-	case balance.Valid && balance.Int64 < cents && charged == 0:
+		return false, err
+	case balance.Valid && balance.Int64 < cents && rows == 0:
 		// 余额确实不够。结算已经发生（上游已被调用、费用已固化进
 		// cost_total），钱收不回 —— 报欠费比悄悄放过更诚实。
 		// 同样回滚占位：这次没扣成，充值后的重试必须还能扣。
 		//
-		// ★ 必须**先显式回滚再记账**（2026-10-12 实测踩到的死锁）：
-		// 写池是 SetMaxOpenConns(1)，本事务此刻正**独占**那唯一一条连接。
-		// 若直接调 recordPendingRemainder（它走 s.db 取连接），就是自己
-		// 等自己 —— 连接永远等不到，测试表现为 ChargeBalance 挂死、
-		// go test 堆栈停在 `database/sql.(*DB).conn` 的 select 上。
+		// 欠费：把事实报回去，**回滚与记账由调用方决定**。
 		//
-		// 这里的 tx.Rollback() 与函数尾部的 `defer tx.Rollback()` 是同一个
-		// no-op 语义的两次调用：已回滚后再 Rollback 是安全空操作（Tx 内部
-		// 状态机保证），所以这里提前调用不影响 defer 的兜底职责。
-		if err := tx.Rollback(); err != nil {
-			// 回滚失败属于异常（连接已坏）。仍然把欠费报出去 ——
-			// 用户确实欠费，这个事实不能因为记账失败而改变。
-			s.logger.Error("balance: rollback before recording pending failed",
-				"error", err, "request_id", requestID, "user_id", userID)
-		}
-		// 连接已释放，现在可以安全地用独立事务记待结算账本。
-		if requestID != "" {
-			if perr := s.recordPendingRemainder(context.Background(), requestID, userID,
-				YuanToMicros(amountYuan)); perr != nil {
-				// 记账失败不能盖住欠费这个主要事实：欠费是调用方要处理的
-				// （用户已用完额度），零头漏收只是账目瑕疵。
-				s.logger.Error("balance: record pending remainder failed",
-					"error", perr, "request_id", requestID, "user_id", userID)
-			}
-		}
-		return ErrInsufficientBalance
+		// ★ 为什么本函数不自己回滚（2026-10-21）
+		//
+		// 1. 它可能不是事务的**所有者**：chargeBalanceTx 也被
+		//    RecomputeCost 调用，而那条路径的事务是外层建的、还要用它写
+		//    明细与累计表 —— 在这里回滚会把**外层**的工作一起撤掉。
+		// 2. **回滚后不能在本函数里记账**：记账要走 s.db 取连接，而写池是
+		//    SetMaxOpenConns(1)、本事务正**独占**那唯一一条连接。回滚之后
+		//    连接已释放、才能安全记账（2026-10-12 实测踩到的死锁：
+		//    ChargeBalance 挂死、堆栈停在 database/sql.(*DB).conn 的 select）。
+		//    所以记账必须由**持有事务的那个调用方**在回滚之后做。
+		//
+		// 3. 若本函数在事务仍打开时记账，就是自己等自己 —— 死锁。
+		//
+		// 于是分工是：本函数只报「欠费」；调用方回滚后自行决定要不要
+		// 记 balance_pending（见 ChargeBalance 与 RecomputeCost）。
+		return false, ErrInsufficientBalance
 	}
-	return tx.Commit()
+	return true, nil
 }
 
 // recordPendingRemainder 把一笔欠费金额记进 balance_pending 待结算账本。
@@ -540,50 +622,221 @@ func (s *Store) ChargeBalance(ctx context.Context, userID string, amountYuan flo
 //
 // recordID 为空时不做：没有幂等键就无法保证不重复，只能放弃这一笔
 // （与 ChargeBalance 里「空 request_id 不扣费」的口径一致）。
-func (s *Store) recordPendingRemainder(ctx context.Context, requestID, userID string, micros int64) error {
-	if requestID == "" || micros <= 0 {
+func (s *Store) recordPendingRemainderTx(ctx context.Context, tx *sql.Tx, requestID, userID string, micros int64) error {
+	if micros <= 0 {
 		return nil
 	}
-	_, err := s.db.ExecContext(ctx,
+	key := requestID
+	if key == "" {
+		// 审计 *X17：空 request_id 不能变成「不入账」的理由。生成一个
+		// 单次事务内的随机键，既保留唯一约束，也不会把两次独立调用误去重。
+		key = "internal-pending-" + generateChargeKey()
+	}
+	_, err := tx.ExecContext(ctx,
 		`INSERT OR IGNORE INTO balance_pending (request_id, user_id, amount_micros, ts)
 		 VALUES (?, ?, ?, ?)`,
-		requestID, userID, micros, time.Now().UnixMilli())
+		key, userID, micros, time.Now().UnixMilli())
 	return err
+}
+
+// generateChargeKey 为没有 request_id 的调用生成单次幂等键。
+// 8 字节与 server 的 request_id 同量级；这里只要求同一事务内不撞键，
+// 不需要跨进程可追踪。
+func generateChargeKey() string {
+	var b [8]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		// crypto/rand 失败时不能返回空串（会退化成 SQL NULL 一样的行为）。
+		// 时间戳至少能保证当前进程内单次调用得到一个非空、近乎唯一的键。
+		return fmt.Sprintf("fallback-%d", time.Now().UnixNano())
+	}
+	return hex.EncodeToString(b[:])
+}
+
+// pendingRow 是 balance_pending 的一行：某次欠费留下的待结算金额。
+//
+// requestID 是幂等键（与 balance_charges 同源）—— 精确删除靠它。
+type pendingRow struct {
+	requestID string
+	micros    int64
+	userID    string
 }
 
 // settlePendingForUser 在**充值**时把该用户的待结算零头并入余额。
 //
 // 零头本来就是他欠的钱，充值后收掉天经地义，不需要额外的对账流程。
 //
-// dbtx 刻意接受接口而非 *sql.Tx：调用方 AdjustBalanceWithLedger 刻意不绑
-// 事务（见那里「不为此把低频管理写绑进长事务」的论证），传 s.db 即可。
+// # 必须单事务 + 精确删行（2026-10-21 修 P0-1/2/3/4）
 //
-// amount_micros → 分的换算：1 分 = MicrosPerCent 微元，整除部分扣账。
-// **不足一分的部分直接核销、不留**：充值是结清时刻，与 balance_remainder 的
-// 「攒够才扣」不同 —— 留着它永远不足一分、永远扣不出去，那是纯粹的泄漏。
-func (s *Store) settlePendingForUser(ctx context.Context, dbtx dbtx, userID string) error {
-	var totalMicros sql.NullInt64
-	if err := dbtx.QueryRowContext(ctx,
-		`SELECT COALESCE(SUM(amount_micros), 0) FROM balance_pending WHERE user_id = ?`,
-		userID).Scan(&totalMicros); err != nil {
-		return fmt.Errorf("sum pending: %w", err)
+// 旧实现是三条**自动提交**语句（SUM → UPDATE → DELETE），中间没有任何互斥：
+//
+//	SELECT COALESCE(SUM(amount_micros),0) FROM balance_pending WHERE user_id=?
+//	UPDATE users SET balance_cents = MAX(0, COALESCE(balance_cents,0) - ?) ...
+//	DELETE FROM balance_pending WHERE user_id = ?          ← 整表按 user_id 删
+//
+// 四个缺陷，全在这三条语句的组合里：
+//
+//   - **P0-1 重复结转（多收用户的钱）**：两个管理员并发给同一用户充值，
+//     各自 SUM 到同一笔欠款、各自扣一次 —— 同一笔欠款被扣两次。
+//     实测复现率 59/60（98%）。
+//   - **P0-2 崩溃窗口（同一笔欠款被扣两次）**：UPDATE 与 DELETE 之间进程
+//     被杀 → 余额已扣、账本还在 → 下次充值再扣一次。这是**确定性**的。
+//   - **P0-3 无限额被切成有限额**：`COALESCE(balance_cents,0)` 把 NULL
+//     （= 不限额）当成 0，于是结转把「无限额」写回一个非 NULL 整数。
+//     实测：不限额用户充值后变成 9700 分的有限额用户。
+//   - **P0-4 并发新欠款被无辜抹掉（漏收）**：DELETE 删的是「该用户全部行」，
+//     不是「我 SUM 到的那些行」—— 结算期间并发插入的新欠款被一并删掉，
+//     而它**从未被扣**。实测复现率 60/60（100%）。
+//
+// # 现在的形态
+//
+//  1. **一个事务**包住「读账本 → 扣余额 → 删账本」。SQLite 的写锁把并发
+//     充值串行化：第二个事务进来时读到的账本已经是第一个事务清过的。
+//     崩溃窗口随之消失（要么全成、要么全不成）。
+//  2. **精确删行**：只删本次 SUM 覆盖到的 request_id。并发插入的新欠款
+//     自然不被触及（P0-4）。
+//  3. **NULL 语义正确**：balance_cents IS NULL（不限额）时**不写这一列**
+//     （P0-3）。无限额用户不存在「余额不足」，欠款无从谈起 ——
+//     不限额用户本来也进不了欠费分支（ChargeBalance 的守卫排除它），
+//     但 SetBalance 可以在欠费**之后**把用户切成不限额，于是 pending 行
+//     就成了「给一个无限额用户记账的债务」：那种行应当被**核销**而不是
+//     扣款。
+//
+// # 为什么仍然允许「不足一分的部分直接核销」
+//
+// 充值是结清时刻，与 balance_remainder 的「攒够才扣」不同 —— 留着它永远
+// 不足一分、永远扣不出去，那是纯粹的泄漏。
+func (s *Store) settlePendingForUser(ctx context.Context, tx *sql.Tx, userID string) error {
+	// 读账本：既要总额，也要**具体哪些行**（用于精确删）。
+	//
+	// 不用 SUM 而用逐行读：精确删行需要行标识，而 SUM 拿不到。
+	// pending 的行数是「该用户欠费次数」，量级很小（欠费用户才非零），
+	// 全量读入内存没有压力。
+	rows, err := tx.QueryContext(ctx,
+		`SELECT request_id, amount_micros, user_id FROM balance_pending WHERE user_id = ?
+		 ORDER BY ts, request_id`,
+		userID)
+	if err != nil {
+		return fmt.Errorf("read pending: %w", err)
 	}
-	if !totalMicros.Valid || totalMicros.Int64 <= 0 {
+	var items []pendingRow
+	var totalMicros int64
+	for rows.Next() {
+		var it pendingRow
+		if err := rows.Scan(&it.requestID, &it.micros, &it.userID); err != nil {
+			rows.Close()
+			return fmt.Errorf("scan pending: %w", err)
+		}
+		items = append(items, it)
+		totalMicros += it.micros
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("iterate pending: %w", err)
+	}
+	if len(items) == 0 || totalMicros <= 0 {
 		return nil
 	}
 
-	cents := totalMicros.Int64 / MicrosPerCent
-	if cents > 0 {
-		if _, err := dbtx.ExecContext(ctx,
-			`UPDATE users SET balance_cents = MAX(0, COALESCE(balance_cents,0) - ?), updated_at = ?
-			  WHERE id = ?`,
-			cents, time.Now().UnixMilli(), userID); err != nil {
-			return fmt.Errorf("settle pending: %w", err)
+	// 扣款前的余额。
+	//
+	// NULL = 不限额。理论上不该走到这里（SetBalance 会把用户设成不限额
+	// 的同时核销欠款，充值路径也会先把不限额转成有限额），但**防御**一下：
+	// 万一余额在本次事务内被改成 NULL，绝不能用 COALESCE 把它当 0 扣成
+	// 有限额（P0-3）。核销掉这批行、不扣款。
+	var balance sql.NullInt64
+	if err := tx.QueryRowContext(ctx,
+		`SELECT balance_cents FROM users WHERE id = ?`, userID).Scan(&balance); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			// 用户不存在：账本里的行是孤儿（用户被删了）。FK 是
+			// ON DELETE CASCADE，理论上不会留孤儿；但老数据可能没有。
+			// 核销掉，不报错 —— 否则一笔历史欠款能永久挡住充值。
+			s.logger.Warn("settle pending: user not found, dropping orphan pending rows",
+				"user_id", userID, "rows", len(items))
+			return s.deletePendingRows(ctx, tx, items)
 		}
+		return fmt.Errorf("read balance for settle: %w", err)
 	}
-	if _, err := dbtx.ExecContext(ctx,
-		`DELETE FROM balance_pending WHERE user_id = ?`, userID); err != nil {
-		return fmt.Errorf("clear pending: %w", err)
+
+	if !balance.Valid {
+		// 不限额 → 核销（P0-3：绝不把 NULL 写成有限额）。
+		if err := s.deletePendingRows(ctx, tx, items); err != nil {
+			return err
+		}
+		s.logger.Info("settle pending: unlimited user, pending rows dropped",
+			"user_id", userID, "rows", len(items), "micros", totalMicros)
+		return nil
+	}
+
+	cents := totalMicros / MicrosPerCent
+	if cents > 0 {
+		// 守卫：余额不够时不能把余额扣成负数。
+		//
+		// MAX(0, ...) 是下界夹住（防御纵深），但真正该做的是「只扣得起的
+		// 部分」：欠款超过余额时，扣光余额并把剩下的欠款**留在账本里** ——
+		// 那是用户还欠的钱，不该被核销掉（旧实现会把超出部分一并删掉，
+		// 那正是「用户欠了 10 元、余额 3 元、充值后账本清零」的漏收）。
+		deduct := cents
+		if deduct > balance.Int64 {
+			deduct = balance.Int64
+		}
+		if deduct > 0 {
+			if _, err := tx.ExecContext(ctx,
+				`UPDATE users SET balance_cents = MAX(0, balance_cents - ?), updated_at = ?
+				  WHERE id = ? AND balance_cents IS NOT NULL`,
+				deduct, time.Now().UnixMilli(), userID); err != nil {
+				return fmt.Errorf("settle pending: %w", err)
+			}
+		}
+		// 扣光的部分核销，**扣不动的那部分留在账本里**。
+		// 逐行删：本次结转能覆盖的行才删，其余留给下次充值。
+		//
+		// 覆盖规则：从最早的一行开始扣（按 ts 排序 —— 欠费是有先后的，
+		// 先欠的先结），扣到余额用完为止。
+		var settled []pendingRow
+		budget := deduct * MicrosPerCent
+		for _, it := range items {
+			if budget <= 0 {
+				break
+			}
+			if it.micros <= budget {
+				budget -= it.micros
+				settled = append(settled, it)
+				continue
+			}
+			// 这一行只能扣一部分：把已扣的部分扣掉，剩下的留账本。
+			if budget > 0 {
+				if _, err := tx.ExecContext(ctx,
+					`UPDATE balance_pending SET amount_micros = amount_micros - ?
+					  WHERE request_id = ? AND user_id = ?`,
+					budget, it.requestID, userID); err != nil {
+					return fmt.Errorf("settle pending partial: %w", err)
+				}
+				budget = 0
+			}
+		}
+		if len(settled) > 0 {
+			if err := s.deletePendingRows(ctx, tx, settled); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+
+	// 总额不足一分：直接核销（充值是结清时刻，见函数头说明）。
+	return s.deletePendingRows(ctx, tx, items)
+}
+
+// deletePendingRows 精确删除给定的那几行 pending。
+//
+// **绝不**用 `DELETE ... WHERE user_id = ?`：那会连并发写入的新欠款一起删掉
+// （P0-4）。逐个 request_id 删，作用集合与「本次 SUM 覆盖到的行」严格一致。
+func (s *Store) deletePendingRows(ctx context.Context, tx *sql.Tx, items []pendingRow) error {
+	for _, it := range items {
+		if _, err := tx.ExecContext(ctx,
+			`DELETE FROM balance_pending WHERE request_id = ? AND user_id = ?`,
+			it.requestID, it.userID); err != nil {
+			return fmt.Errorf("clear pending row: %w", err)
+		}
 	}
 	return nil
 }
@@ -603,10 +856,60 @@ func (s *Store) SetBalance(ctx context.Context, userID string, cents int64, unli
 	if cents < 0 {
 		cents = 0
 	}
+	// 设为「不限额」= 免掉该用户的欠费（P0-3 的正解在这里）。
+	//
+	// 「不限额」的语义是「没有余额约束」—— 既然余额无限，「欠费」就无从
+	// 谈起，那笔待结算的欠款是历史遗留（用户当时余额不足）。
+	//
+	// 为什么必须在这里清、而不是在结转时清：结转只在**充值**时发生，而
+	// 「设为不限额」是一条独立的管理写。把「免债」绑在充值上，就变成
+	// 「管理员免了债，但必须先充一次钱才生效」—— 而充值本身会把不限额
+	// 转成有限额（那是 was_unlimited 字段刻意记录的语义），于是顺序上
+	// 互相打架。
+	//
+	// 旧实现不在这里清，而是让结转去处理，于是结转用
+	// COALESCE(balance_cents,0) 把 NULL 当 0 —— 把「无限额」写回一个
+	// 非 NULL 整数（用户从无限额度变成有限额 9700 分，方向还可能正好
+	// 是 0 → 立刻被余额预检拦成 402）。这是 P0-3 的实际危害。
+	if unlimited {
+		return s.setBalanceUnlimited(ctx, userID)
+	}
 	res, err := s.db.ExecContext(ctx,
 		`UPDATE users SET balance_cents = ?, updated_at = ? WHERE id = ?`,
 		balanceValue(cents, unlimited), time.Now().UnixMilli(), userID)
 	return checkAffected(res, err)
+}
+
+// setBalanceUnlimited 把用户设为不限额，并核销其待结算欠款。
+//
+// 两步在**同一个事务**里：设成不限额与免掉欠款必须同时成立 ——
+// 只设不限额而留着欠款，那笔账会在下次充值时被收回来（等于「免掉的债
+// 又活了」）；只免欠款而没设不限额，则用户仍然被余额约束。
+func (s *Store) setBalanceUnlimited(ctx context.Context, userID string) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }() //nolint:errcheck // 已提交时是 no-op
+
+	res, err := tx.ExecContext(ctx,
+		`UPDATE users SET balance_cents = NULL, updated_at = ? WHERE id = ?`,
+		time.Now().UnixMilli(), userID)
+	if err != nil {
+		return err
+	}
+	if n, aerr := res.RowsAffected(); aerr == nil && n == 0 {
+		// 用户不存在：与 SetBalance 的既有口径一致（checkAffected 会报
+		// ErrNotFound）。这里直接走同一条路径。
+		return checkAffected(res, nil)
+	}
+
+	// 核销待结算欠款。
+	if _, err := tx.ExecContext(ctx,
+		`DELETE FROM balance_pending WHERE user_id = ?`, userID); err != nil {
+		return fmt.Errorf("clear pending for unlimited: %w", err)
+	}
+	return tx.Commit()
 }
 
 // AdjustBalance 管理员对余额做**相对增减**（充值用这个更安全）。

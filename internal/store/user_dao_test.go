@@ -50,41 +50,6 @@ func seedUsage(t *testing.T, db *Store, id, keyID, userID string, tokens int) {
 
 // ---- 迁移兼容性（最重要的一组）----
 
-// 老库升级：先造一个「改造前」的 access_keys 行（还没有 user_id 列），
-// 再用同一文件重开，验证迁移把它变成 user_id 为 NULL 的无归属 key
-// 且**读取不报错**。
-func TestMigration_ExistingKeyBecomesOrphan(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "gw.db")
-	ctx := context.Background()
-
-	// 第一次打开：模拟老库（schema 里还没有 user_id）。
-	first := openAt(t, path)
-	if _, err := first.db.Exec(`INSERT INTO access_keys
-		(id, key_hash, key_prefix, name, enabled, quota_tokens, used_tokens, rpm_limit, tpm_limit, created_at)
-		VALUES ('k1','hash1','sk-gw-abc','legacy',1,0,0,0,0,?)`, time.Now().UnixMilli()); err != nil {
-		t.Fatalf("seed legacy key: %v", err)
-	}
-	first.Close()
-
-	// 第二次打开：走迁移路径。
-	second := openAt(t, path)
-
-	k, err := second.GetAccessKey(ctx, "k1")
-	if err != nil {
-		t.Fatalf("read migrated key: %v", err)
-	}
-	if k == nil {
-		t.Fatal("migrated key disappeared")
-	}
-	// 关键：必须是空串（不是字符串 "NULL"，也不能读不出来）。
-	// 空串是「无归属」的唯一表示，DAO 层必须精确还原它 —— 迁移退役
-	// （retireOrphanKeys）与鉴权拒绝（ErrKeyUnowned）都以此为条件，
-	// 读成 "NULL" 会让退役漏掉这批 key。
-	if k.UserID != "" {
-		t.Errorf("UserID = %q, want empty for orphan key", k.UserID)
-	}
-}
-
 // user_id 在库里确实是 NULL，但 DAO 读出来必须是空串。
 func TestUserIDColumnIsNullableAndReadsAsEmpty(t *testing.T) {
 	db := newStore(t)
@@ -106,31 +71,6 @@ func TestUserIDColumnIsNullableAndReadsAsEmpty(t *testing.T) {
 	}
 	if k.UserID != "" {
 		t.Errorf("dao UserID = %q, want empty", k.UserID)
-	}
-}
-
-// 存量用量记录升级后必须保留，统计口径不变。
-func TestMigration_ExistingUsageRowsSurvive(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "gw.db")
-	ctx := context.Background()
-
-	first := openAt(t, path)
-	if _, err := first.db.Exec(`INSERT INTO usage_records
-		(id, ts, access_key_id, public_model, provider_id, upstream_model, ingress_protocol, stream,
-		 input_tokens, output_tokens, total_tokens, usage_state, status, http_status, latency_ms)
-		VALUES ('u1',?, 'k1','m','p','up','openai-chat',0, 10,20,30,'reported','ok',200,100)`,
-		time.Now().UnixMilli()); err != nil {
-		t.Fatalf("seed legacy usage: %v", err)
-	}
-	first.Close()
-
-	second := openAt(t, path)
-	stats, err := second.GetUsageStats(ctx, 0, 0, "")
-	if err != nil {
-		t.Fatalf("stats after migration: %v", err)
-	}
-	if stats.TotalRequests != 1 || stats.TotalTokens != 30 {
-		t.Errorf("legacy usage lost: requests=%d tokens=%d", stats.TotalRequests, stats.TotalTokens)
 	}
 }
 
@@ -241,6 +181,37 @@ func TestUser_DisableTakesEffect(t *testing.T) {
 	}
 	if got.AuthVersion != 2 {
 		t.Errorf("auth_version = %d, want 2 (disable must invalidate existing sessions)", got.AuthVersion)
+	}
+}
+
+// 审计 A7-02：禁用/降权与 auth_version 递增必须在同一事务里完成。
+// 这里不注入「第二条 UPDATE 失败」，而是直接验证组合入口同时改状态并递增，
+// 且旧的 BumpAuthVersion 分开调用路径不再被 handler 使用。
+func TestUpdateUserAndBumpAuthVersion_IsAtomicCombination(t *testing.T) {
+	db := newStore(t)
+	ctx := context.Background()
+	if err := db.CreateUser(ctx, &User{
+		ID: "u1", Username: "alice", Role: RoleUser,
+		Status: UserStatusActive, AuthVersion: 5,
+	}); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+
+	u, err := db.GetUser(ctx, "u1")
+	if err != nil || u == nil {
+		t.Fatalf("get: %v", err)
+	}
+	u.Status = UserStatusDisabled
+	if err := db.UpdateUserAndBumpAuthVersion(ctx, u); err != nil {
+		t.Fatalf("update and bump: %v", err)
+	}
+
+	got, _ := db.GetUser(ctx, "u1")
+	if got.Status != UserStatusDisabled {
+		t.Errorf("status = %q, want disabled", got.Status)
+	}
+	if got.AuthVersion != 6 {
+		t.Errorf("auth_version = %d, want 6 (same transaction must bump exactly once)", got.AuthVersion)
 	}
 }
 
@@ -533,94 +504,3 @@ func TestCountUsers(t *testing.T) {
 }
 
 // ---- 无归属 key 的退役（2026-10-05 决策）----
-
-// 升级后不发新 key 就不给用：存量无归属 key 必须被禁用。
-func TestRetireOrphanKeys_DisablesUnowned(t *testing.T) {
-	db := newStore(t)
-	ctx := context.Background()
-	if err := db.CreateUser(ctx, &User{ID: "u1", Username: "alice"}); err != nil {
-		t.Fatalf("create user: %v", err)
-	}
-	// 一把无归属（会退役）、一把有归属（必须保持原样）
-	if err := db.CreateAccessKey(ctx, &AccessKey{ID: "orphan", KeyHash: "h1", KeyPrefix: "sk-", Name: "orphan", Enabled: true}); err != nil {
-		t.Fatalf("create orphan: %v", err)
-	}
-	if err := db.CreateAccessKey(ctx, &AccessKey{ID: "owned", KeyHash: "h2", KeyPrefix: "sk-", Name: "owned", Enabled: true, UserID: "u1"}); err != nil {
-		t.Fatalf("create owned: %v", err)
-	}
-
-	if err := db.retireOrphanKeys(); err != nil {
-		t.Fatalf("retire: %v", err)
-	}
-
-	orphan, _ := db.GetAccessKey(ctx, "orphan")
-	if orphan.Enabled {
-		t.Error("unowned key still enabled; it must not be usable after migration")
-	}
-	owned, _ := db.GetAccessKey(ctx, "owned")
-	if !owned.Enabled {
-		t.Error("owned key was disabled by retireOrphanKeys")
-	}
-}
-
-// 退役必须**只动无归属的**：不能误伤已有用户的 key。
-// 这条若写错就是生产事故 —— 全公司的 key 一起失效。
-func TestRetireOrphanKeys_LeavesOwnedKeysAlone(t *testing.T) {
-	db := newStore(t)
-	ctx := context.Background()
-	for i, u := range []string{"u1", "u2", "u3"} {
-		if err := db.CreateUser(ctx, &User{ID: u, Username: u}); err != nil {
-			t.Fatalf("create %s: %v", u, err)
-		}
-		if err := db.CreateAccessKey(ctx, &AccessKey{
-			ID: "k" + u, KeyHash: "h" + u, KeyPrefix: "sk-", Name: u, Enabled: true, UserID: u,
-		}); err != nil {
-			t.Fatalf("create key %d: %v", i, err)
-		}
-	}
-	if err := db.retireOrphanKeys(); err != nil {
-		t.Fatalf("retire: %v", err)
-	}
-	keys, _ := db.ListAccessKeys(ctx)
-	for _, k := range keys {
-		if !k.Enabled {
-			t.Errorf("key %q was disabled but has owner %q", k.ID, k.UserID)
-		}
-	}
-	if len(keys) != 3 {
-		t.Errorf("key count = %d, want 3", len(keys))
-	}
-}
-
-// 幂等：跑两次结果相同，且不会把管理员后来补好归属并启用的 key 再关掉。
-func TestRetireOrphanKeys_Idempotent(t *testing.T) {
-	db := newStore(t)
-	ctx := context.Background()
-	if err := db.CreateAccessKey(ctx, &AccessKey{ID: "orphan", KeyHash: "h1", KeyPrefix: "sk-", Name: "o", Enabled: true}); err != nil {
-		t.Fatalf("create: %v", err)
-	}
-	for i := 0; i < 3; i++ {
-		if err := db.retireOrphanKeys(); err != nil {
-			t.Fatalf("retire %d: %v", i, err)
-		}
-	}
-	k, _ := db.GetAccessKey(ctx, "orphan")
-	if k.Enabled {
-		t.Error("key re-enabled by repeated retire calls")
-	}
-
-	// 管理员接管：补上归属并重新启用，之后不该再被退役
-	if err := db.CreateUser(ctx, &User{ID: "u1", Username: "alice"}); err != nil {
-		t.Fatalf("create user: %v", err)
-	}
-	if _, err := db.db.Exec(`UPDATE access_keys SET user_id='u1', enabled=1 WHERE id='orphan'`); err != nil {
-		t.Fatalf("take over: %v", err)
-	}
-	if err := db.retireOrphanKeys(); err != nil {
-		t.Fatalf("retire after takeover: %v", err)
-	}
-	k, _ = db.GetAccessKey(ctx, "orphan")
-	if !k.Enabled || k.UserID != "u1" {
-		t.Errorf("taken-over key was retired again: enabled=%v user=%q", k.Enabled, k.UserID)
-	}
-}

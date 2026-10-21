@@ -3,8 +3,6 @@ package store
 import (
 	"context"
 	"database/sql"
-	"io"
-	"log/slog"
 	"strings"
 	"testing"
 )
@@ -85,54 +83,6 @@ func TestUsageErrorDetail_RoundTripBatched(t *testing.T) {
 	}
 	if d2.Valid {
 		t.Fatalf("成功记录的 detail 必须是 NULL，got %q", d2.String)
-	}
-}
-
-// TestUsageErrorDetail_Migration 老库（无此列）升级后列存在且可读写。
-//
-// 模拟真实老库：建一个不含 error_detail 列的 usage_records，打开 store
-// 触发迁移，再走一遍完整写读。ensureColumns 的 additions 只是「声明」，
-// 这条测的是「声明真的被执行了」。
-func TestUsageErrorDetail_Migration(t *testing.T) {
-	path := t.TempDir() + "/old.db"
-	raw, err := sql.Open("sqlite", path)
-	if err != nil {
-		t.Fatalf("open raw: %v", err)
-	}
-	// 旧 schema：逐列手抄当前 DDL，但**不带 error_detail**。
-	if _, err := raw.Exec(`CREATE TABLE usage_records (
-		id TEXT PRIMARY KEY, ts INTEGER NOT NULL, access_key_id TEXT NOT NULL,
-		user_id TEXT, public_model TEXT NOT NULL, provider_id TEXT NOT NULL,
-		upstream_model TEXT NOT NULL, ingress_protocol TEXT NOT NULL,
-		stream INTEGER NOT NULL DEFAULT 0, input_tokens INTEGER NOT NULL DEFAULT 0,
-		output_tokens INTEGER NOT NULL DEFAULT 0, total_tokens INTEGER NOT NULL DEFAULT 0,
-		reasoning_tokens INTEGER NOT NULL DEFAULT 0, cached_tokens INTEGER NOT NULL DEFAULT 0,
-		usage_state TEXT NOT NULL, status TEXT NOT NULL, http_status INTEGER NOT NULL,
-		error_code TEXT, latency_ms INTEGER NOT NULL, ttfb_ms INTEGER NOT NULL DEFAULT 0,
-		request_id TEXT, cost_total REAL NOT NULL DEFAULT 0)`); err != nil {
-		t.Fatalf("create old table: %v", err)
-	}
-	raw.Close()
-
-	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	st, err := Open(path, logger)
-	if err != nil {
-		t.Fatalf("open migrated store: %v", err)
-	}
-	defer st.Close()
-
-	if has, err := st.columnExists("usage_records", "error_detail"); err != nil || !has {
-		t.Fatalf("迁移后应存在 error_detail 列: has=%v err=%v", has, err)
-	}
-
-	// 迁移后的库必须立即可写（列默认 NULL，不带 DEFAULT 的语义）。
-	seedKeyForUsage(t, st)
-	if err := st.CreateUsageRecord(context.Background(), &UsageRecord{
-		ID: "r9", AccessKeyID: "k1", UserID: "u1", PublicModel: "flash", ProviderID: "p1",
-		UpstreamModel: "m", IngressProtocol: "openai-chat", Status: "error", HTTPStatus: 500,
-		ErrorCode: "upstream_error", ErrorDetail: "upstream 500", UsageState: "none",
-	}); err != nil {
-		t.Fatalf("write to migrated db: %v", err)
 	}
 }
 

@@ -10,8 +10,8 @@ type UserUsageStat struct {
 	// UserID 是 usage_records.user_id 的**冗余固化**值（多用户改造 P0，
 	// 见 UsageRecord.UserID 的注释：归属是历史事实，不靠 JOIN key 回溯）。
 	//
-	// 空串 = **无归属**：user_id 为 NULL/'' 的历史用量（迁移前建的无主 key
-	// 产生的）。它不是一个具体用户，所以单独成一行而不是被丢掉 —— 丢掉它，
+	// 空串 = **无归属异常行**：user_id 为 NULL/''。当前 schema 不允许新写入
+	// 这种记录，但损坏/人工写入的行仍可作为失败态展示 —— 丢掉它，
 	// 这张表的合计就对不上总览的全局合计，而「两张表对不上账」比多一行难解释得多。
 	UserID string
 	// Username 是 LEFT JOIN users 拿到的展示名。
@@ -21,14 +21,14 @@ type UserUsageStat struct {
 	//   - UserID 本身为空           → 无归属用量。
 	// 两种都不是「名字叫空字符串」。前端在第一种情况下必须回退显示 UserID ——
 	// 留白会看起来像「无归属」，而「用户已删除」与「无归属」在处置上是两回事
-	// （前者是一个真实发生过消费的账号，后者是迁移遗留）。
+	// （前者是一个真实发生过消费的账号，后者是损坏/无归属数据）。
 	Username string
 	// Role 是 users.role（admin / user）；空串同样表示 JOIN 不到（用户已删除）。
 	//
 	// 为什么连角色一起查出来：管理员**不该**出现在这张表里（后端
-	// ErrAdminCannotCallModel 已拦下管理员调用模型），但升级前可能有他的历史
+	// ErrAdminCannotCallModel 已拦下管理员调用模型），但异常或人工写入可能有他的历史
 	// 用量。不给这一列的话，那一行看起来就像一条脏数据；给了就能如实标注
-	// 「管理员 · 升级前的历史用量」。刻意**不**在 SQL 里按角色过滤掉它 ——
+	// 「管理员 · 历史异常用量」。刻意**不**在 SQL 里按角色过滤掉它 ——
 	// 静默过滤会让这张表的合计小于全局合计，而那是最难查的一类问题。
 	Role string
 	// Requests 是请求次数，取 SUM(n) 而**不是** COUNT(*)：归档一行代表
@@ -36,10 +36,13 @@ type UserUsageStat struct {
 	// COUNT(*) 会把它当成 1 次请求，直接少算。
 	Requests int64
 	Tokens   int64
-	// Cost 是该用户固化的费用合计（元），即 SUM(cost_total)。
+	// Cost 是该用户固化的**上游成本**合计（元），即 SUM(cost_total)。
 	//
 	// 读固化值而不是按当前单价重算：改价不回溯历史（见 freezeUsageCost）。
-	// 这一列是这张表的主角 —— 用户要的就是「每人花了多少钱」。
+	//
+	// 审计 A8-P1-6：这里包含 status != 'ok' 的失败/取消请求 —— 那是网关的
+	// 上游成本，不代表向用户收取的金额。用户应收见 balance_charges。两者
+	// 结构上可以不同，界面必须分别标注，不能把这一列当成「用户账单」。
 	Cost float64
 }
 
@@ -72,19 +75,13 @@ type UserUsageStat struct {
 func (s *Store) UsageByUser(ctx context.Context, from, to int64, limit int) ([]UserUsageStat, int64, error) {
 	src, args := UsageSource(UsageFilter{From: from, To: to})
 
-	// 有消费的用户总数（去重），单独一条查询。
+	// 审计 M2/M3：总用户数与聚合行必须来自**同一快照**。
 	//
-	// 为什么必须有它：列表被 limit 截断时，调用方**只有**拿到总数才能说出
-	// 「显示前 N / 共 M 位用户」。没有它，一张被截断的表与一张完整的表长得
-	// 一模一样 —— 而这张表是拿来做金额判断的：把「前 100 名」读成「全部用户」
-	// 会让人得出「这家公司只有 100 个账号」，或更糟：「消费合计对不上汇总卡」。
-	// 与 ExportCSV 用 X-Export-Truncated 表态是同一个原则：**截断必须可见**。
-	var total int64
-	if err := s.read.QueryRowContext(ctx,
-		`SELECT COUNT(DISTINCT u.user_id) FROM `+src, args...).Scan(&total); err != nil {
-		return nil, 0, err
-	}
-
+	// 旧实现先 COUNT(DISTINCT) 再跑聚合，是两条独立的读池查询；WAL 下每条
+	// 语句各取快照，并发写入时会出现「共 M 位用户」与实际行数不一致。
+	// 这里用窗口函数把总数并进同一条查询；内层先 GROUP BY，外层 COUNT(*)
+	// 才是「有消费的用户数」，LIMIT 不影响这个窗口值。
+	//
 	// 聚合别名（requests / tokens / cost）在 ORDER BY 里可直接引用，
 	// SQLite 允许；GROUP BY 里不行，那里必须写原列名。
 	//
@@ -98,7 +95,8 @@ func (s *Store) UsageByUser(ctx context.Context, from, to int64, limit int) ([]U
 		       COALESCE(usr.role, '')     AS role,
 		       COALESCE(SUM(u.n), 0)      AS requests,
 		       ` + UsageSumExpr("total_tokens", "u") + ` AS tokens,
-		       ` + UsageSumExpr("cost_total", "u") + `   AS cost
+		       ` + UsageSumExpr("cost_total", "u") + `   AS cost,
+		       COUNT(*) OVER ()           AS total_users
 		    FROM ` + src + `
 		    LEFT JOIN users usr ON usr.id = u.user_id
 		   GROUP BY u.user_id
@@ -120,10 +118,11 @@ func (s *Store) UsageByUser(ctx context.Context, from, to int64, limit int) ([]U
 	// 初始化为空切片而非 nil：nil 会被编码成 JSON null，前端 .map() 直接
 	// TypeError（与 writeGroupEntries 同一条约定）。
 	out := make([]UserUsageStat, 0)
+	var total int64
 	for rows.Next() {
 		var st UserUsageStat
 		if err := rows.Scan(&st.UserID, &st.Username, &st.Role,
-			&st.Requests, &st.Tokens, &st.Cost); err != nil {
+			&st.Requests, &st.Tokens, &st.Cost, &total); err != nil {
 			return nil, 0, err
 		}
 		out = append(out, st)

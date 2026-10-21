@@ -5,7 +5,6 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
-	"math"
 	"strings"
 	"time"
 )
@@ -19,7 +18,7 @@ type UsageRecord struct {
 	// 为什么冗余：归属是历史事实。用户改名、key 被删、key 转归别人，
 	// 都不该改变「这条消耗是谁的」。若靠 JOIN 回溯，删key 后用量记录
 	// 就失去归属，审计链断裂。
-	// 空串 = 无归属 key（user_id 为 NULL）产生的用量，即迁移前遗留的历史记录。
+	// 空串 = 损坏/人工写入的无归属行；当前写入路径必须固化具体 user id。
 	UserID          string
 	PublicModel     string
 	ProviderID      string
@@ -41,6 +40,15 @@ type UsageRecord struct {
 	LatencyMs   int64
 	TTFBMs      int64
 	RequestID   string
+	// PreviousCost 是**落库前**已有的 cost_total，只在重算路径上被读
+	// （见 RecomputeCost）。
+	//
+	// 补扣余额必须用「重算值 - 原值」的**差额**：原值那一笔在落库时
+	// 已经扣过一次（或本该扣但没扣成），用重算值去扣会重复收钱。
+	//
+	// 写路径不填它 —— 写入时 cost_total 由 freezeUsageCost 现算，没有
+	// 「前一个值」可言。
+	PreviousCost float64
 	// RouteTrace 是失败决策轨迹（2026-10-17）：按发生顺序记录链上每个目标的
 	// 决策与原因，形如 "1:deepseek/model -> 404 model_not_found (switch);
 	// 2:openai/gpt-4o -> ok"。
@@ -302,53 +310,13 @@ func usageInsertArgs(r *UsageRecord, cost float64, costPending bool) []any {
 	}
 }
 
-// priceUsage 是**全仓唯一的单价公式**：把一次调用的 token 数换算成费用（元）。
+// priceUsage 是包内别名，保留历史调用点与测试（见 pricing.go 的 PriceUsage）。
 //
-// # 为什么必须只有这一份
-//
-// 这套公式有两个消费者，语义要求它们**永远相等**：
-//   - usage_records.cost_total（freezeUsageCost 落库时固化，报表全部读它）；
-//   - 余额扣费（balance_dao 收到 usage 落库时返回的同一个 cost 值，
-//     不重新计算 —— 见 CreateUsageRecordWithCost）。
-//
-// 两处各写一份公式时，漂移几乎必然发生，且**没有任何人会发现**：报表显示
-// 「花了 3.00 元」、余额实际扣了 2.97 元，两个数字各看都合理，只有逐条对账
-// 才看得出来 —— 而没人会对账。所以本函数是纯函数（无 IO、无状态），调用方
-// 只能取它的返回值、不得复制表达式。
-//
-// # 口径（与原 GetUsageStats 的 JOIN 重算逐字一致，单价「元/百万 tokens」）：
-//
-//	缓存未命中输入 = MAX(input - cached, 0) × price_input
-//	缓存命中输入   = cached × price_cache_hit（<=0 时回退 price_input，
-//	                 只填输入价的模型不会把命中部分算成免费）
-//	输出           = output × price_output
-//	合计           = 上述三项之和 / 1e6
-//
-// 四个入参的价格来自上游单价表，NULL/未配置一律按 0（调用方用 COALESCE 兜底），
-// 未配置价格的模型因此贡献 0 —— 与「未配价 = 0」的既有口径同语义。
-//
-// 负 token 不在这里兜：CreateUsageRecord 已在入口把负值归一为 0
-// （见其注释），而 priceUsage 的调用方只有 freezeUsageCost 一处。
+// 真正的定义在 pricing.go —— 全仓唯一，且现在**同时**被余额预检
+// （cmd/gateway/billing.go）与落库实扣共用，消除了审计 A4-P1-3 指出的
+// 两份公式漂移（只配 price_cache_hit 的模型预检 fail-open 漏放行）。
 func priceUsage(priceInput, priceCacheHit, priceOutput, inputTokens, cachedTokens, outputTokens float64) float64 {
-	uncached := inputTokens - cachedTokens
-	if uncached < 0 {
-		uncached = 0
-	}
-	hit := priceCacheHit
-	if hit <= 0 {
-		hit = priceInput
-	}
-	total := (uncached*priceInput + cachedTokens*hit + outputTokens*priceOutput) / 1_000_000.0
-	// 舍入到 1e-9 元。float64 的二进制表示无法精确表达十进制小数，
-	// 于是「×3 个单价再除 1e6」会带出长尾（如 0.0030000000000000005），
-	// 这些值原样进 JSON 响应，前端展示与对账都会看到脏尾巴。
-	//
-	// 精度取 1e-9 而非更高：1 纳元的 1% 仍远小于任何真实计费的最小粒度，
-	// 而更长的尾数只会把噪声带得更远。
-	if total != 0 {
-		total = math.Round(total*1e9) / 1e9
-	}
-	return total
+	return PriceUsage(priceInput, priceCacheHit, priceOutput, inputTokens, cachedTokens, outputTokens)
 }
 
 // usageStateCostPending 是 cost_total 因查价失败而**待重算**的标记
@@ -470,6 +438,137 @@ func (s *Store) RecomputePendingCosts(ctx context.Context, limit int) (int64, bo
 	return fixed, remaining, nil
 }
 
+// UnchargedUsage 是一条「已落库但**没扣到钱**」的用量记录。
+//
+// 这是 F4（落库与扣费之间的无对账窗口）的载体：usage 落库成功后、扣费
+// 执行前进程被杀，或扣费遇到瞬时故障且重试也全部失败，这笔费用就永远
+// 留在「报表上有、余额没扣」的状态 —— 且**没有任何落盘痕迹**说明它漏了。
+type UnchargedUsage struct {
+	RecordID  string
+	UserID    string
+	RequestID string
+	CostYuan  float64
+}
+
+// FindUnchargedUsage 找出「已落库、有费用、但 balance_charges 里没有对应
+// 扣费流水」的用量记录（2026-10-21 修 A4-P1-4 / 汇总 F4）。
+//
+// # 判定条件
+//
+//   - status = 'ok'：只有成功的请求才该扣用户钱（见 usageRecorder.charge
+//     的「只对成功的请求扣费」）。失败/取消的记录 cost_total 记的是**网关的
+//     上游成本**，不是用户的应收 —— 把它们算成「漏扣」会让对账补扣用户
+//     根本不该付的钱。
+//   - cost_total > 0：没费用就不用补扣（未配价模型恒为 0）。
+//   - request_id 非空：空 request_id 没有幂等键，补扣会**真的重复扣**。
+//     那类记录被排除在外的理由见 usageRecorder.charge 里同名的分支。
+//   - balance_charges 里没有 (request_id, user_id)：这正是「没扣过」的证据。
+//     ChargeBalance 的占位行是幂等键，扣费成功必有占位行。
+//
+// # 为什么用 LEFT JOIN 而不是先查再逐条比对
+//
+// 一次 LEFT JOIN 就能把「有费用但无流水」的点集算出来，且能走
+// (request_id, user_id) 主键索引。逐条比对是 N+1 次查询 —— 在
+// 高并发网关上这不是「慢一点」，是每秒几千次额外 IO。
+//
+// # 边界：归档表不在内
+//
+// 只查 usage_records（明细表）。已归档到 usage_daily_rollups 的记录
+// 不在这张表里，因此不会被重复扣 —— 这是对的：归档是**报表**口径的
+// 搬迁，不是「这笔钱还没收」的意思。
+func (s *Store) FindUnchargedUsage(ctx context.Context, limit int) ([]UnchargedUsage, error) {
+	if limit <= 0 {
+		limit = 100
+	}
+	rows, err := s.read.QueryContext(ctx,
+		`SELECT u.id, COALESCE(u.user_id, ''), COALESCE(u.request_id, ''), u.cost_total
+		   FROM usage_records u
+		   LEFT JOIN balance_charges c
+		     ON c.request_id = u.request_id AND c.user_id = COALESCE(u.user_id, '')
+		  WHERE u.status = 'ok'
+		    AND u.cost_total > 0
+		    AND COALESCE(u.request_id, '') <> ''
+		    AND c.request_id IS NULL
+		  ORDER BY u.ts
+		  LIMIT ?`, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []UnchargedUsage
+	for rows.Next() {
+		var u UnchargedUsage
+		if err := rows.Scan(&u.RecordID, &u.UserID, &u.RequestID, &u.CostYuan); err != nil {
+			return nil, err
+		}
+		out = append(out, u)
+	}
+	return out, rows.Err()
+}
+
+// ChargeUnchargedUsage 补扣一条「已落库但没扣到钱」的用量记录。
+//
+// 幂等由 balance_charges 的占位行保证：同一个 (request_id, user_id)
+// 第二次调用会命中幂等快速路径，不会重复扣。所以这个方法可以安全地被
+// 对账任务反复调用。
+//
+// 欠费（ErrInsufficientBalance）**不算失败**：用户真的没钱了。这笔
+// 金额会进 balance_pending 待结算账本，用户充值后被结转（见
+// ChargeBalance 的欠费分支）。这里返回 nil，让对账任务把它当成
+// 「处理过了」—— 否则它会每轮都把同一笔捞出来重试，而重试永远不会
+// 成功（欠费不是瞬时故障）。
+func (s *Store) ChargeUnchargedUsage(ctx context.Context, u UnchargedUsage) error {
+	if u.UserID == "" || u.RequestID == "" || u.CostYuan <= 0 {
+		return nil
+	}
+	err := s.ChargeBalance(ctx, u.UserID, u.CostYuan, u.RequestID)
+	if errors.Is(err, ErrInsufficientBalance) {
+		return nil
+	}
+	return err
+}
+
+// recomputeChargeKey 生成「重算补扣」的幂等键。
+//
+// # 为什么不能直接用 request_id（2026-10-21 修 P0-5）
+//
+// 落库时的扣费已经用 request_id 占位行（balance_charges 的主键）。
+// 重算补扣若用同一个 request_id，INSERT OR IGNORE 会撞上那个占位行、
+// RowsAffected()==0 → 直接返回「已扣过」→ **补扣变成空操作**。
+//
+// 实测（修复前的探针）：落库时按 cost=0.0006 扣过（占位行已写），
+// 重算把费用改成 0.1004（差额 0.0998 元），余额分文未动。
+//
+// # 键的形式
+//
+//	recompute:<record_id>:<cost_micros>
+//
+// 编码「目标费用」而不是「差额」，是因为它让幂等的语义可以说清楚：
+//   - 对同一条记录、同一个目标费用 → 重复重算 → 同键 → 只补扣一次；
+//   - 对同一条记录、不同的目标费用 → 不同键 → 补扣新的差额。
+//
+// 第二条超出了「重算重复执行」的最常见场景，但它是**必要**的：
+// 管理员改价后，后台任务会把同一条记录再重算一次（上一轮可能因为
+// 欠费而没成功、或者两轮之间改了价）。若键不纳入目标费用，
+// 第二轮会命中第一轮的幂等行而不补扣 —— 那就是“改价后仍旧不收钱”。
+//
+// 粒度用微元（整数）而不是元：价格被保存到 1e-9 元（priceUsage 的舍入），
+// 而微元粒度下的 1 微元 = 1e-6 元 才是真正意味着的最小可区分差异。
+//
+// record_id 里的分隔符适合性：record_id 是 32 位 hex（无冒号与细正符号），
+// 故不会与前缀或分隔符冲突；而且它与普通扣费的 request_id（客户端可控）
+// 不同空间，不会合并成同一行。
+func recomputeChargeKey(recordID string, costYuan float64) string {
+	if recordID == "" {
+		// 没有记录标识 → 无法构造幂等键 → 返回空串，
+		// 让 chargeBalanceTx 走「不做幂等」的分支（每次都扣）。
+		// 这条路径实际不可达（RecomputeCost 按 id 查记录，查到就有 id），
+		// 但它的语义比「猜一个键」安全。
+		return ""
+	}
+	return fmt.Sprintf("recompute:%s:%d", recordID, YuanToMicros(costYuan))
+}
+
 // RecomputeCost 按**当前**单价重算某条用量的固化费用。
 //
 // 用途：freezeUsageCost 因读池抖动失败而记 0 时，事后补救。它是唯一一处
@@ -487,12 +586,15 @@ func (s *Store) RecomputePendingCosts(ctx context.Context, limit int) (int64, bo
 // 注意：若重算后费用**仍是 0**（模型确实没配价 / 已删除），也照样复位 ——
 // 那时 0 是正确值而非失败，留着 pending 只会造成无意义的重复扫描。
 func (s *Store) RecomputeCost(ctx context.Context, recordID string) (bool, error) {
+	// 重算需要知道这条记录属于谁、request_id 是什么 —— 补扣余额要用。
 	var r UsageRecord
 	err := s.read.QueryRowContext(ctx,
 		`SELECT COALESCE(provider_id, ''), COALESCE(upstream_model, ''),
-		        COALESCE(input_tokens, 0), COALESCE(cached_tokens, 0), COALESCE(output_tokens, 0)
+		        COALESCE(input_tokens, 0), COALESCE(cached_tokens, 0), COALESCE(output_tokens, 0),
+		        COALESCE(user_id, ''), COALESCE(request_id, ''), COALESCE(cost_total, 0)
 		   FROM usage_records WHERE id = ?`, recordID).
-		Scan(&r.ProviderID, &r.UpstreamModel, &r.InputTokens, &r.CachedTokens, &r.OutputTokens)
+		Scan(&r.ProviderID, &r.UpstreamModel, &r.InputTokens, &r.CachedTokens, &r.OutputTokens,
+			&r.UserID, &r.RequestID, &r.PreviousCost)
 	if errors.Is(err, sql.ErrNoRows) {
 		return false, nil
 	}
@@ -507,7 +609,29 @@ func (s *Store) RecomputeCost(ctx context.Context, recordID string) (bool, error
 	if costPending {
 		state = usageStateCostPending
 	}
-	res, err := s.db.ExecContext(ctx,
+
+	// # 补扣余额（2026-10-21 修 P0-5）
+	//
+	// 此前这里只 UPDATE 了 cost_total，**从不碰余额** —— 而落库时扣费走的是
+	// CreateUsageRecordWithCost 返回的那个 cost（落库时是 0），于是
+	// 「一次读池抖动」= 该请求**永久免单**：报表 0 元、余额不动、无 ERROR。
+	//
+	// 补扣的金额是**差额**（重算值 - 原值），不是重算值：原值已经扣过一次
+	// （或本该扣但没扣成）。用差额才能与「流水里已记的金额」对得上。
+	//
+	// 幂等由 chargeBalanceTx 的占位行保证：它以 (request_id, user_id)
+	// 为主键，第二次补扣会命中「已扣过」而直接返回，不会重复扣。
+	//
+	// 为什么不能调 ChargeBalance（它开自己的事务）：那会让「明细改写」
+	// 与「余额扣减」落在两个事务里 —— 又一处「明细说扣了、余额没扣」的可能。
+	// 必须在**同一个事务**里完成。
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return false, err
+	}
+	defer func() { _ = tx.Rollback() }() //nolint:errcheck // 已提交时是 no-op
+
+	res, err := tx.ExecContext(ctx,
 		`UPDATE usage_records SET cost_total = ?, usage_state = ? WHERE id = ?`,
 		cost, state, recordID)
 	if err != nil {
@@ -517,7 +641,57 @@ func (s *Store) RecomputeCost(ctx context.Context, recordID string) (bool, error
 	if aerr != nil {
 		return false, nil //nolint:nilerr // 无法确认影响行数时不谎报成功
 	}
-	return n > 0, nil
+	if n == 0 {
+		// 记录已被剪枝（明细不在了）。表 B 的累计已由归档维护，无需补。
+		return false, tx.Commit()
+	}
+
+	// 补扣差额。
+	//
+	// 欠费不是错误：用户真的没钱了。欠费时**整体回滚**（明细的 cost_total
+	// 保持原值），让这条记录留在 cost_pending 队列里，下次重算再试 ——
+	// 而它会一直重试到用户充值。这正是「欠费不硬扣」口径的落地：
+	// 收不到就记着，不假装收到了。
+	//
+	// 回滚由本函数做（defer 兜底）：chargeBalanceTx 不回滚 —— 那会把上面
+	// 那次 UPDATE 一起撤掉，明细就又回到「0 元待重算」的死循环。
+	//
+	// user_id 为空 = 无归属的历史记录：没有可扣的账户，补扣无从谈起，
+	// 但明细与累计表仍要更新（它们是**报表**口径，与余额无关）。
+	insufficient := false
+	if delta := cost - r.PreviousCost; delta > 0 && r.UserID != "" {
+		// 幂等键用**重算专属的键**，不用 request_id（见 recomputeChargeKey）。
+		if _, cerr := s.chargeBalanceTx(ctx, tx, r.UserID, delta,
+			recomputeChargeKey(recordID, cost)); cerr != nil {
+			switch {
+			case errors.Is(cerr, ErrInsufficientBalance):
+				insufficient = true
+			case errors.Is(cerr, ErrNotFound):
+				// 用户不存在（无归属的历史记录，或用户已被删）。
+				//
+				// 这**不该**阻塞重算：明细的 cost_total 与累计表是
+				// **报表**口径，与余额无关。没有可扣的账户时，正确做法是
+				// 把报表补对、记一条 WARN，而不是让这条记录永远停在
+				// cost_pending —— 那会让待重算队列非空这个信号永不消失。
+				s.logger.Warn("recompute cost: user not found, cannot charge balance",
+					"record_id", recordID, "user_id", r.UserID, "delta", delta)
+			default:
+				return false, cerr
+			}
+		}
+	}
+	if insufficient {
+		// 回滚，让这条记录留在待重算队列里。
+		// （defer 里的 tx.Rollback() 兜底，这里不重复调用。）
+		s.logger.Warn("recompute cost: insufficient balance, keeping record pending",
+			"record_id", recordID, "user_id", r.UserID,
+			"delta", cost-r.PreviousCost, "request_id", r.RequestID)
+		return false, nil
+	}
+	if err := tx.Commit(); err != nil {
+		return false, err
+	}
+	return true, nil
 }
 
 type UsageStats struct {
@@ -543,6 +717,16 @@ type UsageStats struct {
 	// 影响的。固化后历史金额不可变，改价只影响此后的记录。
 	// 未配价的模型贡献 0（与固化前口径一致）。
 	Cost float64
+	// CostPendingCount 是「费用还是 0、等着被重算」的记录数
+	// （2026-10-21 修 A6-P1-4 / 汇总 M5）。
+	//
+	// 为什么需要它成为**可查的事实**：这类记录的费用是 0，报表上它就是
+	// 一条正常的 0 元记录 —— 与「本来免费」完全同形，事后无从分辨。
+	// 而剪枝会把明细搬进归档表，待重算的标记跟着明细一起消失（M5），
+	// 于是连「曾经有多少条待重算」都问不出来。归档层现在也累加这个计数
+	// （usage_daily_rollups.cost_pending_count），所以剪枝前后这个数
+	// 都能查到 —— 它的存在本身就是「系统里有免单风险」的信号。
+	CostPendingCount int64
 }
 
 // GetUsageStats 返回累计统计。from/to 为毫秒时间戳，0 表示不设该边界
@@ -573,10 +757,11 @@ func (s *Store) GetUsageStats(ctx context.Context, from, to int64, scopeUserID s
 		        `+UsageSumExpr("cached_tokens", "u")+`,
 		        COALESCE(SUM(u.n_err), 0),
 		        COALESCE(SUM(u.cached_tokens) * 1.0 / NULLIF(SUM(u.input_tokens), 0), 0),
-		        `+UsageSumExpr("cost_total", "u")+`
+		        `+UsageSumExpr("cost_total", "u")+`,
+		        `+UsageSumExpr("n_cost_pending", "u")+`
 		   FROM `+src,
 		args...).
-		Scan(&stats.TotalRequests, &stats.TotalTokens, &stats.InputTokens, &stats.OutputTokens, &stats.CachedTokens, &stats.ErrorCount, &stats.CacheHitRate, &stats.Cost)
+		Scan(&stats.TotalRequests, &stats.TotalTokens, &stats.InputTokens, &stats.OutputTokens, &stats.CachedTokens, &stats.ErrorCount, &stats.CacheHitRate, &stats.Cost, &stats.CostPendingCount)
 	if err != nil {
 		return nil, err
 	}

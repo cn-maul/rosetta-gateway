@@ -32,11 +32,21 @@ const (
 		cost_total, latency_ms AS latency_sum,
 		CASE WHEN ttfb_ms > 0 THEN ttfb_ms ELSE 0 END AS ttfb_sum,
 		CASE WHEN ttfb_ms > 0 THEN 1 ELSE 0 END AS n_ttfb,
+		-- 近期性能的独立口径：只取成功请求。ttfb_sum/n_ttfb 还要服务
+		-- 分组统计，那里包含失败请求的已测首字，不能在这里顺手改口径。
+		CASE WHEN status = 'ok' AND ttfb_ms > 0 THEN ttfb_ms ELSE 0 END AS ttfb_ok_sum,
+		CASE WHEN status = 'ok' AND ttfb_ms > 0 THEN 1 ELSE 0 END AS n_ttfb_ok,
 		-- 速度的分子分母，**只取成功请求**。canceled 的 latency 是
 		-- 「断开前跑了多久」而非完整耗时，用它当分母会把平均速度压低；
 		-- truncated / error 同理（它们往往还没开始吐 token）。
 		CASE WHEN status = 'ok' THEN output_tokens ELSE 0 END AS out_ok,
 		CASE WHEN status = 'ok' THEN latency_ms ELSE 0 END AS lat_ok,
+		-- 速度样本的实际条数。明细一行一个请求；归档支对应 ok_sample_count。
+		-- 与 out_ok/lat_ok 必须同口径，否则归档后「样本数」会退化成行数。
+		CASE WHEN status = 'ok' AND output_tokens > 0 AND latency_ms > 0 THEN 1 ELSE 0 END AS n_ok_speed,
+		-- 待重算的条数（2026-10-21 修 M5）。「费用还是 0、等着被纠正」
+		-- 的记录数，归档后仍然可数 —— 剪枝不该让这个信号凭空消失。
+		CASE WHEN usage_state = 'cost_pending' THEN 1 ELSE 0 END AS n_cost_pending,
 		` + dayExpr + ` AS day, ts AS bucket_ts,
 		COALESCE(user_id, '') AS user_id, access_key_id, public_model, upstream_model, provider_id`
 
@@ -51,11 +61,18 @@ const (
 		cost_total, latency_sum_ms AS latency_sum,
 		ttfb_sum_ms AS ttfb_sum,
 		ttfb_count AS n_ttfb,
+		-- 成功请求的首字累计值，对应明细的 ttfb_ok_sum / n_ttfb_ok。
+		ok_ttfb_sum_ms AS ttfb_ok_sum,
+		ok_ttfb_count AS n_ttfb_ok,
 		-- 归档侧直接带成功请求的 token / 延迟累计值，不靠 success_count 的
 		-- 比例去折算总体列：折算出来的是估算值，而这张表的立身之本是
 		-- 「剪枝前后同一个窗口给出同一个数」（见 usageDailyRollupsDDL）。
 		ok_output_tokens AS out_ok,
 		ok_latency_sum_ms AS lat_ok,
+		-- 成功请求数里「同时有正输出与正延迟」的条数，对应明细的 n_ok_speed。
+		ok_sample_count AS n_ok_speed,
+		-- 归档层的待重算条数（2026-10-21 修 M5）。
+		cost_pending_count AS n_cost_pending,
 		day, ` + dayStartMs + ` AS bucket_ts,
 		user_id, access_key_id, public_model, upstream_model, provider_id`
 
@@ -80,13 +97,14 @@ const (
 // 求和就会随时间**自动变小** —— 用户配额每天清零、总览「全部」档从 3 亿
 // 掉到 5 百万。后者被设计 §4.8 直接判定为数据丢失，比「看板变慢」严重得多。
 //
-// # 边界规则：归档只取**完整落在窗口内**的天
+// # 边界规则：归档只取**与窗口有交集**的天
 //
 // 归档的分辨率就是一天（表 A 的 day 列没有更细的时间）。窗口边缘若切在某天
-// 中间，那一天的部分数据已经不可得。因此规则取「整日包含」：
-// 宁可少算窗口边缘那一天，也不越界多算 —— 费用口径下少算可解释，多算会被
-// 当成错账。UI 的时间范围 to 都是「现在」，而当天永远不会被剪，所以上界
-// 实际不触发；下界只在「近 1 年」「全部」这类跨到归档区的范围上生效。
+// 中间，那一天的**部分**数据已经不可得（明细被剪掉了）。
+//
+// 因此规则取「有交集即计入」，而不是「整日包含」：少算会造成真实资损
+// （收入漏记、余额与报表对不上），多算至多偏一天且方向保守。
+// 详见下方 add() 调用处的完整论证（2026-10-21 修 P0-7）。
 //
 // ⚠️ 86400000 假定一天 24 小时。在有 DST 的时区里，那天可能是 23 或 25 小时，
 // dayEnd 会偏差 1 小时，只影响恰好落在这一小时内的窗口边缘。
@@ -113,11 +131,44 @@ func usageSource(alias string, f UsageFilter) (string, []any) {
 		rollupConds = append(rollupConds, cond{rText, v})
 	}
 
+	// 边界规则：归档支取**与窗口有交集**的天，而不是「整日包含」的天。
+	//
+	// # 为什么（2026-10-21 修 P0-7）
+	//
+	// 旧规则是「dayStart >= From 且 dayEnd <= To」（整日包含）。它错在
+	// 假设 **To 一定是本地午夜** —— 而真实调用点的 To 几乎从不是：
+	//   - /v1/organization/*：To = end_date + 1 天的 UTC 零点；
+	//   - 管理端用量页：To = 「现在」（queryRangeExplicit）。
+	//
+	// 于是窗口上界总在某天的正中间，而那一天的数据在剪枝后已进归档表，
+	// 却不满足「整日包含」被整体排除。实测（真实库、8333 行明细、
+	// TZ=Asia/Shanghai）：窗口 [10-07 12:00, 10-09 12:00] 在剪枝前
+	// 是 215338903 token，剪枝后只剩 27882697 —— **丢了 87%**。
+	//
+	// 「整日包含」还有一个更隐蔽的错：它让**剪枝前后的同一个窗口给出
+	// 不同的数**。剪枝前那条天在明细里（按 ts 精确过滤，边界正确），
+	// 剪枝后它在归档里（按整天过滤，边界错误）—— 这条验收
+	// （TestPrune_StatsUnchangedAcrossPrune）之所以绿，是因为它
+	// 刻意把窗口对齐到本地午夜，与生产调用点不一致。
+	//
+	// # 交集规则的实际含义
+	//
+	// 归档的一行代表「某一天的全部用量」。它与窗口有交集时必须计入，
+	// 哪怕只有部分落在窗口内 —— 因为**明细已被删**，那部分的精确值
+	// 已经不可得。
+	//
+	// 代价：窗口边缘那一天会被**多算**（整天的量都算进来，而窗口只
+	// 覆盖其中一部分）。这个方向是刻意选的：
+	//   - 少算 = 收入漏记、用户配额被悄悄放宽、报表与余额对不上；
+	//   - 多算 = 用户被多扣一点、报表偏保守。
+	// 少算会造成**真实资损**且无声无息，多算至少有界（一天）且可解释。
+	//
+	// 换言之：宁可多算，不可少算。
 	if f.From > 0 {
-		add("ts >= ?", dayStartMs+" >= ?", f.From)
+		add("ts >= ?", dayEndMs+" > ?", f.From)
 	}
 	if f.To > 0 {
-		add("ts <= ?", dayEndMs+" <= ?", f.To)
+		add("ts <= ?", dayStartMs+" <= ?", f.To)
 	}
 	// user_id 过滤明细支**必须**写成裸列比较（user_id = ?），不能 COALESCE：
 	// 表达式谓词吃不到 idx_usage_user_ts(user_id, ts)，用户级配额预检是每个

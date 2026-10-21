@@ -5,113 +5,11 @@ import (
 	"database/sql"
 	"errors"
 	"net/netip"
-	"path/filepath"
 	"sort"
 	"testing"
-	"time"
 )
 
 // ---- 老库升级：P1 的两个增量列 ----
-
-// 老库（没有 users.group_id、没有 access_keys.allowed_models_json）
-// 升级后必须能正常打开，且存量数据照常可读。
-//
-// # 这条为什么值得单独写一个测试
-//
-// P1 新增了一个**带外键的列**（users.group_id REFERENCES groups(id)）。
-// SQLite 对 `ALTER TABLE ADD COLUMN ... REFERENCES` 有额外要求：外键目标表
-// 必须已存在。groups 由 migrations 列表创建、ensureColumns 在其后执行，
-// 所以顺序是对的 —— 但顺序一旦被后人调换，症状是**整个网关起不来**
-// （migrate 失败 = Open 失败），而不是某个功能不可用。这条测试守住那个顺序。
-func TestMigration_P1ColumnsAddedToLegacyDB(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "legacy.db")
-	ctx := context.Background()
-
-	raw, err := sql.Open("sqlite", path)
-	if err != nil {
-		t.Fatalf("open raw: %v", err)
-	}
-	for _, ddl := range []string{
-		`CREATE TABLE access_keys (
-			id TEXT PRIMARY KEY, key_hash TEXT NOT NULL UNIQUE, key_prefix TEXT NOT NULL,
-			name TEXT NOT NULL, enabled INTEGER NOT NULL DEFAULT 1,
-			quota_tokens INTEGER NOT NULL DEFAULT 0, used_tokens INTEGER NOT NULL DEFAULT 0,
-			created_at INTEGER NOT NULL)`,
-		`CREATE TABLE users (
-			id TEXT PRIMARY KEY, username TEXT NOT NULL UNIQUE, display_name TEXT,
-			password_hash TEXT NOT NULL, role TEXT NOT NULL DEFAULT 'user',
-			status TEXT NOT NULL DEFAULT 'active', quota_tokens INTEGER NOT NULL DEFAULT 0,
-			used_tokens INTEGER NOT NULL DEFAULT 0, auth_version INTEGER NOT NULL DEFAULT 1,
-			remark TEXT, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL,
-			last_login_at INTEGER NOT NULL DEFAULT 0)`,
-		`CREATE TABLE usage_records (
-			id TEXT PRIMARY KEY, ts INTEGER NOT NULL, access_key_id TEXT NOT NULL,
-			public_model TEXT NOT NULL, provider_id TEXT NOT NULL, upstream_model TEXT NOT NULL,
-			ingress_protocol TEXT NOT NULL, stream INTEGER NOT NULL,
-			input_tokens INTEGER NOT NULL DEFAULT 0, output_tokens INTEGER NOT NULL DEFAULT 0,
-			total_tokens INTEGER NOT NULL DEFAULT 0, reasoning_tokens INTEGER NOT NULL DEFAULT 0,
-			cached_tokens INTEGER NOT NULL DEFAULT 0, usage_state TEXT NOT NULL,
-			status TEXT NOT NULL, http_status INTEGER NOT NULL, error_code TEXT,
-			latency_ms INTEGER NOT NULL, ttfb_ms INTEGER NOT NULL DEFAULT 0, request_id TEXT)`,
-	} {
-		if _, err := raw.Exec(ddl); err != nil {
-			t.Fatalf("legacy ddl: %v", err)
-		}
-	}
-	now := time.Now().UnixMilli()
-	if _, err := raw.Exec(`INSERT INTO users
-		(id, username, password_hash, role, status, created_at, updated_at)
-		VALUES ('u-legacy','legacy','hash','user','active',?,?)`, now, now); err != nil {
-		t.Fatalf("seed legacy user: %v", err)
-	}
-	if _, err := raw.Exec(`INSERT INTO access_keys
-		(id, key_hash, key_prefix, name, enabled, quota_tokens, used_tokens, created_at)
-		VALUES ('k-legacy','h-legacy','sk-gw-legacy','存量key',1,0,0,?)`, now); err != nil {
-		t.Fatalf("seed legacy key: %v", err)
-	}
-	raw.Close()
-
-	db := openAt(t, path)
-
-	// 新增列必须真的加上（否则后面的读写会静默走 NULL）。
-	for _, c := range []struct{ table, column string }{
-		{"users", "group_id"},
-		{"access_keys", "allowed_models_json"},
-	} {
-		has, cerr := db.columnExists(c.table, c.column)
-		if cerr != nil {
-			t.Fatalf("columnExists(%s.%s): %v", c.table, c.column, cerr)
-		}
-		if !has {
-			t.Errorf("%s.%s was not added by migration", c.table, c.column)
-		}
-	}
-
-	// 存量数据照常可读，且新列取「未配置」语义（空串 / nil = 不限制）。
-	u, err := db.GetUser(ctx, "u-legacy")
-	if err != nil || u == nil {
-		t.Fatalf("read legacy user: %v (u=%v)", err, u)
-	}
-	if u.GroupID != "" {
-		t.Errorf("GroupID = %q, want empty for legacy user", u.GroupID)
-	}
-	k, err := db.GetAccessKey(ctx, "k-legacy")
-	if err != nil || k == nil {
-		t.Fatalf("read legacy key: %v (k=%v)", err, k)
-	}
-	if k.AllowedModels != nil {
-		t.Errorf("AllowedModels = %v, want nil (未配置限制)", k.AllowedModels)
-	}
-
-	// groups 表存在且为空 —— 「无分组」就是 P1 的向后兼容状态。
-	groups, err := db.ListGroups(ctx)
-	if err != nil {
-		t.Fatalf("list groups: %v", err)
-	}
-	if len(groups) != 0 {
-		t.Errorf("legacy db should have no groups, got %d", len(groups))
-	}
-}
 
 // ---- 分组 CRUD ----
 

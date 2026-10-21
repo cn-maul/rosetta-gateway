@@ -2,7 +2,6 @@ package store
 
 import (
 	"context"
-	"database/sql"
 	"io"
 	"log/slog"
 	"strconv"
@@ -18,129 +17,6 @@ func testStore(t *testing.T, path string) *Store {
 	}
 	t.Cleanup(func() { st.Close() })
 	return st
-}
-
-// 迁移回归：老库（routes 带 fallback_route_id 与 4 个「按路由策略」列）升级后
-// 必须能正常打开、数据不丢、废弃列被摘除。
-//
-// 这条路径有真实风险：ALTER TABLE DROP COLUMN 对某些列（如带外键的
-// fallback_route_id）可能不被 SQLite 接受，一旦失败就会把网关挡在启动之外。
-// 因此 dropDeadColumns 对失败只记 WARN 不中断，本测试同时守住「能开」与「列已删」。
-func TestMigration_DropsObsoleteRouteColumns(t *testing.T) {
-	path := t.TempDir() + "/old.db"
-
-	// 用原生 SQL 造一个「老 schema」的库（含本次要摘除的列）。
-	raw, err := sql.Open("sqlite", path)
-	if err != nil {
-		t.Fatalf("open raw: %v", err)
-	}
-	ddl := []string{
-		`CREATE TABLE providers (
-			id TEXT PRIMARY KEY, slug TEXT NOT NULL UNIQUE, name TEXT NOT NULL,
-			protocol TEXT NOT NULL DEFAULT 'auto', endpoint TEXT NOT NULL,
-			enabled INTEGER NOT NULL DEFAULT 1, timeout_ms INTEGER NOT NULL DEFAULT 0,
-			max_retries INTEGER NOT NULL DEFAULT 2, quirks_json TEXT,
-			created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL)`,
-		`CREATE TABLE upstream_models (
-			id TEXT PRIMARY KEY, provider_id TEXT NOT NULL, model_id TEXT NOT NULL,
-			display_name TEXT, enabled INTEGER NOT NULL DEFAULT 1,
-			context_window INTEGER, max_output_tokens INTEGER, supports_thinking INTEGER,
-			UNIQUE (provider_id, model_id))`,
-		`CREATE TABLE routes (
-			id TEXT PRIMARY KEY, public_name TEXT NOT NULL UNIQUE,
-			provider_id TEXT NOT NULL, upstream_model_id TEXT NOT NULL,
-			enabled INTEGER NOT NULL DEFAULT 1,
-			fallback_route_id TEXT REFERENCES routes(id) ON DELETE SET NULL,
-			failover_enabled INTEGER NOT NULL DEFAULT 0,
-			max_targets INTEGER NOT NULL DEFAULT 0,
-			failure_threshold INTEGER NOT NULL DEFAULT 0,
-			stream_first_token_timeout_ms INTEGER NOT NULL DEFAULT 0,
-			nonstream_timeout_ms INTEGER NOT NULL DEFAULT 0,
-			created_at INTEGER NOT NULL)`,
-	}
-	for i, s := range ddl {
-		if _, err := raw.Exec(s); err != nil {
-			t.Fatalf("seed ddl[%d]: %v", i, err)
-		}
-	}
-	seed := []string{
-		`INSERT INTO providers (id, slug, name, endpoint, created_at, updated_at) VALUES ('p1','p1','P1','http://x',1,1)`,
-		`INSERT INTO upstream_models (id, provider_id, model_id, enabled) VALUES ('m1','p1','chat',1)`,
-		`INSERT INTO routes (id, public_name, provider_id, upstream_model_id, enabled, failover_enabled, max_targets, created_at)
-		   VALUES ('r1','flash','p1','m1',1,1,4,1)`,
-	}
-	for i, s := range seed {
-		if _, err := raw.Exec(s); err != nil {
-			t.Fatalf("seed data[%d]: %v", i, err)
-		}
-	}
-	_ = raw.Close()
-
-	// 正常路径打开 → 触发迁移。
-	st := testStore(t, path)
-
-	got, err := st.GetRoute(context.Background(), "r1")
-	if err != nil {
-		t.Fatalf("get route after migration: %v", err)
-	}
-	if got == nil || got.PublicName != "flash" {
-		t.Fatalf("route lost during migration: %+v", got)
-	}
-	if !got.FailoverEnabled {
-		t.Fatalf("failover_enabled not preserved: %+v", got)
-	}
-
-	for _, col := range []string{
-		"fallback_route_id", "max_targets", "failure_threshold",
-		"stream_first_token_timeout_ms", "nonstream_timeout_ms",
-	} {
-		has, err := st.columnExists("routes", col)
-		if err != nil {
-			t.Fatalf("columnExists(%s): %v", col, err)
-		}
-		if has {
-			t.Fatalf("obsolete column %s still present after migration", col)
-		}
-	}
-}
-
-// 模拟升级：先建库并写入一条 route（此时还没有 route_targets），
-// 关闭后重新 Open 触发迁移 —— 老 route 应被回填一条 position 0 的目标，
-// 且再开一次不应重复插入（幂等）。
-func TestMigration_BackfillRouteTargets(t *testing.T) {
-	ctx := context.Background()
-	path := t.TempDir() + "/gw.db"
-
-	st := testStore(t, path)
-	if err := st.CreateProvider(ctx, &Provider{ID: "p1", Slug: "p1", Name: "P1", Endpoint: "http://x", Enabled: true, Protocol: "openai-chat"}); err != nil {
-		t.Fatalf("create provider: %v", err)
-	}
-	m := &UpstreamModel{ID: "m1", ProviderID: "p1", ModelID: "chat", Enabled: true}
-	if err := st.CreateUpstreamModel(ctx, m); err != nil {
-		t.Fatalf("create model: %v", err)
-	}
-	if err := st.CreateRoute(ctx, &Route{ID: "r1", PublicName: "flash", ProviderID: "p1", UpstreamModelID: "m1", Enabled: true}); err != nil {
-		t.Fatalf("create route: %v", err)
-	}
-	st.Close()
-
-	// 重开：ensureColumns + backfill
-	st2 := testStore(t, path)
-	targets, err := st2.ListRouteTargets(ctx, "r1")
-	if err != nil {
-		t.Fatalf("list targets: %v", err)
-	}
-	if len(targets) != 1 || targets[0].Position != 0 || targets[0].ProviderID != "p1" || targets[0].UpstreamModelID != "m1" {
-		t.Fatalf("backfill wrong: %+v", targets)
-	}
-
-	// 再重开：不应重复回填
-	st2.Close()
-	st3 := testStore(t, path)
-	targets3, _ := st3.ListRouteTargets(ctx, "r1")
-	if len(targets3) != 1 {
-		t.Fatalf("backfill not idempotent, got %d targets", len(targets3))
-	}
 }
 
 // route 的 failover_enabled 读写往返（策略参数已收拢为全局 runtime_defaults，不再按路由存）。
@@ -300,31 +176,45 @@ func TestSyncHeadTarget(t *testing.T) {
 	must(st.CreateUpstreamModel(ctx, &UpstreamModel{ID: "m2", ProviderID: "p2", ModelID: "c2", Enabled: true}))
 	must(st.CreateRoute(ctx, &Route{ID: "r1", PublicName: "flash", ProviderID: "p1", UpstreamModelID: "m1", Enabled: true}))
 
-	// 空链：补一条 position 0 目标，取新主目标。
-	must(st.SyncHeadTarget(ctx, "r1", "p2", "m2"))
+	// 正常创建路径已原子种下 position 0；这里先确认它在，再模拟链被清空后
+	// 的防御性修复路径。
 	ts, _ := st.ListRouteTargets(ctx, "r1")
+	if len(ts) != 1 || ts[0].Position != 0 || ts[0].ProviderID != "p1" {
+		t.Fatalf("route creation must seed position 0: %+v", ts)
+	}
+	if _, err := st.DB().ExecContext(ctx, `DELETE FROM route_targets WHERE route_id = ?`, "r1"); err != nil {
+		t.Fatalf("clear chain: %v", err)
+	}
+	must(st.SyncHeadTarget(ctx, "r1", "p2", "m2"))
+	ts, _ = st.ListRouteTargets(ctx, "r1")
 	if len(ts) != 1 || ts[0].Position != 0 || ts[0].ProviderID != "p2" || ts[0].UpstreamModelID != "m2" {
 		t.Fatalf("empty-chain sync wrong: %+v", ts)
 	}
 
-	// 有链：只改链首，第二条（position 1）保持不动。
-	must(st.CreateRouteTarget(ctx, &RouteTarget{ID: "t2", RouteID: "r1", ProviderID: "p1", UpstreamModelID: "m1", Position: 1, Enabled: true}))
+	// 有链：把已有的第二条提升为链首，原链首下移到它的位置。
+	// 不能复制目标 —— 唯一约束禁止同一链重复 (provider, model)。
+	must(st.RunTx(ctx, func(ctx context.Context, tx Tx) error {
+		return createRouteTarget(ctx, tx, &RouteTarget{
+			ID: "t2", RouteID: "r1", ProviderID: "p1",
+			UpstreamModelID: "m1", Position: 1, Enabled: true,
+		})
+	}))
 	must(st.SyncHeadTarget(ctx, "r1", "p1", "m1"))
 	ts, _ = st.ListRouteTargets(ctx, "r1")
 	if len(ts) != 2 {
 		t.Fatalf("want 2 targets, got %d", len(ts))
 	}
 	if ts[0].ProviderID != "p1" || ts[0].UpstreamModelID != "m1" {
-		t.Fatalf("head not synced: %+v", ts[0])
+		t.Fatalf("existing target not promoted: %+v", ts[0])
 	}
-	if ts[1].ID != "t2" || ts[1].Position != 1 {
-		t.Fatalf("non-head target mutated: %+v", ts[1])
+	if ts[1].ProviderID != "p2" || ts[1].UpstreamModelID != "m2" || ts[1].Position != 1 {
+		t.Fatalf("old head not demoted: %+v", ts[1])
 	}
 
 	// 幂等：已一致时不新增、不改。
 	must(st.SyncHeadTarget(ctx, "r1", "p1", "m1"))
 	ts, _ = st.ListRouteTargets(ctx, "r1")
-	if len(ts) != 2 || ts[0].ProviderID != "p1" {
+	if len(ts) != 2 || ts[0].ProviderID != "p1" || ts[1].ProviderID != "p2" {
 		t.Fatalf("not idempotent: %+v", ts)
 	}
 }

@@ -499,60 +499,6 @@ func TestSetBalance_TogglesUnlimited(t *testing.T) {
 
 // ---- 5. 迁移 ----
 
-// 老库（没有 balance_cents 列）升级后必须拿到该列，且**存量用户是
-// 「不限额」（NULL）而不是「余额 0」**。
-//
-// 这是加列时最容易被写错的一步：`ADD COLUMN balance_cents INTEGER NOT NULL
-// DEFAULT 0` 会让所有存量用户一夜之间变成「一分钱没有」，全部被 402 挡在
-// 门外 —— 一次升级造成全站不可用。故迁移刻意**不带 DEFAULT**。
-func TestMigration_BalanceColumnDefaultsExistingUsersToUnlimited(t *testing.T) {
-	path := t.TempDir() + "/legacy.db"
-	ctx := context.Background()
-
-	first := testStore(t, path)
-	mustUser(t, first, "old", 0, true)
-	mustUser(t, first, "fresh", 100, false)
-	if err := first.Close(); err != nil {
-		t.Fatalf("close: %v", err)
-	}
-
-	// 摘掉列，模拟「该列落地之前的库」。
-	raw, err := sql.Open("sqlite", path)
-	if err != nil {
-		t.Fatalf("open raw: %v", err)
-	}
-	if _, err := raw.Exec(`CREATE TABLE tmp_users AS SELECT id, username, display_name,
-		password_hash, role, status, quota_tokens, used_tokens, auth_version, remark,
-		created_at, updated_at, last_login_at, group_id FROM users`); err != nil {
-		t.Fatalf("stage copy: %v", err)
-	}
-	if _, err := raw.Exec(`DROP TABLE users`); err != nil {
-		t.Fatalf("drop old table: %v", err)
-	}
-	if _, err := raw.Exec(`ALTER TABLE tmp_users RENAME TO users`); err != nil {
-		t.Fatalf("swap table: %v", err)
-	}
-	_ = raw.Close()
-
-	second := testStore(t, path)
-	if has, err := second.columnExists("users", "balance_cents"); err != nil || !has {
-		t.Fatalf("balance_cents must be restored on upgrade: has=%v err=%v", has, err)
-	}
-
-	// 存量行必须是 NULL（不限额），不是 0。
-	var v sql.NullInt64
-	if err := second.read.QueryRowContext(ctx,
-		`SELECT balance_cents FROM users WHERE id='old'`).Scan(&v); err != nil {
-		t.Fatalf("read migrated balance: %v", err)
-	}
-	if v.Valid {
-		t.Fatalf("migrated user balance = %d, want NULL（存量用户升级后应是不限额）", v.Int64)
-	}
-	if ok, err := second.HasSufficientBalance(ctx, "old", 999_999_99); err != nil || !ok {
-		t.Fatalf("migrated unlimited user must pass precheck: ok=%v err=%v", ok, err)
-	}
-}
-
 // userColumns 与 scanUser 必须逐列同步（列清单漂移的典型后果是**静默赋错值**：
 // 少一列时后面的列会扫进前面的字段，编译与测试全绿，账目在暗处对不上）。
 // 本用例对每个字段填入可区分的值，任何错位都会当场暴露。

@@ -10,7 +10,7 @@ import (
 )
 
 // RouteTarget 是故障转移链上的一个成员：一条 route 下的某个 (provider, model) 目标。
-// Position 升序即尝试顺序，0 通常就是 routes 表里那份「主目标」（迁移时自动回填）。
+// Position 升序即尝试顺序，0 是创建 route 时原子写入的链首目标。
 type RouteTarget struct {
 	ID              string
 	RouteID         string
@@ -92,13 +92,13 @@ func (s *Store) RouteReferencesByModel(ctx context.Context) (ModelRouteRefs, err
 	return out, rows.Err()
 }
 
-// RouteCompatHeadsByModel 查 routes 的「主目标」兼容列：model id → 是否被指着。
+// RouteHeadMirrorsByModel 查 routes 的链首镜像列：model id → 是否被指着。
 //
 // 与 RouteReferencesByModel 并列查而不是合并：两者口径不同（一个看链的
-// position 0，一个看 routes 的向后兼容列），迁移期可能不一致，而
+// position 0，一个看 routes 的链首镜像列），异常数据下可能不一致，而
 // store 层的链首拒绝判定也正是两个来源都查。界面若只查一个，就会出现
 // 「按钮亮着但点下去必然 409」。
-func (s *Store) RouteCompatHeadsByModel(ctx context.Context) (map[string]bool, error) {
+func (s *Store) RouteHeadMirrorsByModel(ctx context.Context) (map[string]bool, error) {
 	out := make(map[string]bool)
 	rows, err := s.read.QueryContext(ctx,
 		`SELECT upstream_model_id FROM routes WHERE upstream_model_id IS NOT NULL AND upstream_model_id <> ''`)
@@ -153,11 +153,12 @@ func (s *Store) GetRouteTarget(ctx context.Context, id string) (*RouteTarget, er
 	return &t, nil
 }
 
-func (s *Store) CreateRouteTarget(ctx context.Context, t *RouteTarget) error {
-	return createRouteTarget(ctx, s.db, t)
-}
-
 // createRouteTarget 接受 execer，供事务内复用（见 CreateRouteWithHeadTarget）。
+//
+// 不导出单条 create / update / delete：链的顺序与「position 连续 0..n-1」是
+// ReplaceRouteTargets 维护的不变量，任何单条写入都可能把它写坏（例如把
+// position 改成任意值、删中间一行留出空洞）。审计 A6-P1-5 确认这三个导出
+// 方法全仓无生产调用点，属于「一用就破坏约束」的公开 API。
 func createRouteTarget(ctx context.Context, ex execer, t *RouteTarget) error {
 	if t.CreatedAt == 0 {
 		t.CreatedAt = time.Now().UnixMilli()
@@ -176,22 +177,6 @@ func createRouteTarget(ctx context.Context, ex execer, t *RouteTarget) error {
 	return err
 }
 
-func (s *Store) UpdateRouteTarget(ctx context.Context, id string, t *RouteTarget) error {
-	enabled := 0
-	if t.Enabled {
-		enabled = 1
-	}
-	_, err := s.db.ExecContext(ctx,
-		`UPDATE route_targets SET route_id = ?, provider_id = ?, upstream_model_id = ?, position = ?, enabled = ? WHERE id = ?`,
-		t.RouteID, t.ProviderID, t.UpstreamModelID, t.Position, enabled, id)
-	return err
-}
-
-func (s *Store) DeleteRouteTarget(ctx context.Context, id string) error {
-	_, err := s.db.ExecContext(ctx, `DELETE FROM route_targets WHERE id = ?`, id)
-	return err
-}
-
 // generateTargetID 生成 32 位十六进制主键，与网关各处 ID 同构。
 func generateTargetID() string {
 	b := make([]byte, 16)
@@ -204,7 +189,7 @@ func generateTargetID() string {
 // 运行时以链为准（buildCandidates 一旦见到目标行就不再看 routes 主目标列），
 // 所以当有人绕过目标链接口、直接 PATCH route.provider_id/upstream_model_id 时，
 // 必须把这次改动落到链首 —— 否则 DB 列变了、响应回显新值，实际流量仍打旧目标，
-// 静默失效。链为空（从未配过链的老 route）则补一条 position 0。幂等：已一致直接返回。
+// 静默失效。链为空（异常缺失）则补一条 position 0。幂等：已一致直接返回。
 func (s *Store) SyncHeadTarget(ctx context.Context, routeID, providerID, modelID string) error {
 	return syncHeadTarget(ctx, s.db, routeID, providerID, modelID)
 }
@@ -215,9 +200,11 @@ func (s *Store) SyncHeadTarget(ctx context.Context, routeID, providerID, modelID
 // 覆盖不了「两条语句为一组」的组合。
 func syncHeadTarget(ctx context.Context, ex execer, routeID, providerID, modelID string) error {
 	var headID, headProvider, headModel string
+	var headPosition int
 	err := ex.QueryRowContext(ctx,
-		`SELECT id, provider_id, upstream_model_id FROM route_targets WHERE route_id = ? ORDER BY position LIMIT 1`,
-		routeID).Scan(&headID, &headProvider, &headModel)
+		`SELECT id, provider_id, upstream_model_id, position
+		   FROM route_targets WHERE route_id = ? ORDER BY position LIMIT 1`,
+		routeID).Scan(&headID, &headProvider, &headModel, &headPosition)
 	switch {
 	case errors.Is(err, sql.ErrNoRows):
 		return createRouteTarget(ctx, ex, &RouteTarget{
@@ -233,6 +220,31 @@ func syncHeadTarget(ctx context.Context, ex execer, routeID, providerID, modelID
 	if headProvider == providerID && headModel == modelID {
 		return nil
 	}
+
+	// 目标已在链中的其他位置：把它提升为链首，原链首下移到它原来的位置。
+	// 不能像旧实现那样直接把链首改成同一个 (provider, model) —— 那会产生
+	// 两个相同目标，既被唯一索引拒绝，也会在运行时重复尝试、重复计费。
+	var existingID string
+	var existingPosition int
+	err = ex.QueryRowContext(ctx,
+		`SELECT id, position FROM route_targets
+		  WHERE route_id = ? AND provider_id = ? AND upstream_model_id = ? AND id <> ?`,
+		routeID, providerID, modelID, headID).Scan(&existingID, &existingPosition)
+	switch {
+	case err == nil:
+		if _, err := ex.ExecContext(ctx,
+			`UPDATE route_targets SET position = ? WHERE id = ?`,
+			headPosition, existingID); err != nil {
+			return err
+		}
+		_, err = ex.ExecContext(ctx,
+			`UPDATE route_targets SET position = ? WHERE id = ?`,
+			existingPosition, headID)
+		return err
+	case !errors.Is(err, sql.ErrNoRows):
+		return err
+	}
+
 	_, err = ex.ExecContext(ctx,
 		`UPDATE route_targets SET provider_id = ?, upstream_model_id = ? WHERE id = ?`,
 		providerID, modelID, headID)
@@ -241,14 +253,20 @@ func syncHeadTarget(ctx context.Context, ex execer, routeID, providerID, modelID
 
 // ReplaceRouteTargets 用给定顺序整体重建某条 route 的目标链（position 按切片下标重排）。
 // 供后台「保存有序目标列表」使用：删旧插新，一次事务内完成，避免中途状态让快照读到断链。
-// in[0] 会同时写回 routes.provider_id / upstream_model_id 作为主目标（向后兼容列）。
+// in[0] 会同时写回 routes.provider_id / upstream_model_id，保持主目标列与链首一致。
 func (s *Store) ReplaceRouteTargets(ctx context.Context, routeID string, targets []RouteTarget) error {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
 	}
 	defer tx.Rollback()
+	if err := replaceRouteTargets(ctx, tx, routeID, targets); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
 
+func replaceRouteTargets(ctx context.Context, tx Tx, routeID string, targets []RouteTarget) error {
 	if _, err := tx.ExecContext(ctx, `DELETE FROM route_targets WHERE route_id = ?`, routeID); err != nil {
 		return err
 	}
@@ -283,5 +301,5 @@ func (s *Store) ReplaceRouteTargets(ctx context.Context, routeID string, targets
 		}
 	}
 
-	return tx.Commit()
+	return nil
 }

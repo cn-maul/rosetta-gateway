@@ -116,7 +116,7 @@ func (u *User) IsActive() bool { return u != nil && u.Status == UserStatusActive
 // 加一列要改三处 —— 漏一处的表现是「某一处 SELECT 少一列，scanUser 报
 // 列数不匹配」，而报错点与漏改点不在一处。三处现在共用本常量。
 //
-// group_id 必须 COALESCE：老库升级后该列对存量行是真 NULL，
+// group_id 必须 COALESCE：未归组时该列是真 NULL，
 // 扫进 string 会报 "converting NULL to string is unsupported"。
 //
 // ⚠️ **本常量与 scanUser 必须逐列同步**，新增列时两处一起改。手写列清单
@@ -207,8 +207,8 @@ func (s *Store) FindUninitializedAdmin(ctx context.Context) (*User, error) {
 // 调用方应先用 IsUniqueViolation(err) 区分「重名」与「其他故障」。
 //
 // balance_cents **随创建写入**：新建账号时管理员通常要同时给一个初始余额。
-// Unlimited=true 落 NULL（不限额），否则落整数分。与迁移路径的编码一致
-// （见 store.ensureColumns 里对 balance_cents 可空性的说明）。
+// Unlimited=true 落 NULL（不限额），否则落整数分。NULL 与 0 是两种业务
+// 状态：「不限额」与「余额为零」，不可合并。
 func (s *Store) CreateUser(ctx context.Context, u *User) error {
 	now := time.Now().UnixMilli()
 	if u.CreatedAt == 0 {
@@ -247,8 +247,8 @@ func (s *Store) CreateUser(ctx context.Context, u *User) error {
 // balanceValue 把 (cents, unlimited) 编码成可直接绑定的列值。
 //
 // Unlimited → nil（SQL NULL = 不限额），否则落整数分。集中在一处是为了
-// 让「NULL 才是不限额」这条约定只有一份实现（CreateUser / SetBalance /
-// 迁移的编码必须一致，分散写必然漂移）。见 User.BalanceCents 的注释。
+// 让「NULL 才是不限额」这条约定只有一份实现（CreateUser / SetBalance
+// 等写路径必须一致，分散写必然漂移）。见 User.BalanceCents 的注释。
 func balanceValue(cents int64, unlimited bool) any {
 	if unlimited {
 		return nil
@@ -276,6 +276,38 @@ func (s *Store) UpdateUser(ctx context.Context, u *User) error {
 		u.DisplayName, u.Role, u.Status, nullIfEmpty(u.GroupID), u.QuotaTokens,
 		u.Remark, u.UpdatedAt, u.ID)
 	return checkAffected(res, err)
+}
+
+// UpdateUserAndBumpAuthVersion 在**同一事务**里更新可管理字段并递增 auth_version。
+//
+// 审计 A7-02：角色/状态变更与会话失效此前是两次独立提交（UpdateUser 一次、
+// BumpAuthVersion 一次）。第二步失败时字段已落库而 handler 回 500，旧 JWT 在
+// 自然过期前仍能通过 auth_version 校验 —— 也就是「已经把这个账号改成普通用户 /
+// 已禁用，但被盗的旧会话照常能用」。两次写必须要么都成、要么都不成。
+//
+// 为什么不用 UpdateUser + BumpAuthVersion 的 RunTx 组合：那需要在 handler 里重复
+// 写两段 SQL 的调用顺序，且 UpdateUser 走的是 s.db（事务外）—— 一旦有人把顺序
+// 调换或改成并发调用，原子性就悄悄消失。这里把两步固定在同一个函数体内。
+//
+// auth_version 依然在 SQL 里相对递增（auth_version + 1），不读快照值，因此
+// 与 SetUserPassword 的递增可以安全叠加，不会出现「读旧写旧」把吊销撤销。
+func (s *Store) UpdateUserAndBumpAuthVersion(ctx context.Context, u *User) error {
+	return s.RunTx(ctx, func(ctx context.Context, ex Tx) error {
+		u.UpdatedAt = time.Now().UnixMilli()
+		res, err := ex.ExecContext(ctx,
+			`UPDATE users SET display_name = ?, role = ?, status = ?, group_id = ?,
+			                  quota_tokens = ?, remark = ?, updated_at = ?
+			 WHERE id = ?`,
+			u.DisplayName, u.Role, u.Status, nullIfEmpty(u.GroupID), u.QuotaTokens,
+			u.Remark, u.UpdatedAt, u.ID)
+		if err := checkAffected(res, err); err != nil {
+			return err
+		}
+		res, err = ex.ExecContext(ctx,
+			`UPDATE users SET auth_version = auth_version + 1, updated_at = ? WHERE id = ?`,
+			time.Now().UnixMilli(), u.ID)
+		return checkAffected(res, err)
+	})
 }
 
 // SetUserPassword 单独更新密码哈希，隐式递增 auth_version。
@@ -389,7 +421,7 @@ func (s *Store) setInitialAdminPassword(ctx context.Context, id, passwordHash st
 				return false, ErrBootstrapTokenMismatch
 			}
 		}
-		// tokErr == ErrNoRows = 库里没有令牌记录 → 不要求令牌（老库兼容路径）。
+		// tokErr == ErrNoRows = 库里没有令牌记录 → 不要求令牌。
 	}
 	res, err := tx.ExecContext(ctx,
 		`UPDATE users SET password_hash = ?, auth_version = auth_version + 1, updated_at = ?
@@ -439,7 +471,7 @@ func (s *Store) SetInitialAdminPasswordWithToken(ctx context.Context, id, passwo
 }
 
 // BootstrapTokenRequired 报告本安装是否配置了引导令牌。
-// 为 false 时（老库、本地直跑）BootstrapSetup 放行不带令牌的请求。
+// 为 false 时（如本地直跑）BootstrapSetup 放行不带令牌的请求。
 //
 // 用途只有一个：告诉前端「这个安装的引导窗口要凭令牌才能完成」。
 // **不要**用它来做放行/拒绝的判定 —— 那是事务内那次比对的事，
@@ -506,8 +538,8 @@ func (s *Store) SumUserUsedTokens(ctx context.Context, userID string) (int64, er
 
 	// users 里没有这一行 —— 回退到实时 SUM，保持与旧实现逐字一致的语义。
 	//
-	// 什么时候会走到：usage_records 对 users **没有外键**（孤儿 key 的历史行
-	// 必须能存在，见 store.go 里 usage_records.user_id 的迁移注释），所以
+	// 什么时候会走到：usage_records 对 users **没有外键**（历史用量必须能
+	// 在用户删除后继续存在），所以
 	// user_id 可以指向一个已被删除的用户。此时累加列无从累加，实时 SUM
 	// 反而是唯一正确的数据源。
 	//
@@ -555,50 +587,41 @@ func (s *Store) ReserveUserQuota(ctx context.Context, userID string, est int64) 
 	}
 	defer func() { _ = tx.Rollback() }() //nolint:errcheck // 已提交时是 no-op
 
-	// 累加列可能缺行（孤儿 user_id：用户已删但用量行仍在，见 SumUserUsedTokens
-	// 的回退分支）。缺行按 used=0 处理，不因此让整次预检失败。
-	var quota int64
-	err = tx.QueryRowContext(ctx,
-		`SELECT quota_tokens FROM users WHERE id = ?`, userID).Scan(&quota)
-	if errors.Is(err, sql.ErrNoRows) {
-		return 0, false, nil
-	}
+	// 审计 M1：与 key 级 ReserveQuota 同构，写语句必须是事务的第一条。
+	// 先 SELECT 再 UPDATE 在跨连接竞争时会撞 SQLITE_BUSY_SNAPSHOT，而调用方
+	// 是 fail-open 的，等于让终身配额在并发下失效。
+	//
+	// used 来自 user_usage_totals（触发器维护）；缺行按 0 处理。COALESCE
+	// 放在子查询里，让「尚无用量」的用户仍然可以走同一条条件 UPDATE。
+	res, err := tx.ExecContext(ctx,
+		`UPDATE users
+		    SET reserved_tokens = reserved_tokens + ?
+		  WHERE id = ? AND quota_tokens > 0
+		    AND COALESCE((SELECT total_tokens FROM user_usage_totals WHERE user_id = ?), 0)
+		        + reserved_tokens + ? <= quota_tokens`,
+		est, userID, userID, est)
 	if err != nil {
 		return 0, false, err
 	}
-	// quota<=0 = 不限额，与 key 级判定一致；此时不预占也不受限。
-	if quota <= 0 {
-		return 0, true, tx.Commit()
-	}
-
-	var used int64
-	// 用**写池的 tx**而非 s.read：读池在 WAL 下可能读到本事务之前的状态，
-	// 与 RecomputeUsedTokens 的同一理由 —— 跨事务读会让判定在并发下不可复现。
-	// 缺行回退到 0（该用户还没有任何用量）。
-	uerr := tx.QueryRowContext(ctx,
-		`SELECT total_tokens FROM user_usage_totals WHERE user_id = ?`, userID).Scan(&used)
-	if errors.Is(uerr, sql.ErrNoRows) {
-		used = 0
-	} else if uerr != nil {
-		return 0, false, uerr
-	}
-
-	var reservedNow int64
-	if rerr := tx.QueryRowContext(ctx,
-		`SELECT reserved_tokens FROM users WHERE id = ?`, userID).Scan(&reservedNow); rerr != nil {
-		return 0, false, rerr
-	}
-
-	// 判定必须计入**在途预占**：漏掉 reservedNow，并发的第二个请求会在第一个
-	// 收尾前看到假性余量 —— 正是预占要堵住的 check-then-act 窗口。
-	if used+reservedNow+est > quota {
-		return 0, false, nil
-	}
-	// 同一事务内把预占推上去。刻意**不写** user_usage_totals：那列是触发器
-	// 维护的派生值，这里再写就是双倍记账。
-	if _, err := tx.ExecContext(ctx,
-		`UPDATE users SET reserved_tokens = reserved_tokens + ? WHERE id = ?`, est, userID); err != nil {
+	n, err := res.RowsAffected()
+	if err != nil {
 		return 0, false, err
+	}
+	if n == 0 {
+		// 未修改行：区分用户不存在、不限额、额度不足。
+		var quota int64
+		qerr := tx.QueryRowContext(ctx,
+			`SELECT quota_tokens FROM users WHERE id = ?`, userID).Scan(&quota)
+		if errors.Is(qerr, sql.ErrNoRows) {
+			return 0, false, nil
+		}
+		if qerr != nil {
+			return 0, false, qerr
+		}
+		if quota <= 0 {
+			return 0, true, tx.Commit()
+		}
+		return 0, false, nil
 	}
 	if err := tx.Commit(); err != nil {
 		return 0, false, err

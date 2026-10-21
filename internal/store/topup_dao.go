@@ -196,10 +196,29 @@ func (s *Store) AdjustBalanceWithLedger(ctx context.Context, userID string, delt
 		return Topup{}, err
 	}
 
+	// # 「加余额 → 结转欠款 → 写流水」必须在一个事务里（2026-10-21 修 P0-1/2）
+	//
+	// 此前这三步是三条自动提交语句，settlePendingForUser 内部还有两条 ——
+	// 组合起来有四种资损形态（详见 settlePendingForUser 的注释）：
+	// 重复结转（多收）、崩溃窗口（再收一次）、无限额被切成有限额、
+	// 并发新欠款被无辜抹掉（漏收）。
+	//
+	// 之前那句「本函数刻意不绑事务」的论证（「不为此把低频管理写绑进长事务」）
+	// **前提是错的**：结转不是「低频的附带写」，它是一笔**扣款**，
+	// 而且与「充值」共用一条不互斥的路径 —— 正是那句话漏掉的另一半。
+	//
+	// 事务的持锁时间只比原来多两条语句（读账本 + 精确删行），仍是低频管理写，
+	// 不会成为吞吐瓶颈。
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return Topup{}, err
+	}
+	defer func() { _ = tx.Rollback() }() //nolint:errcheck // 已提交时是 no-op
+
 	// 改余额 + 读回改后值，压进**同一条语句**：写锁保证两者之间没有别的写入，
 	// 因此读到的就是「本次自己的结果」，不会是他人的中间态。
 	var after int64
-	err := s.db.QueryRowContext(ctx,
+	err = tx.QueryRowContext(ctx,
 		`UPDATE users
 		    SET balance_cents = MAX(0, COALESCE(balance_cents, 0) + ?), updated_at = ?
 		  WHERE id = ?
@@ -217,12 +236,11 @@ func (s *Store) AdjustBalanceWithLedger(ctx context.Context, userID string, delt
 	// 欠费时那些不足一分的零头被记进 balance_pending（见 ChargeBalance 的
 	// 欠费分支），原本会永远收不回来。充值是它们该被结清的时刻。
 	//
-	// 本函数刻意不绑事务（见上面「不为此把低频管理写绑进长事务」的论证），
-	// 所以结转是两条独立语句：先扣账再清账本。万一清账本失败，零头会被
-	// **下次充值再扣一次** —— 那是可恢复的、且下次会成功（余额仍不足一时
-	// MAX(0,…) 兜底）；反过来若先清账本再扣账，扣失败就永久漏收了。
-	// 方向的选择原则：宁可多扣一次（可发现、可纠正）也不漏收（无迹可寻）。
-	if err := s.settlePendingForUser(ctx, s.db, userID); err != nil {
+	// 现在它在**同一个事务**里：扣账与清账本要么都成、要么都不成。
+	// 「先扣账再清账本」在自动提交下曾被当作可接受的取舍（宁可多扣一次
+	// 也不漏收），但那个取舍的前提是「没有并发」—— 有了并发，同一笔欠款
+	// 会被扣 N 次（N = 并发充值数），那不是「多扣一次」，是「按并发度多收」。
+	if err := s.settlePendingForUser(ctx, tx, userID); err != nil {
 		return Topup{}, err
 	}
 
@@ -240,13 +258,32 @@ func (s *Store) AdjustBalanceWithLedger(ctx context.Context, userID string, delt
 		Remark:           remark,
 	}
 
-	if err := s.insertTopup(ctx, t); err != nil {
-		// 余额已经改了。**绝不**把错误往上抛成「充值失败」—— 见函数注释
-		// 第 2 点：那会诱导管理员重复充值。记 ERROR 让运维能发现并补记。
+	// 写流水。它**在同一个事务里**：流水与余额变化必须同生共死 ——
+	// 余额变了而流水没写，是对账侧无法解释的状态（函数注释第 3 点）。
+	//
+	// 但写流水失败**不**让整个事务回滚：余额已经生效了，回滚等于把
+	// 管理员的充值凭空取消（那比缺一条流水更糟 —— 管理员会看到「充值失败」
+	// 而余额其实变了，于是再充一次，那就是真的多充了钱）。
+	//
+	// 所以：写流水失败 → 提交事务（余额与结转生效）→ 记 ERROR 让运维补记。
+	// 这与函数注释第 2 点是同一条纪律。
+	if err := s.insertTopupTx(ctx, tx, t); err != nil {
+		if cerr := tx.Commit(); cerr != nil {
+			s.logger.Error("balance adjusted but commit failed (MUST reconcile manually)",
+				"error", cerr, "user_id", userID, "delta_cents", deltaCents,
+				"balance_after", after, "operator_id", operatorID)
+			return t, nil
+		}
 		s.logger.Error("balance adjusted but topup ledger write failed (MUST reconcile manually)",
 			"error", err, "user_id", userID, "delta_cents", deltaCents,
 			"balance_after", after, "operator_id", operatorID)
 		return t, nil
+	}
+	if err := tx.Commit(); err != nil {
+		// 提交失败：余额与流水都没生效，对调用方报失败（它可以重试）。
+		s.logger.Error("topup commit failed", "error", err,
+			"user_id", userID, "delta_cents", deltaCents, "operator_id", operatorID)
+		return Topup{}, err
 	}
 	return t, nil
 }
@@ -254,11 +291,28 @@ func (s *Store) AdjustBalanceWithLedger(ctx context.Context, userID string, delt
 // insertTopup 写一条流水。单独拆出是为了让「写流水失败」能被调用方
 // 明确识别为**可恢复**的失败（余额已生效），而不是与余额调整的错误混为一谈。
 func (s *Store) insertTopup(ctx context.Context, t Topup) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }() //nolint:errcheck // 已提交时是 no-op
+	if err := s.insertTopupTx(ctx, tx, t); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+// insertTopupTx 在**给定事务**里写一条流水。
+//
+// 与 insertTopup 的区别只是事务归属：充值路径（AdjustBalanceWithLedger）
+// 要把「加余额 → 结转欠款 → 写流水」压进**同一个事务**，所以流水也得
+// 用那个事务写，不能自己开一笔（自己开就是另一笔事务 = 流水与余额不同生共死）。
+func (s *Store) insertTopupTx(ctx context.Context, tx *sql.Tx, t Topup) error {
 	wasUnlimited := 0
 	if t.WasUnlimited {
 		wasUnlimited = 1
 	}
-	_, err := s.db.ExecContext(ctx,
+	_, err := tx.ExecContext(ctx,
 		`INSERT INTO balance_topups (id, user_id, delta_cents, balance_after, was_unlimited,
 		                             operator_id, operator_username, ts, remark)
 		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,

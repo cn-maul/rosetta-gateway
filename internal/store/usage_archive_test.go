@@ -2,8 +2,6 @@ package store
 
 import (
 	"context"
-	"io"
-	"log/slog"
 	"testing"
 	"time"
 )
@@ -696,108 +694,5 @@ func TestUsageTotals_TriggerAccumulates(t *testing.T) {
 	}
 	if lt2.FirstRecordAt != lt.FirstRecordAt {
 		t.Errorf("first_record_at changed across prune: %d -> %d", lt.FirstRecordAt, lt2.FirstRecordAt)
-	}
-}
-
-// TestEnsureRollupDimensions_RebuildsStaleTable 守老库升级路径。
-//
-// 表 A 最初落盘时主键是 7 列（缺 upstream_model）。SQLite 不能 ALTER 主键，
-// 只能整张重建；而不重建的话那条 ON CONFLICT 会直接报错，剪枝永久失败。
-// 这里造一个「7 列主键的旧表」再 Open，验证重建后 upstream_model 进了主键。
-func TestEnsureRollupDimensions_RebuildsStaleTable(t *testing.T) {
-	path := t.TempDir() + "/old-rollup.db"
-	ctx := context.Background()
-	base := time.Now()
-	freezeNow(t, base)
-
-	st := testStore(t, path)
-	archiveFixture(t, st, base, DefaultRetentionDays)
-	// 手工把表退化成旧形状：7 列主键、没有 upstream_model 列。
-	legacy := `CREATE TABLE usage_daily_rollups_old (
-		day TEXT NOT NULL, user_id TEXT NOT NULL DEFAULT '',
-		access_key_id TEXT NOT NULL DEFAULT '', public_model TEXT NOT NULL DEFAULT '',
-		provider_id TEXT NOT NULL DEFAULT '', ingress_protocol TEXT NOT NULL DEFAULT '',
-		stream INTEGER NOT NULL DEFAULT 0,
-		request_count INTEGER NOT NULL DEFAULT 0, success_count INTEGER NOT NULL DEFAULT 0,
-		error_count INTEGER NOT NULL DEFAULT 0,
-		input_tokens INTEGER NOT NULL DEFAULT 0, output_tokens INTEGER NOT NULL DEFAULT 0,
-		cached_tokens INTEGER NOT NULL DEFAULT 0, reasoning_tokens INTEGER NOT NULL DEFAULT 0,
-		total_tokens INTEGER NOT NULL DEFAULT 0, cost_total REAL NOT NULL DEFAULT 0,
-		latency_sum_ms INTEGER NOT NULL DEFAULT 0,
-		PRIMARY KEY (day, user_id, access_key_id, public_model, provider_id,
-		             ingress_protocol, stream))`
-	if _, err := st.db.Exec(`DROP TABLE usage_daily_rollups`); err != nil {
-		t.Fatalf("drop rollups: %v", err)
-	}
-	if _, err := st.db.Exec(legacy); err != nil {
-		t.Fatalf("create legacy rollups: %v", err)
-	}
-	// 重新打开走一遍 migrate（迁移必须能从旧形状升上来）。
-	if err := st.Close(); err != nil {
-		t.Fatalf("close: %v", err)
-	}
-	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	st2, err := Open(path, logger)
-	if err != nil {
-		t.Fatalf("reopen after legacy shape: %v", err)
-	}
-	t.Cleanup(func() { st2.Close() })
-
-	has, err := st2.columnExists("usage_daily_rollups", "upstream_model")
-	if err != nil {
-		t.Fatalf("check column: %v", err)
-	}
-	if !has {
-		t.Fatal("upstream_model column must exist after migrate")
-	}
-	// 重建后剪枝必须能跑通（重建前那条 ON CONFLICT 必然报错）。
-	if _, err := st2.PruneOldUsage(ctx, DefaultRetentionDays); err != nil {
-		t.Fatalf("prune after rebuild: %v", err)
-	}
-}
-
-// TestBackfillUsageCost_SkipsRowsWithoutPrices 守回填的可观测行为。
-//
-// 未配价的模型 cost_total 恒为 0，回填扫过去也只能写 0 —— 但它必须**跑完**
-// 并打上标记，否则每次启动都重扫全表，启动时间随历史数据量线性增长。
-func TestBackfillUsageCost_SkipsRowsWithoutPrices(t *testing.T) {
-	ctx := context.Background()
-	st := testStore(t, t.TempDir()+"/gw.db")
-	base := time.Now()
-	freezeNow(t, base)
-	archiveFixture(t, st, base, DefaultRetentionDays)
-
-	// marker 已由 migrate 写入（本次是空库，不需要回填），这里直接验证幂等：
-	// 再跑一次不改变任何金额。
-	before, err := st.GetUsageStats(ctx, 0, 0, "")
-	if err != nil {
-		t.Fatalf("stats: %v", err)
-	}
-	if err := st.backfillUsageCost(); err != nil {
-		t.Fatalf("second backfill: %v", err)
-	}
-	after, err := st.GetUsageStats(ctx, 0, 0, "")
-	if err != nil {
-		t.Fatalf("stats after: %v", err)
-	}
-	assertStatsEqual(t, before, after)
-
-	// 但「老库里 cost_total=0 的存量行必须被补上」是这条迁移存在的理由。
-	// 手工置 0 并清掉 marker，模拟升级到 P1.5 之前的老库。
-	if _, err := st.db.Exec(`UPDATE usage_records SET cost_total = 0`); err != nil {
-		t.Fatalf("zero costs: %v", err)
-	}
-	if _, err := st.db.Exec(`DELETE FROM app_settings WHERE key = ?`, settingUsageCostBackfillKey); err != nil {
-		t.Fatalf("clear marker: %v", err)
-	}
-	if err := st.backfillUsageCost(); err != nil {
-		t.Fatalf("backfill: %v", err)
-	}
-	backfilled, err := st.GetUsageStats(ctx, 0, 0, "")
-	if err != nil {
-		t.Fatalf("stats after backfill: %v", err)
-	}
-	if diff := backfilled.Cost - before.Cost; diff > 1e-9 || diff < -1e-9 {
-		t.Errorf("backfill must restore frozen cost: %v -> %v", before.Cost, backfilled.Cost)
 	}
 }

@@ -79,13 +79,29 @@ func (s *Store) GetNetwork(ctx context.Context, id string) (*Network, error) {
 func (s *Store) CreateNetwork(ctx context.Context, n *Network) error {
 	n.ProxyURL = strings.TrimSpace(n.ProxyURL)
 	now := time.Now().UnixMilli()
-	if _, err := s.db.ExecContext(ctx,
-		`INSERT INTO networks (id, name, proxy_url, created_at) VALUES (?, ?, ?, ?)`,
-		n.ID, n.Name, n.ProxyURL, now); err != nil {
+	if err := createNetwork(ctx, s.db, n, now); err != nil {
 		return err
 	}
 	n.CreatedAt = now
 	return nil
+}
+
+// CreateNetworkTx 在一笔事务里创建出站网络，供导入等整批写入复用。
+func (s *Store) CreateNetworkTx(ctx context.Context, tx Tx, n *Network) error {
+	n.ProxyURL = strings.TrimSpace(n.ProxyURL)
+	now := time.Now().UnixMilli()
+	if err := createNetwork(ctx, tx, n, now); err != nil {
+		return err
+	}
+	n.CreatedAt = now
+	return nil
+}
+
+func createNetwork(ctx context.Context, ex execer, n *Network, now int64) error {
+	_, err := ex.ExecContext(ctx,
+		`INSERT INTO networks (id, name, proxy_url, created_at) VALUES (?, ?, ?, ?)`,
+		n.ID, n.Name, n.ProxyURL, now)
+	return err
 }
 
 func (s *Store) UpdateNetwork(ctx context.Context, id, name, proxyURL string) error {
@@ -165,91 +181,12 @@ func (s *Store) ProviderProxyURLs(ctx context.Context) ([]ProviderProxyURL, erro
 	return result, rows.Err()
 }
 
-// backfillProxyNetworks 把老库里 providers.proxy_url 的非空值迁移到 networks。
+// NewNetworkID 生成一条出站网络的主键。
 //
-// 一次性、幂等：迁移完成后 providers.proxy_url 列被 drop（见 dropDeadColumns），
-// 所以第二次运行时该列已不存在，此时直接返回。
-//
-// 迁移策略是「按 URL 归并成一行」：多个 provider 手填了同一个代理地址时，
-// 它们本来就该共用一个网络 —— 这正是本次改造想达成的形态，自动归并等于
-// 把历史配置顺手整理好。
-func (s *Store) backfillProxyNetworks(ctx context.Context) error {
-	has, err := s.columnExists("providers", "proxy_url")
-	if err != nil {
-		return err
-	}
-	if !has {
-		return nil
-	}
-	rows, err := s.read.QueryContext(ctx,
-		`SELECT DISTINCT TRIM(proxy_url) FROM providers
-		 WHERE proxy_url IS NOT NULL AND TRIM(proxy_url) <> ''`)
-	if err != nil {
-		return err
-	}
-	var urls []string
-	for rows.Next() {
-		var u string
-		if err := rows.Scan(&u); err != nil {
-			rows.Close()
-			return err
-		}
-		urls = append(urls, u)
-	}
-	if err := rows.Err(); err != nil {
-		rows.Close()
-		return err
-	}
-	rows.Close()
-
-	for _, u := range urls {
-		if n, err := s.findNetworkByProxyURL(ctx, u); err != nil {
-			return err
-		} else if n != nil {
-			continue
-		}
-		// 网络名用 URL 本身兜底：老库里没有名字可继承，而「手填的代理地址」
-		// 是一个诚实且唯一的默认展示名。之后管理员可以在界面上改名。
-		if err := s.CreateNetwork(ctx, &Network{ID: newNetworkID(), Name: u, ProxyURL: u}); err != nil {
-			// UNIQUE(name) 冲突说明并发启动时另一个实例已经建好了同一行。
-			// 那种情况下直接用已存在的那行，不是错误。
-			if !IsUniqueViolation(err) {
-				return err
-			}
-		}
-	}
-
-	// 回填 network_id。每个 provider 单独按 URL 匹配，避免「同 URL 多行」。
-	for _, u := range urls {
-		n, err := s.findNetworkByProxyURL(ctx, u)
-		if err != nil {
-			return err
-		}
-		if n == nil {
-			continue
-		}
-		if _, err := s.db.ExecContext(ctx,
-			`UPDATE providers SET network_id = ? WHERE proxy_url = ?`, n.ID, u); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
-func (s *Store) findNetworkByProxyURL(ctx context.Context, proxyURL string) (*Network, error) {
-	var n Network
-	err := s.read.QueryRowContext(ctx, `SELECT id, name, proxy_url, created_at FROM networks WHERE proxy_url = ?`, proxyURL).
-		Scan(&n.ID, &n.Name, &n.ProxyURL, &n.CreatedAt)
-	if err == sql.ErrNoRows {
-		return nil, nil
-	}
-	if err != nil {
-		return nil, err
-	}
-	return &n, nil
-}
-
-func newNetworkID() string {
+// 导出到 store 之外是为了让 admin 的配置导入走 CreateNetworkTx 时生成
+// 同一格式的 id；此前导入自己拼 "net-"+generateID()，与这里的格式看似
+// 相同，实际是两套生成器 —— 将来改前缀只会改到一处。
+func NewNetworkID() string {
 	b := make([]byte, 16)
 	crand.Read(b)
 	return "net-" + hex.EncodeToString(b)

@@ -15,7 +15,6 @@ package store
 
 import (
 	"context"
-	"database/sql"
 	"testing"
 )
 
@@ -151,61 +150,4 @@ func TestQuotaReserve_UsageMissingOnlyRefundsReservation(t *testing.T) {
 		t.Fatalf("release: %v", err)
 	}
 	assertTokens(t, st, "k1", 0, 0)
-}
-
-// 老库升级：建库时没有 reserved_tokens 列的库，重开后必须能拿到该列，
-// 否则 ReserveQuota 的 SELECT/UPDATE 直接报「无此列」—— 配额预检 fail-open，
-// 终身配额整体失效。这里走「先 Open、手工把 access_keys 换成无该列的旧表、
-// 再 Open」来复现老库形态；migrate() 里 ensureColumns 必须把它补回来。
-// 注意 trg_update_used_tokens 定义在 usage_records 上（不是 access_keys 上），
-// 摘表不会连带摘掉它，必须先显式 DROP —— 否则 RENAME 时严格校验会因触发器
-// 引用了已不存在的表而失败。重开时 migrate() 会按 DROP+CREATE 重建触发器。
-func TestMigration_AddsReservedTokensColumn(t *testing.T) {
-	path := t.TempDir() + "/legacy.db"
-
-	st := testStore(t, path)
-	mustCreateKey(t, st, "k1", 1000)
-	st.Close()
-
-	// 摘掉列，模拟「该列落地之前的库」。
-	raw, err := sql.Open("sqlite", path)
-	if err != nil {
-		t.Fatalf("open raw: %v", err)
-	}
-	if _, err := raw.Exec(`DROP TRIGGER IF EXISTS trg_update_used_tokens`); err != nil {
-		t.Fatalf("drop trigger: %v", err)
-	}
-	if _, err := raw.Exec(`CREATE TABLE tmp_keys AS SELECT id, key_hash, key_prefix, name, enabled,
-		quota_tokens, used_tokens, user_id, rpm_limit, tpm_limit, allowed_models_json, expires_at,
-		allowed_ips, group_id, created_at FROM access_keys`); err != nil {
-		t.Fatalf("stage copy: %v", err)
-	}
-	if _, err := raw.Exec(`DROP TABLE access_keys`); err != nil {
-		t.Fatalf("drop old table: %v", err)
-	}
-	if _, err := raw.Exec(`ALTER TABLE tmp_keys RENAME TO access_keys`); err != nil {
-		t.Fatalf("swap table: %v", err)
-	}
-	_ = raw.Close()
-
-	st2 := testStore(t, path)
-	if has, err := st2.columnExists("access_keys", "reserved_tokens"); err != nil || !has {
-		t.Fatalf("reserved_tokens must be restored on upgrade: has=%v err=%v", has, err)
-	}
-
-	// 列回来之后，预占 → 落 usage → 释放 的不变量在升级库上同样成立。
-	reserved, ok, err := st2.ReserveQuota(context.Background(), "k1", 100)
-	if err != nil || !ok {
-		t.Fatalf("reserve on upgraded db: ok=%v err=%v", ok, err)
-	}
-	if err := st2.CreateUsageRecord(context.Background(), &UsageRecord{
-		ID: "u1", AccessKeyID: "k1", PublicModel: "flash", IngressProtocol: "openai-chat",
-		TotalTokens: 60, UsageState: "reported", Status: "ok",
-	}); err != nil {
-		t.Fatalf("usage: %v", err)
-	}
-	if err := st2.ReleaseQuota(context.Background(), "k1", reserved); err != nil {
-		t.Fatalf("release: %v", err)
-	}
-	assertTokens(t, st2, "k1", 60, 0)
 }

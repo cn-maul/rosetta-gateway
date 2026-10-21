@@ -98,6 +98,65 @@ func TestBalancePending_不同RequestId分别记账(t *testing.T) {
 	}
 }
 
+// 审计 *X17：空 request_id 的欠费不得蒸发。公共 API 允许空 request_id，
+// 旧的「requestID == "" 直接跳过 pending」会让已发生的应收完全消失。
+// 这里断言：余额不变（欠费不硬扣）、仍有 pending 记录、且欠费错误照常返回。
+// 欠费尝试本身必须局部回滚，所以 balance_charges 不应留下占位行。
+func TestBalancePending_EmptyRequestIDStillRecordsDebt(t *testing.T) {
+	ctx := context.Background()
+	st := testStore(t, t.TempDir()+"/gw.db")
+	mustUser(t, st, "empty-req", 1, false)
+
+	if err := st.ChargeBalance(ctx, "empty-req", 3.0, ""); !errors.Is(err, ErrInsufficientBalance) {
+		t.Fatalf("应返回 ErrInsufficientBalance，得到 %v", err)
+	}
+	if got := pendingAmount(t, st, "empty-req"); got != 3_000_000 {
+		t.Fatalf("待结算 = %d 微元，期望 3000000（空 request_id 也必须记账）", got)
+	}
+	var charges int
+	if err := st.read.QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM balance_charges WHERE user_id = 'empty-req'`).Scan(&charges); err != nil {
+		t.Fatalf("read charges: %v", err)
+	}
+	if charges != 0 {
+		t.Fatalf("balance_charges 占位行 = %d，期望 0（欠费尝试应局部回滚）", charges)
+	}
+}
+
+// 审计 *X17：欠费事务必须一次提交。这里在 balance_pending 的写入路径上
+// 注入失败（把主键改成 CHECK 不可行，直接用只读触发器模拟），断言
+// balance_charges 占位行与 users.balance_remainder 都不留下半个状态。
+// 控制器：通过临时新增一个会拒绝插入的触发器，验证事务整体回滚。
+func TestBalancePending_InsufficientPathIsAtomic(t *testing.T) {
+	ctx := context.Background()
+	st := testStore(t, t.TempDir()+"/gw.db")
+	mustUser(t, st, "atomic", 1, false)
+
+	if _, err := st.db.ExecContext(ctx,
+		`CREATE TRIGGER reject_pending BEFORE INSERT ON balance_pending
+		 BEGIN SELECT RAISE(ABORT, 'pending write rejected'); END`); err != nil {
+		t.Fatalf("create trigger: %v", err)
+	}
+
+	err := st.ChargeBalance(ctx, "atomic", 3.0, "atomic-req")
+	if err == nil || errors.Is(err, ErrInsufficientBalance) {
+		t.Fatalf("pending 写失败时应返回底层错误而不是吞掉，得到 %v", err)
+	}
+
+	var charges int
+	if err := st.read.QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM balance_charges WHERE request_id = 'atomic-req'`).Scan(&charges); err != nil {
+		t.Fatalf("read charges: %v", err)
+	}
+	if charges != 0 {
+		t.Fatalf("balance_charges 留下 %d 条占位行 —— 占位与欠款必须同事务", charges)
+	}
+	if got := readRemainder(t, st, "atomic"); got != 0 {
+		t.Fatalf("balance_remainder = %d，期望 0 —— 失败的欠费事务留下了余数", got)
+	}
+	assertBalance(t, st, "atomic", 1, true)
+}
+
 // 充值必须把待结算金额结转掉，且余额里体现出来。
 //
 // 欠下的钱本来就是他要付的，充值是它该被收掉的时刻 —— 否则它永远挂着、

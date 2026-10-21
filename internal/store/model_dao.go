@@ -256,7 +256,7 @@ func (s *Store) DeleteUpstreamModelDetaching(ctx context.Context, id string) ([]
 	// 链首判定：position = 0 的那一行。
 	//
 	// 只看 route_targets 是**不够**的：routes.provider_id/upstream_model_id
-	// 是「主目标」的向后兼容列，迁移期可能还指着某个已不在链上的模型。
+	// 是「主目标」列，异常数据下可能还指着某个已不在链上的模型。
 	// 两个来源都查，否则会出现「routes 说它是主目标、链上却没有」时
 	// 删掉它、留下一个指向空模型的路由。
 	//
@@ -306,8 +306,8 @@ func (s *Store) DeleteUpstreamModelDetaching(ctx context.Context, id string) ([]
 
 // headRoutesOfModel 返回把该模型当作**链首**的路由 id 列表。
 //
-// 查两个来源：route_targets 的 position 0，以及 routes 的兼容列。两者都查的
-// 理由见调用处的说明。
+// 查两个来源：route_targets 的 position 0，以及 routes 的链首镜像列。
+// 正常写入路径同步两者；异常数据下两处都查，删除判定才与界面一致。
 func headRoutesOfModel(ctx context.Context, ex execer, modelID string) ([]string, error) {
 	rows, err := ex.QueryContext(ctx,
 		`SELECT route_id FROM route_targets WHERE upstream_model_id = ? AND position = 0`, modelID)
@@ -327,7 +327,7 @@ func headRoutesOfModel(ctx context.Context, ex execer, modelID string) ([]string
 		return nil, err
 	}
 
-	// 兼容列：即使 route_targets 里没有对应行，routes 仍可能指着它。
+	// 链首镜像列：即使 route_targets 里没有对应行，routes 仍可能指着它。
 	//
 	// 单行查询用 QueryRowContext 扫进一个 string —— 一开始写成 Scan(&[]string)，
 	// 编译能过（any 接一切）、运行才炸：driver.Value 是 string，塞不进
@@ -345,7 +345,7 @@ func headRoutesOfModel(ctx context.Context, ex execer, modelID string) ([]string
 			heads = append(heads, compat)
 		}
 	case errors.Is(err, sql.ErrNoRows):
-		// 没有兼容列引用它，正常。
+		// 没有镜像列引用它，正常。
 	default:
 		return nil, err
 	}
