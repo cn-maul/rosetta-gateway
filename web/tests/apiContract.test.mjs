@@ -1,5 +1,6 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
+import { API_ROUTES } from '../src/generated/routes.ts'
 
 // # 兼容性注意（未本地验证）
 //
@@ -289,4 +290,32 @@ test('模型白名单按组写入用 PUT 到 models 子路径', async () => {
   const [call] = globalThis.__calls
   assert.equal(call.init.method, 'PUT')
   assert.equal(call.url, '/admin/api/groups/g1/models')
+})
+
+test('生产路由快照完整且免鉴权端点集合固定', () => {
+  assert.equal(API_ROUTES.length, 103, '路由增删必须同步承认契约变化')
+  assert.equal(new Set(API_ROUTES.map((r) => r.pattern)).size, 103, '路由 pattern 不得重复')
+
+  const publicRoutes = API_ROUTES
+    .filter((r) => r.public)
+    .map((r) => r.pattern)
+    .sort()
+  assert.deepEqual(publicRoutes, [
+    'GET /admin/api/bootstrap',
+    'GET /admin/api/session',
+    'POST /admin/api/bootstrap',
+    'POST /admin/api/login',
+  ])
+
+  const patterns = new Set(API_ROUTES.map((r) => r.pattern))
+  for (const pattern of [
+    'POST /v1/chat/completions',
+    'GET /v1/models',
+    'GET /healthz',
+    'GET /admin/',
+    'PUT /admin/api/routes/{id}/targets',
+    'GET /admin/api/usage/history.csv',
+  ]) {
+    assert.ok(patterns.has(pattern), `缺少生产路由 ${pattern}`)
+  }
 })

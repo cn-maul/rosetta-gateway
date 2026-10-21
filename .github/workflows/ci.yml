@@ -118,6 +118,13 @@ jobs:
           go generate ./internal/config
           git diff --exit-code -- web/src/generated/defaults.ts
 
+      # 前端路由快照从真实 buildApp 导出，而不是从源码正则或手抄清单生成。
+      # 注册表改了但忘记同步快照时，这里直接失败。
+      - name: 前端路由快照一致
+        run: |
+          go generate ./cmd/gateway
+          git diff --exit-code -- web/src/generated/routes.ts
+
       # 依赖方向是架构约束里最容易在重构中回退的一类：代码能编译、测试也绿，
       # 但 admin 又 import 回 server。单独一步让失败原因一眼可见。
       - name: 架构依赖方向
