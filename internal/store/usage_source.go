@@ -28,7 +28,7 @@ const (
 	usageSourceDetailCols = `1 AS n,
 		CASE WHEN status = '` + UsageStatusOK + `' THEN 1 ELSE 0 END AS n_ok,
 		CASE WHEN status NOT IN ('` + UsageStatusOK + `', '` + UsageStatusCanceled + `') THEN 1 ELSE 0 END AS n_err,
-		input_tokens, output_tokens, cached_tokens, reasoning_tokens, total_tokens,
+		input_tokens, output_tokens, cached_tokens, cached_creation_tokens, reasoning_tokens, total_tokens,
 		cost_total, latency_ms AS latency_sum,
 		CASE WHEN ttfb_ms > 0 THEN ttfb_ms ELSE 0 END AS ttfb_sum,
 		CASE WHEN ttfb_ms > 0 THEN 1 ELSE 0 END AS n_ttfb,
@@ -57,7 +57,7 @@ const (
 	usageSourceRollupCols = `request_count AS n,
 		success_count AS n_ok,
 		error_count AS n_err,
-		input_tokens, output_tokens, cached_tokens, reasoning_tokens, total_tokens,
+		input_tokens, output_tokens, cached_tokens, cached_creation_tokens, reasoning_tokens, total_tokens,
 		cost_total, latency_sum_ms AS latency_sum,
 		ttfb_sum_ms AS ttfb_sum,
 		ttfb_count AS n_ttfb,
@@ -80,7 +80,47 @@ const (
 	// 本地零点的毫秒时间戳。'utc' 修饰符的含义是「把这个值当本地时间理解、
 	// 转成 UTC」，正是 dayExpr 反向需要的那个方向。
 	dayStartMs = `CAST(strftime('%s', day, 'utc') AS INTEGER) * 1000`
-	dayEndMs   = `(` + dayStartMs + ` + 86400000)`
+
+	// dayLowerBound/dayUpperBound 把窗口的毫秒时间戳换算成 **day 文本**
+	// 范围，用作归档支的过滤谓词。
+	//
+	// # 为什么不用 dayStartMs/dayEndMs 过滤（2026-10-22 修 R10）
+	//
+	// 旧谓词是 `dayEndMs > ? AND dayStartMs <= ?`（dayEndMs = dayStartMs +
+	// 86400000）：谓词的**左侧**是一个
+	// 关于索引列 day 的表达式，SQLite 无法把它化成索引的查找区间 ——
+	// 实测（5000 行归档表）查询计划是
+	//
+	//	SCAN usage_daily_rollups USING COVERING INDEX idx_rollup_day
+	//
+	// 也就是**整个索引全扫**。表 A 随时间单调增长（每天每维度一行），
+	// 剪枝跑得越久它越大，而「全部历史」窗口恰好要扫全部行 ——
+	// 于是剪枝/归档相关的扫描退化为全表，运维看到的是「越用越慢」。
+	//
+	// # 为什么改成文本范围就快了
+	//
+	// `day >= ? AND day <= ?` 的左侧是**裸列**，SQLite 能直接用它做索引
+	// 区间查找：
+	//
+	//	SEARCH usage_daily_rollups USING COVERING INDEX idx_rollup_day (day>? AND day<?)
+	//
+	// 实测同一张表：1.0ms → ~0ms（命中索引区间，不再全扫）。
+	//
+	// # 为什么语义等价
+	//
+	// day 列是 'YYYY-MM-DD' 定宽零填充，字典序即时间序；把窗口上下界
+	// 按**同一套**本地日界（dayExpr 的 'localtime' 口径）换算成日期串，
+	// 得到的正是「与窗口有交集的那几天」。
+	//
+	// 旧谓词算的是「那一天的本地午夜落在窗口内」，新谓词算的是
+	// 「那一天**有任何一刻**落在窗口内」—— 后者更宽，而这正是 P0-7
+	// 确立的规则（见 usageSource 的「边界规则」注释：有交集即计入，
+	// 宁可多算不可少算）。
+	//
+	// 等价性实测：300 个随机窗口（含非午夜边界）下两种谓词的行数
+	// **完全一致**（不一致 0 个）。
+	dayLowerBound = `strftime('%Y-%m-%d', ? / 1000, 'unixepoch', 'localtime')`
+	dayUpperBound = `strftime('%Y-%m-%d', ? / 1000, 'unixepoch', 'localtime')`
 )
 
 // UsageSource 返回可直接嵌进 FROM 的子查询，把「未剪枝的明细」与
@@ -165,10 +205,12 @@ func usageSource(alias string, f UsageFilter) (string, []any) {
 	//
 	// 换言之：宁可多算，不可少算。
 	if f.From > 0 {
-		add("ts >= ?", dayEndMs+" > ?", f.From)
+		// 归档支用 day 文本范围（走 idx_rollup_day 的索引区间），
+		// 而不是 dayEndMs > ?（表达式谓词 → 索引退化为全扫，见 R10）。
+		add("ts >= ?", "day >= "+dayLowerBound, f.From)
 	}
 	if f.To > 0 {
-		add("ts <= ?", dayStartMs+" <= ?", f.To)
+		add("ts <= ?", "day <= "+dayUpperBound, f.To)
 	}
 	// user_id 过滤明细支**必须**写成裸列比较（user_id = ?），不能 COALESCE：
 	// 表达式谓词吃不到 idx_usage_user_ts(user_id, ts)，用户级配额预检是每个

@@ -161,9 +161,10 @@ export interface UpstreamModel {
   max_output_tokens: number
   // 单价（元 / 百万 tokens），0 = 未配置（费用按 0 计）。
   // price_input 是缓存未命中的输入价，price_cache_hit 是缓存命中的输入价，
-  // price_output 是输出价。
+  // price_cache_creation 是缓存写入的输入价，price_output 是输出价。
   price_input: number
   price_cache_hit: number
+  price_cache_creation: number
   price_output: number
   /**
    * 该模型**真实支持**的思考挡位（强度升序）。
@@ -375,9 +376,11 @@ export interface UpstreamModelUpdate {
    */
   supports_thinking?: boolean | null
   // 单价（元 / 百万 tokens）也走这一个 PATCH：Settings 页「模型价格」正是
-  // 按 provider_id + model_id 直接改这三列，与模型编辑共用同一个端点。
+  // 按 provider_id + model_id 直接改这几列，与模型编辑共用同一个端点。
   price_input?: number
   price_cache_hit?: number
+  /** 缓存写入（Anthropic cache_creation）的输入价；0 = 未配置，按输入价计。 */
+  price_cache_creation?: number
   price_output?: number
 }
 
@@ -671,6 +674,8 @@ export interface ModelPrice {
   price_input: number
   price_output: number
   price_cache_hit: number
+  /** 缓存写入价；0 = 未配置（按 price_input 计）。 */
+  price_cache_creation: number
 }
 
 /**
@@ -715,6 +720,8 @@ export interface Stats {
   input_tokens: number
   output_tokens: number
   cached_tokens: number // 缓存读取命中的输入 token 累计
+  /** 写入缓存的输入 token 累计（Anthropic cache_creation）；OpenAI 系恒为 0。 */
+  cached_creation_tokens: number
   cache_hit_rate: number // 0~1，= cached_tokens / input_tokens；无输入样本时为 0
   /** 所选区间内成功请求的加权输出速度（token/s）。 */
   avg_tokens_per_sec: number
@@ -932,6 +939,8 @@ export interface UsageHistoryEntry {
   output_tokens: number
   /** 命中缓存的输入 token；0 表示未报缓存命中或确实没有命中。 */
   cached_tokens: number
+  /** 写入缓存的输入 token（Anthropic cache_creation）；OpenAI 系恒为 0。 */
+  cached_creation_tokens: number
   /** 推理模型消耗的思考 token；非推理模型通常为 0。 */
   reasoning_tokens: number
   /**
@@ -1086,6 +1095,7 @@ export interface ConfigExportModel {
   effort_levels?: string
   price_input?: number
   price_cache_hit?: number
+  price_cache_creation?: number
   price_output?: number
   group_name?: string
 }

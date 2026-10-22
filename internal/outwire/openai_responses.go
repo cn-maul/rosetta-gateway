@@ -630,12 +630,14 @@ func (s *ResponsesSSE) Finish(status string, stop rosetta.StopReason, usage rose
 		return
 	}
 
+	eventName := "response.completed"
 	resp := s.responseSkeleton("completed")
 	if len(s.output) > 0 {
 		resp["output"] = s.output
 	}
 	// StopLength 在 Responses 语义里是「未完成」而非失败。
 	if stop == rosetta.StopLength {
+		eventName = "response.incomplete"
 		resp["status"] = "incomplete"
 		resp["incomplete_details"] = map[string]any{"reason": "max_output_tokens"}
 	}
@@ -671,7 +673,7 @@ func (s *ResponsesSSE) Finish(status string, stop rosetta.StopReason, usage rose
 			"reasoning_tokens": usage.ReasoningTokens,
 		}
 	}
-	s.writeEvent("response.completed", map[string]any{"response": resp})
+	s.writeEvent(eventName, map[string]any{"response": resp})
 }
 
 func (s *ResponsesSSE) Keepalive() {

@@ -163,6 +163,17 @@ func (h *UserHandler) SessionStatus(w http.ResponseWriter, r *http.Request) {
 // 细分等于给攻击者一个枚举用户名的 oracle。限速按来源 IP 做（复用
 // guard.FailureThrottle），对策是拖慢而非完全阻止。
 func (h *UserHandler) Login(w http.ResponseWriter, r *http.Request) {
+	// 登录也走同源门禁（2026-10-22 修 A7-14）。
+	//
+	// 登录是免鉴权入口，但它的响应会写会话 Cookie：同站不同源的页面可以
+	// 把受害者浏览器登进攻击者账号（login CSRF），之后受害者在该账号下的
+	// 操作都会落进攻击者能看到的地方。SameSite=Strict 与 JSON 的
+	// Content-Type 只是间接防线，不能替代对 Origin/Sec-Fetch-Site 的显式判定。
+	// 非浏览器客户端（curl / SDK）不带这些头，仍按同源放行。
+	if !httpx.SameOrigin(r) {
+		httpx.WriteForbidden(w)
+		return
+	}
 	if !h.mgr.Enabled() {
 		writeError(w, http.StatusServiceUnavailable,
 			"用户登录未启用：请设置环境变量 "+userauth.SecretEnvName+"（至少 32 个字符）后重启")

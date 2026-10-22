@@ -29,10 +29,12 @@ type UpstreamModel struct {
 
 	// 价格：单位为「元 / 百万 tokens」，0 = 未配置（费用统计按 0 计）。
 	// PriceInput 对应缓存未命中的输入，PriceCacheHit 对应缓存命中的输入，
-	// PriceOutput 对应输出。
-	PriceInput    float64
-	PriceCacheHit float64
-	PriceOutput   float64
+	// PriceCacheCreation 对应写入缓存的输入（Anthropic cache creation），
+	// PriceOutput 对应输出。未配置 PriceCacheCreation 时按 PriceInput 计费。
+	PriceInput         float64
+	PriceCacheHit      float64
+	PriceCacheCreation float64
+	PriceOutput        float64
 
 	// GroupID 是模型归组（跨上游的同一个模型标成一组，统计合并显示）。
 	// 空串 = 未归组。组的权威显示名在 model_groups.display_name，
@@ -41,7 +43,7 @@ type UpstreamModel struct {
 }
 
 // modelColumns 是 upstream_models 三处读路径共用的列清单。
-const modelColumns = `id, provider_id, model_id, display_name, context_window, max_output_tokens, supports_thinking, effort_levels, price_input, price_cache_hit, price_output, group_id`
+const modelColumns = `id, provider_id, model_id, display_name, context_window, max_output_tokens, supports_thinking, effort_levels, price_input, price_cache_hit, price_cache_creation, price_output, group_id`
 
 // nullIfZeroInt 把 0 写回 NULL。
 // context_window / max_output_tokens 是可空列，0 与"未知"语义不同，
@@ -89,11 +91,11 @@ func scanModel(sc scanner) (UpstreamModel, error) {
 	var ctxWindow, maxOut sql.NullInt64
 	var thinking sql.NullBool
 	var effortCSV sql.NullString
-	var priceIn, priceHit, priceOut sql.NullFloat64
+	var priceIn, priceHit, priceCreate, priceOut sql.NullFloat64
 	var groupID sql.NullString
 
 	err := sc.Scan(&m.ID, &m.ProviderID, &m.ModelID, &displayName,
-		&ctxWindow, &maxOut, &thinking, &effortCSV, &priceIn, &priceHit, &priceOut, &groupID)
+		&ctxWindow, &maxOut, &thinking, &effortCSV, &priceIn, &priceHit, &priceCreate, &priceOut, &groupID)
 	if err != nil {
 		return m, err
 	}
@@ -103,6 +105,7 @@ func scanModel(sc scanner) (UpstreamModel, error) {
 	m.MaxOutputTokens = int(maxOut.Int64)
 	m.PriceInput = priceIn.Float64
 	m.PriceCacheHit = priceHit.Float64
+	m.PriceCacheCreation = priceCreate.Float64
 	m.PriceOutput = priceOut.Float64
 	m.GroupID = groupID.String
 	if thinking.Valid {
@@ -179,24 +182,49 @@ func (s *Store) CreateUpstreamModelTx(ctx context.Context, tx Tx, m *UpstreamMod
 // createUpstreamModel 接受 execer，供事务内复用（见 ImportUpstreamModels）。
 func createUpstreamModel(ctx context.Context, ex execer, m *UpstreamModel) error {
 	_, err := ex.ExecContext(ctx,
-		`INSERT INTO upstream_models (id, provider_id, model_id, display_name, context_window, max_output_tokens, supports_thinking, effort_levels, price_input, price_cache_hit, price_output, group_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		`INSERT INTO upstream_models (id, provider_id, model_id, display_name, context_window, max_output_tokens, supports_thinking, effort_levels, price_input, price_cache_hit, price_cache_creation, price_output, group_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		m.ID, m.ProviderID, m.ModelID, nullIfEmpty(m.DisplayName),
 		nullIfZeroInt(m.ContextWindow), nullIfZeroInt(m.MaxOutputTokens), m.SupportsThinking,
 		effortColumnValue(m),
-		nullIfZeroFloat(m.PriceInput), nullIfZeroFloat(m.PriceCacheHit), nullIfZeroFloat(m.PriceOutput),
+		nullIfZeroFloat(m.PriceInput), nullIfZeroFloat(m.PriceCacheHit), nullIfZeroFloat(m.PriceCacheCreation), nullIfZeroFloat(m.PriceOutput),
 		nullIfEmpty(m.GroupID))
 	return err
 }
 
 func (s *Store) UpdateUpstreamModel(ctx context.Context, id string, m *UpstreamModel) error {
 	res, err := s.db.ExecContext(ctx,
-		`UPDATE upstream_models SET model_id = ?, display_name = ?, context_window = ?, max_output_tokens = ?, supports_thinking = ?, effort_levels = ?, price_input = ?, price_cache_hit = ?, price_output = ?, group_id = ? WHERE id = ?`,
+		`UPDATE upstream_models SET model_id = ?, display_name = ?, context_window = ?, max_output_tokens = ?, supports_thinking = ?, effort_levels = ?, price_input = ?, price_cache_hit = ?, price_cache_creation = ?, price_output = ?, group_id = ? WHERE id = ?`,
 		m.ModelID, nullIfEmpty(m.DisplayName),
 		nullIfZeroInt(m.ContextWindow), nullIfZeroInt(m.MaxOutputTokens), m.SupportsThinking,
 		effortColumnValue(m),
-		nullIfZeroFloat(m.PriceInput), nullIfZeroFloat(m.PriceCacheHit), nullIfZeroFloat(m.PriceOutput),
+		nullIfZeroFloat(m.PriceInput), nullIfZeroFloat(m.PriceCacheHit), nullIfZeroFloat(m.PriceCacheCreation), nullIfZeroFloat(m.PriceOutput),
 		nullIfEmpty(m.GroupID), id)
 	return checkAffected(res, err)
+}
+
+// UpstreamModelUsageExists 报告某个 (provider_id, model_id) 是否已有历史用量。
+//
+// 用途：A7-12 的改名契约。用量归档以 (provider_id, upstream_model) 作为
+// 不可变定位符（明细、日归档、CSV、按模型分组都靠它），改名会让旧数据
+// 与当前配置对不上：报表里旧名一组、配置里新名一条，两边都“正常”但
+// 无法互相对账。
+//
+// 明细与归档都要查：只查 usage_records 时，30 天前的历史已经被剪进
+// usage_daily_rollups，改名会绕过保护。两处都命中才算“有历史”。
+func (s *Store) UpstreamModelUsageExists(ctx context.Context, providerID, modelID string) (bool, error) {
+	var exists int
+	err := s.read.QueryRowContext(ctx, `
+		SELECT EXISTS (
+			SELECT 1 FROM usage_records
+			 WHERE provider_id = ? AND upstream_model = ?
+			UNION ALL
+			SELECT 1 FROM usage_daily_rollups
+			 WHERE provider_id = ? AND upstream_model = ?
+		)`, providerID, modelID, providerID, modelID).Scan(&exists)
+	if err != nil {
+		return false, err
+	}
+	return exists != 0, nil
 }
 
 // DeleteUpstreamModel 删除一个上游模型；id 不存在时返回 ErrNotFound。
@@ -406,19 +434,20 @@ func compactTargetPositions(ctx context.Context, ex execer, routeID string) erro
 // 返回实际更新的行数。调用方（admin handler）用它核对「ids 里有多少真的
 // 存在」—— 传了 10 个 id 只更新 8 个，说明有 2 个 id 写错了，必须报错
 // 而不是静默跳过（沿用凭据「坏值必须让操作失败而不是部分生效」的立场）。
-func (s *Store) BatchUpdateModelPrices(ctx context.Context, ids []string, priceInput, priceCacheHit, priceOutput float64) (int64, error) {
+func (s *Store) BatchUpdateModelPrices(ctx context.Context, ids []string, priceInput, priceCacheHit, priceCacheCreation, priceOutput float64) (int64, error) {
 	if len(ids) == 0 {
 		return 0, nil
 	}
 	placeholders := strings.Repeat("?,", len(ids))
 	placeholders = placeholders[:len(placeholders)-1]
-	args := make([]any, 0, len(ids)+3)
-	args = append(args, nullIfZeroFloat(priceInput), nullIfZeroFloat(priceCacheHit), nullIfZeroFloat(priceOutput))
+	args := make([]any, 0, len(ids)+4)
+	args = append(args, nullIfZeroFloat(priceInput), nullIfZeroFloat(priceCacheHit),
+		nullIfZeroFloat(priceCacheCreation), nullIfZeroFloat(priceOutput))
 	for _, id := range ids {
 		args = append(args, id)
 	}
 	res, err := s.db.ExecContext(ctx,
-		`UPDATE upstream_models SET price_input = ?, price_cache_hit = ?, price_output = ? WHERE id IN (`+placeholders+`)`,
+		`UPDATE upstream_models SET price_input = ?, price_cache_hit = ?, price_cache_creation = ?, price_output = ? WHERE id IN (`+placeholders+`)`,
 		args...)
 	if err != nil {
 		return 0, err

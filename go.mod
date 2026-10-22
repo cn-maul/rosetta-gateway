@@ -1,9 +1,9 @@
 module github.com/cn-maul/rosetta-gateway
 
-go 1.27.1
+go 1.27.3
 
 require (
-	github.com/cn-maul/rosetta v1.2.0
+	github.com/cn-maul/rosetta v1.2.1
 	github.com/golang-jwt/jwt/v5 v5.3.1
 	modernc.org/sqlite v1.60.1
 )

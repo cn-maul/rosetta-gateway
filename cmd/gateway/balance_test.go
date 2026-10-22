@@ -469,19 +469,23 @@ func TestEstimateCost_IsUpperBoundOverActualCharge(t *testing.T) {
 		{"配全价", store.Prices{Input: 3, CacheHit: 0.1, Output: 9}},
 		{"只配输入价", store.Prices{Input: 3}},
 		{"只配缓存价", store.Prices{CacheHit: 3}},
+		{"只配缓存写入价", store.Prices{CacheCreation: 3}},
 		{"只配输出价", store.Prices{Output: 9}},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
 			est := billing.EstimateBalanceCost(req, &routing.UpstreamModel{
-				PriceInput:    c.p.Input,
-				PriceCacheHit: c.p.CacheHit,
-				PriceOutput:   c.p.Output,
+				PriceInput:         c.p.Input,
+				PriceCacheHit:      c.p.CacheHit,
+				PriceCacheCreation: c.p.CacheCreation,
+				PriceOutput:        c.p.Output,
 			})
-			// 实扣可能的三种缓存命中比例，取**最大**的那一笔。
+			// 实扣可能的缓存命中 / 写入组合，取**最大**的那一笔。
 			var worst float64
-			for _, cached := range []float64{0, inTokens / 2, inTokens} {
-				actual := store.PriceUsageWithPrices(c.p, inTokens, cached, 0)
+			for _, split := range []struct{ cached, creation float64 }{
+				{0, 0}, {inTokens / 2, 0}, {inTokens, 0}, {0, inTokens / 2},
+			} {
+				actual := store.PriceUsageWithPrices(c.p, inTokens, split.cached, split.creation, 0)
 				if actual > worst {
 					worst = actual
 				}

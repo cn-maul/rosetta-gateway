@@ -8,7 +8,7 @@ import DataTable from './DataTable.vue'
  * 做成一个组件由 props 切换，而不是复制两份 —— 复制后加一列（比如哪天
  * 想加「缓存命中」）就只会改一处，两页的数字对不上，且没人发现。
  */
-import { onMounted, ref, watch } from 'vue'
+import { computed, onMounted, ref, watch } from 'vue'
 import { fmtNum, fmtTokens, fmtMoney, fmtSec, fmtSpeed } from '../fmt'
 import { rangeBounds } from '../range'
 import type { UsageGroupEntry } from '../types'
@@ -56,6 +56,14 @@ async function load() {
 onMounted(load)
 watch(() => props.days, load)
 
+const unit = computed(() => props.kind === 'provider' ? '个上游' : props.kind === 'model' ? '个模型' : '个密钥')
+const totals = computed(() => rows.value.reduce((acc, row) => {
+  acc.requests += row.count
+  acc.tokens += row.tokens
+  acc.cost += row.cost
+  return acc
+}, { requests: 0, tokens: 0, cost: 0 }))
+
 /**
  * 成功率。
  *
@@ -67,10 +75,14 @@ function successRate(r: UsageGroupEntry): number {
   return r.count > 0 ? r.ok / r.count : 0
 }
 
-/** 成功率格：百分比 + 原始计数。 */
-function rateText(r: UsageGroupEntry): string {
+function ratePercent(r: UsageGroupEntry): string {
   if (r.count === 0) return '—'
-  return `${Math.round(successRate(r) * 100)}%（${fmtNum(r.ok)}/${fmtNum(r.count)}）`
+  return `${Math.round(successRate(r) * 100)}%`
+}
+
+function rateDetail(r: UsageGroupEntry): string {
+  if (r.count === 0) return '暂无请求'
+  return `${fmtNum(r.ok)} 成功 · ${fmtNum(r.err)} 失败`
 }
 
 /**
@@ -84,6 +96,10 @@ function rateClass(r: UsageGroupEntry): string {
   if (rate < 0.5) return 'bad'
   if (rate < 0.9) return 'mid'
   return ''
+}
+
+function rateWidth(r: UsageGroupEntry): string {
+  return `${Math.max(0, Math.min(100, successRate(r) * 100))}%`
 }
 
 /**
@@ -113,7 +129,7 @@ function tpsText(r: UsageGroupEntry): string {
 function firstCell(r: UsageGroupEntry): string {
   // 占位文案按维度给：模型页的 key 是上游裸模型名（不会是空串），
   // 写「未知上游」在那里是错的；只有 provider_id 可能为空。
-  return r.name || r.key || (props.kind === 'provider' ? '（未知上游）' : '（未命名）')
+  return r.name || r.key || '未归属请求'
 }
 
 /**
@@ -150,8 +166,13 @@ function costTitle(r: UsageGroupEntry): string {
 
 <template>
   <div class="panel">
-    <div class="panel-actions">
-      <span class="dim">{{ rows.length >= 200 ? '前 200 项' : '共 ' + rows.length + ' 项' }} · 按用量降序</span>
+    <div class="panel-actions usage-toolbar">
+      <div class="summary-strip" aria-label="当前范围汇总">
+        <span class="summary-chip"><b>{{ fmtNum(rows.length) }}</b> {{ unit }}</span>
+        <span class="summary-chip"><b>{{ fmtNum(totals.requests) }}</b> 次请求</span>
+        <span class="summary-chip"><b>{{ fmtTokens(totals.tokens) }}</b> Tokens</span>
+        <span class="summary-chip"><b>¥{{ fmtMoney(totals.cost) }}</b> 记录费用</span>
+      </div>
       <button class="btn btn-sm" :disabled="loading" @click="load">
         {{ loading ? '加载中…' : '刷新' }}
       </button>
@@ -165,34 +186,56 @@ function costTitle(r: UsageGroupEntry): string {
     <div v-else-if="rows.length === 0" class="empty sub-empty">该时段没有调用记录</div>
 
     <DataTable v-else label="用量分组统计">
-      <table class="tbl">
+      <table class="tbl usage-table">
         <thead>
           <tr>
+            <th class="rank-h">排名</th>
             <th>{{ firstCol }}</th>
-            <th class="num-h">请求数</th>
-            <th class="num-h">总 token</th>
-            <th class="num-h">花费（元）</th>
-            <th class="num-h">成功率</th>
-            <th class="num-h">首字 / 速度</th>
+            <th class="num-h">请求量</th>
+            <th class="num-h">Tokens</th>
+            <th class="num-h">记录费用</th>
+            <th>成功率</th>
+            <th>性能</th>
           </tr>
         </thead>
         <tbody>
-          <tr v-for="r in rows" :key="r.key">
-            <td>
-              <div class="name mono">{{ firstCell(r) }}</div>
+          <tr v-for="(r, i) in rows" :key="r.key">
+            <td class="rank-cell">
+              <span class="rank" :class="{ 'rank-top': i < 3 }">{{ i + 1 }}</span>
+            </td>
+            <td class="name-cell">
+              <div class="name">{{ firstCell(r) }}</div>
               <!-- 显示名与分组键不同时给出副标题：模型页是「归组自 <上游裸名>」，
                    上游页是 provider_id 兜底（provider 被删后拿不到名字）。
                    措辞由 subLabel 按维度决定，见那里的注释。 -->
-              <div v-if="hasSub(r)" class="sub-line dim">{{ subLabel(r) }}</div>
+              <div v-if="hasSub(r)" class="sub-line dim mono">{{ subLabel(r) }}</div>
             </td>
-            <td class="num">{{ fmtNum(r.count) }}</td>
-            <td class="num">{{ fmtTokens(r.tokens) }}</td>
-            <td class="num" :title="costTitle(r)">{{ fmtMoney(r.cost) }}</td>
-            <td class="num" :class="rateClass(r)">{{ rateText(r) }}</td>
             <td class="num">
-              <span>{{ ttfbText(r) }}</span>
-              <span class="sep">/</span>
-              <span>{{ tpsText(r) }} t/s</span>
+              <span class="metric-value">{{ fmtNum(r.count) }}</span>
+              <span class="metric-note">{{ fmtNum(r.ok) }} 成功 · {{ fmtNum(r.err) }} 失败</span>
+            </td>
+            <td class="num">
+              <span class="metric-value">{{ fmtTokens(r.tokens) }}</span>
+              <span class="metric-note">总 token</span>
+            </td>
+            <td class="num" :title="costTitle(r)">
+              <span class="metric-value">¥{{ fmtMoney(r.cost) }}</span>
+              <span class="metric-note">固化费用</span>
+            </td>
+            <td>
+              <div class="rate-head">
+                <span class="rate-value" :class="rateClass(r)">{{ ratePercent(r) }}</span>
+                <span class="rate-detail">{{ rateDetail(r) }}</span>
+              </div>
+              <div class="rate-track" aria-hidden="true">
+                <span class="rate-fill" :class="rateClass(r)" :style="{ width: rateWidth(r) }"></span>
+              </div>
+            </td>
+            <td>
+              <div class="perf-list">
+                <span class="perf-chip"><span>首字</span><b>{{ ttfbText(r) }}</b></span>
+                <span class="perf-chip"><span>速度</span><b>{{ tpsText(r) }} t/s</b></span>
+              </div>
             </td>
           </tr>
         </tbody>
@@ -202,7 +245,167 @@ function costTitle(r: UsageGroupEntry): string {
 </template>
 
 <style scoped>
+.usage-toolbar {
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  margin-bottom: 16px;
+}
+.summary-strip {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+.summary-chip {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 5px;
+  min-height: 30px;
+  padding: 5px 10px;
+  border: 1px solid var(--separator);
+  border-radius: 999px;
+  background: var(--surface-secondary);
+  color: var(--muted);
+  font-size: 11.5px;
+  white-space: nowrap;
+}
+.summary-chip b {
+  color: var(--foreground);
+  font-size: 12.5px;
+  font-variant-numeric: tabular-nums;
+}
+.usage-table {
+  table-layout: fixed;
+}
+.usage-table th,
+.usage-table td {
+  padding-left: 14px;
+  padding-right: 14px;
+  vertical-align: middle;
+}
+.usage-table th {
+  height: 44px;
+}
+.usage-table td {
+  height: 72px;
+}
+.usage-table .rank-h {
+  width: 62px;
+  text-align: center;
+}
+.usage-table .rank-cell {
+  text-align: center;
+}
+.rank {
+  display: inline-grid;
+  place-items: center;
+  width: 26px;
+  height: 26px;
+  border-radius: 9px;
+  background: var(--surface-secondary);
+  color: var(--muted);
+  font-size: 11.5px;
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+}
+.rank-top {
+  background: var(--accent-soft);
+  color: var(--accent-link);
+}
+.name-cell {
+  width: 30%;
+}
+.name {
+  overflow: hidden;
+  color: var(--foreground);
+  font-size: 13.5px;
+  font-weight: 650;
+  line-height: 1.35;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.sub-line {
+  overflow: hidden;
+  margin-top: 4px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
 .num {
+  font-variant-numeric: tabular-nums;
+}
+.metric-value {
+  display: block;
+  color: var(--foreground);
+  font-size: 13px;
+  font-weight: 650;
+  line-height: 1.3;
+}
+.metric-note {
+  display: block;
+  margin-top: 3px;
+  color: var(--muted);
+  font-size: 10.5px;
+  line-height: 1.3;
+  white-space: nowrap;
+}
+.rate-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 10px;
+}
+.rate-value {
+  color: var(--success-soft-foreground);
+  font-size: 13px;
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+}
+.rate-detail {
+  color: var(--muted);
+  font-size: 10.5px;
+  white-space: nowrap;
+}
+.rate-track {
+  overflow: hidden;
+  height: 4px;
+  margin-top: 7px;
+  border-radius: 999px;
+  background: var(--surface-tertiary);
+}
+.rate-fill {
+  display: block;
+  height: 100%;
+  border-radius: inherit;
+  background: var(--success);
+  transition: width 240ms var(--ease-out-quart);
+}
+.rate-fill.bad {
+  background: var(--danger);
+}
+.rate-fill.mid {
+  background: var(--warning);
+}
+.perf-list {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+.perf-chip {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 4px;
+  padding: 4px 7px;
+  border-radius: 7px;
+  background: var(--surface-secondary);
+  color: var(--muted);
+  font-size: 10px;
+  white-space: nowrap;
+}
+.perf-chip b {
+  color: var(--text-2);
+  font-size: 11px;
   font-variant-numeric: tabular-nums;
 }
 /* 成功率低于 90% 才标色：低于 100% 就报警的话，几十次调用的上游会
@@ -213,8 +416,12 @@ function costTitle(r: UsageGroupEntry): string {
 .mid {
   color: var(--warning);
 }
-.sep {
-  color: var(--muted);
-  margin: 0 5px;
+@media (max-width: 980px) {
+  .usage-table {
+    min-width: 860px;
+  }
+  .name-cell {
+    width: auto;
+  }
 }
 </style>

@@ -24,23 +24,27 @@ const tab = computed({
   set: key => { void router.push({ query: { ...route.query, tab: key } }) },
 })
 const days = computed({
-  get: () => [1, 7, 30].includes(Number(route.query.days)) ? Number(route.query.days) : 7,
+  get: () => [1, 7, 30].includes(Number(route.query.days))
+    ? Number(route.query.days)
+    : logs.value ? 7 : 1,
   set: value => { void router.push({ query: { ...route.query, days: String(value), page: undefined } }) },
 })
 const scope = computed(() => isAdmin() ? '全站' : '仅你自己')
 const title = computed(() => logs.value ? (isAdmin() ? '请求日志' : '我的调用') : '用量与费用')
-const subtitle = computed(() => logs.value ? '逐条查看调用结果、耗时与记录费用'
-  : tab.value === 'groups' ? '将跨上游的同名模型合并统计；不改变路由、转发或权限'
-  : '按维度比较请求量、Tokens、质量与记录费用')
+const subtitle = computed(() => logs.value
+  ? `逐条查看调用结果、耗时与记录费用 · ${scope.value}`
+  : tab.value === 'groups'
+    ? `将跨上游的同名模型合并统计；不改变路由、转发或权限 · ${scope.value}`
+    : '')
 const fetchProviders = (from: number, to: number) => api.usageByProvider(from, to)
 const fetchModels = (from: number, to: number) => api.usageByModel(from, to)
 const fetchKeys = (from: number, to: number) => api.usageByKey(from, to)
 </script>
 
 <template>
-  <div class="page">
+  <div class="page" :class="{ 'page-wide': logs }">
     <div class="page-head">
-      <div><h1>{{ title }}</h1><div class="sub">{{ subtitle }} · {{ scope }}</div></div>
+      <div><h1>{{ title }}</h1><div v-if="subtitle" class="sub">{{ subtitle }}</div></div>
       <div v-if="logs || tab !== 'groups'" class="head-actions">
         <label class="sr-only" for="usage-days">时间范围</label>
         <select id="usage-days" v-model.number="days" class="select w-auto">
@@ -68,4 +72,14 @@ const fetchKeys = (from: number, to: number) => api.usageByKey(from, to)
 
 <style scoped>
 .w-auto { width: auto; }
+.page-wide {
+  width: calc(100% - 48px);
+  max-width: 1440px;
+  margin-inline: auto;
+}
+@media (max-width: 760px) {
+  .page-wide {
+    width: 100%;
+  }
+}
 </style>

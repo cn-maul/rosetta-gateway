@@ -195,18 +195,38 @@ func DecodeAnthropicMessagesRequest(r *http.Request, maxBytes int64) (*Anthropic
 	return &req, nil
 }
 
-// validateContentShape 逐条校验消息 content 的形态（string | 块数组）。
+// validateContentShape 逐条校验消息 content 的形态（string | 块数组），
+// 外加 assistant 侧的块类型白名单。
 //
-// 只判形态，不判块内容 —— 后者交给 rosetta validate（未知块类型、空文本块
-// 等已有各自的处置，见 convertUserMessage）。这里要堵的只有一件事：
-// content 是**单个对象**时被静默丢弃。
+// 形态这一半只判「是不是块数组」：content 是**单个对象**时会被静默丢弃
+// （用户输入凭空消失而请求照常 200），必须在这里挡成 400。
+//
+// 块类型这一半只对 **assistant** 生效，因为 assistant 块会被
+// assistantBlocks 归一化，而它只认 text / tool_use / thinking /
+// redacted_thinking —— 其余类型（server_tool_use、web_search_tool_result、
+// code_execution_tool_result 等 Anthropic 服务端工具的产物）落进 default
+// 分支被**整块丢掉**：请求照样 200，但模型看到的上下文少了那段工具结果，
+// 且丢失完全无声。这类请求宁可明确 400，也不要给一个内容被悄悄改写过的
+// 对话（user 侧的块不受影响：tool_result / image / document 都有各自分支）。
+//
+// 空文本块等其余情形仍交给 rosetta validate。
 func validateContentShape(field string, msgs []AnthropicMessage) error {
 	for i, m := range msgs {
 		if len(m.Content) == 0 {
 			continue // 缺省 content，交由 rosetta validate 报错
 		}
-		if _, ok := decodeContentBlocks(m.Content); !ok {
+		blocks, ok := decodeContentBlocks(m.Content)
+		if !ok {
 			return fmt.Errorf("%s[%d].content: %w", field, i, ErrContentSingleObject)
+		}
+		if m.Role == "assistant" {
+			for _, b := range blocks {
+				switch b.Type {
+				case "text", "tool_use", "thinking", "redacted_thinking":
+				default:
+					return fmt.Errorf("%s[%d].content: unsupported assistant block type %q (supported: text, tool_use, thinking, redacted_thinking)", field, i, b.Type)
+				}
+			}
 		}
 	}
 	return nil
@@ -450,14 +470,18 @@ func assistantBlocks(raw json.RawMessage) []rosetta.Block {
 		switch b.Type {
 		case "text":
 			if b.Text != "" {
-				out = append(out, rosetta.Block{Type: rosetta.BlockText, Text: b.Text})
+				out = append(out, rosetta.Block{
+					Type: rosetta.BlockText, Text: b.Text, CacheControl: b.cacheControl(),
+				})
 			}
 		case "tool_use":
 			args := string(b.Input)
 			if strings.TrimSpace(args) == "" {
 				args = "{}"
 			}
-			out = append(out, rosetta.ToolCall(b.ID, b.Name, args))
+			block := rosetta.ToolCall(b.ID, b.Name, args)
+			block.CacheControl = b.cacheControl()
+			out = append(out, block)
 		case "thinking":
 			// 签名一起带上：回放给 Anthropic 上游时缺签名会被拒（R4）。
 			out = append(out, rosetta.Thinking(b.Thinking, b.Signature))
@@ -496,6 +520,7 @@ func convertUserMessage(raw json.RawMessage) []rosetta.Message {
 			text, media := toolResultContent(b)
 			toolMedia = append(toolMedia, media...)
 			tb := rosetta.Block{Type: rosetta.BlockToolResult, ToolCallID: b.ToolUseID, Content: text}
+			tb.CacheControl = b.cacheControl()
 			if b.IsError != nil {
 				tb.IsError = *b.IsError
 			}
@@ -647,12 +672,18 @@ func fileBlock(b anthropicBlock) (rosetta.Block, bool) {
 		if b.Source.Data == "" {
 			return rosetta.Block{}, false
 		}
-		return rosetta.Block{Type: rosetta.BlockFile, FileName: b.Name, MimeType: media, FileData: b.Source.Data}, true
+		return rosetta.Block{
+			Type: rosetta.BlockFile, FileName: b.Name, MimeType: media,
+			FileData: b.Source.Data, CacheControl: b.cacheControl(),
+		}, true
 	case "url":
 		if b.Source.URL == "" {
 			return rosetta.Block{}, false
 		}
-		return rosetta.Block{Type: rosetta.BlockFile, FileName: b.Name, MimeType: media, FileData: b.Source.URL}, true
+		return rosetta.Block{
+			Type: rosetta.BlockFile, FileName: b.Name, MimeType: media,
+			FileData: b.Source.URL, CacheControl: b.cacheControl(),
+		}, true
 	}
 	return rosetta.Block{}, false
 }
@@ -696,7 +727,9 @@ func toolResultContent(b anthropicBlock) (string, []rosetta.Block) {
 			sb.WriteString(inner.Text)
 		case "image":
 			if u := imageURL(inner); u != "" {
-				media = append(media, rosetta.Block{Type: rosetta.BlockImage, ImageURL: u})
+				media = append(media, rosetta.Block{
+					Type: rosetta.BlockImage, ImageURL: u, CacheControl: inner.cacheControl(),
+				})
 			}
 		case "document":
 			if blk, ok := fileBlock(inner); ok {

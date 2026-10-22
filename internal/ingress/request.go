@@ -24,6 +24,11 @@ type Request struct {
 
 	WantsStreamUsage bool
 
+	// CacheKey is the client's prompt-cache affinity key, when one was sent.
+	// It is transport metadata, not conversation content: the upstream uses it
+	// to choose a cache shard, while the model never sees it.
+	CacheKey string
+
 	// RequiresStructuredOutput marks a hard structured-output constraint
 	// (chat response_format or responses text.format set to json_object /
 	// json_schema). Such requests must not be sent to Anthropic upstreams.

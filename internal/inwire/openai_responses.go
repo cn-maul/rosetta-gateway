@@ -19,15 +19,25 @@ import (
 //     分块数组（input_text / output_text / input_image / input_file /
 //     input_audio）。
 //   - function_call / function_call_output item 映射为 rosetta 的工具调用与
-//     工具结果；reasoning item 剥除（历史思考不属于对话内容）。
+//     工具结果；reasoning item 连同 id / encrypted_content / summary 搬进
+//     rosetta 的 thinking 块，供 Responses 上游跨轮原样回放。
+//
+//     chat 上游（2026-10-23 补齐）：DeepSeek 系要求 `reasoning_content`
+//     原样回传，而 SDK 的 chat 编码器会丢弃 thinking 块。存在可读思考文本时
+//     由 responsesChatMessagesWithReasoning 重新编码一份 chat messages，
+//     把 summary 回填成 `reasoning_content`；没有 reasoning 的请求继续走
+//     SDK 编码器。详见 responses_chat_replay.go。
+//
+//     anthropic 上游仍是已知缺口：thinking 块必须带 Anthropic 签发的
+//     signature，Responses 的 reasoning item 无法伪造，因此继续剥除。
 //   - instructions 映射为 System；developer/system 角色 item 映射为 RoleSystem。
 //   - reasoning.effort 映射为 rosetta 的 ThinkingConfig（SDK 负责跨协议翻译）。
 //   - 不支持的 item 类型（item_reference / web_search 等内建工具）**显式 400**，
 //     不静默丢弃 —— 静默丢弃正是本网关反复修过的「无声吞内容」。
 //   - tools 里的 namespace（Codex 的工具打包形态）在 ToRosetta 展平成平级
 //     function，见 flattenNamespaceTools。
-//   - previous_response_id / store：网关不托管会话状态（DESIGN §1 明确不做），
-//     两者被忽略；Codex 等客户端在 store:false 下随请求带全量历史，天然兼容。
+//   - previous_response_id / store：Responses 目标经 Extra 原样透传；
+//     chat / anthropic 目标没有对应概念，继续要求客户端自带全量历史。
 //   - text.format 映射到 chat 上游的 response_format（json_object 直映、
 //     json_schema 翻译外壳）；responses 上游经 Extra 原样回传；anthropic 上游
 //     没有对应物 —— tool_choice 仍做等价翻译（any/tool），结构化输出这类
@@ -51,6 +61,8 @@ type ResponsesRequest struct {
 
 	Store              *bool           `json:"store,omitempty"`
 	PreviousResponseID string          `json:"previous_response_id,omitempty"`
+	PromptCacheKey     string          `json:"prompt_cache_key,omitempty"`
+	Include            []string        `json:"include,omitempty"`
 	Text               json.RawMessage `json:"text,omitempty"` // {"format": {...}}
 
 	// flattenedToolChoice 是 ToRosetta 展平 namespace 后**重写过的**
@@ -1158,6 +1170,15 @@ func (a *ResponsesRequest) ApplyUpstreamExtras(req *rosetta.ChatRequest, protoco
 		if a.ParallelToolCalls != nil {
 			extra["parallel_tool_calls"] = *a.ParallelToolCalls
 		}
+		if a.PromptCacheKey != "" {
+			extra["prompt_cache_key"] = a.PromptCacheKey
+		}
+		// thinking 回放：chat 上游唯一能承接 reasoning 的字段是
+		// `reasoning_content`，SDK 编码器会丢掉 thinking 块，所以有可读
+		// 思考文本时整份接管 messages。没有 reasoning 的请求不受影响。
+		if msgs, ok := responsesChatMessagesWithReasoning(req); ok {
+			extra["messages"] = msgs
+		}
 		if len(extra) > 0 {
 			mergeExtra(req, extra)
 		}
@@ -1205,6 +1226,12 @@ func (a *ResponsesRequest) ApplyUpstreamExtras(req *rosetta.ChatRequest, protoco
 		}
 		if a.Store != nil {
 			extra["store"] = *a.Store
+		}
+		if a.PromptCacheKey != "" {
+			extra["prompt_cache_key"] = a.PromptCacheKey
+		}
+		if len(a.Include) > 0 {
+			extra["include"] = a.Include
 		}
 		if len(extra) > 0 {
 			mergeExtra(req, extra)

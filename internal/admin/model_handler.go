@@ -43,7 +43,10 @@ type modelRequest struct {
 	// 命中的输入价，price_output 是输出价。
 	PriceInput    *float64 `json:"price_input"`
 	PriceCacheHit *float64 `json:"price_cache_hit"`
-	PriceOutput   *float64 `json:"price_output"`
+	// PriceCacheCreation 是缓存写入（Anthropic cache_creation）的输入价。
+	// 未配置（0）时按 price_input 计费，与修复前行为一致。
+	PriceCacheCreation *float64 `json:"price_cache_creation"`
+	PriceOutput        *float64 `json:"price_output"`
 
 	// EffortLevels 是该模型支持的思考挡位（空串 = 清除，回到「未配置」）。
 	//
@@ -128,19 +131,20 @@ func levelListHint() string {
 
 // @ts-type UpstreamModel
 type modelResponse struct {
-	ID              string  `json:"id"`
-	ProviderID      string  `json:"provider_id"`
-	ModelID         string  `json:"model_id"`
-	DisplayName     string  `json:"display_name"`
-	ContextWindow   int     `json:"context_window"`
-	MaxOutputTokens int     `json:"max_output_tokens"`
-	PriceInput      float64 `json:"price_input"`
-	PriceCacheHit   float64 `json:"price_cache_hit"`
-	PriceOutput     float64 `json:"price_output"`
-	TokensPerSec    float64 `json:"tokens_per_sec,omitempty"`
-	TtfbMs          float64 `json:"ttfb_ms,omitempty"`
-	SuccessRate     float64 `json:"success_rate"`
-	CallCount       int     `json:"call_count,omitempty"`
+	ID                 string  `json:"id"`
+	ProviderID         string  `json:"provider_id"`
+	ModelID            string  `json:"model_id"`
+	DisplayName        string  `json:"display_name"`
+	ContextWindow      int     `json:"context_window"`
+	MaxOutputTokens    int     `json:"max_output_tokens"`
+	PriceInput         float64 `json:"price_input"`
+	PriceCacheHit      float64 `json:"price_cache_hit"`
+	PriceCacheCreation float64 `json:"price_cache_creation"`
+	PriceOutput        float64 `json:"price_output"`
+	TokensPerSec       float64 `json:"tokens_per_sec,omitempty"`
+	TtfbMs             float64 `json:"ttfb_ms,omitempty"`
+	SuccessRate        float64 `json:"success_rate"`
+	CallCount          int     `json:"call_count,omitempty"`
 
 	// EffortLevels 是该模型真实支持的思考挡位（强度升序）。
 	// 空切片 = 未配置，此时数据面不干预思考强度。
@@ -273,22 +277,24 @@ func (h *ModelHandler) Create(w http.ResponseWriter, r *http.Request, providerID
 
 	priceIn := derefFloat(req.PriceInput)
 	priceHit := derefFloat(req.PriceCacheHit)
+	priceCreate := derefFloat(req.PriceCacheCreation)
 	priceOut := derefFloat(req.PriceOutput)
-	if priceIn < 0 || priceHit < 0 || priceOut < 0 {
+	if priceIn < 0 || priceHit < 0 || priceCreate < 0 || priceOut < 0 {
 		writeError(w, http.StatusBadRequest, "price cannot be negative")
 		return
 	}
 
 	m := &store.UpstreamModel{
-		ID:              generateID(),
-		ProviderID:      providerID,
-		ModelID:         modelID,
-		DisplayName:     strings.TrimSpace(derefStr(req.DisplayName)),
-		ContextWindow:   ctxWindow,
-		MaxOutputTokens: maxOut,
-		PriceInput:      priceIn,
-		PriceCacheHit:   priceHit,
-		PriceOutput:     priceOut,
+		ID:                 generateID(),
+		ProviderID:         providerID,
+		ModelID:            modelID,
+		DisplayName:        strings.TrimSpace(derefStr(req.DisplayName)),
+		ContextWindow:      ctxWindow,
+		MaxOutputTokens:    maxOut,
+		PriceInput:         priceIn,
+		PriceCacheHit:      priceHit,
+		PriceCacheCreation: priceCreate,
+		PriceOutput:        priceOut,
 	}
 	// 挡位：nil = 不设置（与 PATCH 的 nil 语义一致）。单条创建多用于「导入时
 	// 顺手补一条」，管理员此刻往往没有档位信息，所以只在显式传了才校验。
@@ -340,6 +346,24 @@ func (h *ModelHandler) Update(w http.ResponseWriter, r *http.Request, id string)
 			writeError(w, http.StatusBadRequest, "model_id cannot be empty")
 			return
 		}
+		// A7-12：已有历史用量时不允许改名。
+		//
+		// 用量归档以 (provider_id, upstream_model) 定位历史行；改名后
+		// 旧数据留在旧名下、配置指向新名，按模型分组与对账会永久分叉。
+		// 还没产生过用量的模型仍允许改名 —— 那正是“建完发现拼错了”的
+		// 正常场景，一刀切禁止只会逼用户删了重建、顺带丢掉已配好的路由。
+		if v != existing.ModelID {
+			used, err := h.store.UpstreamModelUsageExists(r.Context(), existing.ProviderID, existing.ModelID)
+			if err != nil {
+				writeServerError(w, "check model usage history", err)
+				return
+			}
+			if used {
+				writeError(w, http.StatusConflict,
+					"该上游模型已有历史用量，不能改名（历史归档按 model_id 定位）。请新建模型并迁移路由，或保留原名")
+				return
+			}
+		}
 		existing.ModelID = v
 	}
 	// 可清空字段：空串即清空
@@ -369,6 +393,7 @@ func (h *ModelHandler) Update(w http.ResponseWriter, r *http.Request, id string)
 	}{
 		{"price_input", req.PriceInput, &existing.PriceInput},
 		{"price_cache_hit", req.PriceCacheHit, &existing.PriceCacheHit},
+		{"price_cache_creation", req.PriceCacheCreation, &existing.PriceCacheCreation},
 		{"price_output", req.PriceOutput, &existing.PriceOutput},
 	} {
 		if p.req == nil {
@@ -444,10 +469,11 @@ func (h *ModelHandler) Delete(w http.ResponseWriter, r *http.Request, id string)
 // 清除价格」就是传三个 0。前端把「设置」和「清除」做成两个独立按钮，
 // 避免用户以为填 0 是「设为免费」。
 type batchPriceRequest struct {
-	ModelIDs      []string `json:"model_ids"`
-	PriceInput    float64  `json:"price_input"`
-	PriceCacheHit float64  `json:"price_cache_hit"`
-	PriceOutput   float64  `json:"price_output"`
+	ModelIDs           []string `json:"model_ids"`
+	PriceInput         float64  `json:"price_input"`
+	PriceCacheHit      float64  `json:"price_cache_hit"`
+	PriceCacheCreation float64  `json:"price_cache_creation"`
+	PriceOutput        float64  `json:"price_output"`
 }
 
 // BatchUpdatePrices 把同一组价格批量写到多个模型。
@@ -492,6 +518,7 @@ func (h *ModelHandler) BatchUpdatePrices(w http.ResponseWriter, r *http.Request)
 	}{
 		{"price_input", req.PriceInput},
 		{"price_cache_hit", req.PriceCacheHit},
+		{"price_cache_creation", req.PriceCacheCreation},
 		{"price_output", req.PriceOutput},
 	} {
 		if p.val < 0 {
@@ -522,7 +549,7 @@ func (h *ModelHandler) BatchUpdatePrices(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	updated, err := h.store.BatchUpdateModelPrices(r.Context(), ids, req.PriceInput, req.PriceCacheHit, req.PriceOutput)
+	updated, err := h.store.BatchUpdateModelPrices(r.Context(), ids, req.PriceInput, req.PriceCacheHit, req.PriceCacheCreation, req.PriceOutput)
 	if err != nil {
 		writeServerError(w, "batch update model prices", err)
 		return
@@ -531,9 +558,10 @@ func (h *ModelHandler) BatchUpdatePrices(w http.ResponseWriter, r *http.Request)
 	writeJSON(w, http.StatusOK, map[string]any{
 		"updated": updated,
 		// 回显这次写进去的价格，让运维确认「我填的就是落库的」。
-		"price_input":     req.PriceInput,
-		"price_cache_hit": req.PriceCacheHit,
-		"price_output":    req.PriceOutput,
+		"price_input":          req.PriceInput,
+		"price_cache_hit":      req.PriceCacheHit,
+		"price_cache_creation": req.PriceCacheCreation,
+		"price_output":         req.PriceOutput,
 	})
 }
 

@@ -39,7 +39,7 @@ func New(cfg Config) *Recorder {
 	u := &Recorder{
 		db:              cfg.DB,
 		logger:          logger,
-		queue:           make(chan *store.UsageRecord, usageQueueSize),
+		queue:           make(chan persistJob, usageQueueSize),
 		stop:            make(chan struct{}),
 		batchInsert:     cfg.BatchInsert,
 		isBalanceExempt: isExempt,
@@ -69,7 +69,7 @@ func New(cfg Config) *Recorder {
 type Recorder struct {
 	db     *store.Store
 	logger *slog.Logger
-	queue  chan *store.UsageRecord
+	queue  chan persistJob
 	wg     sync.WaitGroup
 
 	// stop 让「关停超时后仍在重试」的 worker 立刻退出（2026-10-21 修 *X0）。
@@ -123,6 +123,34 @@ type Recorder struct {
 
 	// done 在全部 worker 退出后关闭，仅供生命周期测试观察。
 	done chan struct{}
+}
+
+// persistJob 是一条待落库的用量记录，外加一个「落库尝试结束后」的回调。
+//
+// 回调是配额一致性的关键（2026-10-22 修 A8-P1-1 / 汇总 M0）：
+//
+//	ReserveQuota 预占 est
+//	  → 请求结束
+//	  → [旧] ReleaseQuota 立刻退回预占
+//	  → [旧] usage 异步落库（触发器这时才把 actual 加进 used）
+//
+// 两步之间有一个窗口：此时该请求既不在 reserved 也不在 used 里，并发的
+// 下一个请求能多占一份额度。窗口很短（队列到落库通常几毫秒），但它是
+// **可重复触发**的，高并发下会稳定超发。
+//
+// 现在把「退预占」挂到落库成功（或最终失败）之后：usage 行已经可见，
+// used 已含本次用量，再退预占就不存在空档。落库彻底失败时也必须执行
+// 回调 —— 否则预占会永久冻结（那比少算一次更糟）。
+type persistJob struct {
+	rec  *store.UsageRecord
+	done func()
+}
+
+// finish 执行回调；nil 安全。
+func (j persistJob) finish() {
+	if j.done != nil {
+		j.done()
+	}
 }
 
 const (
@@ -179,7 +207,7 @@ func newRecorder(db *store.Store, logger *slog.Logger) *Recorder {
 	u := &Recorder{
 		db:     db,
 		logger: logger,
-		queue:  make(chan *store.UsageRecord, usageQueueSize),
+		queue:  make(chan persistJob, usageQueueSize),
 		stop:   make(chan struct{}),
 	}
 	for i := 0; i < usageWorkers; i++ {
@@ -226,7 +254,7 @@ func (u *Recorder) worker() {
 
 	// batch 是复用缓冲区：高负载下每秒数千批，每批都 make 一次会直接
 	// 变成 GC 压力（而 GC 压力正是我们想减掉的东西）。
-	batch := make([]*store.UsageRecord, 0, usageBatchSize)
+	batch := make([]persistJob, 0, usageBatchSize)
 
 	// stillPending 是**上一轮落库失败、留待重试**的记录（2026-10-12 修 P1-1）。
 	//
@@ -236,7 +264,7 @@ func (u *Recorder) worker() {
 	// 让入队端自然背压（record 里的 select 会走 default 同步写）。
 	//
 	// 顺序：上一批重试成功后才继续取新记录，保证「先失败的先落库」。
-	var stillPending []*store.UsageRecord
+	var stillPending []persistJob
 
 	for {
 		// 上一轮失败的记录优先重试（仍在 stillPending 里）。
@@ -266,7 +294,7 @@ func (u *Recorder) worker() {
 
 		// 取第一条：**阻塞**读。关闭时 channel 被 close，这里返回 !ok，
 		// 冲掉手上这批再退出（关停 drain 的全部意义就是别弄丢已发生的调用）。
-		rec, ok := <-u.queue
+		job, ok := <-u.queue
 		if !ok {
 			// 队列已关。仍要冲掉手上的 stillPending —— 那批已经出队过，
 			// 留在这里就真的丢了（关停 drain 的意义正在于此）。
@@ -277,7 +305,7 @@ func (u *Recorder) worker() {
 			}
 			return
 		}
-		batch = append(batch, rec)
+		batch = append(batch, job)
 
 		// 尽力多攒：把**当前已就绪**的记录挪进这批。
 		//
@@ -288,11 +316,11 @@ func (u *Recorder) worker() {
 	drain:
 		for len(batch) < usageBatchSize {
 			select {
-			case r2, ok2 := <-u.queue:
+			case next, ok2 := <-u.queue:
 				if !ok2 {
 					break drain
 				}
-				batch = append(batch, r2)
+				batch = append(batch, next)
 			default:
 				break drain
 			}
@@ -346,20 +374,23 @@ func (u *Recorder) Logger() *slog.Logger { return u.logger }
 // 可对账的 ERROR。逐条 "usage record lost" 只在单条写失败时出现；
 // 关停超时可能发生在整批重试阶段，那些记录还没有逐条尝试过，若不在这里
 // 汇总，日志里就只剩下一句「records were lost」，无法知道丢了哪几次调用。
-func (u *Recorder) logPendingAbandoned(recs []*store.UsageRecord) {
-	if len(recs) == 0 {
+func (u *Recorder) logPendingAbandoned(jobs []persistJob) {
+	if len(jobs) == 0 {
 		return
 	}
 	const maxSample = 10
 	sample := make([]string, 0, maxSample)
-	for _, rec := range recs {
+	for _, job := range jobs {
 		if len(sample) == maxSample {
 			break
 		}
-		sample = append(sample, rec.RequestID)
+		sample = append(sample, job.rec.RequestID)
+		// 关停已放弃：这些记录不会再有落库机会，配额预占必须释放，
+		// 否则进程若继续存活（或下次启动读到同一库）会永久冻结额度。
+		job.finish()
 	}
 	u.logger.Error("usage recorder aborted with unpersisted records",
-		"count", len(recs), "request_id_sample", sample,
+		"count", len(jobs), "request_id_sample", sample,
 		"hint", "persistent write failure or shutdown deadline; reconcile these request_ids manually")
 }
 
@@ -390,9 +421,14 @@ func (u *Recorder) logPendingAbandoned(recs []*store.UsageRecord) {
 // 那是把「丢一批」换成「全丢」。降级逐条 + 单条计数告警是更稳的取舍。
 //
 // 返回值报告「是否全部落库成功」，供 worker 决定要不要把这批插回队头。
-func (u *Recorder) flush(ctx context.Context, batch []*store.UsageRecord) bool {
+func (u *Recorder) flush(ctx context.Context, batch []persistJob) bool {
 	if len(batch) == 0 {
 		return true
+	}
+
+	recs := make([]*store.UsageRecord, len(batch))
+	for i := range batch {
+		recs[i] = batch[i].rec
 	}
 
 	// 批量写入走注入点（测试可替换；生产为 nil 时用默认实现）。
@@ -401,18 +437,18 @@ func (u *Recorder) flush(ctx context.Context, batch []*store.UsageRecord) bool {
 		insert = u.db.CreateUsageRecordsBatched
 	}
 
-	costs, err := insert(ctx, batch)
+	costs, err := insert(ctx, recs)
 	for attempt := 1; err != nil && attempt < usageFlushMaxAttempts; attempt++ {
 		u.logger.Warn("usage batch flush failed, retrying",
 			"error", err, "attempt", attempt, "max", usageFlushMaxAttempts,
-			"count", len(batch), "key_id", batch[0].AccessKeyID)
+			"count", len(batch), "key_id", recs[0].AccessKeyID)
 		select {
 		case <-ctx.Done():
 			// 关停路径上不该再等退避：直接走降级，把能落的落掉。
 			attempt = usageFlushMaxAttempts
 		case <-time.After(usageFlushRetryDelay):
 		}
-		costs, err = insert(ctx, batch)
+		costs, err = insert(ctx, recs)
 	}
 
 	if err != nil {
@@ -423,14 +459,76 @@ func (u *Recorder) flush(ctx context.Context, batch []*store.UsageRecord) bool {
 		return u.flushOneByOne(ctx, batch)
 	}
 
-	for i, rec := range batch {
+	u.chargeBatch(recs, costs)
+	// 落库已提交（触发器已把用量累加进 used_tokens），现在退配额预占才是
+	// 原子的。回调幂等，降级重试重复命中同一条记录也不会重复释放。
+	for _, job := range batch {
+		job.finish()
+	}
+	return true
+}
+
+// chargeBatch coalesces the normal successful-charge path into one write
+// transaction. Per-record insufficient-balance outcomes still behave exactly
+// like ChargeBalance; infrastructure failures fall back to the original
+// per-record path so retry/idempotency behavior is preserved.
+func (u *Recorder) chargeBatch(recs []*store.UsageRecord, costs []float64) {
+	charges := make([]store.BalanceCharge, 0, len(recs))
+	index := make([]int, 0, len(recs))
+	for i, rec := range recs {
 		var cost float64
 		if i < len(costs) {
 			cost = costs[i]
 		}
-		u.charge(rec, cost)
+		if u.isBalanceExempt(rec.UserID) || rec.Status != store.UsageStatusOK {
+			continue
+		}
+		if rec.RequestID == "" {
+			// Keep the existing loud diagnostic; there is no idempotency key
+			// and therefore no safe way to include this record in the batch.
+			u.charge(rec, cost)
+			continue
+		}
+		if cost <= 0 {
+			continue
+		}
+		charges = append(charges, store.BalanceCharge{
+			UserID: rec.UserID, AmountYuan: cost, RequestID: rec.RequestID,
+		})
+		index = append(index, i)
 	}
-	return true
+	if len(charges) == 0 {
+		return
+	}
+
+	errs, err := u.db.ChargeBalances(ctxBackground(), charges)
+	if err != nil {
+		// The batch transaction rolled back as a whole. Preserve the old
+		// per-record retry semantics rather than guessing which rows committed.
+		for i, rec := range recs {
+			var cost float64
+			if i < len(costs) {
+				cost = costs[i]
+			}
+			u.charge(rec, cost)
+		}
+		return
+	}
+	for j, chargeErr := range errs {
+		if chargeErr == nil {
+			continue
+		}
+		rec := recs[index[j]]
+		if errors.Is(chargeErr, store.ErrInsufficientBalance) {
+			u.logger.Error("charge failed: insufficient balance (precheck should have prevented this)",
+				"user_id", rec.UserID, "request_id", rec.RequestID,
+				"access_key_id", rec.AccessKeyID, "public_model", rec.PublicModel)
+			continue
+		}
+		u.logger.Error("charge failed in batch",
+			"error", chargeErr, "user_id", rec.UserID, "request_id", rec.RequestID,
+			"access_key_id", rec.AccessKeyID, "public_model", rec.PublicModel)
+	}
 }
 
 // flushOneByOne 逐条落库，作为整批失败后的降级路径（2026-10-12 修 P1-1）。
@@ -448,9 +546,10 @@ func (u *Recorder) flush(ctx context.Context, batch []*store.UsageRecord) bool {
 // 逐条重试又把这些行继续判为失败，那批记录再也冲不出去，
 // worker 停在 stillPending 分支不再消费队列，之后每条用量都退化到
 // 请求路径上的同步写并大概率丢失（配额不涨、余额不扣）。
-func (u *Recorder) flushOneByOne(ctx context.Context, batch []*store.UsageRecord) bool {
+func (u *Recorder) flushOneByOne(ctx context.Context, batch []persistJob) bool {
 	allOK := true
-	for _, rec := range batch {
+	for _, job := range batch {
+		rec := job.rec
 		cost, err := u.db.CreateUsageRecordWithCost(ctx, rec)
 		if err != nil {
 			if !store.IsUniqueViolation(err) {
@@ -459,6 +558,8 @@ func (u *Recorder) flushOneByOne(ctx context.Context, batch []*store.UsageRecord
 				u.logger.Error("usage record lost (per-record write also failed)",
 					"error", err, "request_id", rec.RequestID,
 					"key_id", rec.AccessKeyID, "user_id", rec.UserID)
+				// 不执行 job.finish()：这条还会被 worker 放回 stillPending
+				// 重试，配额预占必须继续持有到它真正落库（或关停放弃）。
 				continue
 			}
 			// 主键冲突：这条**可能**已经落库了。
@@ -486,6 +587,8 @@ func (u *Recorder) flushOneByOne(ctx context.Context, batch []*store.UsageRecord
 				"cost_yuan", cost)
 		}
 		u.charge(rec, cost)
+		// 行已存在（新建成功或主键冲突）→ used 已含本次用量，退预占安全。
+		job.finish()
 	}
 	return allOK
 }
@@ -673,12 +776,29 @@ func (u *Recorder) retryCharge(rec *store.UsageRecord, costYuan float64, cause e
 // 地方」。这里刻意不抽公共函数：两条路径的收尾已经足够短，抽出去反而让
 // 「它们是同一件事」这件事看不出来。
 func (u *Recorder) Record(rec *store.UsageRecord) {
+	u.RecordWithCallback(rec, nil)
+}
+
+// RecordWithCallback 排队一条异步落库，并在**落库尝试结束后**执行 done。
+//
+// 配额预占的释放必须走这个入口（见 persistJob 的注释）：回调执行时
+// usage 行要么已经可见（used 已含本次用量），要么已经彻底放弃（释放
+// 比永久冻结安全）。done 由本方法包一次 sync.Once，降级重试重复命中
+// 同一条记录也不会重复释放。
+func (u *Recorder) RecordWithCallback(rec *store.UsageRecord, done func()) {
+	if done != nil {
+		var once sync.Once
+		original := done
+		done = func() { once.Do(original) }
+	}
+	job := persistJob{rec: rec, done: done}
+
 	// 「判关闭 + 入队」必须在同一把锁里完成，否则会与 wait 的 close 竞争，
 	// 产生 send on closed channel（见 mu 的注释）。锁外的同步写只碰 DB。
 	u.mu.Lock()
 	if !u.closed {
 		select {
-		case u.queue <- rec:
+		case u.queue <- job:
 			u.mu.Unlock()
 			return
 		default:
@@ -693,9 +813,12 @@ func (u *Recorder) Record(rec *store.UsageRecord) {
 	cost, err := u.db.CreateUsageRecordWithCost(context.Background(), rec)
 	if err != nil {
 		u.logger.Error("failed to record usage (sync fallback)", "error", err, "key_id", rec.AccessKeyID)
+		// 同步路径没有重试队列；不释放就会永久冻结预占。
+		job.finish()
 		return
 	}
 	u.charge(rec, cost)
+	job.finish()
 }
 
 // markFlushFailed / clearFlushFailed / HasPendingUsage 记录「是否还攥着

@@ -208,12 +208,12 @@ func BuildApp(d Deps) *App {
 	// 管理写操作审计（DESIGN §13.3）：谁、何时、动了哪个资源、动了哪些字段
 	// （只记字段名不记值 —— body 里有 api_key 与密码明文）。
 	// 审计在重建之前同步落库，失败只 WARN 不阻塞。
-	// actor 写死 "admin" 是已知的不精确：回调没透传会话身份，
-	// 普通用户对自己资源的写操作也会落 "admin" 记录（见 store.AuditEntry 注释）。
-	audit := func(method, path string, status int, remote, fields string) {
+	// actor 由 server.AutoReload 从会话 context 取（2026-10-22 修 P2-4）：
+	// 普通用户、管理员、匿名引导入口各自可区分，不再一律写 "admin"。
+	audit := func(actor, method, path string, status int, remote, fields string) {
 		entry := &store.AuditEntry{
 			Ts:     time.Now().UnixMilli(),
-			Actor:  "admin",
+			Actor:  actor,
 			Remote: remote,
 			Method: method,
 			Path:   path,

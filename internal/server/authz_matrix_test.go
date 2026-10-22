@@ -377,7 +377,7 @@ func (h *authzHarness) seed() {
 // 「请求会被哪个路由模式处理」，再比对普通用户白名单。
 func (h *authzHarness) chain(mux *http.ServeMux) http.Handler {
 	reload := func(context.Context) error { return nil }
-	audit := func(string, string, int, string, string) {}
+	audit := func(string, string, string, int, string, string) {}
 	guarded := server.NewUserAuth(h.mgr, h.db).Guard(server.AdminGateGuard(mux, mux))
 	return server.AutoReload(guarded, reload, audit, slog.New(slog.NewTextHandler(io.Discard, nil)), nil)
 }

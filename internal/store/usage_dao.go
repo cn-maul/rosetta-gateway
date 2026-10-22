@@ -30,10 +30,14 @@ type UsageRecord struct {
 	TotalTokens     int64
 	ReasoningTokens int64
 	CachedTokens    int64
-	UsageState      string
-	Status          string
-	HTTPStatus      int
-	ErrorCode       string
+	// CachedCreationTokens 是 Anthropic cache_creation_input_tokens ——
+	// 本次请求写入缓存的输入 token（已含在 InputTokens 里）。OpenAI 系
+	// 协议自动缓存、不单独上报写入量，该值恒为 0。
+	CachedCreationTokens int64
+	UsageState           string
+	Status               string
+	HTTPStatus           int
+	ErrorCode            string
 	// ErrorDetail 是上游返回的失败详情（脱敏 + 截断后），供调用历史排查。
 	// 空串 = 无详情（成功、预检失败、或 TransportError 这类没有上游正文的失败）。
 	ErrorDetail string
@@ -130,6 +134,9 @@ func (s *Store) CreateUsageRecordWithCost(ctx context.Context, r *UsageRecord) (
 	if r.CachedTokens < 0 {
 		r.CachedTokens = 0
 	}
+	if r.CachedCreationTokens < 0 {
+		r.CachedCreationTokens = 0
+	}
 	if ts == 0 {
 		ts = time.Now().UnixMilli()
 	}
@@ -156,8 +163,8 @@ func (s *Store) CreateUsageRecordWithCost(ctx context.Context, r *UsageRecord) (
 		usageState = usageStateCostPending
 	}
 	_, err := s.db.ExecContext(ctx,
-		`INSERT INTO usage_records (id, ts, access_key_id, user_id, public_model, provider_id, upstream_model, ingress_protocol, stream, input_tokens, output_tokens, total_tokens, reasoning_tokens, cached_tokens, usage_state, status, http_status, error_code, error_detail, latency_ms, ttfb_ms, request_id, route_trace, cost_total) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		r.ID, ts, r.AccessKeyID, nullIfEmpty(r.UserID), r.PublicModel, r.ProviderID, r.UpstreamModel, r.IngressProtocol, stream, r.InputTokens, r.OutputTokens, r.TotalTokens, r.ReasoningTokens, r.CachedTokens, usageState, r.Status, r.HTTPStatus, nullIfEmpty(r.ErrorCode), nullIfEmpty(r.ErrorDetail), r.LatencyMs, r.TTFBMs, nullIfEmpty(r.RequestID), nullIfEmpty(r.RouteTrace), cost)
+		`INSERT INTO usage_records (id, ts, access_key_id, user_id, public_model, provider_id, upstream_model, ingress_protocol, stream, input_tokens, output_tokens, total_tokens, reasoning_tokens, cached_tokens, cached_creation_tokens, usage_state, status, http_status, error_code, error_detail, latency_ms, ttfb_ms, request_id, route_trace, cost_total) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		r.ID, ts, r.AccessKeyID, nullIfEmpty(r.UserID), r.PublicModel, r.ProviderID, r.UpstreamModel, r.IngressProtocol, stream, r.InputTokens, r.OutputTokens, r.TotalTokens, r.ReasoningTokens, r.CachedTokens, r.CachedCreationTokens, usageState, r.Status, r.HTTPStatus, nullIfEmpty(r.ErrorCode), nullIfEmpty(r.ErrorDetail), r.LatencyMs, r.TTFBMs, nullIfEmpty(r.RequestID), nullIfEmpty(r.RouteTrace), cost)
 	if err != nil {
 		// 落库失败：费用随记录一起作废。返回 0 而不是 cost —— 调用方若误用
 		// 这个值去扣费，扣的金额必须与「库里真实存在的记录」对应，
@@ -224,7 +231,7 @@ func (s *Store) CreateUsageRecordsBatched(ctx context.Context, recs []*UsageReco
 	sb.WriteString(`INSERT INTO usage_records
 		(id, ts, access_key_id, user_id, public_model, provider_id, upstream_model,
 		 ingress_protocol, stream, input_tokens, output_tokens, total_tokens,
-		 reasoning_tokens, cached_tokens, usage_state, status, http_status,
+		 reasoning_tokens, cached_tokens, cached_creation_tokens, usage_state, status, http_status,
 		 error_code, error_detail, latency_ms, ttfb_ms, request_id, route_trace,
 		 cost_total) VALUES `)
 
@@ -232,7 +239,7 @@ func (s *Store) CreateUsageRecordsBatched(ctx context.Context, recs []*UsageReco
 		if i > 0 {
 			sb.WriteByte(',')
 		}
-		sb.WriteString("(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)")
+		sb.WriteString("(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)")
 		args = append(args, usageInsertArgs(r, costs[i], costPending[i])...)
 	}
 
@@ -247,7 +254,7 @@ func (s *Store) CreateUsageRecordsBatched(ctx context.Context, recs []*UsageReco
 }
 
 // usageInsertColumns 是 usage_records 写入路径的列数（仅用于容量预估）。
-const usageInsertColumns = 24
+const usageInsertColumns = 25
 
 // batchComputeCosts 逐条算固化费用，并顺带完成 token 负值归一与 ts 兜底。
 //
@@ -275,6 +282,9 @@ func (s *Store) batchComputeCosts(recs []*UsageRecord) ([]float64, []bool) {
 		}
 		if r.CachedTokens < 0 {
 			r.CachedTokens = 0
+		}
+		if r.CachedCreationTokens < 0 {
+			r.CachedCreationTokens = 0
 		}
 		if r.Ts == 0 {
 			r.Ts = now
@@ -304,7 +314,7 @@ func usageInsertArgs(r *UsageRecord, cost float64, costPending bool) []any {
 		r.ID, r.Ts, r.AccessKeyID, nullIfEmpty(r.UserID), r.PublicModel,
 		r.ProviderID, r.UpstreamModel, r.IngressProtocol, stream,
 		r.InputTokens, r.OutputTokens, r.TotalTokens,
-		r.ReasoningTokens, r.CachedTokens, usageState, r.Status,
+		r.ReasoningTokens, r.CachedTokens, r.CachedCreationTokens, usageState, r.Status,
 		r.HTTPStatus, nullIfEmpty(r.ErrorCode), nullIfEmpty(r.ErrorDetail),
 		r.LatencyMs, r.TTFBMs, nullIfEmpty(r.RequestID), nullIfEmpty(r.RouteTrace), cost,
 	}
@@ -315,8 +325,8 @@ func usageInsertArgs(r *UsageRecord, cost float64, costPending bool) []any {
 // 真正的定义在 pricing.go —— 全仓唯一，且现在**同时**被余额预检
 // （cmd/gateway/billing.go）与落库实扣共用，消除了审计 A4-P1-3 指出的
 // 两份公式漂移（只配 price_cache_hit 的模型预检 fail-open 漏放行）。
-func priceUsage(priceInput, priceCacheHit, priceOutput, inputTokens, cachedTokens, outputTokens float64) float64 {
-	return PriceUsage(priceInput, priceCacheHit, priceOutput, inputTokens, cachedTokens, outputTokens)
+func priceUsage(priceInput, priceCacheHit, priceCacheCreation, priceOutput, inputTokens, cachedTokens, cachedCreationTokens, outputTokens float64) float64 {
+	return PriceUsage(priceInput, priceCacheHit, priceCacheCreation, priceOutput, inputTokens, cachedTokens, cachedCreationTokens, outputTokens)
 }
 
 // usageStateCostPending 是 cost_total 因查价失败而**待重算**的标记
@@ -358,11 +368,12 @@ const usageStateCostPending = UsageStateCostPending
 // cost_pending（随 INSERT 落库）。这个标记与「记录已存在」必须同时成立，
 // 否则待重算队列与待重算记录会永久错开。
 func (s *Store) freezeUsageCost(ctx context.Context, r *UsageRecord) (float64, bool) {
-	var pin, phit, pout float64
+	var pin, phit, pcreate, pout float64
 	err := s.read.QueryRowContext(ctx,
-		`SELECT COALESCE(price_input, 0), COALESCE(price_cache_hit, 0), COALESCE(price_output, 0)
+		`SELECT COALESCE(price_input, 0), COALESCE(price_cache_hit, 0),
+		        COALESCE(price_cache_creation, 0), COALESCE(price_output, 0)
 		   FROM upstream_models WHERE provider_id = ? AND model_id = ?`,
-		r.ProviderID, r.UpstreamModel).Scan(&pin, &phit, &pout)
+		r.ProviderID, r.UpstreamModel).Scan(&pin, &phit, &pcreate, &pout)
 	if err != nil {
 		// sql.ErrNoRows 是**正常业务状态**（模型已删除 / 从没配过价），
 		// 与「未配价 = 0」同语义，不需要重算 —— 重算多少次都是 0。
@@ -377,8 +388,8 @@ func (s *Store) freezeUsageCost(ctx context.Context, r *UsageRecord) (float64, b
 		}
 		return 0, false
 	}
-	return priceUsage(pin, phit, pout,
-		float64(r.InputTokens), float64(r.CachedTokens), float64(r.OutputTokens)), false
+	return priceUsage(pin, phit, pcreate, pout,
+		float64(r.InputTokens), float64(r.CachedTokens), float64(r.CachedCreationTokens), float64(r.OutputTokens)), false
 }
 
 // RecomputePendingCosts 重算所有 usage_state='cost_pending' 的记录（2026-10-12 修 P1-2）。
@@ -590,10 +601,11 @@ func (s *Store) RecomputeCost(ctx context.Context, recordID string) (bool, error
 	var r UsageRecord
 	err := s.read.QueryRowContext(ctx,
 		`SELECT COALESCE(provider_id, ''), COALESCE(upstream_model, ''),
-		        COALESCE(input_tokens, 0), COALESCE(cached_tokens, 0), COALESCE(output_tokens, 0),
+		        COALESCE(input_tokens, 0), COALESCE(cached_tokens, 0),
+		        COALESCE(cached_creation_tokens, 0), COALESCE(output_tokens, 0),
 		        COALESCE(user_id, ''), COALESCE(request_id, ''), COALESCE(cost_total, 0)
 		   FROM usage_records WHERE id = ?`, recordID).
-		Scan(&r.ProviderID, &r.UpstreamModel, &r.InputTokens, &r.CachedTokens, &r.OutputTokens,
+		Scan(&r.ProviderID, &r.UpstreamModel, &r.InputTokens, &r.CachedTokens, &r.CachedCreationTokens, &r.OutputTokens,
 			&r.UserID, &r.RequestID, &r.PreviousCost)
 	if errors.Is(err, sql.ErrNoRows) {
 		return false, nil
@@ -702,7 +714,12 @@ type UsageStats struct {
 	InputTokens   int64
 	OutputTokens  int64
 	CachedTokens  int64
-	ErrorCount    int64
+	// CachedCreationTokens 是写入缓存的输入 token 累计（Anthropic
+	// cache_creation_input_tokens）。它已含在 InputTokens 内，单独成列是为了
+	// 让「命中率」与「写入量」可以分开看：命中率的分母仍是全部输入
+	// （含写入），而写入量本身是成本分析的另一维。
+	CachedCreationTokens int64
+	ErrorCount           int64
 	// CacheHitRate 是缓存命中率（0~1）：cached_tokens / input_tokens。
 	// 分母用 input_tokens 而非 total_tokens —— 缓存命中衡量的是输入侧，
 	// 输出 token 与缓存无关，计入分母只会稀释指标。分子分母的语义前提：
@@ -773,6 +790,7 @@ func (s *Store) GetUsageStats(ctx context.Context, from, to int64, scopeUserID s
 		`SELECT COALESCE(SUM(u.n), 0), `+UsageSumExpr("total_tokens", "u")+`,
 		        `+UsageSumExpr("input_tokens", "u")+`, `+UsageSumExpr("output_tokens", "u")+`,
 		        `+UsageSumExpr("cached_tokens", "u")+`,
+		        `+UsageSumExpr("cached_creation_tokens", "u")+`,
 		        COALESCE(SUM(u.n_err), 0),
 		        COALESCE(SUM(u.cached_tokens) * 1.0 / NULLIF(SUM(u.input_tokens), 0), 0),
 		        `+UsageSumExpr("cost_total", "u")+`,
@@ -790,7 +808,7 @@ func (s *Store) GetUsageStats(ctx context.Context, from, to int64, scopeUserID s
 		        COALESCE(MIN(CASE WHEN u.n > 0 THEN u.bucket_ts END), 0)
 		   FROM `+src,
 		args...).
-		Scan(&stats.TotalRequests, &stats.TotalTokens, &stats.InputTokens, &stats.OutputTokens, &stats.CachedTokens, &stats.ErrorCount, &stats.CacheHitRate, &stats.Cost, &stats.CostPendingCount,
+		Scan(&stats.TotalRequests, &stats.TotalTokens, &stats.InputTokens, &stats.OutputTokens, &stats.CachedTokens, &stats.CachedCreationTokens, &stats.ErrorCount, &stats.CacheHitRate, &stats.Cost, &stats.CostPendingCount,
 			&stats.SuccessCount, &stats.CanceledCount, &stats.TtfbMs, &stats.TtfbSamples, &stats.TokensPerSec, &stats.ThroughputSamples,
 			&stats.LastSuccessAt, &stats.FirstRecordAt)
 	if err != nil {

@@ -3,9 +3,9 @@ package inwire
 import (
 	"bytes"
 	"encoding/json"
+	"encoding/json/jsontext"
 	"errors"
 	"fmt"
-	"io"
 )
 
 // ErrDuplicateJSONKey 表示请求体顶层对象里出现了重复键。
@@ -24,8 +24,9 @@ var ErrDuplicateJSONKey = errors.New("request body contains duplicate top-level 
 
 // decodeTopLevelObject 把请求体解码成结构体，并在此之前拒绝重复顶层键。
 //
-// 单遍扫描：json.Decoder 顺手把每个键解成 string，再用「见过就报错」的
-// set 判定。随后用原始字节做一次 Unmarshal，避免二次读取 r.Body。
+// 顶层扫描使用 jsontext.SkipValue：它遍历并校验嵌套值语法，但不会像
+// json.RawMessage 那样把整段值复制到新的缓冲区。随后仍用 Unmarshal 填充
+// 业务结构体，但重复键检查本身不再额外分配约 body 大小的临时数据。
 func decodeTopLevelObject(body []byte, dst any) error {
 	if err := rejectDuplicateTopLevelKeys(body); err != nil {
 		return err
@@ -34,44 +35,44 @@ func decodeTopLevelObject(body []byte, dst any) error {
 }
 
 func rejectDuplicateTopLevelKeys(body []byte) error {
-	dec := json.NewDecoder(bytes.NewReader(body))
+	// AllowDuplicateNames(true) 关闭 jsontext 自己的“全对象递归去重”，
+	// 因为本函数只对决定路由/计费的顶层字段负责；嵌套 schema 中出现重复名
+	// 由最终 Unmarshal 的语义处理。顶层集合这里仍显式检查。
+	dec := jsontext.NewDecoder(bytes.NewReader(body), jsontext.AllowDuplicateNames(true))
 
-	tok, err := dec.Token()
+	tok, err := dec.ReadToken()
 	if err != nil {
 		// 交给随后的 Unmarshal 精确报错（空 body、非对象等）。
 		return nil
 	}
-	if tok != json.Delim('{') {
+	if tok.Kind() != '{' {
 		// 顶层不是对象：也交给 Unmarshal 报「cannot unmarshal ...」，
 		// 由调用方的 400 分支处理，不在这里抢答。
 		return nil
 	}
 
 	seen := make(map[string]struct{})
-	for dec.More() {
-		keyTok, err := dec.Token()
+	for dec.PeekKind() != '}' {
+		keyTok, err := dec.ReadToken()
 		if err != nil {
 			return nil
 		}
-		key, ok := keyTok.(string)
-		if !ok {
+		if keyTok.Kind() != '"' {
 			return nil
 		}
+		key := keyTok.String()
 		if _, dup := seen[key]; dup {
 			return fmt.Errorf("%w: %q", ErrDuplicateJSONKey, key)
 		}
 		seen[key] = struct{}{}
 
-		// 跳过值。RawMessage 让 decoder 自行处理嵌套对象/数组/标量，
-		// 不在这里重新实现 JSON 语法。
-		var raw json.RawMessage
-		if err := dec.Decode(&raw); err != nil {
+		if err := dec.SkipValue(); err != nil {
 			return nil
 		}
 	}
 
 	// 读掉收尾的 '}'。读不到说明 body 被截断，同样交给 Unmarshal 报错。
-	if _, err := dec.Token(); err != nil && !errors.Is(err, io.EOF) {
+	if _, err := dec.ReadToken(); err != nil {
 		return nil
 	}
 	return nil

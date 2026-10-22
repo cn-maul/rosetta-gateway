@@ -1,7 +1,7 @@
 package ingress
 
 import (
-	"strings"
+	"unicode/utf8"
 
 	"github.com/cn-maul/rosetta"
 )
@@ -23,22 +23,31 @@ func EstimateRequestTokens(req *rosetta.ChatRequest) int64 {
 // full output ceiling. Keeping the character-based formula in one place also
 // prevents TPM reservation and usage fallback from drifting apart.
 func EstimateInputTokensOnly(req *rosetta.ChatRequest) int64 {
-	var b strings.Builder
-	b.WriteString(req.System)
+	ascii, other := 0, 0
+	add := func(s string) {
+		for _, r := range s {
+			if r < utf8.RuneSelf {
+				ascii++
+			} else {
+				other++
+			}
+		}
+	}
+	add(req.System)
 	for _, m := range req.Messages {
 		for _, blk := range m.Blocks {
-			b.WriteString(blk.Text)
-			b.WriteString(blk.Thinking)
-			b.WriteString(blk.Content)
-			b.WriteString(blk.Arguments)
+			add(blk.Text)
+			add(blk.Thinking)
+			add(blk.Content)
+			add(blk.Arguments)
 		}
 	}
 	for _, t := range req.Tools {
-		b.WriteString(t.Name)
-		b.WriteString(t.Description)
-		b.WriteString(string(t.Parameters))
+		add(t.Name)
+		add(t.Description)
+		add(string(t.Parameters))
 	}
-	return int64(rosetta.EstimateTokens(b.String()))
+	return int64((ascii+3)/4 + other)
 }
 
 // PartialOutTokens converts already-received output characters into a

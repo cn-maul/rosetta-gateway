@@ -25,7 +25,12 @@
   耗尽即 402 拒绝调用；与 token 配额是两条独立的闸，处置动作不同。
 - **用量记账与归档**：逐请求明细（含固化费用）保留 30 天，
   日归档 + 终身累计单行表保证「明细可删、累计不变」；
-  历史费用按落库时单价固化，改价不改历史。
+  历史费用按落库时单价固化，改价不改历史。输入按未命中 / 缓存命中 /
+  缓存写入（Anthropic cache creation）三个桶分别计价，写入价未配置时按输入价计。
+- **多维度用量分析**：用量与费用页默认看近 1 天，按上游 / 模型 / 密钥
+  排行汇总请求量、Tokens、固化费用、成功率以及首字 / 输出速度；
+  请求日志逐条展示流式模式、入站协议、公开路由与实际模型、Token 细分、
+  速度、首字 / 总耗时和错误轨迹。
 - **上游模型探测**：定时对每个上游模型发最小真实推理，得出连通率曲线，
   画在「可用模型」页的模型卡上（探测不扣网关用户的钱，也不写熔断状态）。
 - **Web 管理界面**：Vue 3 + Vite，产物经 `go:embed` 进二进制，无外部静态资源。
@@ -77,10 +82,21 @@ token 的 SHA-256 哈希，链接放在 URL hash 中，因此不会进入首次 
 > 对端的网段），网关才会采信 `Forwarded` / `X-Forwarded-For` 并恢复真实客户端
 > IP；不配置时这两个头一律忽略，key 的 IP 白名单和登录限速会退化成按代理 IP
 > 计数。反代必须覆盖或追加转发头，不能把客户端自带值原样透传。
+>
+> 需要把「公开监听但未声明 TLS」变成硬失败时，配
+> `"require_tls_for_public_listen": true`。默认 `false`：绑定具体非回环网卡会
+> 打 ERROR 日志，通配地址（`0.0.0.0` / `::`，容器默认）只打 WARN —— 进程看不到
+> 宿主机的端口映射与防火墙，无法判断真实暴露面。
+
+`defaults` 里与并发/过载相关的两个值（缺省即可，通常不用配）：
+
+- `max_concurrent_streams`（默认 256）：同时打开的流式请求上限。
+- `stream_admission_timeout_ms`（默认 5000）：拿不到流式名额时的最长等待；
+  超时返回 `503 server_overloaded` 并带 `Retry-After`，而不是无限堆在网关里。
 
 ### 源码构建
 
-前置 Go 1.27+（与 `go.mod` 的 `go` 指令一致，CI 由 `go-version-file` 单一来源读取）。前端产物已入库（`internal/webui/dist`），只改后端无需 Node：
+前置 Go 1.27.3+（与 `go.mod` 的 `go` 指令一致，CI 由 `go-version-file` 单一来源读取；不要使用较早的 1.27.x）。前端产物已入库（`internal/webui/dist`），只改后端无需 Node：
 
 ```bash
 go build -o gateway ./cmd/gateway
@@ -117,10 +133,20 @@ curl http://<主机>:8666/v1/chat/completions \
 OpenAI 系客户端；额度查询端点（`/dashboard/billing/*`、`/v1/organization/*`）
 与 one-api 系工具兼容。
 
-接入 OpenCode Go 作为上游时，网关会把下游的 `x-opencode-session` 转发给
-`opencode.ai` 及其子域，并把 `User-Agent` 设为 `rosetta-gateway`。多轮会话应让
-客户端持续发送同一个稳定的 `x-opencode-session`；未发送时网关只用本次请求 ID
-兜底，请求可以通过，但无法保证 OpenCode 的会话路由与缓存亲和性。
+接入 OpenCode Go 作为上游时，网关会把下游的会话标识转发给 `opencode.ai` 及其
+子域，并把 `User-Agent` 设为 `rosetta-gateway`。网关按以下顺序识别会话：
+`x-opencode-session`、`x-deepseek-harness-session-id`、`x-session-affinity`、
+`session_id`、`x-session-id`、`session-id`、`x-client-request-id`（最后一个是
+兼容别名：它常被客户端按「每次请求」刷新，所以排在所有稳定标识之后）。多轮会话应让
+客户端持续发送同一个稳定标识；都没有时网关只用本次请求 ID 兜底，请求可以通过，
+但无法保证 OpenCode 的会话路由与缓存亲和性。
+
+对 OpenAI 系上游，网关优先透传客户端的 `prompt_cache_key`，没有该字段时把上述
+稳定会话标识作为缓存亲和键，并通过 `x-session-affinity` / `x-client-request-id`
+发给上游。缓存命中率按 `cached_tokens / input_tokens` 计算，其中
+`input_tokens` 包含本轮新增的上下文；多轮 Agent 追加的工具输出首次出现时不可能
+命中缓存，因此整体命中率低于单轮“上一段前缀复用率”是正常的。上游是否实际共享
+缓存仍由服务商决定，网关不能保证缓存不淘汰或一定落到同一缓存分片。
 
 ## 安全模型（摘要）
 

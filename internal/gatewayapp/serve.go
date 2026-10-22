@@ -118,15 +118,29 @@ func waitLoop(done <-chan struct{}, timeout time.Duration, logger *slog.Logger, 
 	}
 }
 
+func maintenanceContext(shutdown <-chan struct{}) (context.Context, context.CancelFunc) {
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() {
+		select {
+		case <-shutdown:
+			cancel()
+		case <-ctx.Done():
+		}
+	}()
+	return ctx, cancel
+}
+
 func startPruner(db *store.Store, cfg *config.Config, logger *slog.Logger, shutdown <-chan struct{}) <-chan struct{} {
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
+		ctx, cancel := maintenanceContext(shutdown)
+		defer cancel()
 		pruneAudit := func(reason string) {
 			if cfg.AuditLogKeepRows <= 0 {
 				return
 			}
-			n, err := db.PruneAuditLog(context.Background(), cfg.AuditLogKeepRows)
+			n, err := db.PruneAuditLog(ctx, cfg.AuditLogKeepRows)
 			if err != nil {
 				logger.Error("audit log prune failed", "error", err, "trigger", reason)
 				return
@@ -136,27 +150,53 @@ func startPruner(db *store.Store, cfg *config.Config, logger *slog.Logger, shutd
 					"deleted_rows", n, "keep_rows", cfg.AuditLogKeepRows)
 			}
 		}
-		runPrune := func(reason string) {
-			res, err := db.PruneOldUsage(context.Background(), cfg.UsageRetentionDays)
-			switch {
-			case err != nil:
-				logger.Error("usage prune failed", "error", err, "trigger", reason)
-			case res.Skipped:
-				logger.Debug("usage prune skipped", "reason", res.Reason, "trigger", reason)
-			default:
-				logger.Info("usage pruned into daily rollups", "trigger", reason,
-					"deleted_rows", res.DeletedRows, "rollup_rows", res.RollupRows,
-					"pruned_through_day", res.PrunedThrough)
+		runPrune := func(reason string) bool {
+			started := time.Now()
+			var deleted, rollups int64
+			for batch := 0; batch < 10 && time.Since(started) < 30*time.Second; batch++ {
+				batchCtx, batchCancel := context.WithTimeout(ctx, 15*time.Second)
+				res, err := db.PruneOldUsage(batchCtx, cfg.UsageRetentionDays)
+				batchCancel()
+				if err != nil {
+					logger.Error("usage prune failed", "error", err, "trigger", reason,
+						"batches_completed", batch, "deleted_rows", deleted)
+					pruneAudit(reason)
+					return false
+				}
+				if res.Skipped {
+					if deleted > 0 {
+						logger.Info("usage pruned into daily rollups", "trigger", reason,
+							"deleted_rows", deleted, "rollup_rows", rollups,
+							"pruned_through_day", res.PrunedThrough)
+					} else {
+						logger.Debug("usage prune skipped", "reason", res.Reason, "trigger", reason)
+					}
+					pruneAudit(reason)
+					return true
+				}
+				deleted += res.DeletedRows
+				rollups += res.RollupRows
 			}
+			logger.Warn("usage prune backlog remains; retrying sooner",
+				"trigger", reason, "deleted_rows", deleted, "rollup_rows", rollups,
+				"retry_in", 15*time.Minute)
 			pruneAudit(reason)
+			return false
 		}
-		runPrune("startup")
-		t := time.NewTicker(24 * time.Hour)
-		defer t.Stop()
+
+		// Do not compete with request-path quota reservations and usage writes
+		// immediately after process start.
+		timer := time.NewTimer(30 * time.Second)
+		defer timer.Stop()
 		for {
 			select {
-			case <-t.C:
-				runPrune("daily")
+			case <-timer.C:
+				complete := runPrune("scheduled")
+				if complete {
+					timer.Reset(24 * time.Hour)
+				} else {
+					timer.Reset(15 * time.Minute)
+				}
 			case <-shutdown:
 				return
 			}
@@ -169,9 +209,11 @@ func startRecompute(db *store.Store, logger *slog.Logger, shutdown <-chan struct
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
+		ctx, cancel := maintenanceContext(shutdown)
+		defer cancel()
 		runRecompute := func(reason string) {
 			for round := 0; round < 10; round++ {
-				fixed, remaining, err := db.RecomputePendingCosts(context.Background(), 500)
+				fixed, remaining, err := db.RecomputePendingCosts(ctx, 500)
 				if err != nil {
 					logger.Error("pending cost recompute failed", "error", err, "trigger", reason)
 					return
@@ -187,13 +229,15 @@ func startRecompute(db *store.Store, logger *slog.Logger, shutdown <-chan struct
 			logger.Warn("pending cost recompute backlog still large after 10 rounds",
 				"trigger", reason, "batch_size", 500)
 		}
-		runRecompute("startup")
-		tk := time.NewTicker(5 * time.Minute)
-		defer tk.Stop()
+		// Same reasoning as the pruner: give the first requests the single
+		// write connection before a background batch takes it.
+		timer := time.NewTimer(45 * time.Second)
+		defer timer.Stop()
 		for {
 			select {
-			case <-tk.C:
+			case <-timer.C:
 				runRecompute("periodic")
+				timer.Reset(5 * time.Minute)
 			case <-shutdown:
 				return
 			}
@@ -206,8 +250,10 @@ func startReconcile(db *store.Store, logger *slog.Logger, shutdown <-chan struct
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
+		ctx, cancel := maintenanceContext(shutdown)
+		defer cancel()
 		runReconcile := func(reason string) {
-			found, err := db.FindUnchargedUsage(context.Background(), 500)
+			found, err := db.FindUnchargedUsage(ctx, 500)
 			if err != nil {
 				logger.Error("charge reconciliation scan failed", "error", err, "trigger", reason)
 				return
@@ -217,7 +263,7 @@ func startReconcile(db *store.Store, logger *slog.Logger, shutdown <-chan struct
 			}
 			var charged, failed int
 			for _, u := range found {
-				if cerr := db.ChargeUnchargedUsage(context.Background(), u); cerr != nil {
+				if cerr := db.ChargeUnchargedUsage(ctx, u); cerr != nil {
 					failed++
 					logger.Error("charge reconciliation failed to charge",
 						"error", cerr, "record_id", u.RecordID,
@@ -230,13 +276,15 @@ func startReconcile(db *store.Store, logger *slog.Logger, shutdown <-chan struct
 			logger.Warn("reconciled uncharged usage records",
 				"trigger", reason, "found", len(found), "charged", charged, "failed", failed)
 		}
-		runReconcile("startup")
-		tk := time.NewTicker(10 * time.Minute)
-		defer tk.Stop()
+		// Last of the three: reconciliation rewrites money, so let the pruner
+		// and recompute finish their first pass first.
+		timer := time.NewTimer(time.Minute)
+		defer timer.Stop()
 		for {
 			select {
-			case <-tk.C:
+			case <-timer.C:
 				runReconcile("periodic")
+				timer.Reset(10 * time.Minute)
 			case <-shutdown:
 				return
 			}

@@ -541,8 +541,8 @@ export const api = {
   updateModel: (id: string, b: UpstreamModelUpdate) => mutate(() => patch<UpstreamModel>(`/models/${id}`, b)),
   deleteModel: (id: string) => mutate(() => del(`/models/${id}`)),
   // 批量设置价格：把同一组价格写到多个模型（整体替换，见后端 batchPriceRequest）。
-  batchUpdateModelPrices: (modelIds: string[], b: { price_input: number; price_cache_hit: number; price_output: number }) =>
-    mutate(() => post<{ updated: number; price_input: number; price_cache_hit: number; price_output: number }>('/models/batch-price', { model_ids: modelIds, ...b })),
+  batchUpdateModelPrices: (modelIds: string[], b: { price_input: number; price_cache_hit: number; price_cache_creation: number; price_output: number }) =>
+    mutate(() => post<{ updated: number; price_input: number; price_cache_hit: number; price_cache_creation: number; price_output: number }>('/models/batch-price', { model_ids: modelIds, ...b })),
 
   // 模型归组（跨上游的同一个模型合并统计；纯展示层，不参与数据面路由）
   modelGroups: () => get<ModelGroup[]>('/model-groups'),

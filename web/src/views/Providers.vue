@@ -13,7 +13,7 @@ import { PROTOCOL_OPTIONS, protocolLabel } from '../protocols'
 
 const router = useRouter()
 const route = useRoute()
-const search = useQueryText('q')
+const search = useQueryText('q', '', { debounceMs: 200 })
 const status = useQueryText('status')
 const saving = ref(false)
 const pending = ref(new Set<string>())
@@ -34,7 +34,10 @@ function readyLabel(p: Provider) {
   if (!p.enabled) return '已停用'
   return p.ready === true ? '凭据就绪' : p.ready === false ? '未就绪' : '状态未知'
 }
-function clearFilters() { void router.replace({ query: { ...route.query, q: undefined, status: undefined } }) }
+function clearFilters() {
+  search.value = ''
+  status.value = ''
+}
 let loadSeq = 0
 
 const err = ref('')

@@ -213,7 +213,7 @@ jobs:
 
       - name: Set up Go
         # 与上面 test job 同一版且同样从 go.mod 取版本（单一来源），
-        # 不在这儿另写一个 '1.27.1'：两处写死就会漂移，
+        # 不在这儿另写一个 '1.27.3'：两处写死就会漂移，
         # 而漂移的表现是「同一个 PR 两个 job 用不同工具链」。
         uses: actions/setup-go@7b8cf10d4e4a01d4992d18a89f4d7dc5a3e6d6f4
         with:

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"hash/fnv"
 	"io"
 	"log/slog"
 	"math/rand/v2"
@@ -531,6 +532,18 @@ func (p *Pool) ProvidersSnapshot() map[string]*ProviderEntry {
 }
 
 func (p *Pool) GetAnyClient(providerSlug string) (*rosetta.Client, string, error) {
+	return p.getAnyClient(providerSlug, "")
+}
+
+// GetAnyClientByAffinity keeps credentials sticky for one conversation when
+// the provider has multiple healthy keys. Cache shards and rate-limit quotas
+// are commonly scoped to the credential, so random selection on every turn can
+// turn a reusable prompt prefix into a cold read on another account.
+func (p *Pool) GetAnyClientByAffinity(providerSlug, affinity string) (*rosetta.Client, string, error) {
+	return p.getAnyClient(providerSlug, strings.TrimSpace(affinity))
+}
+
+func (p *Pool) getAnyClient(providerSlug, affinity string) (*rosetta.Client, string, error) {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
 
@@ -544,7 +557,12 @@ func (p *Pool) GetAnyClient(providerSlug string) (*rosetta.Client, string, error
 		return nil, "", fmt.Errorf("no healthy credentials for provider %q", providerSlug)
 	}
 
-	cred := p.selectWeighted(healthy)
+	var cred *CredentialEntry
+	if affinity == "" {
+		cred = p.selectWeighted(healthy)
+	} else {
+		cred = p.selectWeightedByAffinity(healthy, affinity)
+	}
 	return cred.Client, cred.ID, nil
 }
 
@@ -859,6 +877,36 @@ func (p *Pool) selectWeighted(creds []*CredentialEntry) *CredentialEntry {
 	}
 
 	r := rand.IntN(totalWeight)
+	for _, c := range creds {
+		r -= c.Weight
+		if r < 0 {
+			return c
+		}
+	}
+	return creds[0]
+}
+
+func (p *Pool) selectWeightedByAffinity(creds []*CredentialEntry, affinity string) *CredentialEntry {
+	if len(creds) == 0 {
+		return nil
+	}
+	if len(creds) == 1 {
+		return creds[0]
+	}
+
+	h := fnv.New64a()
+	_, _ = h.Write([]byte(affinity))
+	pick := h.Sum64()
+
+	totalWeight := 0
+	for _, c := range creds {
+		totalWeight += c.Weight
+	}
+	if totalWeight <= 0 {
+		return creds[int(pick%uint64(len(creds)))]
+	}
+
+	r := int(pick % uint64(totalWeight))
 	for _, c := range creds {
 		r -= c.Weight
 		if r < 0 {
@@ -1575,12 +1623,17 @@ func buildClient(prov *ProviderEntry, apiKey string, cfg *config.Config, modelIn
 		// 且 Idempotency-Key 对 DeepSeek/vLLM/各类中转普遍无效。
 		// 网关自己的重试策略：故障转移链（route_targets），不是同一个上游反复打。
 		rosetta.WithQuirks(rosetta.Quirks{NoIdempotencyKey: true}),
+		// Chat thinking replay needs to replace the SDK's messages array with
+		// the original wire messages, including reasoning_content. It is only
+		// emitted when that field actually exists; all other reserved keys are
+		// still constructed by the SDK and never placed in Extra.
+		rosetta.WithExtraOverrides(true),
 	}
 	// 代理：为空走全局共享 client（读进程环境变量），否则用该 provider
 	// 独享的 client。代理配错时**不失败**，而是回落到全局 client 并把错误
 	// 记进 ProviderFailure —— 理由见 proxyHTTPClientFor 的注释。
 	hc, proxyErr := proxyHTTPClientFor(prov.ProxyURL)
-	opts = append(opts, rosetta.WithHTTPClient(withOpenCodeSessionTransport(hc, prov.Endpoint)))
+	opts = append(opts, rosetta.WithHTTPClient(withConversationAffinityTransport(hc, prov.Endpoint, prov.Protocol, prov.Slug)))
 	prov.ProxyConfigError = proxyErr
 	if prov.Protocol != "" && prov.Protocol != "auto" {
 		switch prov.Protocol {

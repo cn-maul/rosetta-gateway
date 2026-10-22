@@ -158,7 +158,11 @@ func buildHarnessFull(t *testing.T, chain []struct {
 		ri.AddUpstreamModel(&routing.UpstreamModel{ID: c.slug + "/m", ProviderID: c.slug, ModelID: c.slug + "-model"})
 		targets = append(targets, &routing.Target{
 			ID: c.slug + "#t" + string(rune('0'+i)), RouteID: "r1",
-			ProviderID: c.slug, UpstreamModelID: c.slug + "/m", Position: i})
+			ProviderID: c.slug, UpstreamModelID: c.slug + "/m", Position: i,
+			// 生产写入路径（CreateRouteWithHeadTarget / ReplaceRouteTargets）
+			// 默认 enabled=1；快照的 buildCandidates 会跳过 !Enabled 的目标，
+			// 夹具漏写这一位就等于「链上一个可用目标都没有」。
+			Enabled: true})
 	}
 	ttft := 0
 	if len(ttftMs) > 0 {

@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"fmt"
 
@@ -73,6 +74,79 @@ func (s *Store) ensureSchema(ctx context.Context) error {
 func (s *Store) ensureCompatibleSchema(ctx context.Context) error {
 	if _, err := s.db.ExecContext(ctx, userPasswordSetupTokensDDL); err != nil {
 		return fmt.Errorf("ensure user password setup token schema: %w", err)
+	}
+	// 2026-10-22 修 F2：cache creation 的独立单价与归档列。
+	//
+	// 这些是**带默认值的纯新增列**，旧库可以原地升级，不需要提升
+	// currentSchemaVersion（破坏性变更才需要）。默认值 0 与「未配置」同义：
+	// 未配置 price_cache_creation 时按 price_input 计费，与修复前的行为
+	// 逐字一致，因此升级不会改变任何历史或当次金额。
+	for _, col := range []struct {
+		table  string
+		column string
+		decl   string
+	}{
+		{"upstream_models", "price_cache_creation", "REAL"},
+		{"usage_records", "cached_creation_tokens", "INTEGER NOT NULL DEFAULT 0"},
+		{"usage_daily_rollups", "cached_creation_tokens", "INTEGER NOT NULL DEFAULT 0"},
+		{"usage_totals", "cached_creation_tokens", "INTEGER NOT NULL DEFAULT 0"},
+	} {
+		if err := s.ensureAdditiveColumn(ctx, col.table, col.column, col.decl); err != nil {
+			return err
+		}
+	}
+	// 旧库的 trg_update_usage_totals 不包含新列，DROP + CREATE 让新增列
+	// 从下一行明细开始进入终身累计。DROP/CREATE 都是幂等的，且触发器只
+	// 影响后续 INSERT。
+	if _, err := s.db.ExecContext(ctx, `DROP TRIGGER IF EXISTS trg_update_usage_totals`); err != nil {
+		return fmt.Errorf("refresh usage totals trigger: %w", err)
+	}
+	if _, err := s.db.ExecContext(ctx, usageTotalsInsertTriggerDDL); err != nil {
+		return fmt.Errorf("recreate usage totals trigger: %w", err)
+	}
+	return nil
+}
+
+// ensureAdditiveColumn 在列不存在时给已有表补一列。
+//
+// 只接受**可空或带默认值**的新增列：SQLite 的 ALTER TABLE ADD COLUMN
+// 无法给旧行补一个没有默认值的 NOT NULL 列。调用方传的 decl 必须满足
+// 这一点，否则 ALTER 会在旧库上失败（新库走 canonical DDL，不受影响）。
+func (s *Store) ensureAdditiveColumn(ctx context.Context, table, column, decl string) error {
+	rows, err := s.db.QueryContext(ctx, `PRAGMA table_info(`+table+`)`)
+	if err != nil {
+		return fmt.Errorf("inspect %s columns: %w", table, err)
+	}
+
+	found := false
+	for rows.Next() {
+		var (
+			cid     int
+			name    string
+			ctype   string
+			notNull int
+			dflt    sql.NullString
+			pk      int
+		)
+		if err := rows.Scan(&cid, &name, &ctype, &notNull, &dflt, &pk); err != nil {
+			return fmt.Errorf("scan %s columns: %w", table, err)
+		}
+		if name == column {
+			found = true
+		}
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return fmt.Errorf("read %s columns: %w", table, err)
+	}
+	// 必须先关闭行集再执行 ALTER：写池是单连接（SetMaxOpenConns(1)），
+	// 行集未释放时 Exec 会等待同一个连接，形成永久自锁。
+	rows.Close()
+	if found {
+		return nil
+	}
+	if _, err := s.db.ExecContext(ctx, `ALTER TABLE `+table+` ADD COLUMN `+column+` `+decl); err != nil {
+		return fmt.Errorf("add column %s.%s: %w", table, column, err)
 	}
 	return nil
 }
@@ -174,6 +248,30 @@ func (s *Store) initializeSchema(ctx context.Context) error {
 // canonicalSchemaStatements is the complete, authoritative schema. Do not add
 // best-effort ALTER/backfill statements here: unsupported databases are
 // rejected before any statement runs.
+//
+// usageTotalsInsertTriggerDDL 单独抽成常量，是因为它既要出现在 canonical
+// schema 里，又要在 ensureCompatibleSchema 中随新增列重建 —— 两处必须逐字
+// 同一份定义，否则「新库的累计含新列、旧库的不含」会静默分叉。
+const usageTotalsInsertTriggerDDL = `CREATE TRIGGER trg_update_usage_totals
+ AFTER INSERT ON usage_records
+ BEGIN
+   UPDATE usage_totals SET
+     request_count    = request_count + 1,
+     success_count    = success_count + CASE WHEN NEW.status = 'ok' THEN 1 ELSE 0 END,
+     error_count      = error_count + CASE WHEN NEW.status NOT IN ('ok', 'canceled') THEN 1 ELSE 0 END,
+     input_tokens     = input_tokens + NEW.input_tokens,
+     output_tokens    = output_tokens + NEW.output_tokens,
+     total_tokens     = total_tokens + NEW.total_tokens,
+     cached_tokens    = cached_tokens + NEW.cached_tokens,
+     cached_creation_tokens = cached_creation_tokens + NEW.cached_creation_tokens,
+     reasoning_tokens = reasoning_tokens + NEW.reasoning_tokens,
+     cost_total       = cost_total + NEW.cost_total,
+     latency_sum_ms   = latency_sum_ms + NEW.latency_ms,
+     first_record_at  = CASE WHEN first_record_at = 0 THEN NEW.ts
+                             ELSE MIN(first_record_at, NEW.ts) END
+   WHERE id = 1;
+ END`
+
 var canonicalSchemaStatements = []string{
 	`CREATE TABLE networks (
 		id         TEXT PRIMARY KEY,
@@ -224,6 +322,7 @@ var canonicalSchemaStatements = []string{
 		effort_levels     TEXT,
 		price_input       REAL,
 		price_cache_hit   REAL,
+		price_cache_creation REAL,
 		price_output      REAL,
 		group_id          TEXT REFERENCES model_groups(id) ON DELETE SET NULL,
 		UNIQUE (provider_id, model_id)
@@ -311,6 +410,7 @@ var canonicalSchemaStatements = []string{
 		total_tokens      INTEGER NOT NULL DEFAULT 0,
 		reasoning_tokens  INTEGER NOT NULL DEFAULT 0,
 		cached_tokens     INTEGER NOT NULL DEFAULT 0,
+		cached_creation_tokens INTEGER NOT NULL DEFAULT 0,
 		usage_state       TEXT NOT NULL,
 		status            TEXT NOT NULL,
 		http_status       INTEGER NOT NULL,
@@ -334,6 +434,7 @@ var canonicalSchemaStatements = []string{
 		input_tokens       INTEGER NOT NULL DEFAULT 0,
 		output_tokens      INTEGER NOT NULL DEFAULT 0,
 		cached_tokens      INTEGER NOT NULL DEFAULT 0,
+		cached_creation_tokens INTEGER NOT NULL DEFAULT 0,
 		reasoning_tokens   INTEGER NOT NULL DEFAULT 0,
 		total_tokens       INTEGER NOT NULL DEFAULT 0,
 		cost_total         REAL NOT NULL DEFAULT 0,
@@ -430,24 +531,7 @@ var canonicalSchemaStatements = []string{
 	   ON CONFLICT(user_id) DO UPDATE SET
 	     total_tokens = total_tokens + excluded.total_tokens;
 	 END`,
-	`CREATE TRIGGER trg_update_usage_totals
-	 AFTER INSERT ON usage_records
-	 BEGIN
-	   UPDATE usage_totals SET
-	     request_count    = request_count + 1,
-	     success_count    = success_count + CASE WHEN NEW.status = 'ok' THEN 1 ELSE 0 END,
-	     error_count      = error_count + CASE WHEN NEW.status NOT IN ('ok', 'canceled') THEN 1 ELSE 0 END,
-	     input_tokens     = input_tokens + NEW.input_tokens,
-	     output_tokens    = output_tokens + NEW.output_tokens,
-	     total_tokens     = total_tokens + NEW.total_tokens,
-	     cached_tokens    = cached_tokens + NEW.cached_tokens,
-	     reasoning_tokens = reasoning_tokens + NEW.reasoning_tokens,
-	     cost_total       = cost_total + NEW.cost_total,
-	     latency_sum_ms   = latency_sum_ms + NEW.latency_ms,
-	     first_record_at  = CASE WHEN first_record_at = 0 THEN NEW.ts
-	                             ELSE MIN(first_record_at, NEW.ts) END
-	   WHERE id = 1;
-	 END`,
+	usageTotalsInsertTriggerDDL,
 	`CREATE TRIGGER trg_update_usage_totals_cost
 	 AFTER UPDATE OF cost_total ON usage_records
 	 WHEN OLD.cost_total <> NEW.cost_total

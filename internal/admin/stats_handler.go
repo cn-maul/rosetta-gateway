@@ -118,15 +118,16 @@ func (h *StatsHandler) GetOverview(w http.ResponseWriter, r *http.Request) {
 
 // @ts-type Stats
 type statsResponse struct {
-	TotalRequests int64   `json:"total_requests"`
-	SuccessCount  int64   `json:"success_count"`
-	ErrorCount    int64   `json:"error_count"`
-	CanceledCount int64   `json:"canceled_count"`
-	TotalTokens   int64   `json:"total_tokens"`
-	InputTokens   int64   `json:"input_tokens"`
-	OutputTokens  int64   `json:"output_tokens"`
-	CachedTokens  int64   `json:"cached_tokens"`
-	CacheHitRate  float64 `json:"cache_hit_rate"`
+	TotalRequests        int64   `json:"total_requests"`
+	SuccessCount         int64   `json:"success_count"`
+	ErrorCount           int64   `json:"error_count"`
+	CanceledCount        int64   `json:"canceled_count"`
+	TotalTokens          int64   `json:"total_tokens"`
+	InputTokens          int64   `json:"input_tokens"`
+	OutputTokens         int64   `json:"output_tokens"`
+	CachedTokens         int64   `json:"cached_tokens"`
+	CachedCreationTokens int64   `json:"cached_creation_tokens"`
+	CacheHitRate         float64 `json:"cache_hit_rate"`
 	// AvgTokensPerSec / AvgTtfbMs 是所选区间内的成功请求加权值。
 	// 样本数为 0 时必须显示“暂无样本”，不能把 0 当成真实速度/首字。
 	AvgTokensPerSec   float64 `json:"avg_tokens_per_sec"`
@@ -247,24 +248,25 @@ func (h *StatsHandler) Get(w http.ResponseWriter, r *http.Request) { // from/to 
 		return
 	}
 	resp := statsResponse{
-		TotalRequests:     stats.TotalRequests,
-		SuccessCount:      stats.SuccessCount,
-		ErrorCount:        stats.ErrorCount,
-		CanceledCount:     stats.CanceledCount,
-		TotalTokens:       stats.TotalTokens,
-		InputTokens:       stats.InputTokens,
-		OutputTokens:      stats.OutputTokens,
-		CachedTokens:      stats.CachedTokens,
-		CacheHitRate:      stats.CacheHitRate,
-		AvgTokensPerSec:   stats.TokensPerSec,
-		ThroughputSamples: stats.ThroughputSamples,
-		AvgTtfbMs:         stats.TtfbMs,
-		TtfbSamples:       stats.TtfbSamples,
-		Cost:              stats.Cost,
-		CostPendingCount:  stats.CostPendingCount,
-		LastSuccessAt:     stats.LastSuccessAt,
-		RequestedFrom:     from,
-		RequestedTo:       to,
+		TotalRequests:        stats.TotalRequests,
+		SuccessCount:         stats.SuccessCount,
+		ErrorCount:           stats.ErrorCount,
+		CanceledCount:        stats.CanceledCount,
+		TotalTokens:          stats.TotalTokens,
+		InputTokens:          stats.InputTokens,
+		OutputTokens:         stats.OutputTokens,
+		CachedTokens:         stats.CachedTokens,
+		CachedCreationTokens: stats.CachedCreationTokens,
+		CacheHitRate:         stats.CacheHitRate,
+		AvgTokensPerSec:      stats.TokensPerSec,
+		ThroughputSamples:    stats.ThroughputSamples,
+		AvgTtfbMs:            stats.TtfbMs,
+		TtfbSamples:          stats.TtfbSamples,
+		Cost:                 stats.Cost,
+		CostPendingCount:     stats.CostPendingCount,
+		LastSuccessAt:        stats.LastSuccessAt,
+		RequestedFrom:        from,
+		RequestedTo:          to,
 	}
 
 	// 余额随同一份响应下发（省一次请求）。读失败只记 WARN 并保留「不限额」

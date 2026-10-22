@@ -35,6 +35,10 @@ type OpenAIChatRequest struct {
 	// 无日志、无报错，而 rosetta 与上游 OpenAI 侧都完整支持它。
 	// 这是最常用的入站协议，丢它的代价最大（用户以为在用推理模式，实际没有）。
 	ReasoningEffort *string `json:"reasoning_effort,omitempty"`
+	// PromptCacheKey is an explicit cache-affinity hint. It is separate from
+	// conversation headers: clients may keep the same conversation while
+	// intentionally changing the reusable prefix (and vice versa).
+	PromptCacheKey string `json:"prompt_cache_key,omitempty"`
 
 	// RawEffort 是 reasoning_effort 的**原样**取值（规范化前的空白/大小写/别名
 	// 都保留），解析失败时为空。
@@ -108,6 +112,10 @@ type OpenAIMessage struct {
 	Name       string           `json:"name,omitempty"`
 	ToolCalls  []OpenAIToolCall `json:"tool_calls,omitempty"`
 	ToolCallID string           `json:"tool_call_id,omitempty"`
+	// ReasoningContent is DeepSeek's replayable thinking value on the
+	// OpenAI-compatible Chat protocol. It is not ordinary display text:
+	// thinking-mode upstreams require it back verbatim on assistant turns.
+	ReasoningContent string `json:"reasoning_content,omitempty"`
 	// Refusal 是模型拒答时的正文（OpenAI 的
 	// {"role":"assistant","content":null,"refusal":"..."} 形态）。
 	//
@@ -305,6 +313,9 @@ func (r *OpenAIChatRequest) ApplyProtocolPrivateExtra(req *rosetta.ChatRequest, 
 		if r.ParallelToolCalls != nil {
 			extra["parallel_tool_calls"] = *r.ParallelToolCalls
 		}
+		if r.PromptCacheKey != "" {
+			extra["prompt_cache_key"] = r.PromptCacheKey
+		}
 		// presence_penalty / frequency_penalty / seed / user：Responses API 无对应物。
 		// 它们是软偏好或标注类字段，丢弃不改变请求的正确性 —— 与结构化输出这类
 		// 硬约束不同（后者在网关层被拒绝，绝不静默降级）。
@@ -355,13 +366,26 @@ func (r *OpenAIChatRequest) ApplyProtocolPrivateExtra(req *rosetta.ChatRequest, 
 	if r.ParallelToolCalls != nil {
 		extra["parallel_tool_calls"] = *r.ParallelToolCalls
 	}
+	if r.PromptCacheKey != "" {
+		extra["prompt_cache_key"] = r.PromptCacheKey
+	}
+	// The SDK's Chat encoder intentionally drops BlockThinking because it
+	// historically treated all thinking as Anthropic-only. DeepSeek's Chat
+	// protocol does replay a plain reasoning_content field, so when the
+	// original request contains it we provide the complete messages array
+	// ourselves. buildClient enables WithExtraOverrides for this one reserved
+	// field; all requests without replayed reasoning keep the SDK encoder.
+	if r.hasReplayableChatReasoning() {
+		extra["messages"] = r.chatMessagesWithReasoning()
+	}
 	// reasoning_effort 故意**不**进 Extra，尽管它是 OpenAI 的字段。
 	//
-	// rosetta 把 reasoning_effort 列在 openaiChatReservedPayloadKeys 里，
-	// Extra 一旦带上同名键，mergeExtra 就报 ErrInvalidRequest，而网关
-	// buildClient 没有开 WithExtraOverrides —— 于是客户端只要设了这个字段，
-	// 每个请求都必然 400，且死在网关自己的 SDK 校验层，一个字节都到不了上游。
-	// 此前为了"保住 minimal/xhigh 原始值"而直传，正是这条 400 的来源。
+	// 进 Extra 的代价已经变了：internal/upstream 的 buildClient 现在开了
+	// WithExtraOverrides(true)，所以直传不再会撞 openaiChatReservedPayloadKeys 报 400 —— 但
+	// 它现在会**覆盖** SDK 自己按 Thinking 算出的 reasoning_effort，等于把
+	// "effort 归一化 + 与 temperature/top_p 的互斥处理"（provider_openai_chat
+	// 的 emitReasoning 分支）整套绕过去。那条分支不是可有可无的装饰：
+	// 推理模型收到 temperature 会被部分上游 400 拒绝。
 	//
 	// 不直传的代价：Thinking.Effort 只归一到 low/medium/high，minimal→low、
 	// xhigh→high。语义方向正确（都是"少想一点"/"多想想"），只是粒度变粗。
@@ -487,8 +511,11 @@ func convertMessage(m OpenAIMessage) rosetta.Message {
 		// 唯一保留多模态的角色：文本 + image_url 一起透传给上游。
 		return userMessage(m.Content)
 	case "assistant":
-		if len(m.ToolCalls) > 0 {
-			blocks := make([]rosetta.Block, 0, len(m.ToolCalls)+1)
+		if len(m.ToolCalls) > 0 || m.ReasoningContent != "" {
+			blocks := make([]rosetta.Block, 0, len(m.ToolCalls)+2)
+			if m.ReasoningContent != "" {
+				blocks = append(blocks, rosetta.Thinking(m.ReasoningContent, ""))
+			}
 			if text := extractText(m.Content); text != "" {
 				blocks = append(blocks, rosetta.Block{Type: rosetta.BlockText, Text: text})
 			}
@@ -511,6 +538,24 @@ func convertMessage(m OpenAIMessage) rosetta.Message {
 		// 角色未知时按 user 处理（rosetta 的 validate 随后会拒绝非法角色）。
 		return userMessage(m.Content)
 	}
+}
+
+func (r *OpenAIChatRequest) hasReplayableChatReasoning() bool {
+	for _, m := range r.Messages {
+		if m.Role == "assistant" && strings.TrimSpace(m.ReasoningContent) != "" {
+			return true
+		}
+	}
+	return false
+}
+
+// chatMessagesWithReasoning preserves the client's Chat wire messages,
+// including reasoning_content. It is used only when replay is required;
+// all other requests continue through the SDK's normal encoder.
+func (r *OpenAIChatRequest) chatMessagesWithReasoning() []OpenAIMessage {
+	msgs := make([]OpenAIMessage, len(r.Messages))
+	copy(msgs, r.Messages)
+	return msgs
 }
 
 // assistantText 取 assistant 消息的正文，refusal 作为 content 为空时的兜底。

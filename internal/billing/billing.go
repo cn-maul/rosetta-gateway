@@ -3,9 +3,8 @@
 package billing
 
 import (
-	"strings"
-
 	"github.com/cn-maul/rosetta"
+	"github.com/cn-maul/rosetta-gateway/internal/ingress"
 	"github.com/cn-maul/rosetta-gateway/internal/routing"
 	"github.com/cn-maul/rosetta-gateway/internal/store"
 )
@@ -64,22 +63,10 @@ func IsBalanceExempt(role string) bool { return role == store.RoleAdmin }
 // 换句话说：预检估出的值 **≥** 实扣值（保守方向仍然正确），但
 // 「哪些 token 收费」的口径不再可能分叉。
 func EstimateBalanceCost(req *rosetta.ChatRequest, m *routing.UpstreamModel) int64 {
-	var b strings.Builder
-	b.WriteString(req.System)
-	for _, msg := range req.Messages {
-		for _, blk := range msg.Blocks {
-			b.WriteString(blk.Text)
-			b.WriteString(blk.Thinking)
-			b.WriteString(blk.Content)
-			b.WriteString(blk.Arguments)
-		}
-	}
-	for _, t := range req.Tools {
-		b.WriteString(t.Name)
-		b.WriteString(t.Description)
-		b.WriteString(string(t.Parameters))
-	}
-	inTokens := int64(rosetta.EstimateTokens(b.String()))
+	return estimateBalanceCostWithInput(req, m, ingress.EstimateInputTokensOnly(req))
+}
+
+func estimateBalanceCostWithInput(req *rosetta.ChatRequest, m *routing.UpstreamModel, inTokens int64) int64 {
 	// 输出侧按 max_tokens 全额计上界；客户端没给（<=0）时回落模型配置的最大
 	// 输出 —— 都拿不到就只按输入算（下界，宁可不高估）。
 	maxOut := int64(req.MaxOutputTokens)
@@ -87,9 +74,10 @@ func EstimateBalanceCost(req *rosetta.ChatRequest, m *routing.UpstreamModel) int
 		maxOut = int64(m.MaxOutputTokens)
 	}
 	cost := store.EstimateUpperBoundCost(store.Prices{
-		Input:    m.PriceInput,
-		CacheHit: m.PriceCacheHit,
-		Output:   m.PriceOutput,
+		Input:         m.PriceInput,
+		CacheHit:      m.PriceCacheHit,
+		CacheCreation: m.PriceCacheCreation,
+		Output:        m.PriceOutput,
 	}, inTokens, maxOut)
 	return YuanToCents(cost)
 }
@@ -106,12 +94,13 @@ func EstimateBalanceCost(req *rosetta.ChatRequest, m *routing.UpstreamModel) int
 //
 // 整条链都没配价时返回 0 → 调用方判定为「本次不会扣费」而跳过余额读取。
 func EstimateBalanceCostChain(req *rosetta.ChatRequest, cands []routing.Candidate) int64 {
+	inTokens := ingress.EstimateInputTokensOnly(req)
 	var max int64
 	for _, c := range cands {
 		if c.UpstreamModel == nil {
 			continue
 		}
-		if e := EstimateBalanceCost(req, c.UpstreamModel); e > max {
+		if e := estimateBalanceCostWithInput(req, c.UpstreamModel, inTokens); e > max {
 			max = e
 		}
 	}
@@ -210,9 +199,10 @@ func ChainHasPricedModel(cands []routing.Candidate) bool {
 			continue
 		}
 		if (store.Prices{
-			Input:    c.UpstreamModel.PriceInput,
-			CacheHit: c.UpstreamModel.PriceCacheHit,
-			Output:   c.UpstreamModel.PriceOutput,
+			Input:         c.UpstreamModel.PriceInput,
+			CacheHit:      c.UpstreamModel.PriceCacheHit,
+			CacheCreation: c.UpstreamModel.PriceCacheCreation,
+			Output:        c.UpstreamModel.PriceOutput,
 		}).Priced() {
 			return true
 		}

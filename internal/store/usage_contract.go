@@ -12,6 +12,10 @@ const (
 	UsageStatusCanceled  = "canceled"
 	UsageStatusTruncated = "truncated"
 	UsageStatusOverflow  = "overflow"
+	// UsageStatusTimeout 是网关自身总预算到期，不是上游故障。
+	// 单独成值是为了让报表能把「网关没来得及跑完」与「上游真的坏了」
+	// 分开，避免运维按错误率去追一个不存在的上游问题。
+	UsageStatusTimeout = "timeout"
 
 	UsageStateNone        = "none"
 	UsageStateMissing     = "missing"

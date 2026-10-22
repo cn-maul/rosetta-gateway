@@ -5,7 +5,6 @@ import { api } from '../api'
 import { toast, confirmBox } from '../ui'
 import type { RouteCatalogProvider, RouteCatalogEntry, UpstreamModel, Route, RouteTargetInput } from '../types'
 import AppModal from '../components/AppModal.vue'
-import { useRoute, useRouter } from 'vue-router'
 import { useQueryText } from '../composables/useQueryText'
 
 const err = ref('')
@@ -21,9 +20,7 @@ const providerMap = computed(() => {
   return m
 })
 
-const route = useRoute()
-const router = useRouter()
-const search = useQueryText('q')
+const search = useQueryText('q', '', { debounceMs: 200 })
 const status = useQueryText('status')
 const pending = ref(new Set<string>())
 const filtered = computed(() => routes.value.filter(r => {
@@ -31,7 +28,10 @@ const filtered = computed(() => routes.value.filter(r => {
   const matches = !q || [r.public_name, providerMap.value[r.provider_id]?.name ?? '', modelLabel(r)].some(v => v.toLowerCase().includes(q))
   return matches && (!status.value || status.value === 'enabled' && r.enabled || status.value === 'disabled' && !r.enabled || status.value === 'failover' && r.failover_enabled)
 }))
-function clearFilters() { void router.replace({ query: { ...route.query, q: undefined, status: undefined } }) }
+function clearFilters() {
+  search.value = ''
+  status.value = ''
+}
 function targetIssue(providerId: string, modelId: string): string {
   const p = providerMap.value[providerId]
   const m = mmap.value[modelId]

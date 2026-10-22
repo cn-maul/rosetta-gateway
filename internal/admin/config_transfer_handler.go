@@ -156,10 +156,11 @@ func (h *ConfigTransferHandler) buildExport(ctx context.Context) (configExport, 
 				// 挡位也要导出：它是手工按模型文档配出来的运维知识，
 				// 一次「换台机器重新部署」就配一遍是纯粹的重复劳动。
 				// 形态与库里那列一致（CSV），未知档位附在后面不被丢。
-				EffortLevels:  effort.FormatLevels(m.EffortLevels, m.UnknownLevels),
-				PriceInput:    m.PriceInput,
-				PriceCacheHit: m.PriceCacheHit,
-				PriceOutput:   m.PriceOutput,
+				EffortLevels:       effort.FormatLevels(m.EffortLevels, m.UnknownLevels),
+				PriceInput:         m.PriceInput,
+				PriceCacheHit:      m.PriceCacheHit,
+				PriceCacheCreation: m.PriceCacheCreation,
+				PriceOutput:        m.PriceOutput,
 				// 归组用显示名（跨库靠名字对齐，同 provider 靠 slug）。
 				// m.GroupID 为空 → 查表得空串 → omitempty 不写出。
 				GroupName: groupName[m.GroupID],
@@ -568,7 +569,7 @@ func (h *ConfigTransferHandler) attach(
 		// —— 负单价尤其危险，它让该模型的每次调用**倒贴钱**，账目静默失真。
 		// 违例跳过并告警。
 		if me.ContextWindow < 0 || me.MaxOutputTokens < 0 ||
-			me.PriceInput < 0 || me.PriceCacheHit < 0 || me.PriceOutput < 0 {
+			me.PriceInput < 0 || me.PriceCacheHit < 0 || me.PriceCacheCreation < 0 || me.PriceOutput < 0 {
 			resp.ModelsSkipped++
 			resp.Warnings = append(resp.Warnings,
 				fmt.Sprintf("模型 %s / %s 含负数的窗口/输出上限/单价字段，已跳过", slug, modelID))
@@ -581,7 +582,8 @@ func (h *ConfigTransferHandler) attach(
 			ProviderID: pid, ModelID: modelID, DisplayName: me.DisplayName,
 			ContextWindow:   me.ContextWindow,
 			MaxOutputTokens: me.MaxOutputTokens, SupportsThinking: me.SupportsThinking,
-			PriceInput: me.PriceInput, PriceCacheHit: me.PriceCacheHit, PriceOutput: me.PriceOutput,
+			PriceInput: me.PriceInput, PriceCacheHit: me.PriceCacheHit,
+			PriceCacheCreation: me.PriceCacheCreation, PriceOutput: me.PriceOutput,
 		}
 		// 归组：文件里的组名解析成库内组 id（组在循环前已确保存在）。
 		// 解析不到（如 dry 路径库里还没有这个组）→ 未归组。

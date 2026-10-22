@@ -1090,6 +1090,10 @@ textarea {
   background: color-mix(in oklab, var(--warning) 30%, transparent);
   color: color-mix(in oklab, var(--warning) 76%, var(--foreground) 24%);
 }
+.badge-st-timeout {
+  background: color-mix(in oklab, var(--warning) 22%, transparent);
+  color: color-mix(in oklab, var(--warning) 70%, var(--foreground) 30%);
+}
 .badge-st-canceled {
   background: var(--default);
   color: var(--muted);
@@ -1099,7 +1103,8 @@ textarea {
 [data-theme='dark'] .badge-st-ok,
 [data-theme='dark'] .badge-st-error,
 [data-theme='dark'] .badge-st-overflow,
-[data-theme='dark'] .badge-st-truncated {
+[data-theme='dark'] .badge-st-truncated,
+[data-theme='dark'] .badge-st-timeout {
   font-weight: 600;
 }
 [data-theme='dark'] .badge-st-ok {
@@ -1113,6 +1118,9 @@ textarea {
 }
 [data-theme='dark'] .badge-st-truncated {
   color: color-mix(in oklab, var(--warning) 64%, var(--snow) 36%);
+}
+[data-theme='dark'] .badge-st-timeout {
+  color: color-mix(in oklab, var(--warning) 60%, var(--snow) 40%);
 }
 
 /* 开关（启停）：HeroUI 开关选中态用强调色 */

@@ -121,10 +121,11 @@ type modelExport struct {
 	MaxOutputTokens  int    `json:"max_output_tokens,omitempty"`
 	SupportsThinking *bool  `json:"supports_thinking,omitempty"`
 	// EffortLevels 是逗号分隔的挡位原文（与库里那列同形），空串 = 未配置。
-	EffortLevels  string  `json:"effort_levels,omitempty"`
-	PriceInput    float64 `json:"price_input,omitempty"`
-	PriceCacheHit float64 `json:"price_cache_hit,omitempty"`
-	PriceOutput   float64 `json:"price_output,omitempty"`
+	EffortLevels       string  `json:"effort_levels,omitempty"`
+	PriceInput         float64 `json:"price_input,omitempty"`
+	PriceCacheHit      float64 `json:"price_cache_hit,omitempty"`
+	PriceCacheCreation float64 `json:"price_cache_creation,omitempty"`
+	PriceOutput        float64 `json:"price_output,omitempty"`
 	// GroupName 是该模型所属归组的显示名。空 = 未归组。
 	GroupName string `json:"group_name,omitempty"`
 }

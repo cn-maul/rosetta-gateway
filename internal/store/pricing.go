@@ -31,19 +31,22 @@ const PriceUnitDivisor = 1_000_000.0
 
 // Prices 是一组**原始**单价（元/百万 tokens）。
 //
-// 三个字段与 upstream_models 的 price_input / price_cache_hit / price_output
-// 一一对应；0 表示未配置（不是「免费」，见 EffectivePrices）。
+// 四个字段与 upstream_models 的 price_input / price_cache_hit /
+// price_cache_creation / price_output 一一对应；0 表示未配置
+// （不是「免费」，见 EffectivePrices）。
 type Prices struct {
-	Input    float64
-	CacheHit float64
-	Output   float64
+	Input         float64
+	CacheHit      float64
+	CacheCreation float64
+	Output        float64
 }
 
 // EffectivePrices 是**实际生效**的单价。
 type EffectivePrices struct {
-	Input    float64 // 缓存未命中输入的生效单价
-	CacheHit float64 // 缓存命中输入的生效单价
-	Output   float64 // 输出的生效单价
+	Input         float64 // 缓存未命中输入的生效单价
+	CacheHit      float64 // 缓存命中（读取）输入的生效单价
+	CacheCreation float64 // 缓存写入（creation）输入的生效单价
+	Output        float64 // 输出的生效单价
 }
 
 // Priced 报告这组单价是否**真的配了价**。
@@ -53,7 +56,7 @@ type EffectivePrices struct {
 //   - priced=false：整条链都没配价 → 本次真的不计费 → 直接放行、不读余额；
 //   - priced=true ：配了价，只是这次请求小到四舍五入成 0 分 → 仍须校验余额。
 func (p Prices) Priced() bool {
-	return p.Input > 0 || p.CacheHit > 0 || p.Output > 0
+	return p.Input > 0 || p.CacheHit > 0 || p.CacheCreation > 0 || p.Output > 0
 }
 
 // EffectivePrices 把原始单价解析成生效单价，并给出「是否配价」。
@@ -82,18 +85,24 @@ func (p Prices) EffectivePrices() (EffectivePrices, bool) {
 	if !p.Priced() {
 		return EffectivePrices{}, false
 	}
-	eff := EffectivePrices{Input: p.Input, CacheHit: p.CacheHit, Output: p.Output}
+	eff := EffectivePrices{Input: p.Input, CacheHit: p.CacheHit, CacheCreation: p.CacheCreation, Output: p.Output}
 
-	// 缓存命中价缺失 → 回退输入价（不免费）。
-	if eff.CacheHit <= 0 {
-		eff.CacheHit = eff.Input
-	}
 	// 输入价缺失 → 回退「已配价里最贵的一个」（输出价 / 缓存命中价）。
 	if eff.Input <= 0 {
 		eff.Input = eff.Output
 		if eff.Input <= 0 {
 			eff.Input = eff.CacheHit
 		}
+		if eff.Input <= 0 {
+			eff.Input = eff.CacheCreation
+		}
+	}
+	// 缓存命中价 / 缓存写入价缺失 → 回退生效输入价（不免费）。
+	if eff.CacheHit <= 0 {
+		eff.CacheHit = eff.Input
+	}
+	if eff.CacheCreation <= 0 {
+		eff.CacheCreation = eff.Input
 	}
 	// 输出价缺失 → 回退生效输入价。
 	if eff.Output <= 0 {
@@ -122,19 +131,21 @@ func (p Prices) EffectivePrices() (EffectivePrices, bool) {
 //
 // # 口径（单价「元/百万 tokens」）：
 //
-//	缓存未命中输入 = MAX(input - cached, 0) × price_input
+//	缓存未命中输入 = MAX(input - cached - cached_creation, 0) × price_input
 //	缓存命中输入   = cached × price_cache_hit（<=0 时回退 price_input，
 //	                 只填输入价的模型不会把命中部分算成免费）
+//	缓存写入输入   = cached_creation × price_cache_creation（<=0 时回退
+//	                 price_input，即未配置独立写入价时按输入价收费一次）
 //	输出           = output × price_output
-//	合计           = 上述三项之和 / 1e6
+//	合计           = 上述四项之和 / 1e6
 //
-// 四个入参的价格来自上游单价表，NULL/未配置一律按 0（调用方用 COALESCE 兜底），
+// 四个价格来自上游单价表，NULL/未配置一律按 0（调用方用 COALESCE 兜底），
 // 未配置价格的模型因此贡献 0 —— 与「未配价 = 0」的既有口径同语义。
 //
 // 负 token 不在这里兜：CreateUsageRecord 已在入口把负值归一为 0
 // （见其注释），而 PriceUsage 的调用方只有 freezeUsageCost 一处。
-func PriceUsage(priceInput, priceCacheHit, priceOutput, inputTokens, cachedTokens, outputTokens float64) float64 {
-	uncached := inputTokens - cachedTokens
+func PriceUsage(priceInput, priceCacheHit, priceCacheCreation, priceOutput, inputTokens, cachedTokens, cachedCreationTokens, outputTokens float64) float64 {
+	uncached := inputTokens - cachedTokens - cachedCreationTokens
 	if uncached < 0 {
 		uncached = 0
 	}
@@ -142,7 +153,11 @@ func PriceUsage(priceInput, priceCacheHit, priceOutput, inputTokens, cachedToken
 	if hit <= 0 {
 		hit = priceInput
 	}
-	total := (uncached*priceInput + cachedTokens*hit + outputTokens*priceOutput) / PriceUnitDivisor
+	creation := priceCacheCreation
+	if creation <= 0 {
+		creation = priceInput
+	}
+	total := (uncached*priceInput + cachedTokens*hit + cachedCreationTokens*creation + outputTokens*priceOutput) / PriceUnitDivisor
 	// 舍入到 1e-9 元。float64 的二进制表示无法精确表达十进制小数，
 	// 于是「×3 个单价再除 1e6」会带出长尾（如 0.0030000000000000005），
 	// 这些值原样进 JSON 响应，前端展示与对账都会看到脏尾巴。
@@ -156,8 +171,8 @@ func PriceUsage(priceInput, priceCacheHit, priceOutput, inputTokens, cachedToken
 }
 
 // PriceUsageWithPrices 是 PriceUsage 的 Prices 版本。
-func PriceUsageWithPrices(p Prices, inputTokens, cachedTokens, outputTokens float64) float64 {
-	return PriceUsage(p.Input, p.CacheHit, p.Output, inputTokens, cachedTokens, outputTokens)
+func PriceUsageWithPrices(p Prices, inputTokens, cachedTokens, cachedCreationTokens, outputTokens float64) float64 {
+	return PriceUsage(p.Input, p.CacheHit, p.CacheCreation, p.Output, inputTokens, cachedTokens, cachedCreationTokens, outputTokens)
 }
 
 // EstimateUpperBoundCost 估算「一次调用最多可能花多少钱」（元）。
@@ -199,15 +214,18 @@ func EstimateUpperBoundCost(p Prices, inputTokens, maxOutputTokens int64) float6
 	// 原因：预检事前不知道有多少 token 会命中缓存，而实扣对命中部分按
 	// price_cache_hit 收、对未命中部分按 price_input 收。所以「全部命中」
 	// 是实扣侧的上界情形：每 token 的最高可能单价 = max(price_input,
-	// price_cache_hit)。只按 price_input 估会在「缓存命中价 > 输入价」这种
-	// （少见但管理面允许）配置下**低估**，方向是漏放行 —— 正是本次要消除的
-	// 那一类错误。
+	// price_cache_hit, price_cache_creation)。只按 price_input 估会在
+	// 「缓存命中价 / 缓存写入价 > 输入价」这种（少见但管理面允许）配置下
+	// **低估**，方向是漏放行 —— 正是本次要消除的那一类错误。
 	//
 	// 常规配置（缓存命中价 < 输入价）下 max 就是 price_input，与审计前的
 	// 「按未命中计」完全一致，不改变行为。
 	inputPrice := eff.Input
 	if eff.CacheHit > inputPrice {
 		inputPrice = eff.CacheHit
+	}
+	if eff.CacheCreation > inputPrice {
+		inputPrice = eff.CacheCreation
 	}
 	total := (float64(inputTokens)*inputPrice + float64(maxOutputTokens)*eff.Output) / PriceUnitDivisor
 	return total

@@ -19,7 +19,7 @@
 # 「误以为在构建 arm64」留下空间。
 # 基础镜像固定到补丁版本与多架构 manifest digest，避免 tag 漂移导致同一
 # 源码在两次发布中实际使用不同工具链/运行库。升级时两者必须一起评估。
-FROM golang:1.27.1-alpine3.24@sha256:8a5910f31396cd4d89662f56c68b3ae31d374308270a1c3bd96672ee5ed43414 AS build
+FROM golang:1.27.3-alpine3.24@sha256:d530cf60723abf1ffae0cd16bb546b379ec0550d2f3815e5b16ed69dbc00fba4 AS build
 WORKDIR /src
 
 # 依赖单独成层：go.mod / go.sum 没变就命中缓存

@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/cn-maul/rosetta-gateway/internal/httpx"
+	"github.com/cn-maul/rosetta-gateway/internal/identity"
 )
 
 // statusGetter 由 Middleware 的 statusResponseWriter 实现，AutoReload 用它读
@@ -28,8 +29,29 @@ const autoReloadTimeout = 30 * time.Second
 const maxAuditBodyBytes = 64 << 10
 
 // WriteAuditor 是审计回调：一次管理写操作成功后的留痕入口。
+// actor 是操作者身份（用户名的稳定展示值）；匿名入口为 "anonymous"。
 // fields 是请求体顶层字段名（不含值 —— body 里会有 api_key/密码明文）。
-type WriteAuditor func(method, path string, status int, remote, fields string)
+type WriteAuditor func(actor, method, path string, status int, remote, fields string)
+
+// auditActor 从请求上下文取操作者身份。
+//
+// 审计曾经把 actor 写死成 "admin"：AutoReload 的回调没有透传会话身份，
+// 于是普通用户改自己的 key、管理员改别人的配额，落库后都叫 "admin"。
+// 事后追责时只能看到 IP，无法回答「是谁把这条路由切到无效上游的」。
+// 身份已经在鉴权链里注入 context，这里直接读，不额外查库。
+func auditActor(ctx context.Context) string {
+	if u := identity.UserFromContext(ctx); u != nil {
+		if name := strings.TrimSpace(u.Username); name != "" {
+			return name
+		}
+		if id := strings.TrimSpace(u.ID); id != "" {
+			return id
+		}
+	}
+	// 免鉴权入口（首次设密、一次性设密链接）没有会话身份。
+	// 不写空串：空 actor 在审计表里和「历史坏数据」无法区分。
+	return "anonymous"
+}
 
 // AutoReload 在管理写操作成功落库后自动重建运行时（上游池 + 快照），
 // 使配置变更不再依赖前端自觉调用 POST /admin/api/reload：
@@ -115,7 +137,7 @@ func AutoReload(next http.Handler, reload func(context.Context) error, audit Wri
 			return
 		}
 		if audit != nil {
-			audit(r.Method, p, status, httpx.ClientIPOf(r), auditFields)
+			audit(auditActor(r.Context()), r.Method, p, status, httpx.ClientIPOf(r), auditFields)
 		}
 		if isBootstrap || status >= http.StatusBadRequest {
 			return
@@ -237,6 +259,6 @@ func AuditOnly(next http.Handler, audit WriteAuditor) http.Handler {
 		// 审计 A7-15：bootstrap 的成功和失败都要留痕。失败意味着有人在猜
 		// 管理员密码或重复尝试初始化，是安全事件而不是「没有状态变化就忽略」
 		// 的普通写失败。旧实现的 status < 400 让 403/409 全部消失。
-		audit(r.Method, r.URL.Path, sw.StatusCode(), httpx.ClientIPOf(r), fields)
+		audit(auditActor(r.Context()), r.Method, r.URL.Path, sw.StatusCode(), httpx.ClientIPOf(r), fields)
 	})
 }

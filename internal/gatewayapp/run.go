@@ -2,6 +2,7 @@ package gatewayapp
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net"
@@ -166,6 +167,15 @@ func Run(opts Options) error {
 			"note", "监听地址是回环，仅本机可访问；一旦改为 0.0.0.0 暴露到网络，请立即完成设置")
 	}
 
+	// TLS 契约（2026-10-22 修 A10-P0-1 残留）。
+	//
+	// 公开监听（0.0.0.0 等）且没有声明 https 的公开源 = 明文暴露。
+	// 此前这个事实只写在 README 里，进程自己一声不吭；改了 listen 地址
+	// 就悄悄变成不安全部署。
+	if err := checkTLSContract(cfg, logger); err != nil {
+		return err
+	}
+
 	secretPath := filepath.Join(homeDir, userauth.SecretFileName)
 	sessionMgr, err := userauth.NewManager(secretPath)
 	if err != nil {
@@ -256,4 +266,100 @@ func isLoopbackListen(listen string) bool {
 		return true
 	}
 	return false
+}
+
+// checkTLSContract 实施「公开监听且未声明 TLS」的进程级契约
+// （2026-10-22 修 A10-P0-1 残留）。
+//
+// # 判据
+//
+//   - 监听回环地址 → 暴露面只有本机，明文 HTTP 可接受，不告警。
+//   - 监听非回环地址（0.0.0.0 / 某个内网 IP / 域名）→ **公开监听**。
+//     此时若 public_origin 的 scheme 是 https，说明有 TLS 反代在前面
+//     终止 TLS —— 合规，不告警。
+//     若 public_origin 为空或 scheme 是 http → 网关在**明文**上对外服务。
+//
+// # 为什么默认只告警
+//
+// 「反代 + 0.0.0.0 监听」是**正确且常见**的部署：TLS 在同机的 nginx
+// 上终止，网关自己看到的仍是明文。运维忘了配 public_origin 的情况
+// 也有，但那不该让进程起不来 —— 起来一条 ERROR 已经足够醒目。
+// 需要硬失败的人把 require_tls_for_public_listen 置 true。
+//
+// # 为什么这条告警值得存在
+//
+// 之前这个安全事实只存在于 README 的一段说明里。改了 listen 地址、
+// 或者换了个部署方式，进程不会说一个字 —— 而被动观察者能完整截获
+// 管理员会话 cookie、JWT 与上游凭据。告警把它变成**运行期可见**的事实。
+func checkTLSContract(cfg *config.Config, logger *slog.Logger) error {
+	if cfg == nil || isLoopbackListen(cfg.Listen) {
+		return nil
+	}
+	origin := strings.TrimSpace(cfg.PublicOrigin)
+	if strings.HasPrefix(strings.ToLower(origin), "https://") {
+		// 已声明 https 公开源：TLS 在反代处终止，合规。
+		return nil
+	}
+
+	const detail = "网关自身不做 TLS；监听在非回环地址且未声明 https 的公开源，" +
+		"管理员会话 cookie、JWT、上游凭据与下游 Authorization 头可在同网段被完整截获。"
+	if cfg.RequireTLSForPublicListen {
+		logger.Error("SECURITY: refusing to start — public listen without declared TLS",
+			"listen", cfg.Listen,
+			"public_origin", origin,
+			"detail", detail,
+			"fix", "在 public_origin 里声明 https:// 的公开源（前置 TLS 反代），"+
+				"或把 listen 改回回环地址，或去掉 require_tls_for_public_listen")
+		return errors.New("public listen without declared TLS: refusing to start")
+	}
+
+	// # 为什么区分「通配」与「指定网卡」两种非回环监听
+	//
+	// 0.0.0.0 / :: 表示「绑定本命名空间的全部接口」—— 它到底能不能被
+	// 外部访问，取决于**进程之外**的东西：容器端口映射（把宿主端口映射到
+	// 127.0.0.1 就把暴露面收回本机）、宿主机防火墙、k8s NetworkPolicy。
+	// 进程看不到这些，所以只能告警。
+	//
+	// 而绑定到某个具体的内网/公网 IP（如 192.168.1.10:8666）是**明确的
+	// 暴露意图** —— 那张网卡上的人一定能连上。那种情况用 ERROR。
+	//
+	// 分级的意义：容器化部署的默认模板就是 0.0.0.0（容器内必须如此），
+	// 若一律 ERROR，每次启动都会刷一条红色安全日志，运维很快就会学会
+	// 无视 SECURITY 前缀 —— 那比不告警更糟。
+	if isWildcardListen(cfg.Listen) {
+		logger.Warn("SECURITY: listening on all interfaces without declared TLS",
+			"listen", cfg.Listen,
+			"public_origin", origin,
+			"detail", detail,
+			"note", "容器部署通常需要 0.0.0.0 才能在命名空间内被映射；"+
+				"若宿主端口映射限定在回环且前面有 TLS 反代，这条是可接受的",
+			"recommended_fix", "前置 TLS 反代并在 public_origin 里声明 https:// 的公开源")
+		return nil
+	}
+	logger.Error("SECURITY: bound to a specific non-loopback interface without declared TLS",
+		"listen", cfg.Listen,
+		"public_origin", origin,
+		"detail", detail,
+		"recommended_fix", "前置 TLS 反代并在 public_origin 里声明 https:// 的公开源；"+
+			"或在 config.json 里设置 require_tls_for_public_listen=true 让它拒绝启动")
+	return nil
+}
+
+// isWildcardListen 报告监听地址是否是「全部接口」的通配形式
+// （0.0.0.0 / :: / [::]）。
+//
+// 通配监听的**实际暴露面由进程之外决定**（端口映射、防火墙、网络策略），
+// 所以安全契约对它的处置是告警而非硬失败（见 checkTLSContract）。
+func isWildcardListen(listen string) bool {
+	host, _, err := net.SplitHostPort(listen)
+	if err != nil {
+		return false
+	}
+	host = strings.TrimSpace(host)
+	if host == "" {
+		// 空 host 在 net.Listen 里等价于「全部接口」。
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsUnspecified()
 }

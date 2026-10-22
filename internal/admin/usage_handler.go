@@ -413,8 +413,12 @@ type usageHistoryEntry struct {
 	// CachedTokens / ReasoningTokens 是同一份 usage 里的细分计数：
 	// 前者解释缓存命中，后者解释思考模型的隐式输出。历史页把它们放在
 	// 详情里，排障时不必再回数据库拼一次原始记录。
-	CachedTokens    int64 `json:"cached_tokens"`
-	ReasoningTokens int64 `json:"reasoning_tokens"`
+	CachedTokens int64 `json:"cached_tokens"`
+	// CachedCreationTokens 是写入缓存的输入 token（Anthropic
+	// cache_creation_input_tokens）。与 CachedTokens 分开，才能区分
+	// 「读缓存省下的」和「这次写入缓存的」。
+	CachedCreationTokens int64 `json:"cached_creation_tokens"`
+	ReasoningTokens      int64 `json:"reasoning_tokens"`
 	// Tps 是本次请求的平均输出速度（token/s），**由后端算好**（2026-10-11 新增）。
 	//
 	// # 为什么在后端算而不是前端拿 output_tokens/latency_ms 现算
@@ -493,7 +497,7 @@ const (
 		COALESCE(u.provider_id, ''), COALESCE(u.ingress_protocol, ''),
 		COALESCE(a.name, ''), u.access_key_id,
 		u.input_tokens, u.output_tokens, u.total_tokens,
-		u.cached_tokens, u.reasoning_tokens,
+		u.cached_tokens, u.cached_creation_tokens, u.reasoning_tokens,
 		u.ttfb_ms, u.latency_ms, u.status, u.stream,
 		COALESCE(u.cost_total, 0), u.http_status,
 		COALESCE(u.error_code, ''), COALESCE(u.error_detail, ''),
@@ -510,7 +514,7 @@ func scanUsageHistoryEntry(scanner usageHistoryScanner, e *usageHistoryEntry) er
 	return scanner.Scan(
 		&e.Ts, &e.PublicModel, &e.UpstreamModel, &e.ProviderID, &e.IngressProtocol,
 		&e.KeyName, &e.KeyID, &e.InputTokens, &e.OutputTokens, &e.TotalTokens,
-		&e.CachedTokens, &e.ReasoningTokens, &e.TTFBMs, &e.LatencyMs,
+		&e.CachedTokens, &e.CachedCreationTokens, &e.ReasoningTokens, &e.TTFBMs, &e.LatencyMs,
 		&e.Status, &e.Stream, &e.Cost, &e.HTTPStatus, &e.ErrorCode, &e.ErrorDetail,
 		&e.RouteTrace, &e.RequestID,
 	)
@@ -657,7 +661,7 @@ func (h *UsageHandler) ExportCSV(w http.ResponseWriter, r *http.Request) {
 		"total_tokens", "ttfb_ms", "latency_ms", "status", "stream", "cost",
 		"output_tokens", "tps", "route_trace", "provider_id", "ingress_protocol",
 		"input_tokens", "cached_tokens", "reasoning_tokens", "request_id",
-		"http_status", "error_code", "error_detail"})
+		"http_status", "error_code", "error_detail", "cached_creation_tokens"})
 	for rows.Next() {
 		var e usageHistoryEntry
 		if err := scanUsageHistoryEntry(rows, &e); err != nil {
@@ -690,6 +694,7 @@ func (h *UsageHandler) ExportCSV(w http.ResponseWriter, r *http.Request) {
 			strconv.FormatInt(e.ReasoningTokens, 10),
 			csvCell(e.RequestID), strconv.Itoa(e.HTTPStatus),
 			csvCell(e.ErrorCode), csvCell(e.ErrorDetail),
+			strconv.FormatInt(e.CachedCreationTokens, 10),
 		})
 	}
 	cw.Flush()

@@ -60,6 +60,11 @@ var configFieldInventory = []configFieldSpec{
 		Frontend: frontendNone,
 	},
 	{
+		Path:     "require_tls_for_public_listen",
+		ReadBy:   []string{"internal/gatewayapp/run.go:checkTLSContract"},
+		Frontend: frontendNone,
+	},
+	{
 		Path:     "timezone",
 		ReadBy:   []string{"internal/gatewayapp/run.go:Run"},
 		Frontend: frontendNone,
@@ -123,6 +128,16 @@ var configFieldInventory = []configFieldSpec{
 		Path:     "defaults.failover_failure_threshold",
 		ReadBy:   []string{"internal/dataplane/policy.go:FailoverFailureThreshold", "internal/admin/settings_handler.go:Get"},
 		Frontend: frontendSettingsRuntime,
+	},
+	{
+		Path:     "defaults.max_concurrent_streams",
+		ReadBy:   []string{"internal/dataplane/handler.go:NewHandler"},
+		Frontend: frontendNone,
+	},
+	{
+		Path:     "defaults.stream_admission_timeout_ms",
+		ReadBy:   []string{"internal/dataplane/handler.go:NewHandler"},
+		Frontend: frontendNone,
 	},
 	{
 		Path:     "bootstrap.providers",

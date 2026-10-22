@@ -5,8 +5,9 @@
 | 项目名 | **rosetta-gateway** |
 | 项目性质 | 独立项目，不在 Rosetta 上改造（2026-09-15 定，理由见 §2.1） |
 | module path | `github.com/cn-maul/rosetta-gateway` |
-| 运行时依赖 | `github.com/cn-maul/rosetta` v1.2.0（上游 SDK）、`modernc.org/sqlite`（纯 Go SQLite）、`github.com/golang-jwt/jwt/v5`（管理会话） |
-| 版本 | 与 `web/package.json` 同源（当前 1.6.5），镜像与二进制共用 |
+| 运行时依赖 | `github.com/cn-maul/rosetta` v1.2.1（上游 SDK）、`modernc.org/sqlite`（纯 Go SQLite）、`github.com/golang-jwt/jwt/v5`（管理会话） |
+| 工具链 | **Go 1.27.3 起**（`go.mod` 的 `go` 指令是唯一来源，CI 用 `go-version-file` 读取；1.27.3 之前的版本带已知安全漏洞，不得使用，本地也勿用更早的 1.27.x） |
+| 版本 | 与 `web/package.json` 同源（当前 1.6.6），镜像与二进制共用 |
 | 状态 | **已实现**（P0–P3 全部落地，多用户、用量归档、配置导入导出均已上线） |
 | 更新 | 2026-10-22 |
 
@@ -187,6 +188,7 @@ CREATE TABLE upstream_models (
                                             -- 2026-10-11 cbffbc4 新增，配合 internal/effort
   price_input      REAL,                     -- 元 / 百万 token（NULL = 用 rosetta 注册表价）
   price_cache_hit  REAL,
+  price_cache_creation REAL,                 -- 缓存写入价；NULL = 按 price_input 计
   price_output     REAL,
   UNIQUE (provider_id, model_id)
   -- 曾有一个 default_extra_json 列，但没有任何地方拿它构造请求，2026-09-24 摘除。
@@ -323,6 +325,7 @@ CREATE TABLE usage_records (
   total_tokens      INTEGER NOT NULL DEFAULT 0,
   reasoning_tokens  INTEGER NOT NULL DEFAULT 0,
   cached_tokens     INTEGER NOT NULL DEFAULT 0,
+  cached_creation_tokens INTEGER NOT NULL DEFAULT 0,  -- Anthropic cache_creation（⊆ input）
   cost_total        REAL NOT NULL DEFAULT 0,  -- 落库时按当时单价固化；费用查询只 SUM 本列
   usage_state       TEXT NOT NULL,         -- reported|missing
   status            TEXT NOT NULL,         -- ok|truncated|overflow|canceled|error（见 §8.2）
@@ -742,11 +745,34 @@ PATCH 结构体里刻意不含该字段，传了也会被忽略。
 旧数据库或旧导出时做兼容归一化，启动迁移会把存量配置与用量记录改成新值。
 
 **OpenCode Go 会话头**：`opencode.ai` 及其子域的 chat 请求要求
-`x-opencode-session`。数据面会读取下游同名请求头并沿上下文传到上游 transport；
-transport 只对 OpenCode 主机补这个头，同时把 `User-Agent` 设为
-`rosetta-gateway`。客户端没有提供时用本次请求 ID 兜底，单次请求可以成功，
-但多轮会话的 OpenCode 路由/缓存亲和性必须由客户端持续发送同一个稳定会话 ID。
-模型探测没有下游会话，使用独立的 `probe-` 请求 ID，避免误把探测混进真实会话。
+`x-opencode-session`。数据面按 `x-opencode-session`、`x-deepseek-harness-session-id`、
+`x-session-affinity`、`session_id`、`x-session-id`、`session-id`、
+`x-client-request-id` 的顺序识别下游会话（最后一个是兼容别名：客户端常按「每次
+请求」刷新它，所以排在所有稳定标识之后），并沿上下文传到上游 transport；transport 只对
+OpenCode 主机补 `x-opencode-session`，同时把 `User-Agent` 设为
+`rosetta-gateway`。客户端没有提供任何会话标识时用本次请求 ID 兜底，单次请求可以
+成功，但多轮会话的 OpenCode 路由/缓存亲和性必须由客户端持续发送同一个稳定会话
+ID。DeepSeek Harness 的 Responses 路径会发送 `session_id` 与
+`x-client-request-id`，原生 Messages 路径会发送
+`x-deepseek-harness-session-id`。模型探测没有下游会话，使用独立的 `probe-` 请求
+ID，避免误把探测混进真实会话。
+
+对 OpenAI 系上游，数据面优先使用客户端显式提供的 `prompt_cache_key`；没有时用
+同一个稳定会话标识作为缓存亲和键。transport 通过 `x-session-affinity` /
+`x-client-request-id` 把该键交给上游，协议为 Anthropic 时不注入。这个键只改善
+同一会话落到同一缓存分片的概率，不改变服务商的缓存淘汰、租户隔离或分片策略。
+
+缓存命中率按 `cached_tokens / input_tokens` 计算。`input_tokens` 是完整的本轮
+提示词，包含相对上一轮新增的工具输出和上下文；这些新增 token 首次发送时不可能
+命中前缀缓存。因此多轮 Agent 的累计命中率可能明显低于“上一轮完整前缀的复用率”
+（实测可分别约为 88% 与 99%），两者不应混为一谈。
+
+计费侧把输入拆成三个互斥桶：未命中输入 `input - cached - cached_creation`、
+缓存命中 `cached`、缓存写入 `cached_creation`。三者分别按
+`price_input` / `price_cache_hit` / `price_cache_creation` 计价；后两者未配置时
+回退 `price_input`（不会把命中或写入算成免费）。`cached_creation_tokens` 在明细、
+日归档与终身累计里都单独留列，因此「命中率」与「缓存写入量」可以分开分析。
+OpenAI 系协议不单独上报 cache creation，该列恒为 0。
 
 ---
 
@@ -794,6 +820,8 @@ Rosetta 用一对字段表达它：`Sealed` 装载荷，`SealedBy` 记下是哪�
 | 方向 | 处理 |
 |---|---|
 | Responses 入站 | `reasoning` item 搬成 `SealedThinking(summary, sealed, "response")`。**空 item 跳过**：无 `encrypted_content` 且 summary 为空时硬造 block 会被 validate 拒掉，把本来能跑的请求变成 400 |
+| Responses 入站 → chat 上游 | 存在可读 summary 时，`responsesChatMessagesWithReasoning` 重新编码一份 chat `messages`：summary 回填为 assistant 的 `reasoning_content`，同一轮的正文与 `tool_calls` 合并成一条消息（2026-10-23）。没有 reasoning 的请求继续走 SDK 编码器；遇到不认识的块形状回退 SDK（宁可维持旧行为，不静默改写）。anthropic 上游仍剥除 —— thinking 块必须带 Anthropic 签发的 signature，reasoning item 无法伪造 |
+| Responses 上游回放 | 同一协议族的 reasoning block 按 `summary` / `id` / `encrypted_content` 三者各自存在即回放；**只有摘要和 id、没有密封载荷也必须回放**，兼容上游只返回可读思考但强制下一轮带回该 item。空的 `encrypted_content` 不写出 |
 | Responses 出站（流式） | `EventThinkingDelta` 发 `output_item.added` → `reasoning_summary_text.delta` → `output_item.done`（带 `encrypted_content`）。`SealedBy` 非本族的整条丢弃 |
 | Responses 出站（非流式） | `BlockThinking` 输出 reasoning item，同样过 `SealedBy` 门闩 |
 
@@ -994,6 +1022,7 @@ Rosetta 用 `ErrStreamTruncated` 区分「干净结束」与「连接被掐断�
 | 上游 429 | 429 | `rate_limit_exceeded` | 先尝试换凭证 / 换 provider，全部失败才返回 |
 | 上游 5xx | 502 | `upstream_error` | |
 | 上游超时 / 连接失败 | 504 / 502 | `upstream_timeout` | 出站侧 |
+| 网关总预算到期 | 504 | `gateway_timeout` | 网关侧不是上游故障：不冷却凭据、不累计目标熔断、不再转移 |
 | 上游 400（请求非法） | 400 | 透传上游 code | 这类是调用方的问题，原样透传并保留 message |
 | 上游 404 / 410（该目标没有这个模型） | **404** | `model_not_found` | 目标级配置问题（上游退役了那个模型、或链上模型名配错）。**不透传上游原文、也不报 502** —— 调用方给的模型名在网关这边是合法的，报 502 会让人去查错地方；是否可转移见 §10 |
 | 未知模型名 | 404 | `model_not_found` | 网关自己产生 |
@@ -1067,7 +1096,12 @@ Client 是 goroutine 安全的，进程内单例复用（内含连接池）。
   - 同理，**客户端在调用进行中断开时不做任何健康态记账**（`out.eligible && r.Context().Err() == nil`）。SDK 会把 context 取消包成 `TransportError` 落进可转移集合，若照记就会把一把健康凭据冷却 60s 并累计目标熔断 —— 对单 key provider 等于「几次用户点停止 = 该上游 60 秒整体不可用」（冷却期内凭据不再被选中，也就没有任何请求能成功以触发复苏）。判据用 `r.Context()`：它只在客户端断开/服务关停时取消，上游超时用的是派生 ctx，两者不会混淆。
   - **没走到记账的探测名额必须显式归还**（2026-10-07 修复）：熔断 half-open 名额由 `ClaimTargetProbe` 领取，正常由成功/失败记账释放；不可转移错误与客户端断开两种形态不会走到记账，循环尾部用 `ReleaseTargetProbe` 归还 —— 否则一次 400 就把目标占死到下一次池重建。
 - 命中成功目标：回写清除该凭证冷却 + 复位该目标熔断计数。
-- 全链耗尽：透出最后一个上游错误（映射到对应 5xx/4xx），并记一条 error 用量，归因到**实际尝试到**的目标（而非链上最后一个候选）。
+- 全链耗尽：透出最后一个上游错误（映射到对应 5xx/4xx），并记一条 error
+  用量，归因到本次请求**最后评估到**的目标（而非盲取链上最后一个候选）。
+  “评估”包括凭据选择阶段的前置失败（例如 `no_healthy_credential`）：请求已经
+  选中这条链上的 `(provider, model)`，只是尚未发网络调用，仍应把这次失败
+  记在该目标名下。只有候选链本身为空时才允许 `provider_id / upstream_model`
+  为空；这样按上游、按模型统计不会把正常的配置失败伪装成“未知上游 / 未命名”。
 
 **主目标列与链的一致性**：`routes.provider_id / upstream_model_id` 是链首（position 0）的兼容视图，但运行时解析以 `route_targets` 为准（一旦有目标行就不再回看主目标列）。因此 `PATCH /admin/api/routes/{id}` 改这两列时，`SyncHeadTarget` 会把改动落到链首，避免「DB 列变了、响应回显新值、实际流量仍打旧目标」的静默分叉；链为空则补一条 position 0。整体换链走 `PUT .../targets`，其内部再用链首反向同步主目标列。
 
@@ -1168,7 +1202,7 @@ UPDATE access_keys SET used_tokens = used_tokens + NEW.total_tokens WHERE id = N
 
 | 维度 | 实现 |
 |---|---|
-| RPM | 内存固定窗口计数器（每分钟一个桶，`internal/ratelimit`），Key 维度；**被拒的请求同样计数** |
+| RPM | 内存固定窗口计数器（每分钟一个桶，`internal/ratelimit`），Key 维度；**被拒的请求不计数**（否则客户端重试会把窗口永久锁死，见 `AllowRPM` 注释） |
 | TPM | 同桶按 token 计数：请求前按 `estimateRequestTokens` 预占（输入估算 + max_tokens 全额），请求终结时按真实 usage 校正（`CommitTPM`）；被拒的请求不预占 |
 | 执行点 | `internal/dataplane.Handler.Handle` 骨架层（鉴权后 RPM、解码后 TPM），两个入口共享；额度随 `KeySnapshot` 从快照下发（0 = 不限），热路径不查库 |
 | 拒绝响应 | 429 `rate_limit_exceeded` + `Retry-After`（窗口剩余秒数，两个协议同语义、各按自己的错误形状） |
@@ -1293,6 +1327,7 @@ AES-256-GCM 密文。无主密钥、密文损坏、主密钥不匹配或历史�
   "master_key_env": "ROSETTA_GW_MASTER_KEY",
   "public_origin": "",
   "trusted_proxy_cidrs": [],
+  "require_tls_for_public_listen": false,
   "timezone": "Asia/Shanghai",
   "usage_retention_days": 30,
   "probes": {
@@ -1312,7 +1347,9 @@ AES-256-GCM 密文。无主密钥、密文损坏、主密钥不匹配或历史�
     "max_retries": 2,
     "max_request_body_bytes": 33554432,
     "failover_max_targets": 3,
-    "failover_failure_threshold": 3
+    "failover_failure_threshold": 3,
+    "max_concurrent_streams": 256,
+    "stream_admission_timeout_ms": 5000
   },
   "bootstrap": {
     "providers": [
@@ -1389,6 +1426,18 @@ Windows 上才跟 `time.Local`，**只设一个会跨平台失效**（第一版�
 `stream_first_token_timeout_ms` 是流式首字（TTFT）看门狗——区别于 `stream_idle_timeout_ms`（已出字后的空闲超时），掐的是「一个事件都没等到」的慢上游，触发即在写出 SSE 头前转移下一目标。
 `failover_max_targets` 是一次请求最多尝试链上几个目标；`failover_failure_threshold` 是某目标连续失败几次即熔断进 60s 冷却。
 
+**流式并发准入**（2026-10-22 新增）：`max_concurrent_streams`（默认 256）限制
+同时打开的流式请求数；`stream_admission_timeout_ms`（默认 5000）是拿不到名额时
+的最长等待。等待超时返回 `503 server_overloaded` 并带 `Retry-After`，不把请求
+无限堆在网关里。这两个值属于进程级资源保护，不随「设置」页热改 —— 改后需重启，
+因为信号量容量在 `NewHandler` 时固化。
+
+**总预算到期的归因**（2026-10-22 修正）：`TotalRequestBudget` 到期时用量落
+`status='timeout'`、`error_code='gateway_timeout'`，**不冷却凭据、不累计目标
+熔断、不再转移下一目标**。它与上游自己的 504 是两件事：前者是网关没来得及跑完，
+后者是上游超时；混在一起会让连续几次网关过载把健康上游熔断掉，也会把排障方向
+错误地指向上游。
+
 三个超时项的**现行默认值是 2026-10-13 上调过的**（300s / 120s / 60s，此前
 120s / 60s / 30s）：对非流式长回复与带思考的上游，旧值会把**正常请求**判成
 超时并触发故障转移，用户侧看到的是「无故变慢 + 结果不对」而不是明确报错。
@@ -1407,6 +1456,14 @@ Docker 侧对齐，且避开浏览器的保留端口表（6666 是 IRC 段，浏
 此时绑 `0.0.0.0` 等于把「抢先完成首次设置密码」的权利交给局域网里第一个访问 `/admin/` 的人。
 要对外服务就显式改成 `0.0.0.0:<port>` —— 启动日志会打印实际监听地址，
 并在这种「未初始化 + 非回环」状态下打 ERROR 告警。
+
+**`require_tls_for_public_listen`（2026-10-22 新增）**：进程级的明文暴露契约。
+网关自身不做 TLS，`public_origin` 只描述浏览器侧看到的外部源，不改变监听方式。
+默认 `false` 时：绑定具体非回环网卡会打 ERROR（明确暴露意图）；绑定通配地址
+（`0.0.0.0` / `::` / 空 host）只打 WARN —— 容器默认就是这种形态，真实暴露面由
+端口映射与宿主机防火墙决定，进程看不到，直接拒绝启动会让标准容器部署每次刷红。
+置 `true` 后，上述两种公开监听都必须配置 `https://` 的 `public_origin`，否则
+进程拒绝启动。回环监听在任何配置下都不告警。
 
 **关于管理员凭据**：配置文件里没有任何管理员字段 —— 管理面走 users 表 + 会话
 （§6.3）。首次打开 `/admin/` 会出现「首次设置密码」表单，设完即进入后台；
@@ -1481,8 +1538,8 @@ Docker 侧对齐，且避开浏览器的保留端口表（6666 是 IRC 段，浏
 | `/login` | 登录 | 公开 | 账号密码换 JWT；未初始化时改走引导设密 |
 | `/set-password` | 设置密码 | 公开 | 一次性设密链接落地页；`token` 位于 hash query，校验后设置密码并直接登录。登录用户也可访问，完成设置会切换为该账号的会话 |
 | `/` | 总览 | 全体 | 管理员首屏分两块：当前启用的上游/总数、上游模型总数、用户数、Key 数、累计 token 费用；以及所选区间请求数、成功率、平均首字、平均输出速度、费用、token 与缓存命中率。另有趋势、待处理项；普通用户看自己的区间质量指标、余额与配额 |
-| `/history` | 请求日志 | 全体 | `UsageStats.vue` 固定渲染逐条 `UsageDetail.vue`：时间、状态、流式/非流式、入站协议、模型、密钥、输入/输出 token、输出速度、首字/总耗时、费用和详情。支持按时间范围/状态/模型/key 过滤、分页和 CSV 导出 |
-| `/usage` | 用量与费用 | 全体 | `UsageStats.vue` 的非日志形态：按上游、模型、密钥三个维度汇总，管理员另有「统计归并」（`ModelGroups.vue`）。所有子页共用父页面的时间范围，避免切换页签后两页数字对不上 |
+| `/history` | 请求日志 | 全体 | `UsageStats.vue` 固定渲染逐条 `UsageDetail.vue`：时间、状态、流式/非流式、入站协议、公开路由名（下行显示实际上游模型）、密钥、新增输入 / 新增输出（下行显示缓存数）、输出速度、首字 / 总耗时、费用和详情。首字与总耗时按阈值着色：首字 5s / 10s、总耗时 10s / 30s 分别对应绿 / 橙 / 红。支持按时间范围 / 状态 / 模型 / key 过滤、分页和 CSV 导出 |
+| `/usage` | 用量与费用 | 全体 | `UsageStats.vue` 的非日志形态：默认近 1 天，也可切到近 7 / 30 天。按上游、模型、密钥三个维度用排行表汇总，顶部先给出范围总计，每行展示请求量、成功 / 失败数、Tokens、固化费用、成功率进度条以及首字 / 输出速度；管理员另有「统计归并」（`ModelGroups.vue`）。所有子页共用父页面的时间范围，避免切换页签后两页数字对不上 |
 | `/models` | 可用模型 | 全体 | **只读**清单：`GET /admin/api/model-names` 按身份收窄后的模型名（普通用户 = 所属组白名单 ∩ 全部路由名）+ 输入/输出/缓存命中三项单价；`restricted=true` 时显式提示「已被分组收窄」。每张模型卡同时画**连通率曲线**（探测数据，2026-10-14 并表）。刻意不给勾选控件 —— 白名单的写入口在 `/keys`（只能收紧）与 `/groups`（管理员按组收紧），且**空清单一律解释为「一个模型都调不了」而非 ModelPicker 的「一个都不选 = 不限制」**（后者只属于配置态）。未配置的单价显示「未配置」并弱化，**不显示 0.00**（会被读成「确认免费」） |
 | `/wallet` | 钱包与充值 | 全体 | **按身份分两种形态的同一页**：管理员看到全站的用户消费汇总 + 全部充值流水 + 充值入口（没有消耗记录，明细在「用量统计」页）；普通用户看到自己的余额、按天消耗与充值记录。自改密码已迁到「设置」页（2026-10-13）。余额（`balance_cents`）在 `balance_unlimited` 时显示「不限」而非 0.00 元，为 0 时显式提示「余额已用尽，请联系管理员充值」，对应数据面真实的 402 |
 | `/keys` | API 密钥 | 全体 | `AccessControl.vue` 的密钥页签：普通用户只看到并管理自己的 `sk-gw-` key；管理员可查看/调整归属与限制，但不能给自己新建 key。密钥创建与页签路由分离，`/keys` 是可停留地址 |
@@ -1606,7 +1663,7 @@ rosetta-gateway/
 ├── DOCKER.md                       容器化部署
 ├── CONTRIBUTING.md                 开发环境与协作约定（本机 -race 的 CC、sync-embed、TS 上界）
 ├── config.example.json             配置样例（config.json 本身不入库）
-├── Dockerfile                      两段式（golang:alpine 构建 → alpine 运行），CGO_ENABLED=0
+├── Dockerfile                      两段式（golang:1.27.3-alpine 构建 → alpine 运行），CGO_ENABLED=0
 ├── build.ps1                       纯编译脚本：前端构建 + go build → bin\gateway.exe
 ├── gateway.ps1                     一键脚本：编译 + 启动/停止（前台 / -Detached / -Stop）
 ├── docker/
@@ -1730,6 +1787,7 @@ rosetta-gateway/
 | R15 | **Codex 的 namespace 工具形态被网关拒绝** | Codex 经 `/v1/responses` 接入整体 400，不是功能缺失而是整条路径不可用 | **已解决（2026-10-18，v1.6.4）**：`flattenNamespaceTools` 把 namespace 展平成平级 function（`父名__原名`），`tool_choice` 同步改名。展平让工具表变长但被上游前缀缓存完全吸收（实测 4531 token 里 4530 命中）。客户端侧无开关（`tool_namespace` 被 Codex 忽略）。见 §7.3 |
 | R16 | **Responses 流式 reasoning item 被逐增量切碎** | 客户端看到一串逐段变长、前缀重复的思考块；携带 sealed 载荷的那一片单独成 item，其余片对模型无意义且在历史里多出垃圾 item | **已解决（2026-10-18，v1.6.4）**：reasoning item 生命周期改为跨增量（首片 added、中间片 delta、末片或 `Finish` 才 done），`reasonItemID` 在 added/delta/done 里复用，`thinkText` 在开新 item 时 Reset。见 §7.4 与 §8.1 |
 | R17 | **客户端按模型目录声明的托管工具（`web_search`）被网关拒绝** | 走 Responses 接入时整体 400；客户端若不关该能力则无法使用任何走 Responses 的模型 | **有意接受（2026-10-18）**：托管搜索由 OpenAI 服务端执行，任何第三方上游都承接不了，网关无法代理。拒绝而非静默丢弃 —— 静默丢弃的症状是模型在多轮后说「我没有联网能力」，用户要过几轮才会怀疑是代理吞了工具。处置在客户端侧：模型目录（`supports_search_tool: false`）关掉该能力。注意 Magpie 会静默丢弃（200 但无 `web_search_call`），CC Switch 透传到网关导致 400。见 §7.3 |
+| R18 | **`/v1/responses` 的 reasoning item 回放到 chat 上游时被丢弃** | DeepSeek thinking 模式多轮（尤其带工具调用）第二轮 400：`The reasoning_content in the thinking mode must be passed back` | **已解决（2026-10-23，v1.6.6）**：SDK 的 chat 编码器丢弃 thinking 块，网关在存在可读 summary 时自行接管 `messages`（`internal/inwire/responses_chat_replay.go`），把 summary 回填为 `reasoning_content` 并把同一轮的正文 / tool_calls 合并为一条 assistant 消息；无 reasoning 的请求继续走 SDK 编码器，不认识的形状回退 SDK。anthropic 上游仍剥除（无法伪造签名）。见 §7.1 |
 
 ---
 

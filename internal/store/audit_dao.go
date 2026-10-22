@@ -14,9 +14,8 @@ import (
 // 刻意只存**字段名**而不存请求体值：body 里会出现 api_key（上游凭据明文）、
 // 管理密码（密码修改）——审计的价值在「谁在什么时候动了什么资源」，
 // 不在值本身；值泄露的风险远大于排查收益。
-// actor 目前恒为 "admin"：审计回调（WriteAuditor）没有透传会话身份，
-// 多用户后普通用户对自己资源的写操作也会落一条 "admin" 记录 ——
-// 已知的不精确；要修就让 WriteAuditor 把调用者身份带进来。
+// actor 由 server.WriteAuditor 从请求会话注入（2026-10-22 修 P2-4）：
+// 普通用户记用户名、管理员记用户名、免鉴权引导入口记 "anonymous"。
 // remote 记来源 IP。
 type AuditEntry struct {
 	ID     int64

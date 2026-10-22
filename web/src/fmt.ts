@@ -221,7 +221,7 @@ export function fmtDateTime(unixSecOrMs: number): string {
 
 /**
  * 调用状态的展示标签。库内 status 是机器可读值（ok / truncated /
- * overflow / canceled / error），界面统一中文化，未知值原样显示以便排查。
+ * overflow / canceled / timeout / error），界面统一中文化，未知值原样显示以便排查。
  */
 export function statusLabel(status: string): string {
   switch (status) {
@@ -233,6 +233,8 @@ export function statusLabel(status: string): string {
       return '超限'
     case 'canceled':
       return '已取消'
+    case 'timeout':
+      return '网关超时'
     case 'error':
       return '失败'
     default:
@@ -257,6 +259,8 @@ export function statusLabel(status: string): string {
  *   - canceled  灰 —— 客户端主动断开，既不是网关的错也不是上游的错，
  *                 统计口径里同样不计入错误率；给它暖色会让
  *                 「用户关了个页面」看起来像线上故障。
+ *   - timeout   橙 —— 网关自身总请求预算到期，不是上游故障；
+ *                 与 truncated 同色系但文案不同，便于区分责任方。
  *
  * 未知状态回落 badge-off（中性灰）：不认识的值不该被当成异常标红，
  * 那会把「新增了状态但前端没跟上」误报成线上故障。
@@ -273,6 +277,8 @@ export function statusBadge(status: string): string {
       return 'badge-st-truncated'
     case 'canceled':
       return 'badge-st-canceled'
+    case 'timeout':
+      return 'badge-st-timeout'
     default:
       return 'badge-off'
   }

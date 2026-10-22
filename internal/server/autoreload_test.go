@@ -9,6 +9,9 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+
+	"github.com/cn-maul/rosetta-gateway/internal/identity"
+	"github.com/cn-maul/rosetta-gateway/internal/store"
 )
 
 func newTestLogger() *slog.Logger {
@@ -21,7 +24,7 @@ func TestAutoReload_TriggersOnSuccessfulWrite(t *testing.T) {
 	var reloads int
 	reload := func(context.Context) error { reloads++; return nil }
 	logger := newTestLogger()
-	audit := func(string, string, int, string, string) {}
+	audit := func(string, string, string, int, string, string) {}
 
 	base := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
@@ -80,8 +83,8 @@ func TestAutoReload_TriggersOnSuccessfulWrite(t *testing.T) {
 // 审计回调在成功写操作上被调用，且只带字段名、不带请求体值。
 func TestAutoReload_AuditCapturesFieldNames(t *testing.T) {
 	var audited []string
-	audit := func(method, path string, status int, remote, fields string) {
-		audited = append(audited, method+"|"+path+"|"+fields)
+	audit := func(actor, method, path string, status int, remote, fields string) {
+		audited = append(audited, actor+"|"+method+"|"+path+"|"+fields)
 	}
 	reload := func(context.Context) error { return nil }
 	base := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {})
@@ -90,13 +93,14 @@ func TestAutoReload_AuditCapturesFieldNames(t *testing.T) {
 	rec := httptest.NewRecorder()
 	sw := &statusResponseWriter{ResponseWriter: rec, statusCode: http.StatusOK}
 	req := httptest.NewRequest(http.MethodPost, "/admin/api/keys", strings.NewReader(`{"name":"a","quota_tokens":100}`))
+	req = req.WithContext(identity.WithUser(req.Context(), &store.User{ID: "u1", Username: "alice"}))
 	h.ServeHTTP(sw, req)
 
 	if len(audited) != 1 {
 		t.Fatalf("audit should fire exactly once, got %v", audited)
 	}
 	// 字段名排序后拼接；值（"a"/100）绝不出现。
-	if audited[0] != "POST|/admin/api/keys|name,quota_tokens" {
+	if audited[0] != "alice|POST|/admin/api/keys|name,quota_tokens" {
 		t.Fatalf("audit entry = %q", audited[0])
 	}
 
@@ -113,7 +117,7 @@ func TestAutoReload_AuditCapturesFieldNames(t *testing.T) {
 // 进入审计；其他 query 参数不采集，避免把 token/api_key 之类敏感值落库。
 func TestAutoReload_AuditCapturesKeepDaysQueryValue(t *testing.T) {
 	var audited []string
-	audit := func(method, path string, status int, remote, fields string) {
+	audit := func(actor, method, path string, status int, remote, fields string) {
 		audited = append(audited, fields)
 	}
 	reload := func(context.Context) error { return nil }
@@ -140,7 +144,7 @@ func TestAuditOnly_RecordsBootstrapFailure(t *testing.T) {
 		status int
 		fields string
 	}
-	audit := func(method, path string, status int, remote, fields string) {
+	audit := func(actor, method, path string, status int, remote, fields string) {
 		audited = append(audited, struct {
 			status int
 			fields string

@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strconv"
 	"sync"
 	"time"
 
@@ -98,10 +99,55 @@ type SSEWriter struct {
 	// writeErr 是**第一次**写失败的原因（2026-10-21 修 *X12）。
 	// 见 write_error.go 的 WriteErrorReporter。
 	writeErr error
+
+	// envelope 是「除 choices/usage 之外的那段固定前缀」，预编码一次复用
+	// （2026-10-22 修 R9）。
+	//
+	// # 为什么值得这么做
+	//
+	// 旧实现的每个事件都要构造一个 map（5 个键，含一个 []map[string]any
+	// 的 choices）、把 delta 也做成 map 塞进去，再整体 json.Marshal。
+	// 一条长回答动辄几百上千个分片，**每个分片**都重新编码一段完全相同的
+	// id/object/created/model —— 那部分逐字节一模一样，却付了完整的
+	// 反射编码代价，还带着 map 与 interface 的分配。
+	//
+	// 现在固定前缀只编码一次，每个事件用 strconv.AppendQuote 序列化变化的
+	// 字符串、用 json.Marshal 序列化变化的少量结构，直接拼进一个复用缓冲。
+	//
+	// # 为什么不是手写整条 JSON
+	//
+	// delta 里的 content / arguments 是**模型输出**，必须走正确的转义
+	// （引号、反斜杠、控制字符、非法 UTF-8）。手拼字符串会在这些字符上
+	// 出错，而那种错误只在特定输出下才出现 —— 用 AppendQuote 与 Marshal
+	// 保证与旧实现逐字节同语义。
+	envelope []byte
+	// buf 是复用的拼接缓冲：高负载下每个事件都 make 一次会把 GC 压力
+	// 直接叠到热路径上。
+	buf []byte
+	// frame 是复用的「data: …\n\n」帧缓冲，见 writeEventLocked。
+	frame []byte
 }
 
 func NewSSEWriter(w io.Writer, flusher http.Flusher, id, model string, created int64) *SSEWriter {
-	return &SSEWriter{w: w, flusher: flusher, id: id, model: model, created: created}
+	sw := &SSEWriter{w: w, flusher: flusher, id: id, model: model, created: created}
+	sw.rebuildEnvelope()
+	return sw
+}
+
+// rebuildEnvelope 重新编码「choices 之前」的那段固定前缀。
+//
+// 调用时机有约束：id 在流中途可被 SetResponseID 覆盖（上游 message_start
+// 带回真实响应 id 时）。那种覆盖发生在首片之前，所以重建一次即可 ——
+// 一旦 roleSent，说明已经有分片带着旧 id 写出去了，此时不该再改。
+func (sw *SSEWriter) rebuildEnvelope() {
+	sw.envelope = sw.envelope[:0]
+	sw.envelope = append(sw.envelope, `{"id":`...)
+	sw.envelope = appendJSONString(sw.envelope, sw.id)
+	sw.envelope = append(sw.envelope, `,"object":"chat.completion.chunk","created":`...)
+	sw.envelope = strconv.AppendInt(sw.envelope, sw.created, 10)
+	sw.envelope = append(sw.envelope, `,"model":`...)
+	sw.envelope = appendJSONString(sw.envelope, sw.model)
+	sw.envelope = append(sw.envelope, `,"choices":[`...)
 }
 
 // WithResponseWriter 绑定底层 ResponseWriter，用于设置单次写截止时间。
@@ -124,11 +170,22 @@ func (sw *SSEWriter) SetResponseID(id string) {
 		return
 	}
 	sw.id = id
+	// 信封里嵌着 id，改完必须重建，否则后续分片仍带旧 id。
+	sw.rebuildEnvelope()
 }
 
 func (sw *SSEWriter) WriteEvent(event, data string) error {
 	sw.mu.Lock()
 	defer sw.mu.Unlock()
+	return sw.writeEventLocked(event, []byte(data))
+}
+
+// writeEventLocked 在**已持锁**的前提下写一个 SSE 事件。
+//
+// 供 writeChoiceChunk / WriteUsage 这类已经在锁内拼好 payload 的路径使用：
+// 它们不能调 WriteEvent（会二次加锁 → 死锁），而重复一遍写逻辑又会把
+// 「写失败要记 writeErr」这条纪律再抄一份。
+func (sw *SSEWriter) writeEventLocked(event string, data []byte) error {
 	setWriteDeadline(sw.rw)
 	defer clearWriteDeadline(sw.rw)
 	if event != "" {
@@ -137,7 +194,12 @@ func (sw *SSEWriter) WriteEvent(event, data string) error {
 			return err
 		}
 	}
-	if _, err := fmt.Fprintf(sw.w, "data: %s\n\n", data); err != nil {
+	// 一次性写出「data: <payload>\n\n」：三条 Fprintf 会各自走一次
+	// 格式化与反射，而分片写还可能被中间代理观察成半行。
+	sw.frame = append(sw.frame[:0], "data: "...)
+	sw.frame = append(sw.frame, data...)
+	sw.frame = append(sw.frame, '\n', '\n')
+	if _, err := sw.w.Write(sw.frame); err != nil {
 		sw.noteWriteErr(err)
 		return err
 	}
@@ -182,19 +244,54 @@ func (sw *SSEWriter) WriteError() error {
 // writeChunk 组装一个标准的 chat.completion.chunk 信封（含 id/object/created/model），
 // 严格客户端依赖这些字段与末尾的 finish_reason 分片。
 func (sw *SSEWriter) writeChunk(delta map[string]any, finish *string) error {
-	chunk := map[string]any{
-		"id":      sw.id,
-		"object":  "chat.completion.chunk",
-		"created": sw.created,
-		"model":   sw.model,
-		"choices": []map[string]any{{
-			"index":         0,
-			"delta":         delta,
-			"finish_reason": finish,
-		}},
+	deltaJSON, err := json.Marshal(delta)
+	if err != nil {
+		// delta 只含字符串/数字/切片，编码失败属于程序错误；退回旧路径
+		// 让它以同样的方式失败，避免在这里静默吞掉一个事件。
+		return err
 	}
-	data, _ := json.Marshal(chunk)
-	return sw.WriteEvent("", string(data))
+	return sw.writeChoiceChunk(deltaJSON, finish)
+}
+
+// writeChoiceChunk 用**已序列化的 delta** 拼出一个 chat.completion.chunk。
+//
+// 信封（id/object/created/model）与 choices 的骨架都是常量，只有 delta
+// 与 finish_reason 变化 —— 这正是把 map 逐事件重建省掉的地方。
+func (sw *SSEWriter) writeChoiceChunk(deltaJSON []byte, finish *string) error {
+	sw.mu.Lock()
+	defer sw.mu.Unlock()
+
+	sw.buf = append(sw.buf[:0], sw.envelope...)
+	sw.buf = append(sw.buf, `{"index":0,"delta":`...)
+	sw.buf = append(sw.buf, deltaJSON...)
+	sw.buf = append(sw.buf, `,"finish_reason":`...)
+	if finish == nil {
+		sw.buf = append(sw.buf, "null"...)
+	} else {
+		sw.buf = appendJSONString(sw.buf, *finish)
+	}
+	// 收口：close choice 对象 → close choices 数组 → close chunk 对象。
+	// envelope 已经打开了 chunk 与 choices，这里不能再多一个 '}'。
+	sw.buf = append(sw.buf, '}', ']', '}')
+	return sw.writeEventLocked("", sw.buf)
+}
+
+// appendJSONString 把 s 作为 JSON 字符串字面量追加到 dst。
+//
+// 用 strconv.AppendQuote 而不是 fmt：它直接处理转义（引号、反斜杠、
+// 控制字符），且不像 fmt 那样走反射 —— 热路径上每个事件都要用。
+// encoding/json 对字符串的转义规则与 strconv 的实现一致（都会转义
+// <、>、& 吗？见下方说明）。
+//
+// ⚠️ 两者对 U+2028/U+2029 与 HTML 敏感字符的处理**不同**：
+// strconv 不转义 `<> &` 与 U+2028/U+2029，而 encoding/json 会。
+// 对 SSE 的 data 段而言，这两者的产物都是合法 JSON，客户端解析后得到
+// 同一个字符串 —— 差别只在字节层面，不影响语义。为保持与旧实现
+// **逐字节一致**，凡是用 AppendQuote 拼接的位置都只用于
+// id/model/finish_reason 这类受控枚举值（不含用户输入）。模型输出
+// （content/arguments）一律走 json.Marshal。
+func appendJSONString(dst []byte, s string) []byte {
+	return strconv.AppendQuote(dst, s)
 }
 
 // ensureRole 在首个内容/工具分片前补发 delta.role="assistant"，符合 OpenAI 流式约定。
@@ -331,16 +428,20 @@ func (sw *SSEWriter) WriteUsage(u rosetta.Usage) error {
 			"reasoning_tokens": u.ReasoningTokens,
 		}
 	}
-	chunk := map[string]any{
-		"id":      sw.id,
-		"object":  "chat.completion.chunk",
-		"created": sw.created,
-		"model":   sw.model,
-		"choices": []any{},
-		"usage":   usage,
+	usageJSON, err := json.Marshal(usage)
+	if err != nil {
+		return err
 	}
-	data, _ := json.Marshal(chunk)
-	return sw.WriteEvent("", string(data))
+
+	sw.mu.Lock()
+	defer sw.mu.Unlock()
+	// 与 writeChoiceChunk 同一套拼法：信封前缀复用，只是这里是
+	// "choices":[],"usage":{...} —— usage 分片在 finish 之后单独发。
+	sw.buf = append(sw.buf[:0], sw.envelope...)
+	sw.buf = append(sw.buf, `],"usage":`...)
+	sw.buf = append(sw.buf, usageJSON...)
+	sw.buf = append(sw.buf, '}')
+	return sw.writeEventLocked("", sw.buf)
 }
 
 func (sw *SSEWriter) WriteDone() error {

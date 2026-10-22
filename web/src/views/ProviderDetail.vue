@@ -450,6 +450,7 @@ const mForm = reactive({
   max_output_tokens: 0,
   price_input: 0,
   price_cache_hit: 0,
+  price_cache_creation: 0,
   price_output: 0,
   effortCsv: '',
   thinking: 'unset' as 'unset' | 'yes' | 'no',
@@ -501,6 +502,7 @@ function openModel(m?: UpstreamModel) {
   mForm.max_output_tokens = m?.max_output_tokens ?? 0
   mForm.price_input = m?.price_input ?? 0
   mForm.price_cache_hit = m?.price_cache_hit ?? 0
+  mForm.price_cache_creation = m?.price_cache_creation ?? 0
   mForm.price_output = m?.price_output ?? 0
   mForm.saving = false
   // unknown 档位附在后面：它们是网关不认、但可能是上游认得的厂商私有值，
@@ -549,7 +551,7 @@ async function submitModel() {
     toast('上游模型名（model_id）为必填项', 'err')
     return
   }
-  const prices = [mForm.price_input, mForm.price_cache_hit, mForm.price_output].map(Number)
+  const prices = [mForm.price_input, mForm.price_cache_hit, mForm.price_cache_creation, mForm.price_output].map(Number)
   if (prices.some((v) => !Number.isFinite(v) || v < 0)) {
     toast('单价必须是大于等于 0 的数字', 'err')
     return
@@ -557,7 +559,7 @@ async function submitModel() {
   mForm.saving = true
   try {
     const original = models.value.find((m) => m.id === mForm.editing)
-    if (original && [original.price_input, original.price_cache_hit, original.price_output].some((v) => v > 0) && prices.every((v) => v === 0)) {
+    if (original && [original.price_input, original.price_cache_hit, original.price_cache_creation, original.price_output].some((v) => v > 0) && prices.every((v) => v === 0)) {
       const ok = await confirmBox({
         title: '清除该模型的全部价格？',
         body: '之后的调用将按 0 元计费，历史费用不变。',
@@ -571,7 +573,8 @@ async function submitModel() {
       max_output_tokens: Number(mForm.max_output_tokens) || 0,
       price_input: prices[0],
       price_cache_hit: prices[1],
-      price_output: prices[2],
+      price_cache_creation: prices[2],
+      price_output: prices[3],
       // 空串 = 清除（回到未配置），与界面上「一个都不勾选」是同一个动作。
       effort_levels: mForm.effortCsv,
       // 三态映射：unset → null（后端解成「清除」）。不能省略字段 ——
@@ -1002,6 +1005,7 @@ function goBack() {
             <div class="price-edit-grid">
               <label><span>输入</span><input v-model.number="mForm.price_input" class="input num" type="number" min="0" step="any" placeholder="未配置"/></label>
               <label><span>缓存命中</span><input v-model.number="mForm.price_cache_hit" class="input num" type="number" min="0" step="any" placeholder="未配置"/></label>
+              <label><span>缓存写入</span><input v-model.number="mForm.price_cache_creation" class="input num" type="number" min="0" step="any" placeholder="未配置"/></label>
               <label><span>输出</span><input v-model.number="mForm.price_output" class="input num" type="number" min="0" step="any" placeholder="未配置"/></label>
             </div>
           </div>

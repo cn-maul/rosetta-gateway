@@ -37,11 +37,17 @@ type SnapshotProvider func() *snapshot.Snapshot
 // injected provider so the handler does not reach into the package global; a
 // nil provider defaults to snapshot.Get.
 type Deps struct {
-	Pool     *upstream.Pool
-	Config   *config.Config
-	Usage    *usage.Recorder
-	Limiter  *ratelimit.Limiter
-	Snapshot SnapshotProvider
+	Pool                 *upstream.Pool
+	Config               *config.Config
+	Usage                *usage.Recorder
+	Limiter              *ratelimit.Limiter
+	Snapshot             SnapshotProvider
+	MaxConcurrentStreams int
+	// StreamAdmissionTimeout 是「等待流式并发名额」的最长时间。
+	//
+	// 0 = 不等待（拿到名额就拿，拿不到立刻 503）。
+	// 负值 = 用默认值。
+	StreamAdmissionTimeout time.Duration
 }
 
 // Handler serves protocol-independent model requests through the configured
@@ -54,7 +60,29 @@ type Handler struct {
 	snapshot SnapshotProvider
 	db       *store.Store
 	logger   *slog.Logger
+	streams  chan struct{}
+	// admissionTimeout 是等待流式并发名额的上限（见 defaultStreamAdmissionTimeout）。
+	admissionTimeout time.Duration
 }
+
+const defaultMaxConcurrentStreams = 256
+
+// defaultStreamAdmissionTimeout 是等待流式并发名额的默认上限。
+//
+// # 为什么需要它（2026-10-22 修 §7.1-3）
+//
+// 原来的并发上限是**纯阻塞**：拿不到名额就一直等，直到客户端断开。
+// 过载时请求会堆在网关里 —— 每个都占着一个 goroutine、一个连接、
+// 以及一份已鉴权但尚未结算的配额预占。堆到一定程度，网关对**所有**
+// 请求都变慢（不只是流式），而客户端看到的只是「越来越慢」，
+// 没有一个明确的可重试信号。
+//
+// 加了等待上限之后，过载会变成**快速失败**：等待超过上限就回 503 +
+// Retry-After，客户端可以立刻重试或降级，而网关自己不会被拖垮。
+//
+// 5 秒是刻意选的：足够覆盖一次正常的名额周转（长流结束会立刻释放），
+// 又短到「客户端以为自己卡死了」之前。
+const defaultStreamAdmissionTimeout = 5 * time.Second
 
 // NewHandler builds a data plane handler from explicit dependencies.
 func NewHandler(d Deps) *Handler {
@@ -63,9 +91,25 @@ func NewHandler(d Deps) *Handler {
 	}
 	db := d.Usage.Store()
 	logger := d.Usage.Logger()
+	streamLimit := d.MaxConcurrentStreams
+	if streamLimit <= 0 {
+		streamLimit = defaultMaxConcurrentStreams
+		if d.Config != nil && d.Config.Defaults.MaxConcurrentStreams > 0 {
+			streamLimit = d.Config.Defaults.MaxConcurrentStreams
+		}
+	}
+	admissionTimeout := d.StreamAdmissionTimeout
+	if admissionTimeout <= 0 {
+		admissionTimeout = defaultStreamAdmissionTimeout
+		if d.Config != nil && d.Config.Defaults.StreamAdmissionTimeoutMs > 0 {
+			admissionTimeout = time.Duration(d.Config.Defaults.StreamAdmissionTimeoutMs) * time.Millisecond
+		}
+	}
 	return &Handler{
 		pool: d.Pool, cfg: d.Config, usage: d.Usage, limiter: d.Limiter,
 		snapshot: d.Snapshot, db: db, logger: logger,
+		streams:          make(chan struct{}, streamLimit),
+		admissionTimeout: admissionTimeout,
 	}
 }
 
@@ -88,13 +132,44 @@ func setRetryAfter(w http.ResponseWriter, d time.Duration) {
 	w.Header().Set("Retry-After", strconv.Itoa(seconds))
 }
 
+// sessionHeaders are the downstream headers that identify one conversation.
+//
+// The order is intentional. An explicit OpenCode header wins because it is the
+// client's direct instruction to the upstream. DeepSeek Harness has its own
+// header on the native Messages path; its OpenAI-compatible adapters instead
+// send OpenAI-style affinity headers. The generic names cover other clients
+// that use the same conventions. Do not include an installation-wide user ID
+// here: sharing one cache affinity across every conversation is not equivalent
+// to preserving one conversation's affinity.
+var sessionHeaders = []string{
+	upstream.OpenCodeSessionHeader,
+	"x-deepseek-harness-session-id",
+	"x-session-affinity",
+	"session_id",
+	"x-session-id",
+	"session-id",
+	// x-client-request-id is commonly unique per HTTP attempt, not per
+	// conversation. It remains a last-resort compatibility alias, but must
+	// never outrank a stable session identifier.
+	"x-client-request-id",
+}
+
+func conversationSessionID(r *http.Request) string {
+	for _, name := range sessionHeaders {
+		if value := strings.TrimSpace(r.Header.Get(name)); value != "" {
+			return value
+		}
+	}
+	return ""
+}
+
 // withOpenCodeSession carries the downstream conversation ID through the
-// protocol adapters. When the client does not send one, the per-request ID is
-// the only safe fallback: it prevents OpenCode from rejecting the request,
-// although only a client-supplied header can preserve routing/cache affinity
-// across turns.
+// protocol adapters. When the client sends no conversation identifier, the
+// per-request ID is the only safe fallback: it prevents OpenCode from
+// rejecting the request, although only a client-supplied identifier can
+// preserve routing/cache affinity across turns.
 func withOpenCodeSession(r *http.Request) *http.Request {
-	sessionID := strings.TrimSpace(r.Header.Get(upstream.OpenCodeSessionHeader))
+	sessionID := conversationSessionID(r)
 	if sessionID == "" {
 		sessionID = httpx.RequestIDFromContext(r.Context())
 	}
@@ -147,6 +222,36 @@ func (h *Handler) Handle(codec ingress.Codec) http.HandlerFunc {
 			}
 			codec.WriteError(w, http.StatusBadRequest, "invalid_request_error", err.Error())
 			return
+		}
+
+		if ing.Stream {
+			if !h.acquireStreamSlot(r.Context()) {
+				// 客户端已断开：不必再写任何响应。
+				if r.Context().Err() != nil {
+					return
+				}
+				// 过载：并发流已满，且在等待上限内没有等到名额。
+				//
+				// 旧实现是无界阻塞（等客户端断开才放弃），过载时请求会在
+				// 网关里堆积，每个都占着 goroutine、连接与一份已预占的配额 ——
+				// 而且客户端只看到「越来越慢」，没有可重试的信号。
+				//
+				// 现在快速失败：503 + Retry-After。过载是**可重试**的，
+				// 客户端拿到明确信号后可以立刻重试或降级；网关自己不会被
+				// 一堆积的请求拖垮。
+				//
+				// 记 ERROR 而非 WARN：这是过载信号，运维需要看到它。
+				logger.Error("stream admission timeout: too many concurrent streams",
+					"limit", cap(h.streams),
+					"admission_timeout_ms", h.admissionTimeout.Milliseconds(),
+					"model", ing.Model,
+					"request_id", httpx.RequestIDFromContext(r.Context()))
+				setRetryAfter(w, h.admissionTimeout)
+				codec.WriteError(w, http.StatusServiceUnavailable, "server_overloaded",
+					"too many concurrent streaming requests; retry shortly")
+				return
+			}
+			defer func() { <-h.streams }()
 		}
 
 		// TPM 限速（DESIGN §11.4）：流式下真实 token 只有流结束才知道，
@@ -453,17 +558,20 @@ func (h *Handler) Handle(codec ingress.Codec) http.HandlerFunc {
 		keyID := authCtx.KeyID
 
 		var out Outcome
-		// lastTried 记录实际尝试到哪个候选（链耗尽时据此归因，不猜链上最后一个）。
-		// triedAny 与之配对：Candidate 是值类型，「没试过」与「试过零值」无法
-		// 从 lastTried 本身区分，必须有独立布尔。
-		var lastTried routing.Candidate
-		var triedAny bool
+		// lastTarget 记录本次请求最后评估到的候选。归因不能只看“是否已调用
+		// 上游”：没有健康凭据时请求同样已经选中了这个目标，只是没走到网络
+		// 调用；若仍落成空 provider_id，用量页就会出现“未知上游”。
+		// Candidate 是值类型，额外用 evaluatedAny 区分“没评估”与“评估到零值”。
+		var lastTarget routing.Candidate
+		var evaluatedAny bool
 		// routeTrace 记录链上的失败决策（2026-10-17）。只在真的发生过转移时
 		// 才有内容 —— 单目标成功、首跳成功都不写，避免给每条记录加噪声。
 		// 由 AppendRouteTrace 统一格式化，保证「第几个目标」与失败原因成对出现。
 		var routeTrace []string
 		for i, cand := range active {
 			isLast := i == len(active)-1
+			lastTarget = cand
+			evaluatedAny = true
 
 			// 客户端已断开就收手：半路跑掉的人不该消耗整条链的下游配额，
 			// 也不该把一次在途取消误记成目标的失败。此刻尚未写出任何字节，
@@ -519,7 +627,11 @@ func (h *Handler) Handle(codec ingress.Codec) http.HandlerFunc {
 			// 同 provider 的下一把，而是让位给链上下一个目标。跨请求的 key 轮换交给
 			// 冷却 —— 坏 key 被踢出 healthy 后，下个请求自会选到好 key。这是有意取舍，
 			// 免得「一个请求把某 provider 所有 key 各打一遍」放大延迟与配额消耗。
-			client, credID, cerr := h.pool.GetAnyClient(cand.Provider.Slug)
+			credentialAffinity := strings.TrimSpace(ing.CacheKey)
+			if credentialAffinity == "" {
+				credentialAffinity = conversationSessionID(r)
+			}
+			client, credID, cerr := h.pool.GetAnyClientByAffinity(cand.Provider.Slug, credentialAffinity)
 			if cerr != nil {
 				// 该目标当前无健康凭据：这是 provider 的凭据状态，不是目标/上游
 				// 故障。把目标熔断与凭据冷却叠加会延长恢复时间，而且下一次
@@ -544,13 +656,6 @@ func (h *Handler) Handle(codec ingress.Codec) http.HandlerFunc {
 			} else {
 				out = h.attemptNonStream(w, r, client, ing, cand, authCtx, codec, rate, snap, start, routeTrace)
 			}
-			// 记住**实际尝试到**的候选，供链耗尽时记账归因。
-			// 不能用 active[len(active)-1] —— 那是链上最后一个候选，而实际最后
-			// 尝试的可能是链上第一个（failover_max_targets=1、或前面的目标被
-			// 跳过时）。归因错目标会让排障指向一个从未真正打过的上游。
-			lastTried = cand
-			triedAny = true
-
 			if out.Committed {
 				// 只有真成功才记成功 —— 断流/溢出/上游错误虽已提交，却是失败，
 				// 必须让目标熔断计数与凭据健康照常累计，否则故障永不转移。
@@ -558,6 +663,19 @@ func (h *Handler) Handle(codec ingress.Codec) http.HandlerFunc {
 					h.pool.RecordCredentialSuccess(credID)
 					h.pool.RecordTargetSuccess(cand.TargetID, probeToken)
 					routeTrace = AppendRouteTrace(routeTrace, i+1, cand, "ok", "")
+				} else if out.NoUpstreamPenalty {
+					// gateway-local overflow is not evidence that the target or
+					// credential is unhealthy. Clear a half-open probe and keep
+					// the serving target available.
+					routeTrace = AppendRouteTrace(routeTrace, i+1, cand, "committed_fail", out.Code)
+					h.pool.RecordTargetSuccess(cand.TargetID, probeToken)
+					h.pool.RecordCredentialSuccess(credID)
+				} else if out.GatewayTimeout {
+					// 网关总预算到期同样不是上游不健康的证据（2026-10-22 修 *X11）。
+					// 与 overflow 一样按「不罚上游」收尾；usage 已经按 timeout 落库。
+					routeTrace = AppendRouteTrace(routeTrace, i+1, cand, "committed_fail", out.Code)
+					h.pool.RecordTargetSuccess(cand.TargetID, probeToken)
+					h.pool.RecordCredentialSuccess(credID)
 				} else if out.ClientGone {
 					// 客户端自己走了（用户点停止 / 进程退出 / 网络切换）。
 					// 这既不是上游故障也不该罚凭据：照记的话，连续三次
@@ -632,6 +750,8 @@ func (h *Handler) Handle(codec ingress.Codec) http.HandlerFunc {
 		// 记成 canceled 会让网关自己的超时在报表里与用户主动取消混为一谈，
 		// 并让「写不写错误响应」这个决定被预算到期误触发。
 		clientGone := IsClientGone(r.Context(), r.Context().Err())
+		gatewayTimeout := out.GatewayTimeout ||
+			(out.Eligible && errors.Is(r.Context().Err(), context.DeadlineExceeded))
 
 		statusCode, code, message := out.StatusCode, out.Code, out.Message
 		// 兜底：不许把 200 或 0 当作「失败结果」发出去。
@@ -652,24 +772,27 @@ func (h *Handler) Handle(codec ingress.Codec) http.HandlerFunc {
 		}
 		rate.Commit(0)
 		provID, upstreamModel := "", ""
-		// 归因到**实际尝试过**的目标，而不是 active 的最后一个：
-		// failover_max_targets=1、或前面的候选被跳过时，两者不是同一个。
-		// Provider 判空：active 为空（理论不该发生）时 lastTried 是零值
-		// Candidate，解引用 nil Provider 会 panic —— 一行防御，零业务成本。
-		if triedAny && lastTried.Provider != nil {
-			provID, upstreamModel = lastTried.Provider.ID, lastTried.UpstreamModel.ModelID
+		// 归因到最后评估到的目标：即使失败发生在凭据选择阶段，这个目标仍是
+		// 本次请求真实命中的路由成员。Provider 判空防御 active 为空的理论
+		// 分支，避免解引用零值 Candidate 时 panic。
+		if evaluatedAny && lastTarget.Provider != nil {
+			provID, upstreamModel = lastTarget.Provider.ID, lastTarget.UpstreamModel.ModelID
 		}
 		status := store.UsageStatusError
+		errorCode := code
+		errorDetail := out.Detail
 		if clientGone {
 			status = store.UsageStatusCanceled
 			logger.Info("client disconnected before any response was written",
 				"model", ing.Model, "request_id", httpx.RequestIDFromContext(r.Context()))
-		}
-		errorCode := code
-		errorDetail := out.Detail
-		if clientGone {
 			errorCode = ""
 			errorDetail = ""
+		} else if gatewayTimeout {
+			status = store.UsageStatusTimeout
+			errorCode = "gateway_timeout"
+			errorDetail = "gateway request budget exceeded"
+			logger.Warn("request cut by gateway total request budget",
+				"model", ing.Model, "request_id", httpx.RequestIDFromContext(r.Context()))
 		}
 		h.usage.Record(&store.UsageRecord{
 			ID:              newID(),
@@ -689,6 +812,34 @@ func (h *Handler) Handle(codec ingress.Codec) http.HandlerFunc {
 			LatencyMs:       time.Since(start).Milliseconds(),
 			RouteTrace:      strings.Join(routeTrace, "; "),
 		})
+	}
+}
+
+// acquireStreamSlot 申请一个流式并发名额。
+//
+// 返回 true = 拿到名额（调用方负责在请求结束时释放）。
+// 返回 false = 没拿到：要么 ctx 已取消（客户端走了），要么等待超时
+// （过载）。调用方据此决定是静默返回还是回 503。
+//
+// # 为什么等待必须有上限（2026-10-22 修 §7.1-3）
+//
+// 旧实现是纯阻塞：拿不到名额就一直等，直到客户端断开。过载时请求会
+// 堆在网关里 —— 每个都占着一个 goroutine、一个连接、以及一份已鉴权
+// 但尚未结算的配额预占。堆到一定程度，网关对**所有**请求都变慢
+// （不只是流式），而客户端看到的只是「越来越慢」，没有一个明确的可
+// 重试信号。
+//
+// 有了上限，过载就变成**快速失败**：等不到名额就回 503 + Retry-After。
+func (h *Handler) acquireStreamSlot(ctx context.Context) bool {
+	timer := time.NewTimer(h.admissionTimeout)
+	defer timer.Stop()
+	select {
+	case h.streams <- struct{}{}:
+		return true
+	case <-ctx.Done():
+		return false
+	case <-timer.C:
+		return false
 	}
 }
 
@@ -735,6 +886,7 @@ func ModelNotFoundMessage(snap *snapshot.Snapshot, requested string) string {
 // 而那恰恰是这条记录最有价值的部分。
 func (h *Handler) attemptStream(w http.ResponseWriter, r *http.Request, client *rosetta.Client, ing *ingress.Request, cand routing.Candidate, authCtx *auth.Context, codec ingress.Codec, rate *RateCommit, snap *snapshot.Snapshot, start time.Time, priorTrace []string) Outcome {
 	ctx := r.Context()
+	ctx = withPromptCacheAffinity(ctx, ing, cand, conversationSessionID(r))
 	logger := h.usage.Logger()
 	publicModel := ing.Model
 
@@ -782,7 +934,7 @@ func (h *Handler) attemptStream(w http.ResponseWriter, r *http.Request, client *
 
 	stream, err := client.ChatStream(ctx, upstreamReq)
 	if err != nil {
-		return OutcomeFromErr(err)
+		return OutcomeFromErrCtx(r.Context(), err)
 	}
 	defer stream.Close()
 
@@ -812,7 +964,7 @@ func (h *Handler) attemptStream(w http.ResponseWriter, r *http.Request, client *
 
 	if !gotFirst || ttftTimedOut.Load() {
 		if cerr := stream.Err(); cerr != nil {
-			return OutcomeFromErr(cerr)
+			return OutcomeFromErrCtx(r.Context(), cerr)
 		}
 		if ttftTimedOut.Load() {
 			logger.Warn("stream first-token timeout", "model", publicModel,
@@ -1005,25 +1157,40 @@ func (h *Handler) attemptStream(w http.ResponseWriter, r *http.Request, client *
 				"model", publicModel, "key_id", authCtx.KeyID, "error", werr)
 		}
 	} else if err := stream.Err(); err != nil {
-		switch {
-		case errors.Is(err, rosetta.ErrStreamTruncated):
-			status = store.UsageStatusTruncated
-			errorCode = "stream_truncated"
-			logger.Warn("stream truncated", "model", publicModel, "key_id", authCtx.KeyID, "error", err)
-		case errors.Is(err, rosetta.ErrStreamOverflow):
-			status = store.UsageStatusOverflow
-			errorCode = "stream_overflow"
-			logger.Error("stream overflow", "model", publicModel, "key_id", authCtx.KeyID, "error", err)
-		case IsClientGone(ctx, err):
-			// 客户端主动断开不是上游故障。此前一律记 error，后果是：后台错误率虚高、
-			// 成功率虚低，且真故障被 ERROR 噪音淹没。单独一个取值才能把两者分开。
-			status = store.UsageStatusCanceled
-			logger.Info("client disconnected mid-stream", "model", publicModel, "key_id", authCtx.KeyID, "error", err)
-		default:
-			status = store.UsageStatusError
-			errorCode = "upstream_error"
-			errorDetail = outwire.UpstreamErrorDetail(err)
-			logger.Error("stream error", "error", err, "model", publicModel, "key_id", authCtx.KeyID)
+		// 网关总预算到期不是上游故障（2026-10-22 修 *X11）。
+		// 必须排在 truncated / client-gone 之前：预算到期时上游流通常
+		// 也会报 TransportError，若先按上游错误归类，就会冷却凭据并累计
+		// 目标熔断。到期之后也不再重试 —— 共享 deadline 已经没了。
+		if errors.Is(r.Context().Err(), context.DeadlineExceeded) {
+			status = store.UsageStatusTimeout
+			errorCode = "gateway_timeout"
+			errorDetail = "gateway request budget exceeded"
+			logger.Warn("stream cut by gateway total request budget",
+				"model", publicModel, "key_id", authCtx.KeyID,
+				"elapsed_ms", time.Since(start).Milliseconds(),
+				"error", err)
+		}
+		if !errors.Is(r.Context().Err(), context.DeadlineExceeded) {
+			switch {
+			case errors.Is(err, rosetta.ErrStreamTruncated):
+				status = store.UsageStatusTruncated
+				errorCode = "stream_truncated"
+				logger.Warn("stream truncated", "model", publicModel, "key_id", authCtx.KeyID, "error", err)
+			case errors.Is(err, rosetta.ErrStreamOverflow):
+				status = store.UsageStatusOverflow
+				errorCode = "stream_overflow"
+				logger.Error("stream overflow", "model", publicModel, "key_id", authCtx.KeyID, "error", err)
+			case IsClientGone(ctx, err):
+				// 客户端主动断开不是上游故障。此前一律记 error，后果是：后台错误率虚高、
+				// 成功率虚低，且真故障被 ERROR 噪音淹没。单独一个取值才能把两者分开。
+				status = store.UsageStatusCanceled
+				logger.Info("client disconnected mid-stream", "model", publicModel, "key_id", authCtx.KeyID, "error", err)
+			default:
+				status = store.UsageStatusError
+				errorCode = "upstream_error"
+				errorDetail = outwire.UpstreamErrorDetail(err)
+				logger.Error("stream error", "error", err, "model", publicModel, "key_id", authCtx.KeyID)
+			}
 		}
 	} else if idleTimedOut.Load() && !sink.SawTerminal() {
 		status = store.UsageStatusTruncated
@@ -1109,58 +1276,69 @@ func (h *Handler) attemptStream(w http.ResponseWriter, r *http.Request, client *
 			"note", "客户端中断时上游不发终止事件，usage 无从得知；按已收内容折算下界")
 	}
 
-	h.usage.Record(&store.UsageRecord{
-		ID:              newID(),
-		AccessKeyID:     authCtx.KeyID,
-		UserID:          authCtx.UserID,
-		RequestID:       httpx.RequestIDFromContext(r.Context()),
-		PublicModel:     publicModel,
-		ProviderID:      cand.Provider.ID,
-		UpstreamModel:   cand.UpstreamModel.ModelID,
-		IngressProtocol: codec.Name(),
-		Stream:          true,
-		InputTokens:     lastUsage.InputTokens,
-		OutputTokens:    lastUsage.OutputTokens,
-		TotalTokens:     lastUsage.TotalTokens,
-		ReasoningTokens: lastUsage.ReasoningTokens,
-		CachedTokens:    lastUsage.CachedInputTokens,
-		UsageState:      usageStateFor(lastUsage),
-		Status:          status,
-		HTTPStatus:      httpStatus,
-		ErrorCode:       errorCode,
-		ErrorDetail:     errorDetail,
-		LatencyMs:       latency,
-		TTFBMs:          ttfbMs,
+	// 配额预占的释放挂到落库之后（2026-10-22 修 A8-P1-1 / 汇总 M0）。
+	// 先 Record 再 Commit 会让「预占已退、usage 还没落库」成为一个真实窗口：
+	// 并发的下一个请求读不到本次用量，能多占一份额度。
+	h.usage.RecordWithCallback(&store.UsageRecord{
+		ID:                   newID(),
+		AccessKeyID:          authCtx.KeyID,
+		UserID:               authCtx.UserID,
+		RequestID:            httpx.RequestIDFromContext(r.Context()),
+		PublicModel:          publicModel,
+		ProviderID:           cand.Provider.ID,
+		UpstreamModel:        cand.UpstreamModel.ModelID,
+		IngressProtocol:      codec.Name(),
+		Stream:               true,
+		InputTokens:          lastUsage.InputTokens,
+		OutputTokens:         lastUsage.OutputTokens,
+		TotalTokens:          lastUsage.TotalTokens,
+		ReasoningTokens:      lastUsage.ReasoningTokens,
+		CachedTokens:         lastUsage.CachedInputTokens,
+		CachedCreationTokens: lastUsage.CachedCreationTokens,
+		UsageState:           usageStateFor(lastUsage),
+		Status:               status,
+		HTTPStatus:           httpStatus,
+		ErrorCode:            errorCode,
+		ErrorDetail:          errorDetail,
+		LatencyMs:            latency,
+		TTFBMs:               ttfbMs,
 		// 流式已提交后的断流无法再转移，但「打到了哪个目标、为什么断」
 		// 仍需可查。成功时留 ok，断流留对应状态。
 		RouteTrace: strings.Join(AppendRouteTrace(priorTrace, len(priorTrace)+1, cand, StreamCommitOutcome(status), errorCode), "; "),
+	}, func() {
+		// 收尾按「usage 是否已知」分两条（2026-10-07 修复的 P1-3）：
+		//   - 已知：全量收尾 —— TPM 以真实 usage（输入+输出）替换估算值，
+		//     配额预占退回。
+		//   - missing（上游没报任何 token 数）：**只退配额预占，TPM 预占故意保留**。
+		//     commit(0) 会全额退还 TPM 预占，等于不报用量的上游完全绕过 TPM；
+		//     保留估算值让限速继续约束这类流量，估算值随窗口翻转自然清零。
+		//     但配额预占不能跟着一起跳过 —— 它是终身累计，预占按 max_tokens 全额
+		//     计，不退就等于每次 missing 请求永久吃掉数万 token 额度（修复前整个
+		//     commit 被跳过的正是这条路径）。
+		//
+		// 客户端中断的路径在上一步已经被兜底成「有 usage 了」（partialOutRunes>0
+		// 时），所以走的是上面那条「已知」分支：TPM 按保守下界校正，
+		// 终身配额的预占被**消耗**掉一部分（触发器按 total_tokens 累加），
+		// 而不再全额退回 —— 那正是「点停止 = 免费刷上游 token」这条通道。
+		if !lastUsage.IsZero() {
+			rate.Commit(lastUsage.TotalTokens)
+		} else {
+			rate.ReleaseQuota()
+		}
 	})
-	// 收尾按「usage 是否已知」分两条（2026-10-07 修复的 P1-3）：
-	//   - 已知：全量收尾 —— TPM 以真实 usage（输入+输出）替换估算值，
-	//     配额预占退回。
-	//   - missing（上游没报任何 token 数）：**只退配额预占，TPM 预占故意保留**。
-	//     commit(0) 会全额退还 TPM 预占，等于不报用量的上游完全绕过 TPM；
-	//     保留估算值让限速继续约束这类流量，估算值随窗口翻转自然清零。
-	//     但配额预占不能跟着一起跳过 —— 它是终身累计，预占按 max_tokens 全额
-	//     计，不退就等于每次 missing 请求永久吃掉数万 token 额度（修复前整个
-	//     commit 被跳过的正是这条路径）。
-	//
-	// 客户端中断的路径在上一步已经被兜底成「有 usage 了」（partialOutRunes>0
-	// 时），所以走的是上面那条「已知」分支：TPM 按保守下界校正，
-	// 终身配额的预占被**消耗**掉一部分（触发器按 total_tokens 累加），
-	// 而不再全额退回 —— 那正是「点停止 = 免费刷上游 token」这条通道。
-	if !lastUsage.IsZero() {
-		rate.Commit(lastUsage.TotalTokens)
-	} else {
-		rate.ReleaseQuota()
-	}
 	// committed=true（字节已写出、无法回退换目标）与「这一次算成功」是两件事：
 	// truncated / overflow / error / canceled 都已提交，但对上游而言是失败。
 	// 只有 status=="ok" 才允许外层记成功，否则「先200 再断流」这类最常见的
 	// 上游故障永远不累计失败、目标永不熔断。
 	// clientGone 只给「客户端自己走了」的那一种：它不该计入熔断计数
 	// （见 Outcome.ClientGone）。
-	return Outcome{Committed: true, Success: status == "ok", ClientGone: status == "canceled"}
+	return Outcome{
+		Committed:         true,
+		Success:           status == "ok",
+		ClientGone:        status == "canceled",
+		NoUpstreamPenalty: status == store.UsageStatusOverflow,
+		GatewayTimeout:    status == store.UsageStatusTimeout,
+	}
 }
 
 // priorTrace 的含义与 attemptStream 相同：提交后的落库在这里发生，
@@ -1179,11 +1357,12 @@ func (h *Handler) attemptNonStream(w http.ResponseWriter, r *http.Request, clien
 	// 绑定 r.Context() 而非 context.Background()：客户端断开时上游调用应随之取消，
 	// 否则断连请求会一直占用上游连接与配额直到超时（默认 120s）。
 	ctx, cancel := context.WithTimeout(r.Context(), NonStreamTimeout(snap, h.cfg))
+	ctx = withPromptCacheAffinity(ctx, ing, cand, conversationSessionID(r))
 	defer cancel()
 
 	resp, err := client.Chat(ctx, upstreamReq)
 	if err != nil {
-		return OutcomeFromErr(err)
+		return OutcomeFromErrCtx(r.Context(), err)
 	}
 
 	// 非流式响应一次性返回，拿不到"首字"这一独立时刻，用响应到达时刻近似（≈总耗时）。
@@ -1192,35 +1371,37 @@ func (h *Handler) attemptNonStream(w http.ResponseWriter, r *http.Request, clien
 
 	codec.WriteNonStream(w, resp, publicModel, ing)
 
-	h.usage.Record(&store.UsageRecord{
-		ID:              newID(),
-		AccessKeyID:     authCtx.KeyID,
-		UserID:          authCtx.UserID,
-		RequestID:       httpx.RequestIDFromContext(r.Context()),
-		PublicModel:     publicModel,
-		ProviderID:      cand.Provider.ID,
-		UpstreamModel:   cand.UpstreamModel.ModelID,
-		IngressProtocol: codec.Name(),
-		Stream:          false,
-		InputTokens:     resp.Usage.InputTokens,
-		OutputTokens:    resp.Usage.OutputTokens,
-		TotalTokens:     resp.Usage.TotalTokens,
-		ReasoningTokens: resp.Usage.ReasoningTokens,
-		CachedTokens:    resp.Usage.CachedInputTokens,
-		UsageState:      usageStateFor(resp.Usage),
-		Status:          store.UsageStatusOK,
-		HTTPStatus:      200,
-		LatencyMs:       latency,
-		TTFBMs:          ttfbMs,
-		RouteTrace:      strings.Join(AppendRouteTrace(priorTrace, len(priorTrace)+1, cand, "ok", ""), "; "),
+	h.usage.RecordWithCallback(&store.UsageRecord{
+		ID:                   newID(),
+		AccessKeyID:          authCtx.KeyID,
+		UserID:               authCtx.UserID,
+		RequestID:            httpx.RequestIDFromContext(r.Context()),
+		PublicModel:          publicModel,
+		ProviderID:           cand.Provider.ID,
+		UpstreamModel:        cand.UpstreamModel.ModelID,
+		IngressProtocol:      codec.Name(),
+		Stream:               false,
+		InputTokens:          resp.Usage.InputTokens,
+		OutputTokens:         resp.Usage.OutputTokens,
+		TotalTokens:          resp.Usage.TotalTokens,
+		ReasoningTokens:      resp.Usage.ReasoningTokens,
+		CachedTokens:         resp.Usage.CachedInputTokens,
+		CachedCreationTokens: resp.Usage.CachedCreationTokens,
+		UsageState:           usageStateFor(resp.Usage),
+		Status:               store.UsageStatusOK,
+		HTTPStatus:           200,
+		LatencyMs:            latency,
+		TTFBMs:               ttfbMs,
+		RouteTrace:           strings.Join(AppendRouteTrace(priorTrace, len(priorTrace)+1, cand, "ok", ""), "; "),
+	}, func() {
+		// 收尾口径与 attemptStream 一致（见该处的注释）：usage 已知 → 全量收尾；
+		// missing → 只退配额预占，TPM 预占保留（窗口自愈）。
+		if !resp.Usage.IsZero() {
+			rate.Commit(resp.Usage.TotalTokens)
+		} else {
+			rate.ReleaseQuota()
+		}
 	})
-	// 收尾口径与 attemptStream 一致（见该处的注释）：usage 已知 → 全量收尾；
-	// missing → 只退配额预占，TPM 预占保留（窗口自愈）。
-	if !resp.Usage.IsZero() {
-		rate.Commit(resp.Usage.TotalTokens)
-	} else {
-		rate.ReleaseQuota()
-	}
 	// 非流式能走到这里就意味着上游完整返回了响应 —— 一定是成功。
 	// 漏写 Success 会让每次非流式成功都被外层记成「目标失败」，
 	// 健康的链首目标 3 个请求后就被误熔断（详见 Outcome.Success）。

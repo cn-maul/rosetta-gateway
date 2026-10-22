@@ -444,13 +444,20 @@ function lineNote(name: string): string {
                   {{ priceCell(priceOf(m)?.price_output) }}
                 </span>
               </div>
-              <!-- 「其中:缓存命中」这个前缀不能省：三档并排会让人以为
-                   「三项相加 = 总输入成本」，而缓存命中其实是**输入的一部分**
-                   （两个上游协议里 cached 都 ⊆ input），它是命中时的**折扣价**。 -->
+              <!-- 「其中:」这个前缀不能省：几档并排会让人以为
+                   「各项相加 = 总输入成本」，而缓存命中/写入其实是**输入的一部分**
+                   （两个上游协议里 cached 与 creation 都 ⊆ input），它们是同一批
+                   输入 token 在不同状态下的单价。 -->
               <div class="price-row">
                 <span class="price-lab">其中:缓存命中</span>
                 <span class="price-val mono" :class="{ unset: (priceOf(m)?.price_cache_hit ?? 0) <= 0 && (priceOf(m)?.price_input ?? 0) <= 0 }">
                   {{ cacheUnitPrice(priceOf(m)?.price_input ?? 0, priceOf(m)?.price_cache_hit ?? 0) }}
+                </span>
+              </div>
+              <div class="price-row">
+                <span class="price-lab">其中:缓存写入</span>
+                <span class="price-val mono" :class="{ unset: (priceOf(m)?.price_cache_creation ?? 0) <= 0 && (priceOf(m)?.price_input ?? 0) <= 0 }">
+                  {{ cacheUnitPrice(priceOf(m)?.price_input ?? 0, priceOf(m)?.price_cache_creation ?? 0) }}
                 </span>
               </div>
             </div>

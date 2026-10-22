@@ -240,9 +240,15 @@ func (s *Store) AdjustBalanceWithLedger(ctx context.Context, userID string, delt
 	// 「先扣账再清账本」在自动提交下曾被当作可接受的取舍（宁可多扣一次
 	// 也不漏收），但那个取舍的前提是「没有并发」—— 有了并发，同一笔欠款
 	// 会被扣 N 次（N = 并发充值数），那不是「多扣一次」，是「按并发度多收」。
-	if err := s.settlePendingForUser(ctx, tx, userID); err != nil {
+	settledCents, err := s.settlePendingForUser(ctx, tx, userID)
+	if err != nil {
 		return Topup{}, err
 	}
+	// 流水里的 balance_after 必须是**结转之后**的真实余额（2026-10-22 修
+	// 汇总 *X3）。上面的 RETURNING 拿到的是「刚加上这次充值」的余额；
+	// 结转欠款会立刻把它扣掉一部分，不减去 settledCents 就会记下一个
+	// 比用户实际余额更高的数 —— 对账时看起来像凭空多了一笔钱。
+	after -= settledCents
 
 	t := Topup{
 		ID:           generateTopupID(),

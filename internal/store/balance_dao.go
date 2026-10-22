@@ -373,6 +373,80 @@ func (s *Store) ChargeBalance(ctx context.Context, userID string, amountYuan flo
 	return tx.Commit()
 }
 
+// BalanceCharge is one idempotent charge request in a batch.
+type BalanceCharge struct {
+	UserID     string
+	AmountYuan float64
+	RequestID  string
+}
+
+// ChargeBalances applies a batch of idempotent balance charges in one write
+// transaction. Per-record insufficient-balance outcomes are returned in the
+// result slice; infrastructure errors abort the whole transaction and return
+// an error so the caller can fall back to the per-record path.
+func (s *Store) ChargeBalances(ctx context.Context, charges []BalanceCharge) ([]error, error) {
+	errs := make([]error, len(charges))
+	if len(charges) == 0 {
+		return errs, nil
+	}
+
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = tx.Rollback() }() //nolint:errcheck // already committed is a no-op
+
+	for i, charge := range charges {
+		if charge.UserID == "" {
+			errs[i] = ErrNotFound
+			continue
+		}
+		if charge.AmountYuan <= 0 {
+			continue
+		}
+		chargeKey := charge.RequestID
+		if chargeKey == "" {
+			chargeKey = generateChargeKey()
+		}
+
+		sp := fmt.Sprintf("charge_batch_%d", i)
+		if _, err := tx.ExecContext(ctx, `SAVEPOINT `+sp); err != nil {
+			return nil, err
+		}
+		_, err := s.chargeBalanceTx(ctx, tx, charge.UserID, charge.AmountYuan, chargeKey)
+		if errors.Is(err, ErrInsufficientBalance) {
+			if _, rerr := tx.ExecContext(ctx, `ROLLBACK TO `+sp); rerr != nil {
+				return nil, rerr
+			}
+			if _, rerr := tx.ExecContext(ctx, `RELEASE `+sp); rerr != nil {
+				return nil, rerr
+			}
+			if perr := s.recordPendingRemainderTx(ctx, tx, chargeKey, charge.UserID,
+				YuanToMicros(charge.AmountYuan)); perr != nil {
+				return nil, perr
+			}
+			errs[i] = ErrInsufficientBalance
+			continue
+		}
+		if err != nil {
+			return nil, err
+		}
+		if _, err := tx.ExecContext(ctx, `RELEASE `+sp); err != nil {
+			return nil, err
+		}
+		if _, err := tx.ExecContext(ctx,
+			`DELETE FROM balance_pending WHERE request_id = ? AND user_id = ?`,
+			chargeKey, charge.UserID); err != nil {
+			return nil, err
+		}
+	}
+
+	if err := tx.Commit(); err != nil {
+		return nil, err
+	}
+	return errs, nil
+}
+
 // chargeBalanceTx 是 ChargeBalance 的事务内实现。
 //
 // # 为什么要把它从 ChargeBalance 里拆出来（2026-10-21 修 P0-5）
@@ -705,7 +779,7 @@ type pendingRow struct {
 //
 // 充值是结清时刻，与 balance_remainder 的「攒够才扣」不同 —— 留着它永远
 // 不足一分、永远扣不出去，那是纯粹的泄漏。
-func (s *Store) settlePendingForUser(ctx context.Context, tx *sql.Tx, userID string) error {
+func (s *Store) settlePendingForUser(ctx context.Context, tx *sql.Tx, userID string) (int64, error) {
 	// 读账本：既要总额，也要**具体哪些行**（用于精确删）。
 	//
 	// 不用 SUM 而用逐行读：精确删行需要行标识，而 SUM 拿不到。
@@ -716,7 +790,7 @@ func (s *Store) settlePendingForUser(ctx context.Context, tx *sql.Tx, userID str
 		 ORDER BY ts, request_id`,
 		userID)
 	if err != nil {
-		return fmt.Errorf("read pending: %w", err)
+		return 0, fmt.Errorf("read pending: %w", err)
 	}
 	var items []pendingRow
 	var totalMicros int64
@@ -724,17 +798,17 @@ func (s *Store) settlePendingForUser(ctx context.Context, tx *sql.Tx, userID str
 		var it pendingRow
 		if err := rows.Scan(&it.requestID, &it.micros, &it.userID); err != nil {
 			rows.Close()
-			return fmt.Errorf("scan pending: %w", err)
+			return 0, fmt.Errorf("scan pending: %w", err)
 		}
 		items = append(items, it)
 		totalMicros += it.micros
 	}
 	rows.Close()
 	if err := rows.Err(); err != nil {
-		return fmt.Errorf("iterate pending: %w", err)
+		return 0, fmt.Errorf("iterate pending: %w", err)
 	}
 	if len(items) == 0 || totalMicros <= 0 {
-		return nil
+		return 0, nil
 	}
 
 	// 扣款前的余额。
@@ -752,19 +826,19 @@ func (s *Store) settlePendingForUser(ctx context.Context, tx *sql.Tx, userID str
 			// 核销掉，不报错 —— 否则一笔历史欠款能永久挡住充值。
 			s.logger.Warn("settle pending: user not found, dropping orphan pending rows",
 				"user_id", userID, "rows", len(items))
-			return s.deletePendingRows(ctx, tx, items)
+			return 0, s.deletePendingRows(ctx, tx, items)
 		}
-		return fmt.Errorf("read balance for settle: %w", err)
+		return 0, fmt.Errorf("read balance for settle: %w", err)
 	}
 
 	if !balance.Valid {
 		// 不限额 → 核销（P0-3：绝不把 NULL 写成有限额）。
 		if err := s.deletePendingRows(ctx, tx, items); err != nil {
-			return err
+			return 0, err
 		}
 		s.logger.Info("settle pending: unlimited user, pending rows dropped",
 			"user_id", userID, "rows", len(items), "micros", totalMicros)
-		return nil
+		return 0, nil
 	}
 
 	cents := totalMicros / MicrosPerCent
@@ -784,7 +858,7 @@ func (s *Store) settlePendingForUser(ctx context.Context, tx *sql.Tx, userID str
 				`UPDATE users SET balance_cents = MAX(0, balance_cents - ?), updated_at = ?
 				  WHERE id = ? AND balance_cents IS NOT NULL`,
 				deduct, time.Now().UnixMilli(), userID); err != nil {
-				return fmt.Errorf("settle pending: %w", err)
+				return 0, fmt.Errorf("settle pending: %w", err)
 			}
 		}
 		// 扣光的部分核销，**扣不动的那部分留在账本里**。
@@ -809,21 +883,21 @@ func (s *Store) settlePendingForUser(ctx context.Context, tx *sql.Tx, userID str
 					`UPDATE balance_pending SET amount_micros = amount_micros - ?
 					  WHERE request_id = ? AND user_id = ?`,
 					budget, it.requestID, userID); err != nil {
-					return fmt.Errorf("settle pending partial: %w", err)
+					return 0, fmt.Errorf("settle pending partial: %w", err)
 				}
 				budget = 0
 			}
 		}
 		if len(settled) > 0 {
 			if err := s.deletePendingRows(ctx, tx, settled); err != nil {
-				return err
+				return 0, err
 			}
 		}
-		return nil
+		return deduct, nil
 	}
 
 	// 总额不足一分：直接核销（充值是结清时刻，见函数头说明）。
-	return s.deletePendingRows(ctx, tx, items)
+	return 0, s.deletePendingRows(ctx, tx, items)
 }
 
 // deletePendingRows 精确删除给定的那几行 pending。

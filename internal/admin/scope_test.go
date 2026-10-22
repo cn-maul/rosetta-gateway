@@ -582,6 +582,35 @@ func TestLogin_NoUserEnumeration(t *testing.T) {
 	}
 }
 
+// 登录必须拒绝跨站 Origin（2026-10-22 修 A7-14）。
+//
+// 登录响应会写会话 Cookie。若同站不同源的页面能把受害者登进攻击者账号，
+// 受害者后续在该账号下的操作都会落进攻击者可见的范围（login CSRF）。
+// 非浏览器客户端不带 Origin/Sec-Fetch-Site，仍应正常放行。
+func TestLogin_RejectsCrossOriginRequest(t *testing.T) {
+	st := newScopeStore(t)
+	seedTwoUsers(t, st)
+	h := NewUserHandler(st, newTestManager(t))
+
+	body := strings.NewReader(`{"username":"alice","password":"wrong-password"}`)
+	req := jsonRequest(http.MethodPost, "/admin/api/login", body)
+	req.Header.Set("Origin", "http://evil.example")
+
+	rec := httptest.NewRecorder()
+	h.Login(rec, req)
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("cross-origin login status = %d, want 403", rec.Code)
+	}
+
+	// 无 Origin 的非浏览器客户端不应被误伤。
+	rec = httptest.NewRecorder()
+	h.Login(rec, jsonRequest(http.MethodPost, "/admin/api/login",
+		strings.NewReader(`{"username":"alice","password":"wrong-password"}`)))
+	if rec.Code == http.StatusForbidden {
+		t.Fatalf("non-browser login must not be rejected as cross-origin")
+	}
+}
+
 // loginThrottled 用某个用户名连打若干次错密码，返回最后一次的 (code, msg)。
 func loginThrottled(t *testing.T, h *UserHandler, username string, times int, remoteAddr string) (int, string) {
 	t.Helper()

@@ -443,7 +443,7 @@ watch([priceProvider, priceSearch], () => {
 })
 
 function isPriced(m: UpstreamModel): boolean {
-  return m.price_input > 0 || m.price_cache_hit > 0 || m.price_output > 0
+  return m.price_input > 0 || m.price_cache_hit > 0 || m.price_cache_creation > 0 || m.price_output > 0
 }
 
 // 单价单元格：条目里的某一档没填（如缓存命中留空=按输入价计）时写「未配置」，
@@ -494,6 +494,7 @@ const pForm = reactive({
   modelId: '',
   price_input: 0,
   price_cache_hit: 0,
+  price_cache_creation: 0,
   price_output: 0,
   saving: false,
 })
@@ -517,6 +518,7 @@ function resetPriceForm() {
   pForm.modelId = ''
   pForm.price_input = 0
   pForm.price_cache_hit = 0
+  pForm.price_cache_creation = 0
   pForm.price_output = 0
 }
 
@@ -537,6 +539,7 @@ function openEditPrice(r: PriceRow) {
   pForm.modelId = r.model.id
   pForm.price_input = r.model.price_input
   pForm.price_cache_hit = r.model.price_cache_hit
+  pForm.price_cache_creation = r.model.price_cache_creation
   pForm.price_output = r.model.price_output
   pForm.open = true
 }
@@ -552,14 +555,15 @@ async function savePrice() {
   const body = {
     price_input: Number(pForm.price_input) || 0,
     price_cache_hit: Number(pForm.price_cache_hit) || 0,
+    price_cache_creation: Number(pForm.price_cache_creation) || 0,
     price_output: Number(pForm.price_output) || 0,
   }
-  if (body.price_input < 0 || body.price_cache_hit < 0 || body.price_output < 0) {
+  if (body.price_input < 0 || body.price_cache_hit < 0 || body.price_cache_creation < 0 || body.price_output < 0) {
     toast('单价不能为负数', 'err')
     return
   }
-  // 三项全 0 = 不生成条目（列表里不会出现该行），属于「什么都没填」而不是有效价格。
-  if (body.price_input === 0 && body.price_cache_hit === 0 && body.price_output === 0) {
+  // 四项全 0 = 不生成条目（列表里不会出现该行），属于「什么都没填」而不是有效价格。
+  if (body.price_input === 0 && body.price_cache_hit === 0 && body.price_cache_creation === 0 && body.price_output === 0) {
     toast('至少填写一项单价', 'err')
     return
   }
@@ -576,7 +580,7 @@ async function savePrice() {
   }
 }
 
-// 删除价格：行内按钮与编辑弹窗共用。确认后把三项单价清零（= 未配置）。
+// 删除价格：行内按钮与编辑弹窗共用。确认后把四项单价清零（= 未配置）。
 //
 // 文案必须说清「只影响以后」：历史费用在落库时已按当时的价固化，删价不会
 // 把已经算好的金额抹掉。写成「该模型的用量按 0 元计」会让人以为历史费用
@@ -590,7 +594,7 @@ async function deletePrice(modelId: string, label: string): Promise<boolean> {
   })
   if (!ok) return false
   try {
-    await api.updateModel(modelId, { price_input: 0, price_cache_hit: 0, price_output: 0 })
+    await api.updateModel(modelId, { price_input: 0, price_cache_hit: 0, price_cache_creation: 0, price_output: 0 })
     toast('价格已删除')
     return true
   } catch (e) {
@@ -612,9 +616,9 @@ async function clearPrice(r: PriceRow) {
 const priceSelected = ref(new Set<string>())
 const batchOpen = ref(false)
 const batchSaving = ref(false)
-// 批量弹窗里的三个价格输入。以「当前勾选的第一行」的价格为初值，方便
+// 批量弹窗里的四个价格输入。以「当前勾选的第一行」的价格为初值，方便
 // 「复制到其它模型」的流程 —— 用户点某行「复制到…」时，这里预填的就是那行的价。
-const batchForm = reactive({ price_input: 0, price_cache_hit: 0, price_output: 0 })
+const batchForm = reactive({ price_input: 0, price_cache_hit: 0, price_cache_creation: 0, price_output: 0 })
 
 function isPriceSelected(id: string): boolean {
   return priceSelected.value.has(id)
@@ -729,6 +733,7 @@ function openBatchPrice(seedRow?: PriceRow) {
   }
   batchForm.price_input = seed.model.price_input
   batchForm.price_cache_hit = seed.model.price_cache_hit
+  batchForm.price_cache_creation = seed.model.price_cache_creation
   batchForm.price_output = seed.model.price_output
   // 筛选重置到「全部」：来源行可能来自某个供应商筛选下，直接沿用会让
   // 用户在弹窗里看不到其它供应商的模型（而跨供应商复制正是主要用途）。
@@ -752,14 +757,15 @@ async function saveBatchPrice() {
   const body = {
     price_input: Number(batchForm.price_input) || 0,
     price_cache_hit: Number(batchForm.price_cache_hit) || 0,
+    price_cache_creation: Number(batchForm.price_cache_creation) || 0,
     price_output: Number(batchForm.price_output) || 0,
   }
-  if (body.price_input < 0 || body.price_cache_hit < 0 || body.price_output < 0) {
+  if (body.price_input < 0 || body.price_cache_hit < 0 || body.price_cache_creation < 0 || body.price_output < 0) {
     toast('单价不能为负数', 'err')
     return
   }
-  // 三项全 0 = 清除价格。这里不拦（批量清除是合法动作），但确认文案要讲清。
-  const clearing = body.price_input === 0 && body.price_cache_hit === 0 && body.price_output === 0
+  // 四项全 0 = 清除价格。这里不拦（批量清除是合法动作），但确认文案要讲清。
+  const clearing = body.price_input === 0 && body.price_cache_hit === 0 && body.price_cache_creation === 0 && body.price_output === 0
   // 确认框里列出前几个模型名：跨供应商批量改价最容易勾错行，名字是唯一
   // 能让用户在点确认前核对「到底要改谁」的信息。
   const preview = targets
@@ -1283,6 +1289,7 @@ onMounted(() => {
                 <th>模型</th>
                 <th class="num-h">输入（元/1M）</th>
                 <th class="num-h">缓存命中（元/1M）</th>
+                <th class="num-h">缓存写入（元/1M）</th>
                 <th class="num-h">输出（元/1M）</th>
                 <th class="c-op">操作</th>
               </tr>
@@ -1305,6 +1312,9 @@ onMounted(() => {
                 </td>
                 <td class="num-h" :class="{ unset: r.model.price_cache_hit <= 0 && r.model.price_input <= 0 }">
                   {{ cacheUnitPrice(r.model.price_input, r.model.price_cache_hit) }}
+                </td>
+                <td class="num-h" :class="{ unset: r.model.price_cache_creation <= 0 && r.model.price_input <= 0 }">
+                  {{ cacheUnitPrice(r.model.price_input, r.model.price_cache_creation) }}
                 </td>
                 <td class="num-h" :class="{ unset: r.model.price_output <= 0 }">
                   {{ priceCell(r.model.price_output) }}
@@ -1412,7 +1422,18 @@ onMounted(() => {
               placeholder="0 = 同输入价" id="cgw-lSettings-14"/>
             <span class="tip">留空/填 0 时按输入价计</span>
           </div>
-          <div class="field span2">
+          <div class="field">
+            <label for="cgw-lSettings-19">缓存写入价格（元/1M）</label>
+            <input
+              v-model.number="pForm.price_cache_creation"
+              class="input num"
+              type="number"
+              min="0"
+              step="0.001"
+              placeholder="0 = 同输入价" id="cgw-lSettings-19"/>
+            <span class="tip">Anthropic cache creation；留空/填 0 时按输入价计</span>
+          </div>
+          <div class="field">
             <label for="cgw-lSettings-15">输出价格（元/1M）</label>
             <input
               v-model.number="pForm.price_output"
@@ -1485,7 +1506,7 @@ onMounted(() => {
               </div>
             </div>
             <span class="tip">
-              含未配价的模型 —— 一次把同一批模型的价格配齐。三项全 0 = 清除价格。
+              含未配价的模型 —— 一次把同一批模型的价格配齐。四项全 0 = 清除价格。
             </span>
           </div>
           <div class="field">
@@ -1508,7 +1529,17 @@ onMounted(() => {
               step="0.001"
               placeholder="0 = 同输入价" id="cgw-lSettings-17"/>
           </div>
-          <div class="field span2">
+          <div class="field">
+            <label for="cgw-lSettings-20">缓存写入价格（元/1M）</label>
+            <input
+              v-model.number="batchForm.price_cache_creation"
+              class="input num"
+              type="number"
+              min="0"
+              step="0.001"
+              placeholder="0 = 同输入价" id="cgw-lSettings-20"/>
+          </div>
+          <div class="field">
             <label for="cgw-lSettings-18">输出价格（元/1M）</label>
             <input
               v-model.number="batchForm.price_output"
@@ -1517,7 +1548,7 @@ onMounted(() => {
               min="0"
               step="0.001"
               placeholder="0 = 不计费" id="cgw-lSettings-18"/>
-            <span class="tip">三项全填 0 = 清除这些模型的价格（不是设为免费）</span>
+            <span class="tip">四项全填 0 = 清除这些模型的价格（不是设为免费）</span>
           </div>
         </div>
         <div class="form-actions">

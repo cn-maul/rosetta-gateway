@@ -85,7 +85,8 @@ func buildHarnessProtocols(t *testing.T, chain []harnessChain, failover bool, co
 		ri.AddUpstreamModel(&routing.UpstreamModel{ID: c.slug + "/m", ProviderID: c.slug, ModelID: c.slug + "-model"})
 		targets = append(targets, &routing.Target{
 			ID: c.slug + "#t" + string(rune('0'+i)), RouteID: "r1",
-			ProviderID: c.slug, UpstreamModelID: c.slug + "/m", Position: i})
+			ProviderID: c.slug, UpstreamModelID: c.slug + "/m", Position: i,
+			Enabled: true})
 	}
 	ri.AddRoute(&routing.Route{
 		ID: "r1", PublicName: "flash",

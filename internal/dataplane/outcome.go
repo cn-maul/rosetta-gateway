@@ -63,7 +63,18 @@ type Outcome struct {
 	// ctx.Err() 也是 DeadlineExceeded —— 与用户点「停止」在那一刻无法区分。
 	// 旧实现只按「Committed 且非 ok」一律记目标失败，于是连点三次停止就把
 	// 健康目标熔断 60 秒；预算到期同样被误记成上游故障。
-	ClientGone         bool
+	ClientGone bool
+	// NoUpstreamPenalty marks a committed failure caused by a gateway-local
+	// limit rather than upstream behavior. The most important case is
+	// ErrStreamOverflow: the SDK's in-memory accumulator hit its cap, so the
+	// target must not be cooled down or circuit-broken for it.
+	NoUpstreamPenalty bool
+	// GatewayTimeout marks a failure caused by the gateway's own total request
+	// budget expiring, not by the upstream. It must not cool a credential or
+	// count toward target circuit-breaking, and it must not trigger failover:
+	// the shared deadline is already gone, so trying another target can only
+	// consume the remaining budget of a request that is already over.
+	GatewayTimeout     bool
 	Eligible           bool
 	CredentialCooldown time.Duration
 	StatusCode         int
@@ -117,6 +128,26 @@ func OutcomeFromErr(err error) Outcome {
 		Message:            message,
 		Detail:             outwire.UpstreamErrorDetail(err),
 	}
+}
+
+// OutcomeFromErrCtx 在 OutcomeFromErr 之上区分「网关总预算到期」。
+//
+// 预算挂在请求 ctx 上（见 handleIngress 的 WithTimeout），到期时上游调用
+// 同样会以 TransportError / context.DeadlineExceeded 的形式失败。只看错误
+// 类型会把「网关自己没来得及跑完」记成「上游坏了」：一次总预算到期就让
+// 凭据冷却 60s、目标熔断计数 +1，连续三次就把健康目标熔断 —— 而真正
+// 需要调整的是网关的超时/负载。
+func OutcomeFromErrCtx(ctx context.Context, err error) Outcome {
+	out := OutcomeFromErr(err)
+	if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+		out.GatewayTimeout = true
+		out.Eligible = false
+		out.CredentialCooldown = 0
+		out.StatusCode = http.StatusGatewayTimeout
+		out.Code = "gateway_timeout"
+		out.Message = "gateway request budget exceeded"
+	}
+	return out
 }
 
 // IsClientGone 判断一次流式中断是否源于**客户端**断开，而不是上游故障。

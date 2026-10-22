@@ -523,6 +523,18 @@ func TestResponses_PreviousResponseIDForwarded(t *testing.T) {
 	}
 }
 
+func TestResponses_PromptCacheKeyForwarded(t *testing.T) {
+	a := decodeResponses(t, `{"model":"m","input":"hi",
+		"prompt_cache_key":"conversation-42"}`)
+
+	req := a.ToRosetta()
+	a.ApplyUpstreamExtras(req, "response")
+
+	if got := req.Extra["prompt_cache_key"]; got != "conversation-42" {
+		t.Fatalf("prompt_cache_key 未透传：%v", got)
+	}
+}
+
 // role 缺失的 message 项里，output_text 不得被当成用户输入。
 //
 // 修复前 default 分支取 input_text 与 output_text 的并集，于是模型自己的

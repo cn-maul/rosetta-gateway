@@ -53,6 +53,26 @@ type Config struct {
 	// 拒绝启动。低熵密钥保护的是**全部上游 API key**，拿到数据库的人可以
 	// 离线字典爆破，所以对安全要求高的部署点应该显式打开这个开关。
 	RequireStrongMasterKey bool `json:"require_strong_master_key"`
+	// RequireTLSForPublicListen 把「公开监听但未声明 TLS」从告警升级为
+	// **拒绝启动**。
+	//
+	// # 为什么需要这个开关（2026-10-22 修 A10-P0-1 残留）
+	//
+	// 网关自身不做 TLS。监听在回环地址上时，明文 HTTP 的暴露面只有本机；
+	// 而监听在 0.0.0.0（或任何非回环地址）上时，同网段的被动观察者可以
+	// 完整截获管理员会话 cookie、JWT、上游凭据与下游 Authorization 头。
+	//
+	// 此前只有「README 里的部署建议」在提醒这件事，进程自己不会说一个字 ——
+	// 改了 listen 地址就悄悄变成不安全部署，没有日志、没有告警。
+	//
+	// 缺省 false = 只告警（保持既有行为）：大量部署点是「反代 + 0.0.0.0
+	// 监听」的组合，反代在同机做 TLS 终止，网关自己看到的仍是明文 ——
+	// 那种部署是**正确**的，直接改成硬失败等于让它们升级后起不来。
+	//
+	// 置 true 后：公开监听且 public_origin 的 scheme 不是 https 时，
+	// 进程拒绝启动。适合「网关直接暴露、或强制要求反代在别处终止 TLS」
+	// 的部署点。
+	RequireTLSForPublicListen bool `json:"require_tls_for_public_listen"`
 	// Timezone 是按天统计的日界时区（IANA 名，如 "Asia/Shanghai"）。
 	//
 	// # 为什么必须有这个字段（2026-10-09 修复的线上缺陷）
@@ -175,6 +195,19 @@ type Defaults struct {
 	StreamFirstTokenTimeoutMs int `json:"stream_first_token_timeout_ms"`
 	FailoverMaxTargets        int `json:"failover_max_targets"`
 	FailoverFailureThreshold  int `json:"failover_failure_threshold"`
+	// MaxConcurrentStreams 是同时允许的流式请求数上限。
+	//
+	// 0 = 用内置缺省（256）。达到上限后新来的流式请求会等待一个名额，
+	// 等不到就回 503（见 StreamAdmissionTimeoutMs）。
+	MaxConcurrentStreams int `json:"max_concurrent_streams"`
+	// StreamAdmissionTimeoutMs 是「等待流式并发名额」的最长等待时间（毫秒）。
+	//
+	// 超时就回 503 + Retry-After —— 过载是**可重试**的，快速失败比让
+	// 请求堆在网关里好得多（堆着的请求各占一个 goroutine、一个连接、
+	// 以及一份已预占的配额）。
+	//
+	// 0 = 用内置缺省（5000ms）。
+	StreamAdmissionTimeoutMs int `json:"stream_admission_timeout_ms"`
 }
 
 type Bootstrap struct {
@@ -332,6 +365,12 @@ func (c *Config) setDefaults() {
 	if c.Defaults.FailoverFailureThreshold == 0 {
 		c.Defaults.FailoverFailureThreshold = 3
 	}
+	if c.Defaults.MaxConcurrentStreams == 0 {
+		c.Defaults.MaxConcurrentStreams = 256
+	}
+	if c.Defaults.StreamAdmissionTimeoutMs == 0 {
+		c.Defaults.StreamAdmissionTimeoutMs = 5000
+	}
 	// 缺省沿用 store.DefaultRetentionDays 的值，避免两处默认值漂移。
 	if c.UsageRetentionDays == 0 {
 		c.UsageRetentionDays = 30
@@ -437,6 +476,13 @@ func (c *Config) validate() error {
 		// 熔断阈值过大等于永不熔断，故也加上界（1000 次连续失败足够）。
 		{"failover_max_targets", c.Defaults.FailoverMaxTargets, 1, 100},
 		{"failover_failure_threshold", c.Defaults.FailoverFailureThreshold, 1, 1000},
+		// 并发上限为 0 会让信号量退化成「永远拿不到名额」（无缓冲
+		// channel 的发送永远阻塞），而准入等待又会把它变成「所有流式
+		// 请求必然 503」。负值同理。上界 10000 足够任何真实部署。
+		{"max_concurrent_streams", c.Defaults.MaxConcurrentStreams, 1, 10000},
+		// 准入等待是时长：负值会让 time.NewTimer 立即开火（所有流式
+		// 请求秒 503），上界沿用 maxDurMillis。
+		{"stream_admission_timeout_ms", c.Defaults.StreamAdmissionTimeoutMs, 1, maxDurMillis},
 	} {
 		if f.val < f.min {
 			return fmt.Errorf("defaults.%s: must be >= %d, got %d", f.name, f.min, f.val)

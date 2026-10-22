@@ -42,6 +42,7 @@ const usageDailyRollupsDDL = `CREATE TABLE IF NOT EXISTS usage_daily_rollups (
 	input_tokens     INTEGER NOT NULL DEFAULT 0,
 	output_tokens    INTEGER NOT NULL DEFAULT 0,
 	cached_tokens    INTEGER NOT NULL DEFAULT 0,
+	cached_creation_tokens INTEGER NOT NULL DEFAULT 0,
 	reasoning_tokens INTEGER NOT NULL DEFAULT 0,
 	total_tokens     INTEGER NOT NULL DEFAULT 0,
 	-- 固化计价：不固化的话改价后历史费用永久算错。
@@ -262,7 +263,7 @@ func (s *Store) PruneOldUsage(ctx context.Context, keepDays int) (*PruneResult, 
 			     day, user_id, access_key_id, public_model, upstream_model, provider_id,
 			     ingress_protocol, stream,
 			     request_count, success_count, error_count,
-			     input_tokens, output_tokens, cached_tokens, reasoning_tokens, total_tokens,
+			     input_tokens, output_tokens, cached_tokens, cached_creation_tokens, reasoning_tokens, total_tokens,
 			     cost_total, latency_sum_ms, ttfb_sum_ms, ttfb_count,
 			     ok_ttfb_sum_ms, ok_ttfb_count,
 			     ok_output_tokens, ok_latency_sum_ms, ok_sample_count, cost_pending_count)
@@ -272,7 +273,8 @@ func (s *Store) PruneOldUsage(ctx context.Context, keepDays int) (*PruneResult, 
 			       COUNT(CASE WHEN status = 'ok' THEN 1 END),
 			       COUNT(CASE WHEN status NOT IN ('ok', 'canceled') THEN 1 END),
 			       COALESCE(SUM(input_tokens), 0), COALESCE(SUM(output_tokens), 0),
-			       COALESCE(SUM(cached_tokens), 0), COALESCE(SUM(reasoning_tokens), 0),
+			       COALESCE(SUM(cached_tokens), 0), COALESCE(SUM(cached_creation_tokens), 0),
+			       COALESCE(SUM(reasoning_tokens), 0),
 			       COALESCE(SUM(total_tokens), 0), COALESCE(SUM(cost_total), 0),
 			       COALESCE(SUM(latency_ms), 0),
 			       -- 只累计**真正测到过首字**的请求（ttfb_ms > 0）。非流式请求的
@@ -300,6 +302,7 @@ func (s *Store) PruneOldUsage(ctx context.Context, keepDays int) (*PruneResult, 
 			       input_tokens     = input_tokens + excluded.input_tokens,
 			       output_tokens    = output_tokens + excluded.output_tokens,
 			       cached_tokens    = cached_tokens + excluded.cached_tokens,
+			       cached_creation_tokens = cached_creation_tokens + excluded.cached_creation_tokens,
 			       reasoning_tokens = reasoning_tokens + excluded.reasoning_tokens,
 			       total_tokens     = total_tokens + excluded.total_tokens,
 			       cost_total       = cost_total + excluded.cost_total,
@@ -389,18 +392,19 @@ func (s *Store) PruneOldUsage(ctx context.Context, keepDays int) (*PruneResult, 
 
 // usageLifetime 是表 B 的一行（总览「全部」档的大数字）。
 type usageLifetime struct {
-	RequestCount    int64
-	SuccessCount    int64
-	ErrorCount      int64
-	InputTokens     int64
-	OutputTokens    int64
-	TotalTokens     int64
-	CachedTokens    int64
-	ReasoningTokens int64
-	CostTotal       float64
-	LatencySumMs    int64
-	FirstRecordAt   int64
-	PrunedThrough   string
+	RequestCount         int64
+	SuccessCount         int64
+	ErrorCount           int64
+	InputTokens          int64
+	OutputTokens         int64
+	TotalTokens          int64
+	CachedTokens         int64
+	CachedCreationTokens int64
+	ReasoningTokens      int64
+	CostTotal            float64
+	LatencySumMs         int64
+	FirstRecordAt        int64
+	PrunedThrough        string
 }
 
 // GetUsageLifetime 读终身累计（表 B）。
@@ -412,11 +416,11 @@ func (s *Store) GetUsageLifetime(ctx context.Context) (*usageLifetime, error) {
 	var t usageLifetime
 	err := s.read.QueryRowContext(ctx,
 		`SELECT request_count, success_count, error_count, input_tokens, output_tokens,
-		        total_tokens, cached_tokens, reasoning_tokens, cost_total, latency_sum_ms,
+		        total_tokens, cached_tokens, cached_creation_tokens, reasoning_tokens, cost_total, latency_sum_ms,
 		        first_record_at, pruned_through_day
 		   FROM usage_totals WHERE id = 1`).
 		Scan(&t.RequestCount, &t.SuccessCount, &t.ErrorCount, &t.InputTokens, &t.OutputTokens,
-			&t.TotalTokens, &t.CachedTokens, &t.ReasoningTokens, &t.CostTotal, &t.LatencySumMs,
+			&t.TotalTokens, &t.CachedTokens, &t.CachedCreationTokens, &t.ReasoningTokens, &t.CostTotal, &t.LatencySumMs,
 			&t.FirstRecordAt, &t.PrunedThrough)
 	if err == sql.ErrNoRows {
 		return nil, nil

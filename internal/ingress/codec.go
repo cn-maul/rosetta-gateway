@@ -57,6 +57,7 @@ func (openaiChatCodec) Decode(r *http.Request, maxBytes int64) (*Request, error)
 		BuildRosetta:             req.ToRosetta,
 		Stream:                   req.Stream,
 		Model:                    req.Model,
+		CacheKey:                 req.PromptCacheKey,
 		WantsStreamUsage:         wantsStreamUsage(req),
 		RequiresStructuredOutput: req.RequiresStructuredOutput(),
 		ApplyUpstreamExtras:      req.ApplyProtocolPrivateExtra,
@@ -124,6 +125,7 @@ func (openaiResponsesCodec) Decode(r *http.Request, maxBytes int64) (*Request, e
 		BuildRosetta:             req.ToRosetta,
 		Stream:                   req.Stream,
 		Model:                    req.Model,
+		CacheKey:                 req.PromptCacheKey,
 		WantsStreamUsage:         false, // response.completed always carries usage
 		RequiresStructuredOutput: req.RequiresStructuredOutput(),
 		ApplyUpstreamExtras:      req.ApplyUpstreamExtras,

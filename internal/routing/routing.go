@@ -91,6 +91,7 @@ type UpstreamModel struct {
 	// 单价，单位「元 / 百万 tokens」，0 = 未配置（与 store.freezeUsageCost
 	// 的「未配价按 0 计」同义）。语义与上游_models 三列逐字对应：
 	// PriceInput 是缓存未命中的输入，PriceCacheHit 是缓存命中的输入，
+	// PriceCacheCreation 是写入缓存的输入（Anthropic cache creation），
 	// PriceOutput 是输出。
 	//
 	// 为什么把计费字段放进这个「路由/拓扑」结构（Lead 已确认的口径）：
@@ -106,9 +107,10 @@ type UpstreamModel struct {
 	// 也按落库当时的单价固化），且预检只是「够不够」的粗判，真正入账仍
 	// 由 store.freezeUsageCost 按扣费当时的价格算 —— 预检用旧价的窗口
 	// 最多是一笔预检尺度的偏差，不会让账目漂移。
-	PriceInput    float64
-	PriceCacheHit float64
-	PriceOutput   float64
+	PriceInput         float64
+	PriceCacheHit      float64
+	PriceCacheCreation float64
+	PriceOutput        float64
 }
 
 type RouteIndex struct {

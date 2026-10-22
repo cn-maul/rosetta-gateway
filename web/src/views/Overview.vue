@@ -434,7 +434,7 @@ onMounted(refresh)
         <div class="performance-strip">
           <div><span class="perf-label">平均首字</span><strong>{{ stats.ttfb_samples ? fmtSec(stats.avg_ttfb_ms) + ' s' : '—' }}</strong><small>{{ stats.ttfb_samples ? fmtNum(stats.ttfb_samples) + ' 个成功流式样本' : '暂无可用样本' }}</small></div>
           <div><span class="perf-label">平均输出速度</span><strong>{{ stats.throughput_samples ? fmtSpeed(stats.avg_tokens_per_sec) + ' tok/s' : '—' }}</strong><small>{{ stats.throughput_samples ? fmtNum(stats.throughput_samples) + ' 个成功样本' : '暂无可用样本' }}</small></div>
-          <div><span class="perf-label">缓存命中率</span><strong>{{ stats.input_tokens > 0 ? fmtPercent(stats.cache_hit_rate) + '%' : '—' }}</strong><small>缓存 {{ fmtTokens(stats.cached_tokens) }} / 输入 {{ fmtTokens(stats.input_tokens) }}</small></div>
+          <div><span class="perf-label">缓存命中率</span><strong>{{ stats.input_tokens > 0 ? fmtPercent(stats.cache_hit_rate) + '%' : '—' }}</strong><small>命中 {{ fmtTokens(stats.cached_tokens) }} · 写入 {{ fmtTokens(stats.cached_creation_tokens) }} / 输入 {{ fmtTokens(stats.input_tokens) }}</small></div>
         </div>
       </section>
 

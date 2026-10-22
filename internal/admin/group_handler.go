@@ -430,10 +430,11 @@ func metaForModel(routes *routing.RouteIndex, name string) modelMeta {
 // priceCell 同口径）。
 // @ts-type ModelPrice
 type modelPrice struct {
-	Name          string  `json:"name"`
-	PriceInput    float64 `json:"price_input"`
-	PriceOutput   float64 `json:"price_output"`
-	PriceCacheHit float64 `json:"price_cache_hit"`
+	Name               string  `json:"name"`
+	PriceInput         float64 `json:"price_input"`
+	PriceOutput        float64 `json:"price_output"`
+	PriceCacheHit      float64 `json:"price_cache_hit"`
+	PriceCacheCreation float64 `json:"price_cache_creation"`
 }
 
 // priceForModel 按公开名取该模型的单价。
@@ -460,6 +461,7 @@ func priceForModel(routes *routing.RouteIndex, name string) modelPrice {
 	p.PriceInput = m.PriceInput
 	p.PriceOutput = m.PriceOutput
 	p.PriceCacheHit = m.PriceCacheHit
+	p.PriceCacheCreation = m.PriceCacheCreation
 	return p
 }
 

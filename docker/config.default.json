@@ -8,6 +8,7 @@
   "usage_retention_days": 30,
   "audit_log_keep_rows": 20000,
   "timezone": "Asia/Shanghai",
+  "require_tls_for_public_listen": false,
   "defaults": {
     "upstream_timeout_ms": 300000,
     "stream_idle_timeout_ms": 120000,
@@ -15,7 +16,9 @@
     "max_retries": 2,
     "max_request_body_bytes": 33554432,
     "failover_max_targets": 3,
-    "failover_failure_threshold": 3
+    "failover_failure_threshold": 3,
+    "max_concurrent_streams": 256,
+    "stream_admission_timeout_ms": 5000
   },
   "bootstrap": {
     "providers": [],
