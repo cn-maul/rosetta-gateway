@@ -156,12 +156,12 @@ jobs:
         # 整包红一轮）就是这么漏进主干的。
         # ./... 而非手列 ./internal/... ./cmd/gateway/：手列的清单每次新增
         # 命令目录都要记得改这里，漏改就是「整包不进测试范围」且无人察觉。
-      #
-      # -short 让 perf/leak/stress 这些自带 testing.Short() 守卫的用例跳过
-      # （2026-10-21 修 A11-P2-4）。它们跑的是压测与固定 sleep，在共享
-      # runner 上是时序敏感的：偶发红很难归因到「性能抖动」还是「真回归」，
-      # 于是红色开始贬值。慢测改由 nightly-long 触发，见下。
-      run: go test -short -count=1 -timeout 300s ./...
+        #
+        # -short 让 perf/leak/stress 这些自带 testing.Short() 守卫的用例跳过
+        # （2026-10-21 修 A11-P2-4）。它们跑的是压测与固定 sleep，在共享
+        # runner 上是时序敏感的：偶发红很难归因到「性能抖动」还是「真回归」，
+        # 于是红色开始贬值。慢测改由 nightly-long 触发，见下。
+        run: go test -short -count=1 -timeout 300s ./...
 
       # 竞态检测单独一轮（2026-10-10 新增）。
       #
