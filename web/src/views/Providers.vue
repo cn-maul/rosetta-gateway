@@ -19,7 +19,14 @@ const saving = ref(false)
 const pending = ref(new Set<string>())
 const filtered = computed(() => providers.value.filter(p => {
   const q = search.value.trim().toLowerCase()
-  const matches = !q || [p.name, p.slug, p.endpoint, p.protocol, protocolLabel(p.protocol)].some(v => v.toLowerCase().includes(q))
+  const matches = !q || [
+    p.name,
+    p.slug,
+    p.endpoint,
+    p.protocol,
+    protocolLabel(p.protocol),
+    isDirectProvider(p) ? '直连' : `代理 ${networkLabel.value(p.network_id)}`,
+  ].some(v => v.toLowerCase().includes(q))
   const state = !p.enabled ? 'disabled' : p.ready === false ? 'unready' : p.ready === true ? 'ready' : 'unknown'
   return matches && (!status.value || status.value === state)
 }))
@@ -158,14 +165,22 @@ onMounted(() => {
   void loadNetworks()
 })
 
-// network_id → 显示名。只在**有引用**的行上被用到（直连不显示这一行），
-// 所以查不到就退回短 id —— 那说明网络刚被删掉而 provider 还没重载，
-// 显示「直连」会是错的（它其实还没回到直连）。
+// network_id → 显示名。查不到时退回短 id —— 那说明代理刚被删掉而
+// provider 还没重载，不能误显示成「直连」（它其实还没切换回直连）。
 const networkLabel = computed(() => {
   const map: Record<string, string> = {}
   for (const n of networks.value) map[n.id] = n.name
   return (id: string) => map[id] ?? id.slice(0, 8)
 })
+
+function isDirectProvider(p: Provider): boolean {
+  return !p.network_id || p.network_id === NETWORK_DIRECT_ID
+}
+
+function networkTitle(p: Provider): string {
+  if (isDirectProvider(p)) return '直接连接，不经过代理'
+  return p.proxy_url ? `代理地址：${p.proxy_url}` : `代理：${networkLabel.value(p.network_id)}`
+}
 </script>
 
 <template>
@@ -175,7 +190,7 @@ const networkLabel = computed(() => {
       <div class="head-actions"><button class="btn" :disabled="loading" @click="load">刷新</button><button class="btn btn-primary" @click="openCreate">新建上游</button></div>
     </div>
     <div class="data-toolbar">
-      <label class="search-field"><span class="sr-only">搜索上游</span><input v-model="search" class="input" type="search" placeholder="搜索名称、类型或 Endpoint"/></label>
+      <label class="search-field"><span class="sr-only">搜索上游</span><input v-model="search" class="input" type="search" placeholder="搜索名称、类型、网络或 Endpoint"/></label>
       <label><span class="sr-only">上游状态</span><select v-model="status" class="select"><option value="">全部状态</option><option value="ready">凭据就绪</option><option value="unready">未就绪</option><option value="disabled">已停用</option><option value="unknown">状态未知</option></select></label>
       <span class="result-count">{{ filtered.length }} / {{ providers.length }} 个上游</span>
     </div>
@@ -185,16 +200,26 @@ const networkLabel = computed(() => {
           <colgroup>
             <col class="col-provider" />
             <col class="col-type" />
+            <col class="col-network" />
             <col class="col-state" />
             <col class="col-metrics" />
             <col class="col-actions" />
             <col class="col-toggle" />
           </colgroup>
-          <thead><tr><th>上游 / Endpoint</th><th class="provider-type-cell">类型</th><th>配置状态</th><th class="num-h provider-metrics">模型 / 凭据</th><th class="provider-actions">操作</th><th class="provider-toggle-head">启用</th></tr></thead>
+          <thead><tr><th>上游 / Endpoint</th><th class="provider-type-cell">类型</th><th>网络状态</th><th>配置状态</th><th class="num-h provider-metrics">模型 / 凭据</th><th class="provider-actions">操作</th><th class="provider-toggle-head">启用</th></tr></thead>
           <tbody>
             <tr v-for="p in filtered" :key="p.id">
-              <td class="provider-identity"><span class="name-link">{{ p.name || p.slug }}</span><div class="sub-line mono endpoint">{{ p.endpoint }}</div><span v-if="p.network_id" class="sub-line">经网络「{{ networkLabel(p.network_id) }}」转发</span></td>
+              <td class="provider-identity"><span class="name-link">{{ p.name || p.slug }}</span><div class="sub-line mono endpoint">{{ p.endpoint }}</div></td>
               <td class="provider-type-cell"><span class="badge">{{ protocolLabel(p.protocol) }}</span></td>
+              <td class="provider-network">
+                <span class="badge network-badge" :class="isDirectProvider(p) ? 'badge-dim' : 'badge-accent'" :title="networkTitle(p)">
+                  <template v-if="isDirectProvider(p)">直连</template>
+                  <template v-else>
+                    <span class="network-kind">代理 ·</span>
+                    <span class="network-name">{{ networkLabel(p.network_id) }}</span>
+                  </template>
+                </span>
+              </td>
               <td class="provider-state"><span class="badge" :class="!p.enabled ? 'badge-off' : p.ready === false ? 'badge-st-error' : p.ready === true ? 'badge-live' : 'badge-dim'">{{ readyLabel(p) }}</span><div v-if="p.enabled && p.ready !== true" class="sub-line state-reason">{{ p.ready_reason || (p.ready === false ? '未建立可用凭据池，请检查凭据' : '暂未取得运行时状态') }}</div></td>
               <td class="num-h provider-metrics"><span>{{ p.model_count ?? '—' }}</span><span class="dim"> / </span><span>{{ p.cred_count ?? '—' }}</span></td>
               <td class="provider-actions"><div class="row-actions">
@@ -233,14 +258,14 @@ const networkLabel = computed(() => {
             </span>
           </div>
           <div class="field span2">
-            <label for="cgw-lProviders-5">出站网络</label>
+            <label for="cgw-lProviders-5">代理</label>
             <select v-model="pForm.network_id" class="select" id="cgw-lProviders-5">
               <option :value="NETWORK_DIRECT_ID">直连（默认，不经过代理）</option>
               <option v-for="n in networks" :key="n.id" :value="n.id">{{ n.name }} — {{ n.proxy_url }}</option>
             </select>
             <span class="tip">
               默认<b>直连</b>，大多数上游不用改。要走代理就先去
-              <RouterLink to="/networks">出站网络</RouterLink> 建一条（地址填一次到处可用），
+              <RouterLink to="/networks">代理</RouterLink> 建一条（地址填一次到处可用），
               再回来从下拉里选 —— 不用在这里手填 URL，写错不会报错只是连不上。
             </span>
           </div>
@@ -255,10 +280,11 @@ const networkLabel = computed(() => {
 </template>
 
 <style scoped>
-.providers-table { min-width: 860px; table-layout: fixed; }
+.providers-table { min-width: 1080px; table-layout: fixed; }
 .col-provider { width: auto; }
 .col-type { width: 80px; }
-.col-state { width: 25%; }
+.col-network { width: 160px; }
+.col-state { width: 22%; }
 .col-metrics { width: 112px; }
 .col-actions { width: 144px; }
 .col-toggle { width: 64px; }
@@ -267,6 +293,10 @@ const networkLabel = computed(() => {
 .name-link { font-weight: 650; text-align: left; overflow-wrap: anywhere; }
 .endpoint { color: var(--muted); font-size: 12px; overflow-wrap: anywhere; }
 .provider-type-cell { white-space: nowrap; }
+.provider-network { min-width: 0; }
+.network-badge { max-width: 100%; }
+.network-kind { flex: none; }
+.network-name { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
 .provider-state { min-width: 180px; }
 .state-reason { max-width: 320px; white-space: normal; color: var(--danger); font-size: 12px; }
 .provider-metrics { white-space: nowrap; }

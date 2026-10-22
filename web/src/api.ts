@@ -437,6 +437,7 @@ import type {
   UpstreamModelUpdate,
   ModelGroup,
   Network,
+  NetworkTestResult,
   ProbeHealth,
   ProbeTimelineBucket,
   DiscoveredModel,
@@ -519,6 +520,8 @@ export const api = {
   updateNetwork: (id: string, b: { name: string; proxy_url: string }) =>
     mutate(() => patch<Network>(`/networks/${id}`, b)),
   deleteNetwork: (id: string) => mutate(() => del(`/networks/${id}`)),
+  testNetwork: (id: string, timeoutMs = 15_000) =>
+    post<NetworkTestResult>(`/networks/${id}/test`, undefined, timeoutMs),
 
   // credentials（挂在 provider 下）
   credentials: (providerId: string) => get<Credential[]>(`/providers/${providerId}/credentials`),

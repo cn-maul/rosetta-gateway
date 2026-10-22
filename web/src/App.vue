@@ -82,7 +82,7 @@ const navigation = computed(() => isAdmin() ? [
     { to: '/usage', label: '用量与费用', icon: icons.usage },
   ] },
   { label: '网关配置', items: [
-    { to: '/networks', label: '出站网络', icon: icons.networks },
+    { to: '/networks', label: '代理', icon: icons.networks },
     { to: '/routes', label: '模型与路由', icon: icons.routes },
     { to: '/providers', label: '上游服务', icon: icons.providers },
     { to: '/users', label: '用户与权限', icon: icons.users },

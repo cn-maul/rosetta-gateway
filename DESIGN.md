@@ -515,12 +515,14 @@ NULL 只作为损坏数据的 fail-closed 状态处理，不再提供迁移或�
 POST   /admin/api/password-setup/check          校验普通用户的一次性设密链接
 POST   /admin/api/password-setup                设置密码并直接登录；token 一次性消费
 
-GET    /admin/api/networks                      出站网络（代理地址）清单；直连是保留 id
+GET    /admin/api/networks                      代理清单；直连是保留 id
                                                "direct"，不在此列表里（2026-10-20）
 POST   /admin/api/networks                      新建
 PATCH  /admin/api/networks/{id}
 DELETE /admin/api/networks/{id}                 引用它的上游回到直连（ON DELETE SET NULL），
                                                **不删上游**
+POST   /admin/api/networks/{id}/test            经代理访问固定探测地址；结果是测试结论，
+                                               失败仍返回 HTTP 200
 GET    /admin/api/providers                     列表
 POST   /admin/api/providers                     新建
 GET    /admin/api/providers/{id}                单个详情（编辑表单回显）
@@ -1465,7 +1467,7 @@ Docker 侧对齐，且避开浏览器的保留端口表（6666 是 IRC 段，浏
 
 实际路由以 `web/src/router.ts` 为准（2026-10-22 核实）。共有 **13 个可渲染页面
 组件**：登录、普通用户设密、总览、请求日志/用量统计、可用模型、钱包、API 密钥/
-用户与权限、上游服务、上游详情、模型与路由、出站网络、账号设置、系统设置。
+用户与权限、上游服务、上游详情、模型与路由、代理、账号设置、系统设置。
 其中 6 条路由带 `meta.adminOnly`：`/users`、`/providers`、`/providers/:id`、
 `/routes`、`/networks`、`/settings`，未登录或非 admin 看不到也进不去。
 
@@ -1485,9 +1487,9 @@ Docker 侧对齐，且避开浏览器的保留端口表（6666 是 IRC 段，浏
 | `/wallet` | 钱包与充值 | 全体 | **按身份分两种形态的同一页**：管理员看到全站的用户消费汇总 + 全部充值流水 + 充值入口（没有消耗记录，明细在「用量统计」页）；普通用户看到自己的余额、按天消耗与充值记录。自改密码已迁到「设置」页（2026-10-13）。余额（`balance_cents`）在 `balance_unlimited` 时显示「不限」而非 0.00 元，为 0 时显式提示「余额已用尽，请联系管理员充值」，对应数据面真实的 402 |
 | `/keys` | API 密钥 | 全体 | `AccessControl.vue` 的密钥页签：普通用户只看到并管理自己的 `sk-gw-` key；管理员可查看/调整归属与限制，但不能给自己新建 key。密钥创建与页签路由分离，`/keys` 是可停留地址 |
 | `/users` | 用户与权限 | admin | `AccessControl.vue` 的「用户 / 权限分组」两个页签。用户页含 CRUD、角色、启停、一次性设密/改密、余额充值；空密码普通用户可签发 24 小时设密链接，admin 新建时仍必须带初始密码。分组页维护成员与组级模型白名单 `PUT /admin/api/groups/{id}/models`。`delta_cents` 是相对金额，误操作不会把余额清零 |
-| `/networks` | 出站网络 | admin | 组件是 `Networks.vue`：可复用的代理地址清单（2026-10-20）。provider 只存 `network_id`，实际地址由读路径 JOIN 派生。直连是保留 id `direct`，不是一行记录。删网络让引用它的上游回到直连，不删上游 |
-| `/providers` | 上游服务 | admin | `Providers.vue` 列表：类型用 `Chat / Response / Anthropic` 展示，模型/凭据摘要右对齐，操作列保留配置与删除，启停开关独立成最后一列；新建时可选出站网络 |
-| `/providers/:id` | 上游详情 | admin | `ProviderDetail.vue`：凭据、模型发现/导入、余额查询、连通性测试、批量改价与协议配置。协议值在 API/DB 中仍为 `chat / response / anthropic` |
+| `/networks` | 代理 | admin | 组件是 `Networks.vue`：可复用的代理地址清单（2026-10-20）。provider 只存 `network_id`，实际地址由读路径 JOIN 派生。直连是保留 id `direct`，不是一行记录。删网络让引用它的上游回到直连，不删上游。列表可按行发起连通性测试并显示正常/失败状态 |
+| `/providers` | 上游服务 | admin | `Providers.vue` 列表：类型用 `Chat / Response / Anthropic` 展示，紧跟一列用胶囊标出「直连」或「代理 · 名称」，模型/凭据摘要右对齐，操作列保留配置与删除，启停开关独立成最后一列；新建时可选择代理 |
+| `/providers/:id` | 上游详情 | admin | `ProviderDetail.vue`：凭据、模型发现/导入、余额查询、连通性测试、批量改价与协议配置。模型测试结果通过页面底部的临时 toast 展示，不嵌入模型行。协议值在 API/DB 中仍为 `chat / response / anthropic` |
 | `/routes` | 模型与路由 | admin | `Routes.vue`：公开模型名到有序上游链；`PUT /admin/api/routes/{id}/targets` 原子替换整条链。跨上游同名模型的统计归并在 `/usage?tab=groups`，不改变转发 |
 | `/account` | 账号设置 | 全体 | 当前用户自助改密、查看账号信息；管理员和普通用户都可访问 |
 | `/settings` | 系统设置 | admin | 五个页签：模型默认、运行时、模型价格、修改密码、导入导出（§13.3）。**审计日志页签已移除**（用户要求）—— 后端 `GET /admin/api/audit` 端点与 `api.ts` 的 `api.audit()` 都保留，那是运维取证的正路，删的只是界面那一块 |

@@ -248,6 +248,11 @@ export const DTO_CONTRACTS: readonly DTOFieldContract[] = [
     "provider_count",
     "created_at",
   ] },
+  { goType: "internal/admin.networkTestResponse", tsType: "NetworkTestResult", fields: [
+    "status",
+    "message",
+    "latency_ms",
+  ] },
   { goType: "internal/admin.passwordSetupLinkResponse", tsType: "PasswordSetupLink", fields: [
     "url_path",
     "expires_at",

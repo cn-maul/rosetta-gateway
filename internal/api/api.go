@@ -280,6 +280,7 @@ func BuildApp(d Deps) *App {
 		{Pattern: "POST /admin/api/networks", Handler: networkHandler.Create, Public: false},
 		{Pattern: "PATCH /admin/api/networks/{id}", Handler: func(w http.ResponseWriter, r *http.Request) { networkHandler.Update(w, r, r.PathValue("id")) }, Public: false},
 		{Pattern: "DELETE /admin/api/networks/{id}", Handler: func(w http.ResponseWriter, r *http.Request) { networkHandler.Delete(w, r, r.PathValue("id")) }, Public: false},
+		{Pattern: "POST /admin/api/networks/{id}/test", Handler: func(w http.ResponseWriter, r *http.Request) { networkHandler.Test(w, r, r.PathValue("id")) }, Public: false},
 		// 上游余额查询：逐条凭据打上游的余额端点（见 internal/upstream/balance.go）。
 		// 纯读操作，不改任何配置，因此不触发 AutoReload（挂 reload 的写操作判据
 		// 看的是方法/路径白名单，这里是 POST 却明确不参与，理由见 handler 注释）。

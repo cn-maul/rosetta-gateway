@@ -296,23 +296,25 @@ function setTesting(id: string, on: boolean): void {
   testing.value = next
 }
 
-const modelTestResults = reactive<Record<string, ModelTestResult>>({})
+function modelTestToast(m: UpstreamModel, r: ModelTestResult): string {
+  if (r.status === 'ok') {
+    const parts = [`${m.model_id} · 正常`, `${r.latency_ms}ms`]
+    if (r.output_tokens) parts.push(`输出 ${r.output_tokens} tok`)
+    return parts.join(' · ')
+  }
+  const base = r.in_band ? `${r.message}（上游以 HTTP 200 返回错误）` : r.message
+  return `${m.model_id} · 测试失败：${r.hint ? `${base} → ${r.hint}` : base}`
+}
 
 async function testModel(m: UpstreamModel) {
   if (isTesting(m.id)) return
   setTesting(m.id, true)
-  delete modelTestResults[m.id]
   try {
-    modelTestResults[m.id] = await api.testModel(m.id, testTimeoutMs.value)
+    const result = await api.testModel(m.id, testTimeoutMs.value)
+    toast(modelTestToast(m, result), result.status === 'ok' ? 'ok' : 'err')
   } catch (e) {
     if (is401(e)) return
-    modelTestResults[m.id] = {
-      status: 'error',
-      model_id: m.model_id,
-      provider_id: m.provider_id,
-      message: '管理接口调用失败：' + (e as Error).message,
-      latency_ms: 0,
-    }
+    toast(`${m.model_id} · 测试失败：${(e as Error).message}`, 'err')
   } finally {
     setTesting(m.id, false)
   }
@@ -797,7 +799,7 @@ function goBack() {
                 <div class="kv-row"><span class="kv-k">类型</span><span class="kv-v"><span class="badge">{{ protocolLabel(provider.protocol) }}</span></span></div>
                 <div class="kv-row"><span class="kv-k">Endpoint</span><span class="kv-v mono kv-ep" :title="provider.endpoint">{{ provider.endpoint }}</span></div>
                 <div class="kv-row">
-                  <span class="kv-k">出站网络</span>
+                  <span class="kv-k">代理</span>
                   <span class="kv-v dim" :title="provider.proxy_url || '直连（不经过代理）'">
                     <template v-if="provider.network_id">
                       {{ networkLabel(provider.network_id) }}
@@ -859,7 +861,6 @@ function goBack() {
         <UpstreamModelPanel
           :models="models"
           :testing="testing"
-          :test-results="modelTestResults"
           @add="openModel()"
           @test="testModel"
           @edit="(m) => openModel(m)"
@@ -904,7 +905,7 @@ function goBack() {
           </div>
 
           <div class="field span2">
-            <label for="cgw-lProviderDetail-6">出站网络</label>
+            <label for="cgw-lProviderDetail-6">代理</label>
             <select v-model="pForm.network_id" class="select" id="cgw-lProviderDetail-6">
               <option :value="NETWORK_DIRECT_ID">直连（不经过代理）</option>
               <option v-for="n in networks" :key="n.id" :value="n.id">{{ n.name }} — {{ n.proxy_url }}</option>

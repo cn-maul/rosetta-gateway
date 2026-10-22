@@ -29,7 +29,7 @@ import { api } from '../api'
 import { toast, confirmBox } from '../ui'
 import AppModal from '../components/AppModal.vue'
 import DataTable from '../components/DataTable.vue'
-import type { Network } from '../types'
+import type { Network, NetworkTestResult } from '../types'
 import { useNetworks } from '../composables/useNetworks'
 
 const err = ref('')
@@ -47,8 +47,8 @@ async function loadWithError() {
   err.value = ''
   const message = await load()
   if (!message) return
-  err.value = '加载网络失败：' + message
-  toast('加载网络失败：' + message, 'err')
+  err.value = '加载代理失败：' + message
+  toast('加载代理失败：' + message, 'err')
 }
 onMounted(loadWithError)
 
@@ -80,23 +80,24 @@ async function submit() {
   const name = nForm.name.trim()
   const proxyURL = nForm.proxy_url.trim()
   if (!name) {
-    toast('网络名称不能为空', 'err')
+    toast('代理名称不能为空', 'err')
     return
   }
   if (!proxyURL) {
     // 直连已经有（且不需要）一个入口，再让用户建一条空地址的「网络」
     // 只会造出第二种「不代理」的表示。
-    toast('代理地址不能为空 —— 不代理请在上游那里选「直连」', 'err')
+    toast('代理地址不能为空', 'err')
     return
   }
   nForm.saving = true
   try {
     if (nForm.editing) {
       await api.updateNetwork(nForm.editing, { name, proxy_url: proxyURL })
-      toast('网络已更新')
+      delete testStates[nForm.editing]
+      toast('代理已更新')
     } else {
       await api.createNetwork({ name, proxy_url: proxyURL })
-      toast('网络已创建')
+      toast('代理已创建')
     }
     nForm.open = false
     await loadWithError()
@@ -109,11 +110,11 @@ async function submit() {
 
 async function remove(n: Network) {
   const ok = await confirmBox({
-    title: `删除网络「${n.name}」？`,
+    title: `删除代理「${n.name}」？`,
     // 讲清后果：引用它的上游会回到直连，**不会**被删掉。删网络看起来像
     // 「让一批上游改走直连」—— 必须说，否则有人会以为是在删上游。
     body: n.provider_count > 0
-      ? `正在使用它的 ${n.provider_count} 个上游会退回「直连」（上游本身不会被删除）。之后可以重新建一条同名网络再选回去。`
+      ? `正在使用它的 ${n.provider_count} 个上游会退回「直连」（上游本身不会被删除）。之后可以重新建一条同名代理再选回去。`
       : '当前没有上游使用它。',
     danger: true,
     confirmLabel: '删除',
@@ -121,46 +122,81 @@ async function remove(n: Network) {
   if (!ok) return
   try {
     await api.deleteNetwork(n.id)
-    toast('网络已删除')
+    delete testStates[n.id]
+    toast('代理已删除')
     await loadWithError()
   } catch (e) {
     if (!is401(e)) toast('删除失败：' + (e as Error).message, 'err')
   }
 }
 
-// 「直连」那一行常驻显示：它是合法且最常用的选项（新建上游的默认值），
-// 但它不是一条 networks 记录 —— 不把它显式画出来，界面上就会出现
-// 「这个网关只能走代理？」的误解。
 const rows = computed(() => networks.value)
+
+// 连通性结果只保留在当前页面会话：它描述的是「刚才那次测试」，不是配置本身。
+type TestState = { pending: boolean; result: NetworkTestResult | null }
+const testStates = reactive<Record<string, TestState>>({})
+
+function isTesting(id: string): boolean {
+  return testStates[id]?.pending === true
+}
+
+function testLabel(id: string): string {
+  const state = testStates[id]
+  if (!state) return '未测试'
+  if (state.pending) return '测试中…'
+  if (state.result?.status === 'ok') return `正常 · ${state.result.latency_ms}ms`
+  return '失败'
+}
+
+function testBadgeClass(id: string): string {
+  const state = testStates[id]
+  if (!state) return 'badge-dim'
+  if (state.pending) return 'badge-warn'
+  return state.result?.status === 'ok' ? 'badge-live' : 'badge-err'
+}
+
+function testTitle(id: string): string | undefined {
+  return testStates[id]?.result?.message
+}
+
+async function testProxy(n: Network) {
+  if (isTesting(n.id)) return
+  testStates[n.id] = { pending: true, result: null }
+  try {
+    const result = await api.testNetwork(n.id)
+    testStates[n.id] = { pending: false, result }
+    if (result.status !== 'ok') toast('测试失败：' + result.message, 'err')
+  } catch (e) {
+    if (is401(e)) {
+      delete testStates[n.id]
+      return
+    }
+    const result: NetworkTestResult = {
+      status: 'error',
+      message: '管理接口调用失败：' + (e as Error).message,
+      latency_ms: 0,
+    }
+    testStates[n.id] = { pending: false, result }
+    toast('测试失败：' + (e as Error).message, 'err')
+  }
+}
 </script>
 
 <template>
   <div class="page">
     <div class="page-head">
       <div>
-        <h1>出站网络</h1>
-        <div class="sub">可复用的代理地址清单：填一次，各上游从下拉里选 · 新建上游默认直连</div>
+        <h1>代理</h1>
       </div>
       <div class="head-actions">
         <button class="btn" :disabled="loading" @click="loadWithError">刷新</button>
-        <button class="btn btn-primary" @click="openCreate">新建网络</button>
+        <button class="btn btn-primary" @click="openCreate">新建代理</button>
       </div>
     </div>
 
-    <p class="context-note">
-      出站网络是一份<b>可复用</b>的代理地址清单：同一个代理被多个上游共用时填一次，
-      上游从下拉里选，改一处全部生效。<b>新建上游默认走「直连」</b>，
-      不需要代理的绝大多数上游什么都不用填。
-    </p>
-
-    <div class="direct-row">
-      <span class="badge badge-live">直连</span>
-      <span class="dim">不经过代理（读进程环境变量里的 <code>HTTP_PROXY</code> / <code>HTTPS_PROXY</code>）—— 保留选项，不是可编辑的网络。</span>
-    </div>
-
-    <DataTable class="panel" label="网络列表" :loading="loading" :error="err" :has-data="!!rows.length" :empty="!rows.length" @retry="loadWithError">
+    <DataTable class="panel" label="代理列表" :loading="loading" :error="err" :has-data="!!rows.length" :empty="!rows.length" @retry="loadWithError">
       <template #empty>
-        <template v-if="!rows.length">还没有自建网络 —— 全部上游走「直连」即可。需要代理时点上方「新建网络」。</template>
+        <template v-if="!rows.length">暂无代理</template>
       </template>
       <table class="tbl">
         <thead>
@@ -168,6 +204,7 @@ const rows = computed(() => networks.value)
             <th>名称</th>
             <th>代理地址</th>
             <th class="num-h">使用中的上游</th>
+            <th>联通状态</th>
             <th class="c-op">操作</th>
           </tr>
         </thead>
@@ -176,8 +213,16 @@ const rows = computed(() => networks.value)
             <td>{{ n.name }}</td>
             <td class="mono addr">{{ n.proxy_url }}</td>
             <td class="num-h">{{ n.provider_count }}</td>
+            <td>
+              <span class="badge" :class="testBadgeClass(n.id)" :title="testTitle(n.id)">
+                {{ testLabel(n.id) }}
+              </span>
+            </td>
             <td class="c-op">
               <div class="row-actions">
+                <button class="btn btn-sm btn-ghost" :disabled="isTesting(n.id)" @click="testProxy(n)">
+                  {{ isTesting(n.id) ? '测试中…' : '测试' }}
+                </button>
                 <button class="btn btn-sm btn-ghost" @click="openEdit(n)">编辑</button>
                 <button class="btn btn-sm btn-danger" @click="remove(n)">删除</button>
               </div>
@@ -189,7 +234,7 @@ const rows = computed(() => networks.value)
 
     <AppModal
       :open="nForm.open"
-      :title="nForm.editing ? '编辑网络' : '新建网络'"
+      :title="nForm.editing ? '编辑代理' : '新建代理'"
       max-width="520px"
       :dismissable="false"
     >
@@ -198,21 +243,10 @@ const rows = computed(() => networks.value)
           <div class="field span2">
             <label for="cgw-lNetworks-1">名称 *</label>
             <input v-model="nForm.name" class="input" placeholder="公司代理 / 本机 Clash" id="cgw-lNetworks-1"/>
-            <span class="tip">上游下拉里显示的就是这个名字，全库唯一。填「直连」以外的可读名字即可。</span>
           </div>
           <div class="field span2">
             <label for="cgw-lNetworks-2">代理地址 *</label>
             <input v-model="nForm.proxy_url" class="input mono" placeholder="http://127.0.0.1:7897" autocomplete="off" id="cgw-lNetworks-2"/>
-            <span class="tip">
-              支持 <code>http</code> / <code>https</code> / <code>socks5</code> /
-              <code>socks5h</code>（<code>socks5h</code> 让 DNS 也走代理，本地 DNS 被污染时用它）。
-              保存时会校验，写错当场报错 —— 不会等到请求打过去才发现连不上。
-              <br/>
-              <strong>网关跑在 Docker 里时注意</strong>：<code>127.0.0.1</code>
-              指的是网关容器自己，不是宿主机。代理也在容器里的话，填
-              <code>http://代理容器名:端口</code>（同一 Docker 网络内用容器名互访）；
-              代理在宿主机上时才用 <code>host.docker.internal</code>。
-            </span>
           </div>
         </div>
         <div class="form-actions">
@@ -227,14 +261,6 @@ const rows = computed(() => networks.value)
 </template>
 
 <style scoped>
-.direct-row {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  padding: 10px 0 14px;
-  font-size: 13px;
-  flex-wrap: wrap;
-}
 .addr { overflow-wrap: anywhere; }
 .actions-right { display: flex; gap: 10px; }
 </style>

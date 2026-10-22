@@ -8,14 +8,12 @@ import DataTable from './DataTable.vue'
  */
 import { fmtSpeed, fmtSec, fmtPercent } from '../fmt'
 import { modelPriceLine as priceLine } from '../modelPrice'
-import type { UpstreamModel, ModelTestResult } from '../types'
+import type { UpstreamModel } from '../types'
 
 const props = defineProps<{
   models: UpstreamModel[]
   /** 正在探测的 model id 集合。 */
   testing: Set<string>
-  /** 探测结果，按 upstream_models.id 索引。 */
-  testResults: Record<string, ModelTestResult>
 }>()
 
 const emit = defineEmits<{
@@ -29,25 +27,6 @@ function isTesting(id: string): boolean {
   return props.testing.has(id)
 }
 
-// testResultLine 把探测结果压成界面上那一行。
-//
-// 成功：`可用 · 1234ms · 输出 1 tok`。耗时与用量都带出来，因为探测的
-// 成本与体感全在这两个数上 —— 只说「可用」就没法区分「可用但很慢」。
-// 失败：原样给出上游原因；InBand 的错误额外加一句说明，否则
-// 「HTTP 是成功的却报错」会看起来像网关自己坏了。
-//
-// 失败时把后端给的 hint 附在后面：上游原文是英文且不回答「所以呢」，
-// 而 401/403/404 在这里分别对应「换 key / 开权限 / 改模型名」——
-// 不点破的话用户只能自己把错误翻译成操作判断。
-function testResultLine(r: ModelTestResult): string {
-  if (r.status === 'ok') {
-    const parts = [`可用`, `${r.latency_ms}ms`]
-    if (r.output_tokens) parts.push(`输出 ${r.output_tokens} tok`)
-    return parts.join(' · ')
-  }
-  const base = r.in_band ? `${r.message}（上游以 HTTP 200 返回错误）` : r.message
-  return r.hint ? `${base} → ${r.hint}` : base
-}
 </script>
 
 <template>
@@ -99,16 +78,6 @@ function testResultLine(r: ModelTestResult): string {
                 <span v-if="m.unknown_effort_levels?.length" class="dim">
                   （未识别：{{ m.unknown_effort_levels.join('、') }}）
                 </span>
-              </div>
-              <!-- 探测结果留在行内而不是只弹 toast：探测会真实计费，
-                   失败原因是管理员唯一能据以行动的信息，而 toast
-                   5.2 秒后消失、并发时还会互相顶掉。 -->
-              <div
-                v-if="testResults[m.id]"
-                class="sub-line"
-                :class="testResults[m.id].status === 'ok' ? 'test-ok' : 'test-err'"
-              >
-                {{ testResultLine(testResults[m.id]) }}
               </div>
             </td>
             <td class="num-h dim">{{ m.tokens_per_sec ? fmtSpeed(m.tokens_per_sec) : '—' }}</td>

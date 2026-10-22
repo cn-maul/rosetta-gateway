@@ -90,6 +90,7 @@ export const API_ROUTES: readonly ApiRouteContract[] = [
   { pattern: "POST /admin/api/models/batch-price", public: false },
   { pattern: "POST /admin/api/models/{id}/test", public: false },
   { pattern: "POST /admin/api/networks", public: false },
+  { pattern: "POST /admin/api/networks/{id}/test", public: false },
   { pattern: "POST /admin/api/password-setup", public: true },
   { pattern: "POST /admin/api/password-setup/check", public: true },
   { pattern: "POST /admin/api/providers", public: false },

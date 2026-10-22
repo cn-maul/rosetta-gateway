@@ -29,7 +29,7 @@ const router = createRouter({
     },
     { path: '/routes', name: 'routes', component: () => import('./views/Routes.vue'), meta: { title: '模型与路由', adminOnly: true } },
     { path: '/model-groups', redirect: { name: 'usage', query: { tab: 'groups' } } },
-    { path: '/networks', name: 'networks', component: () => import('./views/Networks.vue'), meta: { title: '出站网络', adminOnly: true } },
+    { path: '/networks', name: 'networks', component: () => import('./views/Networks.vue'), meta: { title: '代理', adminOnly: true } },
     { path: '/providers/:id', name: 'provider-detail', component: () => import('./views/ProviderDetail.vue'), meta: { title: '上游详情', adminOnly: true } },
     { path: '/health', redirect: { name: 'models' } },
     { path: '/account', name: 'account', component: () => import('./views/AccountSettings.vue'), meta: { title: '账号设置' } },

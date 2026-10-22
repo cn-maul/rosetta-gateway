@@ -1,1 +1,0 @@
-import{T as e}from"./api-BnJ-WvqE.js";import{a as t,o as n}from"./index-_IOa5MA6.js";function r(r,i=``){let a=t(),o=n();return e({get:()=>typeof a.query[r]==`string`?a.query[r]:i,set:e=>{o.replace({query:{...a.query,[r]:e===i?void 0:e}})}})}export{r as t};

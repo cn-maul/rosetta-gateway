@@ -247,6 +247,18 @@ export interface Network {
 }
 
 /**
+ * 代理连通性测试结果。
+ *
+ * status 与 HTTP 状态码是两件事：代理不可达、认证失败或目标不可达时管理
+ * 接口仍返回 200，只把失败写在 status/message 里。
+ */
+export interface NetworkTestResult {
+  status: 'ok' | 'error'
+  message: string
+  latency_ms: number
+}
+
+/**
  * 上游模型健康摘要（总览健康卡数据源）。
  *
  * health 四态：unknown（窗口内无探测）/ healthy / degraded / down。

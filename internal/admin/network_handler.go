@@ -1,12 +1,16 @@
 package admin
 
 import (
+	"context"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/url"
 	"strings"
+	"time"
 
 	"github.com/cn-maul/rosetta-gateway/internal/store"
+	"github.com/cn-maul/rosetta-gateway/internal/upstream"
 )
 
 // NetworkHandler 管理「出站网络选项」—— 一份可复用的代理地址清单。
@@ -172,6 +176,45 @@ func (h *NetworkHandler) Delete(w http.ResponseWriter, r *http.Request, id strin
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]string{"status": "deleted"})
+}
+
+// @ts-type NetworkTestResult
+type networkTestResponse struct {
+	Status    string `json:"status"`
+	Message   string `json:"message"`
+	LatencyMs int64  `json:"latency_ms"`
+}
+
+// Test 通过该代理访问一个固定的轻量探测地址，验证代理确实能建立出站连接。
+//
+// 状态码恒为 200：代理拒绝、超时或目标不可达是**测试结论**，不是管理接口
+// 调用失败；只有网络记录不存在才返回 404。前端据此展示行内联通状态。
+func (h *NetworkHandler) Test(w http.ResponseWriter, r *http.Request, id string) {
+	n, err := h.store.GetNetwork(r.Context(), id)
+	if err != nil {
+		writeServerError(w, "get network", err)
+		return
+	}
+	if n == nil {
+		writeError(w, http.StatusNotFound, "代理不存在（可能已被并发删除）")
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(r.Context(), 12*time.Second)
+	defer cancel()
+
+	latencyMs, err := upstream.TestProxyConnectivity(ctx, n.ProxyURL)
+	if err != nil {
+		writeJSON(w, http.StatusOK, networkTestResponse{
+			Status: "error", Message: err.Error(), LatencyMs: latencyMs,
+		})
+		return
+	}
+	writeJSON(w, http.StatusOK, networkTestResponse{
+		Status:    "ok",
+		Message:   fmt.Sprintf("代理可用，%dms", latencyMs),
+		LatencyMs: latencyMs,
+	})
 }
 
 // validateProxyURL 在写入前校验代理地址。
