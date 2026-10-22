@@ -61,7 +61,7 @@ func TestQuotaReserve_FullFlowChargesActualOnce(t *testing.T) {
 
 	const actual = 120
 	if err := st.CreateUsageRecord(ctx, &UsageRecord{
-		ID: "u1", AccessKeyID: "k1", PublicModel: "flash", IngressProtocol: "openai-chat",
+		ID: "u1", AccessKeyID: "k1", PublicModel: "flash", IngressProtocol: "chat",
 		TotalTokens: actual, UsageState: "reported", Status: "ok",
 	}); err != nil {
 		t.Fatalf("usage: %v", err)
@@ -83,7 +83,7 @@ func TestQuotaReserve_RejectsWhenUsedPlusReservedPlusEstExceedsQuota(t *testing.
 
 	// used_tokens = 40（触发器累加）。
 	if err := st.CreateUsageRecord(ctx, &UsageRecord{
-		ID: "u1", AccessKeyID: "k1", PublicModel: "flash", IngressProtocol: "openai-chat",
+		ID: "u1", AccessKeyID: "k1", PublicModel: "flash", IngressProtocol: "chat",
 		TotalTokens: 40, UsageState: "reported", Status: "ok",
 	}); err != nil {
 		t.Fatalf("seed usage: %v", err)

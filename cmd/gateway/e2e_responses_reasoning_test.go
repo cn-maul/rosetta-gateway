@@ -47,7 +47,7 @@ func TestE2E_Responses_ReasoningSealedRoundTrip(t *testing.T) {
 	defer up.Close()
 
 	h := buildHarnessProtocols(t, []harnessChain{
-		{slug: "good", url: up.URL, protocol: "openai-responses"},
+		{slug: "good", url: up.URL, protocol: "response"},
 	}, false, ingress.NewResponses())
 
 	// --- 第一轮：拿到 reasoning item ---
@@ -158,7 +158,7 @@ func TestE2E_Responses_ReasoningSealedStream(t *testing.T) {
 	defer up.Close()
 
 	h := buildHarnessProtocols(t, []harnessChain{
-		{slug: "good", url: up.URL, protocol: "openai-responses"},
+		{slug: "good", url: up.URL, protocol: "response"},
 	}, false, ingress.NewResponses())
 
 	rec := e2ePost(h, "/v1/responses", testAccessKey, `{

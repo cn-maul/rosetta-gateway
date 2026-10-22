@@ -26,7 +26,7 @@ func thinkingStore(t *testing.T) (*store.Store, string) {
 
 	ctx := context.Background()
 	p := &store.Provider{
-		ID: "p1", Slug: "p1", Name: "P1", Protocol: "openai-chat",
+		ID: "p1", Slug: "p1", Name: "P1", Protocol: "chat",
 		Endpoint: "https://example.test", Enabled: true,
 	}
 	if err := st.CreateProvider(ctx, p); err != nil {
@@ -42,7 +42,7 @@ func addModel(t *testing.T, st *store.Store, pid, id, modelID string, sup *bool,
 		lv = append(lv, effort.Level(s))
 	}
 	m := &store.UpstreamModel{
-		ID: id, ProviderID: pid, ModelID: modelID, Enabled: true,
+		ID: id, ProviderID: pid, ModelID: modelID,
 		SupportsThinking: sup, EffortLevels: lv,
 	}
 	if err := st.CreateUpstreamModel(context.Background(), m); err != nil {
@@ -112,7 +112,7 @@ func TestModelInfosForProvider_只带思考能力(t *testing.T) {
 	yes := true
 	ctx := context.Background()
 	m := &store.UpstreamModel{
-		ID: "m1", ProviderID: pid, ModelID: "gpt-5", Enabled: true,
+		ID: "m1", ProviderID: pid, ModelID: "gpt-5",
 		SupportsThinking: &yes, ContextWindow: 200000, MaxOutputTokens: 64000,
 	}
 	if err := st.CreateUpstreamModel(ctx, m); err != nil {
@@ -137,7 +137,7 @@ func TestBuildClient_思考闸门因注入而生效(t *testing.T) {
 	addModel(t, st, pid, "m1", "gpt-4o", &no, nil)
 	addModel(t, st, pid, "m2", "o3", &yes, nil)
 
-	c, err := buildClient(&ProviderEntry{Protocol: "openai-chat", Endpoint: "https://example.test"},
+	c, err := buildClient(&ProviderEntry{Protocol: "chat", Endpoint: "https://example.test"},
 		"sk-x", nil, modelInfosForProvider(context.Background(), st, pid, slog.Default())...)
 	if err != nil {
 		t.Fatalf("buildClient: %v", err)

@@ -11,8 +11,7 @@ import (
 func seedChainModel(t *testing.T, ctx context.Context, st *Store, pid, id, modelID string) {
 	t.Helper()
 	if err := st.CreateUpstreamModel(ctx, &UpstreamModel{
-		ID: id, ProviderID: pid, ModelID: modelID, Enabled: true,
-	}); err != nil {
+		ID: id, ProviderID: pid, ModelID: modelID}); err != nil {
 		t.Fatalf("create model %s: %v", id, err)
 	}
 }

@@ -3,11 +3,8 @@ import DataTable from '../components/DataTable.vue'
 import { computed, onMounted, reactive, ref } from 'vue'
 import { api } from '../api'
 import { toast, confirmBox } from '../ui'
-import type { RouteCatalogProvider, RouteCatalogEntry, UpstreamModel, Route, RouteTargetInput, Settings } from '../types'
-import { fmtSec } from '../fmt'
-import { modelPriceLine } from '../modelPrice'
+import type { RouteCatalogProvider, RouteCatalogEntry, UpstreamModel, Route, RouteTargetInput } from '../types'
 import AppModal from '../components/AppModal.vue'
-import DetailDrawer from '../components/DetailDrawer.vue'
 import { useRoute, useRouter } from 'vue-router'
 import { useQueryText } from '../composables/useQueryText'
 
@@ -17,9 +14,6 @@ const routes = ref<RouteCatalogEntry[]>([])
 const providers = ref<RouteCatalogProvider[]>([])
 // upstream_models.id（短哈希外键）→ 模型对象；Resolve 时拿的是这个外键
 const mmap = ref<Record<string, UpstreamModel>>({})
-const runtime = ref<Settings | null>(null)
-const runtimeError = ref('')
-const runtimeLoading = ref(false)
 
 const providerMap = computed(() => {
   const m: Record<string, RouteCatalogProvider> = {}
@@ -31,9 +25,6 @@ const route = useRoute()
 const router = useRouter()
 const search = useQueryText('q')
 const status = useQueryText('status')
-const selectedId = useQueryText('route')
-const selected = computed(() => routes.value.find(r => r.id === selectedId.value))
-const previewTargets = computed(() => selected.value?.targets ?? [])
 const pending = ref(new Set<string>())
 const filtered = computed(() => routes.value.filter(r => {
   const q = search.value.trim().toLowerCase()
@@ -41,12 +32,6 @@ const filtered = computed(() => routes.value.filter(r => {
   return matches && (!status.value || status.value === 'enabled' && r.enabled || status.value === 'disabled' && !r.enabled || status.value === 'failover' && r.failover_enabled)
 }))
 function clearFilters() { void router.replace({ query: { ...route.query, q: undefined, status: undefined } }) }
-function inspect(r: Route) { selectedId.value = r.id }
-function editSelected() {
-  const r = selected.value
-  selectedId.value = ''
-  if (r) void openRoute(r)
-}
 function targetIssue(providerId: string, modelId: string): string {
   const p = providerMap.value[providerId]
   const m = mmap.value[modelId]
@@ -54,9 +39,15 @@ function targetIssue(providerId: string, modelId: string): string {
   if (!p.enabled) return '上游已停用'
   if (p.ready === false) return p.ready_reason || '上游凭据未就绪'
   if (!m) return '上游模型不存在'
-  if (!m.enabled) return '上游模型已停用'
   if (typeof p.ready !== 'boolean') return '凭据状态未知'
   return ''
+}
+// 与后端 Resolve 的候选过滤保持一致：只看目标与上游是否启用。
+// 凭据暂时未就绪仍可能是候选，不应因此把高亮跳到下一行。
+function targetRoutable(providerId: string, modelId: string): boolean {
+  const p = providerMap.value[providerId]
+  const m = mmap.value[modelId]
+  return !!p?.enabled && !!m
 }
 let loadSeq = 0
 
@@ -70,12 +61,6 @@ function modelLabel(routeRow: Route): string {
   if (m) return m.display_name ? `${m.display_name} (${m.model_id})` : m.model_id
   // 兜底：外键悬空时至少显示路由自身信息
   return routeRow.upstream_model_id
-}
-
-function modelPrice(modelId: string): string {
-  const m = mmap.value[modelId]
-  if (!m) return '价格未知'
-  return modelPriceLine(m)
 }
 
 async function load() {
@@ -99,18 +84,6 @@ async function load() {
     toast('加载失败：' + (e as Error).message, 'err')
   } finally {
     if (seq === loadSeq) loading.value = false
-  }
-}
-
-async function loadRuntime() {
-  runtimeLoading.value = true
-  runtimeError.value = ''
-  try {
-    runtime.value = await api.settings()
-  } catch (e) {
-    if ((e as { status?: number }).status !== 401) runtimeError.value = '全局运行时策略暂不可读'
-  } finally {
-    runtimeLoading.value = false
   }
 }
 
@@ -171,6 +144,13 @@ const saving = ref(false)
 
 // 链未就绪期间禁止一切改动与保存（覆盖「加载中」与「加载失败」两种情形）
 const chainBlocked = computed(() => chainLoading.value || !chainReady.value || saving.value)
+
+// 当前请求会优先命中的目标。后端按 position 过滤掉停用的上游/模型后，
+// 取候选链首；故障转移开启时它仍是首个尝试目标，后续目标只在失败时接管。
+const activeTargetIndex = computed(() => {
+  if (!form.enabled) return -1
+  return form.targets.findIndex(t => t.enabled && targetRoutable(t.provider_id, t.upstream_model_id))
+})
 
 function blankTarget(): TargetRow {
   return { provider_id: '', upstream_model_id: '', enabled: true }
@@ -366,6 +346,21 @@ async function toggleRoute(r: Route) {
   }
 }
 
+async function toggleFailover(r: Route) {
+  if (pending.value.has(r.id)) return
+  pending.value.add(r.id)
+  try {
+    const next = !r.failover_enabled
+    await api.updateRoute(r.id, { failover_enabled: next })
+    toast(next ? '已开启故障转移' : '已关闭故障转移')
+    await load()
+  } catch (e) {
+    if ((e as { status?: number }).status !== 401) toast('操作失败：' + (e as Error).message, 'err')
+  } finally {
+    pending.value.delete(r.id)
+  }
+}
+
 async function removeRoute(r: Route) {
   if (pending.value.has(r.id)) return
   const ok = await confirmBox({
@@ -378,7 +373,6 @@ async function removeRoute(r: Route) {
   pending.value.add(r.id)
   try {
     await api.deleteRoute(r.id)
-    if (selectedId.value === r.id) selectedId.value = ''
     toast('已删除')
     await load()
   } catch (e) {
@@ -390,48 +384,41 @@ async function removeRoute(r: Route) {
 
 onMounted(() => {
   void load()
-  void loadRuntime()
 })
 </script>
 
 <template>
   <div class="page routes-page">
     <div class="page-head">
-      <div><h1>模型与路由</h1><div class="sub">客户端公开模型名 → 首选目标 → 有序后备链 · 全站配置</div></div>
-      <div class="head-actions"><button class="btn" :disabled="loading" @click="load">刷新</button><button class="btn btn-primary" @click="openRoute()">新建公开模型</button></div>
+      <div><h1>模型与路由</h1></div>
+      <div class="head-actions"><button class="btn" :disabled="loading" @click="load">刷新</button><button class="btn btn-primary" @click="openRoute()">新建路由</button></div>
     </div>
     <div class="data-toolbar">
-      <label class="search-field"><span class="sr-only">搜索模型与路由</span><input v-model="search" class="input" type="search" placeholder="搜索公开名、首选上游或模型"/></label>
+      <label class="search-field"><span class="sr-only">搜索路由</span><input v-model="search" class="input" type="search" placeholder="搜索路由名、当前模型或上游"/></label>
       <label><span class="sr-only">路由状态</span><select v-model="status" class="select"><option value="">全部路由</option><option value="enabled">已启用</option><option value="disabled">已停用</option><option value="failover">已开启故障转移</option></select></label>
-      <span class="result-count">{{ filtered.length }} / {{ routes.length }} 个公开模型</span>
     </div>
-    <div class="context-links"><RouterLink to="/models">模型目录 ↗</RouterLink><RouterLink to="/settings?tab=price">批量管理价格 ↗</RouterLink><span class="dim">单价：元 / 1M tokens · 参考价来自对应上游模型，实际费用取决于命中的目标</span></div>
-    <DataTable class="panel table-panel" label="模型与路由列表" :loading="loading" :error="err" :has-data="!!routes.length" :empty="!filtered.length" @retry="load">
-      <template #empty><template v-if="!routes.length">尚未配置公开模型。先接入上游、添加凭据与模型，再创建路由供客户端调用。<RouterLink to="/providers" class="btn btn-sm">接入上游</RouterLink></template><template v-else>没有匹配的路由<button class="btn btn-sm" @click="clearFilters">清除筛选</button></template></template>
+    <DataTable class="panel table-panel" label="路由列表" :loading="loading" :error="err" :has-data="!!routes.length" :empty="!filtered.length" @retry="load">
+      <template #empty><template v-if="!routes.length">尚未配置路由。先接入上游、添加凭据与模型，再创建路由供客户端调用。<RouterLink to="/providers" class="btn btn-sm">接入上游</RouterLink></template><template v-else>没有匹配的路由<button class="btn btn-sm" @click="clearFilters">清除筛选</button></template></template>
         <table class="tbl routes-table">
-          <thead><tr><th>公开模型名</th><th>首选目标</th><th>转发策略</th><th class="c-act">操作</th></tr></thead>
+          <colgroup>
+            <col class="routes-col-name" />
+            <col class="routes-col-model" />
+            <col class="routes-col-count" />
+            <col class="routes-col-actions" />
+            <col class="routes-col-switch" />
+            <col class="routes-col-switch" />
+          </colgroup>
+          <thead><tr><th>路由名</th><th>当前服务模型</th><th class="num-h">上游数</th><th>操作</th><th class="routes-switch-col">故障转移</th><th class="routes-switch-col">启用</th></tr></thead>
           <tbody><tr v-for="r in filtered" :key="r.id">
-            <td class="route-identity"><button class="text-link name-link mono" @click="inspect(r)">{{ r.public_name }}</button><div class="sub-line"><span class="badge" :class="r.enabled ? 'badge-live' : 'badge-off'">{{ r.enabled ? '已启用' : '已停用' }}</span></div><div class="mobile-route-summary"><div>{{ providerMap[r.provider_id]?.name ?? r.provider_id }} → <span class="mono">{{ modelLabel(r) }}</span></div><span class="sub-line">{{ modelPrice(r.upstream_model_id) }}</span><span>{{ r.chain.total }} 个配置目标 · {{ r.chain.standby }} 个后备</span><span>{{ r.failover_enabled ? '自动故障转移' : '仅首选目标' }}</span><p v-if="targetIssue(r.provider_id, r.upstream_model_id)" class="target-warning">{{ targetIssue(r.provider_id, r.upstream_model_id) }}</p><button class="text-link chain-link" @click="inspect(r)">查看目标链与配置 →</button></div></td>
-            <td class="route-target"><div>{{ providerMap[r.provider_id]?.name ?? r.provider_id }}</div><div class="mono sub-line">{{ modelLabel(r) }}</div><div class="sub-line price-line">{{ modelPrice(r.upstream_model_id) }}</div><div v-if="targetIssue(r.provider_id, r.upstream_model_id)" class="sub-line target-warning">{{ targetIssue(r.provider_id, r.upstream_model_id) }}</div></td>
-            <td><span class="badge" :class="r.failover_enabled ? 'badge-accent' : 'badge-dim'">{{ r.failover_enabled ? '自动故障转移' : '仅首选目标' }}</span><div class="sub-line dim">{{ r.chain.total }} 个配置目标 · {{ r.chain.enabled }} 个启用 · {{ r.chain.standby }} 个后备</div><button class="text-link sub-line chain-link" @click="inspect(r)">查看完整目标链 →</button></td>
-            <td class="c-act"><div class="row-actions"><button class="btn btn-act" @click="openRoute(r)">编辑</button><button class="switch" :class="{ on: r.enabled }" role="switch" :aria-checked="r.enabled" :disabled="pending.has(r.id)" :aria-label="(r.enabled ? '停用 ' : '启用 ') + r.public_name" @click="toggleRoute(r)"></button><details class="row-menu"><summary :aria-label="'更多操作：' + r.public_name">⋯</summary><div class="row-menu-content"><button class="btn btn-sm btn-danger" :disabled="pending.has(r.id)" @click="removeRoute(r)">删除路由</button></div></details></div></td>
+            <td class="route-identity"><span class="name-link mono">{{ r.public_name }}</span></td>
+            <td class="route-current-model"><div>{{ providerMap[r.provider_id]?.name ?? r.provider_id }}</div><div class="mono sub-line">{{ modelLabel(r) }}</div><p v-if="targetIssue(r.provider_id, r.upstream_model_id)" class="target-warning">{{ targetIssue(r.provider_id, r.upstream_model_id) }}</p></td>
+            <td class="num-h route-target-count">{{ r.chain.total }} 个</td>
+            <td class="routes-actions-col"><div class="row-actions"><button class="btn btn-act btn-ghost" @click="openRoute(r)">编辑</button><button class="btn btn-act btn-danger" :disabled="pending.has(r.id)" @click="removeRoute(r)">删除</button></div></td>
+            <td class="routes-switch-col"><button class="switch" :class="{ on: r.failover_enabled }" role="switch" :aria-checked="r.failover_enabled" :aria-label="(r.failover_enabled ? '关闭 ' : '开启 ') + r.public_name + ' 的故障转移'" :title="r.failover_enabled ? '关闭故障转移' : '开启故障转移'" :disabled="pending.has(r.id)" @click="toggleFailover(r)"></button></td>
+            <td class="routes-switch-col"><button class="switch" :class="{ on: r.enabled }" role="switch" :aria-checked="r.enabled" :disabled="pending.has(r.id)" :aria-label="(r.enabled ? '停用 ' : '启用 ') + r.public_name" :title="r.enabled ? '停用路由' : '启用路由'" @click="toggleRoute(r)"></button></td>
           </tr></tbody>
         </table>
     </DataTable>
-
-    <DetailDrawer :open="!!selectedId" :title="selected?.public_name || '目标链详情'" max-width="660px" @close="selectedId = ''">
-      <p class="context-note">目标按配置位置排序。{{ selected?.failover_enabled ? '故障转移已开启；实际尝试受全局预算、熔断与启用状态影响。' : '故障转移已关闭，仅使用首选目标；后备目标不会自动接管。' }}</p>
-      <p class="context-note">价格单位：元 / 1M tokens。<RouterLink to="/settings?tab=runtime" class="text-link">查看全局转发策略 ↗</RouterLink></p>
-      <div v-if="!selected" class="empty">未找到该路由，请关闭后刷新列表。</div>
-      <div v-else-if="!previewTargets.length" class="empty">未返回独立目标链，请进入编辑检查主目标配置。</div>
-      <ol v-else class="target-timeline">
-        <li v-for="(t, i) in previewTargets" :key="t.id" :class="{ 'target-disabled': !t.enabled || (i > 0 && !selected.failover_enabled) }">
-          <span class="target-position">{{ i + 1 }}</span>
-          <div class="target-content"><div class="target-heading"><strong>{{ i === 0 ? '首选目标' : '后备 ' + i }}</strong><span v-if="!t.enabled" class="badge badge-off">目标停用</span><span v-else-if="i > 0 && !selected.failover_enabled" class="badge badge-off">策略未启用</span></div><RouterLink :to="{ name: 'provider-detail', params: { id: t.provider_id }, query: { model: t.upstream_model_id } }" class="text-link">{{ providerMap[t.provider_id]?.name ?? t.provider_name ?? t.provider_id }} ↗</RouterLink><div class="mono target-model">{{ mmap[t.upstream_model_id]?.model_id ?? t.model_id ?? t.upstream_model_id }}</div><div class="sub-line price-line">{{ modelPrice(t.upstream_model_id) }} · 点击上游名可直接编辑模型</div><p v-if="targetIssue(t.provider_id, t.upstream_model_id)" class="target-warning">{{ targetIssue(t.provider_id, t.upstream_model_id) }}</p></div>
-        </li>
-      </ol>
-      <template #footer><button v-if="selected" class="btn btn-ghost" :disabled="pending.has(selected.id)" @click="toggleRoute(selected)">{{ selected.enabled ? '停用路由' : '启用路由' }}</button><button v-if="selected" class="btn btn-ghost" :disabled="pending.has(selected.id)" @click="removeRoute(selected)">删除路由</button><button class="btn btn-ghost" @click="selectedId = ''">关闭</button><button v-if="selected" class="btn btn-primary" @click="editSelected">编辑目标链</button></template>
-    </DetailDrawer>
 
     <!-- 表单填一半别丢：遮罩/Esc 都不关（:dismissable=false），只能走取消/保存 -->
     <AppModal
@@ -442,81 +429,105 @@ onMounted(() => {
       :dismissable="false"
     >
       <form class="route-form" @submit.prevent="submitRoute">
-        <div class="form-grid">
-          <div class="field span2">
+        <div class="route-basics">
+          <div class="field">
             <label for="cgw-lRoutes-1">公开模型名 *</label>
             <input v-model="form.public_name" :disabled="chainBlocked" class="input mono" placeholder="gpt-4o" id="cgw-lRoutes-1"/>
-            <span class="tip">客户端在 /v1/chat/completions 里填的 model 名</span>
+          </div>
+          <div class="failover-inline">
+            <span class="failover-label">自动故障转移</span>
+            <button
+              type="button"
+              class="switch"
+              :class="{ on: form.failover_enabled }"
+              role="switch"
+              :aria-checked="form.failover_enabled"
+              aria-label="自动故障转移"
+              :disabled="chainBlocked"
+              @click="form.failover_enabled = !form.failover_enabled"
+            />
           </div>
         </div>
 
         <!-- 有序上游链 -->
         <div class="chain">
           <div class="chain-head">
-            <span class="section-label">有序目标链</span>
+            <span class="section-label">上游目标</span>
             <button type="button" class="btn btn-sm btn-ghost" :disabled="chainBlocked" @click="addTarget">+ 添加目标</button>
           </div>
-          <p class="chain-explanation">{{ form.failover_enabled ? '符合转移条件时按此顺序选择下一目标；停用、熔断和尝试预算会影响实际执行。' : '当前只使用第 1 个目标。后备目标会保留，开启故障转移后才会参与。' }}</p>
           <!-- 链的加载态必须可见：否则弹窗里静静躺着一行占位主目标，看着就像
                「这条路由本来就只有一个上游」，用户会直接保存。 -->
           <p v-if="chainLoading" class="chain-loading" role="status">正在读取上游链…</p>
-          <div v-for="(t, i) in form.targets" :key="i" class="chain-row" :class="{ 'chain-row-inactive': !t.enabled || (i > 0 && !form.failover_enabled) }">
-            <div class="chain-row-heading">
-              <strong class="chain-idx">{{ i + 1 }} · {{ i === 0 ? '首选目标' : '后备目标' }}</strong>
-              <span v-if="i > 0 && !form.failover_enabled" class="badge badge-off">暂不参与</span>
-              <label class="check-inline"><input v-model="t.enabled" type="checkbox" :disabled="chainBlocked"/> 目标启用</label>
-            </div>
-            <label class="chain-field"><span>上游服务</span><select v-model="t.provider_id" class="select" :disabled="chainBlocked" @change="onTargetProviderChange(t)">
-              <option value="" disabled>选择上游</option>
-              <option v-for="p in providers" :key="p.id" :value="p.id">{{ p.name }} ({{ p.slug }})</option>
-            </select></label>
-            <label class="chain-field"><span>上游模型</span><select v-model="t.upstream_model_id" class="select" :disabled="chainBlocked || !t.provider_id">
-              <option value="" disabled>选择模型</option>
-              <option v-for="m in modelsOf(t.provider_id)" :key="m.id" :value="m.id">
-                {{ m.display_name ? `${m.display_name} (${m.model_id})` : m.model_id }}
-              </option>
-            </select></label>
-            <div v-if="t.upstream_model_id" class="chain-meta">
-              <span>{{ modelPrice(t.upstream_model_id) }}</span>
-              <span v-if="targetIssue(t.provider_id, t.upstream_model_id)" class="target-warning">{{ targetIssue(t.provider_id, t.upstream_model_id) }}</span>
-            </div>
-            <div class="chain-ops">
-              <!-- 置顶：一键挪到链首（未开故障转移时 = 当前生效的上游）。
-                   链长时靠 ↑ 要连点好几次，而换上游是个高频动作。 -->
-              <button
-                type="button"
-                class="btn btn-sm btn-ghost"
-                :disabled="chainBlocked || i === 0"
-                :title="i === 0 ? '已在链首（未开故障转移时就是当前生效的上游）' : '置顶：设为链首'"
-                @click="pinTarget(i)"
-              >
-                置顶
-              </button>
-              <button type="button" class="btn btn-sm btn-ghost" :disabled="chainBlocked || i === 0" :aria-label="'上移第 ' + (i + 1) + ' 个目标'" @click="moveTarget(i, -1)">上移</button>
-              <button type="button" class="btn btn-sm btn-ghost" :disabled="chainBlocked || i === form.targets.length - 1" :aria-label="'下移第 ' + (i + 1) + ' 个目标'" @click="moveTarget(i, 1)">下移</button>
-              <button type="button" class="btn btn-sm btn-ghost" :disabled="chainBlocked" @click="removeTarget(i)">移除</button>
-            </div>
-          </div>
-        </div>
-
-        <!-- 故障转移开关（策略参数在「设置」页统一配置） -->
-        <div class="failover">
-          <label class="check-line">
-            <input v-model="form.failover_enabled" type="checkbox" :disabled="chainBlocked"/>
-            启用自动故障转移
-          </label>
-          <p class="tip" style="margin-top: 6px">
-            关闭时仅使用链首；开启后也只有符合条件的错误才会转移。流式响应开始返回后无法更换目标。
-          </p>
-          <div class="runtime-summary" aria-live="polite">
-            <template v-if="runtime">
-              <span>全局预算 {{ runtime.failover_max_targets }} 个目标</span>
-              <span>连续 {{ runtime.failover_failure_threshold }} 次失败熔断</span>
-              <span>非流式超时 {{ fmtSec(runtime.upstream_timeout_ms) }}s</span>
-              <span>流式首字 / 空闲 {{ fmtSec(runtime.stream_first_token_timeout_ms) }}s / {{ fmtSec(runtime.stream_idle_timeout_ms) }}s</span>
-            </template>
-            <span v-else-if="runtimeLoading" class="dim">正在读取全局策略…</span>
-            <span v-else class="dim">{{ runtimeError || '全局策略未读取' }}<button type="button" class="text-link" :disabled="runtimeLoading" @click="loadRuntime">重新读取</button></span>
+          <div class="chain-table-wrap">
+            <table class="tbl chain-table">
+              <colgroup>
+                <col class="chain-col-order" />
+                <col class="chain-col-provider" />
+                <col class="chain-col-model" />
+                <col class="chain-col-enabled" />
+                <col class="chain-col-actions" />
+              </colgroup>
+              <thead>
+                <tr>
+                  <th class="chain-order">序号</th>
+                  <th>上游服务</th>
+                  <th>上游模型</th>
+                  <th class="chain-enabled">启用</th>
+                  <th class="chain-actions">操作</th>
+                </tr>
+              </thead>
+              <tbody>
+                <tr v-for="(t, i) in form.targets" :key="i" :class="{ 'chain-row-active': i === activeTargetIndex }" :title="i === activeTargetIndex ? '当前服务目标：正常请求优先使用此目标' : undefined">
+                  <td class="chain-order">{{ i + 1 }}<span v-if="i === activeTargetIndex" class="sr-only">（当前服务目标）</span></td>
+                  <td class="chain-provider">
+                    <select v-model="t.provider_id" class="select" :disabled="chainBlocked" :aria-label="`第 ${i + 1} 个目标的上游服务`" @change="onTargetProviderChange(t)">
+                      <option value="" disabled>选择上游</option>
+                      <option v-for="p in providers" :key="p.id" :value="p.id">{{ p.name }} ({{ p.slug }})</option>
+                    </select>
+                  </td>
+                  <td class="chain-model">
+                    <select v-model="t.upstream_model_id" class="select" :disabled="chainBlocked || !t.provider_id" :aria-label="`第 ${i + 1} 个目标的上游模型`">
+                      <option value="" disabled>选择模型</option>
+                      <option v-for="m in modelsOf(t.provider_id)" :key="m.id" :value="m.id">
+                        {{ m.display_name ? `${m.display_name} (${m.model_id})` : m.model_id }}
+                      </option>
+                    </select>
+                    <p v-if="targetIssue(t.provider_id, t.upstream_model_id)" class="target-warning">{{ targetIssue(t.provider_id, t.upstream_model_id) }}</p>
+                  </td>
+                  <td class="chain-enabled">
+                    <button
+                      type="button"
+                      class="switch"
+                      :class="{ on: t.enabled }"
+                      role="switch"
+                      :aria-checked="t.enabled"
+                      :aria-label="`${t.enabled ? '停用' : '启用'}第 ${i + 1} 个目标`"
+                      :title="t.enabled ? '停用该目标' : '启用该目标'"
+                      :disabled="chainBlocked"
+                      @click="t.enabled = !t.enabled"
+                    />
+                  </td>
+                  <td class="chain-actions">
+                    <div class="row-actions">
+                      <!-- 置顶：一键挪到链首（未开故障转移时 = 当前生效的上游）。
+                           链长时靠上移要连点好几次，而换上游是个高频动作。 -->
+                      <button
+                        type="button"
+                        class="btn btn-act btn-ghost"
+                        :disabled="chainBlocked || i === 0"
+                        :title="i === 0 ? '已在链首' : '置顶'"
+                        @click="pinTarget(i)"
+                      >
+                        置顶
+                      </button>
+                      <button type="button" class="btn btn-act btn-ghost" :disabled="chainBlocked || i === 0" :aria-label="'上移第 ' + (i + 1) + ' 个目标'" @click="moveTarget(i, -1)">上移</button>
+                      <button type="button" class="btn btn-act btn-ghost" :disabled="chainBlocked || i === form.targets.length - 1" :aria-label="'下移第 ' + (i + 1) + ' 个目标'" @click="moveTarget(i, 1)">下移</button>
+                      <button type="button" class="btn btn-act btn-danger" :disabled="chainBlocked || form.targets.length === 1" :title="form.targets.length === 1 ? '至少保留一个目标' : '删除'" @click="removeTarget(i)">删除</button>
+                    </div>
+                  </td>
+                </tr>
+              </tbody>
+            </table>
           </div>
         </div>
 
@@ -544,6 +555,21 @@ onMounted(() => {
 </template>
 
 <style scoped>
+.route-basics {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 28px;
+  align-items: end;
+}
+.failover-inline {
+  height: 38px;
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 12px;
+  white-space: nowrap;
+}
+.failover-label { color: var(--muted); font-size: 12.5px; font-weight: 550; }
 .chain {
   margin: 12px 0;
 }
@@ -551,60 +577,46 @@ onMounted(() => {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  margin-bottom: 8px;
+  margin-bottom: 10px;
 }
 .section-label {
   font-weight: 600;
 }
-.chain-row {
-  display: grid;
-  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
-  align-items: center;
-  gap: 12px;
-  margin-top: 12px;
-  padding: 16px;
+.chain-table-wrap {
+  overflow-x: auto;
   border: 1px solid var(--border);
   border-radius: 12px;
-  background: var(--surface);
 }
-.chain-row-inactive { background: var(--surface-secondary); }
-.chain-row-heading { grid-column: 1 / -1; display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
-.chain-row-heading .check-inline { margin-left: auto; font-size: 12px; }
-.chain-field { min-width: 0; display: grid; gap: 6px; font-size: 12px; color: var(--muted); }
-.chain-explanation { color: var(--muted); font-size: 12px; line-height: 1.7; margin: 8px 0; }
-.chain-idx {
-  font-size: 13px;
+.chain-table {
+  width: 100%;
+  min-width: 760px;
+  table-layout: fixed;
 }
-.chain-ops {
-  grid-column: 1 / -1;
-  display: flex;
-  flex-wrap: wrap;
-  gap: 4px;
+.chain-col-order { width: 52px; }
+.chain-col-provider { width: 27%; }
+.chain-col-model { width: auto; }
+.chain-col-enabled { width: 64px; }
+.chain-col-actions { width: 214px; }
+.chain-table td {
+  vertical-align: middle;
 }
-.chain-meta {
-  grid-column: 1 / -1;
-  display: flex;
-  gap: 10px;
-  align-items: center;
-  flex-wrap: wrap;
-  min-width: 0;
-  padding: 2px 0 6px;
-  color: var(--muted);
-  font-size: 12px;
+.chain-table tbody tr.chain-row-active td {
+  background: color-mix(in oklab, var(--success-soft) 72%, var(--surface) 28%);
 }
-.chain-meta .target-warning { margin: 0; }
-.check-inline {
-  white-space: nowrap;
-  display: inline-flex;
-  align-items: center;
-  gap: 4px;
+.chain-table tbody tr.chain-row-active td:first-child {
+  box-shadow: inset 3px 0 0 var(--success);
 }
-.failover {
-  margin: 12px 0;
-  padding: 12px;
-  border: 1px dashed var(--border);
-  border-radius: var(--r-thumb, 12px);
+@media (hover: hover) {
+  .chain-table tbody tr.chain-row-active:hover td {
+    background: color-mix(in oklab, var(--success-soft-hover) 68%, var(--surface) 32%);
+  }
 }
+.chain-table .select { width: 100%; min-width: 0; }
+.chain-order { text-align: center; color: var(--text-3); font-variant-numeric: tabular-nums; font-weight: 600; }
+.chain-enabled { text-align: center; }
+.chain-actions { text-align: right; white-space: nowrap; }
+.chain-actions .row-actions { justify-content: flex-end; flex-wrap: nowrap; gap: 4px; }
+.chain-provider, .chain-model { min-width: 0; }
 /* 链加载中的说明：与失败提示同位置，避免加载态被读成「链就是这么短」 */
 .chain-loading {
   margin: 0 0 8px;
@@ -621,35 +633,23 @@ onMounted(() => {
   line-height: 1.5;
 }
 
-.routes-table { min-width: 780px; }
-.mobile-route-summary { display: none; }
-.route-identity { width: 27%; min-width: 200px; }
-.route-target { width: 34%; min-width: 230px; overflow-wrap: anywhere; }
+.routes-table { min-width: 760px; table-layout: fixed; }
+.routes-table td { vertical-align: middle; }
+.routes-col-name { width: 24%; }
+.routes-col-model { width: auto; }
+.routes-col-count { width: 84px; }
+.routes-col-actions { width: 124px; }
+.routes-col-switch { width: 94px; }
+.route-identity { min-width: 0; }
+.route-current-model { min-width: 0; overflow-wrap: anywhere; }
+.route-target-count { white-space: nowrap; }
+.routes-actions-col { white-space: nowrap; }
+.routes-switch-col { text-align: center; white-space: nowrap; }
 .name-link { text-align: left; font-weight: 650; overflow-wrap: anywhere; }
 .target-warning { font-size: 12px; color: var(--warning-soft-foreground); white-space: normal; margin: 6px 0 0; }
-.chain-link { display: block; margin-top: 8px; font-size: 12px; }
-.context-links { display: flex; flex-wrap: wrap; gap: 18px; margin: 12px 0 18px; font-size: 12px; }
-.target-timeline { list-style: none; padding: 10px 0; margin: 0; }
-.target-timeline li { position: relative; display: flex; gap: 16px; padding-bottom: 24px; }
-.target-timeline li:not(:last-child)::before { content: ''; position: absolute; left: 16px; top: 34px; bottom: 0; border-left: 1px solid var(--border); }
-.target-position { width: 34px; height: 34px; flex-shrink: 0; border-radius: 50%; display: grid; place-items: center; background: var(--accent-soft); color: var(--accent-soft-foreground); font-weight: 650; }
-.target-content { flex: 1; min-width: 0; padding: 12px 16px; border: 1px solid var(--border); border-radius: 12px; }
-.target-heading { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; margin-bottom: 10px; }
-.target-model { overflow-wrap: anywhere; margin-top: 6px; font-size: 13px; }
-.price-line { overflow-wrap: anywhere; }
-.runtime-summary { display: flex; gap: 12px; flex-wrap: wrap; align-items: center; margin-top: 12px; padding-top: 10px; border-top: 1px solid var(--border); font-size: 12px; color: var(--muted); }
 .route-form .form-actions { position: sticky; bottom: -22px; padding: 16px 0; background: var(--overlay); border-top: 1px solid var(--border); z-index: 1; }
-.target-disabled .target-position { color: var(--muted); background: var(--default); }
 @media (max-width: 760px) {
-  .chain-row { grid-template-columns: minmax(0, 1fr); padding: 12px; }
+  .route-basics { grid-template-columns: minmax(0, 1fr); gap: 14px; }
   .chain-head { gap: 10px; flex-wrap: wrap; }
-}
-
-@media (max-width: 640px) {
-  .routes-table { min-width: 0; table-layout: fixed; }
-  .routes-table th:not(:first-child), .routes-table td:not(:first-child) { display: none; }
-  .route-identity { width: 100%; min-width: 0; }
-  .mobile-route-summary { display: grid; gap: 8px; margin-top: 12px; font-size: 12px; color: var(--muted); }
-  .routes-table .mono { white-space: normal; overflow-wrap: anywhere; }
 }
 </style>

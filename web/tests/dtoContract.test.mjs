@@ -40,7 +40,7 @@ function propertyNames(declaration, seen = new Set()) {
 }
 
 test('Go DTO contract contains every reviewed frontend response type', () => {
-  assert.equal(DTO_CONTRACTS.length, 51)
+  assert.equal(DTO_CONTRACTS.length, 54)
   const targets = DTO_CONTRACTS.map((contract) => contract.tsType)
   assert.equal(new Set(targets).size, targets.length, '一个 TS 类型不能映射多个 Go DTO')
 })

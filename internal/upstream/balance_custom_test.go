@@ -112,7 +112,7 @@ func TestFetchCustomBalance(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	p := &store.Provider{ID: "p1", Endpoint: srv.URL, Protocol: "openai-chat"}
+	p := &store.Provider{ID: "p1", Endpoint: srv.URL, Protocol: "chat"}
 
 	t.Run("嵌套字段", func(t *testing.T) {
 		spec := &BalanceSpec{Path: "/credits", Field: "data.remaining", Currency: "USD", Auth: "bearer"}

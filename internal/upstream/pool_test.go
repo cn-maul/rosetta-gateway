@@ -22,7 +22,7 @@ func newTestConfig() *config.Config {
 	cfg.Bootstrap.Providers = []config.BootstrapProvider{{
 		Slug:     "testprov",
 		Name:     "Test Provider",
-		Protocol: "openai-chat",
+		Protocol: "chat",
 		Endpoint: "https://example.invalid/v1",
 		Credentials: []config.BootstrapCredential{
 			{Label: "k1", APIKey: "sk-test-1"},
@@ -217,7 +217,7 @@ func TestPrepareFromStore_ReportsFailures(t *testing.T) {
 
 	if err := st.CreateProvider(ctx, &store.Provider{
 		ID: "p1", Slug: "prov", Name: "P",
-		Endpoint: "https://example.invalid/v1", Protocol: "openai-chat", Enabled: true,
+		Endpoint: "https://example.invalid/v1", Protocol: "chat", Enabled: true,
 	}); err != nil {
 		t.Fatalf("create provider: %v", err)
 	}
@@ -296,7 +296,7 @@ func TestPrepareFromStore_PartialCredentialFailure(t *testing.T) {
 	}
 	if err := st.CreateProvider(ctx, &store.Provider{
 		ID: "p1", Slug: "prov", Name: "P",
-		Endpoint: "https://example.invalid/v1", Protocol: "openai-chat", Enabled: true,
+		Endpoint: "https://example.invalid/v1", Protocol: "chat", Enabled: true,
 	}); err != nil {
 		t.Fatalf("create provider: %v", err)
 	}

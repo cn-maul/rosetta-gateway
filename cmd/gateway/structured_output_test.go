@@ -24,7 +24,7 @@ import (
 
 // harnessChain 与 failover_test.go 里 buildHarness 的匿名链结构对应，
 // 但每个 provider 自带 protocol —— 硬约束过滤的用例必须让链上混有
-// openai-chat 与 anthropic 两种协议，统一 openai-chat 的旧 harness 不够用。
+// chat 与 anthropic 两种协议，统一 chat 的旧 harness 不够用。
 type harnessChain struct {
 	slug     string
 	url      string
@@ -82,11 +82,10 @@ func buildHarnessProtocols(t *testing.T, chain []harnessChain, failover bool, co
 	var targets []*routing.Target
 	for i, c := range chain {
 		ri.AddProvider(&routing.ProviderRef{ID: c.slug, Slug: c.slug, Endpoint: c.url, Protocol: c.protocol, Enabled: true})
-		ri.AddUpstreamModel(&routing.UpstreamModel{ID: c.slug + "/m", ProviderID: c.slug, ModelID: c.slug + "-model", Enabled: true})
+		ri.AddUpstreamModel(&routing.UpstreamModel{ID: c.slug + "/m", ProviderID: c.slug, ModelID: c.slug + "-model"})
 		targets = append(targets, &routing.Target{
 			ID: c.slug + "#t" + string(rune('0'+i)), RouteID: "r1",
-			ProviderID: c.slug, UpstreamModelID: c.slug + "/m", Position: i, Enabled: true,
-		})
+			ProviderID: c.slug, UpstreamModelID: c.slug + "/m", Position: i})
 	}
 	ri.AddRoute(&routing.Route{
 		ID: "r1", PublicName: "flash",
@@ -149,7 +148,7 @@ func TestStructuredOutput_AnthropicOnlyChainRejected(t *testing.T) {
 	}
 }
 
-// (b) 链 [openai-chat(可转移失败), anthropic] + json_schema → 最终错误，
+// (b) 链 [chat(可转移失败), anthropic] + json_schema → 最终错误，
 // 而不是「转移到 anthropic 后 200 但约束丢失」。anthropic 假上游必须零命中。
 func TestStructuredOutput_FailoverSkipsAnthropicCandidate(t *testing.T) {
 	var hits atomic.Int64
@@ -159,7 +158,7 @@ func TestStructuredOutput_FailoverSkipsAnthropicCandidate(t *testing.T) {
 	defer bad.Close()
 
 	h := buildHarnessProtocols(t, []harnessChain{
-		{slug: "openai", url: bad.URL, protocol: "openai-chat"},
+		{slug: "openai", url: bad.URL, protocol: "chat"},
 		{slug: "claude", url: anth.URL, protocol: "anthropic"},
 	}, true, ingress.NewOpenAIChat())
 
@@ -174,7 +173,7 @@ func TestStructuredOutput_FailoverSkipsAnthropicCandidate(t *testing.T) {
 	if got := hits.Load(); got != 0 {
 		t.Fatalf("anthropic 上游不应被命中，实际 %d 次", got)
 	}
-	// openai-chat 目标确实被打过（失败是真实上游错误，不是过滤造成的空转）。
+	// chat 目标确实被打过（失败是真实上游错误，不是过滤造成的空转）。
 	if !strings.Contains(rec.Body.String(), "error") {
 		t.Fatalf("应透出上游错误而非其它：%s", rec.Body.String())
 	}
@@ -187,7 +186,7 @@ func TestStructuredOutput_OpenAIChatTargetStillServes(t *testing.T) {
 	up := recordingUpstream(t, ch, false)
 	defer up.Close()
 
-	h := buildHarnessProtocols(t, []harnessChain{{slug: "openai", url: up.URL, protocol: "openai-chat"}}, false, ingress.NewOpenAIChat())
+	h := buildHarnessProtocols(t, []harnessChain{{slug: "openai", url: up.URL, protocol: "chat"}}, false, ingress.NewOpenAIChat())
 
 	rec := postRaw(h, `{"model":"flash","messages":[{"role":"user","content":"hi"}],"stream":false,
 		"response_format":{"type":"json_schema","json_schema":{"name":"out","schema":{"type":"object"}}}}`)
@@ -197,7 +196,7 @@ func TestStructuredOutput_OpenAIChatTargetStillServes(t *testing.T) {
 	m := <-ch
 	rf, ok := m["response_format"].(map[string]any)
 	if !ok || rf["type"] != "json_schema" {
-		t.Fatalf("response_format 未透传给 openai-chat 上游：%v", m["response_format"])
+		t.Fatalf("response_format 未透传给 chat 上游：%v", m["response_format"])
 	}
 }
 

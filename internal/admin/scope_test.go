@@ -38,7 +38,7 @@ func seedUsageRow(t *testing.T, st *store.Store, id, keyID, userID string, token
 	_, err := st.DB().Exec(`INSERT INTO usage_records
 		(id, ts, access_key_id, user_id, public_model, provider_id, upstream_model, ingress_protocol,
 		 stream, input_tokens, output_tokens, total_tokens, usage_state, status, http_status, latency_ms)
-		VALUES (?,?,?,?, 'm','p','up','openai-chat', 0, ?,0, ?, 'reported','ok',200,10)`,
+		VALUES (?,?,?,?, 'm','p','up','chat', 0, ?,0, ?, 'reported','ok',200,10)`,
 		id, time.Now().UnixMilli(), keyID, uid, tokens, tokens)
 	if err != nil {
 		t.Fatalf("seed usage %s: %v", id, err)
@@ -136,7 +136,7 @@ func TestUsage_FractionalLatencyDoesNot500(t *testing.T) {
 		_, err := st.DB().Exec(`INSERT INTO usage_records
 			(id, ts, access_key_id, user_id, public_model, provider_id, upstream_model, ingress_protocol,
 			 stream, input_tokens, output_tokens, total_tokens, usage_state, status, http_status, latency_ms)
-			VALUES (?,?,?,?, 'm','p','up','openai-chat', 0, 10,2,12, 'reported','ok',200,?)`,
+			VALUES (?,?,?,?, 'm','p','up','chat', 0, 10,2,12, 'reported','ok',200,?)`,
 			fmt.Sprintf("f%d", i), time.Now().UnixMilli(), "k1", "u1", latency)
 		if err != nil {
 			t.Fatalf("seed latency=%d: %v", latency, err)

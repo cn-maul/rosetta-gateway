@@ -42,7 +42,7 @@ func seedHistoryRows(t *testing.T, st *store.Store) int64 {
 			ID: r.id, Ts: ts, AccessKeyID: "kA", PublicModel: "code",
 			ProviderID: "p1", UpstreamModel: "cn:glm", Stream: r.stream,
 			TotalTokens: 100, Status: "ok", HTTPStatus: http.StatusOK,
-			IngressProtocol: "openai-chat", UsageState: "reported",
+			IngressProtocol: "chat", UsageState: "reported",
 		}); err != nil {
 			t.Fatalf("seed %s: %v", r.id, err)
 		}

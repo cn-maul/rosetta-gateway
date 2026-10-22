@@ -43,7 +43,7 @@ func seedCostPending(t *testing.T, db *Store, id string, input, output int) {
 		   provider_id, upstream_model, ingress_protocol, stream,
 		   input_tokens, output_tokens, total_tokens, usage_state, status, http_status,
 		   latency_ms, cost_total)
-		 VALUES (?, ?, 'k1', ?, 'priced', 'p1', 'priced', 'openai-chat', 0, ?, ?, ?, ?, 'ok', 200, 10, 0)`,
+		 VALUES (?, ?, 'k1', ?, 'priced', 'p1', 'priced', 'chat', 0, ?, ?, ?, ?, 'ok', 200, 10, 0)`,
 		id, 1700000000000, uid, input, output, input+output, usageStateCostPending)
 	if err != nil {
 		t.Fatalf("seed cost_pending %s: %v", id, err)
@@ -98,14 +98,14 @@ func TestCostPending_未配价模型不标记(t *testing.T) {
 	// 只建 provider，不建 upstream_models → 查价必然 sql.ErrNoRows。
 	if err := db.CreateProvider(ctx, &Provider{
 		ID: "p2", Slug: "p2", Name: "p2",
-		Endpoint: "http://x", Protocol: "openai-chat", Enabled: true}); err != nil {
+		Endpoint: "http://x", Protocol: "chat", Enabled: true}); err != nil {
 		t.Fatalf("create provider: %v", err)
 	}
 
 	if err := db.CreateUsageRecord(ctx, &UsageRecord{
 		ID: "u-noprice", Ts: 1700000000000, UserID: "u1", AccessKeyID: "k1",
 		PublicModel: "m", ProviderID: "p2", UpstreamModel: "unknown",
-		IngressProtocol: "openai-chat",
+		IngressProtocol: "chat",
 		InputTokens:     100, TotalTokens: 100,
 		UsageState: "reported", Status: "ok", HTTPStatus: 200, LatencyMs: 10,
 	}); err != nil {

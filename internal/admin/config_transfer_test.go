@@ -36,9 +36,9 @@ func seedSource(t *testing.T, h *ConfigTransferHandler, st *store.Store) {
 	t.Helper()
 	ctx := context.Background()
 	for _, p := range []store.Provider{
-		{ID: "p1", Slug: "alpha", Name: "Alpha", Protocol: "openai-chat",
+		{ID: "p1", Slug: "alpha", Name: "Alpha", Protocol: "chat",
 			Endpoint: "https://a.example.com/v1", Enabled: true, TimeoutMs: 60000, MaxRetries: 2},
-		{ID: "p2", Slug: "beta", Name: "Beta", Protocol: "openai-responses",
+		{ID: "p2", Slug: "beta", Name: "Beta", Protocol: "response",
 			Endpoint: "https://b.example.com/v1", Enabled: false},
 	} {
 		p := p
@@ -48,9 +48,9 @@ func seedSource(t *testing.T, h *ConfigTransferHandler, st *store.Store) {
 	}
 	for _, m := range []store.UpstreamModel{
 		{ID: "m1", ProviderID: "p1", ModelID: "alpha-chat", DisplayName: "Alpha Chat",
-			Enabled: true, ContextWindow: 128000, MaxOutputTokens: 8192, PriceInput: 1.5, PriceOutput: 6},
-		{ID: "m2", ProviderID: "p1", ModelID: "alpha-reason", Enabled: true},
-		{ID: "m3", ProviderID: "p2", ModelID: "beta-pro", Enabled: true},
+			ContextWindow: 128000, MaxOutputTokens: 8192, PriceInput: 1.5, PriceOutput: 6},
+		{ID: "m2", ProviderID: "p1", ModelID: "alpha-reason"},
+		{ID: "m3", ProviderID: "p2", ModelID: "beta-pro"},
 	} {
 		m := m
 		if err := st.CreateUpstreamModel(ctx, &m); err != nil {
@@ -194,7 +194,7 @@ func TestExportAlwaysIncludesCredentials(t *testing.T) {
 		byslug[p.Slug] = p
 	}
 	a := byslug["alpha"]
-	if a.Endpoint != "https://a.example.com/v1" || a.Protocol != "openai-chat" ||
+	if a.Endpoint != "https://a.example.com/v1" || a.Protocol != "chat" ||
 		a.TimeoutMs != 60000 || a.MaxRetries != 2 || !a.Enabled {
 		t.Fatalf("alpha 的配置不完整: %+v", a)
 	}
@@ -334,7 +334,7 @@ func TestImportRenamesOnConflict(t *testing.T) {
 	// 目标库已有一个 alpha，但 endpoint 与模型都不同 ——
 	// 导入绝不能把它覆盖掉。
 	existing := store.Provider{ID: "x1", Slug: "alpha", Name: "本地 Alpha",
-		Protocol: "openai-chat", Endpoint: "http://localhost:1234/v1", Enabled: true}
+		Protocol: "chat", Endpoint: "http://localhost:1234/v1", Enabled: true}
 	if err := dst.store.CreateProvider(ctx, &existing); err != nil {
 		t.Fatalf("seed: %v", err)
 	}
@@ -371,7 +371,7 @@ func TestImportRenamesRepeatedlyToUniqueSlugs(t *testing.T) {
 	file := configExport{
 		Version: exportFormatVersion,
 		Providers: []providerExport{
-			{Slug: "dup", Name: "Dup", Protocol: "openai-chat", Endpoint: "https://x/v1", Enabled: true},
+			{Slug: "dup", Name: "Dup", Protocol: "chat", Endpoint: "https://x/v1", Enabled: true},
 		},
 	}
 
@@ -384,7 +384,7 @@ func TestImportRenamesRepeatedlyToUniqueSlugs(t *testing.T) {
 		}
 		if err := dst.store.CreateProvider(ctx, &store.Provider{
 			ID: "e" + string(rune('0'+i)), Slug: slug, Name: slug,
-			Protocol: "openai-chat", Endpoint: "http://local/v1", Enabled: true,
+			Protocol: "chat", Endpoint: "http://local/v1", Enabled: true,
 		}); err != nil {
 			t.Fatalf("seed %d: %v", i, err)
 		}
@@ -417,16 +417,16 @@ func TestImportSkipsModelAlreadyUnderSameProvider(t *testing.T) {
 	ctx := context.Background()
 	// 让导入的 alpha 保持原slug：目标库里 alpha 已被占用，因此占位 alpha-2。
 	if err := dst.store.CreateProvider(ctx, &store.Provider{ID: "occupy", Slug: "alpha-2",
-		Name: "占位", Protocol: "openai-chat", Endpoint: "http://placeholder/v1", Enabled: true}); err != nil {
+		Name: "占位", Protocol: "chat", Endpoint: "http://placeholder/v1", Enabled: true}); err != nil {
 		t.Fatalf("seed: %v", err)
 	}
 	p := store.Provider{ID: "p1", Slug: "alpha", Name: "Alpha",
-		Protocol: "openai-chat", Endpoint: "http://localhost/v1", Enabled: true}
+		Protocol: "chat", Endpoint: "http://localhost/v1", Enabled: true}
 	if err := dst.store.CreateProvider(ctx, &p); err != nil {
 		t.Fatalf("seed: %v", err)
 	}
 	m := store.UpstreamModel{ID: "m1", ProviderID: "p1", ModelID: "alpha-chat",
-		Enabled: true, PriceInput: 99, ContextWindow: 4096}
+		PriceInput: 99, ContextWindow: 4096}
 	if err := dst.store.CreateUpstreamModel(ctx, &m); err != nil {
 		t.Fatalf("seed: %v", err)
 	}
@@ -481,7 +481,7 @@ func TestImportModelsFollowRenamedProvider(t *testing.T) {
 	dst, _ := transferFixture(t)
 	ctx := context.Background()
 	if err := dst.store.CreateProvider(ctx, &store.Provider{ID: "x1", Slug: "alpha",
-		Name: "本地", Protocol: "openai-chat", Endpoint: "http://local/v1", Enabled: true}); err != nil {
+		Name: "本地", Protocol: "chat", Endpoint: "http://local/v1", Enabled: true}); err != nil {
 		t.Fatalf("seed: %v", err)
 	}
 
@@ -543,7 +543,7 @@ func TestImportDryRunWritesNothing(t *testing.T) {
 	dst, _ := transferFixture(t)
 	ctx := context.Background()
 	if err := dst.store.CreateProvider(ctx, &store.Provider{ID: "x1", Slug: "alpha",
-		Name: "本地", Protocol: "openai-chat", Endpoint: "http://local/v1", Enabled: true}); err != nil {
+		Name: "本地", Protocol: "chat", Endpoint: "http://local/v1", Enabled: true}); err != nil {
 		t.Fatalf("seed: %v", err)
 	}
 
@@ -584,7 +584,7 @@ func TestImportRejectsUnknownVersion(t *testing.T) {
 	r := asAdmin(jsonRequest(http.MethodPost, "/admin/api/config-export/import",
 		bytes.NewReader(mustMarshal(t, importRequest{
 			Data: configExport{Version: 99, Providers: []providerExport{
-				{Slug: "x", Endpoint: "https://x/v1", Protocol: "openai-chat"},
+				{Slug: "x", Endpoint: "https://x/v1", Protocol: "chat"},
 			}},
 		}))))
 	w := httptest.NewRecorder()
@@ -606,8 +606,7 @@ func TestImportRejectsPlaintextFile(t *testing.T) {
 	raw := mustMarshal(t, importRequest{Data: configExport{
 		Version: exportFormatVersion,
 		Providers: []providerExport{{
-			Slug: "plain", Protocol: "openai-chat", Endpoint: "https://plain/v1", Enabled: true,
-		}},
+			Slug: "plain", Protocol: "chat", Endpoint: "https://plain/v1"}},
 	}})
 	r := asAdmin(jsonRequest(http.MethodPost, "/admin/api/config-export/import", bytes.NewReader(raw)))
 	w := httptest.NewRecorder()
@@ -691,17 +690,17 @@ func TestImportValidatesNumericFieldsAndHonorsCredentialEnabled(t *testing.T) {
 	file := configExport{
 		Version: exportFormatVersion,
 		Providers: []providerExport{
-			{Slug: "bad-timeout", Name: "Bad Timeout", Protocol: "openai-chat",
+			{Slug: "bad-timeout", Name: "Bad Timeout", Protocol: "chat",
 				Endpoint: "https://x.example.com/v1", Enabled: true,
 				TimeoutMs: config.MaxDurationMillis + 1},
-			{Slug: "bad-retries", Name: "Bad Retries", Protocol: "openai-chat",
+			{Slug: "bad-retries", Name: "Bad Retries", Protocol: "chat",
 				Endpoint: "https://x.example.com/v1", MaxRetries: -1},
-			{Slug: "good", Name: "Good", Protocol: "openai-chat",
+			{Slug: "good", Name: "Good", Protocol: "chat",
 				Endpoint: "https://x.example.com/v1", Enabled: true},
 		},
 		Models: []modelExport{
-			{ProviderSlug: "good", ModelID: "m-neg-price", Enabled: true, PriceInput: -0.5},
-			{ProviderSlug: "good", ModelID: "m-ok", Enabled: true, PriceInput: 1.5, PriceOutput: 6},
+			{ProviderSlug: "good", ModelID: "m-neg-price", PriceInput: -0.5},
+			{ProviderSlug: "good", ModelID: "m-ok", PriceInput: 1.5, PriceOutput: 6},
 		},
 		Credentials: []credentialExport{
 			{ProviderSlug: "good", Label: "off", APIKey: "sk-disabled", Enabled: &disabled},

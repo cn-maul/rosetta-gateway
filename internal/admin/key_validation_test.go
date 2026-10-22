@@ -176,8 +176,8 @@ func snapshotWithRoute(t *testing.T, publicName string) {
 		UsersByID:  map[string]*snapshot.UserSnapshot{},
 	}
 	ri := routing.NewRouteIndex()
-	ri.AddProvider(&routing.ProviderRef{ID: "p1", Slug: "p1", Protocol: "openai-chat", Enabled: true})
-	ri.AddUpstreamModel(&routing.UpstreamModel{ID: "m1", ProviderID: "p1", ModelID: "m1", Enabled: true})
+	ri.AddProvider(&routing.ProviderRef{ID: "p1", Slug: "p1", Protocol: "chat", Enabled: true})
+	ri.AddUpstreamModel(&routing.UpstreamModel{ID: "m1", ProviderID: "p1", ModelID: "m1"})
 	ri.AddRoute(&routing.Route{ID: "r1", PublicName: publicName, ProviderID: "p1", UpstreamModelID: "m1", Enabled: true})
 	snap.Routes = ri
 	snapshot.Init(snap)
@@ -311,9 +311,8 @@ func TestProviderHandler_TimeoutMsUpperBound(t *testing.T) {
 	st := newTestStore(t)
 	ctx := t.Context()
 	if err := st.CreateProvider(ctx, &store.Provider{
-		ID: "prov-timeout", Slug: "prov-timeout", Name: "prov-timeout", Protocol: "openai-chat",
-		Endpoint: "https://example.invalid/v1", Enabled: true,
-	}); err != nil {
+		ID: "prov-timeout", Slug: "prov-timeout", Name: "prov-timeout", Protocol: "chat",
+		Endpoint: "https://example.invalid/v1"}); err != nil {
 		t.Fatalf("seed provider: %v", err)
 	}
 	h := NewProviderHandler(st, nil, config.Default())

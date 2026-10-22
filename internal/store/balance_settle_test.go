@@ -266,7 +266,7 @@ func TestRecompute_补扣余额且幂等(t *testing.T) {
 		   provider_id, upstream_model, ingress_protocol, stream,
 		   input_tokens, output_tokens, total_tokens, usage_state, status, http_status,
 		   latency_ms, cost_total, request_id)
-		 VALUES (?, 1700000000000, 'k1', 'u1', 'priced', 'p1', 'priced', 'openai-chat', 0,
+		 VALUES (?, 1700000000000, 'k1', 'u1', 'priced', 'p1', 'priced', 'chat', 0,
 		         1000, 500, 1500, ?, 'ok', 200, 10, 0.0006, ?)`,
 		recordID, usageStateCostPending, reqID); err != nil {
 		t.Fatalf("seed usage: %v", err)
@@ -352,7 +352,7 @@ func TestRecompute_欠费时保留待重算(t *testing.T) {
 		   provider_id, upstream_model, ingress_protocol, stream,
 		   input_tokens, output_tokens, total_tokens, usage_state, status, http_status,
 		   latency_ms, cost_total, request_id)
-		 VALUES (?, 1700000000000, 'k1', 'u1', 'priced', 'p1', 'priced', 'openai-chat', 0,
+		 VALUES (?, 1700000000000, 'k1', 'u1', 'priced', 'p1', 'priced', 'chat', 0,
 		         1000000, 0, 1000000, ?, 'ok', 200, 10, 0, 'req-poor')`,
 		recordID, usageStateCostPending); err != nil {
 		t.Fatalf("seed usage: %v", err)
@@ -388,7 +388,7 @@ func TestReconcile_UnchargedUsageIsFoundAndCharged(t *testing.T) {
 	cost, err := st.CreateUsageRecordWithCost(ctx, &UsageRecord{
 		ID: "rec-1", UserID: "u1", AccessKeyID: "k1",
 		PublicModel: "m", ProviderID: "p1", UpstreamModel: "priced",
-		IngressProtocol: "openai-chat",
+		IngressProtocol: "chat",
 		InputTokens:     1_000_000,
 		OutputTokens:    0,
 		TotalTokens:     1_000_000,
@@ -456,13 +456,13 @@ func TestReconcile_OnlySuccessfulChargedRecordsArePicked(t *testing.T) {
 	}{
 		{"失败请求不补扣", UsageRecord{
 			ID: "r-fail", UserID: "u1", AccessKeyID: "k1", PublicModel: "m",
-			ProviderID: "p1", UpstreamModel: "priced", IngressProtocol: "openai-chat",
+			ProviderID: "p1", UpstreamModel: "priced", IngressProtocol: "chat",
 			InputTokens: 1_000_000, TotalTokens: 1_000_000,
 			UsageState: "reported", Status: "error", RequestID: "req-fail",
 		}, false},
 		{"无 request_id 不补扣", UsageRecord{
 			ID: "r-noreq", UserID: "u1", AccessKeyID: "k1", PublicModel: "m",
-			ProviderID: "p1", UpstreamModel: "priced", IngressProtocol: "openai-chat",
+			ProviderID: "p1", UpstreamModel: "priced", IngressProtocol: "chat",
 			InputTokens: 1_000_000, TotalTokens: 1_000_000,
 			UsageState: "reported", Status: "ok",
 		}, false},

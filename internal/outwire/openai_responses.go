@@ -398,11 +398,11 @@ func localShellAction(args string) any {
 //	  → response.reasoning_summary_text.delta*   （有可读文本时）
 //	→ response.output_item.done(带 encrypted_content)
 //
-// 只在 SealedBy == "openai-responses" 时发。别的协议族封的载荷不该
+// 只在 SealedBy 为 OpenAI Responses 时发。别的协议族封的载荷不该
 // 出现在 Responses 事件里 —— 那是别家的不透明状态，写出来既无意义，
 // 也可能把跨协议的内部形状泄漏给客户端。
 func (s *ResponsesSSE) thinkingDelta(ev *rosetta.Event) {
-	if ev.SealedBy != "" && ev.SealedBy != "openai-responses" {
+	if ev.SealedBy != "" && ev.SealedBy != string(rosetta.ProtoOpenAIResponses) {
 		return
 	}
 	// 没有 sealed 载荷的裸思考增量仍可显示，但没有续接价值。
@@ -742,9 +742,9 @@ func WriteResponsesResponseWithTools(w http.ResponseWriter, resp *rosetta.ChatRe
 			// 修复前这里只处理 BlockText / BlockToolCall，sealed 载荷被
 			// 整个丢掉，客户端下一轮回放时报 "Item with id 'rs_…' not found"。
 			//
-			// SealedBy 门闩：只有 openai-responses 自己封的载荷才写回
+			// SealedBy 门闩：只有 OpenAI Responses 自己封的载荷才写回
 			// Responses。chat / anthropic 封的写进来是这个协议的异物。
-			if blk.SealedBy != "" && blk.SealedBy != "openai-responses" {
+			if blk.SealedBy != "" && blk.SealedBy != string(rosetta.ProtoOpenAIResponses) {
 				continue
 			}
 			item := map[string]any{"type": "reasoning", "status": "completed"}

@@ -88,6 +88,22 @@ func setRetryAfter(w http.ResponseWriter, d time.Duration) {
 	w.Header().Set("Retry-After", strconv.Itoa(seconds))
 }
 
+// withOpenCodeSession carries the downstream conversation ID through the
+// protocol adapters. When the client does not send one, the per-request ID is
+// the only safe fallback: it prevents OpenCode from rejecting the request,
+// although only a client-supplied header can preserve routing/cache affinity
+// across turns.
+func withOpenCodeSession(r *http.Request) *http.Request {
+	sessionID := strings.TrimSpace(r.Header.Get(upstream.OpenCodeSessionHeader))
+	if sessionID == "" {
+		sessionID = httpx.RequestIDFromContext(r.Context())
+	}
+	if sessionID == "" {
+		return r
+	}
+	return r.WithContext(upstream.WithOpenCodeSession(r.Context(), sessionID))
+}
+
 func (h *Handler) Handle(codec ingress.Codec) http.HandlerFunc {
 	db, logger := h.db, h.logger
 	return func(w http.ResponseWriter, r *http.Request) {
@@ -98,6 +114,7 @@ func (h *Handler) Handle(codec ingress.Codec) http.HandlerFunc {
 			authhttp.WriteAuthError(w, err, codec.WriteError)
 			return
 		}
+		r = withOpenCodeSession(r)
 
 		// RPM 限速（DESIGN §11.4）：额度随鉴权从快照带出（0 = 不限）。
 		// 被拒的请求**不**计数 —— 实现见 ratelimit.AllowRPM 的注释：
@@ -399,12 +416,12 @@ func (h *Handler) Handle(codec ingress.Codec) http.HandlerFunc {
 		//
 		// 为什么不能放行：Anthropic 没有 response_format / text.format 的对应物，
 		// inwire 层已无处可翻；照发等于接受「200 但约束静默丢失」——尤其恶劣的
-		// 是它让故障转移改变语义：同一请求打 openai-chat 目标时约束生效，转移
+		// 是它让故障转移改变语义：同一请求打 chat 目标时约束生效，转移
 		// 到 anthropic 目标后仍回 200 但约束消失。取舍：跳过候选比谎报成功更
 		// 安全 —— 客户端拿到明确错误，至少知道该改请求或改路由，而不是拿着
 		// 「看起来成功」的无约束输出去下游消费。
 		//
-		// "auto" / "" / openai 系协议不受影响：openai-chat 与 openai-responses
+		// "auto" / "" / openai 系协议不受影响：chat 与 response
 		// 都能表达这两类约束（inwire 层已做等价翻译）。放在熔断筛选之后、预算
 		// 截断之前：先剔除服务不了的目标，让 failover_max_targets 的预算花在
 		// 真正可服务的候选上。

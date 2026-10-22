@@ -97,7 +97,7 @@ func TestUsageGroupBy_AfterPrune(t *testing.T) {
 			PublicModel:     "m",
 			ProviderID:      "p1",
 			UpstreamModel:   "x",
-			IngressProtocol: "openai-chat",
+			IngressProtocol: "chat",
 			InputTokens:     10,
 			OutputTokens:    5,
 			TotalTokens:     15,
@@ -179,7 +179,7 @@ func TestUsageGroupBy_QualityColumns(t *testing.T) {
 		if err := st.CreateUsageRecord(ctx, &store.UsageRecord{
 			ID: r.id, Ts: now, AccessKeyID: "kA", PublicModel: "m",
 			ProviderID: "p1", UpstreamModel: "x",
-			IngressProtocol: "openai-chat",
+			IngressProtocol: "chat",
 			InputTokens:     10,
 			OutputTokens:    r.out,
 			TotalTokens:     10 + r.out,
@@ -247,7 +247,7 @@ func TestUsageGroupBy_QualityColumnsSurvivePrune(t *testing.T) {
 	if err := st.CreateUsageRecord(ctx, &store.UsageRecord{
 		ID: "old1", Ts: old, AccessKeyID: "kA", PublicModel: "m",
 		ProviderID: "p1", UpstreamModel: "x",
-		IngressProtocol: "openai-chat",
+		IngressProtocol: "chat",
 		InputTokens:     10, OutputTokens: 100, TotalTokens: 110,
 		Status: "ok", HTTPStatus: 200,
 		LatencyMs: 1000, TTFBMs: 400,
@@ -306,7 +306,7 @@ func TestUsageGroupBy_ProviderDownsName(t *testing.T) {
 	ctx := t.Context()
 
 	if err := st.CreateProvider(ctx, &store.Provider{
-		ID: "pname1", Slug: "openai", Name: "OpenAI 官方", Protocol: "openai-chat",
+		ID: "pname1", Slug: "openai", Name: "OpenAI 官方", Protocol: "chat",
 		Endpoint: "https://api.openai.com", Enabled: true, CreatedAt: 1, UpdatedAt: 1,
 	}); err != nil {
 		t.Fatalf("create provider: %v", err)
@@ -314,7 +314,7 @@ func TestUsageGroupBy_ProviderDownsName(t *testing.T) {
 	if err := st.CreateUsageRecord(ctx, &store.UsageRecord{
 		ID: "n1", Ts: time.Now().UnixMilli(), AccessKeyID: "kA",
 		PublicModel: "gpt-4o", ProviderID: "pname1", UpstreamModel: "gpt-4o",
-		IngressProtocol: "openai-chat",
+		IngressProtocol: "chat",
 		InputTokens:     10, OutputTokens: 5, TotalTokens: 15,
 		Status: "ok", HTTPStatus: 200,
 	}); err != nil {
@@ -376,7 +376,7 @@ func TestUsageGroupBy_ScopeNarrowsArchive(t *testing.T) {
 			PublicModel:     "m",
 			ProviderID:      "p1",
 			UpstreamModel:   "x",
-			IngressProtocol: "openai-chat",
+			IngressProtocol: "chat",
 			InputTokens:     100 * int64(i+1),
 			OutputTokens:    10,
 			TotalTokens:     100 * int64(i+1),
@@ -442,7 +442,7 @@ func TestUsageHistory_PaginationNoDupNoSkip(t *testing.T) {
 			TotalTokens:     int64(i), // 唯一标签
 			Status:          "ok",
 			HTTPStatus:      http.StatusOK,
-			IngressProtocol: "openai-chat",
+			IngressProtocol: "chat",
 			UsageState:      "reported",
 		}); err != nil {
 			t.Fatalf("seed usage %d: %v", i, err)

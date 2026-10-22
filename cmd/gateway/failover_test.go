@@ -114,7 +114,7 @@ func buildHarnessFull(t *testing.T, chain []struct {
 		bps = append(bps, config.BootstrapProvider{
 			Slug:        c.slug,
 			Name:        c.slug,
-			Protocol:    "openai-chat",
+			Protocol:    "chat",
 			Endpoint:    c.url,
 			Credentials: []config.BootstrapCredential{{Label: "k", APIKey: "sk-" + c.slug}},
 		})
@@ -154,12 +154,11 @@ func buildHarnessFull(t *testing.T, chain []struct {
 	ri := routing.NewRouteIndex()
 	var targets []*routing.Target
 	for i, c := range chain {
-		ri.AddProvider(&routing.ProviderRef{ID: c.slug, Slug: c.slug, Endpoint: c.url, Protocol: "openai-chat", Enabled: true})
-		ri.AddUpstreamModel(&routing.UpstreamModel{ID: c.slug + "/m", ProviderID: c.slug, ModelID: c.slug + "-model", Enabled: true})
+		ri.AddProvider(&routing.ProviderRef{ID: c.slug, Slug: c.slug, Endpoint: c.url, Protocol: "chat", Enabled: true})
+		ri.AddUpstreamModel(&routing.UpstreamModel{ID: c.slug + "/m", ProviderID: c.slug, ModelID: c.slug + "-model"})
 		targets = append(targets, &routing.Target{
 			ID: c.slug + "#t" + string(rune('0'+i)), RouteID: "r1",
-			ProviderID: c.slug, UpstreamModelID: c.slug + "/m", Position: i, Enabled: true,
-		})
+			ProviderID: c.slug, UpstreamModelID: c.slug + "/m", Position: i})
 	}
 	ttft := 0
 	if len(ttftMs) > 0 {

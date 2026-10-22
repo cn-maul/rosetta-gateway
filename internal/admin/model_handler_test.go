@@ -50,7 +50,7 @@ func TestModelHandler_PriceRoundTrip(t *testing.T) {
 	}
 
 	// 不带价格字段的 PATCH 必须原样保留
-	rec, _ = patch(`{"enabled":false}`)
+	rec, _ = patch(`{"display_name":"renamed"}`)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("patch without prices: code=%d body=%s", rec.Code, rec.Body.String())
 	}
@@ -58,7 +58,7 @@ func TestModelHandler_PriceRoundTrip(t *testing.T) {
 	if m.PriceInput != 0.2 || m.PriceCacheHit != 0.02 || m.PriceOutput != 0.8 {
 		t.Fatalf("prices clobbered by unrelated patch: %+v", m)
 	}
-	if m.Enabled {
+	if m.DisplayName != "renamed" {
 		t.Fatalf("unrelated patch should still apply: %+v", m)
 	}
 

@@ -46,7 +46,7 @@ func NewResponses() Codec {
 
 type openaiChatCodec struct{}
 
-func (openaiChatCodec) Name() string { return "openai-chat" }
+func (openaiChatCodec) Name() string { return "chat" }
 
 func (openaiChatCodec) Decode(r *http.Request, maxBytes int64) (*Request, error) {
 	req, err := inwire.DecodeOpenAIChatRequest(r, maxBytes)
@@ -113,7 +113,7 @@ func (anthropicMessagesCodec) NewSink(w http.ResponseWriter, model string, _ *Re
 
 type openaiResponsesCodec struct{}
 
-func (openaiResponsesCodec) Name() string { return "openai-responses" }
+func (openaiResponsesCodec) Name() string { return "response" }
 
 func (openaiResponsesCodec) Decode(r *http.Request, maxBytes int64) (*Request, error) {
 	req, err := inwire.DecodeResponsesRequest(r, maxBytes)

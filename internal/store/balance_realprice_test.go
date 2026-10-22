@@ -34,7 +34,7 @@ func TestRealPriceInput_SmallCallsNowGetCharged(t *testing.T) {
 		cost, err := st.CreateUsageRecordWithCost(ctx, &UsageRecord{
 			ID: string(rune('a' + i)), UserID: "test", AccessKeyID: "k1",
 			PublicModel: "glm", ProviderID: "p1", UpstreamModel: "priced",
-			IngressProtocol: "openai-chat", Stream: false,
+			IngressProtocol: "chat", Stream: false,
 			InputTokens: c.in, OutputTokens: c.out, TotalTokens: c.in + c.out,
 			UsageState: "reported", Status: "ok",
 			RequestID: "real-" + string(rune('a'+i)),

@@ -165,18 +165,22 @@ CI 因此把 `node-version` 写成**具体的 `22.12`** 而不是 `'22'`
 ```bash
 # 后端
 gofmt -l cmd/ internal/          # 必须无输出
-go build ./...
-go vet ./...
-go test ./... -count=1
-$env:CC="C:/mingw64/bin/gcc.exe"; go test -race ./... -count=1   # 本机需带 CC
+go build ./cmd/... ./internal/...
+go vet ./cmd/... ./internal/...
+go test ./cmd/... ./internal/... -count=1
+$env:CC="C:/mingw64/bin/gcc.exe"; go test -race ./cmd/... ./internal/... -count=1   # 本机需带 CC
 
 # 前端
 cd web && npm ci && npm run typecheck && npm run build && node sync-embed.mjs
 ```
 
-**为什么总是全量跑而不是只跑相关的 `-run TestXxx`**：历史上出过两次
-「只跑子集，cmd/gateway 整包红一轮」的事故 —— 契约改动必须全量跑来兜底，
-这条红绿灯不能靠自觉。CI 里也是这么配的。
+**按批次验证，门禁跑全量。** 开发小改时不要求每改一行就完整跑一遍；同一组相关
+改动完成、准备提交或切换任务时再跑上述门禁。门禁本身仍要跑完整包，而不是只跑
+相关的 `-run TestXxx`：历史上出过两次「只跑子集，cmd/gateway 整包红一轮」的事故，
+契约改动必须全量跑来兜底。CI 里也是这么配的。
+
+这里的 `./cmd/... ./internal/...` 刻意不包含 `work/`：仓库里的审计/实验目录可能
+有独立的 `main` 代码，但它不属于产品构建与测试门禁。
 
 ---
 

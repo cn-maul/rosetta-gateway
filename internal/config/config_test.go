@@ -70,7 +70,7 @@ func itoa(n int) string {
 // max_request_body_bytes 必须有上界（2026-10-12 修 P2-18）。
 //
 // 它此前是整张校验表里**唯一** max=0（无上界）的字段。而 inwire 的三条入口
-// （openai-chat / openai-responses / anthropic）都是 io.ReadAll 全量读进内存，
+// （chat / response / anthropic）都是 io.ReadAll 全量读进内存，
 // MaxBytesReader 是唯一闸门 —— 误配成天文数字（手滑多敲几个 0、把 GB 当 MB）
 // 后，局域网内任意客户端发一个超大 body 就能让单进程网关 OOM。
 //

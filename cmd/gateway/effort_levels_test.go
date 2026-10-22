@@ -25,10 +25,9 @@ import (
 func newEffortSnapshot(t *testing.T, publicName, modelID string, levels []effort.Level) {
 	t.Helper()
 	ri := routing.NewRouteIndex()
-	ri.AddProvider(&routing.ProviderRef{ID: "p1", Slug: "prov", Protocol: "openai-chat", Enabled: true})
+	ri.AddProvider(&routing.ProviderRef{ID: "p1", Slug: "prov", Protocol: "chat", Enabled: true})
 	ri.AddUpstreamModel(&routing.UpstreamModel{
-		ID: "m1", ProviderID: "p1", ModelID: modelID, Enabled: true,
-		EffortLevels: levels,
+		ID: "m1", ProviderID: "p1", ModelID: modelID, EffortLevels: levels,
 	})
 	ri.AddRoute(&routing.Route{ID: "r1", PublicName: publicName, ProviderID: "p1", UpstreamModelID: "m1", Enabled: true})
 	snapshot.Init(&snapshot.Snapshot{
@@ -220,7 +219,7 @@ func TestApplyThinkingCapability_档位处理(t *testing.T) {
 			}
 			proto := c.proto
 			if proto == "" {
-				proto = "openai-chat"
+				proto = "chat"
 			}
 			ing.ApplyThinkingCapability(req, c.m, proto)
 
@@ -385,7 +384,7 @@ func TestApplyThinkingCapability_Anthropic预算原样透传(t *testing.T) {
 // TestApplyThinkingCapability_OpenAI系不动预算 钉住修改的边界：
 // BudgetTokens 只有 Anthropic 协议在意，OpenAI 两条路径碰它就等于引入回归。
 func TestApplyThinkingCapability_OpenAI系不动预算(t *testing.T) {
-	for _, proto := range []string{"openai-chat", "openai-responses"} {
+	for _, proto := range []string{"chat", "response"} {
 		t.Run(proto, func(t *testing.T) {
 			req := &rosetta.ChatRequest{
 				Model: "public",
@@ -423,7 +422,7 @@ func TestApplyThinkingCapability_不支持思考时剥掉(t *testing.T) {
 	ing := &ingress.Request{RawEffort: "high"}
 	ing.ApplyThinkingCapability(req, &routing.UpstreamModel{
 		ModelID: "gpt-4o", SupportsThinking: &no,
-	}, "openai-chat")
+	}, "chat")
 
 	if req.Thinking != nil {
 		t.Fatalf("不支持思考的模型不该收到思考配置：%+v", req.Thinking)
@@ -443,7 +442,7 @@ func TestApplyThinkingCapability_未配置不等于不支持(t *testing.T) {
 		ing := &ingress.Request{RawEffort: "high"}
 		ing.ApplyThinkingCapability(req, &routing.UpstreamModel{
 			ModelID: "gpt-5", SupportsThinking: sup,
-		}, "openai-chat")
+		}, "chat")
 
 		if req.Thinking == nil {
 			t.Fatalf("SupportsThinking=%v 时不该剥掉思考配置", sup)
@@ -462,7 +461,7 @@ func TestApplyThinkingCapability_未请求思考不新建Thinking(t *testing.T) 
 	ing := &ingress.Request{RawEffort: "high"}
 	ing.ApplyThinkingCapability(req, &routing.UpstreamModel{
 		ModelID: "gpt-5", EffortLevels: []effort.Level{effort.Low},
-	}, "openai-chat")
+	}, "chat")
 
 	if req.Thinking != nil {
 		t.Fatalf("不该凭空创建 Thinking：%+v", req.Thinking)
@@ -503,10 +502,9 @@ func TestListModels_披露思考开关(t *testing.T) {
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
 			ri := routing.NewRouteIndex()
-			ri.AddProvider(&routing.ProviderRef{ID: "p1", Slug: "prov", Protocol: "openai-chat", Enabled: true})
+			ri.AddProvider(&routing.ProviderRef{ID: "p1", Slug: "prov", Protocol: "chat", Enabled: true})
 			ri.AddUpstreamModel(&routing.UpstreamModel{
-				ID: "m1", ProviderID: "p1", ModelID: "gpt-4o", Enabled: true,
-				SupportsThinking: c.sup,
+				ID: "m1", ProviderID: "p1", ModelID: "gpt-4o", SupportsThinking: c.sup,
 			})
 			ri.AddRoute(&routing.Route{ID: "r1", PublicName: "flash", ProviderID: "p1", UpstreamModelID: "m1", Enabled: true})
 			snapshot.Init(&snapshot.Snapshot{
@@ -545,7 +543,7 @@ func TestListModels_披露思考开关(t *testing.T) {
 //
 // 这里明确只测数据面那一半：未配置 = 网关不干预，原样透传。
 func TestApplyThinkingCapability_未配置仍然不干预(t *testing.T) {
-	for _, proto := range []string{"openai-chat", "openai-responses", "anthropic"} {
+	for _, proto := range []string{"chat", "response", "anthropic"} {
 		t.Run(proto, func(t *testing.T) {
 			ing := &ingress.Request{}
 			req := &rosetta.ChatRequest{}
@@ -571,7 +569,7 @@ func TestApplyThinkingCapability_未配置仍然不干预(t *testing.T) {
 // RawEffort 是夹取的数据来源；任何一个协议漏填，该协议的请求就永远
 // 不会被夹取（且没有任何症状）。
 func TestRawEffort_三个入站协议都带上原始档位(t *testing.T) {
-	t.Run("openai-chat", func(t *testing.T) {
+	t.Run("chat", func(t *testing.T) {
 		r, err := inwire.DecodeOpenAIChatRequest(
 			effortBody(`{"model":"m","messages":[{"role":"user","content":"hi"}],"reasoning_effort":"XHigh"}`), 0)
 		if err != nil {
@@ -582,7 +580,7 @@ func TestRawEffort_三个入站协议都带上原始档位(t *testing.T) {
 		}
 	})
 
-	t.Run("openai-responses", func(t *testing.T) {
+	t.Run("response", func(t *testing.T) {
 		r, err := inwire.DecodeResponsesRequest(
 			effortBody(`{"model":"m","input":"hi","reasoning":{"effort":"xhigh"}}`), 0)
 		if err != nil {

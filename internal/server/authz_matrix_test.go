@@ -297,18 +297,17 @@ func (h *authzHarness) seed() {
 	// 的金额」这条断言会在 0 == 0 上假通过。
 	if err := st.CreateProvider(ctx, &store.Provider{
 		ID: "p1", Slug: "p1", Name: "Alpha", Endpoint: "http://a",
-		Enabled: true, Protocol: "openai-chat",
+		Enabled: true, Protocol: "chat",
 	}); err != nil {
 		t.Fatalf("create provider: %v", err)
 	}
 	if err := st.CreateUpstreamModel(ctx, &store.UpstreamModel{
-		ID: "um-priced", ProviderID: "p1", ModelID: "priced", Enabled: true, PriceInput: 1.0,
+		ID: "um-priced", ProviderID: "p1", ModelID: "priced", PriceInput: 1.0,
 	}); err != nil {
 		t.Fatalf("create model: %v", err)
 	}
 	if err := st.CreateRoute(ctx, &store.Route{
-		ID: "r1", PublicName: "flash", ProviderID: "p1", UpstreamModelID: "um-priced", Enabled: true,
-	}); err != nil {
+		ID: "r1", PublicName: "flash", ProviderID: "p1", UpstreamModelID: "um-priced"}); err != nil {
 		t.Fatalf("create route: %v", err)
 	}
 
@@ -326,7 +325,7 @@ func (h *authzHarness) seed() {
 		if err := st.CreateUsageRecord(ctx, &store.UsageRecord{
 			ID: "rec-" + u.id, Ts: 1_700_000_000_000, UserID: u.id,
 			AccessKeyID: "key-" + u.id, PublicModel: "flash", ProviderID: "p1",
-			UpstreamModel: "priced", IngressProtocol: "openai-chat",
+			UpstreamModel: "priced", IngressProtocol: "chat",
 			InputTokens: u.tokens, TotalTokens: u.tokens,
 			Status: "ok", HTTPStatus: 200, UsageState: "reported",
 		}); err != nil {

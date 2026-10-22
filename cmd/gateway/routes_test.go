@@ -26,10 +26,10 @@ func TestBuildApp_RegistersEveryCataloguedRoute(t *testing.T) {
 		usage: newUsageRecorder(db, discardLogger()),
 	})
 
-	// 103 是重构前的真实生产契约（含 5 条 /admin/api/ 方法兜底）。
+	// 107 是当前真实生产契约（含 5 条 /admin/api/ 方法兜底）。
 	// 端点增删必须显式更新这个数，不能靠测试里手抄第三份清单。
-	if len(app.Routes) != 103 {
-		t.Fatalf("生产路由契约应为 103 条，实际 %d 条", len(app.Routes))
+	if len(app.Routes) != 107 {
+		t.Fatalf("生产路由契约应为 107 条，实际 %d 条", len(app.Routes))
 	}
 	seen := make(map[string]registeredRoute)
 	for _, r := range app.Routes {
@@ -62,10 +62,12 @@ func TestBuildApp_RegistersEveryCataloguedRoute(t *testing.T) {
 
 	// 几条容易写错、且安全敏感的路径必须落在正确 mux 上。
 	public := map[string]bool{
-		"POST /admin/api/login":     true,
-		"GET /admin/api/session":    true,
-		"GET /admin/api/bootstrap":  true,
-		"POST /admin/api/bootstrap": true,
+		"POST /admin/api/login":                true,
+		"GET /admin/api/session":               true,
+		"GET /admin/api/bootstrap":             true,
+		"POST /admin/api/bootstrap":            true,
+		"POST /admin/api/password-setup/check": true,
+		"POST /admin/api/password-setup":       true,
 	}
 	for pattern, wantPublic := range public {
 		if got := seen[pattern].Public; got != wantPublic {

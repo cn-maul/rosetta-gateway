@@ -14,7 +14,6 @@ type UpstreamModel struct {
 	ProviderID       string
 	ModelID          string
 	DisplayName      string
-	Enabled          bool
 	ContextWindow    int
 	MaxOutputTokens  int
 	SupportsThinking *bool
@@ -42,7 +41,7 @@ type UpstreamModel struct {
 }
 
 // modelColumns 是 upstream_models 三处读路径共用的列清单。
-const modelColumns = `id, provider_id, model_id, display_name, enabled, context_window, max_output_tokens, supports_thinking, effort_levels, price_input, price_cache_hit, price_output, group_id`
+const modelColumns = `id, provider_id, model_id, display_name, context_window, max_output_tokens, supports_thinking, effort_levels, price_input, price_cache_hit, price_output, group_id`
 
 // nullIfZeroInt 把 0 写回 NULL。
 // context_window / max_output_tokens 是可空列，0 与"未知"语义不同，
@@ -86,7 +85,6 @@ type scanner interface {
 // "converting NULL to string is unsupported"，这是此前 list/get 失败的原因。
 func scanModel(sc scanner) (UpstreamModel, error) {
 	var m UpstreamModel
-	var enabled int
 	var displayName sql.NullString
 	var ctxWindow, maxOut sql.NullInt64
 	var thinking sql.NullBool
@@ -94,13 +92,12 @@ func scanModel(sc scanner) (UpstreamModel, error) {
 	var priceIn, priceHit, priceOut sql.NullFloat64
 	var groupID sql.NullString
 
-	err := sc.Scan(&m.ID, &m.ProviderID, &m.ModelID, &displayName, &enabled,
+	err := sc.Scan(&m.ID, &m.ProviderID, &m.ModelID, &displayName,
 		&ctxWindow, &maxOut, &thinking, &effortCSV, &priceIn, &priceHit, &priceOut, &groupID)
 	if err != nil {
 		return m, err
 	}
 
-	m.Enabled = enabled == 1
 	m.DisplayName = displayName.String
 	m.ContextWindow = int(ctxWindow.Int64)
 	m.MaxOutputTokens = int(maxOut.Int64)
@@ -181,13 +178,9 @@ func (s *Store) CreateUpstreamModelTx(ctx context.Context, tx Tx, m *UpstreamMod
 
 // createUpstreamModel 接受 execer，供事务内复用（见 ImportUpstreamModels）。
 func createUpstreamModel(ctx context.Context, ex execer, m *UpstreamModel) error {
-	enabled := 0
-	if m.Enabled {
-		enabled = 1
-	}
 	_, err := ex.ExecContext(ctx,
-		`INSERT INTO upstream_models (id, provider_id, model_id, display_name, enabled, context_window, max_output_tokens, supports_thinking, effort_levels, price_input, price_cache_hit, price_output, group_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		m.ID, m.ProviderID, m.ModelID, nullIfEmpty(m.DisplayName), enabled,
+		`INSERT INTO upstream_models (id, provider_id, model_id, display_name, context_window, max_output_tokens, supports_thinking, effort_levels, price_input, price_cache_hit, price_output, group_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		m.ID, m.ProviderID, m.ModelID, nullIfEmpty(m.DisplayName),
 		nullIfZeroInt(m.ContextWindow), nullIfZeroInt(m.MaxOutputTokens), m.SupportsThinking,
 		effortColumnValue(m),
 		nullIfZeroFloat(m.PriceInput), nullIfZeroFloat(m.PriceCacheHit), nullIfZeroFloat(m.PriceOutput),
@@ -196,13 +189,9 @@ func createUpstreamModel(ctx context.Context, ex execer, m *UpstreamModel) error
 }
 
 func (s *Store) UpdateUpstreamModel(ctx context.Context, id string, m *UpstreamModel) error {
-	enabled := 0
-	if m.Enabled {
-		enabled = 1
-	}
 	res, err := s.db.ExecContext(ctx,
-		`UPDATE upstream_models SET model_id = ?, display_name = ?, enabled = ?, context_window = ?, max_output_tokens = ?, supports_thinking = ?, effort_levels = ?, price_input = ?, price_cache_hit = ?, price_output = ?, group_id = ? WHERE id = ?`,
-		m.ModelID, nullIfEmpty(m.DisplayName), enabled,
+		`UPDATE upstream_models SET model_id = ?, display_name = ?, context_window = ?, max_output_tokens = ?, supports_thinking = ?, effort_levels = ?, price_input = ?, price_cache_hit = ?, price_output = ?, group_id = ? WHERE id = ?`,
+		m.ModelID, nullIfEmpty(m.DisplayName),
 		nullIfZeroInt(m.ContextWindow), nullIfZeroInt(m.MaxOutputTokens), m.SupportsThinking,
 		effortColumnValue(m),
 		nullIfZeroFloat(m.PriceInput), nullIfZeroFloat(m.PriceCacheHit), nullIfZeroFloat(m.PriceOutput),
@@ -494,21 +483,16 @@ func (s *Store) UpsertUpstreamModel(ctx context.Context, m *UpstreamModel) error
 }
 
 func upsertUpstreamModel(ctx context.Context, ex execer, m *UpstreamModel) error {
-	enabled := 0
-	if m.Enabled {
-		enabled = 1
-	}
 	_, err := ex.ExecContext(ctx,
-		`INSERT INTO upstream_models (id, provider_id, model_id, display_name, enabled, context_window, max_output_tokens, supports_thinking, effort_levels, price_input, price_cache_hit, price_output)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		`INSERT INTO upstream_models (id, provider_id, model_id, display_name, context_window, max_output_tokens, supports_thinking, effort_levels, price_input, price_cache_hit, price_output)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		 ON CONFLICT(provider_id, model_id) DO UPDATE SET
 		   display_name = excluded.display_name,
-		   enabled = excluded.enabled,
 		   context_window = excluded.context_window,
 		   max_output_tokens = excluded.max_output_tokens,
 		   supports_thinking = COALESCE(excluded.supports_thinking, upstream_models.supports_thinking),
 		   effort_levels = COALESCE(upstream_models.effort_levels, excluded.effort_levels)`,
-		m.ID, m.ProviderID, m.ModelID, nullIfEmpty(m.DisplayName), enabled,
+		m.ID, m.ProviderID, m.ModelID, nullIfEmpty(m.DisplayName),
 		nullIfZeroInt(m.ContextWindow), nullIfZeroInt(m.MaxOutputTokens), m.SupportsThinking,
 		effortColumnValue(m),
 		nullIfZeroFloat(m.PriceInput), nullIfZeroFloat(m.PriceCacheHit), nullIfZeroFloat(m.PriceOutput))

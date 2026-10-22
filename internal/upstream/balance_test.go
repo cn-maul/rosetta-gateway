@@ -29,7 +29,7 @@ func balanceFixture(t *testing.T) (*store.Store, string, []byte) {
 
 	master := []byte("0123456789abcdef0123456789abcdef")
 	p := &store.Provider{
-		ID: "p1", Slug: "p1", Name: "P1", Protocol: "openai-chat",
+		ID: "p1", Slug: "p1", Name: "P1", Protocol: "chat",
 		Endpoint: "http://127.0.0.1:0", Enabled: true,
 	}
 	if err := st.CreateProvider(context.Background(), p); err != nil {

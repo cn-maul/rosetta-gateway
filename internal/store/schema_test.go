@@ -9,6 +9,8 @@ import (
 	"path/filepath"
 	"testing"
 
+	wireproto "github.com/cn-maul/rosetta-gateway/internal/protocol"
+
 	_ "modernc.org/sqlite"
 )
 
@@ -33,10 +35,41 @@ func TestSchema_FreshDatabaseUsesCurrentVersion(t *testing.T) {
 	if version != currentSchemaVersion {
 		t.Fatalf("user_version = %d, want %d", version, currentSchemaVersion)
 	}
+	var setupTable int
+	if err := st.DB().QueryRow(
+		`SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'user_password_setup_tokens'`,
+	).Scan(&setupTable); err != nil {
+		t.Fatalf("inspect password setup table: %v", err)
+	}
+	if setupTable != 1 {
+		t.Fatal("fresh database is missing user_password_setup_tokens")
+	}
+}
+
+func TestSchema_AddsPasswordSetupTableToExistingCurrentDatabase(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "existing.db")
+	st := openSchemaTestStore(t, path)
+	if _, err := st.DB().Exec(`DROP TABLE user_password_setup_tokens`); err != nil {
+		t.Fatalf("drop setup table: %v", err)
+	}
+	if err := st.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+
+	reopened := openSchemaTestStore(t, path)
+	var n int
+	if err := reopened.DB().QueryRow(
+		`SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'user_password_setup_tokens'`,
+	).Scan(&n); err != nil {
+		t.Fatalf("inspect setup table: %v", err)
+	}
+	if n != 1 {
+		t.Fatal("existing current-version database did not gain user_password_setup_tokens")
+	}
 }
 
 func TestSchema_RejectsNonCurrentVersionWithoutModifyingDatabase(t *testing.T) {
-	for _, version := range []int{0, currentSchemaVersion + 1} {
+	for _, version := range []int{0, 1, currentSchemaVersion + 1} {
 		t.Run("version_"+schemaTestItoa(version), func(t *testing.T) {
 			path := filepath.Join(t.TempDir(), "old.db")
 			seedVersionedDatabase(t, path, version)
@@ -98,6 +131,75 @@ func TestSchema_ReopensCurrentVersionAndKeepsData(t *testing.T) {
 	}
 	if len(networks) != 1 || networks[0].Name != "proxy" {
 		t.Fatalf("current database data not preserved: %+v", networks)
+	}
+}
+
+func TestSchema_NormalizesLegacyProtocolValues(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "legacy-protocols.db")
+	st := openSchemaTestStore(t, path)
+	if err := st.CreateProvider(context.Background(), &Provider{
+		ID: "p1", Slug: "p1", Name: "P1", Protocol: wireproto.Chat,
+		Endpoint: "http://example.invalid/v1", Enabled: true,
+	}); err != nil {
+		t.Fatalf("create provider: %v", err)
+	}
+	if err := st.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+
+	db, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatalf("open raw database: %v", err)
+	}
+	if _, err := db.Exec(`
+		INSERT INTO usage_records (
+			id, ts, access_key_id, public_model, provider_id, upstream_model,
+			ingress_protocol, stream, usage_state, status, http_status, latency_ms
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		"u1", int64(1700000000000), "k1", "public", "p1", "upstream",
+		wireproto.LegacyResponse, 0, "reported", "ok", 200, 10,
+	); err != nil {
+		t.Fatalf("insert legacy usage row: %v", err)
+	}
+	if _, err := db.Exec(`
+		INSERT INTO usage_daily_rollups (day, ingress_protocol)
+		VALUES (?, ?)`, "2026-10-20", wireproto.LegacyChat); err != nil {
+		t.Fatalf("insert legacy rollup row: %v", err)
+	}
+	if _, err := db.Exec(`UPDATE providers SET protocol = ? WHERE id = ?`,
+		wireproto.LegacyChat, "p1"); err != nil {
+		t.Fatalf("set legacy provider protocol: %v", err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("close raw database: %v", err)
+	}
+
+	st2 := openSchemaTestStore(t, path)
+	var providerProtocol string
+	if err := st2.DB().QueryRow(`SELECT protocol FROM providers WHERE id = 'p1'`).
+		Scan(&providerProtocol); err != nil {
+		t.Fatalf("read provider protocol: %v", err)
+	}
+	if providerProtocol != wireproto.Chat {
+		t.Fatalf("provider protocol = %q, want %q", providerProtocol, wireproto.Chat)
+	}
+
+	var ingressProtocol string
+	if err := st2.DB().QueryRow(`SELECT ingress_protocol FROM usage_records WHERE id = 'u1'`).
+		Scan(&ingressProtocol); err != nil {
+		t.Fatalf("read usage protocol: %v", err)
+	}
+	if ingressProtocol != wireproto.Response {
+		t.Fatalf("usage protocol = %q, want %q", ingressProtocol, wireproto.Response)
+	}
+
+	var rollupProtocol string
+	if err := st2.DB().QueryRow(`SELECT ingress_protocol FROM usage_daily_rollups WHERE day = '2026-10-20'`).
+		Scan(&rollupProtocol); err != nil {
+		t.Fatalf("read rollup protocol: %v", err)
+	}
+	if rollupProtocol != wireproto.Chat {
+		t.Fatalf("rollup protocol = %q, want %q", rollupProtocol, wireproto.Chat)
 	}
 }
 
@@ -163,6 +265,9 @@ func TestSchema_CanonicalObjectsAndColumns(t *testing.T) {
 			}
 		}
 	}
+	if tableColumns(t, st, "upstream_models")["enabled"] {
+		t.Error("upstream_models.enabled should not exist: models are always available once added")
+	}
 
 	var rowCount int
 	if err := st.DB().QueryRow(`SELECT COUNT(*) FROM usage_totals WHERE id = 1`).Scan(&rowCount); err != nil {
@@ -177,14 +282,13 @@ func TestCreateRoute_SeedsHeadTargetAtomically(t *testing.T) {
 	ctx := context.Background()
 	st := openSchemaTestStore(t, filepath.Join(t.TempDir(), "route.db"))
 	if err := st.CreateProvider(ctx, &Provider{
-		ID: "p1", Slug: "p1", Name: "P1", Protocol: "openai-chat",
+		ID: "p1", Slug: "p1", Name: "P1", Protocol: "chat",
 		Endpoint: "http://example.test", Enabled: true,
 	}); err != nil {
 		t.Fatalf("create provider: %v", err)
 	}
 	if err := st.CreateUpstreamModel(ctx, &UpstreamModel{
-		ID: "m1", ProviderID: "p1", ModelID: "model-1", Enabled: true,
-	}); err != nil {
+		ID: "m1", ProviderID: "p1", ModelID: "model-1"}); err != nil {
 		t.Fatalf("create model: %v", err)
 	}
 	if err := st.CreateRoute(ctx, &Route{

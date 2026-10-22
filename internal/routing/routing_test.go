@@ -5,10 +5,10 @@ import "testing"
 // newFixture 造一条含两个 provider、各一个上游模型的 route。
 func newFixture() *RouteIndex {
 	ri := NewRouteIndex()
-	ri.AddProvider(&ProviderRef{ID: "pA", Slug: "alpha", Protocol: "openai-chat", Enabled: true})
-	ri.AddProvider(&ProviderRef{ID: "pB", Slug: "beta", Protocol: "openai-chat", Enabled: true})
-	ri.AddUpstreamModel(&UpstreamModel{ID: "mA", ProviderID: "pA", ModelID: "alpha-chat", Enabled: true})
-	ri.AddUpstreamModel(&UpstreamModel{ID: "mB", ProviderID: "pB", ModelID: "beta-chat", Enabled: true})
+	ri.AddProvider(&ProviderRef{ID: "pA", Slug: "alpha", Protocol: "chat", Enabled: true})
+	ri.AddProvider(&ProviderRef{ID: "pB", Slug: "beta", Protocol: "chat", Enabled: true})
+	ri.AddUpstreamModel(&UpstreamModel{ID: "mA", ProviderID: "pA", ModelID: "alpha-chat"})
+	ri.AddUpstreamModel(&UpstreamModel{ID: "mB", ProviderID: "pB", ModelID: "beta-chat"})
 	ri.AddRoute(&Route{ID: "r1", PublicName: "flash", ProviderID: "pA", UpstreamModelID: "mA", Enabled: true, FailoverEnabled: true})
 	return ri
 }
@@ -87,7 +87,7 @@ func TestResolve_FiltersDisabled(t *testing.T) {
 	ri2 := newFixture()
 	ri2.AddRouteTarget(&Target{ID: "t0", RouteID: "r1", ProviderID: "pA", UpstreamModelID: "mA", Position: 0, Enabled: true})
 	ri2.AddRouteTarget(&Target{ID: "t1", RouteID: "r1", ProviderID: "pB", UpstreamModelID: "mB", Position: 1, Enabled: true})
-	ri2.AddProvider(&ProviderRef{ID: "pA", Slug: "alpha", Protocol: "openai-chat", Enabled: false})
+	ri2.AddProvider(&ProviderRef{ID: "pA", Slug: "alpha", Protocol: "chat", Enabled: false})
 	res2, _ := ri2.Resolve("flash")
 	if len(res2.Candidates) != 1 || res2.Candidates[0].Provider.ID != "pB" {
 		t.Fatalf("disabled provider target not filtered: %+v", res2.Candidates)

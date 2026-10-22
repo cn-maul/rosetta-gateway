@@ -11,7 +11,7 @@ func seedProvider(t *testing.T, st *Store, id string) {
 	t.Helper()
 	if err := st.CreateProvider(context.Background(), &Provider{
 		ID: id, Slug: id, Name: id, Endpoint: "http://example.invalid",
-		Enabled: true, Protocol: "openai-chat",
+		Enabled: true, Protocol: "chat",
 	}); err != nil {
 		t.Fatalf("seed provider %s: %v", id, err)
 	}

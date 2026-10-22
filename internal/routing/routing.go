@@ -54,8 +54,8 @@ type ProviderRef struct {
 	ID       string
 	Slug     string
 	Endpoint string
-	// Protocol is the upstream wire protocol ("openai-chat",
-	// "openai-responses", "anthropic", or "auto"/"" to let the SDK probe).
+	// Protocol is the upstream wire protocol ("chat",
+	// "response", "anthropic", or "auto"/"" to let the SDK probe).
 	// Request construction needs it: protocol-private fields are only valid
 	// on the dialect that defines them.
 	Protocol string
@@ -67,7 +67,6 @@ type UpstreamModel struct {
 	ProviderID      string
 	ModelID         string
 	DisplayName     string
-	Enabled         bool
 	ContextWindow   int
 	MaxOutputTokens int
 
@@ -251,7 +250,7 @@ func (ri *RouteIndex) Resolve(model string) (*Resolution, error) {
 			// provider/model 直连兜底。
 			//
 			// 旧实现写成 `if r, ok := ...; ok && r.Enabled`，!r.Enabled 时条件
-			// 短路、控制流直接落到下一个分支，而下一支只看 p.Enabled/m.Enabled，
+			// 短路、控制流直接落到下一个分支，而下一支只看 p.Enabled，
 			// 完全不再看「这个名字是否已被显式禁用」。触发路径完全现实：
 			// public_name 只校验非空、不限制含 "/"，所以「acme/gpt-4」这种
 			// 按客户分模型名的路由是合法的 —— 运维把它禁掉后，客户端请求该名字
@@ -274,7 +273,7 @@ func (ri *RouteIndex) Resolve(model string) (*Resolution, error) {
 		rest := model[idx+1:]
 		p := ri.findProviderBySlug(slug)
 		if p != nil && p.Enabled {
-			if m := ri.FindUpstreamModelByModelID(p.ID, rest); m != nil && m.Enabled {
+			if m := ri.FindUpstreamModelByModelID(p.ID, rest); m != nil {
 				synth := &Route{
 					PublicName:      model,
 					ProviderID:      p.ID,
@@ -313,7 +312,7 @@ func (ri *RouteIndex) buildCandidates(r *Route) []Candidate {
 			continue
 		}
 		m := ri.findUpstreamModel(t.ProviderID, t.UpstreamModelID)
-		if m == nil || !m.Enabled {
+		if m == nil {
 			continue
 		}
 		out = append(out, Candidate{TargetID: t.ID, Position: t.Position, Provider: p, UpstreamModel: m})
@@ -330,7 +329,7 @@ func (ri *RouteIndex) buildCandidates(r *Route) []Candidate {
 		return nil
 	}
 	m := ri.findUpstreamModel(r.ProviderID, r.UpstreamModelID)
-	if m == nil || !m.Enabled {
+	if m == nil {
 		return nil
 	}
 	return []Candidate{{TargetID: r.ID + "#synth", Provider: p, UpstreamModel: m}}
@@ -459,8 +458,7 @@ type UpstreamModelRef struct {
 
 // ListUpstreamModels 枚举全部 (provider, upstream model) 对，供
 // /v1/models?include=upstream 展开。providers 索引按 ID 与 slug 各存一份，
-// 这里按 ID 去重；model 本身禁用或 provider 禁用时 Enabled=false，
-// 由调用方决定是否列出。
+// 这里按 ID 去重；provider 禁用时 Enabled=false，由调用方决定是否列出。
 func (ri *RouteIndex) ListUpstreamModels() []UpstreamModelRef {
 	ri.mu.RLock()
 	defer ri.mu.RUnlock()
@@ -476,7 +474,7 @@ func (ri *RouteIndex) ListUpstreamModels() []UpstreamModelRef {
 				ProviderID:   p.ID,
 				ProviderSlug: p.Slug,
 				ModelID:      m.ModelID,
-				Enabled:      m.Enabled && p.Enabled,
+				Enabled:      p.Enabled,
 			})
 		}
 	}

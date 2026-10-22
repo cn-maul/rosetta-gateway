@@ -116,7 +116,7 @@ func probeTestStore(t *testing.T, endpoint string, withCredential bool) *store.S
 	ctx := context.Background()
 	if err := st.CreateProvider(ctx, &store.Provider{
 		ID: "p1", Slug: "probe", Name: "Probe",
-		Endpoint: endpoint, Protocol: "openai-chat", Enabled: true,
+		Endpoint: endpoint, Protocol: "chat", Enabled: true,
 	}); err != nil {
 		t.Fatalf("create provider: %v", err)
 	}
@@ -129,8 +129,7 @@ func probeTestStore(t *testing.T, endpoint string, withCredential bool) *store.S
 		}
 	}
 	if err := st.CreateUpstreamModel(ctx, &store.UpstreamModel{
-		ID: "m1", ProviderID: "p1", ModelID: "probe-model", Enabled: true,
-	}); err != nil {
+		ID: "m1", ProviderID: "p1", ModelID: "probe-model"}); err != nil {
 		t.Fatalf("create model: %v", err)
 	}
 	return st
@@ -300,25 +299,21 @@ func TestModelTest_InBandErrorIsNotSuccess(t *testing.T) {
 	}
 }
 
-// 停用的模型也必须能测。
-//
-// 这是刻意的：管理员在「启用」之前最需要知道的就是「它到底能不能用」。
-// 若这里加 enabled 前置判定，唯一的效果是把探测推后到启用之后 ——
-// 那时坏模型已经进入候选池，一次真实流量才会撞上它。
-func TestModelTest_DisabledModelIsStillProbed(t *testing.T) {
+// 模型没有启停状态，添加后即可测试。
+func TestModelTest_ModelIsImmediatelyProbeable(t *testing.T) {
 	up := recordingProbeUpstream(t, 0, "")
 	st := probeTestStore(t, up.srv.URL, true)
 	ctx := context.Background()
 	if err := st.UpdateUpstreamModel(ctx, "m1", &store.UpstreamModel{
-		ID: "m1", ProviderID: "p1", ModelID: "probe-model", Enabled: false,
+		ID: "m1", ProviderID: "p1", ModelID: "probe-model",
 	}); err != nil {
-		t.Fatalf("disable model: %v", err)
+		t.Fatalf("update model: %v", err)
 	}
 	h := probeHandler(t, st)
 
 	_, resp := callTest(t, h, "m1")
 	if resp.Status != "ok" {
-		t.Fatalf("停用的模型仍应可探测，got %q message=%q", resp.Status, resp.Message)
+		t.Fatalf("模型应立即可探测，got %q message=%q", resp.Status, resp.Message)
 	}
 	if n := up.hitCount(); n != 1 {
 		t.Fatalf("应恰好发出一次探测请求，实际 %d 次", n)

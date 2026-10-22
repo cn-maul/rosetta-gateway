@@ -2,9 +2,9 @@
 import { computed, onMounted, ref, watch } from 'vue'
 import { RouterLink } from 'vue-router'
 import { api, isAdmin } from '../api'
-import { fmtNum, fmtTokens, fmtSpeed, fmtSec, fmtPercent, fmtMoney, fmtBalance, fmtRemainder } from '../fmt'
+import { fmtNum, fmtTokens, fmtSpeed, fmtSec, fmtPercent, fmtMoney, fmtBalance, fmtRemainder, fmtTimeMs } from '../fmt'
 import * as timeRange from '../range'
-import type { Stats, UsageGroupEntry, Provider, Route } from '../types'
+import type { Stats, StatsOverview, UsageGroupEntry, Provider } from '../types'
 import { useQueryText } from '../composables/useQueryText'
 
 const err = ref('')
@@ -13,17 +13,21 @@ const stats = ref<Stats | null>(null)
 const byDay = ref<UsageGroupEntry[]>([])
 const loadedAt = ref(0)
 const providers = ref<Provider[]>([])
-const routes = ref<Route[]>([])
+const overview = ref<StatsOverview | null>(null)
 const gatewayLoading = ref(true)
 const providerError = ref('')
-const routeError = ref('')
+const overviewError = ref('')
 const gatewayAt = ref(0)
 const unready = computed(() => providers.value.filter(p => p.enabled && p.ready === false))
 const unknown = computed(() => providers.value.filter(p => p.enabled && typeof p.ready !== 'boolean'))
-const readyCount = computed(() => providers.value.filter(p => p.enabled && p.ready === true).length)
-const activeRoutes = computed(() => routes.value.filter(r => r.enabled).length)
-const errorRate = computed(() => stats.value && stats.value.total_requests > 0
-  ? fmtPercent(stats.value.error_count / stats.value.total_requests) + '%' : '—')
+const successRate = computed(() => {
+  const s = stats.value
+  if (!s) return '—'
+  const finished = s.success_count + s.error_count
+  return finished > 0 ? fmtPercent(s.success_count / finished) + '%' : '—'
+})
+const lifetimeTokens = computed(() => stats.value?.lifetime?.total_tokens ?? null)
+const lifetimeCost = computed(() => stats.value?.lifetime?.cost_total ?? null)
 
 type RangeKey = '1d' | '7d' | '14d' | '1m' | '1y' | 'all'
 const RANGES: { key: RangeKey; label: string; days: number }[] = [
@@ -53,6 +57,69 @@ function rangeBounds(key: RangeKey): { from: number; to: number } {
 function rangeLabel(key: RangeKey): string {
   return RANGES.find((r) => r.key === key)?.label ?? ''
 }
+
+// 首页只列“需要动手”的事项；正常的配置不在待办区重复一遍。
+type AttentionItem = {
+  level: 'error' | 'warn'
+  title: string
+  detail: string
+  to: string
+}
+const attentionItems = computed<AttentionItem[]>(() => {
+  const items: AttentionItem[] = []
+  const o = overview.value
+  const s = stats.value
+  if (o) {
+    if (o.providers_unready > 0) {
+      items.push({
+        level: 'error',
+        title: `${fmtNum(o.providers_unready)} 个已启用上游未就绪`,
+        detail: '凭据池为空或无法建立上游客户端，相关模型请求会失败。',
+        to: '/providers?status=unready',
+      })
+    }
+    if (o.providers_unknown > 0) {
+      items.push({
+        level: 'warn',
+        title: `${fmtNum(o.providers_unknown)} 个上游运行状态未知`,
+        detail: '当前快照缺少这些上游的就绪信息，请检查网关日志或重新刷新。',
+        to: '/providers?status=unknown',
+      })
+    }
+    if (o.routes_total === 0) {
+      items.push({
+        level: 'error',
+        title: '还没有公开模型路由',
+        detail: '客户端目前没有可调用的模型名。',
+        to: '/routes',
+      })
+    } else if (o.routes_enabled === 0) {
+      items.push({
+        level: 'error',
+        title: '所有公开模型路由均已停用',
+        detail: '上游即使正常，客户端也无法发起模型调用。',
+        to: '/routes',
+      })
+    }
+  }
+  if (s?.cost_pending_count) {
+    items.push({
+      level: 'warn',
+      title: `${fmtNum(s.cost_pending_count)} 条费用待重算`,
+      detail: '这些记录当前按 0 元显示，不能据此判断模型免费。',
+      to: '/history',
+    })
+  }
+  if (s && s.total_requests > 0 && s.success_count === 0) {
+    items.push({
+      level: 'error',
+      title: '所选区间没有成功请求',
+      detail: `共 ${fmtNum(s.total_requests)} 次调用，其中失败 ${fmtNum(s.error_count)} 次、取消 ${fmtNum(s.canceled_count)} 次。`,
+      to: '/history',
+    })
+  }
+  return items
+})
 
 // 柱状图的一个桶。labFull / labShort 是**预先算好的展示标签**，模板不再做字符串切片
 // （切片散在模板里，改桶宽时极易忘掉一处，标签就会露出原始日期串）。
@@ -247,7 +314,8 @@ async function loadStats() {
   err.value = ''
   try {
     const { from, to } = rangeBounds(requested)
-    const [s, d] = await Promise.all([api.stats(from, to, requested === 'all'), api.usageByDay(from, to)])
+    // 管理员始终带终身累计：首页“当前状态”的累计用量不能随区间切换而消失。
+    const [s, d] = await Promise.all([api.stats(from, to, isAdmin()), api.usageByDay(from, to)])
     if (seq !== statsSeq) return
     stats.value = s
     byDay.value = d
@@ -266,12 +334,18 @@ async function loadGateway() {
   const seq = ++gatewaySeq
   gatewayLoading.value = true
   // 当前配置独立于历史统计；任一数据源失败只把自己的状态置为未知。
-  const [p, r] = await Promise.allSettled([api.providers(), api.routes()])
+  const [o, p] = await Promise.allSettled([api.statsOverview(), api.providers()])
   if (seq !== gatewaySeq) return
+  if (o.status === 'fulfilled') { overview.value = o.value; overviewError.value = '' }
+  else {
+    overview.value = null
+    overviewError.value = o.reason instanceof Error ? o.reason.message : '当前配置读取失败'
+  }
   if (p.status === 'fulfilled') { providers.value = p.value; providerError.value = '' }
-  else { providers.value = []; providerError.value = '上游状态读取失败，当前状态未知' }
-  if (r.status === 'fulfilled') { routes.value = r.value; routeError.value = '' }
-  else { routes.value = []; routeError.value = '路由配置读取失败，当前状态未知' }
+  else {
+    providers.value = []
+    providerError.value = p.reason instanceof Error ? p.reason.message : '上游状态读取失败'
+  }
   gatewayAt.value = Date.now()
   gatewayLoading.value = false
 }
@@ -283,7 +357,7 @@ onMounted(refresh)
 <template>
   <div class="page overview-page">
     <div class="page-head">
-      <div><h1>{{ isAdmin() ? '网关总览' : '我的总览' }}</h1><div class="sub">{{ isAdmin() ? '全站流量、请求质量与待处理配置' : '个人调用、费用与账户状态' }}</div></div>
+      <div><h1>{{ isAdmin() ? '网关总览' : '我的总览' }}</h1><div class="sub">{{ isAdmin() ? '当前配置、运行质量与需要处理的事项' : '个人调用、费用与账户状态' }}</div></div>
       <div class="head-actions">
         <label class="sr-only" for="overview-range">统计时间范围</label>
         <select id="overview-range" v-model="selectedRange" class="select range-control"><option v-for="r in RANGES" :key="r.key" :value="r.key">{{ r.label }}</option></select>
@@ -291,27 +365,55 @@ onMounted(refresh)
       </div>
     </div>
 
-    <section v-if="isAdmin()" class="panel gateway-status">
-      <div class="panel-title">当前配置<span class="hint">{{ gatewayLoading ? '正在刷新…' : '更新于 ' + new Date(gatewayAt).toLocaleTimeString() }} · 与统计时间范围无关</span></div>
-      <div v-if="gatewayLoading" class="status-loading" role="status">正在读取上游与路由配置…</div>
-      <template v-else>
-        <div class="config-summary">
-          <RouterLink to="/providers"><strong>{{ providerError ? '—' : readyCount }}</strong><span>凭据就绪 / {{ providerError ? '上游总数未知' : '共 ' + providers.length + ' 个上游' }}</span></RouterLink>
-          <RouterLink to="/routes"><strong>{{ routeError ? '—' : activeRoutes }}</strong><span>已启用公开模型 / {{ routeError ? '总数未知' : '共 ' + routes.length + ' 个' }}</span></RouterLink>
-          <RouterLink to="/models" class="status-link">查看首选目标探测 →</RouterLink>
+    <section v-if="isAdmin()" class="current-section">
+      <div class="section-heading"><div><h2>当前状态</h2><p>配置开关与运行时就绪情况，不随统计时间范围变化</p></div><span class="section-meta">{{ gatewayLoading ? '正在刷新…' : '更新于 ' + new Date(gatewayAt).toLocaleTimeString() }}</span></div>
+      <div v-if="gatewayLoading && !overview" class="loading compact">正在读取当前配置…</div>
+      <div v-else-if="overviewError && !overview" class="status-message warn" role="alert">{{ overviewError }}<button class="text-link" @click="loadGateway">重试</button></div>
+      <template v-else-if="overview">
+        <div class="current-grid">
+          <RouterLink to="/providers" class="current-card">
+            <span class="current-label">上游</span>
+            <strong class="current-value">{{ fmtNum(overview.providers_enabled) }}<small>/ {{ fmtNum(overview.providers_total) }}</small></strong>
+            <span class="current-note">启用 / 共</span>
+            <span class="current-foot" :class="{ warnText: overview.providers_unready > 0 }">凭据就绪 {{ fmtNum(overview.providers_ready) }}<template v-if="overview.providers_unready"> · 未就绪 {{ fmtNum(overview.providers_unready) }}</template><template v-if="overview.providers_unknown"> · 状态未知 {{ fmtNum(overview.providers_unknown) }}</template></span>
+          </RouterLink>
+          <RouterLink to="/routes" class="current-card">
+            <span class="current-label">公开模型</span>
+            <strong class="current-value">{{ fmtNum(overview.routes_enabled) }}<small>/ {{ fmtNum(overview.routes_total) }}</small></strong>
+            <span class="current-note">启用 / 共</span>
+            <span class="current-foot">上游模型 {{ fmtNum(overview.upstream_models_total) }} 个</span>
+          </RouterLink>
+          <RouterLink to="/users" class="current-card">
+            <span class="current-label">用户</span>
+            <strong class="current-value">{{ fmtNum(overview.users_enabled) }}<small>/ {{ fmtNum(overview.users_total) }}</small></strong>
+            <span class="current-note">启用 / 共</span>
+            <span class="current-foot">禁用账号无法调用</span>
+          </RouterLink>
+          <RouterLink to="/keys" class="current-card">
+            <span class="current-label">API Key</span>
+            <strong class="current-value">{{ fmtNum(overview.keys_enabled) }}<small>/ {{ fmtNum(overview.keys_total) }}</small></strong>
+            <span class="current-note">启用 / 共</span>
+            <span class="current-foot">禁用且过期密钥立即失效</span>
+          </RouterLink>
+          <div class="current-card current-card-wide">
+            <span class="current-label">累计用量</span>
+            <strong class="current-value">{{ lifetimeTokens === null ? '—' : fmtTokens(lifetimeTokens) }}<small>tokens</small></strong>
+            <span class="current-note">自首次记录以来</span>
+            <span class="current-foot">累计费用 {{ lifetimeCost === null ? '—' : '¥' + fmtMoney(lifetimeCost) }} · 包含已归档历史</span>
+          </div>
         </div>
-        <div class="config-alerts">
+        <div class="current-alerts">
           <p v-if="providerError" class="status-message warn" role="alert">{{ providerError }}<button class="text-link" @click="loadGateway">重试</button></p>
-          <p v-if="routeError" class="status-message warn" role="alert">{{ routeError }}<button class="text-link" @click="loadGateway">重试</button></p>
+          <p v-if="overviewError" class="status-message warn" role="alert">当前配置刷新失败，显示上次结果：{{ overviewError }}<button class="text-link" @click="loadGateway">重试</button></p>
           <div v-for="p in unready.slice(0, 3)" :key="p.id" class="status-message">
             <span class="badge badge-st-error">未就绪</span><div><strong>{{ p.name }}</strong><div class="sub-line">{{ p.ready_reason || '未建立可用凭据池，请检查凭据配置' }}</div></div><RouterLink :to="{ name: 'provider-detail', params: { id: p.id } }" class="btn btn-sm">检查凭据</RouterLink>
           </div>
           <RouterLink v-if="unready.length > 3" to="/providers?status=unready" class="text-link">查看全部 {{ unready.length }} 个未就绪上游 →</RouterLink>
           <p v-if="unknown.length" class="status-message warn">{{ unknown.length }} 个已启用上游状态未知<RouterLink to="/providers?status=unknown" class="text-link">查看</RouterLink></p>
-          <p v-if="!providerError && !providers.length" class="status-message">还没有上游。先接入服务并配置凭据与模型。<RouterLink to="/providers" class="btn btn-sm">接入上游</RouterLink></p>
-          <p v-if="!routeError && !routes.length" class="status-message">还没有公开模型路由，客户端暂时没有可调用的模型名。<RouterLink to="/routes" class="btn btn-sm">配置路由</RouterLink></p>
-          <p v-else-if="!routeError && !activeRoutes" class="status-message warn">所有公开模型路由均已停用。<RouterLink to="/routes" class="text-link">检查路由</RouterLink></p>
-          <p v-if="!providerError && providers.length && !unready.length && !unknown.length" class="context-note">已启用上游的凭据池均已就绪。此状态不代表实时推理成功，需结合模型探测与请求日志判断。</p>
+          <p v-if="!overview.providers_total" class="status-message">还没有上游。先接入服务并配置凭据与模型。<RouterLink to="/providers" class="btn btn-sm">接入上游</RouterLink></p>
+          <p v-if="!overview.routes_total" class="status-message">还没有公开模型路由，客户端暂时没有可调用的模型名。<RouterLink to="/routes" class="btn btn-sm">配置路由</RouterLink></p>
+          <p v-else-if="!overview.routes_enabled" class="status-message warn">所有公开模型路由均已停用。<RouterLink to="/routes" class="text-link">检查路由</RouterLink></p>
+          <p v-if="overview.providers_total && overview.providers_enabled && !overview.providers_unready && !overview.providers_unknown" class="context-note">已启用上游的凭据池均已就绪。此状态不代表实时推理成功，需结合请求成功率与请求日志判断。</p>
         </div>
       </template>
     </section>
@@ -320,65 +422,147 @@ onMounted(refresh)
     <div v-if="loading && !stats" class="loading">正在加载统计…</div>
     <template v-if="stats">
       <div v-if="readiness" class="call-readiness" :class="readiness.cls" role="status"><span class="cr-dot" aria-hidden="true"></span><div class="cr-body"><div class="cr-title">{{ readiness.title }}</div><div class="cr-detail">{{ readiness.detail }}</div></div><RouterLink v-if="readiness.linkTo" :to="readiness.linkTo" class="btn btn-sm">{{ readiness.linkText }}</RouterLink></div>
-      <div class="section-caption"><span>{{ rangeLabel(range) }} · {{ isAdmin() ? '全站统计' : '我的统计' }}</span><span class="dim">{{ loading ? '正在加载所选范围，暂显上次结果' : '更新于 ' + new Date(loadedAt).toLocaleTimeString() }}</span></div>
-      <div class="overview-metrics">
-        <div class="card stat-card"><div class="card__title">请求量</div><div class="stat-v num">{{ fmtNum(stats.total_requests) }}</div><div class="metric-note">所选区间内的全部调用</div></div>
-        <div class="card stat-card" :class="{ 'is-err': stats.error_count > 0 }"><div class="card__title">错误率</div><div class="stat-v num">{{ errorRate }}</div><div class="metric-note">{{ fmtNum(stats.error_count) }} 次错误 / {{ fmtNum(stats.total_requests) }} 次请求</div></div>
-        <div class="card stat-card"><div class="card__title">近期平均首字用时</div><div class="stat-v num">{{ stats.avg_ttfb_ms > 0 ? fmtSec(stats.avg_ttfb_ms) : '—' }}<span v-if="stats.avg_ttfb_ms > 0" class="unit">s</span></div><div class="metric-note">{{ stats.recent_performance_status === 'error' ? '近期性能读取失败，请刷新重试' : stats.ttfb_samples ? '最近 ' + stats.ttfb_samples + ' 条成功且有首字计时的请求（最多 ' + stats.recent_sample_limit + ' 条）' : '暂无成功且有首字计时的样本' }} · 不随区间变化</div></div>
-        <div class="card stat-card"><div class="card__title">记录费用</div><div class="stat-v num">¥{{ fmtMoney(stats.cost) }}</div><div class="metric-note">按调用当时单价固化 · 未配价不计费</div></div>
-      </div>
+
+      <section class="range-section">
+        <div class="section-heading"><div><h2>{{ rangeLabel(range) }}运行质量</h2><p>{{ isAdmin() ? '全站请求、费用与缓存明细' : '我的请求、费用与缓存明细' }}</p></div><span class="section-meta">{{ loading ? '正在加载所选范围，暂显上次结果' : '更新于 ' + new Date(loadedAt).toLocaleTimeString() }}</span></div>
+        <div class="kpi-grid">
+          <div class="card stat-card"><div class="card__title">请求数</div><div class="stat-v num">{{ fmtNum(stats.total_requests) }}</div><div class="metric-note">所选区间内的全部调用</div></div>
+          <div class="card stat-card" :class="{ 'is-err': stats.error_count > 0 }"><div class="card__title">成功率</div><div class="stat-v num">{{ successRate }}</div><div class="metric-note">成功 {{ fmtNum(stats.success_count) }} · 失败 {{ fmtNum(stats.error_count) }}<template v-if="stats.canceled_count"> · 取消 {{ fmtNum(stats.canceled_count) }}</template></div></div>
+          <div class="card stat-card"><div class="card__title">Token 用量</div><div class="stat-v num">{{ fmtTokens(stats.total_tokens) }}</div><div class="metric-note">输入 {{ fmtTokens(stats.input_tokens) }} · 输出 {{ fmtTokens(stats.output_tokens) }}</div></div>
+          <div class="card stat-card"><div class="card__title">费用</div><div class="stat-v num">¥{{ fmtMoney(stats.cost) }}</div><div class="metric-note">按调用当时单价固化<template v-if="stats.cost_pending_count"> · 待重算 {{ fmtNum(stats.cost_pending_count) }} 条</template></div></div>
+        </div>
+        <div class="performance-strip">
+          <div><span class="perf-label">平均首字</span><strong>{{ stats.ttfb_samples ? fmtSec(stats.avg_ttfb_ms) + ' s' : '—' }}</strong><small>{{ stats.ttfb_samples ? fmtNum(stats.ttfb_samples) + ' 个成功流式样本' : '暂无可用样本' }}</small></div>
+          <div><span class="perf-label">平均输出速度</span><strong>{{ stats.throughput_samples ? fmtSpeed(stats.avg_tokens_per_sec) + ' tok/s' : '—' }}</strong><small>{{ stats.throughput_samples ? fmtNum(stats.throughput_samples) + ' 个成功样本' : '暂无可用样本' }}</small></div>
+          <div><span class="perf-label">缓存命中率</span><strong>{{ stats.input_tokens > 0 ? fmtPercent(stats.cache_hit_rate) + '%' : '—' }}</strong><small>缓存 {{ fmtTokens(stats.cached_tokens) }} / 输入 {{ fmtTokens(stats.input_tokens) }}</small></div>
+        </div>
+      </section>
 
       <div v-if="!isAdmin()" class="personal-balance"><div><span class="dim">当前账户余额</span><strong>{{ fmtBalance(stats.balance_cents, stats.balance_unlimited) }}</strong><span v-if="fmtRemainder(stats.balance_remainder)" class="dim">含 {{ fmtRemainder(stats.balance_remainder) }} 待结算</span></div><RouterLink to="/wallet" class="text-link">余额与账单 →</RouterLink></div>
-      <section class="panel trend-panel">
-        <div class="panel-title">Token 用量趋势<span class="hint">{{ rangeLabel(range) }} · {{ range === 'all' ? '每桶 30 天' : range === '1y' ? '按周聚合' : '按日聚合' }}</span><RouterLink to="/usage?tab=models" class="text-link trend-more">按模型分析 →</RouterLink></div>
-        <div v-if="stats.total_requests === 0" class="context-note">这个时间范围内没有请求记录。可切换时间范围，或到请求日志查看其他时段。</div>
-        <div v-if="lifetimeTruncated" class="hint-note">趋势仅覆盖当前返回的最近 {{ byDay.length }} 个有记录日期，可能不含全部历史。</div>
-        <div class="bars"><div v-for="d in daySeries" :key="d.key" class="bar-col"><div class="bar-track"><div class="bar" :class="{ dim: !d.tokens }" :style="{ height: Math.max(2, d.tokens / maxTokens * 100) + '%' }" :data-tip="d.tip + ' · ' + fmtNum(d.count) + ' 次 · ' + fmtTokens(d.tokens) + ' tok'"></div></div></div></div>
-        <div class="bar-labels" :class="{ dense: daySeries.length > 20 }"><span v-for="(d, i) in daySeries" :key="d.key" class="bar-lab" :class="{ dim: i % labelStride !== 0 }"><span class="bar-full">{{ d.labFull }}</span><span class="bar-short">{{ d.labShort }}</span></span></div>
-        <div class="usage-summary"><span>输入 <strong>{{ fmtTokens(stats.input_tokens) }}</strong></span><span>输出 <strong>{{ fmtTokens(stats.output_tokens) }}</strong></span><span>缓存命中 <strong>{{ stats.input_tokens > 0 ? fmtPercent(stats.cache_hit_rate) + '%' : '—' }}</strong></span><span>近期输出速度 <strong>{{ stats.avg_tokens_per_sec > 0 ? fmtSpeed(stats.avg_tokens_per_sec) + ' tok/s' : '—' }}</strong>（{{ stats.recent_performance_status === 'error' ? '近期性能读取失败，请刷新重试' : stats.throughput_samples ? '最近 ' + stats.throughput_samples + ' 条成功且有输出计时的请求，最多 ' + stats.recent_sample_limit + ' 条' : '暂无成功且有输出计时的样本' }}，不随区间变化）</span></div>
-      </section>
-      <div class="overview-shortcuts"><RouterLink to="/history">查看{{ isAdmin() ? '请求日志' : '我的调用' }} →</RouterLink><RouterLink v-if="isAdmin()" to="/routes">管理模型与路由 →</RouterLink><RouterLink v-else to="/keys">管理 API 密钥 →</RouterLink></div>
+
+      <div class="trend-grid">
+        <section class="panel trend-panel">
+          <div class="panel-title">Token 用量趋势<span class="hint">{{ rangeLabel(range) }} · {{ range === 'all' ? '每桶 30 天' : range === '1y' ? '按周聚合' : '按日聚合' }}</span><RouterLink to="/usage?tab=models" class="text-link trend-more">按模型分析 →</RouterLink></div>
+          <div v-if="stats.total_requests === 0" class="context-note">这个时间范围内没有请求记录。可切换时间范围，或到请求日志查看其他时段。</div>
+          <div v-if="lifetimeTruncated" class="hint-note">趋势仅覆盖当前返回的最近 {{ byDay.length }} 个有记录日期，可能不含全部历史。</div>
+          <div class="bars"><div v-for="d in daySeries" :key="d.key" class="bar-col"><div class="bar-track"><div class="bar" :class="{ dim: !d.tokens }" :style="{ height: Math.max(2, d.tokens / maxTokens * 100) + '%' }" :data-tip="d.tip + ' · ' + fmtNum(d.count) + ' 次 · ' + fmtTokens(d.tokens) + ' tok'"></div></div></div></div>
+          <div class="bar-labels" :class="{ dense: daySeries.length > 20 }"><span v-for="(d, i) in daySeries" :key="d.key" class="bar-lab" :class="{ dim: i % labelStride !== 0 }"><span class="bar-full">{{ d.labFull }}</span><span class="bar-short">{{ d.labShort }}</span></span></div>
+          <div class="usage-summary"><span>输入 <strong>{{ fmtTokens(stats.input_tokens) }}</strong></span><span>输出 <strong>{{ fmtTokens(stats.output_tokens) }}</strong></span><span>缓存命中 <strong>{{ stats.input_tokens > 0 ? fmtPercent(stats.cache_hit_rate) + '%' : '—' }}</strong></span><span>费用 <strong>¥{{ fmtMoney(stats.cost) }}</strong></span></div>
+        </section>
+
+        <section v-if="isAdmin()" class="panel todo-panel">
+          <div class="panel-title">需要处理<span class="hint">按影响程度排序</span></div>
+          <div v-if="attentionItems.length" class="todo-list">
+            <RouterLink v-for="item in attentionItems" :key="item.title" :to="item.to" class="todo-item" :class="item.level">
+              <span class="todo-dot" aria-hidden="true"></span><div><strong>{{ item.title }}</strong><p>{{ item.detail }}</p></div><span class="todo-arrow" aria-hidden="true">→</span>
+            </RouterLink>
+          </div>
+          <div v-else class="todo-empty"><span class="todo-ok">✓</span><strong>没有发现需要处理的问题</strong><p>上游凭据、公开路由与费用状态均正常。</p></div>
+          <div class="todo-meta"><span>最近一次成功请求</span><strong>{{ stats.last_success_at ? fmtTimeMs(stats.last_success_at) : '所选区间无成功请求' }}</strong></div>
+        </section>
+      </div>
+      <div class="overview-shortcuts"><RouterLink to="/history">查看{{ isAdmin() ? '请求日志' : '我的调用' }} →</RouterLink><RouterLink v-if="isAdmin()" to="/usage?tab=models">按模型分析用量 →</RouterLink><RouterLink v-else to="/keys">管理 API 密钥 →</RouterLink></div>
     </template>
   </div>
 </template>
 
 <style scoped>
 .range-control { width: auto; min-width: 110px; }
-.gateway-status { margin-bottom: 24px; padding: 20px; }
-.config-summary { display: flex; align-items: center; gap: 28px; padding: 8px 0 14px; flex-wrap: wrap; }
-.config-summary > a { display: flex; align-items: baseline; gap: 10px; color: var(--text); text-decoration: none; }
-.config-summary strong { font-size: 26px; font-variant-numeric: tabular-nums; }
-.config-summary span { color: var(--muted); font-size: 13px; }
-.config-summary .status-link { margin-left: auto; color: var(--accent); font-size: 13px; }
-.config-alerts { padding: 0; }
+.current-section, .range-section { margin-bottom: 30px; }
+.section-heading { display: flex; justify-content: space-between; align-items: flex-end; gap: 16px; flex-wrap: wrap; margin: 4px 0 14px; }
+.section-heading h2 { margin: 0; font-size: 17px; letter-spacing: -.01em; }
+.section-heading p { margin: 4px 0 0; color: var(--muted); font-size: 12px; }
+.section-meta { color: var(--muted); font-size: 11px; }
+.current-grid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)) minmax(220px, 1.25fr); gap: 12px; }
+.current-card {
+  position: relative; display: flex; flex-direction: column; min-height: 134px; padding: 17px 18px;
+  color: var(--text); text-decoration: none; background: var(--surface);
+  border: 1px solid var(--border); border-radius: 14px; overflow: hidden;
+}
+.current-card::before {
+  content: ""; position: absolute; inset: 0 auto 0 0; width: 3px;
+  background: var(--accent); opacity: .7;
+}
+.current-card:hover { border-color: color-mix(in srgb, var(--accent) 45%, var(--border)); }
+.current-label { color: var(--muted); font-size: 12px; }
+.current-value { margin-top: 6px; font-size: 31px; font-weight: 600; line-height: 1; font-variant-numeric: tabular-nums; }
+.current-value small { margin-left: 5px; color: var(--muted); font-size: 13px; font-weight: 400; }
+.current-note { margin-top: 6px; color: var(--muted); font-size: 11px; }
+.current-foot { margin-top: auto; padding-top: 12px; color: var(--muted); font-size: 11px; line-height: 1.45; }
+.warnText { color: var(--warning-soft-foreground); }
+.current-card-wide { min-width: 0; }
+.current-alerts { padding-top: 8px; }
 .status-loading { padding: 20px; color: var(--muted); }
 .status-message { display: flex; align-items: center; gap: 12px; padding: 12px; background: var(--surface-secondary); border-radius: 10px; margin: 6px 0; font-size: 13px; }
 .status-message > div { min-width: 0; flex: 1; overflow-wrap: anywhere; }
 .status-message > .btn, .status-message > .text-link { margin-left: auto; flex-shrink: 0; }
 .warn { color: var(--warning-soft-foreground); background: var(--warning-soft); }
-.section-caption { display: flex; justify-content: space-between; flex-wrap: wrap; gap: 8px; margin: 20px 0 10px; font-size: 12px; }
-.overview-metrics { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 14px; margin-bottom: 22px; }
-.overview-metrics .stat-card { padding: 20px; border-radius: 16px; gap: 10px; }
+.loading.compact { padding: 22px 0; }
+.kpi-grid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 12px; }
+.kpi-grid .stat-card { padding: 18px 19px; border-radius: 14px; gap: 8px; min-height: 118px; }
+.kpi-grid .stat-v { font-size: 27px; }
 .metric-note { color: var(--muted); font-size: 11px; line-height: 1.6; }
 .unit { font-size: 13px; margin-left: 4px; color: var(--muted); }
+.performance-strip {
+  display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 0;
+  margin-top: 12px; padding: 4px 0; background: var(--surface); border: 1px solid var(--border); border-radius: 14px;
+}
+.performance-strip > div { display: grid; grid-template-columns: 1fr auto; gap: 2px 14px; align-items: baseline; padding: 13px 18px; }
+.performance-strip > div + div { border-left: 1px solid var(--border); }
+.perf-label { color: var(--muted); font-size: 11px; }
+.performance-strip strong { font-size: 20px; font-weight: 550; font-variant-numeric: tabular-nums; }
+.performance-strip small { grid-column: 1 / -1; color: var(--muted); font-size: 10px; }
 .personal-balance, .personal-balance > div { display: flex; align-items: center; gap: 16px; flex-wrap: wrap; }
 .personal-balance { justify-content: space-between; padding: 18px 0 24px; font-size: 13px; }
 .personal-balance strong { font-size: 22px; }
+.trend-grid { display: grid; grid-template-columns: minmax(0, 1.65fr) minmax(280px, .75fr); gap: 14px; align-items: stretch; }
+.trend-panel, .todo-panel { margin: 0; min-width: 0; }
 .trend-more { margin-left: auto; font-size: 12px; }
 .usage-summary { display: flex; flex-wrap: wrap; gap: 12px 28px; padding: 18px 20px; margin-top: 14px; border-top: 1px solid var(--border); color: var(--muted); font-size: 12px; }
 .usage-summary strong { color: var(--text); font-weight: 500; }
+.todo-panel { padding: 20px; }
+.todo-list { display: flex; flex-direction: column; gap: 7px; margin-top: 4px; }
+.todo-item {
+  display: grid; grid-template-columns: 8px minmax(0, 1fr) auto; gap: 10px; align-items: start;
+  padding: 11px 10px; color: var(--text); text-decoration: none; border-radius: 9px;
+}
+.todo-item:hover { background: var(--surface-secondary); }
+.todo-item strong { font-size: 12px; font-weight: 550; }
+.todo-item p { margin: 4px 0 0; color: var(--muted); font-size: 11px; line-height: 1.55; }
+.todo-dot { width: 6px; height: 6px; margin-top: 6px; border-radius: 50%; background: var(--warning-soft-foreground); }
+.todo-item.error .todo-dot { background: var(--error, #d54b42); }
+.todo-arrow { margin-top: 2px; color: var(--muted); }
+.todo-empty { display: flex; flex-direction: column; align-items: flex-start; gap: 7px; padding: 22px 10px; }
+.todo-empty strong { font-size: 13px; }
+.todo-empty p { margin: 0; color: var(--muted); font-size: 11px; }
+.todo-ok { display: grid; place-items: center; width: 25px; height: 25px; border-radius: 50%; color: var(--accent); background: var(--surface-secondary); }
+.todo-meta { display: flex; justify-content: space-between; gap: 8px; margin-top: 16px; padding-top: 13px; border-top: 1px solid var(--border); color: var(--muted); font-size: 10px; }
+.todo-meta strong { color: var(--text); font-weight: 500; text-align: right; }
 .overview-shortcuts { display: flex; flex-wrap: wrap; gap: 24px; padding: 16px 2px; font-size: 13px; }
 .bar-full { display: inline; } .bar-short { display: none; }
-@media (max-width: 1100px) { .overview-metrics { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
+@media (max-width: 1200px) {
+  .current-grid { grid-template-columns: repeat(4, minmax(0, 1fr)); }
+  .current-card-wide { grid-column: 1 / -1; min-height: 100px; }
+}
+@media (max-width: 1000px) {
+  .kpi-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .trend-grid { grid-template-columns: 1fr; }
+}
 @media (max-width: 640px) {
-  .config-summary { gap: 14px; padding: 8px 0 14px; }
-  .config-summary > a { width: 100%; }
-  .config-summary .status-link { margin-left: 0; }
-  .config-alerts { padding: 0; }
+  .current-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 9px; }
+  .current-card { min-height: 126px; padding: 14px; }
+  .current-card-wide { grid-column: 1 / -1; min-height: 96px; }
+  .current-value { font-size: 25px; }
+  .current-foot { font-size: 10px; }
+  .current-alerts { padding-top: 2px; }
   .status-message { flex-wrap: wrap; }
-  .overview-metrics { gap: 10px; }
-  .overview-metrics .stat-card { padding: 14px; }
-  .overview-metrics .stat-v { font-size: 23px; }
+  .section-heading { align-items: flex-start; }
+  .kpi-grid { gap: 9px; }
+  .kpi-grid .stat-card { padding: 14px; min-height: 106px; }
+  .kpi-grid .stat-v { font-size: 22px; }
+  .performance-strip { grid-template-columns: 1fr; }
+  .performance-strip > div { padding: 12px 14px; }
+  .performance-strip > div + div { border-left: 0; border-top: 1px solid var(--border); }
   .trend-more { width: 100%; margin-left: 0; }
   .bar-full { display: none; } .bar-short { display: inline; }
 }

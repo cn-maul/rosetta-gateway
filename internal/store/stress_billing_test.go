@@ -858,7 +858,7 @@ func TestStress_FullLifecycle_ChargeMatchesFrozenCostExactly(t *testing.T) {
 		rec := &UsageRecord{
 			ID: fmt.Sprintf("lc-%d", i), UserID: "u1", AccessKeyID: "k1",
 			PublicModel: "priced", ProviderID: "p1", UpstreamModel: "priced",
-			IngressProtocol: "openai-chat",
+			IngressProtocol: "chat",
 			InputTokens:     in, OutputTokens: out, CachedTokens: cached,
 			TotalTokens: in + out,
 			UsageState:  "reported", Status: "ok", HTTPStatus: 200,
@@ -1348,13 +1348,12 @@ func mustProviderAndModel(t *testing.T, st *Store) {
 	ctx := context.Background()
 	if err := st.CreateProvider(ctx, &Provider{
 		ID: "p1", Slug: "p1", Name: "P1", Endpoint: "http://x",
-		Protocol: "openai-chat", Enabled: true,
+		Protocol: "chat", Enabled: true,
 	}); err != nil {
 		t.Fatalf("provider: %v", err)
 	}
 	if err := st.CreateUpstreamModel(ctx, &UpstreamModel{
-		ID: "m1", ProviderID: "p1", ModelID: "priced", Enabled: true,
-		PriceInput: 0.2, PriceOutput: 0.8,
+		ID: "m1", ProviderID: "p1", ModelID: "priced", PriceInput: 0.2, PriceOutput: 0.8,
 	}); err != nil {
 		t.Fatalf("model: %v", err)
 	}
@@ -1374,7 +1373,7 @@ func seedOldUsage(t *testing.T, st *Store, base time.Time) {
 		if err := st.CreateUsageRecord(ctx, &UsageRecord{
 			ID: fmt.Sprintf("old-%d", i), Ts: old + int64(i),
 			AccessKeyID: "k1", PublicModel: "priced", ProviderID: "p1",
-			UpstreamModel: "priced", IngressProtocol: "openai-chat",
+			UpstreamModel: "priced", IngressProtocol: "chat",
 			InputTokens: 100, OutputTokens: 50, TotalTokens: 150,
 			UsageState: "reported", Status: "ok", HTTPStatus: 200,
 			LatencyMs: 100,

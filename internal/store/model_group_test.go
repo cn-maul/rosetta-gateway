@@ -20,7 +20,7 @@ func TestModelGroup_RoundTrip(t *testing.T) {
 	seedProvider(t, st, "p1")
 	seedCred(t, st, "p1", "c1", true)
 
-	if err := st.CreateUpstreamModel(ctx, &UpstreamModel{ID: "m1", ProviderID: "p1", ModelID: "deepseek-chat", Enabled: true}); err != nil {
+	if err := st.CreateUpstreamModel(ctx, &UpstreamModel{ID: "m1", ProviderID: "p1", ModelID: "deepseek-chat"}); err != nil {
 		t.Fatalf("create model: %v", err)
 	}
 	seedGroup(t, st, "g1", "DeepSeek V3")
@@ -54,7 +54,7 @@ func TestModelGroup_SetUnknownGroup(t *testing.T) {
 	st := testStore(t, t.TempDir()+"/g.db")
 	ctx := context.Background()
 	seedProvider(t, st, "p1")
-	if err := st.CreateUpstreamModel(ctx, &UpstreamModel{ID: "m1", ProviderID: "p1", ModelID: "x", Enabled: true}); err != nil {
+	if err := st.CreateUpstreamModel(ctx, &UpstreamModel{ID: "m1", ProviderID: "p1", ModelID: "x"}); err != nil {
 		t.Fatalf("model: %v", err)
 	}
 	if err := st.SetModelGroup(ctx, "m1", "ghost"); !errors.Is(err, ErrNotFound) {
@@ -73,7 +73,7 @@ func TestModelGroup_DeleteSetsNull(t *testing.T) {
 	ctx := context.Background()
 	seedProvider(t, st, "p1")
 	seedGroup(t, st, "g1", "G")
-	if err := st.CreateUpstreamModel(ctx, &UpstreamModel{ID: "m1", ProviderID: "p1", ModelID: "x", Enabled: true, GroupID: "g1"}); err != nil {
+	if err := st.CreateUpstreamModel(ctx, &UpstreamModel{ID: "m1", ProviderID: "p1", ModelID: "x", GroupID: "g1"}); err != nil {
 		t.Fatalf("model: %v", err)
 	}
 	if err := st.SetModelGroup(ctx, "m1", "g1"); err != nil {
@@ -98,7 +98,7 @@ func TestModelGroup_Unassign(t *testing.T) {
 	ctx := context.Background()
 	seedProvider(t, st, "p1")
 	seedGroup(t, st, "g1", "G")
-	if err := st.CreateUpstreamModel(ctx, &UpstreamModel{ID: "m1", ProviderID: "p1", ModelID: "x", Enabled: true, GroupID: "g1"}); err != nil {
+	if err := st.CreateUpstreamModel(ctx, &UpstreamModel{ID: "m1", ProviderID: "p1", ModelID: "x", GroupID: "g1"}); err != nil {
 		t.Fatalf("model: %v", err)
 	}
 	if err := st.SetModelGroup(ctx, "m1", ""); err != nil {
@@ -117,12 +117,12 @@ func TestModelGroup_GroupNamesByModel(t *testing.T) {
 	seedProvider(t, st, "p1")
 	seedGroup(t, st, "g1", "G1")
 	for _, id := range []string{"m1", "m2"} {
-		if err := st.CreateUpstreamModel(ctx, &UpstreamModel{ID: id, ProviderID: "p1", ModelID: id, Enabled: true, GroupID: "g1"}); err != nil {
+		if err := st.CreateUpstreamModel(ctx, &UpstreamModel{ID: id, ProviderID: "p1", ModelID: id, GroupID: "g1"}); err != nil {
 			t.Fatalf("model %s: %v", id, err)
 		}
 	}
 	// m3 未归组
-	if err := st.CreateUpstreamModel(ctx, &UpstreamModel{ID: "m3", ProviderID: "p1", ModelID: "m3", Enabled: true}); err != nil {
+	if err := st.CreateUpstreamModel(ctx, &UpstreamModel{ID: "m3", ProviderID: "p1", ModelID: "m3"}); err != nil {
 		t.Fatalf("model m3: %v", err)
 	}
 

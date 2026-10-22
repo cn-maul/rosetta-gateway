@@ -32,8 +32,7 @@ func newDayCostStore(t *testing.T) *store.Store {
 	t.Helper()
 	st := newTestStore(t)
 	if err := st.CreateUpstreamModel(t.Context(), &store.UpstreamModel{
-		ID: "priced", ProviderID: "p1", ModelID: "priced", Enabled: true,
-		PriceInput: 1.0,
+		ID: "priced", ProviderID: "p1", ModelID: "priced", PriceInput: 1.0,
 	}); err != nil {
 		t.Fatalf("seed priced model: %v", err)
 	}
@@ -110,7 +109,7 @@ func TestGroupByDay_CostIsSumOfThatDay(t *testing.T) {
 		if err := st.CreateUsageRecord(ctx, &store.UsageRecord{
 			ID: "today-" + string(rune('a'+i)), Ts: ts, UserID: "u1",
 			AccessKeyID: "k1", PublicModel: "m", ProviderID: "p1", UpstreamModel: "priced",
-			IngressProtocol: "openai-chat",
+			IngressProtocol: "chat",
 			InputTokens:     100_000, TotalTokens: 100_000,
 			Status: "ok", HTTPStatus: 200, UsageState: "reported",
 		}); err != nil {
@@ -120,7 +119,7 @@ func TestGroupByDay_CostIsSumOfThatDay(t *testing.T) {
 	if err := st.CreateUsageRecord(ctx, &store.UsageRecord{
 		ID: "yest-0", Ts: localDayStart(t, 1) + 3_600_000, UserID: "u1",
 		AccessKeyID: "k1", PublicModel: "m", ProviderID: "p1", UpstreamModel: "priced",
-		IngressProtocol: "openai-chat",
+		IngressProtocol: "chat",
 		InputTokens:     250_000, TotalTokens: 250_000,
 		Status: "ok", HTTPStatus: 200, UsageState: "reported",
 	}); err != nil {
@@ -168,7 +167,7 @@ func TestGroupByDay_CostMatchesStats(t *testing.T) {
 		if err := st.CreateUsageRecord(ctx, &store.UsageRecord{
 			ID: "r-" + string(rune('a'+i)), Ts: localDayStart(t, back) + int64(3_600_000*(i+1)),
 			UserID: "u1", AccessKeyID: "k1", PublicModel: "m", ProviderID: "p1", UpstreamModel: "priced",
-			IngressProtocol: "openai-chat",
+			IngressProtocol: "chat",
 			InputTokens:     int64(50_000 * (i + 1)), TotalTokens: int64(50_000 * (i + 1)),
 			Status: "ok", HTTPStatus: 200, UsageState: "reported",
 		}); err != nil {
@@ -232,7 +231,7 @@ func TestGroupByDay_DoesNotTruncateLongSeries(t *testing.T) {
 		if err := st.CreateUsageRecord(ctx, &store.UsageRecord{
 			ID: "series-" + strconv.Itoa(back), Ts: ts, UserID: "u1",
 			AccessKeyID: "k1", PublicModel: "m", ProviderID: "p1", UpstreamModel: "priced",
-			IngressProtocol: "openai-chat",
+			IngressProtocol: "chat",
 			InputTokens:     1, TotalTokens: 1,
 			Status: "ok", HTTPStatus: 200, UsageState: "reported",
 		}); err != nil {
@@ -286,8 +285,8 @@ func TestGroupByDay_ScopedToCaller(t *testing.T) {
 	// 同一天：u1 花 10 万（0.1 元），u2 花 90 万（0.9 元）。
 	ts := localDayStart(t, 0) + 3_600_000
 	for _, r := range []*store.UsageRecord{
-		{ID: "d-u1", Ts: ts, UserID: "u1", AccessKeyID: "k1", PublicModel: "m", ProviderID: "p1", UpstreamModel: "priced", IngressProtocol: "openai-chat", InputTokens: 100_000, TotalTokens: 100_000, Status: "ok", HTTPStatus: 200, UsageState: "reported"},
-		{ID: "d-u2", Ts: ts, UserID: "u2", AccessKeyID: "k2", PublicModel: "m", ProviderID: "p1", UpstreamModel: "priced", IngressProtocol: "openai-chat", InputTokens: 900_000, TotalTokens: 900_000, Status: "ok", HTTPStatus: 200, UsageState: "reported"},
+		{ID: "d-u1", Ts: ts, UserID: "u1", AccessKeyID: "k1", PublicModel: "m", ProviderID: "p1", UpstreamModel: "priced", IngressProtocol: "chat", InputTokens: 100_000, TotalTokens: 100_000, Status: "ok", HTTPStatus: 200, UsageState: "reported"},
+		{ID: "d-u2", Ts: ts, UserID: "u2", AccessKeyID: "k2", PublicModel: "m", ProviderID: "p1", UpstreamModel: "priced", IngressProtocol: "chat", InputTokens: 900_000, TotalTokens: 900_000, Status: "ok", HTTPStatus: 200, UsageState: "reported"},
 	} {
 		if err := st.CreateUsageRecord(ctx, r); err != nil {
 			t.Fatalf("create usage %s: %v", r.ID, err)

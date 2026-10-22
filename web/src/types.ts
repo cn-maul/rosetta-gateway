@@ -157,7 +157,6 @@ export interface UpstreamModel {
   provider_id: string
   model_id: string
   display_name: string
-  enabled: boolean
   context_window: number
   max_output_tokens: number
   // 单价（元 / 百万 tokens），0 = 未配置（费用按 0 计）。
@@ -351,7 +350,6 @@ export interface ProviderBalance {
 export interface UpstreamModelUpdate {
   model_id?: string
   display_name?: string
-  enabled?: boolean
   context_window?: number
   max_output_tokens?: number
   /** 逗号分隔的挡位原文；空串 = 清除（回到「未配置」）。 */
@@ -486,14 +484,30 @@ export interface BootstrapStatus {
   needs_setup: boolean
   /** 待初始化的账号名，供表单标题显示。needs_setup 为 false 时为空。 */
   username?: string
-  /**
-   * 本安装的引导窗口是否需要一次性令牌（needs_setup 为真时才有意义）。
-   *
-   * 为真时登录页要显示一个令牌输入框。这个端点**免鉴权**，所以服务端
-   * 只会告知「需不需要」而绝不会把令牌本身发下来 —— 令牌只在启动日志里。
-   */
-  requires_token?: boolean
   session_enabled: boolean
+}
+
+/**
+ * POST /admin/api/users/{id}/password-setup 的响应。
+ *
+ * token 只在这次响应里出现一次，服务端只保存哈希。`url_path` 把 token 放在
+ * hash fragment 中，所以首次 HTTP 请求不会把 token 发到服务器访问日志里。
+ */
+export interface PasswordSetupLink {
+  url_path: string
+  expires_at: number
+}
+
+/**
+ * POST /admin/api/password-setup/check 的响应。
+ *
+ * 无效、过期、已使用、账号被禁用都统一返回 valid=false，不区分具体原因，
+ * 避免公开端点变成账号/链接枚举 oracle。
+ */
+export interface PasswordSetupStatus {
+  valid: boolean
+  username?: string
+  expires_at?: number
 }
 
 /** GET /admin/api/me 的响应。 */
@@ -678,25 +692,39 @@ export interface KeyCreateResponse extends AccessKey {
 }
 
 export interface Stats {
-  throughput_samples: number
-  ttfb_samples: number
-  recent_performance_status: 'ready' | 'error'
-  recent_sample_limit: number
   total_requests: number
+  /** 成功请求数（status='ok'）。成功率的分母是 success_count + error_count。 */
+  success_count: number
+  /** 真正失败数：status 不在 ok/canceled 之列。 */
+  error_count: number
+  /** 客户端主动断开，既不算成功也不算失败。 */
+  canceled_count: number
   total_tokens: number
   input_tokens: number
   output_tokens: number
   cached_tokens: number // 缓存读取命中的输入 token 累计
   cache_hit_rate: number // 0~1，= cached_tokens / input_tokens；无输入样本时为 0
-  error_count: number
+  /** 所选区间内成功请求的加权输出速度（token/s）。 */
   avg_tokens_per_sec: number
+  /** 参与速度加权的成功样本数；0 = 暂无样本。 */
+  throughput_samples: number
+  /** 所选区间内成功流式请求的平均首字延迟（毫秒）。 */
   avg_ttfb_ms: number
+  /** 参与首字平均的成功样本数；0 = 暂无样本。 */
+  ttfb_samples: number
   // 费用（元）：每条用量落库**当时**按模型单价算好并固化的金额求和
   // （usage_records.cost_total）。改价只影响此后的记录，不回溯历史。
   //
   // 普通用户拿到的是**自己**的合计（2026-10-10 起）—— 此前服务端对普通用户
   // 强制归零，依据是「网关不做计费结算」，但余额计费落地后该前提已不成立。
   cost: number
+  /** 费用仍为 0、等待重算的记录数；与“未配置价格”的可核对信号。 */
+  cost_pending_count: number
+  /** 所选区间最近一次成功请求的毫秒时间戳；0 = 无成功请求。 */
+  last_success_at: number
+  /** 本次统计实际采用的查询边界（毫秒）。 */
+  requested_from: number
+  requested_to: number
   /**
    * 当前登录者的账户余额（分）与待结算余数（微元），随 stats 一并下发。
    *
@@ -737,6 +765,27 @@ export interface Stats {
     // 明细已被剪到的水位日（YYYY-MM-DD）；空 = 未剪过
     pruned_through_day: string
   }
+}
+
+/**
+ * GET /admin/api/stats/overview 的响应。
+ *
+ * 当前配置计数与统计时间范围无关。上游额外区分“已启用”与“凭据就绪”：
+ * 前者只是配置开关，后者才决定请求是否真的有机会到达上游。
+ */
+export interface StatsOverview {
+  providers_total: number
+  providers_enabled: number
+  providers_ready: number
+  providers_unready: number
+  providers_unknown: number
+  routes_total: number
+  routes_enabled: number
+  upstream_models_total: number
+  users_total: number
+  users_enabled: number
+  keys_total: number
+  keys_enabled: number
 }
 
 // usage 分组端点（by-day / by-model / by-key / by-provider）的统一返回行
@@ -847,8 +896,19 @@ export interface UsageHistoryEntry {
   ts: number // 毫秒时间戳
   public_model: string // 调用模型（对外名）
   upstream_model: string // 实际模型（底层上游名）
+  /** 实际命中的上游配置 id；历史记录中可能为空。 */
+  provider_id: string
+  /**
+   * 入站协议：chat / response / anthropic。
+   *
+   * 它回答的是“这次请求从哪个入口进来”，与 upstream_model 所属上游的
+   * 协议不是同一个概念。页面用短标签展示，详情里保留原值。
+   */
+  ingress_protocol: string
   key_name: string // 调用密钥名称（密钥删除后为空）
   key_id: string // 调用密钥 id（回退显示用）
+  /** 输入侧 token（请求上下文、工具定义等）。 */
+  input_tokens: number
   total_tokens: number
   /**
    * 本次**生成**出来的 token 数（后端 usage_records.output_tokens）。
@@ -858,6 +918,10 @@ export interface UsageHistoryEntry {
    * （1 万输入 / 2 百输出时，用总量算出来是真实生成速度的 50 倍）。
    */
   output_tokens: number
+  /** 命中缓存的输入 token；0 表示未报缓存命中或确实没有命中。 */
+  cached_tokens: number
+  /** 推理模型消耗的思考 token；非推理模型通常为 0。 */
+  reasoning_tokens: number
   /**
    * 本次请求的平均输出速度（token/s），**由后端算好下发**。
    *
@@ -908,6 +972,8 @@ export interface UsageHistoryEntry {
    * 这次为什么走了备用上游，或者为什么明明失败了却没有换上游。
    */
   route_trace?: string
+  /** 网关/上游链路请求标识；旧记录或未透传时为空串。 */
+  request_id: string
 }
 
 // 调用历史的分页结果：当页明细 + 过滤后的总条数（用于计算总页数）
@@ -1001,7 +1067,6 @@ export interface ConfigExportModel {
   provider_slug: string
   model_id: string
   display_name?: string
-  enabled: boolean
   context_window?: number
   max_output_tokens?: number
   supports_thinking?: boolean

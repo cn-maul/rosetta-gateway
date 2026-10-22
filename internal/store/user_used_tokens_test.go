@@ -164,12 +164,12 @@ func TestUserUsedTokens_空串用户不被累加(t *testing.T) {
 		}
 	}
 	must(st.CreateProvider(ctx, &Provider{
-		ID: "p1", Slug: "p1", Name: "P1", Endpoint: "http://x", Protocol: "openai-chat", Enabled: true}))
+		ID: "p1", Slug: "p1", Name: "P1", Endpoint: "http://x", Protocol: "chat", Enabled: true}))
 	if err := st.CreateUsageRecord(ctx, &UsageRecord{
 		ID: "r1", Ts: time.Now().UnixMilli(),
 		UserID: "", AccessKeyID: "k1",
 		PublicModel: "m", ProviderID: "p1", UpstreamModel: "m",
-		IngressProtocol: "openai-chat", Stream: false,
+		IngressProtocol: "chat", Stream: false,
 		InputTokens: 100, OutputTokens: 100, TotalTokens: 200,
 		UsageState: "reported", Status: "ok", HTTPStatus: 200,
 	}); err != nil {

@@ -71,7 +71,7 @@ func seedTpsHistory(t *testing.T, st *store.Store) int64 {
 			TTFBMs:       r.ttfbMs,
 			LatencyMs:    r.latencyMs,
 			Status:       r.status, HTTPStatus: http.StatusOK,
-			IngressProtocol: "openai-chat", UsageState: "reported",
+			IngressProtocol: "chat", UsageState: "reported",
 		}); err != nil {
 			t.Fatalf("seed %s: %v", r.id, err)
 		}
@@ -365,13 +365,14 @@ func TestUsage_ExportCSV_IncludesOutputTokensAndTps(t *testing.T) {
 			t.Errorf("CSV 表头缺 %q 列：%s", col, header)
 		}
 	}
-	// 新增列必须**追加在末尾**：原有 11 列的下标不能变，
+	// 新增列必须**追加在末尾**：原有列的下标不能变，
 	// 否则任何按下标取值的既有消费方（脚本、Excel 模板）会静默错位。
-	// route_trace 是第 14 列（2026-10-17 的失败决策轨迹），同样追加在末尾。
-	want := "ts,public_model,upstream_model,key_name,key_id,total_tokens,ttfb_ms,latency_ms,status,stream,cost,output_tokens,tps,route_trace"
-	if strings.TrimSpace(header) != want {
-		t.Errorf("CSV 表头 = %q\nwant %q\n（新增列必须追加在末尾，不得插入中间）",
-			strings.TrimSpace(header), want)
+	// 现在页面还会导出协议、输入/缓存/推理 token 与请求 ID，所以只钉住
+	// 已发布列的前缀；后续新增列仍可继续追加，不会悄悄插到中间。
+	wantPrefix := "ts,public_model,upstream_model,key_name,key_id,total_tokens,ttfb_ms,latency_ms,status,stream,cost,output_tokens,tps,route_trace,"
+	if !strings.HasPrefix(strings.TrimSpace(header), wantPrefix) {
+		t.Errorf("CSV 表头 = %q\nwant prefix %q\n（新增列必须追加在末尾，不得插入中间）",
+			strings.TrimSpace(header), wantPrefix)
 	}
 	// 正常样本那一行必须写出 50（200*1000/4000）。
 	// 不能直接搜 ",50\n"：route_trace 是最后一列，样本里它是空的，

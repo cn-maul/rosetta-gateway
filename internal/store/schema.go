@@ -4,14 +4,17 @@ import (
 	"context"
 	"errors"
 	"fmt"
+
+	wireproto "github.com/cn-maul/rosetta-gateway/internal/protocol"
 )
 
-// currentSchemaVersion is the only database schema this build can open.
+// currentSchemaVersion 是当前代码写入的数据库结构版本。
 //
-// Schema changes are not migrated in place. Bump this version, update the
-// canonical DDL below, and require operators to export configuration,
-// recreate the database, then import it.
-const currentSchemaVersion = 1
+// 破坏性结构变更不提供原地迁移：提升版本并更新 canonical DDL，旧数据库
+// 会被拒绝启动。开发与测试库直接删除重建，正式环境通过配置导出/导入搬运。
+// 纯新增对象和值归一化仍可通过 ensureCompatibleSchema /
+// normalizeLegacyProtocolValues 原地补齐。
+const currentSchemaVersion = 2
 
 // ErrUnsupportedSchemaVersion marks a database that this build must not touch.
 var ErrUnsupportedSchemaVersion = errors.New("unsupported database schema version")
@@ -42,6 +45,19 @@ func (s *Store) ensureSchema(ctx context.Context) error {
 		return unsupportedSchemaVersion(version)
 	}
 
+	// Additive, backward-compatible objects may be introduced without bumping
+	// currentSchemaVersion. The setup-token table is one of those: old databases
+	// keep their data and gain the table on the next start.
+	if err := s.ensureCompatibleSchema(ctx); err != nil {
+		return err
+	}
+
+	// The protocol rename changes values, not columns. Normalize existing data
+	// before any provider snapshot is rebuilt from the database.
+	if err := s.normalizeLegacyProtocolValues(ctx); err != nil {
+		return err
+	}
+
 	// Reservations are process-local. A previous process cannot still own one
 	// after this process has opened the database.
 	if _, err := s.recoverStaleReservations(ctx); err != nil {
@@ -51,10 +67,85 @@ func (s *Store) ensureSchema(ctx context.Context) error {
 	return nil
 }
 
+// ensureCompatibleSchema adds tables that can be created idempotently on
+// databases already stamped with currentSchemaVersion. Keep this limited to
+// additive objects: destructive changes still require a schema-version bump.
+func (s *Store) ensureCompatibleSchema(ctx context.Context) error {
+	if _, err := s.db.ExecContext(ctx, userPasswordSetupTokensDDL); err != nil {
+		return fmt.Errorf("ensure user password setup token schema: %w", err)
+	}
+	return nil
+}
+
+// normalizeLegacyProtocolValues upgrades the protocol values introduced before
+// the switch to chat / response. It is a data-only migration (the column types
+// and indexes are unchanged), so databases keep the same schema version.
+func (s *Store) normalizeLegacyProtocolValues(ctx context.Context) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin protocol value migration: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }() //nolint:errcheck // no-op after commit
+
+	updates := []struct {
+		name string
+		sql  string
+	}{
+		{
+			name: "providers.protocol",
+			sql: `UPDATE providers
+				SET protocol = CASE protocol
+					WHEN ? THEN ?
+					WHEN ? THEN ?
+					ELSE protocol
+				END
+				WHERE protocol IN (?, ?)`,
+		},
+		{
+			name: "usage_records.ingress_protocol",
+			sql: `UPDATE usage_records
+				SET ingress_protocol = CASE ingress_protocol
+					WHEN ? THEN ?
+					WHEN ? THEN ?
+					ELSE ingress_protocol
+				END
+				WHERE ingress_protocol IN (?, ?)`,
+		},
+		{
+			name: "usage_daily_rollups.ingress_protocol",
+			sql: `UPDATE usage_daily_rollups
+				SET ingress_protocol = CASE ingress_protocol
+					WHEN ? THEN ?
+					WHEN ? THEN ?
+					ELSE ingress_protocol
+				END
+				WHERE ingress_protocol IN (?, ?)`,
+		},
+	}
+
+	for _, update := range updates {
+		result, err := tx.ExecContext(ctx, update.sql,
+			wireproto.LegacyChat, wireproto.Chat,
+			wireproto.LegacyResponse, wireproto.Response,
+			wireproto.LegacyChat, wireproto.LegacyResponse,
+		)
+		if err != nil {
+			return fmt.Errorf("migrate %s: %w", update.name, err)
+		}
+		if changed, err := result.RowsAffected(); err == nil && changed > 0 {
+			s.logger.Info("migrated legacy protocol values", "field", update.name, "rows", changed)
+		}
+	}
+
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit protocol value migration: %w", err)
+	}
+	return nil
+}
+
 func unsupportedSchemaVersion(found int) error {
 	return fmt.Errorf(
-		"%w: found %d, require %d; this build does not upgrade old databases. "+
-			"Export the configuration, recreate the database, then import the configuration",
+		"%w: found %d, require %d; export the configuration, recreate the database, then import it",
 		ErrUnsupportedSchemaVersion, found, currentSchemaVersion)
 }
 
@@ -127,7 +218,6 @@ var canonicalSchemaStatements = []string{
 		provider_id       TEXT NOT NULL REFERENCES providers(id) ON DELETE CASCADE,
 		model_id          TEXT NOT NULL,
 		display_name      TEXT,
-		enabled           INTEGER NOT NULL DEFAULT 1,
 		context_window    INTEGER,
 		max_output_tokens INTEGER,
 		supports_thinking INTEGER,
@@ -164,6 +254,7 @@ var canonicalSchemaStatements = []string{
 		updated_at         INTEGER NOT NULL,
 		last_login_at      INTEGER NOT NULL DEFAULT 0
 	)`,
+	userPasswordSetupTokensDDL,
 	`CREATE TABLE access_keys (
 		id                  TEXT PRIMARY KEY,
 		key_hash            TEXT NOT NULL UNIQUE,

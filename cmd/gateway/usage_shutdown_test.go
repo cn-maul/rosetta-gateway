@@ -34,7 +34,7 @@ func shutdownTestRec(id string) *store.UsageRecord {
 	return &store.UsageRecord{
 		ID: id, AccessKeyID: "k1", TotalTokens: 1,
 		PublicModel: "m", ProviderID: "p1", UpstreamModel: "up",
-		IngressProtocol: "openai-chat", UsageState: "reported",
+		IngressProtocol: "chat", UsageState: "reported",
 		Status: "ok", HTTPStatus: 200,
 	}
 }

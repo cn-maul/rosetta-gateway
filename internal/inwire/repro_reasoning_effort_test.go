@@ -75,7 +75,7 @@ func TestRegression_ReasoningEffortNoLonger400(t *testing.T) {
 
 	ros := decodeToRosetta(t,
 		`{"model":"m","messages":[{"role":"user","content":"hi"}],"reasoning_effort":"high"}`,
-		"openai-chat")
+		"chat")
 
 	if _, ok := ros.Extra["reasoning_effort"]; ok {
 		t.Fatalf("reasoning_effort 不该出现在 Extra 里：%v", ros.Extra)
@@ -100,7 +100,7 @@ func TestRegression_AllEffortValuesPass(t *testing.T) {
 
 			ros := decodeToRosetta(t,
 				`{"model":"m","messages":[{"role":"user","content":"hi"}],"reasoning_effort":"`+eff+`"}`,
-				"openai-chat")
+				"chat")
 
 			if _, err := gwClient(t, srv.URL).Chat(context.Background(), ros); err != nil {
 				t.Fatalf("effort=%s 不应失败: %v", eff, err)
@@ -121,7 +121,7 @@ func TestRegression_UnknownEffortStillNot400(t *testing.T) {
 
 	ros := decodeToRosetta(t,
 		`{"model":"m","messages":[{"role":"user","content":"hi"}],"reasoning_effort":"turbo"}`,
-		"openai-chat")
+		"chat")
 
 	if ros.Thinking != nil {
 		t.Fatalf("未知 effort 不应设 Thinking，实际 %+v", ros.Thinking)
@@ -143,7 +143,7 @@ func TestRegression_OtherExtrasStillForwarded(t *testing.T) {
 
 	ros := decodeToRosetta(t, `{"model":"m","messages":[{"role":"user","content":"hi"}],
 		"reasoning_effort":"high","seed":42,"user":"u1","parallel_tool_calls":true,
-		"presence_penalty":0.1,"frequency_penalty":0.2,"tool_choice":"auto"}`, "openai-chat")
+		"presence_penalty":0.1,"frequency_penalty":0.2,"tool_choice":"auto"}`, "chat")
 
 	if _, err := gwClient(t, srv.URL).Chat(context.Background(), ros); err != nil {
 		t.Fatalf("请求不应失败: %v", err)
@@ -162,9 +162,9 @@ func TestRegression_OtherExtrasStillForwarded(t *testing.T) {
 }
 
 // TestRegression_ProtocolsWithoutPassthroughUnaffected 确认 anthropic /
-// openai-responses 路径的既有行为没变：这些 OpenAI 私有字段一概不下发。
+// response 路径的既有行为没变：这些 OpenAI 私有字段一概不下发。
 func TestRegression_ProtocolsWithoutPassthroughUnaffected(t *testing.T) {
-	for _, p := range []string{"anthropic", "openai-responses"} {
+	for _, p := range []string{"anthropic", "response"} {
 		t.Run(p, func(t *testing.T) {
 			ros := decodeToRosetta(t,
 				`{"model":"m","messages":[{"role":"user","content":"hi"}],
@@ -190,7 +190,7 @@ func TestRegression_ErrorMessageNoLongerLeaksSDKInternals(t *testing.T) {
 
 	ros := decodeToRosetta(t,
 		`{"model":"m","messages":[{"role":"user","content":"hi"}],"reasoning_effort":"high"}`,
-		"openai-chat")
+		"chat")
 
 	_, err := gwClient(t, srv.URL).Chat(context.Background(), ros)
 	if err != nil && strings.Contains(err.Error(), "collides with an SDK-managed field") {

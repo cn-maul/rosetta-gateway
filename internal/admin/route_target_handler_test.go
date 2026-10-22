@@ -23,10 +23,10 @@ func newTestStore(t *testing.T) *store.Store {
 	t.Cleanup(func() { st.Close() })
 
 	ctx := context.Background()
-	_ = st.CreateProvider(ctx, &store.Provider{ID: "p1", Slug: "p1", Name: "Alpha", Endpoint: "http://a", Enabled: true, Protocol: "openai-chat"})
-	_ = st.CreateProvider(ctx, &store.Provider{ID: "p2", Slug: "p2", Name: "Beta", Endpoint: "http://b", Enabled: true, Protocol: "openai-chat"})
-	_ = st.CreateUpstreamModel(ctx, &store.UpstreamModel{ID: "m1", ProviderID: "p1", ModelID: "alpha-chat", Enabled: true})
-	_ = st.CreateUpstreamModel(ctx, &store.UpstreamModel{ID: "m2", ProviderID: "p2", ModelID: "beta-chat", Enabled: true})
+	_ = st.CreateProvider(ctx, &store.Provider{ID: "p1", Slug: "p1", Name: "Alpha", Endpoint: "http://a", Enabled: true, Protocol: "chat"})
+	_ = st.CreateProvider(ctx, &store.Provider{ID: "p2", Slug: "p2", Name: "Beta", Endpoint: "http://b", Enabled: true, Protocol: "chat"})
+	_ = st.CreateUpstreamModel(ctx, &store.UpstreamModel{ID: "m1", ProviderID: "p1", ModelID: "alpha-chat"})
+	_ = st.CreateUpstreamModel(ctx, &store.UpstreamModel{ID: "m2", ProviderID: "p2", ModelID: "beta-chat"})
 	_ = st.CreateRoute(ctx, &store.Route{ID: "r1", PublicName: "flash", ProviderID: "p1", UpstreamModelID: "m1", Enabled: true})
 	// 建一把**真实存在**的 asAdmin 身份行（id 与 testhelpers 里的 asAdmin 一致）。
 	// Create 的归属恒等于 me.ID，而 access_keys.user_id 有外键约束，

@@ -28,26 +28,15 @@ docker run -d \
 然后打开 `http://127.0.0.1:8666/admin/` —— 首次进入会显示「首次设置密码」表单，
 为自动创建的 `admin` 账号设一个密码，设完直接进入后台。
 
-表单里多了一个**引导令牌**输入框。推荐用环境变量预先指定（值只有部署者持有）：
+首次设置只要求管理员密码，不需要额外令牌。完成引导的端点在设密前是免鉴权的，
+所以容器启动后应**立即**打开 `/admin/` 完成设置 —— 在密码设好之前，能访问该端口
+的人都可以抢先初始化。窗口是**一次性**的：首次设密成功即写入
+`bootstrap_completed` 标记并永久关闭，不存在「空密码 admin 重新打开窗口」的路径。
 
-```bash
-docker run -d \
-  --name rosetta-gateway \
-  -e ROSETTA_GW_BOOTSTRAP_TOKEN="$(openssl rand -hex 32)" \
-  -p 127.0.0.1:8666:8666 \
-  -v rosetta-gateway-data:/data \
-  --restart unless-stopped \
-  ghcr.io/cn-maul/rosetta-gateway:1.6.5
-```
-
-没设环境变量时网关会生成一枚随机令牌，**不打印到日志**（日志会轮转、会被聚合
-到集中式日志平台，等于把「谁还没完成引导」这条信息的攻击面从「能连到端口」
-扩大到「能读日志」）。取用方式是从数据库读回：
-
-```bash
-docker exec rosetta-gateway sqlite3 /data/data/gateway.db \
-  "SELECT value FROM app_settings WHERE key='bootstrap_token'"
-```
+普通用户不由网关开放注册。管理员在「用户与权限」里新建普通用户时把初始密码留空，
+系统会生成本次有效的 24 小时一次性设密链接。用户打开链接设置密码后直接登录；
+重新生成链接、管理员改密、禁用或删除用户都会让旧链接失效。服务端只保存 token
+哈希，明文链接不会长期留存。
 
 > **为什么端口映射绑回环**（2026-10-21 修 A10-P0-1）
 >
@@ -237,53 +226,8 @@ services:
 这种「未初始化 + 非回环监听」的状态会打一条 ERROR 日志提醒。
 
 同源判定挡不住这条路径 —— `curl` 不发 `Origin`，服务端无从分辨是运维还是攻击者。
-所以完成引导**必须带一次性令牌**（见下）。窗口是**一次性**的：首次设密成功即写入
-`bootstrap_completed` 标记、永久关闭，令牌同时作废（不存在「空密码 admin 重新打开窗口」
-的路径，也不存在「密码设了、令牌还在」的重放窗口）。
-
-### 引导令牌
-
-启动日志里会有一条 WARN 说明令牌**已布置**，但**不打印令牌值**
-（2026-10-21 修 A10-P1-1）：
-
-```bash
-docker logs rosetta-gateway 2>&1 | grep 引导令牌
-```
-
-- 未设置 `ROSETTA_GW_BOOTSTRAP_TOKEN` 时，网关在启动时生成 32 字节随机值（64 位 hex）；
-- 令牌**不进日志**，只从数据库读回：
-
-  ```bash
-  docker exec rosetta-gateway sqlite3 /data/data/gateway.db \
-    "SELECT value FROM app_settings WHERE key='bootstrap_token'"
-  ```
-
-  裸机部署把 `/data/data/gateway.db` 换成 `<home>/data/gateway.db` 即可。
-- 令牌不会出现在任何 HTTP 响应里 —— `/admin/api/bootstrap` 免鉴权，
-  把令牌放进去等于取消令牌；
-- 重启不会覆盖已有令牌。令牌若已丢失，删除该部署的
-  `app_settings.bootstrap_token` 后重启即可重新生成；
-- 令牌在「写密码 + 置完成标记 + 清令牌」**同一个事务**里消耗，不存在中间态。
-
-生产环境建议显式指定它：
-
-```bash
-docker run -d \
-  --name rosetta-gateway \
-  -e ROSETTA_GW_BOOTSTRAP_TOKEN="$(openssl rand -hex 32)" \
-  -p 127.0.0.1:8666:8666 \
-  -v rosetta-gateway-data:/data \
-  --restart unless-stopped \
-  ghcr.io/cn-maul/rosetta-gateway:latest
-```
-
-理由与自动生成的令牌同类：值只由部署者持有，备份与日志体系都不需要承载它。
-指定令牌时长度必须
-**至少 32 字节**，过短会被拒绝并在日志里报 ERROR（此时不会写入任何令牌，引导窗口
-回到无令牌保护状态）。
-
-> **备份注意**：`/data` 里的数据库若在引导完成前被备份，备份中包含尚未消费的
-> 引导令牌明文。备份文件要按凭据级别保护，别丢进公开的对象存储或代码库。
+`bootstrap_completed` 标记与首次设密在同一个事务里写入，因此窗口只开一次。
+局域网自用部署接受抢注风险；最稳妥的做法是先在本机完成设置，再让其他设备访问。
 
 所以：**容器起来后第一时间去 `/admin/` 完成首次设置密码**。
 默认的端口映射已经是回环（`-p 127.0.0.1:8666:8666`）；对外访问请走 TLS 反代，

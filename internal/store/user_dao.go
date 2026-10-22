@@ -2,19 +2,10 @@ package store
 
 import (
 	"context"
-	"crypto/subtle"
 	"database/sql"
 	"errors"
 	"time"
 )
-
-// ErrBootstrapTokenMismatch 表示引导令牌比对不通过（给错了或没给）。
-//
-// 为什么用哨兵错误而不是一个额外的 bool 返回值：设密本身已经有一个
-// 「没写成」的布尔结果（窗口已关），令牌不匹配塞进同一个 bool 之后，
-// 调用方分不清「你输错令牌、窗口还开着、拿正确令牌还能继续」与
-// 「窗口已经关了、你怎么重试都没用」—— 这两种情况的处置完全相反。
-var ErrBootstrapTokenMismatch = errors.New("bootstrap token mismatch")
 
 // User 是访问密钥的归属主体（多用户改造 P0）。
 //
@@ -128,7 +119,7 @@ func (u *User) IsActive() bool { return u != nil && u.Status == UserStatusActive
 // balance_cents 用**布尔表达式** `IS NULL` 直接产出「不限额」标志，而不是
 // COALESCE(..,0) 再补一列：前者少一个扫描目标，也免得「NULL 与 0 谁在前面」
 // 这种顺序错位（正是上面警告的那类静默错误）。
-const userColumns = `id, username, COALESCE(display_name,''), COALESCE(password_hash,''),
+const userColumns = `id, username, COALESCE(display_name,''), COALESCE(password_hash,'') AS password_hash,
 		        role, status, COALESCE(group_id,''), quota_tokens, used_tokens, auth_version,
 		        COALESCE(remark,''), created_at, updated_at, last_login_at,
 		        COALESCE(balance_cents, 0) AS balance_cents,
@@ -187,8 +178,8 @@ func (s *Store) CountUsers(ctx context.Context) (int, error) {
 //
 // 首次登录引导靠它判定「现在该不该让用户设密码」。条件必须同时包含
 // role='admin' **且** password_hash 为空 —— 只看 password_hash 为空会
-// 命中任何「管理员为某个人建的空密码账号」，而那些账号的密码由管理员
-// 掌握，让本人自助设密等于绕过管理员。
+// 命中普通用户的空密码账号；那些账号只能通过管理员签发的一次性设密
+// 链接初始化，不能复用首次部署的免鉴权 bootstrap 通道。
 //
 // 不存在时返回 (nil, nil) —— 引导已完成是正常状态，不是错误。
 func (s *Store) FindUninitializedAdmin(ctx context.Context) (*User, error) {
@@ -306,7 +297,14 @@ func (s *Store) UpdateUserAndBumpAuthVersion(ctx context.Context, u *User) error
 		res, err = ex.ExecContext(ctx,
 			`UPDATE users SET auth_version = auth_version + 1, updated_at = ? WHERE id = ?`,
 			time.Now().UnixMilli(), u.ID)
-		return checkAffected(res, err)
+		if err := checkAffected(res, err); err != nil {
+			return err
+		}
+		// Disabling or changing the role is a security-boundary change. Any
+		// outstanding password-setup link must die with the old account state.
+		_, err = ex.ExecContext(ctx,
+			`DELETE FROM user_password_setup_tokens WHERE user_id = ?`, u.ID)
+		return err
 	})
 }
 
@@ -315,11 +313,18 @@ func (s *Store) UpdateUserAndBumpAuthVersion(ctx context.Context, u *User) error
 // 递增放在 SQL 里而不是让调用方先读后写：改密码与「让旧会话失效」
 // 必须是同一个原子动作，分两步会出现「密码改了但旧 JWT 还能用」的窗口。
 func (s *Store) SetUserPassword(ctx context.Context, id, passwordHash string) error {
-	res, err := s.db.ExecContext(ctx,
-		`UPDATE users SET password_hash = ?, auth_version = auth_version + 1, updated_at = ?
-		 WHERE id = ?`,
-		passwordHash, time.Now().UnixMilli(), id)
-	return checkAffected(res, err)
+	return s.RunTx(ctx, func(ctx context.Context, ex Tx) error {
+		res, err := ex.ExecContext(ctx,
+			`UPDATE users SET password_hash = ?, auth_version = auth_version + 1, updated_at = ?
+			 WHERE id = ?`,
+			passwordHash, time.Now().UnixMilli(), id)
+		if err := checkAffected(res, err); err != nil {
+			return err
+		}
+		_, err = ex.ExecContext(ctx,
+			`DELETE FROM user_password_setup_tokens WHERE user_id = ?`, id)
+		return err
+	})
 }
 
 // SetInitialAdminPassword 为**尚未设过密码的管理员**设置初始密码，返回是否写入。
@@ -341,53 +346,17 @@ func (s *Store) SetUserPassword(ctx context.Context, id, passwordHash string) er
 // 设的那把；反过来「置标成功但设密失败」会把真正要引导的人锁在门外。
 // 只有真正设上密码（UPDATE 命中）才置标，重复初始化（0 行）不产生任何写入。
 func (s *Store) SetInitialAdminPassword(ctx context.Context, id, passwordHash string) (bool, error) {
-	return s.setInitialAdminPassword(ctx, id, passwordHash, false, "")
-}
-
-// setInitialAdminPassword 是上面那个方法的真实实现，多带一个引导令牌闸门。
-//
-// # 为什么需要令牌（2026-10-14 上线前审计加固）
-//
-// 引导窗口是**免鉴权**的，且容器默认监听 0.0.0.0 —— 于是「谁先连到端口，
-// 谁就是管理员」。SameOrigin 只能挡浏览器发起的跨站请求，挡不住任何能
-// 直接访问该端口的人：curl 没有 Origin，服务端无从分辨是运维还是攻击者。
-// 部署到公网/共享网络时这是一条真实的抢注路径。
-//
-// 令牌由启动流程生成并打印到日志（见 cmd/gateway 的引导令牌生成段），
-// 只有部署者拿得到。检查与写入在**同一事务**里：比对通过才写密码，
-// 比对不过则 0 行受影响、窗口照旧开着，运维拿正确令牌重试即可。
-//
-// 必须同事务的理由与「置 bootstrap_completed 标记」完全一致：分成两步，
-// 就会出现「密码设上了但令牌没清」的中间态 —— 那一态下攻击者仍持有效令牌，
-// 而管理员以为窗口已关。
-func (s *Store) setInitialAdminPassword(ctx context.Context, id, passwordHash string,
-	requireToken bool, token string) (bool, error) {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return false, err
 	}
 	defer tx.Rollback()
 
-	// 先读一次窗口状态，再比令牌。
+	// 先读一次窗口状态，给调用方返回明确的「窗口已关」而不是数据库错误。
 	//
-	// # 为什么必须这个顺序
-	//
-	// 顺序反过来（先比令牌）会稳定地给出**错误诊断**：窗口已关这一态在
-	// 库里的表现恰好是「令牌已被消费清空」，于是它落到
-	// ErrBootstrapTokenMismatch 上，HTTP 层回 403「令牌不正确」。运维看到
-	// 的是「我令牌明明是对的，怎么一直 403」—— 而真实原因是这扇门已经
-	// **永久**关上了、怎么重试都没用。两种诊断指向完全相反的处置：
-	// 一个让你去核对令牌，一个让你去确认部署状态。
-	//
-	// 那为什么不干脆把条件 UPDATE 提到最前？因为那等于每发一个**错令牌**
-	// 请求就发起一次真实写入（哪怕随后回滚），凭一个免鉴权端点就能反复
-	// 触发写事务、放大写锁竞争。只读 SELECT 先判一次，写只留在成功路径。
-	//
-	// # 它不是守卫，只是诊断
-	//
-	// 读与写是两个时刻，其间窗口可能被正常流程关掉。**权威判定始终是下面
-	// 那条带 AND password_hash = '' 的条件 UPDATE** —— 并发下的「只设一次」
-	// 由数据库原子保证。这一点不能因为多了一次读就放松。
+	// 它不是守卫，只是诊断：读与写是两个时刻，其间窗口可能被正常流程关掉。
+	// **权威判定始终是下面那条带 AND password_hash = '' 的条件 UPDATE** ——
+	// 并发下的「只设一次」由数据库原子保证。
 	var open int
 	err = tx.QueryRowContext(ctx,
 		`SELECT 1 FROM users WHERE id = ? AND password_hash = '' AND role = 'admin'`,
@@ -400,29 +369,6 @@ func (s *Store) setInitialAdminPassword(ctx context.Context, id, passwordHash st
 		return false, err
 	}
 
-	// 令牌闸门：只在「本安装配置了令牌」时生效（老部署与本地直跑没有，
-	// 保持升级后行为不变）。比对用恒定时间函数，避免按前缀猜口令。
-	if requireToken {
-		var want string
-		tokErr := tx.QueryRowContext(ctx,
-			`SELECT value FROM app_settings WHERE key = ?`, settingBootstrapTokenKey).Scan(&want)
-		switch {
-		case tokErr != nil && !errors.Is(tokErr, sql.ErrNoRows):
-			return false, tokErr
-		case tokErr == nil && want == "":
-			// 记录存在但为空 = 令牌已被消费（设密成功的那个事务会把它清空）。
-			// 走到这里说明引导并未完成，窗口却已经没有令牌了 —— 只可能是
-			// 进程在「写密码」与「置 completed 标记」之间被打断，事务已回滚。
-			// 绝不能在这里放行：那一态下任何人都能无凭据完成引导。
-			return false, ErrBootstrapTokenMismatch
-		case tokErr == nil:
-			// 恒定时间比较，避免按前缀逐位试探。
-			if subtle.ConstantTimeCompare([]byte(want), []byte(token)) != 1 {
-				return false, ErrBootstrapTokenMismatch
-			}
-		}
-		// tokErr == ErrNoRows = 库里没有令牌记录 → 不要求令牌。
-	}
 	res, err := tx.ExecContext(ctx,
 		`UPDATE users SET password_hash = ?, auth_version = auth_version + 1, updated_at = ?
 		 WHERE id = ? AND password_hash = '' AND role = 'admin'`,
@@ -443,45 +389,10 @@ func (s *Store) setInitialAdminPassword(ctx context.Context, id, passwordHash st
 		// 整个事务回滚，密码也没设上 —— 调用方按失败重试，窗口保持原状。
 		return false, err
 	}
-	// 令牌与密码、标记三者同进同退：设密成功即作废令牌，避免它长期留在
-	// app_settings 里成为一块过期但看起来很权威的凭据。
-	if err := setSettingExec(ctx, tx, settingBootstrapTokenKey, ""); err != nil {
-		return false, err
-	}
 	if err := tx.Commit(); err != nil {
 		return false, err
 	}
 	return true, nil
-}
-
-// SetInitialAdminPasswordWithToken 是带引导令牌闸门的设密入口，供 HTTP 层
-// 调用（admin.UserHandler.BootstrapSetup）。
-//
-// 三种结局必须能被调用方区分开，因为它们对应三种不同的 HTTP 响应：
-//   - (true, nil)              写入成功；
-//   - (false, ErrBootstrapTokenMismatch) 令牌不对 → 403；
-//   - (false, nil)             窗口已关（已设过密码 / 非 admin / 不存在）→ 409。
-//
-// 为什么不把令牌不匹配也塞进 false：那会让「你输错令牌」与「窗口已经关了」
-// 返回同一句话。前者运维需要知道要去日志里核对令牌、窗口其实还开着；
-// 后者再怎么重试都没用。同一个 bool 表达两种语义，调用方只能靠猜。
-func (s *Store) SetInitialAdminPasswordWithToken(ctx context.Context, id, passwordHash,
-	token string) (bool, error) {
-	return s.setInitialAdminPassword(ctx, id, passwordHash, true, token)
-}
-
-// BootstrapTokenRequired 报告本安装是否配置了引导令牌。
-// 为 false 时（如本地直跑）BootstrapSetup 放行不带令牌的请求。
-//
-// 用途只有一个：告诉前端「这个安装的引导窗口要凭令牌才能完成」。
-// **不要**用它来做放行/拒绝的判定 —— 那是事务内那次比对的事，
-// 拿这里的结果去判会开一个 TOCTOU 窗口（预判通过之后令牌才被消费掉）。
-func (s *Store) BootstrapTokenRequired(ctx context.Context) (bool, error) {
-	tok, err := s.BootstrapToken(ctx)
-	if err != nil {
-		return false, err
-	}
-	return tok != "", nil
 }
 
 // BumpAuthVersion 递增 auth_version，用于「禁用账号」「改角色」这类

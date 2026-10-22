@@ -42,7 +42,7 @@ func seedByUserUsage(t *testing.T, st *Store, id, userID, keyID string, ts, in, 
 	if err := st.CreateUsageRecord(context.Background(), &UsageRecord{
 		ID: id, Ts: ts, UserID: userID, AccessKeyID: keyID,
 		PublicModel: pricedModel, ProviderID: "p1", UpstreamModel: pricedModel,
-		IngressProtocol: "openai-chat",
+		IngressProtocol: "chat",
 		InputTokens:     in, OutputTokens: out, TotalTokens: in + out,
 		Status: "ok", HTTPStatus: 200, UsageState: "reported",
 	}); err != nil {

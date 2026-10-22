@@ -74,7 +74,7 @@ func usageRows(t *testing.T, st *Store) []usageRow {
 func mkRec(id string, in, out int64) *UsageRecord {
 	return &UsageRecord{
 		ID: id, AccessKeyID: "k1", UserID: "u1", PublicModel: "m",
-		ProviderID: "p1", UpstreamModel: "priced", IngressProtocol: "openai-chat",
+		ProviderID: "p1", UpstreamModel: "priced", IngressProtocol: "chat",
 		InputTokens: in, OutputTokens: out, TotalTokens: in + out,
 		UsageState: "reported", Status: "ok", HTTPStatus: 200,
 		RequestID: "rq-" + id,
@@ -278,7 +278,7 @@ func TestBatched_NegativeTokensClampedLikeSinglePath(t *testing.T) {
 
 	recs := []*UsageRecord{
 		{ID: "neg1", AccessKeyID: "k1", UserID: "u1", PublicModel: "m",
-			ProviderID: "p1", UpstreamModel: "priced", IngressProtocol: "openai-chat",
+			ProviderID: "p1", UpstreamModel: "priced", IngressProtocol: "chat",
 			InputTokens: -100, OutputTokens: -50, TotalTokens: -150,
 			ReasoningTokens: -10, CachedTokens: -5,
 			UsageState: "reported", Status: "ok", HTTPStatus: 200, RequestID: "rq-neg1"},

@@ -26,7 +26,7 @@ func TestRouteIndex_ConcurrentReadWriteDoesNotCrash(t *testing.T) {
 
 	// 先放一条可解析的路由，读 goroutine 才有东西可读。
 	ri.AddProvider(&ProviderRef{ID: "p0", Slug: "alpha", Enabled: true})
-	ri.AddUpstreamModel(&UpstreamModel{ID: "m0", ProviderID: "p0", ModelID: "chat", Enabled: true})
+	ri.AddUpstreamModel(&UpstreamModel{ID: "m0", ProviderID: "p0", ModelID: "chat"})
 	ri.AddRoute(&Route{ID: "r0", PublicName: "flash", ProviderID: "p0", UpstreamModelID: "m0", Enabled: true})
 
 	stop := make(chan struct{})
@@ -70,15 +70,14 @@ func TestRouteIndex_ConcurrentReadWriteDoesNotCrash(t *testing.T) {
 				id := "p" + strconv.Itoa(base) + "-" + strconv.Itoa(i)
 				ri.AddProvider(&ProviderRef{ID: id, Slug: "slug-" + id, Enabled: true})
 				ri.AddUpstreamModel(&UpstreamModel{
-					ID: "m" + id, ProviderID: id, ModelID: "model-" + id, Enabled: true,
-				})
+					ID: "m" + id, ProviderID: id, ModelID: "model-" + id})
 				ri.AddRoute(&Route{
 					ID: "r" + id, PublicName: "pub-" + id,
 					ProviderID: id, UpstreamModelID: "m" + id, Enabled: true,
 				})
 				ri.AddRouteTarget(&Target{
 					ID: "t" + id, RouteID: "r" + id,
-					ProviderID: id, UpstreamModelID: "m" + id, Position: 0, Enabled: true,
+					ProviderID: id, UpstreamModelID: "m" + id, Position: 0,
 				})
 			}
 		}(w)
@@ -127,11 +126,10 @@ func TestRouteIndex_ResolveNeverReturnsHalfBuiltChain(t *testing.T) {
 			}
 			id := "x" + strconv.Itoa(i)
 			ri.AddProvider(&ProviderRef{ID: id, Slug: id, Enabled: true})
-			ri.AddUpstreamModel(&UpstreamModel{ID: id, ProviderID: id, ModelID: id, Enabled: true})
+			ri.AddUpstreamModel(&UpstreamModel{ID: id, ProviderID: id, ModelID: id})
 			ri.AddRoute(&Route{ID: id, PublicName: id, ProviderID: id, UpstreamModelID: id, Enabled: true})
 			ri.AddRouteTarget(&Target{
-				ID: id, RouteID: id, ProviderID: id, UpstreamModelID: id, Position: 0, Enabled: true,
-			})
+				ID: id, RouteID: id, ProviderID: id, UpstreamModelID: id, Position: 0})
 		}
 	}()
 

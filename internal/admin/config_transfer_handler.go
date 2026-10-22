@@ -12,6 +12,7 @@ import (
 
 	"github.com/cn-maul/rosetta-gateway/internal/config"
 	"github.com/cn-maul/rosetta-gateway/internal/effort"
+	wireproto "github.com/cn-maul/rosetta-gateway/internal/protocol"
 	"github.com/cn-maul/rosetta-gateway/internal/store"
 )
 
@@ -149,7 +150,6 @@ func (h *ConfigTransferHandler) buildExport(ctx context.Context) (configExport, 
 				ProviderSlug:     p.Slug,
 				ModelID:          m.ModelID,
 				DisplayName:      m.DisplayName,
-				Enabled:          m.Enabled,
 				ContextWindow:    m.ContextWindow,
 				MaxOutputTokens:  m.MaxOutputTokens,
 				SupportsThinking: m.SupportsThinking,
@@ -353,9 +353,10 @@ func (h *ConfigTransferHandler) apply(ctx context.Context, in *configExport, dry
 		// 与手工创建保持同一套兜底：缺协议/端点的记录导进来就 unusable，
 		// 不如当场报错让人知道文件有问题。
 		if p.Protocol == "" {
-			p.Protocol = "openai-chat"
+			p.Protocol = wireproto.Chat
 		}
-		if err := validateProtocol(p.Protocol); err != nil {
+		p.Protocol, err = normalizeProtocol(p.Protocol)
+		if err != nil {
 			return nil, fmt.Errorf("供应商 %s 的 protocol 非法：%w", slug, err)
 		}
 		if p.Endpoint == "" {
@@ -578,7 +579,7 @@ func (h *ConfigTransferHandler) attach(
 			// 同 provider：ID 必须现生成，DAO 是原样写入的。
 			ID:         generateID(),
 			ProviderID: pid, ModelID: modelID, DisplayName: me.DisplayName,
-			Enabled: me.Enabled, ContextWindow: me.ContextWindow,
+			ContextWindow:   me.ContextWindow,
 			MaxOutputTokens: me.MaxOutputTokens, SupportsThinking: me.SupportsThinking,
 			PriceInput: me.PriceInput, PriceCacheHit: me.PriceCacheHit, PriceOutput: me.PriceOutput,
 		}

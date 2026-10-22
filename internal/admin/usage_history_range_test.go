@@ -45,7 +45,7 @@ func TestUsage_History_DistinguishesExplicitZeroFromMissing(t *testing.T) {
 		if err := st.CreateUsageRecord(context.Background(), &store.UsageRecord{
 			ID: r.id, Ts: r.ts, UserID: "u1", AccessKeyID: "k1", PublicModel: "m",
 			ProviderID: "p1", UpstreamModel: "up", TotalTokens: 10, Status: "ok",
-			HTTPStatus: 200, IngressProtocol: "openai-chat", UsageState: "reported",
+			HTTPStatus: 200, IngressProtocol: "chat", UsageState: "reported",
 		}); err != nil {
 			t.Fatalf("seed %s: %v", r.id, err)
 		}
@@ -93,7 +93,7 @@ func TestUsage_ExportCSV_DistinguishesExplicitZeroFromMissing(t *testing.T) {
 	if err := st.CreateUsageRecord(context.Background(), &store.UsageRecord{
 		ID: "old", Ts: old, UserID: "u1", AccessKeyID: "k1", PublicModel: "m",
 		ProviderID: "p1", UpstreamModel: "up", TotalTokens: 10, Status: "ok",
-		HTTPStatus: 200, IngressProtocol: "openai-chat", UsageState: "reported",
+		HTTPStatus: 200, IngressProtocol: "chat", UsageState: "reported",
 	}); err != nil {
 		t.Fatalf("seed: %v", err)
 	}

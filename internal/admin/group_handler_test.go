@@ -26,13 +26,12 @@ func initRouteSnapshot(t *testing.T, names ...string) {
 func initSnapshotWithUsers(t *testing.T, names []string, users map[string]*snapshot.UserSnapshot) {
 	t.Helper()
 	ri := routing.NewRouteIndex()
-	ri.AddProvider(&routing.ProviderRef{ID: "p1", Slug: "good", Protocol: "openai-chat", Enabled: true})
-	ri.AddUpstreamModel(&routing.UpstreamModel{ID: "good/m", ProviderID: "p1", ModelID: "good-model", Enabled: true})
+	ri.AddProvider(&routing.ProviderRef{ID: "p1", Slug: "good", Protocol: "chat", Enabled: true})
+	ri.AddUpstreamModel(&routing.UpstreamModel{ID: "good/m", ProviderID: "p1", ModelID: "good-model"})
 	for _, n := range names {
 		ri.AddRoute(&routing.Route{
 			ID: "r-" + n, PublicName: n,
-			ProviderID: "p1", UpstreamModelID: "good/m", Enabled: true,
-		})
+			ProviderID: "p1", UpstreamModelID: "good/m"})
 	}
 	if users == nil {
 		users = map[string]*snapshot.UserSnapshot{}
@@ -474,19 +473,19 @@ type modelNamesResponse struct {
 func initPricedRouteSnapshot(t *testing.T, names map[string][3]float64, users map[string]*snapshot.UserSnapshot) {
 	t.Helper()
 	ri := routing.NewRouteIndex()
-	ri.AddProvider(&routing.ProviderRef{ID: "p1", Slug: "good", Protocol: "openai-chat", Enabled: true})
+	ri.AddProvider(&routing.ProviderRef{ID: "p1", Slug: "good", Protocol: "chat", Enabled: true})
 	// 每个公开名对应一个独立的上游模型，价格各不相同。
 	i := 0
 	for n, p := range names {
 		i++
 		modelID := "m" + string(rune('0'+i))
 		ri.AddUpstreamModel(&routing.UpstreamModel{
-			ID: "up/" + modelID, ProviderID: "p1", ModelID: modelID, Enabled: true,
-			PriceInput: p[0], PriceCacheHit: p[1], PriceOutput: p[2],
+			ID: "up/" + modelID, ProviderID: "p1", ModelID: modelID, PriceInput: p[0], PriceCacheHit: p[1], PriceOutput: p[2],
 		})
 		ri.AddRoute(&routing.Route{
 			ID: "r-" + n, PublicName: n,
-			ProviderID: "p1", UpstreamModelID: "up/" + modelID, Enabled: true,
+			ProviderID: "p1", UpstreamModelID: "up/" + modelID,
+			Enabled: true,
 		})
 	}
 	if users == nil {

@@ -144,12 +144,11 @@ func Run(opts Options) error {
 
 	if opts.Bootstrap != nil {
 		if err := opts.Bootstrap(context.Background(), db, logger); err != nil {
-			logger.Error("bootstrap protection unavailable, refusing to start",
+			logger.Error("bootstrap initialization failed, refusing to start",
 				"error", err,
-				"impact", "免鉴权的 POST /admin/api/bootstrap 在本次启动中没有任何凭据保护；"+
-					"继续监听会把「首个管理员」的决定权交给任何能连到本端口的人",
-				"hint", "修复后重启即可；也可显式设置一个至少 32 字节的 ROSETTA_GW_BOOTSTRAP_TOKEN 后重启")
-			return fmt.Errorf("bootstrap protection unavailable, refusing to start: %w", err)
+				"impact", "无法安全地建立首次管理员账号；继续监听会让初始化状态不确定",
+				"hint", "检查数据库可用性与状态目录权限后重启")
+			return fmt.Errorf("bootstrap initialization failed, refusing to start: %w", err)
 		}
 	}
 
@@ -159,11 +158,11 @@ func Run(opts Options) error {
 	} else if pending != nil && !isLoopbackListen(cfg.Listen) {
 		logger.Error("SECURITY: admin password not yet set AND listening on a non-loopback address — "+
 			"anyone who can reach this port can attempt to become the first administrator; "+
-			"only holders of the bootstrap token can complete it",
+			"complete first-run setup immediately",
 			"listen", cfg.Listen,
-			"immediate_action", "立即在浏览器打开 /admin/ 完成首次设置密码（需填本次部署的引导令牌）")
+			"immediate_action", "立即在浏览器打开 /admin/ 完成首次设置密码")
 	} else if pending != nil {
-		logger.Warn("admin password not set yet; open the admin UI with the bootstrap token to complete first-run setup",
+		logger.Warn("admin password not set yet; open the admin UI to complete first-run setup",
 			"note", "监听地址是回环，仅本机可访问；一旦改为 0.0.0.0 暴露到网络，请立即完成设置")
 	}
 

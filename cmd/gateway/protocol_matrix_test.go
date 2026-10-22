@@ -13,7 +13,7 @@ import (
 // **任意入站协议 + 任意上游协议**的组合都能跑通，且出站形状由入站协议决定
 // —— 上游是 chat 还是 responses 不影响客户端看到的格式。
 //
-// 这是整个网关的核心价值主张：「/v1/responses 进、openai-chat 上游」这种
+// 这是整个网关的核心价值主张：「/v1/responses 进、chat 上游」这种
 // 组合必须可用，否则 Codex CLI 之类只说 responses 的客户端就没法接
 // DeepSeek / 大部分国产 chat 上游。三条入站路径共享一个 handleIngress，
 // 协议差异收在 ingress.Codec 里，转换本体由 rosetta SDK 承担。
@@ -27,8 +27,8 @@ func TestProtocolMatrix_AnyIngressToAnyUpstream(t *testing.T) {
 		protocol string
 		handler  http.HandlerFunc
 	}{
-		{"openai-chat", fakeUpstreamChat},
-		{"openai-responses", fakeUpstreamResponses},
+		{"chat", fakeUpstreamChat},
+		{"response", fakeUpstreamResponses},
 		{"anthropic", fakeUpstreamAnthropic},
 	}
 	ingresses := []struct {
@@ -175,8 +175,8 @@ func TestProtocolMatrix_Streaming(t *testing.T) {
 		protocol string
 		handler  http.HandlerFunc
 	}{
-		{"openai-chat", fakeStreamChat},
-		{"openai-responses", fakeStreamResponses},
+		{"chat", fakeStreamChat},
+		{"response", fakeStreamResponses},
 		{"anthropic", fakeStreamAnthropic},
 	}
 	ingresses := []struct {

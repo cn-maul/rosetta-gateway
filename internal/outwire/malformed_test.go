@@ -94,7 +94,7 @@ func TestMalformed_SentinelIsNotTooWide(t *testing.T) {
 
 // wrapMalformedLikeSDK 构造与 SDK 实际形状一致的错误：
 //
-//	fmt.Errorf("%w: decoding openai-chat response: %w", ErrUpstreamMalformed, jsonErr)
+//	fmt.Errorf("%w: decoding chat response: %w", ErrUpstreamMalformed, jsonErr)
 //
 // 刻意用**双层** %w：单层测不出 errors.Is 能否穿透，而这正是网关侧的用法。
 //
@@ -111,7 +111,7 @@ func wrapMalformedLikeSDK() error {
 	if jsonErr == nil {
 		panic("测试素材失效：这段 JSON 本该解析失败")
 	}
-	return fmt.Errorf("%w: decoding openai-chat response: %w",
+	return fmt.Errorf("%w: decoding chat response: %w",
 		rosetta.ErrUpstreamMalformed, jsonErr)
 }
 

@@ -15,12 +15,12 @@ import (
 func (h *Handler) applyReplayGate(req *rosetta.ChatRequest, protocol string) {
 	keepThinking, keepRedacted := false, false
 	switch protocol {
-	case "", "openai-chat", "auto":
+	case "", "chat", "auto":
 		// OpenAI chat has no replayable thinking block.
 	case "anthropic":
 		keepThinking, keepRedacted = true, true
 	default:
-		// openai-responses handles foreign seals inside the SDK.
+		// response handles foreign seals inside the SDK.
 		return
 	}
 

@@ -282,13 +282,12 @@ func TestSplitStoreTxCeiling(t *testing.T) {
 		t.Fatalf("seed user: %v", err)
 	}
 	if err := db.CreateProvider(ctx, &store.Provider{
-		ID: "p1", Slug: "p1", Name: "p1", Protocol: "openai-chat", Enabled: true,
+		ID: "p1", Slug: "p1", Name: "p1", Protocol: "chat", Enabled: true,
 	}); err != nil {
 		t.Fatalf("seed provider: %v", err)
 	}
 	if err := db.CreateUpstreamModel(ctx, &store.UpstreamModel{
-		ID: "m1", ProviderID: "p1", ModelID: "m", Enabled: true,
-		PriceInput: 30, PriceOutput: 30,
+		ID: "m1", ProviderID: "p1", ModelID: "m", PriceInput: 30, PriceOutput: 30,
 	}); err != nil {
 		t.Fatalf("seed model: %v", err)
 	}
@@ -301,7 +300,7 @@ func TestSplitStoreTxCeiling(t *testing.T) {
 		_, err := db.CreateUsageRecordWithCost(ctx, &store.UsageRecord{
 			ID: fmt.Sprintf("si-%d", i), UserID: "u1", AccessKeyID: "k1",
 			PublicModel: "m", ProviderID: "p1", UpstreamModel: "m",
-			IngressProtocol: "openai-chat", Status: "ok",
+			IngressProtocol: "chat", Status: "ok",
 			InputTokens: 5, OutputTokens: 3, TotalTokens: 8,
 		})
 		return err
@@ -317,7 +316,7 @@ func TestSplitStoreTxCeiling(t *testing.T) {
 		_, err := db.CreateUsageRecordWithCost(ctx, &store.UsageRecord{
 			ID: fmt.Sprintf("ci-%d", i), UserID: "u1", AccessKeyID: "k1",
 			PublicModel: "m", ProviderID: "p1", UpstreamModel: "m",
-			IngressProtocol: "openai-chat", Status: "ok",
+			IngressProtocol: "chat", Status: "ok",
 			InputTokens: 5, OutputTokens: 3, TotalTokens: 8,
 		})
 		return err

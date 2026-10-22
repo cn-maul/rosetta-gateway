@@ -170,11 +170,11 @@ func TestRebuildFromDB_MarksNotReadyProviders(t *testing.T) {
 	}
 	must(db.CreateProvider(ctx, &store.Provider{
 		ID: "p-ok", Slug: "ok-prov", Name: "正常上游",
-		Endpoint: "https://example.invalid/v1", Protocol: "openai-chat", Enabled: true,
+		Endpoint: "https://example.invalid/v1", Protocol: "chat", Enabled: true,
 	}))
 	must(db.CreateProvider(ctx, &store.Provider{
 		ID: "p-bad", Slug: "bad-prov", Name: "凭据坏了的上游",
-		Endpoint: "https://example.invalid/v1", Protocol: "openai-chat", Enabled: true,
+		Endpoint: "https://example.invalid/v1", Protocol: "chat", Enabled: true,
 	}))
 
 	// 正常 provider 在快照里必须是 Ready=true 且不带原因。
@@ -220,7 +220,7 @@ func TestRebuildFromDB_UnknownSlugFailureIsIgnored(t *testing.T) {
 	ctx := context.Background()
 	if err := db.CreateProvider(ctx, &store.Provider{
 		ID: "p1", Slug: "prov", Name: "P",
-		Endpoint: "https://example.invalid/v1", Protocol: "openai-chat", Enabled: true,
+		Endpoint: "https://example.invalid/v1", Protocol: "chat", Enabled: true,
 	}); err != nil {
 		t.Fatalf("create provider: %v", err)
 	}

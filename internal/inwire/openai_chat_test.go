@@ -122,7 +122,7 @@ func TestDecodeOpenAIChatRequest_RejectsNegativeN(t *testing.T) {
 	}
 }
 
-// chat → openai-responses：能等价翻译的字段必须翻译，不得整个静默丢弃（P1-8）。
+// chat → response：能等价翻译的字段必须翻译，不得整个静默丢弃（P1-8）。
 func TestApplyProtocolPrivateExtra_ResponsesTranslation(t *testing.T) {
 	got := decodeChat(t, `{"model":"m","messages":[{"role":"user","content":"hi"}],
 		"response_format":{"type":"json_schema","json_schema":{"name":"out","strict":true,"schema":{"type":"object"}}},
@@ -131,7 +131,7 @@ func TestApplyProtocolPrivateExtra_ResponsesTranslation(t *testing.T) {
 		"presence_penalty":0.5,"frequency_penalty":0.5,"seed":42,"user":"u-1"}`)
 
 	req := got.ToRosetta()
-	got.ApplyProtocolPrivateExtra(req, "openai-responses")
+	got.ApplyProtocolPrivateExtra(req, "response")
 
 	// response_format json_schema → text.format 平铺外壳（与正向翻译互为镜像）。
 	textObj, ok := req.Extra["text"].(map[string]any)
@@ -162,12 +162,12 @@ func TestApplyProtocolPrivateExtra_ResponsesTranslation(t *testing.T) {
 	}
 }
 
-// chat → openai-responses：json_object 直映。
+// chat → response：json_object 直映。
 func TestApplyProtocolPrivateExtra_ResponsesJsonObject(t *testing.T) {
 	got := decodeChat(t, `{"model":"m","messages":[{"role":"user","content":"hi"}],
 		"response_format":{"type":"json_object"},"tool_choice":"none"}`)
 	req := got.ToRosetta()
-	got.ApplyProtocolPrivateExtra(req, "openai-responses")
+	got.ApplyProtocolPrivateExtra(req, "response")
 
 	textObj, ok := req.Extra["text"].(map[string]any)
 	if !ok {
@@ -229,9 +229,9 @@ func TestApplyProtocolPrivateExtra_AnthropicTranslation(t *testing.T) {
 	}
 }
 
-// openai-chat 直传路径不受影响：""/auto 与显式 openai-chat 同组。
+// chat 直传路径不受影响：""/auto 与显式 chat 同组。
 func TestApplyProtocolPrivateExtra_OpenAIChatPassthrough(t *testing.T) {
-	for _, proto := range []string{"", "openai-chat", "auto"} {
+	for _, proto := range []string{"", "chat", "auto"} {
 		got := decodeChat(t, `{"model":"m","messages":[{"role":"user","content":"hi"}],
 			"response_format":{"type":"json_object"},"tool_choice":"auto","seed":7}`)
 		req := got.ToRosetta()

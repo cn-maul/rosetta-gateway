@@ -216,7 +216,7 @@ func (sw *SSEWriter) WriteTextDelta(delta string) error {
 // WriteThinkingDelta 把上游的推理（思维链）增量透传为 delta.reasoning_content。
 //
 // OpenAI 官方协议没有这个字段，但 DeepSeek / Qwen / vLLM / OpenRouter 一致用它承载
-// reasoning_content，rosetta 的 openai-chat 适配器也按这个键回读
+// reasoning_content，rosetta 的 chat 适配器也按这个键回读
 // （provider_openai_chat.go 的 ReasoningContent），所以键名对整个链路是自洽的。
 //
 // 不透传的代价不只是「少了一个字段」：只吐思考的流（思考型模型在 max_tokens
@@ -256,7 +256,7 @@ func (sw *SSEWriter) WriteThinkingDelta(delta string) error {
 // # 为什么「恒发 function」对其它客户端也无副作用（已实测）
 //
 // 用 AI SDK 的**原样 zod schema**（vercel/ai 的 openaiChatChunkSchema，
-// 逐字取自 packages/openai/src/chat/openai-chat-api.ts）实测四种产出：
+// 逐字取自 packages/openai/src/chat/chat-api.ts）实测四种产出：
 //
 //	OpenAI 原生流 / 本修复的产出   → 全部通过
 //	修复前（无 function）          → 拒绝，报 expected object, received undefined

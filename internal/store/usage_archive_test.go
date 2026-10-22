@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"math"
 	"testing"
 	"time"
 )
@@ -26,17 +27,15 @@ func archiveFixture(t *testing.T, st *Store, base time.Time, keepDays int) (old,
 		}
 	}
 	must(st.CreateProvider(ctx, &Provider{
-		ID: "p1", Slug: "p1", Name: "P1", Endpoint: "http://x", Protocol: "openai-chat", Enabled: true}))
+		ID: "p1", Slug: "p1", Name: "P1", Endpoint: "http://x", Protocol: "chat", Enabled: true}))
 	must(st.CreateProvider(ctx, &Provider{
 		ID: "p2", Slug: "p2", Name: "P2", Endpoint: "http://y", Protocol: "anthropic", Enabled: true}))
 	// 两个模型分别定价，才能让 cost_total 在归档后仍可复算。
 	must(st.CreateUpstreamModel(ctx, &UpstreamModel{
-		ID: "m1", ProviderID: "p1", ModelID: "sonnet", Enabled: true,
-		PriceInput: 0.2, PriceCacheHit: 0.02, PriceOutput: 0.8,
+		ID: "m1", ProviderID: "p1", ModelID: "sonnet", PriceInput: 0.2, PriceCacheHit: 0.02, PriceOutput: 0.8,
 	}))
 	must(st.CreateUpstreamModel(ctx, &UpstreamModel{
-		ID: "m2", ProviderID: "p2", ModelID: "haiku", Enabled: true,
-		PriceInput: 0.5, PriceOutput: 2,
+		ID: "m2", ProviderID: "p2", ModelID: "haiku", PriceInput: 0.5, PriceOutput: 2,
 	}))
 
 	// 保留窗口的切分点与 PruneOldUsage 内部一致：本地午夜往前 keepDays 天。
@@ -104,7 +103,7 @@ func itoa(n int) string {
 
 func protocolFor(providerID string) string {
 	if providerID == "p1" {
-		return "openai-chat"
+		return "chat"
 	}
 	return "anthropic"
 }
@@ -314,8 +313,24 @@ func assertStatsEqual(t *testing.T, before, after *UsageStats) {
 	if before.ErrorCount != after.ErrorCount {
 		t.Errorf("error_count: %d -> %d", before.ErrorCount, after.ErrorCount)
 	}
+	if before.SuccessCount != after.SuccessCount {
+		t.Errorf("success_count: %d -> %d", before.SuccessCount, after.SuccessCount)
+	}
+	if before.CanceledCount != after.CanceledCount {
+		t.Errorf("canceled_count: %d -> %d", before.CanceledCount, after.CanceledCount)
+	}
+	if before.CostPendingCount != after.CostPendingCount {
+		t.Errorf("cost_pending_count: %d -> %d", before.CostPendingCount, after.CostPendingCount)
+	}
 	if before.CacheHitRate != after.CacheHitRate {
 		t.Errorf("cache_hit_rate: %v -> %v", before.CacheHitRate, after.CacheHitRate)
+	}
+	if before.TtfbSamples != after.TtfbSamples || math.Abs(before.TtfbMs-after.TtfbMs) > 1e-9 {
+		t.Errorf("ttfb: %v/%d -> %v/%d", before.TtfbMs, before.TtfbSamples, after.TtfbMs, after.TtfbSamples)
+	}
+	if before.ThroughputSamples != after.ThroughputSamples || math.Abs(before.TokensPerSec-after.TokensPerSec) > 1e-9 {
+		t.Errorf("throughput: %v/%d -> %v/%d",
+			before.TokensPerSec, before.ThroughputSamples, after.TokensPerSec, after.ThroughputSamples)
 	}
 	if diff := before.Cost - after.Cost; diff > 1e-9 || diff < -1e-9 {
 		t.Errorf("cost: %v -> %v", before.Cost, after.Cost)
@@ -530,7 +545,7 @@ func TestPrune_LargeBacklogAggregatesOnce(t *testing.T) {
 			PublicModel:     "sonnet",
 			ProviderID:      "p-bulk",
 			UpstreamModel:   "sonnet",
-			IngressProtocol: "openai-chat",
+			IngressProtocol: "chat",
 			TotalTokens:     1,
 			UsageState:      "reported",
 			Status:          "ok",

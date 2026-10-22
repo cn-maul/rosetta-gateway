@@ -6,6 +6,12 @@ const router = createRouter({
   history: createWebHashHistory(),
   routes: [
     { path: '/login', name: 'login', component: () => import('./views/Login.vue'), meta: { title: '登录', public: true } },
+    {
+      path: '/set-password',
+      name: 'password-setup',
+      component: () => import('./views/PasswordSetup.vue'),
+      meta: { title: '设置密码', public: true, allowAuthenticated: true },
+    },
     { path: '/', name: 'overview', component: () => import('./views/Overview.vue'), meta: { title: '总览' } },
     { path: '/history', name: 'history', component: () => import('./views/UsageStats.vue'), meta: { title: '请求日志' } },
     { path: '/usage', name: 'usage', component: () => import('./views/UsageStats.vue'), meta: { title: '用量与费用' } },
@@ -57,7 +63,7 @@ function guardDecision(to: RouteLocationNormalized): true | RouteLocationRaw {
   // 已登录的人不该再看见登录页。会话过期把人踢回这里后重新登录，
   // 或刷新时 hash 还停在 /login —— 两种情况都该直接放行进后台，
   // 否则页面停在登录表单上，看起来像「登录没生效」（导航栏其实已经在了）。
-  if (to.meta.public && session.me) {
+  if (to.meta.public && session.me && !to.meta.allowAuthenticated) {
     // 回跳目标只接受站内相对路径（单斜杠开头）：redirect 来自 URL query，
     // 不校验就是开放重定向 —— 受害者被送到 /login?redirect=//evil.com，
     // 登录后这个 replace 把他交给外站，而且是从我们自己的域名出发的，

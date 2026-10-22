@@ -83,9 +83,6 @@ function testResultLine(r: ModelTestResult): string {
             <td>
               <div class="cell-key">
                 <span class="name mono">{{ m.model_id }}</span>
-                <span class="badge" :class="m.enabled ? 'badge-live' : 'badge-off'">
-                  {{ m.enabled ? '启用' : '停用' }}
-                </span>
               </div>
               <div class="sub-line price-line">价格（元/1M）：{{ priceLine(m) }}</div>
               <!-- 思考挡位。agent 工具靠 /v1/models 的 supported_reasoning

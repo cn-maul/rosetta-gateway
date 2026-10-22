@@ -6,9 +6,9 @@
 | 项目性质 | 独立项目，不在 Rosetta 上改造（2026-09-15 定，理由见 §2.1） |
 | module path | `github.com/cn-maul/rosetta-gateway` |
 | 运行时依赖 | `github.com/cn-maul/rosetta` v1.2.0（上游 SDK）、`modernc.org/sqlite`（纯 Go SQLite）、`github.com/golang-jwt/jwt/v5`（管理会话） |
-| 版本 | 与 `web/package.json` 同源（当前 1.6.2），镜像与二进制共用 |
+| 版本 | 与 `web/package.json` 同源（当前 1.6.5），镜像与二进制共用 |
 | 状态 | **已实现**（P0–P3 全部落地，多用户、用量归档、配置导入导出均已上线） |
-| 更新 | 2026-10-17 |
+| 更新 | 2026-10-22 |
 
 ---
 
@@ -35,7 +35,7 @@
   拒绝调用（§11.5）。口径未变的是「不做钱」那一半：余额不可提现、不与任何支付
   渠道对接、费用按上游单价估算而非账单。
 - 不做上游 Responses 的会话状态托管：`previous_response_id` / `store` 在上游协议为
-  `openai-responses` 时经 `Extra` 透传给上游承接；chat / anthropic 上游无此概念，
+  `response` 时经 `Extra` 透传给上游承接；chat / anthropic 上游无此概念，
   这两个字段被丢弃，客户端须自带全量历史
 - 不做 Embeddings / Rerank 的对外入口（Rosetta 已具备上游能力，P3 之后再评估）
 - 不做多节点集群（单进程，SQLite 本地文件）
@@ -149,7 +149,7 @@ CREATE TABLE providers (
   slug          TEXT NOT NULL UNIQUE,      -- 前缀语法用，限定 [a-z0-9]{2,32}（不允许连字符）
   name          TEXT NOT NULL,             -- 显示名
   protocol      TEXT NOT NULL DEFAULT 'auto',
-                                           -- auto|openai-chat|openai-responses|anthropic
+                                           -- auto|chat|response|anthropic
   endpoint      TEXT NOT NULL,
   enabled       INTEGER NOT NULL DEFAULT 1,
   timeout_ms    INTEGER NOT NULL DEFAULT 0,    -- 0 = 用全局默认
@@ -179,7 +179,6 @@ CREATE TABLE upstream_models (
   provider_id       TEXT NOT NULL REFERENCES providers(id) ON DELETE CASCADE,
   model_id          TEXT NOT NULL,          -- 上游真实模型名，可含 "/"
   display_name      TEXT,
-  enabled           INTEGER NOT NULL DEFAULT 1,
   context_window    INTEGER,                -- 覆盖 rosetta 注册表
   max_output_tokens INTEGER,
   supports_thinking INTEGER,                -- NULL = 不覆盖
@@ -283,6 +282,17 @@ CREATE TABLE users (
   last_login_at INTEGER NOT NULL DEFAULT 0
 );
 
+-- 普通用户的一次性设密链接（2026-10-22）
+-- 一个用户最多一条；重新签发覆盖旧记录。表是向后兼容的新增对象，
+-- 旧数据库启动时用 CREATE TABLE IF NOT EXISTS 补齐，不提升 user_version。
+CREATE TABLE user_password_setup_tokens (
+  user_id    TEXT PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+  token_hash TEXT NOT NULL UNIQUE,       -- SHA-256(明文 token)，不存明文
+  expires_at INTEGER NOT NULL,           -- 毫秒时间戳
+  created_by TEXT NOT NULL,              -- 签发链接的管理员 user id
+  created_at INTEGER NOT NULL
+);
+
 -- 分组与组级模型白名单（groups 刻意不带 quota/rpm/tpm 列 —— 没有执行点的列不建）
 CREATE TABLE groups (
   id          TEXT PRIMARY KEY,
@@ -306,7 +316,7 @@ CREATE TABLE usage_records (
   public_model      TEXT NOT NULL,         -- 下游看到的名字
   provider_id       TEXT NOT NULL,
   upstream_model    TEXT NOT NULL,
-  ingress_protocol  TEXT NOT NULL,         -- openai-chat|openai-responses|anthropic
+  ingress_protocol  TEXT NOT NULL,         -- chat|response|anthropic
   stream            INTEGER NOT NULL,
   input_tokens      INTEGER NOT NULL DEFAULT 0,
   output_tokens     INTEGER NOT NULL DEFAULT 0,
@@ -406,7 +416,7 @@ resolve(model):
 |---|---|---|
 | `POST /v1/chat/completions` | OpenAI Chat | P0，已实现 |
 | `POST /v1/messages` | Anthropic Messages | **已实现（2026-10-02）**——Claude Code 把 `ANTHROPIC_BASE_URL` 指向网关即可用；thinking 回放（含签名）见 §17 R4 |
-| `POST /v1/responses` | OpenAI Responses | **已实现（2026-10-04）**——Codex CLI 等客户端接入点；`previous_response_id`/`store` 由上游承接（见 §17 R11）；`text.format` 跨协议映射为 openai-chat 的 response_format；reasoning item 的 `encrypted_content` 随 Rosetta v1.2.0 起无损往返（同样见 R11） |
+| `POST /v1/responses` | OpenAI Responses | **已实现（2026-10-04）**——Codex CLI 等客户端接入点；`previous_response_id`/`store` 由上游承接（见 §17 R11）；`text.format` 跨协议映射为 chat 的 response_format；reasoning item 的 `encrypted_content` 随 Rosetta v1.2.0 起无损往返（同样见 R11） |
 | `GET /v1/models` | 形状按认证头分流（D9） | 已实现，`?include=upstream` 展开轨道二；**条目带容量元数据**（见 §5.3） |
 | `GET /v1/models/{model}` | 单模型详情 | 已实现（OpenAI/Anthropic 形状 + 容量元数据；`/openai/v1/models/{m}`、`/anthropic/v1/models/{m}` 别名） |
 | `GET /dashboard/billing/*`、`GET /v1/organization/usage|costs` | 额度/费用查询 | 已实现（2026-10-04），见 §6.4 |
@@ -466,31 +476,45 @@ NULL 只作为损坏数据的 fail-closed 状态处理，不再提供迁移或�
 - **窗口是一次性的**（2026-10-07 加固）：`app_settings` 里的 `bootstrap_completed`
   标记与首次设密在同一事务写入 —— 设过一次后，无论日后是否再出现空密码 admin
   （该形态本身已被下一条堵死），免鉴权窗口永不重开；
-- **窗口需要一次性令牌**（2026-10-14 加固）：`app_settings` 里的 `bootstrap_token`
-  在启动时生成（或取自 `ROSETTA_GW_BOOTSTRAP_TOKEN`，少于 32 字节直接拒绝启动），
-  只写启动日志、绝不出现在任何 HTTP 响应里，并在设密的同一事务内被清空 ——
-  因此不存在「设过密但令牌还在」（可重放）或「令牌清了但密码没设上」
-  （管理员被永久锁在门外）这两种中间态。**令牌布置失败时进程拒绝启动**
-  （fail-secure），否则绑非回环时窗口会退回「谁先连到端口谁就是管理员」；
 - 防 线：只对 `role='admin' AND password_hash=''` 的账号生效（条件 UPDATE，
   设过即 409）、创建 admin 必须带初始密码、空密码账号禁止升级为 admin、
   同源校验 + Content-Type 断言（防 CSRF）；
-- 暴露面边界：全新部署且监听非回环时，**持有引导令牌的人**能抢先完成首次设置
-  —— 窗口只开这一次，抢到的人成为第一个管理员。令牌的来源只有启动日志或
-  `ROSETTA_GW_BOOTSTRAP_TOKEN`，所以真正的防线是「谁能看到部署日志与部署清单」，
-  而不是「谁能连到端口」；默认回环监听把这一面进一步缩小，启动时另有
-  ERROR 告警（`FindUninitializedAdmin != nil && !isLoopbackListen`）。
+- 暴露面边界：全新部署且监听非回环时，**能访问该端口的人**可以抢先完成首次设置
+  —— 窗口只开这一次，抢到的人成为第一个管理员。局域网自用部署接受这一风险；
+  默认回环监听把这一面进一步缩小，启动时另有 ERROR 告警
+  （`FindUninitializedAdmin != nil && !isLoopbackListen`），部署后应立即设置密码。
+
+**普通用户的一次性设密链接**（2026-10-22）：
+
+- 系统不开放公开注册，也不允许空密码账号从普通登录框自助设密。管理员创建普通
+  用户时可以留空密码；用户列表随后显示「设密」，管理员签发一条 24 小时有效的
+  一次性链接。
+- 公开端点只有 `POST /admin/api/password-setup/check`（校验链接并显示目标用户名）
+  和 `POST /admin/api/password-setup`（设置密码并直接签发会话）。两者都要求同源 +
+  JSON Content-Type；设置密码的请求另按来源 IP 限速。
+- token 使用高熵随机值，数据库只存 SHA-256 哈希。链接形如
+  `/admin/#/set-password?token=...`，token 位于 hash fragment，不进入首次 HTTP
+  请求的访问日志。无效、过期、已消费、账号禁用等状态统一返回同一条错误，避免
+  账号或链接枚举。
+- 设密与消费 token 在同一数据库事务内完成，并递增 `auth_version`，因此旧会话
+  失效且链接不能重放。重新签发会覆盖旧链接；管理员改密、禁用、删除用户也会
+  清理或级联清理未使用的链接。
 
 | 端点 | 放行规则 |
 |---|---|
 | `GET /admin/api/session` | 恒放行（探测是否已登录；未初始化时一并回报） |
 | `GET /admin/api/bootstrap` | 恒放行（返回是否需要初始化与待初始化账号名） |
-| `POST /admin/api/bootstrap` | 仅当 `bootstrap_completed` 标记未写入且存在未初始化 admin 时放行；同源 + JSON Content-Type；本安装配置了引导令牌时还必须带对令牌（同事务内恒定时间比对）。标记、令牌与首次设密同事务写入，窗口一次性。它挂在 `publicAdminMux` 上因而**绕过**了 `adminAuto` 的审计，故单独套 `server.AuditOnly` 补上（只补审计，不触发快照重建 —— 它只改密码哈希） |
+| `POST /admin/api/bootstrap` | 仅当 `bootstrap_completed` 标记未写入且存在未初始化 admin 时放行；同源 + JSON Content-Type。标记与首次设密同事务写入，窗口一次性。它挂在 `publicAdminMux` 上因而**绕过**了 `adminAuto` 的审计，故单独套 `server.AuditOnly` 补上（只补审计，不触发快照重建 —— 它只改密码哈希） |
 | `POST /admin/api/login` | 免鉴权（登录本体；失败计入来源 IP 限速，§11.4） |
+| `POST /admin/api/password-setup/check` | 免鉴权；只接受一次性设密 token，返回目标用户名和过期时间；无效 token 统一返回 `valid=false` |
+| `POST /admin/api/password-setup` | 免鉴权；消费 token、写入密码并签发会话；按来源 IP 限速，token 使用与密码更新同事务 |
 | `POST /admin/api/logout` | **要会话**：它必须知道吊销谁（`BumpAuthVersion`）。「免鉴权」的登出只会清 cookie，而令牌在自然过期前仍然可用 —— 那是一次假登出 |
 | 其余 | `Authorization: Bearer <会话令牌>`，查 users 表比对 `auth_version` |
 
 ```
+POST   /admin/api/password-setup/check          校验普通用户的一次性设密链接
+POST   /admin/api/password-setup                设置密码并直接登录；token 一次性消费
+
 GET    /admin/api/networks                      出站网络（代理地址）清单；直连是保留 id
                                                "direct"，不在此列表里（2026-10-20）
 POST   /admin/api/networks                      新建
@@ -555,6 +579,7 @@ PATCH  /admin/api/users/{id}                    角色/状态/配额/分组/备�
                                                  自动递增 auth_version 使旧会话失效
 DELETE /admin/api/users/{id}
 POST   /admin/api/users/{id}/password           管理员重置该用户密码
+POST   /admin/api/users/{id}/password-setup     为未设密普通用户签发 24 小时一次性链接
 PUT    /admin/api/users/{id}/balance             管理员充值/扣减余额，body `{delta_cents}`（分，正充负扣）
 
 GET    /admin/api/groups                        分组与组级模型白名单（admin）
@@ -586,7 +611,8 @@ GET    /admin/api/usage/history.csv             同一套过滤的 CSV 导出（
 GET    /admin/api/usage/by-provider|by-day|by-model|by-key    分维度用量（按身份收窄）
 GET    /admin/api/usage/by-user                              **仅管理员**：按用户维度用量
 POST   /admin/api/usage/prune                   手动触发归档剪枝（每日定时之外的人口）
-GET    /admin/api/stats                         当前快照：总请求/总 token/错误率/各 provider 健康
+GET    /admin/api/stats                         所选区间统计：请求/成功/失败/取消、token、费用、首字/速度加权样本
+GET    /admin/api/stats/overview                **仅管理员**：上游/公开模型/用户/Key 的当前配置计数与就绪状态
 GET/PUT /admin/api/settings                     运行时全局默认（超时/故障转移策略，§10）
 POST   /admin/api/config-export/export|import   配置导出/导入（§13.3，requireAdmin）
 GET    /admin/api/model-names                   公开模型名清单（按身份收窄，供白名单选择）；附带
@@ -708,6 +734,18 @@ ms > 9.223e12 时会回绕成**负数**，负 Duration 让 `context.WithTimeout`
 例外：`providers` 的 `slug` 创建后不可修改（它是对外引用的稳定标识），
 PATCH 结构体里刻意不含该字段，传了也会被忽略。
 
+**协议值口径**：数据库、管理 API 与 Go 内部统一使用
+`auto / chat / response / anthropic`；界面只把后三者显示为
+`Chat / Response / Anthropic`。旧值 `openai-chat` / `openai-responses` 只在读取
+旧数据库或旧导出时做兼容归一化，启动迁移会把存量配置与用量记录改成新值。
+
+**OpenCode Go 会话头**：`opencode.ai` 及其子域的 chat 请求要求
+`x-opencode-session`。数据面会读取下游同名请求头并沿上下文传到上游 transport；
+transport 只对 OpenCode 主机补这个头，同时把 `User-Agent` 设为
+`rosetta-gateway`。客户端没有提供时用本次请求 ID 兜底，单次请求可以成功，
+但多轮会话的 OpenCode 路由/缓存亲和性必须由客户端持续发送同一个稳定会话 ID。
+模型探测没有下游会话，使用独立的 `probe-` 请求 ID，避免误把探测混进真实会话。
+
 ---
 
 ## 7. 协议转换边界（网关 vs Rosetta）
@@ -753,7 +791,7 @@ Rosetta 用一对字段表达它：`Sealed` 装载荷，`SealedBy` 记下是哪�
 
 | 方向 | 处理 |
 |---|---|
-| Responses 入站 | `reasoning` item 搬成 `SealedThinking(summary, sealed, "openai-responses")`。**空 item 跳过**：无 `encrypted_content` 且 summary 为空时硬造 block 会被 validate 拒掉，把本来能跑的请求变成 400 |
+| Responses 入站 | `reasoning` item 搬成 `SealedThinking(summary, sealed, "response")`。**空 item 跳过**：无 `encrypted_content` 且 summary 为空时硬造 block 会被 validate 拒掉，把本来能跑的请求变成 400 |
 | Responses 出站（流式） | `EventThinkingDelta` 发 `output_item.added` → `reasoning_summary_text.delta` → `output_item.done`（带 `encrypted_content`）。`SealedBy` 非本族的整条丢弃 |
 | Responses 出站（非流式） | `BlockThinking` 输出 reasoning item，同样过 `SealedBy` 门闩 |
 
@@ -842,9 +880,9 @@ CC Switch 透传，网关 400；Magpie 静默丢弃（200 但 output 无 `web_se
 
 | 目标协议 | SDK 行为 | 撞上的约束 |
 |---|---|---|
-| `openai-chat` | thinking / redacted-thinking 一律跳过 | 该 assistant turn 恰好只有这些块时，跳完变成一条什么都没有的 assistant，SDK 报 `assistant turn has only thinking/redacted-thinking blocks, which the OpenAI chat protocol cannot replay`（400） |
+| `chat` | thinking / redacted-thinking 一律跳过 | 该 assistant turn 恰好只有这些块时，跳完变成一条什么都没有的 assistant，SDK 报 `assistant turn has only thinking/redacted-thinking blocks, which the OpenAI chat protocol cannot replay`（400） |
 | `anthropic` | 无签名的 thinking 被跳过 | turn 因此空了同样报 `assistant turn has only unsigned thinking blocks, which anthropic cannot replay` |
-| `openai-responses` | 由 `SealedBy` 门闩自管 | 不需要这一刀 |
+| `response` | 由 `SealedBy` 门闩自管 | 不需要这一刀 |
 
 这两条报错是 SDK **故意**写清楚的（宁可报错也不发畸形空消息出去），但它
 没有退路可选 —— 客户端无法为别人的协议重造签名，剥掉是唯一走法。网关在
@@ -853,15 +891,15 @@ CC Switch 透传，网关 400；Magpie 静默丢弃（200 但 output 无 `web_se
 
 | 目标协议 | thinking | redacted_thinking |
 |---|---|---|
-| `openai-chat` / `""` / `auto` | 剥（带不带签名都剥） | 剥 |
+| `chat` / `""` / `auto` | 剥（带不带签名都剥） | 剥 |
 | `anthropic` | 剥无签名的，保留有签名的 | 保留 |
-| `openai-responses` | 不动 | 不动 |
+| `response` | 不动 | 不动 |
 
 剥空之后的 assistant turn 整条删掉 —— 留着零块消息 SDK 照样会以「只有思考块
 无法回放」报 400。删掉是安全的：turn 空了意味着它既没有正文也没有 tool_call，
 对模型本来就是一条空消息；工具调用链不受影响（tool_call 在同一 turn 里会保留）。
 
-**症状与验证**：deepseek harness 经 `/v1/messages` → `openai-chat`，第一轮正常，
+**症状与验证**：deepseek harness 经 `/v1/messages` → `chat`，第一轮正常，
 第二轮必然 400（客户端回传了上一轮的 thinking）。修复后四种回放形态（带签名
 thinking / 无签名 thinking / redacted_thinking / thinking+text+tool_use 混合）
 全部 200，且模型仍知道前文问了什么 —— 剥掉不损失对话语义。
@@ -884,7 +922,7 @@ thinking / 无签名 thinking / redacted_thinking / thinking+text+tool_use 混�
 | Flush | 用 `http.NewResponseController(w).Flush()`（Go 1.20+），不用 `http.Flusher` 类型断言 |
 | 首字节时机 | `ChatStream` 成功后才写 `200 + Content-Type: text/event-stream` + `Cache-Control: no-cache` + `X-Accel-Buffering: no` |
 | 结束事件 | OpenAI 系发 `data: [DONE]`；Anthropic 发 `event: message_stop`。**只有 `status=="ok"` 才发** |
-| 思考增量 | `EventThinkingDelta` 编码为 `delta.reasoning_content`（DeepSeek / Qwen / vLLM 的既成约定，Rosetta 的 openai-chat 适配器也按这个键回读）。**不能丢**：只吐思考的流丢了它就是个零内容的流。**Responses 下游的 reasoning item 生命周期必须跨增量**（2026-10-18 修复，§7.4）：每片增量独立 `added → delta → done` 会让 N 片思考变成 N 个 item，且 `thinkText` 跨 item 累积使 summary 变成「第 1+2 片」「第 1+2+3 片」——客户端按 item 渲染就是逐段变长、前缀重复的思考块 |
+| 思考增量 | `EventThinkingDelta` 编码为 `delta.reasoning_content`（DeepSeek / Qwen / vLLM 的既成约定，Rosetta 的 chat 适配器也按这个键回读）。**不能丢**：只吐思考的流丢了它就是个零内容的流。**Responses 下游的 reasoning item 生命周期必须跨增量**（2026-10-18 修复，§7.4）：每片增量独立 `added → delta → done` 会让 N 片思考变成 N 个 item，且 `thinkText` 跨 item 累积使 summary 变成「第 1+2 片」「第 1+2+3 片」——客户端按 item 渲染就是逐段变长、前缀重复的思考块 |
 | 空文本事件 | `EventThinkingDelta` 的 `Text==""` 是 Anthropic thinking signature 的载体，OpenAI 下游无对应字段，跳过即可。**但 Responses 下游不能跳过**：空 `Text` 同时是 sealed 载荷的载体，跳了就丢续接状态（§7.1） |
 | usage 合成 | OpenAI 下游要 usage 需客户端传 `stream_options.include_usage`；网关在 `EventMessageEnd` 处合成仅含 usage 的 chunk，且仅当客户端要求时下发 |
 | 断流处理 | 见 §8.2 |
@@ -1323,9 +1361,8 @@ AES-256-GCM 密文。无主密钥、密文损坏、主密钥不匹配或历史�
 **`require_strong_master_key`（2026-10-18 新增）**：
 缺省 `false` = 低熵主密钥（< 32 字符，`crypto.WeakMaterial`）只告警，这是既有
 行为 —— 很多部署点有意用口令形态的主密钥，直接改成硬失败等于让它们在升级后
-起不来。置 `true` 后，低熵主密钥会让进程**拒绝启动**，与引导令牌路径
-（fail-closed）取向一致：主密钥一旦可离线爆破，全部上游 API key 一起失守。
-`bootstrap_token` 那条路径本来就 fail-closed，两者的不一致正是本次补齐的。
+起不来。置 `true` 后，低熵主密钥会让进程**拒绝启动**：主密钥一旦可离线爆破，
+全部上游 API key 一起失守。
 
 **`timezone`（按天统计的日界）**：IANA 名（如 `Asia/Shanghai`），启动最早期被
 `config.ApplyTimezone` 应用 —— 它同时写 `time.Local` 与 `TZ` 环境变量，因为
@@ -1390,7 +1427,7 @@ Docker 侧对齐，且避开浏览器的保留端口表（6666 是 IRC 段，浏
 > `-ldflags` 注入 `main.buildVersion`，与 CI/前端页脚同源。
 
 **鉴权**：管理 API 由 `adminGuarded` 鉴权链保护，凭据逻辑在 `internal/userauth` +
-`internal/admin`（users 表 + JWT 会话，见 §6.3）。**恰好 4 条路由免鉴权**，且必须显式
+`internal/admin`（users 表 + JWT 会话，见 §6.3）。**恰好 6 条路由免鉴权**，且必须显式
 注册到根 mux（`internal/api/api.go` 的 `routeSpecs` 表）—— 它们不进 `adminAuto`（那会走鉴权链），但也不能
 因为「没注册」而落到 `/admin/api/` 前缀上被鉴权拦掉，那样会得到 401 而非功能缺失，
 症状是「登录页一直转圈」：
@@ -1401,6 +1438,8 @@ Docker 侧对齐，且避开浏览器的保留端口表（6666 是 IRC 段，浏
 | `GET /admin/api/session` | 探测是否已登录（前端启动时决定去登录页还是主页） |
 | `GET /admin/api/bootstrap` | 查询是否需要引导（未初始化 → 前端弹「设置密码」） |
 | `POST /admin/api/bootstrap` | 设初始管理员密码，**仅在系统尚无任何凭据时开放** |
+| `POST /admin/api/password-setup/check` | 校验普通用户一次性设密链接；无效 token 统一返回 `valid=false` |
+| `POST /admin/api/password-setup` | 消费一次性 token、设置普通用户密码并直接签发会话 |
 
 > **历史沿革（2026-10-06 已整体删除）**：统一认证之前是「`admin_auth.json` 密码文件 +
 > `config.json` 的 `admin_token`」双通道，前端存的是**管理密码**而不是令牌，靠三个
@@ -1424,38 +1463,38 @@ Docker 侧对齐，且避开浏览器的保留端口表（6666 是 IRC 段，浏
 
 ### 13.2 页面清单
 
-实际路由（`web/src/router.ts`，2026-10-17 核实）共 **8 个可渲染页面**
-（`/login`、`/`、`/usage`、`/models`、`/wallet`、`/users`、`/providers`、`/settings`），
-其中 2 页带 `meta.adminOnly`（`/providers`、`/settings`）—— 未登录或非 admin
-看不到也进不去。注意「页面数」与「侧栏项数」不是一回事：普通用户那一侧的侧栏
-只有 5 项（总览 / 可用模型 / 钱包与充值 / 用量统计 / 用户与分组），
-管理员那一侧是 7 项（个人 3 项 + 上游与模型 / 用户与分组 / 用量统计 / 设置）。
-`/wallet` 与 `/profile` 渲染的是**同一个** `Wallet.vue`（后者是重定向），
-路由名 `profile` 被守卫的「非 admin 踢回」与登出回跳复用，所以两条路径都得在。
+实际路由以 `web/src/router.ts` 为准（2026-10-22 核实）。共有 **13 个可渲染页面
+组件**：登录、普通用户设密、总览、请求日志/用量统计、可用模型、钱包、API 密钥/
+用户与权限、上游服务、上游详情、模型与路由、出站网络、账号设置、系统设置。
+其中 6 条路由带 `meta.adminOnly`：`/users`、`/providers`、`/providers/:id`、
+`/routes`、`/networks`、`/settings`，未登录或非 admin 看不到也进不去。
 
-另有若干**只做重定向的老书签**（`/keys` → `/users`；`/history` → `/usage`；
-`/profile` → `/wallet`；`/routes` 与 `/model-groups` → `/providers`；
-`/health` → `/models`），它们不渲染独立组件，保留是为了不把旧链接变成 404。
-`/keys` 在 router.ts 里出现了两次（一次在注释块之后、一次在 `/users` 之后），
-vue-router 的 `insertMatcher` 按路径得分二分插入（`findInsertionIndex`），
-两条同路径得分相同 → 后注册的排在前面，而 `resolve` 用 `matchers.find(...)`
-取第一个匹配，所以**后注册的那条胜出**。两条目标都是 `name: 'users'`，
-重复注册不影响行为 —— 但这是巧合而不是设计，后人改其中一条时两条都要看。
+管理员侧栏 10 项（运行 3 项 + 网关配置 4 项 + 管理 3 项）；普通用户侧栏 5 项
+（我的总览 / 可用模型 / API 密钥 / 我的调用 / 余额与账单）。`/profile` 是
+`/wallet` 的兼容重定向；`/model-groups`、`/health` 和 catch-all 也只做重定向。
+`/history`、`/keys`、`/routes` 仍是可访问的真实入口，不再按旧文档描述为纯重定向。
 
 | 路由 | 页签 | 可见 | 内容 |
 |---|---|---|---|
 | `/login` | 登录 | 公开 | 账号密码换 JWT；未初始化时改走引导设密 |
-| `/` | 总览 | 全体 | 今日请求数 / token / 错误率 / 各 provider 健康灯；「全部」档的区间聚合与缓存命中率在同一条 SELECT 里完成 |
-| `/usage` | 用量统计 | 全体 | **2026-10-16 由「调用历史」改名并拆成三个子页**：**调用明细**（`UsageDetail.vue`，原 `/history` 的逐条列表，含 usage_state、耗时、tps、失败轨迹与 CSV 导出）、**上游**、**模型**（两者是 `UsageByGroup.vue` 的按维度汇总）。三个子页共用一个时间范围，选择器由父页面持有 —— 各带一个的话，用户在「上游」页选了 30 天、切到「明细」页又看到默认 7 天，两页数字对不上且会被当成网关算错账。老书签 `/history` 重定向到本页并落在「调用明细」子页 |
+| `/set-password` | 设置密码 | 公开 | 一次性设密链接落地页；`token` 位于 hash query，校验后设置密码并直接登录。登录用户也可访问，完成设置会切换为该账号的会话 |
+| `/` | 总览 | 全体 | 管理员首屏分两块：当前启用的上游/总数、上游模型总数、用户数、Key 数、累计 token 费用；以及所选区间请求数、成功率、平均首字、平均输出速度、费用、token 与缓存命中率。另有趋势、待处理项；普通用户看自己的区间质量指标、余额与配额 |
+| `/history` | 请求日志 | 全体 | `UsageStats.vue` 固定渲染逐条 `UsageDetail.vue`：时间、状态、流式/非流式、入站协议、模型、密钥、输入/输出 token、输出速度、首字/总耗时、费用和详情。支持按时间范围/状态/模型/key 过滤、分页和 CSV 导出 |
+| `/usage` | 用量与费用 | 全体 | `UsageStats.vue` 的非日志形态：按上游、模型、密钥三个维度汇总，管理员另有「统计归并」（`ModelGroups.vue`）。所有子页共用父页面的时间范围，避免切换页签后两页数字对不上 |
 | `/models` | 可用模型 | 全体 | **只读**清单：`GET /admin/api/model-names` 按身份收窄后的模型名（普通用户 = 所属组白名单 ∩ 全部路由名）+ 输入/输出/缓存命中三项单价；`restricted=true` 时显式提示「已被分组收窄」。每张模型卡同时画**连通率曲线**（探测数据，2026-10-14 并表）。刻意不给勾选控件 —— 白名单的写入口在 `/keys`（只能收紧）与 `/groups`（管理员按组收紧），且**空清单一律解释为「一个模型都调不了」而非 ModelPicker 的「一个都不选 = 不限制」**（后者只属于配置态）。未配置的单价显示「未配置」并弱化，**不显示 0.00**（会被读成「确认免费」） |
 | `/wallet` | 钱包与充值 | 全体 | **按身份分两种形态的同一页**：管理员看到全站的用户消费汇总 + 全部充值流水 + 充值入口（没有消耗记录，明细在「用量统计」页）；普通用户看到自己的余额、按天消耗与充值记录。自改密码已迁到「设置」页（2026-10-13）。余额（`balance_cents`）在 `balance_unlimited` 时显示「不限」而非 0.00 元，为 0 时显式提示「余额已用尽，请联系管理员充值」，对应数据面真实的 402 |
-| `/users` | 用户与分组 | 全体 | 组件是 `AccessControl.vue`，三个页签：**用户**与**分组**（都是 `UsersGroups.vue`，由宿主按 tab 分发）、**访问密钥**（`Keys.vue`，原 `/keys` 页内容）。用户页含 CRUD、角色、启停、密码重置、**余额充值** —— `delta_cents` 是相对调整，填 100 是「加 100 元」而非「设为 100 元」，误操作不会清零；给不限额用户充值会把它切成有限额，界面上必须写明；admin 账号必须带初始密码。余额列区分「不限」与「0.00 元」。分组页含增删改、成员增删、**组级模型白名单** `PUT /admin/api/groups/{id}/models`。路由刻意**不带 `adminOnly`** —— 普通用户看得到这一项、进来落在密钥页签，后端按会话身份强制收窄每个操作的数据面 |
+| `/keys` | API 密钥 | 全体 | `AccessControl.vue` 的密钥页签：普通用户只看到并管理自己的 `sk-gw-` key；管理员可查看/调整归属与限制，但不能给自己新建 key。密钥创建与页签路由分离，`/keys` 是可停留地址 |
+| `/users` | 用户与权限 | admin | `AccessControl.vue` 的「用户 / 权限分组」两个页签。用户页含 CRUD、角色、启停、一次性设密/改密、余额充值；空密码普通用户可签发 24 小时设密链接，admin 新建时仍必须带初始密码。分组页维护成员与组级模型白名单 `PUT /admin/api/groups/{id}/models`。`delta_cents` 是相对金额，误操作不会把余额清零 |
 | `/networks` | 出站网络 | admin | 组件是 `Networks.vue`：可复用的代理地址清单（2026-10-20）。provider 只存 `network_id`，实际地址由读路径 JOIN 派生。直连是保留 id `direct`，不是一行记录。删网络让引用它的上游回到直连，不删上游 |
-| `/providers` | 上游与模型 | admin | 组件是 `Upstream.vue`，三个页签顺序即数据面配置链的顺序（上游 → 路由 → 归组）：**上游与模型**（`Providers.vue`，列表、协议/端点、**出站网络下拉（引用 `/networks`，默认直连）**、余额查询配置、连通性测试、模型管理与批量改价）、**路由**（`Routes.vue`，公开名 → 有序上游链，PUT 整体换链）、**模型归组**（`ModelGroups.vue`，跨上游同名模型的统计身份，不影响转发）。原 `/routes`、`/model-groups` 已并入本页 |
-| `/settings` | 设置 | admin | 五个页签：模型默认、运行时、模型价格、修改密码、导入导出（§13.3）。**审计日志页签已移除**（用户要求）—— 后端 `GET /admin/api/audit` 端点与 `api.ts` 的 `api.audit()` 都保留，那是运维取证的正路，删的只是界面那一块 |
+| `/providers` | 上游服务 | admin | `Providers.vue` 列表：类型用 `Chat / Response / Anthropic` 展示，模型/凭据摘要右对齐，操作列保留配置与删除，启停开关独立成最后一列；新建时可选出站网络 |
+| `/providers/:id` | 上游详情 | admin | `ProviderDetail.vue`：凭据、模型发现/导入、余额查询、连通性测试、批量改价与协议配置。协议值在 API/DB 中仍为 `chat / response / anthropic` |
+| `/routes` | 模型与路由 | admin | `Routes.vue`：公开模型名到有序上游链；`PUT /admin/api/routes/{id}/targets` 原子替换整条链。跨上游同名模型的统计归并在 `/usage?tab=groups`，不改变转发 |
+| `/account` | 账号设置 | 全体 | 当前用户自助改密、查看账号信息；管理员和普通用户都可访问 |
+| `/settings` | 系统设置 | admin | 五个页签：模型默认、运行时、模型价格、修改密码、导入导出（§13.3）。**审计日志页签已移除**（用户要求）—— 后端 `GET /admin/api/audit` 端点与 `api.ts` 的 `api.audit()` 都保留，那是运维取证的正路，删的只是界面那一块 |
 
-「用量看板」不是独立页 —— 按天 / 按 Key / 按模型 / 按 provider 的汇总以
-子页签的形式内嵌在 `/usage`（调用明细 / 上游 / 模型）。设置页的导入导出即 §13.3 描述的功能。
+「用量看板」不是独立页 —— 按上游 / 模型 / 密钥的汇总以子页签形式内嵌在
+`/usage`，管理员另有跨上游同名模型的统计归并；逐条请求日志在 `/history`。
+设置页的导入导出即 §13.3 描述的功能。
 
 > **`/model-names` 加价格为什么是「平行数组」而不是把 `models` 改成对象数组**
 >
@@ -1497,11 +1536,19 @@ vue-router 的 `insertMatcher` 按路径得分二分插入（`findInsertionIndex
 配置迁移只认**当前 schema**：导出/导入格式是唯一受支持的跨环境搬运方式。
 项目不再维护旧版本数据库的原地迁移工具，也不为历史 schema 保留第二套建表、
 列补丁或回填逻辑 —— 那会让同一份数据语义在两条路径上各自演化。
+上游模型没有独立启停状态：模型一旦添加就参与路由、探测和 `/v1/models`
+直连枚举；是否对外提供由公开路由及其启停状态决定。该字段的移除属于破坏性
+结构变更，`user_version` 因此提升到 2，旧库需导出配置后重建并重新导入。
+唯一例外是**向后兼容的纯新增对象**（如 `user_password_setup_tokens`）和**纯值归一化**
+（如旧协议名 `openai-chat` / `openai-responses` 改成 `chat` / `response`）：
+它们不改变既有列、索引或约束，启动时可幂等执行，因此无需提升 `user_version`。
 
 ### 13.4 安全
 
 - 管理面只有 users 表 + 会话一条通道（§6.3），不做「内网免鉴权」的假设；
   首次初始化窗口只对未设密码的 admin 开启，且启动时对「非回环监听 + 未初始化」打 ERROR
+- 普通用户不开放注册；一次性设密链接 24 小时有效、只能消费一次，服务端只存 token
+  哈希，重新签发/管理员改密/禁用/删除都会使旧链接失效
 - 上游 key 在界面只显示掩码（`sk-...abcd`），明文不可回读
 - 所有写操作记审计日志（**已实现，2026-10-04**）：`server.AutoReload` 在每个管理写
   操作上落 `audit_log`（谁=admin+来源 IP、何时、哪个资源、**哪些字段名**）。

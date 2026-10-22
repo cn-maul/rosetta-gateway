@@ -25,7 +25,7 @@ func seedCostlyUsage(t *testing.T, st *store.Store, id, userID, keyID string, co
 		ID: id, Ts: time.Now().UnixMilli(), UserID: userID, AccessKeyID: keyID,
 		PublicModel: "m", ProviderID: "p1", UpstreamModel: "up",
 		TotalTokens: 100, Status: "ok", HTTPStatus: 200,
-		IngressProtocol: "openai-chat", UsageState: "reported",
+		IngressProtocol: "chat", UsageState: "reported",
 	}); err != nil {
 		t.Fatalf("seed usage %s: %v", id, err)
 	}

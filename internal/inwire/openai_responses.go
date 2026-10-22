@@ -28,7 +28,7 @@ import (
 //     function，见 flattenNamespaceTools。
 //   - previous_response_id / store：网关不托管会话状态（DESIGN §1 明确不做），
 //     两者被忽略；Codex 等客户端在 store:false 下随请求带全量历史，天然兼容。
-//   - text.format 映射到 openai-chat 上游的 response_format（json_object 直映、
+//   - text.format 映射到 chat 上游的 response_format（json_object 直映、
 //     json_schema 翻译外壳）；responses 上游经 Extra 原样回传；anthropic 上游
 //     没有对应物 —— tool_choice 仍做等价翻译（any/tool），结构化输出这类
 //     硬约束则由网关层拒绝（见 RequiresStructuredOutput 与 handleIngress）。
@@ -806,7 +806,7 @@ func (a *ResponsesRequest) ToRosetta() *rosetta.ChatRequest {
 			// 客户端多轮 reasoning 会话直接断在这里。
 			//
 			// 现在原样搬进统一模型的 Sealed/SealedBy，由 rosetta 的
-			// SealedBy 门闩决定写回哪个协议族：openai-responses 上游完整
+			// SealedBy 门闩决定写回哪个协议族：response 上游完整
 			// 回放，chat / anthropic 上游自动剥除（那两个协议没有对应概念，
 			// 客户端本应自带全量历史）。
 			//
@@ -821,7 +821,7 @@ func (a *ResponsesRequest) ToRosetta() *rosetta.ChatRequest {
 			// ReasoningID 单独设：SealedThinking 只填 summary/sealed/sealedBy，
 			// 而 item id 是下一轮寻址的依据（SDK 的 Responses 适配器按
 			// Block.ReasoningID 写出 "id"），漏了它等于带着载荷却没有地址。
-			blk := rosetta.SealedThinking(summary, item.EncryptedContent, "openai-responses")
+			blk := rosetta.SealedThinking(summary, item.EncryptedContent, string(rosetta.ProtoOpenAIResponses))
 			blk.ReasoningID = item.ID
 			req.Messages = append(req.Messages, rosetta.Message{
 				Role:   rosetta.RoleAssistant,
@@ -1143,8 +1143,8 @@ func (a *ResponsesRequest) ApplyUpstreamExtras(req *rosetta.ChatRequest, protoco
 		// parallel_tool_calls 亦无开关对应物，丢弃不改变正确性。
 		return
 
-	case "", "openai-chat", "auto":
-		// "auto" 与 ""/"openai-chat" 同组：auto 下SDK 自动探测，落点几乎总是
+	case "", "chat", "auto":
+		// "auto" 与 ""/"chat" 同组：auto 下SDK 自动探测，落点几乎总是
 		// OpenAI 方言，漏掉它等于让最常用的协议配置静默丢字段。
 		extra := map[string]any{}
 		if v := responsesToolChoiceOpenAI(a.effectiveToolChoice()); v != nil {
@@ -1161,7 +1161,7 @@ func (a *ResponsesRequest) ApplyUpstreamExtras(req *rosetta.ChatRequest, protoco
 		if len(extra) > 0 {
 			mergeExtra(req, extra)
 		}
-	case "openai-responses":
+	case "response":
 		extra := map[string]any{}
 		if tc := a.effectiveToolChoice(); len(tc) > 0 {
 			extra["tool_choice"] = json.RawMessage(tc)
@@ -1172,7 +1172,7 @@ func (a *ResponsesRequest) ApplyUpstreamExtras(req *rosetta.ChatRequest, protoco
 		//   "text":{"format":{"format":{"type":"json_schema",…}}}
 		// 上游看到的 format 对象里没有 type、schema 埋在重复的 format 键下，
 		// 于是结构化输出**静默不生效**，而客户端以为它生效了
-		// （实测抓到的出站 body 就是双层）。同函数上面的 openai-chat 分支
+		// （实测抓到的出站 body 就是双层）。同函数上面的 chat 分支
 		// 用 textFormatMap() 正确拆包 —— 两个分支的处理方式本就该一致。
 		if f := a.textFormatMap(); f != nil {
 			extra["text"] = map[string]any{"format": f}
@@ -1193,12 +1193,12 @@ func (a *ResponsesRequest) ApplyUpstreamExtras(req *rosetta.ChatRequest, protoco
 		if a.ParallelToolCalls != nil {
 			extra["parallel_tool_calls"] = *a.ParallelToolCalls
 		}
-		// previous_response_id / store 交给 openai-responses 上游承接。
+		// previous_response_id / store 交给 response 上游承接。
 		//
 		// 修复前这两个字段解析完就被丢弃：客户端拿它续会话，收到的却是
 		// 「只含本次 input」的 200，模型完全不知道前文。SDK 没把
-		// previous_response_id 列入 openai-responses 的保留键，走 Extra 合法。
-		// 非 openai-responses 上游没有对应概念（chat/anthropic 都是无状态），
+		// previous_response_id 列入 response 的保留键，走 Extra 合法。
+		// 非 response 上游没有对应概念（chat/anthropic 都是无状态），
 		// 继续按原样丢弃 —— 那条路径客户端本就该自带全量历史。
 		if a.PreviousResponseID != "" {
 			extra["previous_response_id"] = a.PreviousResponseID
@@ -1257,7 +1257,7 @@ func (a *ResponsesRequest) textPassthroughKeys() map[string]any {
 	return obj
 }
 
-// responsesToolChoiceOpenAI 把 Responses 的 tool_choice 翻译成 openai-chat 形状。
+// responsesToolChoiceOpenAI 把 Responses 的 tool_choice 翻译成 chat 形状。
 func responsesToolChoiceOpenAI(raw json.RawMessage) any {
 	if len(raw) == 0 {
 		return nil
@@ -1332,7 +1332,7 @@ func responsesToolChoiceAnthropic(raw json.RawMessage) any {
 	return nil
 }
 
-// textFormatToResponseFormat 把 Responses 的 text.format 翻译成 openai-chat 的
+// textFormatToResponseFormat 把 Responses 的 text.format 翻译成 chat 的
 // response_format。text（默认）返回 nil（无需表达）；json_object 直映；
 // json_schema 翻译外壳（Responses 平铺 name/schema/strict，chat 嵌套在
 // json_schema 子对象里）。未知类型返回占位错误形态的 map 由 SDK 拒绝 ——
@@ -1356,7 +1356,7 @@ func textFormatToResponseFormat(f map[string]any) map[string]any {
 	}
 }
 
-// responseFormatToTextFormat 把 openai-chat 的 response_format 翻译回 Responses
+// responseFormatToTextFormat 把 chat 的 response_format 翻译回 Responses
 // 的 text.format —— textFormatToResponseFormat 的反向（chat 入口打到
 // responses 上游时用）。json_object 直映；json_schema 把 chat 嵌套在
 // json_schema 子对象里的 name/schema/strict/description 摊平回 Responses 的

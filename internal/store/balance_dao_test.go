@@ -59,13 +59,12 @@ func seedPricedModel(t *testing.T, st *Store, pin, phit, pout float64) {
 	ctx := context.Background()
 	if err := st.CreateProvider(ctx, &Provider{
 		ID: "p1", Slug: "p1", Name: "P1", Endpoint: "http://x",
-		Protocol: "openai-chat", Enabled: true,
+		Protocol: "chat", Enabled: true,
 	}); err != nil {
 		t.Fatalf("provider: %v", err)
 	}
 	if err := st.CreateUpstreamModel(ctx, &UpstreamModel{
-		ID: "m1", ProviderID: "p1", ModelID: "priced", Enabled: true,
-		PriceInput: pin, PriceCacheHit: phit, PriceOutput: pout,
+		ID: "m1", ProviderID: "p1", ModelID: "priced", PriceInput: pin, PriceCacheHit: phit, PriceOutput: pout,
 	}); err != nil {
 		t.Fatalf("model: %v", err)
 	}
@@ -164,7 +163,7 @@ func TestCharge_CostMatchesUsageRecordCostTotal(t *testing.T) {
 
 	cost, err := st.CreateUsageRecordWithCost(ctx, &UsageRecord{
 		ID: "r1", UserID: "u1", AccessKeyID: "k1", PublicModel: "priced",
-		ProviderID: "p1", UpstreamModel: "priced", IngressProtocol: "openai-chat",
+		ProviderID: "p1", UpstreamModel: "priced", IngressProtocol: "chat",
 		InputTokens: 1_000_000, CachedTokens: 400_000, OutputTokens: 100_000,
 		TotalTokens: 1_100_000, UsageState: "reported", Status: "ok",
 		RequestID: "req-1",
@@ -252,18 +251,17 @@ func TestCharge_ZeroAmountIsCompleteNoOp(t *testing.T) {
 	// 「no-op」两条路径接起来：口径 A（usage missing 不扣钱）的落点。
 	if err := st.CreateProvider(ctx, &Provider{
 		ID: "pf", Slug: "pf", Name: "PF", Endpoint: "http://f",
-		Protocol: "openai-chat", Enabled: true,
+		Protocol: "chat", Enabled: true,
 	}); err != nil {
 		t.Fatalf("provider: %v", err)
 	}
 	if err := st.CreateUpstreamModel(ctx, &UpstreamModel{
-		ID: "mf", ProviderID: "pf", ModelID: "free", Enabled: true,
-	}); err != nil {
+		ID: "mf", ProviderID: "pf", ModelID: "free"}); err != nil {
 		t.Fatalf("model: %v", err)
 	}
 	cost, err := st.CreateUsageRecordWithCost(ctx, &UsageRecord{
 		ID: "r-free", UserID: "u1", AccessKeyID: "k1", PublicModel: "free",
-		ProviderID: "pf", UpstreamModel: "free", IngressProtocol: "openai-chat",
+		ProviderID: "pf", UpstreamModel: "free", IngressProtocol: "chat",
 		InputTokens: 1_000_000, OutputTokens: 1_000_000, TotalTokens: 2_000_000,
 		UsageState: "reported", Status: "ok", RequestID: "req-free",
 	})
@@ -621,7 +619,7 @@ func TestCreateUsageRecord_KeepsOldSignatureAndSameCost(t *testing.T) {
 	rec := func(id string) *UsageRecord {
 		return &UsageRecord{
 			ID: id, UserID: "u1", AccessKeyID: "k1", PublicModel: "priced",
-			ProviderID: "p1", UpstreamModel: "priced", IngressProtocol: "openai-chat",
+			ProviderID: "p1", UpstreamModel: "priced", IngressProtocol: "chat",
 			InputTokens: 1_000_000, CachedTokens: 400_000, OutputTokens: 100_000,
 			TotalTokens: 1_100_000, UsageState: "reported", Status: "ok", RequestID: id,
 		}

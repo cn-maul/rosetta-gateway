@@ -30,7 +30,7 @@ func seedUsage(t *testing.T, st *store.Store, id, providerID, upstreamModel stri
 	if err := st.CreateUsageRecord(t.Context(), &store.UsageRecord{
 		ID: id, Ts: time.Now().UnixMilli(), AccessKeyID: "k1", UserID: "admin-test",
 		PublicModel: "any", ProviderID: providerID, UpstreamModel: upstreamModel,
-		IngressProtocol: "openai-chat", InputTokens: tokens, TotalTokens: tokens,
+		IngressProtocol: "chat", InputTokens: tokens, TotalTokens: tokens,
 		Status: "ok", HTTPStatus: 200, UsageState: "reported",
 	}); err != nil {
 		t.Fatalf("seed usage %s: %v", id, err)

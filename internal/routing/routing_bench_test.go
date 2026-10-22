@@ -14,7 +14,6 @@ func buildIndexWithModels(n int) *RouteIndex {
 			ID:         fmt.Sprintf("m%04d", i),
 			ProviderID: "p1",
 			ModelID:    fmt.Sprintf("model-name-%04d", i),
-			Enabled:    true,
 		})
 	}
 	return ri

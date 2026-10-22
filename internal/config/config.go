@@ -11,6 +11,8 @@ import (
 	"regexp"
 	"strings"
 	"time"
+
+	wireproto "github.com/cn-maul/rosetta-gateway/internal/protocol"
 )
 
 type Config struct {
@@ -209,14 +211,6 @@ type BootstrapRoute struct {
 }
 
 var slugRe = regexp.MustCompile(`^[a-z0-9]{2,32}$`)
-
-// validBootstrapProtocols 与 admin 写入校验、upstream.buildClient 使用同一组取值。
-var validBootstrapProtocols = map[string]bool{
-	"auto":             true,
-	"openai-chat":      true,
-	"openai-responses": true,
-	"anthropic":        true,
-}
 
 func Load(path string) (*Config, error) {
 	data, err := os.ReadFile(path)
@@ -432,7 +426,7 @@ func (c *Config) validate() error {
 		// 上界（max=0）的字段，其余时长字段都有 maxDurMillis 兜底。
 		//
 		// 没上界的后果不是「配大了浪费内存」这么轻：inwire 的三条入口
-		//（openai-chat / openai-responses / anthropic）都是 io.ReadAll 全量
+		//（chat / response / anthropic）都是 io.ReadAll 全量
 		// 读进内存，MaxBytesReader 是唯一的闸门。误配成 0 以外的巨大值
 		//（比如手滑多敲几个 0，或把 GB 当 MB 填）后，一个带超大 body 的
 		// 请求就能让单进程网关 OOM —— 而这是**局域网内任意客户端**都能触发的。
@@ -521,11 +515,13 @@ func (c *Config) validate() error {
 		if p.Endpoint == "" {
 			return fmt.Errorf("bootstrap.providers[%d].endpoint: required", i)
 		}
-		// 与 admin/provider_handler.go 的 validProtocols 同一份白名单：配置入口
+		// 与管理 API 使用同一份协议白名单：配置入口
 		// 就挡住拼写错误，而不是等到运行时 buildClient 才失败（那时错误会伪装成
 		// 上游连接问题，指向下游而非配置）。空串合法，表示走默认/自动探测。
-		if p.Protocol != "" && !validBootstrapProtocols[p.Protocol] {
-			return fmt.Errorf("bootstrap.providers[%d].protocol: must be one of auto / openai-chat / openai-responses / anthropic, got %q", i, p.Protocol)
+		p.Protocol = wireproto.Normalize(p.Protocol)
+		c.Bootstrap.Providers[i].Protocol = p.Protocol
+		if p.Protocol != "" && !wireproto.Valid(p.Protocol) {
+			return fmt.Errorf("bootstrap.providers[%d].protocol: must be one of %s, got %q", i, wireproto.AllowedValues, p.Protocol)
 		}
 		for j, cred := range p.Credentials {
 			if cred.APIKeyEnv == "" && cred.APIKey == "" {

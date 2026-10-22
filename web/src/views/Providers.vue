@@ -9,6 +9,7 @@ import type { Provider } from '../types'
 import AppModal from '../components/AppModal.vue'
 import { useQueryText } from '../composables/useQueryText'
 import { useNetworks, NETWORK_DIRECT_ID } from '../composables/useNetworks'
+import { PROTOCOL_OPTIONS, protocolLabel } from '../protocols'
 
 const router = useRouter()
 const route = useRoute()
@@ -18,7 +19,7 @@ const saving = ref(false)
 const pending = ref(new Set<string>())
 const filtered = computed(() => providers.value.filter(p => {
   const q = search.value.trim().toLowerCase()
-  const matches = !q || [p.name, p.slug, p.endpoint, p.protocol].some(v => v.toLowerCase().includes(q))
+  const matches = !q || [p.name, p.slug, p.endpoint, p.protocol, protocolLabel(p.protocol)].some(v => v.toLowerCase().includes(q))
   const state = !p.enabled ? 'disabled' : p.ready === false ? 'unready' : p.ready === true ? 'ready' : 'unknown'
   return matches && (!status.value || status.value === state)
 }))
@@ -66,7 +67,7 @@ const { networks, load: loadNetworks } = useNetworks()
 const pForm = reactive({
   open: false,
   name: '',
-  protocol: 'openai-chat',
+  protocol: 'chat',
   endpoint: '',
   api_key: '',
   // 默认直连：绝大多数上游不需要代理。存 NETWORK_DIRECT_ID 而不是空串，
@@ -77,7 +78,7 @@ const pForm = reactive({
 
 function openCreate() {
   pForm.name = ''
-  pForm.protocol = 'openai-chat'
+  pForm.protocol = 'chat'
   pForm.endpoint = ''
   pForm.api_key = ''
   pForm.network_id = NETWORK_DIRECT_ID
@@ -170,30 +171,37 @@ const networkLabel = computed(() => {
 <template>
   <div class="page providers-page">
     <div class="page-head">
-      <div><h1>上游服务</h1><div class="sub">接入服务、管理凭据与上游模型 · 全站配置</div></div>
+      <div><h1>上游服务</h1></div>
       <div class="head-actions"><button class="btn" :disabled="loading" @click="load">刷新</button><button class="btn btn-primary" @click="openCreate">新建上游</button></div>
     </div>
     <div class="data-toolbar">
-      <label class="search-field"><span class="sr-only">搜索上游</span><input v-model="search" class="input" type="search" placeholder="搜索名称、协议或 Endpoint"/></label>
+      <label class="search-field"><span class="sr-only">搜索上游</span><input v-model="search" class="input" type="search" placeholder="搜索名称、类型或 Endpoint"/></label>
       <label><span class="sr-only">上游状态</span><select v-model="status" class="select"><option value="">全部状态</option><option value="ready">凭据就绪</option><option value="unready">未就绪</option><option value="disabled">已停用</option><option value="unknown">状态未知</option></select></label>
       <span class="result-count">{{ filtered.length }} / {{ providers.length }} 个上游</span>
     </div>
-    <p class="context-note">“凭据就绪”表示已构建可用凭据池；实时推理是否成功需结合模型探测与请求日志判断。</p>
     <DataTable class="panel table-panel" label="上游列表" :loading="loading" :error="err" :has-data="!!providers.length" :empty="!filtered.length" @retry="load">
       <template #empty><template v-if="!providers.length">尚未接入上游。新建后添加凭据与模型，再配置路由。</template><template v-else>没有匹配的上游<button class="btn btn-sm" @click="clearFilters">清除筛选</button></template></template>
         <table class="tbl providers-table">
-          <thead><tr><th>上游 / Endpoint</th><th>协议</th><th>配置状态</th><th class="num-h">模型 / 凭据</th><th class="c-act">操作</th></tr></thead>
+          <colgroup>
+            <col class="col-provider" />
+            <col class="col-type" />
+            <col class="col-state" />
+            <col class="col-metrics" />
+            <col class="col-actions" />
+            <col class="col-toggle" />
+          </colgroup>
+          <thead><tr><th>上游 / Endpoint</th><th class="provider-type-cell">类型</th><th>配置状态</th><th class="num-h provider-metrics">模型 / 凭据</th><th class="provider-actions">操作</th><th class="provider-toggle-head">启用</th></tr></thead>
           <tbody>
             <tr v-for="p in filtered" :key="p.id">
-              <td class="provider-identity"><button class="text-link name-link" @click="goDetail(p)">{{ p.name || p.slug }}</button><div class="sub-line mono endpoint">{{ p.endpoint }}</div><span v-if="p.network_id" class="sub-line">经网络「{{ networkLabel(p.network_id) }}」转发</span></td>
-              <td><span class="badge">{{ p.protocol }}</span></td>
+              <td class="provider-identity"><span class="name-link">{{ p.name || p.slug }}</span><div class="sub-line mono endpoint">{{ p.endpoint }}</div><span v-if="p.network_id" class="sub-line">经网络「{{ networkLabel(p.network_id) }}」转发</span></td>
+              <td class="provider-type-cell"><span class="badge">{{ protocolLabel(p.protocol) }}</span></td>
               <td class="provider-state"><span class="badge" :class="!p.enabled ? 'badge-off' : p.ready === false ? 'badge-st-error' : p.ready === true ? 'badge-live' : 'badge-dim'">{{ readyLabel(p) }}</span><div v-if="p.enabled && p.ready !== true" class="sub-line state-reason">{{ p.ready_reason || (p.ready === false ? '未建立可用凭据池，请检查凭据' : '暂未取得运行时状态') }}</div></td>
-              <td class="num"><span>{{ p.model_count ?? '—' }}</span><span class="dim"> / </span><span>{{ p.cred_count ?? '—' }}</span></td>
-              <td class="c-act"><div class="row-actions">
-                <button class="btn btn-act" @click="goDetail(p)">配置</button>
-                <button class="switch" :class="{ on: p.enabled }" role="switch" :aria-checked="p.enabled" :aria-label="(p.enabled ? '停用 ' : '启用 ') + p.name" :disabled="pending.has(p.id)" @click="toggleProvider(p)"></button>
-                <details class="row-menu"><summary :aria-label="'更多操作：' + p.name">⋯</summary><div class="row-menu-content"><button class="btn btn-sm btn-danger" :disabled="pending.has(p.id)" @click="removeProvider(p)">删除上游</button></div></details>
+              <td class="num-h provider-metrics"><span>{{ p.model_count ?? '—' }}</span><span class="dim"> / </span><span>{{ p.cred_count ?? '—' }}</span></td>
+              <td class="provider-actions"><div class="row-actions">
+                <button class="btn btn-act btn-ghost" @click="goDetail(p)">配置</button>
+                <button class="btn btn-act btn-danger" :disabled="pending.has(p.id)" @click="removeProvider(p)">删除</button>
               </div></td>
+              <td class="provider-toggle"><button class="switch" :class="{ on: p.enabled }" role="switch" :aria-checked="p.enabled" :aria-label="(p.enabled ? '停用 ' : '启用 ') + p.name" :title="p.enabled ? '停用' : '启用'" :disabled="pending.has(p.id)" @click="toggleProvider(p)"></button></td>
             </tr>
           </tbody>
         </table>
@@ -207,11 +215,9 @@ const networkLabel = computed(() => {
             <input v-model="pForm.name" class="input" placeholder="DeepSeek（留空则用 Endpoint）" id="cgw-lProviders-1"/>
           </div>
           <div class="field">
-            <label for="cgw-lProviders-2">协议</label>
+            <label for="cgw-lProviders-2">类型</label>
             <select v-model="pForm.protocol" class="select" id="cgw-lProviders-2">
-              <option value="openai-chat">openai-chat</option>
-              <option value="anthropic">anthropic</option>
-              <option value="openai-responses">openai-responses</option>
+              <option v-for="option in PROTOCOL_OPTIONS" :key="option.value" :value="option.value">{{ option.label }}</option>
             </select>
           </div>
           <div class="field span2">
@@ -249,20 +255,21 @@ const networkLabel = computed(() => {
 </template>
 
 <style scoped>
-.providers-table { min-width: 760px; }
-.provider-identity { width: 34%; min-width: 240px; }
+.providers-table { min-width: 860px; table-layout: fixed; }
+.col-provider { width: auto; }
+.col-type { width: 80px; }
+.col-state { width: 25%; }
+.col-metrics { width: 112px; }
+.col-actions { width: 144px; }
+.col-toggle { width: 64px; }
+.providers-table td { vertical-align: middle; }
+.provider-identity { min-width: 280px; }
 .name-link { font-weight: 650; text-align: left; overflow-wrap: anywhere; }
 .endpoint { color: var(--muted); font-size: 12px; overflow-wrap: anywhere; }
-.provider-state { width: 25%; min-width: 180px; }
+.provider-type-cell { white-space: nowrap; }
+.provider-state { min-width: 180px; }
 .state-reason { max-width: 320px; white-space: normal; color: var(--danger); font-size: 12px; }
-@media (max-width: 640px) {
-  .providers-table { min-width: 0; table-layout: fixed; }
-  .providers-table th:nth-child(2), .providers-table td:nth-child(2),
-  .providers-table th:nth-child(4), .providers-table td:nth-child(4),
-  .providers-table th:nth-child(5), .providers-table td:nth-child(5) { display: none; }
-  .provider-identity { min-width: 0; width: 56%; }
-  .provider-state { min-width: 0; width: 44%; }
-  .provider-state .badge { padding: 0 6px; }
-  .name-link { white-space: normal; }
-}
+.provider-metrics { white-space: nowrap; }
+.provider-actions { text-align: left; white-space: nowrap; }
+.provider-toggle-head, .provider-toggle { text-align: left; white-space: nowrap; }
 </style>

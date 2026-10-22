@@ -94,7 +94,6 @@ func bootstrapDB(db *store.Store, cfg *config.Config, logger *slog.Logger, maste
 				ID:         newIdentifier(),
 				ProviderID: bp.Slug,
 				ModelID:    modelID,
-				Enabled:    true,
 			}
 			if err := db.CreateUpstreamModel(ctx, m); err != nil {
 				logger.Error("bootstrap: create model failed", "provider", bp.Slug, "model", modelID, "error", err)
@@ -155,7 +154,6 @@ func buildSnapshotFromConfig(cfg *config.Config) *snapshot.Snapshot {
 				ID:         id,
 				ProviderID: bp.Slug,
 				ModelID:    modelID,
-				Enabled:    true,
 			})
 		}
 	}

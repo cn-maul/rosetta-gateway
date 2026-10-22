@@ -63,13 +63,12 @@ func batchProbeDB(t *testing.T) (*store.Store, func(*store.UsageRecord)) {
 		t.Fatalf("seed user: %v", err)
 	}
 	if err := db.CreateProvider(ctx, &store.Provider{
-		ID: "p1", Slug: "p1", Name: "p1", Protocol: "openai-chat", Enabled: true,
+		ID: "p1", Slug: "p1", Name: "p1", Protocol: "chat", Enabled: true,
 	}); err != nil {
 		t.Fatalf("seed provider: %v", err)
 	}
 	if err := db.CreateUpstreamModel(ctx, &store.UpstreamModel{
-		ID: "m1", ProviderID: "p1", ModelID: "m", Enabled: true,
-		PriceInput: 30, PriceOutput: 30,
+		ID: "m1", ProviderID: "p1", ModelID: "m", PriceInput: 30, PriceOutput: 30,
 	}); err != nil {
 		t.Fatalf("seed model: %v", err)
 	}
@@ -79,7 +78,7 @@ func batchProbeDB(t *testing.T) (*store.Store, func(*store.UsageRecord)) {
 		r.PublicModel = "m"
 		r.ProviderID = "p1"
 		r.UpstreamModel = "m"
-		r.IngressProtocol = "openai-chat"
+		r.IngressProtocol = "chat"
 		r.Status = "ok"
 		r.InputTokens, r.OutputTokens, r.TotalTokens = 5, 3, 8
 	}

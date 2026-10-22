@@ -19,6 +19,7 @@ import (
 	"github.com/cn-maul/rosetta"
 	"github.com/cn-maul/rosetta-gateway/internal/config"
 	"github.com/cn-maul/rosetta-gateway/internal/crypto"
+	"github.com/cn-maul/rosetta-gateway/internal/httpx"
 	"github.com/cn-maul/rosetta-gateway/internal/store"
 )
 
@@ -997,6 +998,15 @@ func TestUpstreamModel(ctx context.Context, st *store.Store, m *store.UpstreamMo
 		return ModelProbeResult{Err: err}
 	}
 
+	// OpenCode Go rejects chat requests without a conversation session. Model
+	// probes are not a real conversation, but still need a stable value while
+	// this one request and its retries are in flight.
+	probeSession := strings.TrimSpace(httpx.RequestIDFromContext(ctx))
+	if probeSession == "" {
+		probeSession = fmt.Sprintf("%d", start.UnixNano())
+	}
+	ctx = WithOpenCodeSession(ctx, "probe-"+probeSession)
+
 	req := &rosetta.ChatRequest{
 		Model:           m.ModelID,
 		Messages:        []rosetta.Message{rosetta.User(probeInput)},
@@ -1570,13 +1580,13 @@ func buildClient(prov *ProviderEntry, apiKey string, cfg *config.Config, modelIn
 	// 独享的 client。代理配错时**不失败**，而是回落到全局 client 并把错误
 	// 记进 ProviderFailure —— 理由见 proxyHTTPClientFor 的注释。
 	hc, proxyErr := proxyHTTPClientFor(prov.ProxyURL)
-	opts = append(opts, rosetta.WithHTTPClient(hc))
+	opts = append(opts, rosetta.WithHTTPClient(withOpenCodeSessionTransport(hc, prov.Endpoint)))
 	prov.ProxyConfigError = proxyErr
 	if prov.Protocol != "" && prov.Protocol != "auto" {
 		switch prov.Protocol {
-		case "openai-chat":
+		case "chat":
 			opts = append(opts, rosetta.WithProtocol(rosetta.ProtoOpenAIChat))
-		case "openai-responses":
+		case "response":
 			opts = append(opts, rosetta.WithProtocol(rosetta.ProtoOpenAIResponses))
 		case "anthropic":
 			opts = append(opts, rosetta.WithProtocol(rosetta.ProtoAnthropic))
@@ -1585,7 +1595,7 @@ func buildClient(prov *ProviderEntry, apiKey string, cfg *config.Config, modelIn
 			// 自动探测，请求打到错误的端点形态上，报出来的错误指向下游而非配置。
 			// 配置错了就说配置错了。管理 API 在写入时已用同一份白名单校验过，
 			// 这里是运行时（含 bootstrap 配置）的最后一道。
-			return nil, fmt.Errorf("provider %s: 未知的 protocol %q（合法值：auto / openai-chat / openai-responses / anthropic）", prov.Slug, prov.Protocol)
+			return nil, fmt.Errorf("provider %s: 未知的 protocol %q（合法值：auto / chat / response / anthropic）", prov.Slug, prov.Protocol)
 		}
 	}
 	if prov.Timeout > 0 {

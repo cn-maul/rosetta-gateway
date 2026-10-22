@@ -9,8 +9,8 @@ import (
 //
 // Resolve 的第一个分支是 `if r, ok := ri.byPublicName[model]; ok && r.Enabled`：
 // 命中一条**被禁用**的具名路由时，条件因 !r.Enabled 短路，控制流直接落到
-// 第二个分支（provider/model 直连兜底）—— 而那一支只看 p.Enabled 和
-// m.Enabled，**完全不再看「这个 model 字符串是否命中了一条被显式禁用的路由」**。
+// 第二个分支（provider/model 直连兜底）—— 而那一支只看上游是否存在且启用，
+// **完全不再看「这个 model 字符串是否命中了一条被显式禁用的路由」**。
 //
 // 触发路径完全现实：route_handler 对 public_name 只校验非空、不限制是否含
 // "/"，所以运维完全可以建一条 PublicName 为 "acme/gpt-4" 的路由（这在
@@ -27,7 +27,7 @@ import (
 func TestResolve_DisabledRouteIsNotBypassedByProviderModelFallback(t *testing.T) {
 	ri := NewRouteIndex()
 	ri.AddProvider(&ProviderRef{ID: "p-acme", Slug: "acme", Enabled: true})
-	ri.AddUpstreamModel(&UpstreamModel{ID: "m-gpt4", ProviderID: "p-acme", ModelID: "gpt-4", Enabled: true})
+	ri.AddUpstreamModel(&UpstreamModel{ID: "m-gpt4", ProviderID: "p-acme", ModelID: "gpt-4"})
 
 	// 运维建了一条公开名含 "/" 的路由，然后禁用了它。
 	ri.AddRoute(&Route{
@@ -50,7 +50,7 @@ func TestResolve_DisabledRouteIsNotBypassedByProviderModelFallback(t *testing.T)
 func TestResolve_NamesWithoutSlashStillUseDirectConnect(t *testing.T) {
 	ri := NewRouteIndex()
 	ri.AddProvider(&ProviderRef{ID: "p-acme", Slug: "acme", Enabled: true})
-	ri.AddUpstreamModel(&UpstreamModel{ID: "m-gpt4", ProviderID: "p-acme", ModelID: "gpt-4", Enabled: true})
+	ri.AddUpstreamModel(&UpstreamModel{ID: "m-gpt4", ProviderID: "p-acme", ModelID: "gpt-4"})
 
 	res, err := ri.Resolve("acme/gpt-4")
 	if err != nil {
@@ -69,9 +69,9 @@ func TestResolve_NamesWithoutSlashStillUseDirectConnect(t *testing.T) {
 func TestResolve_EnabledRouteWithSlashWinsOverDirectConnect(t *testing.T) {
 	ri := NewRouteIndex()
 	ri.AddProvider(&ProviderRef{ID: "p-acme", Slug: "acme", Enabled: true})
-	ri.AddUpstreamModel(&UpstreamModel{ID: "m-gpt4", ProviderID: "p-acme", ModelID: "gpt-4", Enabled: true})
+	ri.AddUpstreamModel(&UpstreamModel{ID: "m-gpt4", ProviderID: "p-acme", ModelID: "gpt-4"})
 	// 另造一个「直连兜底」会命中的模型，验证具名路由的优先。
-	ri.AddUpstreamModel(&UpstreamModel{ID: "m-direct", ProviderID: "p-acme", ModelID: "gpt-4", Enabled: true})
+	ri.AddUpstreamModel(&UpstreamModel{ID: "m-direct", ProviderID: "p-acme", ModelID: "gpt-4"})
 
 	ri.AddRoute(&Route{
 		ID:              "r1",

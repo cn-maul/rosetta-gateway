@@ -32,19 +32,19 @@ func e2eSource(t *testing.T) (*ConfigTransferHandler, *store.Store) {
 		m []store.UpstreamModel
 	}{
 		{
-			p: store.Provider{ID: "p1", Slug: "alpha", Name: "Alpha 云", Protocol: "openai-chat",
+			p: store.Provider{ID: "p1", Slug: "alpha", Name: "Alpha 云", Protocol: "chat",
 				Endpoint: "https://alpha.example.com/v1", Enabled: true, TimeoutMs: 90000, MaxRetries: 3},
 			m: []store.UpstreamModel{
 				{ID: "m1", ProviderID: "p1", ModelID: "alpha-1", DisplayName: "Alpha 一号",
-					Enabled: true, ContextWindow: 131072, MaxOutputTokens: 32768, PriceInput: 2, PriceOutput: 8},
-				{ID: "m2", ProviderID: "p1", ModelID: "alpha-2", Enabled: false, ContextWindow: 65536},
+					ContextWindow: 131072, MaxOutputTokens: 32768, PriceInput: 2, PriceOutput: 8},
+				{ID: "m2", ProviderID: "p1", ModelID: "alpha-2", ContextWindow: 65536},
 			},
 		},
 		{
 			p: store.Provider{ID: "p2", Slug: "beta", Name: "Beta", Protocol: "anthropic",
 				Endpoint: "https://beta.example.com", Enabled: true},
 			m: []store.UpstreamModel{
-				{ID: "m3", ProviderID: "p2", ModelID: "beta-large", Enabled: true, ContextWindow: 200000},
+				{ID: "m3", ProviderID: "p2", ModelID: "beta-large", ContextWindow: 200000},
 			},
 		},
 	}
@@ -139,7 +139,7 @@ func TestE2E_EncryptedExportToFreshInstance(t *testing.T) {
 		bySlug[p.Slug] = p
 	}
 	if a := bySlug["alpha"]; a.Endpoint != "https://alpha.example.com/v1" ||
-		a.Protocol != "openai-chat" || a.TimeoutMs != 90000 || a.MaxRetries != 3 || !a.Enabled {
+		a.Protocol != "chat" || a.TimeoutMs != 90000 || a.MaxRetries != 3 || !a.Enabled {
 		t.Fatalf("alpha 字段没对上: %+v", a)
 	}
 	if b := bySlug["beta"]; b.Protocol != "anthropic" || b.Endpoint != "https://beta.example.com" {
@@ -159,8 +159,8 @@ func TestE2E_EncryptedExportToFreshInstance(t *testing.T) {
 		a1.PriceInput != 2 || a1.PriceOutput != 8 || a1.DisplayName != "Alpha 一号" {
 		t.Fatalf("alpha-1 的定价/容量没对上: %+v", a1)
 	}
-	if a2 := mm["alpha-2"]; a2.Enabled {
-		t.Fatalf("alpha-2 应保持停用（导入了 enabled=false）")
+	if a2 := mm["alpha-2"]; a2.ContextWindow != 65536 {
+		t.Fatalf("alpha-2 的容量没对上: %+v", a2)
 	}
 }
 
@@ -188,13 +188,13 @@ func TestE2E_MergeIntoExistingDeployment(t *testing.T) {
 	ctx := context.Background()
 	// 目标库已有一个 alpha，配置完全不同
 	local := store.Provider{ID: "local", Slug: "alpha", Name: "本地自建",
-		Protocol: "openai-responses", Endpoint: "http://192.168.1.50:8000/v1",
+		Protocol: "response", Endpoint: "http://192.168.1.50:8000/v1",
 		Enabled: true, TimeoutMs: 30000, MaxRetries: 1}
 	if err := dstStore.CreateProvider(ctx, &local); err != nil {
 		t.Fatalf("seed: %v", err)
 	}
 	localModel := store.UpstreamModel{ID: "lm", ProviderID: "local", ModelID: "alpha-1",
-		Enabled: true, PriceInput: 99}
+		PriceInput: 99}
 	if err := dstStore.CreateUpstreamModel(ctx, &localModel); err != nil {
 		t.Fatalf("seed: %v", err)
 	}
@@ -264,7 +264,7 @@ func TestE2E_DryRunThenApplyMatches(t *testing.T) {
 		t.Cleanup(func() { st.Close() })
 		ctx := context.Background()
 		if err := st.CreateProvider(ctx, &store.Provider{ID: "x", Slug: "alpha",
-			Name: "本地", Protocol: "openai-chat", Endpoint: "http://local/v1", Enabled: true}); err != nil {
+			Name: "本地", Protocol: "chat", Endpoint: "http://local/v1", Enabled: true}); err != nil {
 			t.Fatalf("seed: %v", err)
 		}
 		return NewConfigTransferHandler(st, []byte("0123456789abcdef0123456789abcdef"), nil), st

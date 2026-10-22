@@ -74,7 +74,7 @@ func TestResponsesSSE_ReasoningSealed(t *testing.T) {
 	s := NewResponsesSSE(rec, nil, "resp_1", "gw-model", nil)
 
 	s.Event(&rosetta.Event{Type: rosetta.EventMessageStart, ID: "up-1"})
-	s.Event(&rosetta.Event{Type: rosetta.EventThinkingDelta, Text: "先想一下", Sealed: "gAAAAA-secret", SealedBy: "openai-responses", ReasoningID: "rs_abc"})
+	s.Event(&rosetta.Event{Type: rosetta.EventThinkingDelta, Text: "先想一下", Sealed: "gAAAAA-secret", SealedBy: string(rosetta.ProtoOpenAIResponses), ReasoningID: "rs_abc"})
 	s.Event(&rosetta.Event{Type: rosetta.EventTextDelta, Text: "答案是 42"})
 	s.Event(&rosetta.Event{Type: rosetta.EventMessageEnd, Usage: &rosetta.Usage{InputTokens: 7, OutputTokens: 3}})
 	s.Finish("ok", rosetta.StopEnd, rosetta.Usage{InputTokens: 7, OutputTokens: 3, TotalTokens: 10}, false)
@@ -200,7 +200,7 @@ func TestWriteResponsesResponse_ReasoningSealed(t *testing.T) {
 	WriteResponsesResponse(rec, &rosetta.ChatResponse{
 		ID: "up-9", Model: "x",
 		Content: []rosetta.Block{
-			{Type: rosetta.BlockThinking, Thinking: "先想一下", Sealed: "gAAAAA-secret", SealedBy: "openai-responses", ReasoningID: "rs_abc"},
+			{Type: rosetta.BlockThinking, Thinking: "先想一下", Sealed: "gAAAAA-secret", SealedBy: string(rosetta.ProtoOpenAIResponses), ReasoningID: "rs_abc"},
 			{Type: rosetta.BlockText, Text: "答"},
 		},
 		StopReason: rosetta.StopEnd,

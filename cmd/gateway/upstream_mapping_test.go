@@ -130,7 +130,7 @@ func TestUpstreamMapping_StreamAlsoReplacesPublicAlias(t *testing.T) {
 	}
 }
 
-// 每个 attempt 必须造自己的请求实例：链上 A 目标（openai-chat）与 B 目标
+// 每个 attempt 必须造自己的请求实例：链上 A 目标（chat）与 B 目标
 // （anthropic）的 Extra 形状不同，复用同一实例会把 A 的字段泄漏给 B。
 func TestUpstreamPassthrough_NoExtraLeakAcrossFailoverTargets(t *testing.T) {
 	chB := make(chan map[string]any, 8)

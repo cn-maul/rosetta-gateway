@@ -65,7 +65,7 @@ func TestCreateUser_DefaultsToUnlimitedBalance(t *testing.T) {
 	}
 }
 
-// 普通用户的空密码账号行为不变：仍可建出（由管理员稍后重置密码）。
+// 普通用户的空密码账号仍可建出，之后由管理员签发一次性设密链接。
 func TestCreateUser_AllowsEmptyPasswordRegularUser(t *testing.T) {
 	st := newScopeStore(t)
 	h := NewUserHandler(st, newTestManager(t))
@@ -86,7 +86,7 @@ func TestCreateUser_AllowsEmptyPasswordRegularUser(t *testing.T) {
 	}
 }
 
-// 把空密码账号升级成 admin 必须被拒：先重置密码，再升级。
+// 把空密码账号升级成 admin 必须被拒：先完成一次性设密，再升级。
 func TestUpdateUser_RejectsPromotingPasswordlessUser(t *testing.T) {
 	st := newScopeStore(t)
 	h := NewUserHandler(st, newTestManager(t))

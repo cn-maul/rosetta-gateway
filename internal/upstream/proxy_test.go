@@ -115,7 +115,7 @@ func TestProxyHTTPClientFor_InvalidURL(t *testing.T) {
 func TestBuildClient_SetsProxyConfigError(t *testing.T) {
 	good := &ProviderEntry{
 		Slug: "direct", Endpoint: "https://example.invalid/v1",
-		Protocol: "openai-chat", MaxRetries: 0,
+		Protocol: "chat", MaxRetries: 0,
 	}
 	if _, err := buildClient(good, "sk-x", newTestConfig()); err != nil {
 		t.Fatalf("无代理的 client 应建成: %v", err)
@@ -126,7 +126,7 @@ func TestBuildClient_SetsProxyConfigError(t *testing.T) {
 
 	bad := &ProviderEntry{
 		Slug: "badproxy", Endpoint: "https://example.invalid/v1",
-		Protocol: "openai-chat", MaxRetries: 0, ProxyURL: "ftp://127.0.0.1:1",
+		Protocol: "chat", MaxRetries: 0, ProxyURL: "ftp://127.0.0.1:1",
 	}
 	if _, err := buildClient(bad, "sk-x", newTestConfig()); err != nil {
 		t.Fatalf("代理配错不该让 client 构建失败: %v", err)
@@ -165,7 +165,7 @@ func TestProxyHTTPClientFor_TrafficActuallyRouted(t *testing.T) {
 
 	prov := &ProviderEntry{
 		Slug: "proxied", Endpoint: up.URL + "/v1",
-		Protocol: "openai-chat", MaxRetries: 0,
+		Protocol: "chat", MaxRetries: 0,
 		ProxyURL: proxy.URL,
 	}
 	client, err := buildClient(prov, "sk-x", newTestConfig())

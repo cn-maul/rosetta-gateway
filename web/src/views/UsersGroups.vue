@@ -17,8 +17,8 @@ import DataTable from '../components/DataTable.vue'
  *    后端回 400，界面因此把按钮置灰并给提示 —— 但真正的拦截在后端。
  * 2. 禁用 / 改角色会让该用户的**所有会话立即失效**（auth_version 递增），
  *    所以这两个操作要提示管理员这一点。
- * 3. 密码**不设默认值**。建号时密码可留空，账号需自行设置或由管理员重置。
- *    留空账号无法登录（后端明确拒绝），这是刻意的。
+ * 3. 密码**不设默认值**。建号时密码可留空，并由管理员签发一次性设密链接。
+ *    用户完成设置前无法登录；链接只有管理员能签发，不开放公开注册。
  *
  * 用户列表刻意做成**只读**的：分组、角色、显示名、额度这些字段一律走
  * 「编辑」弹窗，行内不再挂下拉，连角色切换也不给按钮 —— 升级/降级都会让
@@ -43,7 +43,7 @@ import DataTable from '../components/DataTable.vue'
 import { computed, onMounted, ref } from 'vue'
 import { api, ApiFail } from '../api'
 import type { Group, User, UserRole, UserStatus } from '../types'
-import { fmtTokens, fmtDateTime, fmtBalance, fmtRemainder } from '../fmt'
+import { fmtTokens, fmtDateTime, fmtBalance, fmtRemainder, copyText } from '../fmt'
 import { toast, confirmBox } from '../ui'
 import { checkPasswordStrength } from '../password'
 import AppModal from '../components/AppModal.vue'
@@ -96,6 +96,11 @@ const pwdFor = ref<User | null>(null)
 const pwdValue = ref('')
 const pwdErr = ref('')
 const pwdBusy = ref(false)
+
+const setupLinkFor = ref<User | null>(null)
+const setupLinkURL = ref('')
+const setupLinkExpiresAt = ref(0)
+const setupLinkBusy = ref(false)
 
 /** 编辑弹窗的表单状态。editing 指向正在改的那一行，null = 弹窗关闭。 */
 const editing = ref<User | null>(null)
@@ -187,7 +192,7 @@ async function saveEdit() {
     return
   }
   if (eRole.value === 'admin' && u.role !== 'admin' && !u.has_password) {
-    eErr.value = '该账号尚未设置密码，请先为其重置密码，再升级为管理员'
+    eErr.value = '该账号尚未设置密码，请先生成一次性设密链接，再升级为管理员'
     return
   }
   if (eQuota.value < 0) {
@@ -243,8 +248,9 @@ async function create() {
     }
   }
   cBusy.value = true
+  const needsSetupLink = !cPassword.value
   try {
-    await api.createUser({
+    const created = await api.createUser({
       username: cName.value.trim(),
       // 密码留空则不传 —— 后端接受空密码，建出「尚未设置密码」的账号
       password: cPassword.value || undefined,
@@ -252,13 +258,14 @@ async function create() {
       group_id: cGroup.value || undefined,
       quota_tokens: Number(cQuota.value) || 0,
     })
-    toast('已创建', 'ok')
     showCreate.value = false
     cName.value = cPassword.value = ''
     cRole.value = 'user'
     cGroup.value = ''
     cQuota.value = 0
     await load()
+    toast('已创建', 'ok')
+    if (needsSetupLink) await generateSetupLink(created)
   } catch (e) {
     cErr.value = e instanceof ApiFail ? e.message : '创建失败'
   } finally {
@@ -384,6 +391,43 @@ async function resetPassword() {
   } finally {
     pwdBusy.value = false
   }
+}
+
+/**
+ * 生成一次性设密链接。明文只存在于本次响应和这个弹窗里：
+ * 后端只保存 token 哈希，关闭弹窗时前端也会立刻抹掉明文 URL。
+ */
+async function generateSetupLink(u: User) {
+  if (setupLinkBusy.value || isPending(u.id)) return
+  setPending(u.id, '生成中…')
+  setupLinkBusy.value = true
+  try {
+    const link = await api.createPasswordSetupLink(u.id)
+    setupLinkFor.value = u
+    setupLinkURL.value = new URL(link.url_path, window.location.origin).href
+    setupLinkExpiresAt.value = link.expires_at
+  } catch (e) {
+    toast(e instanceof ApiFail ? e.message : '生成设密链接失败', 'err')
+  } finally {
+    setupLinkBusy.value = false
+    setPending(u.id, null)
+  }
+}
+
+function closeSetupLink() {
+  setupLinkFor.value = null
+  setupLinkURL.value = ''
+  setupLinkExpiresAt.value = 0
+}
+
+async function copySetupLink() {
+  const ok = await copyText(setupLinkURL.value)
+  toast(ok ? '设密链接已复制' : '复制失败，请手动选择复制', ok ? 'ok' : 'err')
+}
+
+function selectSetupLink(e: FocusEvent) {
+  const input = e.target as HTMLInputElement | null
+  input?.select()
 }
 
 function openReset(u: User) {
@@ -637,11 +681,13 @@ async function askDeleteGroup(g: Group) {
                   <button class="btn btn-act" :disabled="isPending(u.id)" @click="openEdit(u)">编辑</button>
                   <button
                     class="btn btn-act"
-                    :disabled="isPending(u.id)"
-                    title="重置该用户的密码"
-                    @click="openReset(u)"
+                    :disabled="u.status !== 'active' || isPending(u.id)"
+                    :title="u.status !== 'active'
+                      ? '请先启用该用户'
+                      : u.has_password ? '重置该用户的密码' : '生成 24 小时有效的一次性设密链接'"
+                    @click="u.has_password ? openReset(u) : generateSetupLink(u)"
                   >
-                    改密
+                    {{ isPending(u.id) ? '处理中…' : u.has_password ? '改密' : '设密' }}
                   </button>
                   <button
                     class="btn btn-act"
@@ -737,9 +783,9 @@ async function askDeleteGroup(g: Group) {
           </div>
           <div class="fcell">
             <label class="flabel" for="newuser-initial-password">初始密码</label>
-            <input id="newuser-initial-password" v-model="cPassword" type="password" class="input" autocomplete="new-password" placeholder="留空则由用户自行设置" />
+            <input id="newuser-initial-password" v-model="cPassword" type="password" class="input" autocomplete="new-password" placeholder="留空则生成一次性设密链接" />
             <div v-if="cRole === 'admin' && !cPassword" class="fhint warn">创建管理员必须设置初始密码。</div>
-            <div v-else class="fhint">留空的账号无法登录，需重置密码后才能使用。</div>
+            <div v-else class="fhint">留空后生成一次性设密链接；用户完成设置前不能登录。</div>
           </div>
           <div class="fcell">
             <label class="flabel" for="cr">角色</label>
@@ -773,6 +819,29 @@ async function askDeleteGroup(g: Group) {
           <button class="btn btn-primary" :disabled="cBusy" @click="create">
             {{ cBusy ? '创建中…' : '创建' }}
           </button>
+        </div>
+    </AppModal>
+
+    <!-- 一次性设密链接。链接里包含明文 token，关闭时必须清掉组件状态，
+         避免它在整个页面生命周期里一直可被 devtools / 同源脚本读到。 -->
+    <AppModal
+      :open="!!setupLinkFor"
+      :title="setupLinkFor ? `设密链接 · ${setupLinkFor.username}` : '设密链接'"
+      max-width="620px"
+      @close="closeSetupLink"
+    >
+        <div class="fhint">
+          将下面的链接发给用户。链接 <b>24 小时</b>内有效且只能使用一次；
+          重新生成会让旧链接立即失效。
+        </div>
+        <input class="input setup-link" :value="setupLinkURL" readonly @focus="selectSetupLink" />
+        <div v-if="setupLinkExpiresAt" class="fhint">
+          有效至 {{ fmtDateTime(setupLinkExpiresAt) }}
+        </div>
+        <div class="fhint warn">链接等同于一次性凭据，不要发到公开群组或长期留存。</div>
+        <div class="form-actions">
+          <button class="btn" @click="closeSetupLink">关闭</button>
+          <button class="btn btn-primary" @click="copySetupLink">复制链接</button>
         </div>
     </AppModal>
 
@@ -916,5 +985,6 @@ async function askDeleteGroup(g: Group) {
 .cell-group .name { font-weight: 500; }
 /* 白名单列表可能很长：主战场是这张表的宽度，宁可让 tbl-wrap 出横向滚动。 */
 .cell-models { max-width: 480px; }
+.setup-link { margin-top: 10px; font-family: var(--mono); font-size: 12px; }
 
 </style>

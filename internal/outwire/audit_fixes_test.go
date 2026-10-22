@@ -89,7 +89,7 @@ func TestResponsesSink_ReasoningItemBoundaryByReasoningID(t *testing.T) {
 	s.Event(&rosetta.Event{Type: rosetta.EventMessageStart, ID: "up-1"})
 	s.Event(&rosetta.Event{Type: rosetta.EventThinkingDelta, Text: "A1", ReasoningID: "rs_1"})
 	s.Event(&rosetta.Event{Type: rosetta.EventThinkingDelta, Text: "B1", ReasoningID: "rs_2"})
-	s.Event(&rosetta.Event{Type: rosetta.EventThinkingDelta, Sealed: "SEAL_B", SealedBy: "openai-responses", ReasoningID: "rs_2"})
+	s.Event(&rosetta.Event{Type: rosetta.EventThinkingDelta, Sealed: "SEAL_B", SealedBy: string(rosetta.ProtoOpenAIResponses), ReasoningID: "rs_2"})
 	s.Finish("ok", rosetta.StopEnd, rosetta.Usage{InputTokens: 1, OutputTokens: 1}, false)
 
 	raw := sb.String()

@@ -166,13 +166,13 @@ func TestPrune_CostPendingMarkerSurvivesArchiving(t *testing.T) {
 		}
 	}
 	must(st.CreateProvider(ctx, &Provider{
-		ID: "p1", Slug: "p1", Name: "P1", Endpoint: "http://x", Protocol: "openai-chat", Enabled: true}))
+		ID: "p1", Slug: "p1", Name: "P1", Endpoint: "http://x", Protocol: "chat", Enabled: true}))
 
 	for i, state := range []string{"cost_pending", "reported"} {
 		must(st.CreateUsageRecord(ctx, &UsageRecord{
 			ID: fmt.Sprintf("rec-%d", i), Ts: old + int64(i),
 			UserID: "u1", AccessKeyID: "k1", PublicModel: "m",
-			ProviderID: "p1", UpstreamModel: "m", IngressProtocol: "openai-chat",
+			ProviderID: "p1", UpstreamModel: "m", IngressProtocol: "chat",
 			InputTokens: 100, OutputTokens: 50, TotalTokens: 150,
 			UsageState: state, Status: "ok", HTTPStatus: 200,
 		}))

@@ -99,7 +99,7 @@ func (r *Runner) Run(ctx context.Context) {
 	}
 }
 
-// runOnce 探测一轮全部启用的上游模型。
+// runOnce 探测一轮全部上游模型。
 //
 // 并发上限由配置控制（默认 4）：一轮可能打几十个上游，全并发会同时打满
 // 连接。每个模型在周期内随机偏移（stagger），避免所有模型同一秒打上游
@@ -110,14 +110,7 @@ func (r *Runner) runOnce(ctx context.Context) {
 		r.logger.Warn("probe: list models failed", "error", err)
 		return
 	}
-	// 只探测启用的模型。
-	enabled := make([]store.UpstreamModel, 0, len(models))
-	for _, m := range models {
-		if m.Enabled {
-			enabled = append(enabled, m)
-		}
-	}
-	if len(enabled) == 0 {
+	if len(models) == 0 {
 		return
 	}
 
@@ -132,7 +125,7 @@ func (r *Runner) runOnce(ctx context.Context) {
 
 	sem := make(chan struct{}, concurrency)
 	var wg sync.WaitGroup
-	for _, m := range enabled {
+	for _, m := range models {
 		m := m
 		wg.Add(1)
 		go func() {

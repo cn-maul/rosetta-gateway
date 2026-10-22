@@ -811,7 +811,7 @@ func TestE2E_D1_QuotaExhaustedRejectsWithoutTouchingUpstream(t *testing.T) {
 	}
 	if err := db.CreateUsageRecord(context.Background(), &store.UsageRecord{
 		ID: "seed-1", AccessKeyID: "k1", UserID: testUserID, PublicModel: "flash",
-		IngressProtocol: "openai-chat", TotalTokens: 100, UsageState: "reported", Status: "ok",
+		IngressProtocol: "chat", TotalTokens: 100, UsageState: "reported", Status: "ok",
 	}); err != nil {
 		t.Fatalf("seed usage: %v", err)
 	}
@@ -875,7 +875,7 @@ func TestE2E_D1b_QuotaRejectedRequestsDoNotConsumeTPMBudget(t *testing.T) {
 	}
 	if err := db.CreateUsageRecord(context.Background(), &store.UsageRecord{
 		ID: "seed-1", AccessKeyID: "k1", UserID: testUserID, PublicModel: "flash",
-		IngressProtocol: "openai-chat", TotalTokens: 100, UsageState: "reported", Status: "ok",
+		IngressProtocol: "chat", TotalTokens: 100, UsageState: "reported", Status: "ok",
 	}); err != nil {
 		t.Fatalf("seed usage: %v", err)
 	}
@@ -1453,7 +1453,7 @@ func e2eDBHarness(t *testing.T, endpoint string) (http.Handler, *store.Store, *r
 	// 不能调换：任一前置缺失都会得到 "FOREIGN KEY constraint failed"，
 	// 而那条报错完全不指向"你漏了哪一步"。
 	if err := db.CreateProvider(ctx, &store.Provider{
-		ID: "good", Slug: "good", Name: "good", Protocol: "openai-chat",
+		ID: "good", Slug: "good", Name: "good", Protocol: "chat",
 		Endpoint: endpoint, Enabled: true,
 	}); err != nil {
 		t.Fatalf("seed provider: %v", err)
@@ -1470,8 +1470,7 @@ func e2eDBHarness(t *testing.T, endpoint string) (http.Handler, *store.Store, *r
 		t.Fatalf("seed credential: %v", err)
 	}
 	if err := db.CreateUpstreamModel(ctx, &store.UpstreamModel{
-		ID: "good/m", ProviderID: "good", ModelID: "good-model", Enabled: true,
-		PriceInput: 1_000_000, PriceOutput: 1_000_000,
+		ID: "good/m", ProviderID: "good", ModelID: "good-model", PriceInput: 1_000_000, PriceOutput: 1_000_000,
 	}); err != nil {
 		t.Fatalf("seed upstream model: %v", err)
 	}
@@ -1786,7 +1785,7 @@ func TestE2E_Adv2_DuplicateRequestIDChargesOnce(t *testing.T) {
 			ID:          fmt.Sprintf("dup-%d", i),
 			AccessKeyID: "k1", UserID: testUserID,
 			PublicModel: "flash", ProviderID: "good", UpstreamModel: "good-model",
-			IngressProtocol: "openai-chat", Status: "ok", HTTPStatus: 200,
+			IngressProtocol: "chat", Status: "ok", HTTPStatus: 200,
 			InputTokens: 1000, OutputTokens: 1000, TotalTokens: 2000,
 			UsageState: "reported",
 			RequestID:  "replay-same-id",
@@ -2235,7 +2234,7 @@ func TestE2E_Adv10_ConcurrentSameRequestIDChargesOnce(t *testing.T) {
 				ID:          fmt.Sprintf("conc-%d", i),
 				AccessKeyID: "k1", UserID: testUserID,
 				PublicModel: "flash", ProviderID: "good", UpstreamModel: "good-model",
-				IngressProtocol: "openai-chat", Status: "ok", HTTPStatus: 200,
+				IngressProtocol: "chat", Status: "ok", HTTPStatus: 200,
 				InputTokens: 1000, OutputTokens: 1000, TotalTokens: 2000,
 				UsageState: "reported",
 				RequestID:  "concurrent-same-id",

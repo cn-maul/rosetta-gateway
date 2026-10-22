@@ -273,7 +273,7 @@ func TestDiagBottleneck(t *testing.T) {
 				ID: generateID(), AccessKeyID: "k1", UserID: testUserID,
 				RequestID: generateID(), PublicModel: "flash",
 				ProviderID: "good", UpstreamModel: "good-model",
-				IngressProtocol: "openai-chat", Status: usageStatusOK,
+				IngressProtocol: "chat", Status: usageStatusOK,
 				InputTokens: 5, OutputTokens: 3, TotalTokens: 8,
 			}
 			if _, err := db.CreateUsageRecordWithCost(contextTODO(), rec); err != nil {
@@ -481,7 +481,7 @@ func TestDiagUsageWriteCeiling(t *testing.T) {
 			ID: generateID(), AccessKeyID: "k1", UserID: testUserID,
 			RequestID: generateID(), PublicModel: "flash",
 			ProviderID: "good", UpstreamModel: "good-model",
-			IngressProtocol: "openai-chat", Status: usageStatusOK,
+			IngressProtocol: "chat", Status: usageStatusOK,
 			InputTokens: 5, OutputTokens: 3, TotalTokens: 8,
 		}
 	}
@@ -522,7 +522,7 @@ func TestDiagUsageWriteCeiling(t *testing.T) {
 	// 量出来的不是生产口径。
 	if err := db.CreateUpstreamModel(contextTODO(), &store.UpstreamModel{
 		ID: "um-diag", ProviderID: "good", ModelID: "good-model",
-		Enabled: true, PriceInput: 1, PriceOutput: 2,
+		PriceInput: 1, PriceOutput: 2,
 	}); err != nil {
 		t.Logf("Diag-usage 插入价格行失败（%v）：完整路径将走「查不到价」分支", err)
 	}

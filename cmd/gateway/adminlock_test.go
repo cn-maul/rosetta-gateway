@@ -112,7 +112,7 @@ func TestAdminLockout_AllIngressProtocolsRejectAdmin(t *testing.T) {
 			up := fakeCountingGood(&hits)
 			defer up.Close()
 
-			h := buildHarnessProtocols(t, []harnessChain{{slug: "good", url: up.URL, protocol: "openai-chat"}}, false, codec)
+			h := buildHarnessProtocols(t, []harnessChain{{slug: "good", url: up.URL, protocol: "chat"}}, false, codec)
 			adminSnapRole(t, store.RoleAdmin)
 
 			body := `{"model":"flash","max_tokens":16,"messages":[{"role":"user","content":"hi"}]}`

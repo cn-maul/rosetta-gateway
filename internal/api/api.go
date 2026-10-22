@@ -261,6 +261,13 @@ func BuildApp(d Deps) *App {
 			Pattern: "POST /admin/api/bootstrap", Handler: userHandler.BootstrapSetup, Public: true,
 			RootHandler: server.AuditOnly(http.HandlerFunc(userHandler.BootstrapSetup), audit).ServeHTTP,
 		},
+		// 普通用户的一次性设密链接：只有管理员能签发，公开端点只接受高熵
+		// token。token 放在请求体里，避免被反向代理访问日志记录。
+		{Pattern: "POST /admin/api/password-setup/check", Handler: userHandler.CheckPasswordSetupLink, Public: true},
+		{
+			Pattern: "POST /admin/api/password-setup", Handler: userHandler.CompletePasswordSetup, Public: true,
+			RootHandler: server.AuditOnly(http.HandlerFunc(userHandler.CompletePasswordSetup), audit).ServeHTTP,
+		},
 		{Pattern: "GET /admin/api/providers", Handler: providerHandler.List, Public: false},
 		{Pattern: "POST /admin/api/providers", Handler: providerHandler.Create, Public: false},
 		{Pattern: "GET /admin/api/providers/{id}", Handler: func(w http.ResponseWriter, r *http.Request) { providerHandler.Get(w, r, r.PathValue("id")) }, Public: false},
@@ -336,6 +343,7 @@ func BuildApp(d Deps) *App {
 		{Pattern: "POST /admin/api/keys/{id}/recompute-usage", Handler: func(w http.ResponseWriter, r *http.Request) { keyHandler.RecomputeUsage(w, r, r.PathValue("id")) }, Public: false},
 
 		{Pattern: "GET /admin/api/stats", Handler: statsHandler.Get, Public: false},
+		{Pattern: "GET /admin/api/stats/overview", Handler: statsHandler.GetOverview, Public: false},
 		{Pattern: "POST /admin/api/reload", Handler: reloadHandler.Reload, Public: false},
 		{Pattern: "GET /admin/api/audit", Handler: auditHandler.List, Public: false},
 		{Pattern: "GET /admin/api/usage", Handler: usageHandler.Query, Public: false},
@@ -367,6 +375,9 @@ func BuildApp(d Deps) *App {
 		{Pattern: "PATCH /admin/api/users/{id}", Handler: func(w http.ResponseWriter, r *http.Request) { userHandler.UpdateUser(w, r, r.PathValue("id")) }, Public: false},
 		{Pattern: "DELETE /admin/api/users/{id}", Handler: func(w http.ResponseWriter, r *http.Request) { userHandler.DeleteUser(w, r, r.PathValue("id")) }, Public: false},
 		{Pattern: "POST /admin/api/users/{id}/password", Handler: func(w http.ResponseWriter, r *http.Request) { userHandler.ResetPassword(w, r, r.PathValue("id")) }, Public: false},
+		{Pattern: "POST /admin/api/users/{id}/password-setup", Handler: func(w http.ResponseWriter, r *http.Request) {
+			userHandler.CreatePasswordSetupLink(w, r, r.PathValue("id"))
+		}, Public: false},
 		// 余额充值：走 adminMux 即自动要求管理员 + 记审计（AutoReload 对
 		// PUT 走审计分支，字段名由 extractFieldNames 自动取，见 autoreload.go）。
 		// 审计记的是**字段名**（delta_cents）而非数值 —— 这是既有审计的粒度，

@@ -22,7 +22,7 @@ import (
 //   - cache_control（Claude Code 依赖它做提示缓存）逐块透传给 rosetta；
 //     OpenAI 系上游自动忽略。
 //   - top_k / tool_choice 不是 rosetta 建模字段：anthropic 上游经 Extra 原样
-//     透传，openai-chat / openai-responses 上游把 tool_choice 翻译成各自形状
+//     透传，chat / response 上游把 tool_choice 翻译成各自形状
 //     （能等价翻译的必须翻译），top_k 丢弃（OpenAI 系没有这个旋钮）。
 //     rosetta 的保留键校验已确认这两个键不在各协议的保留集合里，不会撞车。
 
@@ -294,11 +294,11 @@ func (a *AnthropicMessagesRequest) ThinkingBudget() int {
 }
 
 // ApplyUpstreamExtras 把 Anthropic 入口的协议私有字段挂到 req.Extra。
-// 门的开口方向与 OpenAI 入口相反：anthropic 上游拿原样字段，openai-chat /
-// openai-responses 拿翻译后的 tool_choice，top_k 谁都拿不到（只有 Anthropic
+// 门的开口方向与 OpenAI 入口相反：anthropic 上游拿原样字段，chat /
+// response 拿翻译后的 tool_choice，top_k 谁都拿不到（只有 Anthropic
 // 有这个旋钮）。
 //
-// openai-responses 分支（2026-10-07 P1-8）：此前对 responses 整个跳过、把
+// response 分支（2026-10-07 P1-8）：此前对 responses 整个跳过、把
 // tool_choice 静默丢掉 —— 故障转移前后同一请求行为不一致。现在做等价翻译
 // （映射见 AnthropicToolChoice.responsesValue）；top_k 在 Responses 无对应物，
 // 丢弃不改变正确性。
@@ -317,8 +317,8 @@ func (a *AnthropicMessagesRequest) ApplyUpstreamExtras(req *rosetta.ChatRequest,
 		if len(extra) > 0 {
 			mergeExtra(req, extra)
 		}
-	case "", "openai-chat", "auto":
-		// "auto" 必须与 ""/"openai-chat" 同组：upstream.buildClient 对 auto
+	case "", "chat", "auto":
+		// "auto" 必须与 ""/"chat" 同组：upstream.buildClient 对 auto
 		// 不加 WithProtocol，让 SDK 自动探测，实际落到的几乎总是 OpenAI 方言。
 		// 把 auto 漏在这里会让「协议自动探测」这条最常用的配置静默丢掉 tool_choice。
 		if a.ToolChoice == nil {
@@ -327,7 +327,7 @@ func (a *AnthropicMessagesRequest) ApplyUpstreamExtras(req *rosetta.ChatRequest,
 		if v := a.ToolChoice.openAIValue(); v != nil {
 			mergeExtra(req, map[string]any{"tool_choice": v})
 		}
-	case "openai-responses":
+	case "response":
 		if a.ToolChoice == nil {
 			return
 		}

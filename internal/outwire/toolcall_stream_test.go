@@ -13,7 +13,7 @@ import (
 // 工具调用的参数通常跨多个 SSE 分片。rosetta 的契约是：
 // **首片**带 ToolID/ToolName，**续片只带 ToolIndex + ArgumentsDelta**
 // （已在 SDK v0.6.0 的三个 provider 里逐一核实：anthropic 的
-// input_json_delta、openai-chat 的续 chunk、responses 的
+// input_json_delta、chat 的续 chunk、responses 的
 // function_call_arguments.delta 都不填 ToolID/ToolName）。
 //
 // sink 若用 ToolID 判「是否同一个工具块」，续片的 ToolID 为空就会切出新块，

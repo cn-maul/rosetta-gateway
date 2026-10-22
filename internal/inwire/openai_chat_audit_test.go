@@ -125,7 +125,7 @@ func TestOpenAIChat_ReasoningEffortNotInExtra(t *testing.T) {
 				t.Fatalf("decode: %v", err)
 			}
 			ros := req.ToRosetta()
-			req.ApplyProtocolPrivateExtra(ros, "openai-chat")
+			req.ApplyProtocolPrivateExtra(ros, "chat")
 			if v, ok := ros.Extra["reasoning_effort"]; ok {
 				t.Fatalf("reasoning_effort=%q 不该进 Extra（撞 rosetta 保留键→ 必然 400），实际 %v", eff, v)
 			}
@@ -167,7 +167,7 @@ func TestOpenAIChat_ReasoningEffortReachesUpstreamViaThinking(t *testing.T) {
 				t.Fatalf("decode: %v", err)
 			}
 			ros := req.ToRosetta()
-			req.ApplyProtocolPrivateExtra(ros, "openai-chat")
+			req.ApplyProtocolPrivateExtra(ros, "chat")
 
 			// 复刻 upstream.buildClient：刻意不传 WithExtraOverrides。
 			c, err := rosetta.NewClient(rosetta.WithEndpoint(srv.URL),
@@ -293,7 +293,7 @@ func rosettaAccepts(t *testing.T, ros *rosetta.ChatRequest) error {
 	defer srv.Close()
 
 	c, err := rosetta.NewClient(rosetta.WithEndpoint(srv.URL),
-		rosetta.WithAPIKey("test"), rosetta.WithProtocol("openai-chat"))
+		rosetta.WithAPIKey("test"), rosetta.WithProtocol(rosetta.ProtoOpenAIChat))
 	if err != nil {
 		return err
 	}

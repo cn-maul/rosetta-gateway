@@ -293,8 +293,8 @@ func (h *UserHandler) CreateUser(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 密码对普通用户可以留空：空密码账号登不进去，由管理员稍后重置（普通
-	// 用户没有自助设密通道，那等于绕过管理员）。**admin 没有留空的资格**：
+	// 密码对普通用户可以留空：空密码账号登不进去，由管理员稍后签发一个
+	// 有期限、只能使用一次的设密链接（不是公开注册）。**admin 没有留空的资格**：
 	// 空密码 admin 会让引导判定（存在 role=admin 且 password_hash='' 的账号）
 	// 重新命中，而免鉴权的 POST /admin/api/bootstrap 恰好认这个条件 ——
 	// 任何能连到端口的人都能给该账号设上自己的密码并直接拿到 admin 会话。
@@ -453,7 +453,7 @@ func (h *UserHandler) UpdateUser(w http.ResponseWriter, r *http.Request, id stri
 		// 是管理员的显式动作（ResetPassword），顺手代劳会掩盖真实意图。
 		if role == store.RoleAdmin && u.Role != store.RoleAdmin && u.PasswordHash == "" {
 			writeError(w, http.StatusBadRequest,
-				"该账号尚未设置密码，请先为其重置密码，再升级为管理员")
+				"该账号尚未设置密码，请先通过一次性设密链接完成设置，再升级为管理员")
 			return
 		}
 		if role != u.Role {

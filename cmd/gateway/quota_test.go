@@ -35,7 +35,7 @@ func TestQuota_ExceededRejectsBeforeUpstream(t *testing.T) {
 	}
 	// 触发器把 used_tokens 累加到 100（同步：INSERT 内即触发）
 	if err := db.CreateUsageRecord(ctx, &store.UsageRecord{
-		ID: "u1", AccessKeyID: "k1", PublicModel: "flash", IngressProtocol: "openai-chat",
+		ID: "u1", AccessKeyID: "k1", PublicModel: "flash", IngressProtocol: "chat",
 		TotalTokens: 100, UsageState: "reported", Status: "ok",
 	}); err != nil {
 		t.Fatalf("seed usage: %v", err)
@@ -57,7 +57,7 @@ func TestQuota_ZeroMeansUnlimited(t *testing.T) {
 
 	// k1 默认 quota 0；灌一大堆用量仍应放行
 	if err := db.CreateUsageRecord(ctx, &store.UsageRecord{
-		ID: "u1", AccessKeyID: "k1", PublicModel: "flash", IngressProtocol: "openai-chat",
+		ID: "u1", AccessKeyID: "k1", PublicModel: "flash", IngressProtocol: "chat",
 		TotalTokens: 999999, UsageState: "reported", Status: "ok",
 	}); err != nil {
 		t.Fatalf("seed usage: %v", err)

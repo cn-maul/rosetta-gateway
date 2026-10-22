@@ -394,12 +394,15 @@ func roundMillis(v sql.NullFloat64) float64 {
 // KeyName 来自 access_keys（密钥被删后为空，前端回退显示 KeyID）。
 // @ts-type UsageHistoryEntry
 type usageHistoryEntry struct {
-	Ts            int64  `json:"ts"`
-	PublicModel   string `json:"public_model"`
-	UpstreamModel string `json:"upstream_model"`
-	KeyName       string `json:"key_name"`
-	KeyID         string `json:"key_id"`
-	TotalTokens   int64  `json:"total_tokens"`
+	Ts              int64  `json:"ts"`
+	PublicModel     string `json:"public_model"`
+	UpstreamModel   string `json:"upstream_model"`
+	ProviderID      string `json:"provider_id"`
+	IngressProtocol string `json:"ingress_protocol"`
+	KeyName         string `json:"key_name"`
+	KeyID           string `json:"key_id"`
+	InputTokens     int64  `json:"input_tokens"`
+	TotalTokens     int64  `json:"total_tokens"`
 	// OutputTokens 是本次**生成**出来的 token 数（2026-10-11 新增）。
 	//
 	// 为什么必须单独下发、不能拿 TotalTokens 顶替：TotalTokens = 输入 + 输出，
@@ -407,6 +410,11 @@ type usageHistoryEntry struct {
 	// 速度虚高好几倍（一个 1 万输入 / 2 百输出的请求，用总量算出来的"速度"
 	// 是真实生成速度的 50 倍），而表格里那一列只有数字、看不出错。
 	OutputTokens int64 `json:"output_tokens"`
+	// CachedTokens / ReasoningTokens 是同一份 usage 里的细分计数：
+	// 前者解释缓存命中，后者解释思考模型的隐式输出。历史页把它们放在
+	// 详情里，排障时不必再回数据库拼一次原始记录。
+	CachedTokens    int64 `json:"cached_tokens"`
+	ReasoningTokens int64 `json:"reasoning_tokens"`
 	// Tps 是本次请求的平均输出速度（token/s），**由后端算好**（2026-10-11 新增）。
 	//
 	// # 为什么在后端算而不是前端拿 output_tokens/latency_ms 现算
@@ -470,6 +478,42 @@ type usageHistoryEntry struct {
 	// 它回答的是 ErrorCode 回答不了的问题：这次为什么走了备用上游、
 	// 或者为什么明明失败了却没有换上游。
 	RouteTrace string `json:"route_trace,omitempty"`
+	// RequestID 是网关/上游链路使用的请求标识，详情抽屉里用于和日志对号。
+	// 旧记录可能没有值，因此空串是正常的“未记录”，不是损坏。
+	RequestID string `json:"request_id"`
+}
+
+// usageHistoryColumns / usageHistorySource 是 History 与 CSV 共用的读取口径。
+//
+// 两处以前各写一份 SELECT，新增字段时只改页面接口、忘了 CSV 的情况很难
+// 在编译期发现；把列顺序与 FROM 收成一处后，页面和导出件读到的就是同一批
+// 事实。CSV 表头仍保持原列的前 14 个下标不变，新列追加在末尾。
+const (
+	usageHistoryColumns = `u.ts, u.public_model, u.upstream_model,
+		COALESCE(u.provider_id, ''), COALESCE(u.ingress_protocol, ''),
+		COALESCE(a.name, ''), u.access_key_id,
+		u.input_tokens, u.output_tokens, u.total_tokens,
+		u.cached_tokens, u.reasoning_tokens,
+		u.ttfb_ms, u.latency_ms, u.status, u.stream,
+		COALESCE(u.cost_total, 0), u.http_status,
+		COALESCE(u.error_code, ''), COALESCE(u.error_detail, ''),
+		COALESCE(u.route_trace, ''), COALESCE(u.request_id, '')`
+	usageHistorySource = ` FROM usage_records u
+		LEFT JOIN access_keys a ON a.id = u.access_key_id`
+)
+
+type usageHistoryScanner interface {
+	Scan(dest ...any) error
+}
+
+func scanUsageHistoryEntry(scanner usageHistoryScanner, e *usageHistoryEntry) error {
+	return scanner.Scan(
+		&e.Ts, &e.PublicModel, &e.UpstreamModel, &e.ProviderID, &e.IngressProtocol,
+		&e.KeyName, &e.KeyID, &e.InputTokens, &e.OutputTokens, &e.TotalTokens,
+		&e.CachedTokens, &e.ReasoningTokens, &e.TTFBMs, &e.LatencyMs,
+		&e.Status, &e.Stream, &e.Cost, &e.HTTPStatus, &e.ErrorCode, &e.ErrorDetail,
+		&e.RouteTrace, &e.RequestID,
+	)
 }
 
 // tpsFor 计算单条请求的平均输出速度（token/s）；无样本时返回 0。
@@ -587,8 +631,7 @@ func (h *UsageHandler) ExportCSV(w http.ResponseWriter, r *http.Request) {
 	}
 
 	rows, err := h.store.Reader().Query(
-		`SELECT u.ts, u.public_model, u.upstream_model, COALESCE(a.name, ''), u.access_key_id, u.total_tokens, u.output_tokens, u.ttfb_ms, u.latency_ms, u.status, u.stream, COALESCE(u.cost_total, 0), COALESCE(u.route_trace, '')
-		   FROM usage_records u LEFT JOIN access_keys a ON a.id = u.access_key_id`+where+
+		`SELECT `+usageHistoryColumns+usageHistorySource+where+
 			` ORDER BY u.ts DESC, u.id DESC LIMIT ?`, append(args, limit)...)
 	if err != nil {
 		writeServerError(w, "usage export", err)
@@ -603,23 +646,21 @@ func (h *UsageHandler) ExportCSV(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("X-Export-Truncated", "1")
 	}
 	cw := csv.NewWriter(w)
-	// 列名与页面表格一一对应：导出件要能独立读懂，缺了 stream/cost 就得
-	// 回网关上看，而 CSV 的常见用途恰恰是拿出去单独分析。
+	// 列名与页面表格一一对应：导出件要能独立读懂，缺了 stream/cost/协议/
+	// token 细分就得回网关上看，而 CSV 的常见用途恰恰是拿出去单独分析。
 	//
-	// output_tokens / tps 追加在**末尾**而不是插在 total_tokens 之后：
-	// 页面新增了「速度」列，导出件若不给这两个数，用户就没法在表格工具里
-	// 复现这一列（连自己算都算不了，因为缺 output_tokens）——
-	// 那正是本注释开头说的「拿出去读不懂」。但列位置一动，任何按下标取值
-	// 的既有消费方（脚本、Excel 模板）会静默错位，所以新增列一律追加，
-	// 让原有 11 列的下标保持不变。
+	// 新增列一律追加在末尾，原有前 14 列的下标保持不变，避免既有脚本与
+	// Excel 模板按下标取值时静默错位。前 14 列分别是：
+	// ts/public_model/upstream_model/key_name/key_id/total_tokens/ttfb_ms/
+	// latency_ms/status/stream/cost/output_tokens/tps/route_trace。
 	_ = cw.Write([]string{"ts", "public_model", "upstream_model", "key_name", "key_id",
 		"total_tokens", "ttfb_ms", "latency_ms", "status", "stream", "cost",
-		"output_tokens", "tps", "route_trace"})
+		"output_tokens", "tps", "route_trace", "provider_id", "ingress_protocol",
+		"input_tokens", "cached_tokens", "reasoning_tokens", "request_id",
+		"http_status", "error_code", "error_detail"})
 	for rows.Next() {
 		var e usageHistoryEntry
-		if err := rows.Scan(&e.Ts, &e.PublicModel, &e.UpstreamModel, &e.KeyName, &e.KeyID,
-			&e.TotalTokens, &e.OutputTokens, &e.TTFBMs, &e.LatencyMs, &e.Status, &e.Stream, &e.Cost,
-			&e.RouteTrace); err != nil {
+		if err := scanUsageHistoryEntry(rows, &e); err != nil {
 			return
 		}
 		e.Tps = tpsFor(e.OutputTokens, e.LatencyMs)
@@ -643,6 +684,12 @@ func (h *UsageHandler) ExportCSV(w http.ResponseWriter, r *http.Request) {
 			strconv.FormatFloat(e.Cost, 'f', -1, 64),
 			strconv.FormatInt(e.OutputTokens, 10), tps,
 			csvCell(e.RouteTrace),
+			csvCell(e.ProviderID), csvCell(e.IngressProtocol),
+			strconv.FormatInt(e.InputTokens, 10),
+			strconv.FormatInt(e.CachedTokens, 10),
+			strconv.FormatInt(e.ReasoningTokens, 10),
+			csvCell(e.RequestID), strconv.Itoa(e.HTTPStatus),
+			csvCell(e.ErrorCode), csvCell(e.ErrorDetail),
 		})
 	}
 	cw.Flush()
@@ -702,8 +749,7 @@ func (h *UsageHandler) History(w http.ResponseWriter, r *http.Request) {
 	}
 
 	rows, err := h.store.Reader().Query(
-		`SELECT u.ts, u.public_model, u.upstream_model, COALESCE(a.name, ''), u.access_key_id, u.total_tokens, u.output_tokens, u.ttfb_ms, u.latency_ms, u.status, u.stream, COALESCE(u.cost_total, 0), u.http_status, COALESCE(u.error_code, ''), COALESCE(u.error_detail, ''), COALESCE(u.route_trace, '')
-		   FROM usage_records u LEFT JOIN access_keys a ON a.id = u.access_key_id`+where+
+		`SELECT `+usageHistoryColumns+usageHistorySource+where+
 			` ORDER BY u.ts DESC, u.id DESC LIMIT ? OFFSET ?`, append(args, limit, offset)...)
 	if err != nil {
 		writeServerError(w, "usage history", err)
@@ -714,9 +760,7 @@ func (h *UsageHandler) History(w http.ResponseWriter, r *http.Request) {
 	entries := make([]usageHistoryEntry, 0)
 	for rows.Next() {
 		var e usageHistoryEntry
-		if err := rows.Scan(&e.Ts, &e.PublicModel, &e.UpstreamModel, &e.KeyName, &e.KeyID,
-			&e.TotalTokens, &e.OutputTokens, &e.TTFBMs, &e.LatencyMs, &e.Status, &e.Stream, &e.Cost,
-			&e.HTTPStatus, &e.ErrorCode, &e.ErrorDetail, &e.RouteTrace); err != nil {
+		if err := scanUsageHistoryEntry(rows, &e); err != nil {
 			writeServerError(w, "usage history scan", err)
 			return
 		}

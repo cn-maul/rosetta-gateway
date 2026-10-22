@@ -30,6 +30,7 @@ import AppModal from '../components/AppModal.vue'
 import CredentialPanel from '../components/CredentialPanel.vue'
 import UpstreamModelPanel from '../components/UpstreamModelPanel.vue'
 import { useNetworks, NETWORK_DIRECT_ID } from '../composables/useNetworks'
+import { PROTOCOL_OPTIONS, protocolLabel } from '../protocols'
 
 const route = useRoute()
 const router = useRouter()
@@ -117,10 +118,9 @@ async function load() {
 const pForm = reactive({
   open: false,
   name: '',
-  protocol: 'openai-chat',
+  protocol: 'chat',
   endpoint: '',
-  slug: '',
-  timeout_ms: 0,
+  timeout_sec: 0,
   max_retries: 0,
   network_id: '',
   balance_spec_json: '',
@@ -137,12 +137,17 @@ const networkLabel = (id: string): string => {
   return n ? n.name : id.slice(0, 8)
 }
 
+function fmtTimeoutSec(ms: number): string {
+  if (!ms) return '默认'
+  const seconds = ms / 1000
+  return `${Number.isInteger(seconds) ? seconds : seconds.toFixed(1)} 秒`
+}
+
 function fillForm(p: Provider) {
   pForm.name = p.name
-  pForm.protocol = p.protocol || 'openai-chat'
+  pForm.protocol = p.protocol || 'chat'
   pForm.endpoint = p.endpoint
-  pForm.slug = p.slug
-  pForm.timeout_ms = p.timeout_ms
+  pForm.timeout_sec = p.timeout_ms / 1000
   pForm.max_retries = p.max_retries
   pForm.network_id = p.network_id || NETWORK_DIRECT_ID
   pForm.balance_spec_json = p.balance_spec_json
@@ -151,17 +156,14 @@ function fillForm(p: Provider) {
 function isFormDirty(p: Provider): boolean {
   return (
     pForm.name !== p.name ||
-    pForm.protocol !== (p.protocol || 'openai-chat') ||
+    pForm.protocol !== (p.protocol || 'chat') ||
     pForm.endpoint !== p.endpoint ||
-    pForm.timeout_ms !== p.timeout_ms ||
+    pForm.timeout_sec !== p.timeout_ms / 1000 ||
     pForm.max_retries !== p.max_retries ||
     pForm.network_id !== (p.network_id || NETWORK_DIRECT_ID) ||
     pForm.balance_spec_json !== p.balance_spec_json
   )
 }
-
-const openRouterSpec =
-  '{"path":"/api/v1/credits","field":"data.total_credits","currency":"USD"}'
 
 async function saveProvider() {
   const p = provider.value
@@ -176,7 +178,7 @@ async function saveProvider() {
       name: pForm.name.trim() || pForm.endpoint.trim(),
       protocol: pForm.protocol,
       endpoint: pForm.endpoint.trim(),
-      timeout_ms: Number(pForm.timeout_ms) || 0,
+      timeout_ms: Math.max(0, Math.round((Number(pForm.timeout_sec) || 0) * 1000)),
       max_retries: Number(pForm.max_retries) || 0,
       // 网络与余额查询配置**每次都发**，空串 = 清空。省略字段的语义是
       // 「保持原值」，那会让「换回直连」「删掉自定义余额脚本」这两个动作
@@ -447,7 +449,6 @@ const mForm = reactive({
   price_input: 0,
   price_cache_hit: 0,
   price_output: 0,
-  enabled: true,
   effortCsv: '',
   thinking: 'unset' as 'unset' | 'yes' | 'no',
   saving: false,
@@ -499,7 +500,6 @@ function openModel(m?: UpstreamModel) {
   mForm.price_input = m?.price_input ?? 0
   mForm.price_cache_hit = m?.price_cache_hit ?? 0
   mForm.price_output = m?.price_output ?? 0
-  mForm.enabled = m?.enabled ?? true
   mForm.saving = false
   // unknown 档位附在后面：它们是网关不认、但可能是上游认得的厂商私有值，
   // 编辑时必须原样带回去，否则点一次保存就把它们悄悄抹掉了。
@@ -570,7 +570,6 @@ async function submitModel() {
       price_input: prices[0],
       price_cache_hit: prices[1],
       price_output: prices[2],
-      enabled: mForm.enabled,
       // 空串 = 清除（回到未配置），与界面上「一个都不勾选」是同一个动作。
       effort_levels: mForm.effortCsv,
       // 三态映射：unset → null（后端解成「清除」）。不能省略字段 ——
@@ -774,34 +773,28 @@ function goBack() {
                凭据与模型挤出首屏。改配置是低频动作，且「编辑基础信息」
                在标题区，位置固定。 -->
           <div class="card ov-card">
-            <div class="card__header">
-              <div class="card__title">
-                概览
-                <span class="badge" :class="provider.enabled ? 'badge-live' : 'badge-off'">
-                  {{ provider.enabled ? '启用' : '停用' }}
-                </span>
+            <div class="card__header ov-head">
+              <div class="card__title">概览</div>
+              <div class="ov-head-actions">
+                <button class="btn btn-sm" @click="openEdit">编辑</button>
+                <button class="btn btn-sm btn-danger" @click="removeProvider">删除</button>
+                <button
+                  class="switch"
+                  :class="{ on: provider.enabled }"
+                  role="switch"
+                  :aria-checked="provider.enabled"
+                  :aria-label="(provider.enabled ? '停用 ' : '启用 ') + (provider.name || provider.slug)"
+                  :disabled="togglingProvider"
+                  :title="provider.enabled ? '停用' : '启用'"
+                  @click="toggleProvider"
+                ></button>
               </div>
-            </div>
-            <div class="card__footer ov-actions">
-              <button
-                class="switch"
-                :class="{ on: provider.enabled }"
-                role="switch"
-                :aria-checked="provider.enabled"
-                :aria-label="(provider.enabled ? '停用 ' : '启用 ') + (provider.name || provider.slug)"
-                :disabled="togglingProvider"
-                :title="provider.enabled ? '停用' : '启用'"
-                @click="toggleProvider"
-              ></button>
-              <button class="btn btn-sm" @click="openEdit">编辑基础信息</button>
-              <span class="up-spacer"></span>
-              <button class="btn btn-sm btn-danger" @click="removeProvider">删除</button>
             </div>
             <div class="card__content">
               <!-- 键值表：标签固定宽、值 flex:1 并省略。全量值在 title 里，
                    且「编辑基础信息」里能直接看到完整原文。 -->
               <div class="kv">
-                <div class="kv-row"><span class="kv-k">协议</span><span class="kv-v"><span class="badge">{{ provider.protocol }}</span></span></div>
+                <div class="kv-row"><span class="kv-k">类型</span><span class="kv-v"><span class="badge">{{ protocolLabel(provider.protocol) }}</span></span></div>
                 <div class="kv-row"><span class="kv-k">Endpoint</span><span class="kv-v mono kv-ep" :title="provider.endpoint">{{ provider.endpoint }}</span></div>
                 <div class="kv-row">
                   <span class="kv-k">出站网络</span>
@@ -817,7 +810,7 @@ function goBack() {
                 <div class="kv-row">
                   <span class="kv-k">超时 / 重试</span>
                   <span class="kv-v dim">
-                    {{ provider.timeout_ms ? `${provider.timeout_ms} ms` : '默认' }} /
+                    {{ fmtTimeoutSec(provider.timeout_ms) }} /
                     {{ provider.max_retries ? `${provider.max_retries} 次` : '默认' }}
                   </span>
                 </div>
@@ -892,11 +885,9 @@ function goBack() {
             <input v-model="pForm.name" class="input" placeholder="DeepSeek" id="cgw-lProviderDetail-1"/>
           </div>
           <div class="field">
-            <label for="cgw-lProviderDetail-2">协议</label>
+            <label for="cgw-lProviderDetail-2">类型</label>
             <select v-model="pForm.protocol" class="select" id="cgw-lProviderDetail-2">
-              <option value="openai-chat">openai-chat</option>
-              <option value="anthropic">anthropic</option>
-              <option value="openai-responses">openai-responses</option>
+              <option v-for="option in PROTOCOL_OPTIONS" :key="option.value" :value="option.value">{{ option.label }}</option>
             </select>
           </div>
           <div class="field span2">
@@ -904,56 +895,30 @@ function goBack() {
             <input v-model="pForm.endpoint" class="input mono" placeholder="https://api.deepseek.com" id="cgw-lProviderDetail-3"/>
           </div>
           <div class="field">
-            <label for="cgw-lProviderDetail-4">Slug</label>
-            <input :value="pForm.slug" class="input mono" disabled id="cgw-lProviderDetail-4"/>
-            <span class="tip">系统生成，不可修改</span>
+            <label for="cgw-lProviderDetail-4">超时（秒）</label>
+            <input v-model.number="pForm.timeout_sec" class="input num" type="number" min="0" step="0.1" id="cgw-lProviderDetail-4"/>
           </div>
           <div class="field">
-            <label for="cgw-lProviderDetail-5">超时（毫秒）</label>
-            <input v-model.number="pForm.timeout_ms" class="input num" type="number" min="0" step="1" id="cgw-lProviderDetail-5"/>
-            <span class="tip">0 = 使用全局默认</span>
-          </div>
-          <div class="field span2">
-            <label for="cgw-lProviderDetail-6">最大重试</label>
-            <input v-model.number="pForm.max_retries" class="input num" type="number" min="0" max="10" step="1" id="cgw-lProviderDetail-6"/>
-            <span class="tip">
-              仅作用于<strong>幂等</strong>请求（如连通性测试时的 GET /models）。
-              对话是 POST，SDK 不会重试 —— 重试由「故障转移链换目标」承担。
-            </span>
+            <label for="cgw-lProviderDetail-5">最大重试次数</label>
+            <input v-model.number="pForm.max_retries" class="input num" type="number" min="0" max="10" step="1" id="cgw-lProviderDetail-5"/>
           </div>
 
           <div class="field span2">
-            <label for="cgw-lProviderDetail-7">出站网络</label>
-            <select v-model="pForm.network_id" class="select" id="cgw-lProviderDetail-7">
+            <label for="cgw-lProviderDetail-6">出站网络</label>
+            <select v-model="pForm.network_id" class="select" id="cgw-lProviderDetail-6">
               <option :value="NETWORK_DIRECT_ID">直连（不经过代理）</option>
               <option v-for="n in networks" :key="n.id" :value="n.id">{{ n.name }} — {{ n.proxy_url }}</option>
             </select>
-            <span class="tip">
-              只对这个上游生效，其它上游不受影响；选「直连」表示不代理。
-              地址在 <RouterLink to="/networks">出站网络</RouterLink> 里维护 ——
-              同一个代理被多个上游共用时填一次，改一处全部生效，也不用手打
-              URL（打错不会报错，只是连不上）。
-            </span>
           </div>
 
           <div class="field span2">
-            <label for="cgw-lProviderDetail-8">余额查询（可选）</label>
+            <label for="cgw-lProviderDetail-7">余额查询（可选）</label>
             <textarea
               v-model="pForm.balance_spec_json"
               class="input mono"
               rows="2"
               spellcheck="false"
-              placeholder='{"path":"/credits","field":"data.remaining","currency":"USD"}' id="cgw-lProviderDetail-8"></textarea>
-            <span class="tip">
-              填 JSON，留空则用内置判定（OpenAI 官方与 DeepSeek 自动识别，其余上报「不支持」）。
-              <code>path</code> 必填，是以 <code>/</code> 开头的相对路径；
-              <code>field</code> 是余额在响应里的点号路径（默认 <code>balance</code>）；
-              <code>currency</code> 只是标单位、不做换算；
-              <code>auth</code> 取 <code>bearer</code>（默认）或 <code>anthropic</code>。
-              <br/>
-              例：OpenRouter 是 <code>{{ openRouterSpec }}</code>。
-              填错会在保存时直接报错，不会等到点「查询余额」才失败。
-            </span>
+              placeholder='{"path":"/credits","field":"data.remaining","currency":"USD"}' id="cgw-lProviderDetail-7"></textarea>
           </div>
         </div>
         <div class="form-actions">
@@ -1022,7 +987,6 @@ function goBack() {
           <div class="field span2">
             <label for="cgw-lProviderDetail-11">上游模型名（model_id）*</label>
             <input v-model="mForm.model_id" class="input mono" placeholder="deepseek-chat" id="cgw-lProviderDetail-11"/>
-            <span class="tip">上游 API 接受的真实模型名</span>
           </div>
           <div class="field">
             <label for="cgw-lProviderDetail-12">上下文窗口</label>
@@ -1039,7 +1003,6 @@ function goBack() {
               <label><span>缓存命中</span><input v-model.number="mForm.price_cache_hit" class="input num" type="number" min="0" step="any" placeholder="未配置"/></label>
               <label><span>输出</span><input v-model.number="mForm.price_output" class="input num" type="number" min="0" step="any" placeholder="未配置"/></label>
             </div>
-            <span class="tip">输入价和输出价填 0 就是不计费；缓存命中价填 0 时沿用输入价。改价只影响之后的调用，历史费用按记录时单价保留。</span>
           </div>
           <div class="field span2">
             <span class="field-label">思考模式</span>
@@ -1057,10 +1020,6 @@ function goBack() {
                 {{ opt.label }}
               </button>
             </div>
-            <span class="tip">
-              「未配置」= 网关不干预，客户端要什么就发什么；「不支持」= 数据面会
-              剥掉请求上的思考配置（并随 /v1/models 下发该声明）。
-            </span>
           </div>
           <div v-if="mForm.thinking !== 'no'" class="field span2">
             <span class="field-label">思考挡位</span>
@@ -1077,16 +1036,6 @@ function goBack() {
                 {{ l }}
               </button>
             </div>
-            <span class="tip">
-              勾选该模型**真实支持**的思考强度档位。一个都不勾 = 未配置。
-              客户端选了不在列表里的档位时，网关会就近夹取并在日志留痕。
-            </span>
-          </div>
-          <div class="field span2">
-            <label class="check-line">
-              <input v-model="mForm.enabled" type="checkbox"/>
-              启用该模型
-            </label>
           </div>
         </div>
         </fieldset>
@@ -1214,9 +1163,8 @@ function goBack() {
    带 flex:1，所以多出来的空间落在键值表下方而不是动作行上。 */
 .expand-col > .card { height: 100%; }
 .ov-card { gap: 10px; }
-.ov-actions { gap: 8px; width: 100%; }
-/* 把「删除」推到右缘：破坏性动作与「编辑」分居两端，减少误点。 */
-.up-spacer { flex: 1; }
+.ov-head { flex-direction: row; align-items: center; justify-content: space-between; gap: 12px; }
+.ov-head-actions { display: flex; align-items: center; justify-content: flex-end; gap: 8px; }
 
 /* 模型卡：整行宽度，不参与两列网格。去掉 .card 自带的 padding ——
    UpstreamModelPanel 本身就是一个 .card，套两层会多出一圈内边距

@@ -15,7 +15,7 @@ import (
 // isLoopbackListen 报告 listen 地址是否只绑定回环。
 //
 // 用途：判断「首次初始化窗口 + 绑非回环」这个组合是否构成
-// **持有引导令牌的人能抢先成为第一个管理员**的暴露面。
+// **能访问该端口的人可以抢先成为第一个管理员**的暴露面。
 // 解析失败时**保守返回 false** —— 宁可多报一次警，不可漏掉真实暴露。
 func isLoopbackListen(listen string) bool {
 	host, _, err := net.SplitHostPort(listen)

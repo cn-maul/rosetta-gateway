@@ -696,6 +696,8 @@ func (s *Store) RecomputeCost(ctx context.Context, recordID string) (bool, error
 
 type UsageStats struct {
 	TotalRequests int64
+	SuccessCount  int64
+	CanceledCount int64
 	TotalTokens   int64
 	InputTokens   int64
 	OutputTokens  int64
@@ -704,7 +706,7 @@ type UsageStats struct {
 	// CacheHitRate 是缓存命中率（0~1）：cached_tokens / input_tokens。
 	// 分母用 input_tokens 而非 total_tokens —— 缓存命中衡量的是输入侧，
 	// 输出 token 与缓存无关，计入分母只会稀释指标。分子分母的语义前提：
-	// 两个上游协议的 cached 都 ⊆ input（openai-chat 的
+	// 两个上游协议的 cached 都 ⊆ input（chat 的
 	// prompt_tokens_details.cached_tokens、anthropic 被 SDK 折进 input 的
 	// cache_read/cache_creation），故比值恒 ≤ 1。并入本查询是为了省掉对
 	// 同一区间的第二次全扫（此前的 stats 页要为它单独再扫一遍 usage_records）。
@@ -727,11 +729,27 @@ type UsageStats struct {
 	// （usage_daily_rollups.cost_pending_count），所以剪枝前后这个数
 	// 都能查到 —— 它的存在本身就是「系统里有免单风险」的信号。
 	CostPendingCount int64
+	// LastSuccessAt 是所选区间内最近一次成功请求的时间（毫秒）；0 = 无成功请求。
+	// 与 ErrorCount 同源，供总览的“需要处理”直接判断服务是否真的跑通过。
+	LastSuccessAt int64
+	// FirstRecordAt 是所选区间内最早已有记录的时间（毫秒）；0 = 区间无记录。
+	FirstRecordAt int64
+	// TTFBMs / TtfbSamples 是**所选区间**内成功流式请求的首字延迟：
+	// 分子是成功请求 ttfb 的累加值，分母是真正测到首字的成功请求数。
+	// 它与 RecentPerformance 的“最近 N 条”口径不同，不能把两者混用。
+	TtfbMs      float64
+	TtfbSamples int64
+	// TokensPerSec / ThroughputSamples 是**所选区间**内成功请求的输出速度：
+	// 用输出 token 总和 / 成功请求耗时总和加权，避免单次快慢请求带偏。
+	TokensPerSec      float64
+	ThroughputSamples int64
 }
 
 // GetUsageStats 返回累计统计。from/to 为毫秒时间戳，0 表示不设该边界
 // （from=0 即统计全部历史）。ErrorCount 排除 canceled：那是「客户端主动断开」，
 // 既不是上游故障也不是本网关的失败，算进错误率只会让成功率虚低。
+// 仪表盘需要精确成功率的，请用 SuccessCount + ErrorCount 作分母；
+// CanceledCount 单独返回，不能把它算进成功或失败。
 //
 // scopeUserID 非空时只统计该用户的用量（多用户改造的作用域收窄）。
 // 空串 = 全局（admin 视角）。**这个参数不能省略** —— 它由
@@ -758,10 +776,23 @@ func (s *Store) GetUsageStats(ctx context.Context, from, to int64, scopeUserID s
 		        COALESCE(SUM(u.n_err), 0),
 		        COALESCE(SUM(u.cached_tokens) * 1.0 / NULLIF(SUM(u.input_tokens), 0), 0),
 		        `+UsageSumExpr("cost_total", "u")+`,
-		        `+UsageSumExpr("n_cost_pending", "u")+`
+		        `+UsageSumExpr("n_cost_pending", "u")+`,
+		        COALESCE(SUM(u.n_ok), 0),
+		        COALESCE(SUM(u.n), 0) - COALESCE(SUM(u.n_ok), 0) - COALESCE(SUM(u.n_err), 0),
+		        COALESCE(SUM(u.ttfb_ok_sum) * 1.0 / NULLIF(SUM(u.n_ttfb_ok), 0), 0),
+		        COALESCE(SUM(u.n_ttfb_ok), 0),
+		        COALESCE(SUM(CASE WHEN u.out_ok > 0 AND u.lat_ok > 0 THEN u.out_ok ELSE 0 END) * 1000.0
+		                 / NULLIF(SUM(CASE WHEN u.out_ok > 0 AND u.lat_ok > 0 THEN u.lat_ok ELSE 0 END), 0), 0),
+		        COALESCE(SUM(u.n_ok_speed), 0),
+		        CASE WHEN COALESCE(SUM(u.n_ok), 0) > 0
+		             THEN COALESCE(MAX(CASE WHEN u.n_ok > 0 THEN u.bucket_ts END), 0)
+		             ELSE 0 END,
+		        COALESCE(MIN(CASE WHEN u.n > 0 THEN u.bucket_ts END), 0)
 		   FROM `+src,
 		args...).
-		Scan(&stats.TotalRequests, &stats.TotalTokens, &stats.InputTokens, &stats.OutputTokens, &stats.CachedTokens, &stats.ErrorCount, &stats.CacheHitRate, &stats.Cost, &stats.CostPendingCount)
+		Scan(&stats.TotalRequests, &stats.TotalTokens, &stats.InputTokens, &stats.OutputTokens, &stats.CachedTokens, &stats.ErrorCount, &stats.CacheHitRate, &stats.Cost, &stats.CostPendingCount,
+			&stats.SuccessCount, &stats.CanceledCount, &stats.TtfbMs, &stats.TtfbSamples, &stats.TokensPerSec, &stats.ThroughputSamples,
+			&stats.LastSuccessAt, &stats.FirstRecordAt)
 	if err != nil {
 		return nil, err
 	}

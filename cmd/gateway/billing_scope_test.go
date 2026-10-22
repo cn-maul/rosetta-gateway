@@ -31,13 +31,13 @@ func TestOrgEndpoints_ScopedToCallerUser(t *testing.T) {
 	ctx := context.Background()
 
 	if err := db.CreateProvider(ctx, &store.Provider{
-		ID: "good", Slug: "good", Name: "good", Protocol: "openai-chat",
+		ID: "good", Slug: "good", Name: "good", Protocol: "chat",
 		Endpoint: up.URL, Enabled: true,
 	}); err != nil {
 		t.Fatalf("seed provider: %v", err)
 	}
 	if err := db.UpsertUpstreamModel(ctx, &store.UpstreamModel{
-		ID: "pm1", ProviderID: "good", ModelID: "good-model", Enabled: true, PriceOutput: 2,
+		ID: "pm1", ProviderID: "good", ModelID: "good-model", PriceOutput: 2,
 	}); err != nil {
 		t.Fatalf("seed price: %v", err)
 	}
@@ -50,7 +50,7 @@ func TestOrgEndpoints_ScopedToCallerUser(t *testing.T) {
 	}
 	if err := db.CreateUsageRecord(ctx, &store.UsageRecord{
 		ID: "other", AccessKeyID: "k1", UserID: "vip", PublicModel: "flash", ProviderID: "good",
-		UpstreamModel: "good-model", IngressProtocol: "openai-chat",
+		UpstreamModel: "good-model", IngressProtocol: "chat",
 		OutputTokens: 1_000_000, TotalTokens: 1_000_000,
 		UsageState: "reported", Status: "ok", HTTPStatus: 200,
 	}); err != nil {

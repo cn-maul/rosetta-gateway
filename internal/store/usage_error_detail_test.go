@@ -31,7 +31,7 @@ func TestUsageErrorDetail_RoundTripSingle(t *testing.T) {
 	detail := "You exceeded your current quota, please check your plan and billing details."
 	if err := st.CreateUsageRecord(ctx, &UsageRecord{
 		ID: "r1", AccessKeyID: "k1", UserID: "u1", PublicModel: "flash",
-		ProviderID: "p1", UpstreamModel: "deepseek-chat", IngressProtocol: "openai-chat",
+		ProviderID: "p1", UpstreamModel: "deepseek-chat", IngressProtocol: "chat",
 		Status: "error", HTTPStatus: 402, ErrorCode: "insufficient_quota",
 		ErrorDetail: detail, UsageState: "none",
 	}); err != nil {
@@ -61,10 +61,10 @@ func TestUsageErrorDetail_RoundTripBatched(t *testing.T) {
 
 	recs := []*UsageRecord{
 		{ID: "b1", AccessKeyID: "k1", UserID: "u1", PublicModel: "flash", ProviderID: "p1",
-			UpstreamModel: "m", IngressProtocol: "openai-chat", Status: "error", HTTPStatus: 429,
+			UpstreamModel: "m", IngressProtocol: "chat", Status: "error", HTTPStatus: 429,
 			ErrorCode: "rate_limited", ErrorDetail: "Too many requests per minute", UsageState: "none"},
 		{ID: "b2", AccessKeyID: "k1", UserID: "u1", PublicModel: "flash", ProviderID: "p1",
-			UpstreamModel: "m", IngressProtocol: "openai-chat", Status: "ok", HTTPStatus: 200,
+			UpstreamModel: "m", IngressProtocol: "chat", Status: "ok", HTTPStatus: 200,
 			UsageState: "none"},
 	}
 	if _, err := st.CreateUsageRecordsBatched(ctx, recs); err != nil {
@@ -95,7 +95,7 @@ func TestUsageErrorDetail_LongTextFits(t *testing.T) {
 	detail := strings.Repeat("a", 1024) // outwire 截断后最长 1024 字节
 	if err := st.CreateUsageRecord(ctx, &UsageRecord{
 		ID: "r2", AccessKeyID: "k1", UserID: "u1", PublicModel: "flash", ProviderID: "p1",
-		UpstreamModel: "m", IngressProtocol: "openai-chat", Status: "error", HTTPStatus: 400,
+		UpstreamModel: "m", IngressProtocol: "chat", Status: "error", HTTPStatus: 400,
 		ErrorCode: "invalid_request", ErrorDetail: detail, UsageState: "none",
 	}); err != nil {
 		t.Fatalf("record: %v", err)

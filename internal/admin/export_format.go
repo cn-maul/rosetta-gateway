@@ -117,7 +117,6 @@ type modelExport struct {
 	ProviderSlug     string `json:"provider_slug"`
 	ModelID          string `json:"model_id"`
 	DisplayName      string `json:"display_name,omitempty"`
-	Enabled          bool   `json:"enabled"`
 	ContextWindow    int    `json:"context_window,omitempty"`
 	MaxOutputTokens  int    `json:"max_output_tokens,omitempty"`
 	SupportsThinking *bool  `json:"supports_thinking,omitempty"`

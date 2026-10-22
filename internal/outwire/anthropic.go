@@ -390,7 +390,7 @@ func (s *AnthropicSSE) ensureStarted(id string) {
 //
 // **同块的判据是 ToolIndex，不是 ToolID**：rosetta 的流式契约是首片带
 // ToolID/ToolName、续片只带 ToolIndex+ArgumentsDelta（SDK 侧
-// anthropic 的 input_json_delta、openai-chat 的续 chunk、responses 的
+// anthropic 的 input_json_delta、chat 的续 chunk、responses 的
 // function_call_arguments.delta 都不填 ToolID）。用 ToolID 判会让每个参数
 // 分片都切出一个新块：客户端收到两个 tool_use —— 一个有 id/name 但参数
 // 为空、一个有参数但没 id/name，工具调用整体失效。

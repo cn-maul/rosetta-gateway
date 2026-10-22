@@ -46,7 +46,7 @@ func TestDecodeResponses_ReasoningSealed(t *testing.T) {
 	if blk.Type != rosetta.BlockThinking {
 		t.Fatalf("reasoning block type = %q, want thinking", blk.Type)
 	}
-	if blk.Sealed != "gAAAAA-secret" || blk.SealedBy != "openai-responses" {
+	if blk.Sealed != "gAAAAA-secret" || blk.SealedBy != string(rosetta.ProtoOpenAIResponses) {
 		t.Fatalf("sealed payload not carried verbatim: %+v", blk)
 	}
 	// ReasoningID 是下一轮寻址的依据，SDK 靠它写出 item 的 "id"。
@@ -158,17 +158,17 @@ func TestDecodeResponses_Full(t *testing.T) {
 	}
 }
 
-// tool_choice 翻译：openai-chat 上游 function→嵌套形状，responses 上游原样。
+// tool_choice 翻译：chat 上游 function→嵌套形状，responses 上游原样。
 func TestDecodeResponses_ToolChoice(t *testing.T) {
 	got := decodeResponses(t, `{"model":"m","input":"hi",
 		"tool_choice":{"type":"function","name":"weather"}}`)
 	req := got.ToRosetta()
-	got.ApplyUpstreamExtras(req, "openai-chat")
+	got.ApplyUpstreamExtras(req, "chat")
 	if tc, ok := req.Extra["tool_choice"].(map[string]any); !ok || tc["type"] != "function" {
-		t.Fatalf("openai-chat tool_choice: %+v", req.Extra)
+		t.Fatalf("chat tool_choice: %+v", req.Extra)
 	}
 	req2 := got.ToRosetta()
-	got.ApplyUpstreamExtras(req2, "openai-responses")
+	got.ApplyUpstreamExtras(req2, "response")
 	if _, ok := req2.Extra["tool_choice"].(json.RawMessage); !ok {
 		t.Fatalf("responses tool_choice passthrough: %+v", req2.Extra)
 	}
@@ -189,12 +189,12 @@ func TestDecodeResponses_ToolChoice(t *testing.T) {
 	}
 }
 
-// text.format → openai-chat 的 response_format 翻译。
+// text.format → chat 的 response_format 翻译。
 func TestDecodeResponses_TextFormat(t *testing.T) {
 	got := decodeResponses(t, `{"model":"m","input":"hi",
 		"text":{"format":{"type":"json_schema","name":"out","schema":{"type":"object"}}}}`)
 	req := got.ToRosetta()
-	got.ApplyUpstreamExtras(req, "openai-chat")
+	got.ApplyUpstreamExtras(req, "chat")
 	rf, ok := req.Extra["response_format"].(map[string]any)
 	if !ok || rf["type"] != "json_schema" {
 		t.Fatalf("response_format: %+v", req.Extra)
@@ -206,7 +206,7 @@ func TestDecodeResponses_TextFormat(t *testing.T) {
 
 	// responses 上游拿原始 text 外壳。
 	req2 := got.ToRosetta()
-	got.ApplyUpstreamExtras(req2, "openai-responses")
+	got.ApplyUpstreamExtras(req2, "response")
 	if _, ok := req2.Extra["text"].(map[string]any); !ok {
 		t.Fatalf("responses text passthrough: %+v", req2.Extra)
 	}
@@ -457,14 +457,14 @@ func TestDecodeResponses_Validation(t *testing.T) {
 // 修复前把整个 a.Text（已是 {"format":…} 的外壳）当成 format 的值放回去，
 // 出站变成 "text":{"format":{"format":{…}}}：上游看到的 format 里没有 type、
 // schema 埋在重复的 format 键下，于是结构化输出静默不生效，而客户端以为
-// 它生效了。同函数上面的 openai-chat 分支用 textFormatMap() 正确拆包。
+// 它生效了。同函数上面的 chat 分支用 textFormatMap() 正确拆包。
 func TestResponses_TextFormatNotDoubleWrapped(t *testing.T) {
 	a := decodeResponses(t, `{"model":"m","input":"hi",
 		"text":{"format":{"type":"json_schema","name":"t","strict":true,
 			"schema":{"type":"object","properties":{"a":{"type":"string"}}}}}}`)
 
 	req := a.ToRosetta()
-	a.ApplyUpstreamExtras(req, "openai-responses")
+	a.ApplyUpstreamExtras(req, "response")
 
 	textObj, ok := req.Extra["text"].(map[string]any)
 	if !ok {
@@ -492,7 +492,7 @@ func TestResponses_TextOtherKeysPassThrough(t *testing.T) {
 		"text":{"format":{"type":"json_object"},"verbosity":"low"}}`)
 
 	req := a.ToRosetta()
-	a.ApplyUpstreamExtras(req, "openai-responses")
+	a.ApplyUpstreamExtras(req, "response")
 
 	textObj, ok := req.Extra["text"].(map[string]any)
 	if !ok {
@@ -506,14 +506,14 @@ func TestResponses_TextOtherKeysPassThrough(t *testing.T) {
 	}
 }
 
-// previous_response_id / store 解析后必须送到 openai-responses 上游，
+// previous_response_id / store 解析后必须送到 response 上游，
 // 否则客户端以为会话续上了，实际模型只看到本次 input。
 func TestResponses_PreviousResponseIDForwarded(t *testing.T) {
 	a := decodeResponses(t, `{"model":"m","input":"hi",
 		"previous_response_id":"resp_abc123","store":false}`)
 
 	req := a.ToRosetta()
-	a.ApplyUpstreamExtras(req, "openai-responses")
+	a.ApplyUpstreamExtras(req, "response")
 
 	if req.Extra["previous_response_id"] != "resp_abc123" {
 		t.Fatalf("previous_response_id 未透传：%v", req.Extra["previous_response_id"])
@@ -658,7 +658,7 @@ func TestDecodeResponses_NamespaceToolChoiceHonored(t *testing.T) {
 	}
 	// tool_choice 挂在 req.Extra 上（ApplyUpstreamExtras 的事），
 	// 断言的是**重写后的值**而不是原始载荷。
-	got.ApplyUpstreamExtras(req, "openai-responses")
+	got.ApplyUpstreamExtras(req, "response")
 	choice := req.Extra["tool_choice"]
 	raw, ok := choice.(json.RawMessage)
 	if !ok {

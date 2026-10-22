@@ -43,10 +43,9 @@ func asScopedGet(path, userID string) *http.Request {
 // /v1/models 带容量元数据；/v1/models/{model} 单模型详情。
 func TestModels_Metadata(t *testing.T) {
 	ri := routing.NewRouteIndex()
-	ri.AddProvider(&routing.ProviderRef{ID: "p1", Slug: "prov", Protocol: "openai-chat", Enabled: true})
+	ri.AddProvider(&routing.ProviderRef{ID: "p1", Slug: "prov", Protocol: "chat", Enabled: true})
 	ri.AddUpstreamModel(&routing.UpstreamModel{
-		ID: "m1", ProviderID: "p1", ModelID: "gpt-x", Enabled: true,
-		ContextWindow: 128000, MaxOutputTokens: 16384,
+		ID: "m1", ProviderID: "p1", ModelID: "gpt-x", ContextWindow: 128000, MaxOutputTokens: 16384,
 	})
 	ri.AddRoute(&routing.Route{ID: "r1", PublicName: "flash", ProviderID: "p1", UpstreamModelID: "m1", Enabled: true})
 	// /v1/models 的可见性经 auth.Authenticate 判定，而它会查快照里的归属
@@ -95,8 +94,8 @@ func TestModels_Metadata(t *testing.T) {
 
 	// 无容量且无默认 → 不编造字段。
 	ri2 := routing.NewRouteIndex()
-	ri2.AddProvider(&routing.ProviderRef{ID: "p1", Slug: "prov", Protocol: "openai-chat", Enabled: true})
-	ri2.AddUpstreamModel(&routing.UpstreamModel{ID: "m1", ProviderID: "p1", ModelID: "gpt-x", Enabled: true})
+	ri2.AddProvider(&routing.ProviderRef{ID: "p1", Slug: "prov", Protocol: "chat", Enabled: true})
+	ri2.AddUpstreamModel(&routing.UpstreamModel{ID: "m1", ProviderID: "p1", ModelID: "gpt-x"})
 	ri2.AddRoute(&routing.Route{ID: "r1", PublicName: "flash", ProviderID: "p1", UpstreamModelID: "m1", Enabled: true})
 	snapshot.Init(&snapshot.Snapshot{
 		Routes: ri2, Providers: map[string]*snapshot.ProviderSnapshot{},
@@ -134,7 +133,7 @@ func TestBillingEndpoints(t *testing.T) {
 	}
 	if err := db.CreateUsageRecord(ctx, &store.UsageRecord{
 		ID: "u1", AccessKeyID: "k1", UserID: testUserID, PublicModel: "flash", ProviderID: "good",
-		UpstreamModel: "good-model", IngressProtocol: "openai-chat",
+		UpstreamModel: "good-model", IngressProtocol: "chat",
 		InputTokens: 500_000, OutputTokens: 0, TotalTokens: 500_000,
 		UsageState: "reported", Status: "ok", HTTPStatus: 200,
 	}); err != nil {
@@ -173,19 +172,18 @@ func TestBillingEndpoints(t *testing.T) {
 	// organization/costs：给模型配 2 元/百万输出价，100 万输出 = 2 元。
 	// harness 的 provider 只存在于快照里，DB 需要实体行满足外键。
 	if err := db.CreateProvider(ctx, &store.Provider{
-		ID: "good", Slug: "good", Name: "good", Protocol: "openai-chat",
-		Endpoint: up.URL, Enabled: true,
-	}); err != nil {
+		ID: "good", Slug: "good", Name: "good", Protocol: "chat",
+		Endpoint: up.URL, Enabled: true}); err != nil {
 		t.Fatalf("seed provider: %v", err)
 	}
 	if err := db.UpsertUpstreamModel(ctx, &store.UpstreamModel{
-		ID: "pm1", ProviderID: "good", ModelID: "good-model", Enabled: true, PriceOutput: 2,
+		ID: "pm1", ProviderID: "good", ModelID: "good-model", PriceOutput: 2,
 	}); err != nil {
 		t.Fatalf("seed price: %v", err)
 	}
 	if err := db.CreateUsageRecord(ctx, &store.UsageRecord{
 		ID: "u2", AccessKeyID: "k1", UserID: testUserID, PublicModel: "flash", ProviderID: "good",
-		UpstreamModel: "good-model", IngressProtocol: "openai-chat",
+		UpstreamModel: "good-model", IngressProtocol: "chat",
 		OutputTokens: 1_000_000, TotalTokens: 1_000_000,
 		UsageState: "reported", Status: "ok", HTTPStatus: 200,
 	}); err != nil {
@@ -231,7 +229,7 @@ func TestUsageHistoryFilterAndCSV(t *testing.T) {
 	for i, st := range []string{"ok", "error", "ok"} {
 		if err := db.CreateUsageRecord(context.Background(), &store.UsageRecord{
 			ID: "r-" + strconv.Itoa(i), AccessKeyID: "k1", UserID: testUserID,
-			PublicModel: "flash", UpstreamModel: "m", IngressProtocol: "openai-chat",
+			PublicModel: "flash", UpstreamModel: "m", IngressProtocol: "chat",
 			TotalTokens: 10, UsageState: "reported", Status: st, HTTPStatus: 200,
 			Ts: time.Now().UnixMilli(),
 		}); err != nil {

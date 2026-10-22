@@ -41,7 +41,7 @@ func seedUsage(t *testing.T, db *Store, id, keyID, userID string, tokens int) {
 	}
 	_, err := db.db.ExecContext(context.Background(),
 		`INSERT INTO usage_records (`+usageSeedColumns+`)
-		 VALUES (?, ?, ?, ?, 'm', 'p', 'up', 'openai-chat', 0, ?, 'reported', 'ok', 200, 10)`,
+		 VALUES (?, ?, ?, ?, 'm', 'p', 'up', 'chat', 0, ?, 'reported', 'ok', 200, 10)`,
 		id, time.Now().UnixMilli(), keyID, uid, tokens)
 	if err != nil {
 		t.Fatalf("seed usage %s: %v", id, err)

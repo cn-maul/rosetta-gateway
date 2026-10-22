@@ -24,8 +24,8 @@ func TestRouteFailoverFlag_RoundTrip(t *testing.T) {
 	ctx := context.Background()
 	st := testStore(t, t.TempDir()+"/gw.db")
 
-	_ = st.CreateProvider(ctx, &Provider{ID: "p1", Slug: "p1", Name: "P1", Endpoint: "http://x", Enabled: true, Protocol: "openai-chat"})
-	_ = st.CreateUpstreamModel(ctx, &UpstreamModel{ID: "m1", ProviderID: "p1", ModelID: "chat", Enabled: true})
+	_ = st.CreateProvider(ctx, &Provider{ID: "p1", Slug: "p1", Name: "P1", Endpoint: "http://x", Enabled: true, Protocol: "chat"})
+	_ = st.CreateUpstreamModel(ctx, &UpstreamModel{ID: "m1", ProviderID: "p1", ModelID: "chat"})
 
 	in := &Route{
 		ID: "r1", PublicName: "flash", ProviderID: "p1", UpstreamModelID: "m1", Enabled: true,
@@ -81,10 +81,10 @@ func TestReplaceRouteTargets(t *testing.T) {
 	ctx := context.Background()
 	st := testStore(t, t.TempDir()+"/gw.db")
 
-	_ = st.CreateProvider(ctx, &Provider{ID: "p1", Slug: "p1", Name: "P1", Endpoint: "http://x", Enabled: true, Protocol: "openai-chat"})
-	_ = st.CreateProvider(ctx, &Provider{ID: "p2", Slug: "p2", Name: "P2", Endpoint: "http://y", Enabled: true, Protocol: "openai-chat"})
-	_ = st.CreateUpstreamModel(ctx, &UpstreamModel{ID: "m1", ProviderID: "p1", ModelID: "chat", Enabled: true})
-	_ = st.CreateUpstreamModel(ctx, &UpstreamModel{ID: "m2", ProviderID: "p2", ModelID: "chat", Enabled: true})
+	_ = st.CreateProvider(ctx, &Provider{ID: "p1", Slug: "p1", Name: "P1", Endpoint: "http://x", Enabled: true, Protocol: "chat"})
+	_ = st.CreateProvider(ctx, &Provider{ID: "p2", Slug: "p2", Name: "P2", Endpoint: "http://y", Enabled: true, Protocol: "chat"})
+	_ = st.CreateUpstreamModel(ctx, &UpstreamModel{ID: "m1", ProviderID: "p1", ModelID: "chat"})
+	_ = st.CreateUpstreamModel(ctx, &UpstreamModel{ID: "m2", ProviderID: "p2", ModelID: "chat"})
 	_ = st.CreateRoute(ctx, &Route{ID: "r1", PublicName: "flash", ProviderID: "p1", UpstreamModelID: "m1", Enabled: true})
 
 	err := st.ReplaceRouteTargets(ctx, "r1", []RouteTarget{
@@ -142,7 +142,7 @@ func TestAccessKeyQuota_WriteAndRead(t *testing.T) {
 
 	// 落一条 usage，触发器应把 used_tokens 累加 total_tokens
 	if err := st.CreateUsageRecord(ctx, &UsageRecord{
-		ID: "u1", AccessKeyID: "k1", PublicModel: "flash", IngressProtocol: "openai-chat",
+		ID: "u1", AccessKeyID: "k1", PublicModel: "flash", IngressProtocol: "chat",
 		TotalTokens: 500, UsageState: "reported", Status: "ok",
 	}); err != nil {
 		t.Fatalf("usage: %v", err)
@@ -170,10 +170,10 @@ func TestSyncHeadTarget(t *testing.T) {
 			t.Fatalf("setup: %v", err)
 		}
 	}
-	must(st.CreateProvider(ctx, &Provider{ID: "p1", Slug: "p1", Name: "P1", Endpoint: "http://x", Protocol: "openai-chat", Enabled: true}))
-	must(st.CreateProvider(ctx, &Provider{ID: "p2", Slug: "p2", Name: "P2", Endpoint: "http://y", Protocol: "openai-chat", Enabled: true}))
-	must(st.CreateUpstreamModel(ctx, &UpstreamModel{ID: "m1", ProviderID: "p1", ModelID: "c1", Enabled: true}))
-	must(st.CreateUpstreamModel(ctx, &UpstreamModel{ID: "m2", ProviderID: "p2", ModelID: "c2", Enabled: true}))
+	must(st.CreateProvider(ctx, &Provider{ID: "p1", Slug: "p1", Name: "P1", Endpoint: "http://x", Protocol: "chat", Enabled: true}))
+	must(st.CreateProvider(ctx, &Provider{ID: "p2", Slug: "p2", Name: "P2", Endpoint: "http://y", Protocol: "chat", Enabled: true}))
+	must(st.CreateUpstreamModel(ctx, &UpstreamModel{ID: "m1", ProviderID: "p1", ModelID: "c1"}))
+	must(st.CreateUpstreamModel(ctx, &UpstreamModel{ID: "m2", ProviderID: "p2", ModelID: "c2"}))
 	must(st.CreateRoute(ctx, &Route{ID: "r1", PublicName: "flash", ProviderID: "p1", UpstreamModelID: "m1", Enabled: true}))
 
 	// 正常创建路径已原子种下 position 0；这里先确认它在，再模拟链被清空后
@@ -196,8 +196,7 @@ func TestSyncHeadTarget(t *testing.T) {
 	must(st.RunTx(ctx, func(ctx context.Context, tx Tx) error {
 		return createRouteTarget(ctx, tx, &RouteTarget{
 			ID: "t2", RouteID: "r1", ProviderID: "p1",
-			UpstreamModelID: "m1", Position: 1, Enabled: true,
-		})
+			UpstreamModelID: "m1", Position: 1})
 	}))
 	must(st.SyncHeadTarget(ctx, "r1", "p1", "m1"))
 	ts, _ = st.ListRouteTargets(ctx, "r1")
@@ -234,22 +233,20 @@ func TestUsageStats_Cost(t *testing.T) {
 			t.Fatalf("setup: %v", err)
 		}
 	}
-	must(st.CreateProvider(ctx, &Provider{ID: "p1", Slug: "p1", Name: "P1", Endpoint: "http://x", Protocol: "openai-chat", Enabled: true}))
+	must(st.CreateProvider(ctx, &Provider{ID: "p1", Slug: "p1", Name: "P1", Endpoint: "http://x", Protocol: "chat", Enabled: true}))
 	must(st.CreateUpstreamModel(ctx, &UpstreamModel{
-		ID: "m1", ProviderID: "p1", ModelID: "priced", Enabled: true,
-		PriceInput: 0.2, PriceCacheHit: 0.02, PriceOutput: 0.8,
+		ID: "m1", ProviderID: "p1", ModelID: "priced", PriceInput: 0.2, PriceCacheHit: 0.02, PriceOutput: 0.8,
 	}))
 	must(st.CreateUpstreamModel(ctx, &UpstreamModel{
-		ID: "m2", ProviderID: "p1", ModelID: "input-only", Enabled: true,
-		PriceInput: 0.5,
+		ID: "m2", ProviderID: "p1", ModelID: "input-only", PriceInput: 0.5,
 	}))
-	must(st.CreateUpstreamModel(ctx, &UpstreamModel{ID: "m3", ProviderID: "p1", ModelID: "free", Enabled: true}))
+	must(st.CreateUpstreamModel(ctx, &UpstreamModel{ID: "m3", ProviderID: "p1", ModelID: "free"}))
 
 	usage := func(id, model string, in, cached, out int64) {
 		t.Helper()
 		must(st.CreateUsageRecord(ctx, &UsageRecord{
 			ID: id, Ts: 1700000000000, AccessKeyID: "k1", PublicModel: model,
-			ProviderID: "p1", UpstreamModel: model, IngressProtocol: "openai-chat",
+			ProviderID: "p1", UpstreamModel: model, IngressProtocol: "chat",
 			InputTokens: in, OutputTokens: out, TotalTokens: in + out, CachedTokens: cached,
 			UsageState: "reported", Status: "ok",
 		}))
@@ -296,14 +293,13 @@ func TestUpsertUpstreamModel_KeepsPrices(t *testing.T) {
 			t.Fatalf("setup: %v", err)
 		}
 	}
-	must(st.CreateProvider(ctx, &Provider{ID: "p1", Slug: "p1", Name: "P1", Endpoint: "http://x", Protocol: "openai-chat", Enabled: true}))
+	must(st.CreateProvider(ctx, &Provider{ID: "p1", Slug: "p1", Name: "P1", Endpoint: "http://x", Protocol: "chat", Enabled: true}))
 	must(st.CreateUpstreamModel(ctx, &UpstreamModel{
-		ID: "m1", ProviderID: "p1", ModelID: "chat", Enabled: true,
-		DisplayName: "Chat", PriceInput: 1, PriceCacheHit: 0.1, PriceOutput: 2,
+		ID: "m1", ProviderID: "p1", ModelID: "chat", DisplayName: "Chat", PriceInput: 1, PriceCacheHit: 0.1, PriceOutput: 2,
 	}))
 
 	must(st.UpsertUpstreamModel(ctx, &UpstreamModel{
-		ID: "other", ProviderID: "p1", ModelID: "chat", Enabled: true, DisplayName: "Chat",
+		ID: "other", ProviderID: "p1", ModelID: "chat", DisplayName: "Chat",
 	}))
 
 	got, err := st.GetUpstreamModel(ctx, "m1")

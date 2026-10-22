@@ -42,7 +42,7 @@ func TestFetchModels_OpenRouter对象形态reasoning(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	cands, err := fetchModels(t.Context(), http.DefaultClient, srv.URL, "openai-chat", "sk-test")
+	cands, err := fetchModels(t.Context(), http.DefaultClient, srv.URL, "chat", "sk-test")
 	if err != nil {
 		t.Fatalf("fetchModels 失败（修复前是 cannot unmarshal object）: %v", err)
 	}

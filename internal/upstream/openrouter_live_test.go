@@ -29,7 +29,7 @@ func TestFetchModels_OpenRouterLive(t *testing.T) {
 	}
 
 	cands, err := fetchModels(t.Context(), http.DefaultClient,
-		"https://openrouter.ai/api/v1/models", "openai-chat", "sk-not-needed-for-models")
+		"https://openrouter.ai/api/v1/models", "chat", "sk-not-needed-for-models")
 	if err != nil {
 		t.Fatalf("fetchModels 失败: %v", err)
 	}

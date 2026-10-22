@@ -253,7 +253,7 @@ func TestStress_ReserveQuota_NetAccountingEqualsActualUsage(t *testing.T) {
 		if err := st.CreateUsageRecord(ctx, &UsageRecord{
 			ID: fmt.Sprintf("u-%d", i), AccessKeyID: "k1",
 			PublicModel: "m", ProviderID: "p", UpstreamModel: "u",
-			IngressProtocol: "openai-chat", TotalTokens: actual,
+			IngressProtocol: "chat", TotalTokens: actual,
 			UsageState: "reported", Status: "ok", HTTPStatus: 200,
 		}); err != nil {
 			mu.Lock()

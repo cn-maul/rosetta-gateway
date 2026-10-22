@@ -156,8 +156,8 @@ func TestMessages_ModelNotFoundShape(t *testing.T) {
 // D9：/v1/models 按认证头分流；别名路径强制形状；include=upstream 展开轨道二。
 func TestListModels_ShapeSplit(t *testing.T) {
 	ri := routing.NewRouteIndex()
-	ri.AddProvider(&routing.ProviderRef{ID: "p1", Slug: "prov", Protocol: "openai-chat", Enabled: true})
-	ri.AddUpstreamModel(&routing.UpstreamModel{ID: "m1", ProviderID: "p1", ModelID: "gpt-x", Enabled: true})
+	ri.AddProvider(&routing.ProviderRef{ID: "p1", Slug: "prov", Protocol: "chat", Enabled: true})
+	ri.AddUpstreamModel(&routing.UpstreamModel{ID: "m1", ProviderID: "p1", ModelID: "gpt-x"})
 	ri.AddRoute(&routing.Route{ID: "r1", PublicName: "flash", ProviderID: "p1", UpstreamModelID: "m1", Enabled: true})
 	snapshot.Init(&snapshot.Snapshot{
 		Routes:     ri,
@@ -249,8 +249,7 @@ func snapshotKeysForTest() map[string]*snapshot.KeySnapshot {
 	// 漏掉它会命中 ModelAllow 刻意的零值 =「拒绝全部」，
 	// 症状是全部数据面用例变成 403 model_not_allowed。
 	return map[string]*snapshot.KeySnapshot{sumHex: {
-		ID: "k1", KeyHash: sumHex, Name: "t", Enabled: true,
-		UserID: testUserID, AllowedModels: snapshot.AllowAll(),
+		ID: "k1", KeyHash: sumHex, Name: "t", Enabled: true, UserID: testUserID, AllowedModels: snapshot.AllowAll(),
 		GroupModelAllow: snapshot.AllowAll(),
 	}}
 }

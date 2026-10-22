@@ -8,6 +8,7 @@ import { fmtNum, fmtTokens, fmtTimeMs, fmtSec, fmtSpeed, fmtMoney, statusLabel, 
 import type { AccessKey, UsageHistoryEntry } from '../types'
 import DetailDrawer from '../components/DetailDrawer.vue'
 import { parseRouteTrace } from '../routeTrace'
+import { protocolLabel } from '../protocols'
 
 const props = defineProps<{ days: number }>()
 const route = useRoute()
@@ -119,6 +120,34 @@ function duration(h: UsageHistoryEntry) {
 function speedText(h: UsageHistoryEntry): string {
   return h.tps > 0 ? fmtSpeed(h.tps) : '—'
 }
+
+function modeLabel(h: UsageHistoryEntry): string {
+  return h.stream ? '流式' : '非流式'
+}
+
+function tokenBreakdown(h: UsageHistoryEntry): string {
+  const parts: string[] = []
+  if (h.cached_tokens > 0) parts.push('缓存 ' + fmtTokens(h.cached_tokens))
+  if (h.reasoning_tokens > 0) parts.push('推理 ' + fmtTokens(h.reasoning_tokens))
+  parts.push('总 ' + fmtTokens(h.total_tokens))
+  return parts.join(' · ')
+}
+
+function tokenTitle(h: UsageHistoryEntry): string {
+  return '输入 ' + fmtNum(h.input_tokens) +
+    ' · 输出 ' + fmtNum(h.output_tokens) +
+    ' · 缓存 ' + fmtNum(h.cached_tokens) +
+    ' · 推理 ' + fmtNum(h.reasoning_tokens) +
+    ' · 总计 ' + fmtNum(h.total_tokens)
+}
+
+function statusHint(h: UsageHistoryEntry): string {
+  const parts = [statusLabel(h.status)]
+  if (h.http_status > 0) parts.push('HTTP ' + h.http_status)
+  if (h.error_code) parts.push(h.error_code)
+  return parts.join(' · ')
+}
+
 const exporting = ref(false)
 const exportNotice = ref('')
 async function exportCSV() {
@@ -151,15 +180,25 @@ async function exportCSV() {
     <p v-if="exportNotice" class="notice-warn" role="alert">{{ exportNotice }}</p>
     <DataTable class="panel table-panel" label="请求日志" :loading="loading" :error="err ? err + (rows.length ? '（近 ' + loadedDays + ' 天，第 ' + loadedPage + ' 页）' : '') : ''" :has-data="!!rows.length" :empty="!rows.length" empty-text="当前条件下没有调用记录" loading-text="正在加载请求日志…" @retry="load">
         <table class="tbl logs-table">
-          <thead><tr><th>时间</th><th>状态</th><th>调用模型 / 实际模型</th><th class="key-column">调用密钥</th><th class="num-h usage-column">Tokens / 费用</th><th class="num-h speed-column">速度(t/s)</th><th class="num-h timing-column">首字 / 总耗时</th><th>详情</th></tr></thead>
+          <thead><tr>
+            <th class="time-column">时间</th><th>状态</th><th class="mode-column">模式</th><th class="protocol-column">协议</th><th class="model-column">模型</th><th class="key-column">密钥</th><th class="num-h token-column">Tokens 入/出</th><th class="num-h speed-column">速度(t/s)</th><th class="num-h timing-column">首字/耗时</th><th class="num-h cost-column">费用</th><th class="detail-column">详情</th>
+          </tr></thead>
           <tbody><tr v-for="(h, i) in rows" :key="h.ts + ':' + i">
             <td class="mono time-column">{{ fmtTimeMs(h.ts) }}</td>
-            <td><button class="status-button" :aria-label="'查看' + statusLabel(h.status) + '请求详情'" @click="selected = h"><span class="badge" :class="statusBadge(h.status)">{{ statusLabel(h.status) }}</span></button></td>
-            <td class="model-column"><span class="mobile-log-time dim">{{ fmtTimeMs(h.ts) }}</span><button class="text-link mono model-name" @click="selected = h">{{ h.public_model || '—' }}</button><span class="cell-meta mono" :title="h.upstream_model || '实际模型未记录'"> / {{ h.upstream_model || '实际模型未记录' }}</span></td>
-            <td class="key-column"><span class="key-name" :title="h.key_name || h.key_id || '—'">{{ h.key_name || h.key_id || '—' }}</span><span class="cell-meta"> · {{ h.stream ? '流式' : '非流式' }}</span></td>
-            <td class="num usage-column">{{ fmtTokens(h.total_tokens) }}<span class="cell-meta"> · ¥{{ fmtMoney(h.cost) }}</span></td>
+            <td>
+              <button class="status-button" :title="statusHint(h)" :aria-label="'查看' + statusLabel(h.status) + '请求详情'" @click="selected = h">
+                <span class="badge" :class="statusBadge(h.status)">{{ statusLabel(h.status) }}</span>
+                <span v-if="h.http_status > 0" class="cell-note">HTTP {{ h.http_status }}</span>
+              </button>
+            </td>
+            <td class="mode-column"><span class="badge" :class="h.stream ? 'badge-accent' : 'badge-dim'">{{ modeLabel(h) }}</span></td>
+            <td class="protocol-column"><span class="protocol-tag mono" :title="h.ingress_protocol || '入站协议未记录'">{{ protocolLabel(h.ingress_protocol, '未记录') }}</span></td>
+            <td class="model-column"><span class="mobile-log-time dim">{{ fmtTimeMs(h.ts) }}</span><span class="model-line"><button class="text-link mono model-name" @click="selected = h">{{ h.public_model || '—' }}</button><span class="cell-meta mono" :title="h.upstream_model || '实际模型未记录'"> / {{ h.upstream_model || '实际模型未记录' }}</span></span></td>
+            <td class="key-column"><span class="key-name" :title="h.key_name || h.key_id || '—'">{{ h.key_name || h.key_id || '—' }}</span></td>
+            <td class="num token-column" :title="tokenTitle(h)"><span>{{ fmtTokens(h.input_tokens) }} / {{ fmtTokens(h.output_tokens) }}</span><span class="cell-note">{{ tokenBreakdown(h) }}</span></td>
             <td class="num speed-column">{{ speedText(h) }}</td>
             <td class="num timing-column">{{ duration(h) }}</td>
+            <td class="num cost-column">¥{{ fmtMoney(h.cost) }}</td>
             <td><button class="btn btn-act" :aria-label="'查看 ' + (h.public_model || '请求') + ' 详情'" @click="selected = h">详情</button></td>
           </tr></tbody>
         </table>
@@ -168,12 +207,16 @@ async function exportCSV() {
 
     <DetailDrawer :open="!!selected" title="请求详情" max-width="680px" @close="selected = null">
       <template v-if="selected">
-        <div class="request-heading"><span class="badge" :class="statusBadge(selected.status)">{{ statusLabel(selected.status) }}</span><span class="dim">{{ fmtTimeMs(selected.ts) }} · {{ selected.stream ? '流式' : '非流式' }}</span></div>
+        <div class="request-heading"><span class="badge" :class="statusBadge(selected.status)">{{ statusLabel(selected.status) }}</span><span class="dim">{{ fmtTimeMs(selected.ts) }} · {{ modeLabel(selected) }} · {{ protocolLabel(selected.ingress_protocol) }}</span></div>
         <dl class="request-facts">
+          <div><dt>请求 ID</dt><dd class="mono">{{ selected.request_id || '未记录' }}</dd></div>
+          <div><dt>入站协议 / 模式</dt><dd>{{ protocolLabel(selected.ingress_protocol, '未记录') }} / {{ modeLabel(selected) }}</dd></div>
+          <div v-if="selected.provider_id"><dt>上游 Provider</dt><dd class="mono">{{ selected.provider_id }}</dd></div>
           <div><dt>公开模型名</dt><dd class="mono">{{ selected.public_model || '—' }}</dd></div>
           <div><dt>实际模型</dt><dd class="mono">{{ selected.upstream_model || '未记录' }}</dd></div>
           <div><dt>调用密钥</dt><dd>{{ selected.key_name || selected.key_id || '未记录' }}</dd></div>
-          <div><dt>总 Tokens / 输出</dt><dd>{{ fmtNum(selected.total_tokens) }} / {{ fmtNum(selected.output_tokens) }}</dd></div>
+          <div><dt>Token 用量</dt><dd>输入 {{ fmtNum(selected.input_tokens) }} · 输出 {{ fmtNum(selected.output_tokens) }} · 总计 {{ fmtNum(selected.total_tokens) }}</dd></div>
+          <div><dt>缓存 / 推理</dt><dd>{{ fmtNum(selected.cached_tokens) }} / {{ fmtNum(selected.reasoning_tokens) }} Tokens</dd></div>
           <div><dt>记录费用</dt><dd>¥{{ fmtMoney(selected.cost) }}<span class="fact-note">按调用当时单价固化；0 元不能单独说明是否配价</span></dd></div>
           <div><dt>首字 / 总耗时</dt><dd>{{ duration(selected) }}</dd></div>
           <div><dt>输出速度</dt><dd>{{ selected.tps > 0 ? fmtSpeed(selected.tps) + ' tok/s' : '无可计算样本' }}</dd></div>
@@ -210,7 +253,7 @@ async function exportCSV() {
 .log-toolbar { margin-bottom: 16px; }
 .log-actions, .request-heading { display: flex; justify-content: space-between; align-items: center; gap: 12px; flex-wrap: wrap; font-size: 12px; margin-bottom: 16px; }
 .w-auto { width: auto; }
-.logs-table { min-width: 980px; }
+.logs-table { min-width: 1120px; table-layout: fixed; }
 .logs-table th, .logs-table td { white-space: nowrap; }
 /* 表格内的 mono 文本**必须**在这里重新钉成 nowrap。
    全局 styles.css 有一条 `.table-panel .tbl .mono { white-space: normal;
@@ -223,27 +266,39 @@ async function exportCSV() {
    行高从 38px 撑到 50px —— 「单行」在长名字上直接失效。
    多带一个 class 把特异性抬到 (0,4,0)，就不必再赌注入顺序。 */
 .logs-table .model-name.mono,
-.logs-table .cell-meta.mono { white-space: nowrap; }
+.logs-table .cell-meta.mono,
+.logs-table .protocol-tag.mono,
+.logs-table .cell-note { white-space: nowrap; }
 /* 请求日志是逐条扫描为主，行密度优先。全局 .table-panel td 给 16px
    上下内边距是按「每格有副标题」的形态定的；本表已把副标题折进主行，
    仍沿用会让每行 ~60px，一屏少看近一半记录。 */
 .logs-table td { padding-top: 6px; padding-bottom: 6px; vertical-align: middle; }
 .mobile-log-time { display: none; }
-.logs-table .time-column { width: 142px; white-space: nowrap; }
-.model-column { min-width: 0; max-width: 300px; }
-.model-name { text-align: left; font-weight: 600; overflow-wrap: normal; }
-.key-name { max-width: 160px; overflow: hidden; text-overflow: ellipsis; display: inline-block; vertical-align: bottom; }
-/* max-width 只做「上限」，实际宽度由 table 布局分配；它同时是省略号的生效条件
-   （inline-block + overflow:hidden + text-overflow:ellipsis 缺一不可）。
-   这两个上限是一对约束，改一个必须重量另一个：1280px 视口下表格可用宽 ~997px，
-   各定宽列（时间 142 + 状态 85 + 密钥 ~107 + Tokens 126 + 速度 86 + 耗时 112
-   + 详情 84）已占 ~742px，留给「模型 / 实际模型」的只有 ~255px。
-   实测 model-column 360 + meta 190 时，1280 视口溢出 47px（整表被推到
-   980px 的 min-width 上，出现横向滚动条）；改成 300 + 190 后溢出为 0。 */
-.cell-meta { color: var(--muted); font-size: 12px; overflow: hidden; text-overflow: ellipsis; display: inline-block; max-width: 190px; vertical-align: bottom; }
-.speed-column { width: 86px; }
-.timing-column { width: 112px; }
-.status-button { border: 0; background: transparent; padding: 0; cursor: pointer; }
+.logs-table .time-column { width: 122px; white-space: nowrap; }
+.logs-table th { overflow: hidden; text-overflow: ellipsis; }
+.logs-table th:nth-child(2), .logs-table td:nth-child(2) { width: 80px; }
+.mode-column { width: 60px; }
+.protocol-column { width: 92px; }
+.model-column { min-width: 0; max-width: none; overflow: hidden; }
+.model-line { display: flex; align-items: baseline; min-width: 0; }
+.model-name { flex: 1 1 0; min-width: 0; text-align: left; font-weight: 600; overflow: hidden; text-overflow: ellipsis; }
+.key-name { max-width: 108px; overflow: hidden; text-overflow: ellipsis; display: inline-block; vertical-align: bottom; }
+/* 模型列内部用 flex + min-width:0，让“公开名 / 实际名”按可用宽度一起收缩，
+   而不是各自写死 max-width 后在窄列里互相顶出单元格。
+   当前定宽列是：
+   时间 122 + 状态 80 + 模式 60 + 协议 92 + 密钥 108 + Tokens 122
+   + 速度 100 + 耗时 104 + 费用 76 + 详情 76 ≈ 940px，剩余宽度给模型列。
+   窄于 1500px 时隐藏密钥列（详情里仍可查看），900px 时再隐藏协议/费用，640px 只保留
+   状态、模式与模型（点击模型仍可打开完整详情）。 */
+.cell-meta { flex: 1 1 0; min-width: 0; color: var(--muted); font-size: 12px; overflow: hidden; text-overflow: ellipsis; }
+.cell-note { display: block; margin-top: 2px; color: var(--muted); font-size: 10.5px; line-height: 1.35; overflow: hidden; text-overflow: ellipsis; }
+.protocol-tag { display: inline-block; max-width: 92px; overflow: hidden; text-overflow: ellipsis; vertical-align: bottom; color: var(--muted); }
+.token-column { width: 122px; }
+.speed-column { width: 100px; }
+.timing-column { width: 104px; }
+.cost-column { width: 76px; }
+.detail-column { width: 76px; }
+.status-button { border: 0; background: transparent; padding: 0; cursor: pointer; display: inline-flex; flex-direction: column; align-items: flex-start; gap: 2px; max-width: 82px; }
 .request-facts { margin: 20px 0; }
 .request-facts > div { display: grid; grid-template-columns: 120px minmax(0, 1fr); gap: 16px; padding: 12px 0; border-bottom: 1px solid var(--border); }
 .request-facts dt { color: var(--muted); font-size: 12px; }
@@ -265,13 +320,23 @@ async function exportCSV() {
 .trace-raw code { display: block; margin-top: 6px; }
 .error-detail { white-space: pre-wrap; overflow-wrap: anywhere; border-radius: 10px; padding: 14px; font-size: 12px; line-height: 1.7; background: var(--danger-soft); color: var(--danger-soft-foreground); }
 .notice-warn { margin: 12px 0; padding: 12px; display: flex; flex-wrap: wrap; align-items: center; gap: 12px; border-radius: 10px; background: var(--warning-soft); color: var(--warning-soft-foreground); font-size: 12px; }
-@media (max-width: 1100px) { .logs-table { min-width: 850px; } .key-column { display: none; } }
+@media (max-width: 1500px) {
+  .logs-table { min-width: 1000px; }
+  .key-column { display: none; }
+}
+@media (max-width: 900px) {
+  .logs-table { min-width: 880px; }
+  .protocol-column, .cost-column { display: none; }
+}
 @media (max-width: 640px) {
   .logs-table { min-width: 0; table-layout: fixed; }
-  .usage-column, .speed-column, .timing-column { display: none; }
+  .token-column, .speed-column, .timing-column, .cost-column, .protocol-column, .key-column { display: none; }
   .logs-table th:first-child, .logs-table .time-column, .logs-table th:last-child, .logs-table td:last-child { display: none; }
   .logs-table th:nth-child(2), .logs-table td:nth-child(2) { width: 76px; }
+  .logs-table th:nth-child(3), .logs-table td:nth-child(3) { width: 64px; }
   .model-column { min-width: 0; max-width: none; }
+  .model-line { display: block; }
+  .model-name, .cell-meta { display: block; max-width: none; }
   .mobile-log-time { display: block; font-size: 11px; margin-bottom: 3px; }
   .logs-table .model-column { white-space: normal; }
   .logs-table .mono { white-space: normal; overflow-wrap: anywhere; }

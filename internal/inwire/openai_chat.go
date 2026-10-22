@@ -259,14 +259,14 @@ func (r *OpenAIChatRequest) ToRosetta() *rosetta.ChatRequest {
 
 // ApplyProtocolPrivateExtra 把 OpenAI-Chat 私有请求字段按**目标上游协议**处理：
 // 能等价翻译的必须翻译，不能翻译的按「软偏好丢弃 / 硬约束由网关层拒绝」分别处置。
-// 此前的实现是「目标为 anthropic / openai-responses 就整个 return」，把
+// 此前的实现是「目标为 anthropic / response 就整个 return」，把
 // response_format、tool_choice 等全部静默丢掉 —— 故障转移到不同协议的目标后，
 // 同一请求的行为悄然改变，路由不再语义透明（2026-10-07 P1-8）。
 //
 // 各目标的处置矩阵：
-//   - openai-chat / "" / auto：OpenAI 方言原样直传（含未知协议值 —— 池构建期
+//   - chat / "" / auto：OpenAI 方言原样直传（含未知协议值 —— 池构建期
 //     已拒绝拼写错误的协议名，这里保持旧的宽容行为不做二次拦截）。
-//   - openai-responses：response_format → text.format（等价约束，反向复用
+//   - response：response_format → text.format（等价约束，反向复用
 //     textFormatToResponseFormat 的翻译）、tool_choice 摊平成 Responses 形状、
 //     parallel_tool_calls 直传。penalty / seed / user 无对应物：三者是**软偏好**
 //     （采样倾向、缓存归并、租户标注），丢弃不改变请求的正确性，注释留痕即可。
@@ -283,7 +283,7 @@ func (r *OpenAIChatRequest) ToRosetta() *rosetta.ChatRequest {
 // then discards. Dropping it is the safer outcome.
 func (r *OpenAIChatRequest) ApplyProtocolPrivateExtra(req *rosetta.ChatRequest, protocol string) {
 	switch protocol {
-	case "openai-responses":
+	case "response":
 		// —— 能等价翻译的必须翻译 ——
 		extra := map[string]any{}
 		// response_format → Responses 的 text.format。json_object 直映、
@@ -329,7 +329,7 @@ func (r *OpenAIChatRequest) ApplyProtocolPrivateExtra(req *rosetta.ChatRequest, 
 		return
 	}
 
-	// "" / "openai-chat" / "auto"（及未知值）：OpenAI 方言直传。
+	// "" / "chat" / "auto"（及未知值）：OpenAI 方言直传。
 	extra := map[string]any{}
 	if r.ToolChoice != nil {
 		extra["tool_choice"] = r.ToolChoice

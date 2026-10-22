@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/cn-maul/rosetta-gateway/internal/config"
+	wireproto "github.com/cn-maul/rosetta-gateway/internal/protocol"
 	"github.com/cn-maul/rosetta-gateway/internal/snapshot"
 	"github.com/cn-maul/rosetta-gateway/internal/store"
 	"github.com/cn-maul/rosetta-gateway/internal/upstream"
@@ -110,22 +111,13 @@ type providerResponse struct {
 	CredCount  int `json:"cred_count"`
 }
 
-// validProtocols 是管理 API 接受的 protocol 取值，与 upstream.buildClient
-// 里的 switch 一一对应（那里现在对未知值直接返回错误）。
-//
-// 在配置入口就挡住，是为了避免「保存成功、调用时才报错」：protocol 拼错
-// （比如写成 "openai"）此前会被静默忽略、退化成 SDK 自动探测，请求打到错误的
-// 端点形态上，报出来的错误指向下游，排查方向从一开始就是错的。
-var validProtocols = []string{"auto", "openai-chat", "openai-responses", "anthropic"}
-
-func validateProtocol(protocol string) error {
-	for _, p := range validProtocols {
-		if protocol == p {
-			return nil
-		}
+// normalizeProtocol 在 API 边界接收旧版配置名，但内部始终只写入新协议值。
+func normalizeProtocol(value string) (string, error) {
+	value = wireproto.Normalize(value)
+	if !wireproto.Valid(value) {
+		return "", fmt.Errorf("protocol 必须是 %s 之一，收到 %q", wireproto.AllowedValues, value)
 	}
-	return fmt.Errorf("protocol 必须是 %s 之一，收到 %q",
-		strings.Join(validProtocols, " / "), protocol)
+	return value, nil
 }
 
 // writeProviderWriteError 把 providers 写操作的失败映射成合适的状态码。
@@ -204,9 +196,10 @@ func (h *ProviderHandler) Create(w http.ResponseWriter, r *http.Request) {
 	}
 	protocol := strings.TrimSpace(req.Protocol)
 	if protocol == "" {
-		protocol = "openai-chat"
+		protocol = wireproto.Chat
 	}
-	if err := validateProtocol(protocol); err != nil {
+	protocol, err := normalizeProtocol(protocol)
+	if err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
@@ -319,8 +312,8 @@ func (h *ProviderHandler) Update(w http.ResponseWriter, r *http.Request, id stri
 		existing.Name = name
 	}
 	if req.Protocol != nil {
-		protocol := strings.TrimSpace(*req.Protocol)
-		if err := validateProtocol(protocol); err != nil {
+		protocol, err := normalizeProtocol(*req.Protocol)
+		if err != nil {
 			writeError(w, http.StatusBadRequest, err.Error())
 			return
 		}

@@ -17,8 +17,7 @@ func seedPriceModels(t *testing.T, st *store.Store, n int) []string {
 	for i := 0; i < n; i++ {
 		id := "m" + string(rune('a'+i))
 		if err := st.CreateUpstreamModel(t.Context(), &store.UpstreamModel{
-			ID: id, ProviderID: "p1", ModelID: "model-" + id, Enabled: true,
-		}); err != nil {
+			ID: id, ProviderID: "p1", ModelID: "model-" + id}); err != nil {
 			t.Fatalf("seed model %s: %v", id, err)
 		}
 		ids = append(ids, id)

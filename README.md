@@ -17,7 +17,8 @@
 - **链式故障转移**：一条路由挂一条有序上游链，目标熔断 + 凭据冷却 +
   half-open 探测，写出任何字节前自动转移。
 - **多用户与权限**：users 表是唯一身份来源（JWT 会话 + `auth_version` 栅栏），
-  分组模型白名单，key 级收紧不放宽，管理写操作全量审计。
+  分组模型白名单，key 级收紧不放宽，管理写操作全量审计。普通用户不开放注册，
+  由管理员签发 24 小时有效的一次性设密链接。
 - **配额与限速**：用户级 / key 级两级终身 token 配额（原子预占）+
   RPM/TPM 固定窗口限速。
 - **余额闸门**：用户级人民币余额（亚分精度累积、待结算账本），
@@ -45,13 +46,16 @@ docker run -d \
 打开 `http://127.0.0.1:8666/admin/`，首次进入是**一次性**的「首次设置密码」表单
 （设完即永久关闭免鉴权窗口），设完即进入后台。
 
-表单需要填**引导令牌**。推荐用 `ROSETTA_GW_BOOTSTRAP_TOKEN` 预先指定
-（≥ 32 字节，值由部署者自己持有）；未指定时网关会生成一枚随机令牌，
-**只从数据库读回**（不打印到日志）—— 见 [DOCKER.md](DOCKER.md) 的取用命令。
-原因：容器内监听 `0.0.0.0`，而完成引导的端点是免鉴权的 —— 没有令牌时
-「谁先连到端口谁就是管理员」。
-详见 [DOCKER.md](DOCKER.md)（含令牌生命周期与备份注意事项）；容器部署的目录布局、
-挂载方式与升级流程也在那里。
+表单只要求设置管理员密码，不需要任何额外令牌。完成引导的端点在设密前是免鉴权的，
+因此部署后应**立即**打开 `/admin/` 完成设置；局域网内能访问该端口的人在该窗口内
+都可以抢先初始化。窗口只开一次，设完即永久关闭。容器部署的目录布局、挂载方式与
+升级流程见 [DOCKER.md](DOCKER.md)。
+
+普通用户同样不由系统开放注册。管理员在「用户与权限」中新建普通用户时把初始密码
+留空，界面会生成一条一次性设密链接；把链接发给本人后，对方打开
+`/admin/#/set-password?token=...` 设置密码，完成后直接登录。链接 24 小时内有效、
+只能使用一次，重新生成、管理员改密、禁用或删除用户都会让旧链接失效。服务端只保存
+token 的 SHA-256 哈希，链接放在 URL hash 中，因此不会进入首次 HTTP 访问日志。
 
 > **端口映射默认绑回环（`127.0.0.1:8666:8666`）是刻意的**（2026-10-21 修 A10-P0-1）。
 > 网关自身不做 TLS：管理员会话 cookie、JWT、上游凭据与下游 `Authorization` 头
@@ -113,6 +117,11 @@ curl http://<主机>:8666/v1/chat/completions \
 OpenAI 系客户端；额度查询端点（`/dashboard/billing/*`、`/v1/organization/*`）
 与 one-api 系工具兼容。
 
+接入 OpenCode Go 作为上游时，网关会把下游的 `x-opencode-session` 转发给
+`opencode.ai` 及其子域，并把 `User-Agent` 设为 `rosetta-gateway`。多轮会话应让
+客户端持续发送同一个稳定的 `x-opencode-session`；未发送时网关只用本次请求 ID
+兜底，请求可以通过，但无法保证 OpenCode 的会话路由与缓存亲和性。
+
 ## 安全模型（摘要）
 
 - **管理面**：users 表 + JWT 会话一条通道，无旁路凭据；首次初始化窗口一次性，
@@ -139,11 +148,15 @@ OpenAI 系客户端；额度查询端点（`/dashboard/billing/*`、`/v1/organiz
 ## 开发
 
 ```bash
-go build ./... && go vet ./... && go test ./...   # 后端门禁
+go build ./cmd/... ./internal/... && go vet ./cmd/... ./internal/...
+go test ./cmd/... ./internal/... -count=1
 cd web && npm ci && npm run typecheck && npm run build && npm run sync
 # sync（= node sync-embed.mjs）把 web/dist 同步进 internal/webui/dist（embed 源）；
 # CI 的 webui-sync job 会重新构建一遍并与入库产物做 git diff，不一致即红灯
 ```
+
+开发过程中可以按改动批次验证，不必每改一行就完整跑一遍；一组相关改动完成、
+准备提交或切换任务时再跑上述后端与前端门禁。
 
 Windows 上一键做同样的事：`.\build.ps1`（`-NoWeb` 跳过前端、`-Typecheck` 加类型检查）；
 启动用 `.\gateway.ps1`（前台）或 `.\gateway.ps1 -Detached`（后台，日志落 `bin\logs\`），

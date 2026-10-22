@@ -22,7 +22,10 @@
 
 import { reactive } from 'vue'
 import { rangeBounds } from './range'
-import type { ApiError, BootstrapStatus, Me, SessionStatus, LoginResult, ConfigImportResult } from './types'
+import type {
+  ApiError, BootstrapStatus, Me, SessionStatus, LoginResult, ConfigImportResult,
+  PasswordSetupLink, PasswordSetupStatus,
+} from './types'
 
 const TOKEN_KEY = 'rosetta_gw_admin_token'
 
@@ -72,15 +75,6 @@ export const session = reactive({
   needsSetup: false,
   /** 待初始化的账号名，供表单标题显示（「为 admin 设置密码」）。 */
   setupUsername: '',
-  /**
-   * 本安装的引导窗口是否需要一次性令牌。
-   *
-   * 为真时 setup 表单要额外显示一个令牌输入框。**只存布尔，绝不存令牌
-   * 本身**：令牌只在启动日志里出现一次，用户粘进来就该只活在这一次的
-   * 提交里，落到 localStorage 会让任何能读浏览器存储的人拿到它
-   * （而它唯一的用途就是打开那个免鉴权写接口）。
-   */
-  requiresBootstrapToken: false,
   /** /session 探测是否成功。false 时界面显示「无法连接」而不是登录框。 */
   backendReady: false,
   checked: false,
@@ -132,13 +126,11 @@ export async function loadSession(): Promise<void> {
     const bs = await get<BootstrapStatus>('/bootstrap')
     session.needsSetup = bs.needs_setup
     session.setupUsername = bs.username ?? ''
-    session.requiresBootstrapToken = bs.requires_token ?? false
   } catch {
     // 拿不到引导状态不是致命问题：按「已初始化」处理，用户会看到登录表单。
     // 真实情况下（全新部署）它一定能拿到 —— 该端点免鉴权。
     session.needsSetup = false
     session.setupUsername = ''
-    session.requiresBootstrapToken = false
   }
 
   try {
@@ -176,15 +168,62 @@ export async function login(username: string, password: string) {
  * 成功后 needs_setup 立刻置 false：这个免鉴权窗口就此关闭，
  * 界面上不该再有任何「设密码」的入口。
  */
-export async function bootstrapSetup(password: string, token?: string) {
-  // token 只在这一个请求体里出现：既不进 localStorage，也不进任何
-  // 全局状态。服务端对没配令牌的旧部署同样接受这个字段（空串 = 不校验）。
-  const r = await post<LoginResult>('/bootstrap', { password, token: token ?? '' })
+export async function bootstrapSetup(password: string) {
+  const r = await post<LoginResult>('/bootstrap', { password })
   saveToken(r.token)
   session.me = await get<Me>('/me')
   session.needsSetup = false
   session.setupUsername = ''
-  session.requiresBootstrapToken = false
+  return r
+}
+
+/**
+ * Public password-setup requests must not inherit the normal 401 handler:
+ * an invalid invitation is not an expired admin session, and clearing a
+ * still-valid local session would be an unrelated side effect.
+ */
+async function publicPost<T>(path: string, body: unknown): Promise<T> {
+  let res: Response
+  try {
+    res = await fetch('/admin/api' + path, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+      signal: AbortSignal.timeout(30_000),
+    })
+  } catch (e) {
+    const name = e instanceof DOMException ? e.name : ''
+    if (name === 'TimeoutError' || name === 'AbortError') {
+      throw new ApiFail(0, '请求超时，请稍后重试')
+    }
+    throw new ApiFail(0, '网络错误：' + (e instanceof Error ? e.message : String(e)))
+  }
+
+  const text = await res.text()
+  let data: any = null
+  try {
+    data = text ? JSON.parse(text) : null
+  } catch {
+    /* non-JSON error response */
+  }
+  if (!res.ok) {
+    const err = data?.error as ApiError | undefined
+    throw new ApiFail(res.status, err?.message ?? `请求失败 (HTTP ${res.status})`)
+  }
+  return data as T
+}
+
+export function checkPasswordSetup(token: string) {
+  return publicPost<PasswordSetupStatus>('/password-setup/check', { token })
+}
+
+/**
+ * Complete a one-time invitation and directly establish the new user session.
+ */
+export async function completePasswordSetup(token: string, password: string) {
+  const r = await publicPost<LoginResult>('/password-setup', { token, password })
+  saveToken(r.token)
+  session.me = await get<Me>('/me')
   return r
 }
 
@@ -413,6 +452,7 @@ import type {
   KeyCreateResponse,
   Settings,
   Stats,
+  StatsOverview,
   UsageGroupEntry,
   UsageByUserPage,
   UsageHistoryPage,
@@ -679,6 +719,14 @@ export const api = {
   /** 管理员重置他人密码。会递增该用户的 auth_version，其所有会话立即失效。 */
   resetUserPassword: (id: string, password: string) =>
     post(`/users/${id}/password`, { password }),
+  /**
+   * 管理员为尚未设密的普通用户生成一次性设密链接。
+   *
+   * 链接默认有效 24 小时，重新生成会让旧链接立即失效。服务端只存 token
+   * 的哈希值；明文 token 只出现在本次响应里。
+   */
+  createPasswordSetupLink: (id: string) =>
+    post<PasswordSetupLink>(`/users/${id}/password-setup`),
   /** 自助改密码。会递增自己的 auth_version，**当前会话也随即失效**。 */
   changeMyPassword: (old_password: string, new_password: string) =>
     post('/me/password', { old_password, new_password }),
@@ -760,6 +808,7 @@ export const api = {
   // 后端只对管理员返回该字段；普通用户传了也只会缺席。
   stats: (from = 0, to = Date.now(), includeLifetime = false) =>
     get<Stats>(`/stats?from=${from}&to=${to}${includeLifetime ? '&include_lifetime=true' : ''}`),
+  statsOverview: () => get<StatsOverview>('/stats/overview'),
   settings: () => get<Settings>('/settings'),
   // 设置里含运行时全局默认（超时 + 故障转移策略），这些值由快照驱动转发路径，
   // 所以必须走 mutate() 触发 reload 才能即时生效（模型容量默认也一并保存）。

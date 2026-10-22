@@ -193,7 +193,7 @@ var balanceDialect = detectBalanceDialect
 
 // detectBalanceDialect 按「先看端点特征、再回落协议」的顺序选择查询方式。
 //
-// 端点特征优先于协议：同一个 openai-chat 协议下，api.openai.com 有 billing
+// 端点特征优先于协议：同一个 chat 协议下，api.openai.com 有 billing
 // 端点而绝大多数中转站没有。若按协议先行，每个中转站都会被发一次注定 404
 // 的请求，而「这个上游不支持」与「这个 key 欠费了」在上游侧返回的东西
 // 无法区分。

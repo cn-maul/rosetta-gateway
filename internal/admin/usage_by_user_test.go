@@ -49,7 +49,7 @@ func seedByUser(t *testing.T, st *store.Store, userID string, ts int64, tokens i
 	if err := st.CreateUsageRecord(ctx, &store.UsageRecord{
 		ID: "rec-" + userID, Ts: ts, UserID: userID, AccessKeyID: "k-" + userID,
 		PublicModel: "m", ProviderID: "p1", UpstreamModel: "priced",
-		IngressProtocol: "openai-chat",
+		IngressProtocol: "chat",
 		InputTokens:     tokens, TotalTokens: tokens,
 		Status: "ok", HTTPStatus: 200, UsageState: "reported",
 	}); err != nil {
@@ -66,8 +66,7 @@ func newByUserStore(t *testing.T) *store.Store {
 	t.Helper()
 	st := newTestStore(t)
 	if err := st.CreateUpstreamModel(t.Context(), &store.UpstreamModel{
-		ID: "priced", ProviderID: "p1", ModelID: "priced", Enabled: true,
-		PriceInput: 1.0,
+		ID: "priced", ProviderID: "p1", ModelID: "priced", PriceInput: 1.0,
 	}); err != nil {
 		t.Fatalf("seed priced model: %v", err)
 	}

@@ -11,7 +11,7 @@ func TestProbe_RecordAndSummary(t *testing.T) {
 	st := testStore(t, t.TempDir()+"/p.db")
 	ctx := context.Background()
 	seedProvider(t, st, "p1")
-	if err := st.CreateUpstreamModel(ctx, &UpstreamModel{ID: "m1", ProviderID: "p1", ModelID: "x", Enabled: true}); err != nil {
+	if err := st.CreateUpstreamModel(ctx, &UpstreamModel{ID: "m1", ProviderID: "p1", ModelID: "x"}); err != nil {
 		t.Fatalf("model: %v", err)
 	}
 
@@ -56,7 +56,7 @@ func TestProbe_ConsecutiveFail(t *testing.T) {
 	st := testStore(t, t.TempDir()+"/p.db")
 	ctx := context.Background()
 	seedProvider(t, st, "p1")
-	if err := st.CreateUpstreamModel(ctx, &UpstreamModel{ID: "m1", ProviderID: "p1", ModelID: "x", Enabled: true}); err != nil {
+	if err := st.CreateUpstreamModel(ctx, &UpstreamModel{ID: "m1", ProviderID: "p1", ModelID: "x"}); err != nil {
 		t.Fatalf("model: %v", err)
 	}
 
@@ -89,7 +89,7 @@ func TestProbe_Timeline(t *testing.T) {
 	st := testStore(t, t.TempDir()+"/p.db")
 	ctx := context.Background()
 	seedProvider(t, st, "p1")
-	if err := st.CreateUpstreamModel(ctx, &UpstreamModel{ID: "m1", ProviderID: "p1", ModelID: "x", Enabled: true}); err != nil {
+	if err := st.CreateUpstreamModel(ctx, &UpstreamModel{ID: "m1", ProviderID: "p1", ModelID: "x"}); err != nil {
 		t.Fatalf("model: %v", err)
 	}
 
@@ -154,7 +154,7 @@ func TestProbe_TimelineMultiModel(t *testing.T) {
 	ctx := context.Background()
 	seedProvider(t, st, "p1")
 	for _, id := range []string{"m1", "m2"} {
-		if err := st.CreateUpstreamModel(ctx, &UpstreamModel{ID: id, ProviderID: "p1", ModelID: id, Enabled: true}); err != nil {
+		if err := st.CreateUpstreamModel(ctx, &UpstreamModel{ID: id, ProviderID: "p1", ModelID: id}); err != nil {
 			t.Fatalf("model %s: %v", id, err)
 		}
 	}
@@ -199,7 +199,7 @@ func TestProbe_Prune(t *testing.T) {
 	st := testStore(t, t.TempDir()+"/p.db")
 	ctx := context.Background()
 	seedProvider(t, st, "p1")
-	if err := st.CreateUpstreamModel(ctx, &UpstreamModel{ID: "m1", ProviderID: "p1", ModelID: "x", Enabled: true}); err != nil {
+	if err := st.CreateUpstreamModel(ctx, &UpstreamModel{ID: "m1", ProviderID: "p1", ModelID: "x"}); err != nil {
 		t.Fatalf("model: %v", err)
 	}
 

@@ -162,7 +162,7 @@ func TestReserveUserQuota_CountsBothUsedAndReserved(t *testing.T) {
 	mustCreateKey(t, st, "k1", 0)
 	if err := st.CreateUsageRecord(ctx, &UsageRecord{
 		ID: "u1", AccessKeyID: "k1", UserID: "u1",
-		PublicModel: "flash", IngressProtocol: "openai-chat",
+		PublicModel: "flash", IngressProtocol: "chat",
 		TotalTokens: 300, UsageState: "reported", Status: "ok",
 	}); err != nil {
 		t.Fatalf("seed usage: %v", err)
@@ -297,7 +297,7 @@ func TestReserveUserQuota_FullFlowCountsActualOnce(t *testing.T) {
 
 	if err := st.CreateUsageRecord(ctx, &UsageRecord{
 		ID: "u1", AccessKeyID: "k1", UserID: "u1",
-		PublicModel: "flash", IngressProtocol: "openai-chat",
+		PublicModel: "flash", IngressProtocol: "chat",
 		TotalTokens: 180, UsageState: "reported", Status: "ok",
 	}); err != nil {
 		t.Fatalf("usage: %v", err)

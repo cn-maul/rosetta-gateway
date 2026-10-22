@@ -195,7 +195,7 @@ func TestOrgBucket_TimestampsAreUnixSeconds(t *testing.T) {
 	}
 	if err := db.CreateUsageRecord(context.Background(), &store.UsageRecord{
 		ID: "u1", Ts: ts, AccessKeyID: "k1", UserID: testUserID, PublicModel: "flash", ProviderID: "p1",
-		UpstreamModel: "p1-model", IngressProtocol: "openai-chat",
+		UpstreamModel: "p1-model", IngressProtocol: "chat",
 		InputTokens: 10, OutputTokens: 5, TotalTokens: 15, Status: "ok", HTTPStatus: 200,
 	}); err != nil {
 		t.Fatal(err)

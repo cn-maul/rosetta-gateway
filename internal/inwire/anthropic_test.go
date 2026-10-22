@@ -119,7 +119,7 @@ func TestDecodeAnthropicMessages_ToolChoice(t *testing.T) {
 		"tool_choice":{"type":"tool","name":"weather"},
 		"messages":[{"role":"user","content":"hi"}]}`)
 	req := good.ToRosetta()
-	good.ApplyUpstreamExtras(req, "openai-chat")
+	good.ApplyUpstreamExtras(req, "chat")
 	if tc, ok := req.Extra["tool_choice"].(map[string]any); !ok || tc["type"] != "function" {
 		t.Fatalf("openai tool_choice translation: %+v", req.Extra)
 	}
@@ -138,7 +138,7 @@ func TestDecodeAnthropicMessages_ToolChoice(t *testing.T) {
 	}
 	// responses 上游拿翻译后的形状（P1-8：不再整个跳过、静默丢 tool_choice）。
 	req3 := anyChoice.ToRosetta()
-	anyChoice.ApplyUpstreamExtras(req3, "openai-responses")
+	anyChoice.ApplyUpstreamExtras(req3, "response")
 	if req3.Extra["tool_choice"] != "required" {
 		t.Fatalf("responses tool_choice translation (any→required): %+v", req3.Extra)
 	}
@@ -146,7 +146,7 @@ func TestDecodeAnthropicMessages_ToolChoice(t *testing.T) {
 	req4 := decodeAnthropic(t, `{"model":"m","max_tokens":8,"top_k":40,
 		"messages":[{"role":"user","content":"hi"}]}`)
 	req4Ros := req4.ToRosetta()
-	req4.ApplyUpstreamExtras(req4Ros, "openai-responses")
+	req4.ApplyUpstreamExtras(req4Ros, "response")
 	if len(req4Ros.Extra) != 0 {
 		t.Fatalf("responses upstream must not receive top_k, got %+v", req4Ros.Extra)
 	}
@@ -158,7 +158,7 @@ func TestDecodeAnthropicMessages_ToolChoice(t *testing.T) {
 	}
 }
 
-// anthropic → openai-responses：tool_choice 等价翻译矩阵（P1-8 补齐的方向）。
+// anthropic → response：tool_choice 等价翻译矩阵（P1-8 补齐的方向）。
 func TestAnthropic_ResponsesToolChoiceMatrix(t *testing.T) {
 	cases := []struct {
 		name       string
@@ -176,7 +176,7 @@ func TestAnthropic_ResponsesToolChoiceMatrix(t *testing.T) {
 			got := decodeAnthropic(t, `{"model":"m","max_tokens":8,
 				"tool_choice":`+c.toolChoice+`,"messages":[{"role":"user","content":"hi"}]}`)
 			req := got.ToRosetta()
-			got.ApplyUpstreamExtras(req, "openai-responses")
+			got.ApplyUpstreamExtras(req, "response")
 			if c.wantJSON == "" {
 				if _, exists := req.Extra["tool_choice"]; exists {
 					t.Fatalf("tool_choice 应被丢弃，实际 %v", req.Extra["tool_choice"])

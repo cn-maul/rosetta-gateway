@@ -24,7 +24,7 @@ func Open(dbPath string, logger *slog.Logger) (*Store, error) {
 		// 0700 而不是 0755（2026-10-21 修 A10-P1-3）。
 		//
 		// 库里有 password_hash、access_keys.key_hash、
-		// provider_credentials.api_key_enc、app_settings.bootstrap_token
+		// provider_credentials.api_key_enc
 		// 与完整的 audit_log。目录是 0755 时，同机的其他本地账号可以
 		// 进去把库整个拷走离线爆破。
 		//

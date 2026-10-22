@@ -23,14 +23,14 @@ import (
 func initProbeScopedSnapshot(t *testing.T, users map[string]*snapshot.UserSnapshot) {
 	t.Helper()
 	ri := routing.NewRouteIndex()
-	ri.AddProvider(&routing.ProviderRef{ID: "p1", Slug: "good", Protocol: "openai-chat", Enabled: true})
+	ri.AddProvider(&routing.ProviderRef{ID: "p1", Slug: "good", Protocol: "chat", Enabled: true})
 	for _, n := range []string{"flash", "pro", "opus"} {
 		ri.AddUpstreamModel(&routing.UpstreamModel{
-			ID: "up/" + n, ProviderID: "p1", ModelID: n, Enabled: true,
-		})
+			ID: "up/" + n, ProviderID: "p1", ModelID: n})
 		ri.AddRoute(&routing.Route{
 			ID: "r-" + n, PublicName: n,
-			ProviderID: "p1", UpstreamModelID: "up/" + n, Enabled: true,
+			ProviderID: "p1", UpstreamModelID: "up/" + n,
+			Enabled: true,
 		})
 	}
 	if users == nil {
@@ -57,7 +57,7 @@ func seedProbe(t *testing.T, st *store.Store, modelID string, ok bool) {
 	// 往往要给多个模型写记录。
 	if existing, err := st.GetProvider(ctx, "p1"); err == nil && existing == nil {
 		if err := st.CreateProvider(ctx, &store.Provider{
-			ID: "p1", Slug: "good", Name: "good", Protocol: "openai-chat",
+			ID: "p1", Slug: "good", Name: "good", Protocol: "chat",
 			Endpoint: "https://example.invalid/v1", Enabled: true,
 		}); err != nil {
 			t.Fatalf("seed provider: %v", err)
@@ -68,8 +68,7 @@ func seedProbe(t *testing.T, st *store.Store, modelID string, ok bool) {
 		// 已有行，跳过插入。
 	} else {
 		err := st.CreateUpstreamModel(ctx, &store.UpstreamModel{
-			ID: modelID, ProviderID: "p1", ModelID: modelID, Enabled: true,
-		})
+			ID: modelID, ProviderID: "p1", ModelID: modelID})
 		if err != nil {
 			t.Fatalf("seed upstream model %s: %v", modelID, err)
 		}

@@ -35,7 +35,6 @@ func NewModelHandler(st *store.Store, masterKey []byte, cfg *config.Config) *Mod
 type modelRequest struct {
 	ModelID         *string `json:"model_id"`
 	DisplayName     *string `json:"display_name"`
-	Enabled         *bool   `json:"enabled"`
 	ContextWindow   *int    `json:"context_window"`
 	MaxOutputTokens *int    `json:"max_output_tokens"`
 
@@ -133,7 +132,6 @@ type modelResponse struct {
 	ProviderID      string  `json:"provider_id"`
 	ModelID         string  `json:"model_id"`
 	DisplayName     string  `json:"display_name"`
-	Enabled         bool    `json:"enabled"`
 	ContextWindow   int     `json:"context_window"`
 	MaxOutputTokens int     `json:"max_output_tokens"`
 	PriceInput      float64 `json:"price_input"`
@@ -281,17 +279,11 @@ func (h *ModelHandler) Create(w http.ResponseWriter, r *http.Request, providerID
 		return
 	}
 
-	enabled := true
-	if req.Enabled != nil {
-		enabled = *req.Enabled
-	}
-
 	m := &store.UpstreamModel{
 		ID:              generateID(),
 		ProviderID:      providerID,
 		ModelID:         modelID,
 		DisplayName:     strings.TrimSpace(derefStr(req.DisplayName)),
-		Enabled:         enabled,
 		ContextWindow:   ctxWindow,
 		MaxOutputTokens: maxOut,
 		PriceInput:      priceIn,
@@ -353,9 +345,6 @@ func (h *ModelHandler) Update(w http.ResponseWriter, r *http.Request, id string)
 	// 可清空字段：空串即清空
 	if req.DisplayName != nil {
 		existing.DisplayName = strings.TrimSpace(*req.DisplayName)
-	}
-	if req.Enabled != nil {
-		existing.Enabled = *req.Enabled
 	}
 	// 传 0 = 显式清空（落 NULL）；负数是非法输入
 	if req.ContextWindow != nil {
@@ -594,6 +583,10 @@ func probeErrorHint(err error) string {
 	if !errors.As(err, &apiErr) {
 		return "上游连接失败或超时：检查 endpoint 是否可达，以及网络与代理设置"
 	}
+	message := strings.ToLower(apiErr.Message)
+	if strings.Contains(message, "missingsessionid") || strings.Contains(message, "x-opencode-session") {
+		return "OpenCode 要求会话标识：确认客户端发送 x-opencode-session，并让网关转发该头"
+	}
 	switch apiErr.StatusCode {
 	case http.StatusUnauthorized:
 		return "凭据无效或已过期：更新该上游的 API Key"
@@ -809,7 +802,6 @@ func (h *ModelHandler) ImportModels(w http.ResponseWriter, r *http.Request, prov
 			ProviderID:      providerID,
 			ModelID:         strings.TrimSpace(it.ModelID),
 			DisplayName:     it.DisplayName,
-			Enabled:         true,
 			ContextWindow:   ctxWindow,
 			MaxOutputTokens: maxOut,
 		})
@@ -864,7 +856,6 @@ func toModelResponse(m store.UpstreamModel) modelResponse {
 		ProviderID:       m.ProviderID,
 		ModelID:          m.ModelID,
 		DisplayName:      m.DisplayName,
-		Enabled:          m.Enabled,
 		ContextWindow:    m.ContextWindow,
 		MaxOutputTokens:  m.MaxOutputTokens,
 		PriceInput:       m.PriceInput,

@@ -78,7 +78,6 @@ func RebuildFromDB(ctx context.Context, st *store.Store, failures []ProviderFail
 			ID:              m.ID,
 			ProviderID:      m.ProviderID,
 			ModelID:         m.ModelID,
-			Enabled:         m.Enabled,
 			ContextWindow:   m.ContextWindow,
 			MaxOutputTokens: m.MaxOutputTokens,
 			// 思考能力随快照下发：数据面按它剥掉/夹紧思考设置，

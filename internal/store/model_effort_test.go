@@ -11,7 +11,7 @@ import (
 func newModelTestProvider(t *testing.T, st *Store) string {
 	t.Helper()
 	p := &Provider{
-		ID: "p1", Slug: "p1", Name: "P1", Protocol: "openai-chat",
+		ID: "p1", Slug: "p1", Name: "P1", Protocol: "chat",
 		Endpoint: "https://example.test", Enabled: true,
 	}
 	if err := st.CreateProvider(context.Background(), p); err != nil {
@@ -31,8 +31,7 @@ func TestEffortLevels_RoundTrip(t *testing.T) {
 	pid := newModelTestProvider(t, st)
 
 	m := &UpstreamModel{
-		ID: "m1", ProviderID: pid, ModelID: "gpt-5", Enabled: true,
-		EffortLevels: []effort.Level{effort.Low, effort.High, effort.XHigh},
+		ID: "m1", ProviderID: pid, ModelID: "gpt-5", EffortLevels: []effort.Level{effort.Low, effort.High, effort.XHigh},
 	}
 	if err := st.CreateUpstreamModel(ctx, m); err != nil {
 		t.Fatalf("create model: %v", err)
@@ -69,7 +68,7 @@ func TestEffortLevels_未配置与未知档位(t *testing.T) {
 	st := testStore(t, t.TempDir()+"/effort2.db")
 	pid := newModelTestProvider(t, st)
 
-	plain := &UpstreamModel{ID: "m1", ProviderID: pid, ModelID: "gpt-4o", Enabled: true}
+	plain := &UpstreamModel{ID: "m1", ProviderID: pid, ModelID: "gpt-4o"}
 	if err := st.CreateUpstreamModel(ctx, plain); err != nil {
 		t.Fatalf("create: %v", err)
 	}
@@ -79,8 +78,7 @@ func TestEffortLevels_未配置与未知档位(t *testing.T) {
 	}
 
 	weird := &UpstreamModel{
-		ID: "m2", ProviderID: pid, ModelID: "custom-thinker", Enabled: true,
-		EffortLevels: []effort.Level{effort.High}, UnknownLevels: []string{"ultra_deep"},
+		ID: "m2", ProviderID: pid, ModelID: "custom-thinker", EffortLevels: []effort.Level{effort.High}, UnknownLevels: []string{"ultra_deep"},
 	}
 	if err := st.CreateUpstreamModel(ctx, weird); err != nil {
 		t.Fatalf("create: %v", err)
@@ -103,8 +101,7 @@ func TestEffortLevels_清除(t *testing.T) {
 	pid := newModelTestProvider(t, st)
 
 	m := &UpstreamModel{
-		ID: "m1", ProviderID: pid, ModelID: "gpt-5", Enabled: true,
-		EffortLevels: []effort.Level{effort.High},
+		ID: "m1", ProviderID: pid, ModelID: "gpt-5", EffortLevels: []effort.Level{effort.High},
 	}
 	if err := st.CreateUpstreamModel(ctx, m); err != nil {
 		t.Fatalf("create: %v", err)
@@ -149,9 +146,8 @@ func TestUpsertModel_不覆盖已有挡位但空时回填(t *testing.T) {
 	pid := newModelTestProvider(t, st)
 
 	orig := &UpstreamModel{
-		ID: "m1", ProviderID: pid, ModelID: "gpt-5", Enabled: true,
-		EffortLevels: []effort.Level{effort.High, effort.XHigh},
-		PriceInput:   3.0,
+		ID: "m1", ProviderID: pid, ModelID: "gpt-5", EffortLevels: []effort.Level{effort.High, effort.XHigh},
+		PriceInput: 3.0,
 	}
 	if err := st.UpsertUpstreamModel(ctx, orig); err != nil {
 		t.Fatalf("upsert 1: %v", err)
@@ -159,8 +155,7 @@ func TestUpsertModel_不覆盖已有挡位但空时回填(t *testing.T) {
 
 	// 重新导入，且这次**带了**挡位（上游报了）：已有配置必须保留。
 	if err := st.UpsertUpstreamModel(ctx, &UpstreamModel{
-		ID: "m2", ProviderID: pid, ModelID: "gpt-5", Enabled: true,
-		EffortLevels: []effort.Level{effort.Low, effort.Medium},
+		ID: "m2", ProviderID: pid, ModelID: "gpt-5", EffortLevels: []effort.Level{effort.Low, effort.Medium},
 	}); err != nil {
 		t.Fatalf("upsert 2: %v", err)
 	}
@@ -177,14 +172,12 @@ func TestUpsertModel_不覆盖已有挡位但空时回填(t *testing.T) {
 
 	// 未配置过的模型：上游报了就应该被回填 —— 这正是本次要修的能力。
 	if err := st.UpsertUpstreamModel(ctx, &UpstreamModel{
-		ID: "m3", ProviderID: pid, ModelID: "fresh", Enabled: true,
-	}); err != nil {
+		ID: "m3", ProviderID: pid, ModelID: "fresh"}); err != nil {
 		t.Fatalf("upsert 3: %v", err)
 	}
 	// 模拟「首次导入时上游就报了」：清空后用带挡位的 payload 写入。
 	if err := st.UpsertUpstreamModel(ctx, &UpstreamModel{
-		ID: "m4", ProviderID: pid, ModelID: "fresh", Enabled: true,
-		EffortLevels: []effort.Level{effort.Low, effort.Medium, effort.Max},
+		ID: "m4", ProviderID: pid, ModelID: "fresh", EffortLevels: []effort.Level{effort.Low, effort.Medium, effort.Max},
 	}); err != nil {
 		t.Fatalf("upsert 4: %v", err)
 	}
@@ -194,8 +187,7 @@ func TestUpsertModel_不覆盖已有挡位但空时回填(t *testing.T) {
 	}
 	// 再来一次不带挡位的导入：已回填的值必须还在（不回退）。
 	if err := st.UpsertUpstreamModel(ctx, &UpstreamModel{
-		ID: "m5", ProviderID: pid, ModelID: "fresh", Enabled: true,
-	}); err != nil {
+		ID: "m5", ProviderID: pid, ModelID: "fresh"}); err != nil {
 		t.Fatalf("upsert 5: %v", err)
 	}
 	got, _ = st.GetUpstreamModel(ctx, "m3")
@@ -213,8 +205,7 @@ func TestUpsertModel_新模型可写入挡位(t *testing.T) {
 	pid := newModelTestProvider(t, st)
 
 	if err := st.UpsertUpstreamModel(ctx, &UpstreamModel{
-		ID: "m1", ProviderID: pid, ModelID: "cn:space-bunny", Enabled: true,
-		EffortLevels: []effort.Level{effort.Low, effort.Medium, effort.High, effort.XHigh, effort.Max},
+		ID: "m1", ProviderID: pid, ModelID: "cn:space-bunny", EffortLevels: []effort.Level{effort.Low, effort.Medium, effort.High, effort.XHigh, effort.Max},
 	}); err != nil {
 		t.Fatalf("upsert: %v", err)
 	}
@@ -242,16 +233,14 @@ func TestUpsertModel_supports_thinking_三态(t *testing.T) {
 
 	yes := true
 	if err := st.UpsertUpstreamModel(ctx, &UpstreamModel{
-		ID: "m1", ProviderID: pid, ModelID: "cn:space-bunny", Enabled: true,
-		SupportsThinking: &yes,
+		ID: "m1", ProviderID: pid, ModelID: "cn:space-bunny", SupportsThinking: &yes,
 	}); err != nil {
 		t.Fatalf("upsert 1: %v", err)
 	}
 
 	// 上游没报（nil）→ 保留 true。
 	if err := st.UpsertUpstreamModel(ctx, &UpstreamModel{
-		ID: "m2", ProviderID: pid, ModelID: "cn:space-bunny", Enabled: true,
-	}); err != nil {
+		ID: "m2", ProviderID: pid, ModelID: "cn:space-bunny"}); err != nil {
 		t.Fatalf("upsert 2: %v", err)
 	}
 	got, _ := st.GetUpstreamModel(ctx, "m1")
@@ -262,8 +251,7 @@ func TestUpsertModel_supports_thinking_三态(t *testing.T) {
 	// 上游明确说 false → 必须覆盖（上游能力变了要看得见）。
 	no := false
 	if err := st.UpsertUpstreamModel(ctx, &UpstreamModel{
-		ID: "m3", ProviderID: pid, ModelID: "cn:space-bunny", Enabled: true,
-		SupportsThinking: &no,
+		ID: "m3", ProviderID: pid, ModelID: "cn:space-bunny", SupportsThinking: &no,
 	}); err != nil {
 		t.Fatalf("upsert 3: %v", err)
 	}

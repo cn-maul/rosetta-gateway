@@ -9,7 +9,7 @@ import (
 	"github.com/cn-maul/rosetta-gateway/internal/store"
 )
 
-func TestStatsRecentPerformanceSamplesAndScope(t *testing.T) {
+func TestStatsPerformanceUsesSelectedRangeAndScope(t *testing.T) {
 	st := newTestStore(t)
 	for i := 1; i <= 7; i++ {
 		ttfb := int64(0)
@@ -36,14 +36,16 @@ func TestStatsRecentPerformanceSamplesAndScope(t *testing.T) {
 	for _, tc := range []struct {
 		user              string
 		tps, ttfb         float64
-		count, firstCount int
+		count, firstCount int64
 	}{
-		{"u1", 50, 250, 5, 2}, {"u2", 999, 900, 1, 1}, {"no-samples", 0, 0, 0, 0},
+		// 区间从 0 开始，统计的是所选范围内的全部成功样本，而不是“最近 5 条”。
+		// u1 的输出 token 合计 10+20+...=280、耗时 7s → 40 tok/s；
+		// 首字只有 i=2/3 有样本，均值 250ms。
+		{"u1", 40, 250, 7, 2}, {"u2", 999, 900, 1, 1}, {"no-samples", 0, 0, 0, 0},
 	} {
 		t.Run(tc.user, func(t *testing.T) {
 			rr := httptest.NewRecorder()
-			// Date-range statistics can be empty while recent samples still exist.
-			h.Get(rr, asUser(httptest.NewRequest("GET", "/admin/api/stats?from=9999999999999", nil), tc.user))
+			h.Get(rr, asUser(httptest.NewRequest("GET", "/admin/api/stats?from=0&to=9999999999999", nil), tc.user))
 			if rr.Code != 200 {
 				t.Fatalf("status=%d body=%s", rr.Code, rr.Body.String())
 			}
@@ -51,7 +53,7 @@ func TestStatsRecentPerformanceSamplesAndScope(t *testing.T) {
 			if err := json.Unmarshal(rr.Body.Bytes(), &got); err != nil {
 				t.Fatal(err)
 			}
-			if got.AvgTokensPerSec != tc.tps || got.AvgTtfbMs != tc.ttfb || got.ThroughputSamples != tc.count || got.TtfbSamples != tc.firstCount || got.RecentPerformanceStatus != "ready" || got.RecentSampleLimit != 5 || got.TotalRequests != 0 {
+			if got.AvgTokensPerSec != tc.tps || got.AvgTtfbMs != tc.ttfb || got.ThroughputSamples != tc.count || got.TtfbSamples != tc.firstCount {
 				t.Fatalf("stats=%+v", got)
 			}
 		})

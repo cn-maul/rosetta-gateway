@@ -52,7 +52,7 @@ func priceRoute(t *testing.T, db *store.Store, slug, modelID string, pin, pout f
 			// constraint failed，而那条报错完全不指向"你忘了建 provider"，
 			// 排查起来很绕。
 			if err := db.CreateProvider(context.Background(), &store.Provider{
-				ID: slug, Slug: slug, Name: slug, Protocol: "openai-chat",
+				ID: slug, Slug: slug, Name: slug, Protocol: "chat",
 				Enabled: true,
 			}); err != nil && !store.IsUniqueViolation(err) {
 				t.Fatalf("seed provider: %v", err)
@@ -61,8 +61,8 @@ func priceRoute(t *testing.T, db *store.Store, slug, modelID string, pin, pout f
 			// 上游模型对上，否则查价失败 → cost_total 记 0 → 不扣费。
 			if err := db.UpsertUpstreamModel(context.Background(), &store.UpstreamModel{
 				ID: slug + "/m", ProviderID: slug, ModelID: modelID,
-				Enabled: true, MaxOutputTokens: 4096,
-				PriceInput: pin, PriceOutput: pout,
+				MaxOutputTokens: 4096,
+				PriceInput:      pin, PriceOutput: pout,
 			}); err != nil {
 				t.Fatalf("seed upstream model price: %v", err)
 			}
