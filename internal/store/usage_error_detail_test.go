@@ -86,13 +86,14 @@ func TestUsageErrorDetail_RoundTripBatched(t *testing.T) {
 	}
 }
 
-// TestUsageErrorDetail_LongTextFits 1KB 边界的文本能完整落库（TEXT 列无截断）。
+// TestUsageErrorDetail_LongTextFits 8KB 边界的文本能完整落库（TEXT 列无截断）。
 func TestUsageErrorDetail_LongTextFits(t *testing.T) {
 	st := testStore(t, t.TempDir()+"/x.db")
 	seedKeyForUsage(t, st)
 	ctx := context.Background()
 
-	detail := strings.Repeat("a", 1024) // outwire 截断后最长 1024 字节
+	const maxDetailBytes = 8 << 10
+	detail := strings.Repeat("a", maxDetailBytes) // outwire 截断后最长 8KB
 	if err := st.CreateUsageRecord(ctx, &UsageRecord{
 		ID: "r2", AccessKeyID: "k1", UserID: "u1", PublicModel: "flash", ProviderID: "p1",
 		UpstreamModel: "m", IngressProtocol: "chat", Status: "error", HTTPStatus: 400,
@@ -104,7 +105,7 @@ func TestUsageErrorDetail_LongTextFits(t *testing.T) {
 	if err := st.Reader().QueryRowContext(ctx, `SELECT error_detail FROM usage_records WHERE id='r2'`).Scan(&got); err != nil {
 		t.Fatalf("read: %v", err)
 	}
-	if len(got) != 1024 {
-		t.Fatalf("应完整存下 1024 字节，got %d", len(got))
+	if len(got) != maxDetailBytes {
+		t.Fatalf("应完整存下 %d 字节，got %d", maxDetailBytes, len(got))
 	}
 }

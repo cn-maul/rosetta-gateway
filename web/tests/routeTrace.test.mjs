@@ -11,6 +11,17 @@ test('保留模型中的路径、冒号与箭头，保留未知原因原文', ()
   assert.equal(step.reasonLabel, 'vendor:extra')
 })
 
+test('转义后的上游名、模型名与分号都能原样还原', () => {
+  const raw = String.raw`1:org\/team\;\name\/prod/org/model\;v2 -> fail_switch:upstream_error; 2:肥鱼中转\/华东/gpt-4o -> ok`
+  const steps = parseRouteTrace(raw)
+  assert.equal(steps.length, 2)
+  assert.equal(steps[0].provider, 'org/team;\\name/prod')
+  assert.equal(steps[0].model, 'org/model;v2')
+  assert.equal(steps[1].provider, '肥鱼中转/华东')
+  assert.equal(steps[1].model, 'gpt-4o')
+  assert.equal(steps[1].outcomeLabel, '完成响应')
+})
+
 test('允许转移不表示已执行后备；跳过与调用失败分别解释', () => {
   const steps = parseRouteTrace('1:primary/model -> skip:probe_busy_or_cooling; 2:backup/model -> fail_switch:upstream_timeout')
   assert.equal(steps.length, 2)

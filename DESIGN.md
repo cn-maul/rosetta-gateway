@@ -6,10 +6,10 @@
 | 项目性质 | 独立项目，不在 Rosetta 上改造（2026-09-15 定，理由见 §2.1） |
 | module path | `github.com/cn-maul/rosetta-gateway` |
 | 运行时依赖 | `github.com/cn-maul/rosetta` v1.2.1（上游 SDK）、`modernc.org/sqlite`（纯 Go SQLite）、`github.com/golang-jwt/jwt/v5`（管理会话） |
-| 工具链 | **Go 1.27.3 起**（`go.mod` 的 `go` 指令是唯一来源，CI 用 `go-version-file` 读取；1.27.3 之前的版本带已知安全漏洞，不得使用，本地也勿用更早的 1.27.x） |
-| 版本 | 与 `web/package.json` 同源（当前 1.6.6），镜像与二进制共用 |
+| 工具链 | **Go 1.27.3 起**（`go.mod` 的 `go` 指令是唯一来源，CI 用 `go-version-file` 读取；1.27.3 之前的版本带已知安全漏洞，不得使用，本地也勿用更早的 1.27.x）。镜像构建固定 `golang:1.27.3-alpine3.24` 的 digest，并设 `GOTOOLCHAIN=local`，版本不足时构建直接失败，不会静默下载其他工具链 |
+| 版本 | 与 `web/package.json` 同源（当前 1.6.7），镜像与二进制共用 |
 | 状态 | **已实现**（P0–P3 全部落地，多用户、用量归档、配置导入导出均已上线） |
-| 更新 | 2026-10-22 |
+| 更新 | 2026-10-24 |
 
 ---
 
@@ -636,6 +636,12 @@ POST   /admin/api/logout                         登出（递增 auth_version）
 POST   /admin/api/reload                        从 DB 重建内存快照（前端兜底，见下）
 ```
 
+调用明细固化 `provider_name` 与 `upstream_protocol`，前者回答「当时实际是哪家上游」，
+后者与入口 `ingress_protocol` 组成上下排的协议对（例如 Responses 入、Chat 出）。
+两者都不 JOIN 当前 provider 配置，避免改名或改协议后把历史记录一起改写；旧记录为空时
+前端回退到 `provider_id`。`route_trace` 保留每次 skip / fail / ok 决策，因此自动
+故障转移可直接看到 `A → B` 的完整链路与每一步原因。
+
 所有写操作的事务边界：**先写 DB，提交成功后再重建快照**。DB 写失败则快照不动。
 
 **重建由服务端自动执行**（2026-10-01 起）：管理写请求成功（2xx）后，`server.AutoReload` 中间件就地调用 `internal/runtime.Reloader.Reload`（池重建 + 快照重建，`sync.Mutex` 串行化，两边都构建成功才原子替换，任一步失败运行时保持旧状态）。**重建失败有后台兜底**（2026-10-07 起）：失败即置 `dirty` 标志，`Reloader.WatchRetry` 按 30s 起步、指数退避（封顶 10 分钟）反复重试直至收敛，避免「响应已 200 +『已禁用』而数据面仍在放行」的分叉无限期存在（健康检查可读 `IsDirty`）。此前生效路径完全依赖前端写完自觉调 `POST /admin/api/reload`——任何绕过前端的调用方（curl/脚本）写完不调 reload 就是静默分叉，最敏感的是**禁用下游 Key 后 auth 读旧快照照常放行**。前端 `mutate()` 里的 reload 调用保留为兜底。
@@ -820,7 +826,7 @@ Rosetta 用一对字段表达它：`Sealed` 装载荷，`SealedBy` 记下是哪�
 | 方向 | 处理 |
 |---|---|
 | Responses 入站 | `reasoning` item 搬成 `SealedThinking(summary, sealed, "response")`。**空 item 跳过**：无 `encrypted_content` 且 summary 为空时硬造 block 会被 validate 拒掉，把本来能跑的请求变成 400 |
-| Responses 入站 → chat 上游 | 存在可读 summary 时，`responsesChatMessagesWithReasoning` 重新编码一份 chat `messages`：summary 回填为 assistant 的 `reasoning_content`，同一轮的正文与 `tool_calls` 合并成一条消息（2026-10-23）。没有 reasoning 的请求继续走 SDK 编码器；遇到不认识的块形状回退 SDK（宁可维持旧行为，不静默改写）。anthropic 上游仍剥除 —— thinking 块必须带 Anthropic 签发的 signature，reasoning item 无法伪造 |
+| Responses 入站 → chat 上游 | **所有** Responses→chat 请求都由 `responsesChatMessages` 重新编码 chat `messages`：把 Responses 拆开的 reasoning / message / function_call item 合并成同一条 assistant 消息，有 summary 时回填 `reasoning_content`。合并与 reasoning 无关，因为 SDK 逐 item 编码会拆成多条连续 assistant，DeepSeek 系会判定工具调用记录不配对（2026-10-23）。遇到不认识的块形状回退 SDK（宁可维持旧行为，不静默改写）；anthropic 上游仍剥除 —— thinking 块必须带 Anthropic 签发的 signature，reasoning item 无法伪造 |
 | Responses 上游回放 | 同一协议族的 reasoning block 按 `summary` / `id` / `encrypted_content` 三者各自存在即回放；**只有摘要和 id、没有密封载荷也必须回放**，兼容上游只返回可读思考但强制下一轮带回该 item。空的 `encrypted_content` 不写出 |
 | Responses 出站（流式） | `EventThinkingDelta` 发 `output_item.added` → `reasoning_summary_text.delta` → `output_item.done`（带 `encrypted_content`）。`SealedBy` 非本族的整条丢弃 |
 | Responses 出站（非流式） | `BlockThinking` 输出 reasoning item，同样过 `SealedBy` 门闩 |
@@ -1009,6 +1015,61 @@ Rosetta 用 `ErrStreamTruncated` 区分「干净结束」与「连接被掐断�
 
 直接 `client.Chat()`。上游失败时把 `*rosetta.APIError` 映射为下游状态码（§9），无部分结果问题。
 
+### 8.4 请求诊断与性能归因
+
+每个数据面请求在终态写一条 `INFO` 日志，`event=gateway_request_diagnostic`。
+生产 logger 是 `slog.NewJSONHandler(os.Stdout)`，因此所有字段都可直接按 JSON
+检索与聚合；日志只保留**元数据、数量与耗时**，绝不记录 prompt、消息正文、
+生成正文或上游凭据。
+
+**能把问题落到哪一段。** 日志里的耗时字段是互相独立的实测区间，不做
+「总耗时减各阶段」的残差推断：
+
+| 字段 | 回答的问题 |
+|---|---|
+| `auth_ms` / `decode_ms` / `admission_ms` / `quota_ms` / `routing_ms` / `balance_precheck_ms` / `credential_select_ms` | 网关在触碰上游前，哪一段本地处理慢 |
+| `gateway_pre_upstream_ms` | 从请求进入网关到第一个真实上游调用开始；排队、预检、凭据选择的合计墙钟时间 |
+| `dns_ms` / `connect_ms` / `tls_ms` / `upstream_headers_ms` | 上游网络的建连阶段，其中任何一段异常高都指向 DNS、直连链路或代理 |
+| `upstream_ttfb_ms` | 上游请求发出后到首个响应事件；结合 `request_written` 可区分“没写出去”与“上游迟迟不回” |
+| `stream_post_ttfb_ms` / `stream_max_event_gap_ms` | 首字之后的生成速度与最长停顿 |
+| `downstream_write_ms` / `downstream_flush_ms` / `response_writes` | 网关写回调用方的阻塞与背压 |
+| `output_tokens_per_second_total` / `..._generation` | 端到端输出速度与纯生成阶段速度，两者分开避免把首字和排队算进模型吞吐 |
+
+`attempts[]` 为每次链路尝试保留目标、凭据、协议、HTTP 状态、HTTP
+round-trip 次数、连接是否复用、各阶段耗时、`failure_stage`、
+`failure_attribution` 与 `attribution_confidence`。因此一次自动故障转移可以
+从 `route_trace` 看到 `A → B`，并在同一事件里看到 A 为什么失败、B 为什么
+成功，不需要跨多条日志拼接。
+
+**归因不是猜谜。** 归因值描述“最可能的责任方”，不是确定判决：
+
+- `upstream_auth` / `upstream_rate_limit` / `upstream_quota` /
+  `upstream_provider_error`：上游按状态码明确拒绝；置信度高。
+- `upstream_timeout` / `upstream_network` / `network_or_proxy`：超时或
+  DNS/TCP/TLS 失败。配置了代理时只能标 `network_or_proxy`，置信度最高为
+  medium，因为直连也可能出现同样的报错。
+- `gateway_timeout` / `gateway_overload` / `gateway_internal`：网关自己的总预算、
+  并发准入或内部处理失败，不冷却上游凭据，也不归入目标熔断。
+- `downstream_client` / `downstream_write`：调用方取消或网关卡在写回阶段；
+  不能因客户端断开而惩罚上游。
+- `caller_configuration` / `target_configuration`：分别是调用方请求/鉴权/额度
+  问题，与上游目标或凭据池配置问题。
+
+`attribution_confidence` 只有 `high`（有明确状态码、终态码或已测到的失败阶段）
+与 `medium`（网络/代理原因无法从网关侧唯一确定）两档；没有证据时留空，不给出
+看似精确的结论。
+
+**流式阶段的边界。** 流式生成和下游写入可以并发发生，因此两者耗时不能相加后
+声称就是网关 CPU 时间。诊断字段只报告真实观测到的区间；`slowest_observed_phase`
+与 `performance_flags` 用于筛选可疑请求，最终判断仍应结合同一次请求的
+`attempts[]`、状态码与 `error_detail`。
+
+**观测边界。** 网关只能观测“请求进入网关到响应写完”这一段。Agent 在发请求前
+的准备、客户端本地排队，以及 Agent 收到响应后执行工具的时间都在网关之外；
+它们只能由调用方自己的 tracing 记录。若调用方整体很慢但 `total_ms`、
+`upstream_ttfb_ms` 与 `downstream_write_ms` 都正常，问题应在调用方或工具层，
+而不是网关。跨系统排查时用 `traceparent` / `trace_id` 与调用方 span 对齐。
+
 ---
 
 ## 9. 错误映射
@@ -1046,6 +1107,8 @@ Rosetta 用 `ErrStreamTruncated` 区分「干净结束」与「连接被掐断�
 
 **出站错误体也要脱敏**：上游错误里的疑似密钥材料在写日志与返回前掩码（Rosetta 已对 `APIError.Raw` 做了脱敏，网关在拼装下游错误时不要重新引入 `Raw` 原文）。
 
+**给运维的错误详情与给客户端的错误体分开。** 返回给客户端的错误形状保持上面的固定文案；`usage_records.error_detail` 与请求诊断日志则保存脱敏后的完整现场：API 错误同时保留 `message` 与原始响应 JSON，传输错误保留底层 DNS / TCP / TLS / 代理 / 超时原因，流失败保留截断、溢出或空闲超时的判定。单条详情最多 8 KB，按 UTF-8 rune 边界截断；调用历史的错误抽屉据此分区展示「说明」与「完整原始响应」，不再只给一个 `upstream_error` 短码。
+
 ---
 
 ## 10. 上游凭证池与故障转移
@@ -1066,7 +1129,8 @@ Client 是 goroutine 安全的，进程内单例复用（内含连接池）。
 
 - `weight` 加权的随机选择（默认）、或轮询
 - 跳过 `disabled` 或处于冷却（`cooldown_until > now`）的凭证
-- 冷却回写（已启用，`outwire.CredentialCooldown`）：401/403 冷却 30 分钟；402 冷却 1 小时；429 / 408 / 5xx / 传输层错误冷却 60s。
+- 冷却回写（已启用，`outwire.CredentialCooldown`）：只冷却能归因到**凭据本身**的失败 —— 401/403 冷却 30 分钟；402 冷却 1 小时；429 冷却 60s。
+  408 / 5xx / 传输层错误 / 各类超时**不冷却凭据**，只累计目标熔断：它们说明目标或链路暂时不可用，不代表这把 key 失效。旧口径把上述错误也冷却 60s，对单 key provider 等于「第一次抖动就把唯一凭据踢出轮换」，第二跳若也在冷却则整条链直接 502，且冷却期内没有成功请求能触发复苏。
   注：Rosetta v0.5.1 未在 `APIError` 上暴露 `Retry-After`，故 429 统一按 60s 上限处理（不读上游响应头）。
 - 冷却回写只影响「同一 provider 内换哪把 key」，不决定跨 provider 转移。
 - **凭据只有两种失效方式**：`cooling`（冷却到期自动恢复）与 `disabled`（运营显式停用）——
@@ -1093,7 +1157,7 @@ Client 是 goroutine 安全的，进程内单例复用（内含连接池）。
 - **目标级熔断**：某 `target` 连续失败达 `failover_failure_threshold`（全局设置，>= 1）后，进入 60s 冷却，期间该目标在链上被跳过；若整条链都在冷却，则回退为按序尝试全链（不让运营配出的链因瞬时抖动整体不可用）。
 - **每次 attempt 只取该 provider 的一把凭证**：单请求内不会就地换同 provider 的下一把 key，失败即让位链上下一个目标；坏 key 的轮换交给跨请求冷却（下个请求自会选到好 key）。有意如此，避免「一个请求把某 provider 所有 key 各打一遍」放大延迟与配额消耗。
 - **客户端断开即收手**：转移循环每轮顶部检查 `r.Context().Err()`，非空则直接返回——不再往链上后续目标打（半路跑掉的客户端不该消耗下游配额），也不记 error 用量（断流是客户端行为，非上游故障）。
-  - 同理，**客户端在调用进行中断开时不做任何健康态记账**（`out.eligible && r.Context().Err() == nil`）。SDK 会把 context 取消包成 `TransportError` 落进可转移集合，若照记就会把一把健康凭据冷却 60s 并累计目标熔断 —— 对单 key provider 等于「几次用户点停止 = 该上游 60 秒整体不可用」（冷却期内凭据不再被选中，也就没有任何请求能成功以触发复苏）。判据用 `r.Context()`：它只在客户端断开/服务关停时取消，上游超时用的是派生 ctx，两者不会混淆。
+  - 同理，**客户端在调用进行中断开时不做任何健康态记账**（`out.eligible && r.Context().Err() == nil`）。SDK 会把 context 取消包成 `TransportError` 落进可转移集合，若照记就会累计目标熔断 —— 对链首目标等于「几次用户点停止 = 该目标 60 秒整体不可用」。判据用 `r.Context()`：它只在客户端断开/服务关停时取消，上游超时用的是派生 ctx，两者不会混淆。
   - **没走到记账的探测名额必须显式归还**（2026-10-07 修复）：熔断 half-open 名额由 `ClaimTargetProbe` 领取，正常由成功/失败记账释放；不可转移错误与客户端断开两种形态不会走到记账，循环尾部用 `ReleaseTargetProbe` 归还 —— 否则一次 400 就把目标占死到下一次池重建。
 - 命中成功目标：回写清除该凭证冷却 + 复位该目标熔断计数。
 - 全链耗尽：透出最后一个上游错误（映射到对应 5xx/4xx），并记一条 error
@@ -1787,7 +1851,7 @@ rosetta-gateway/
 | R15 | **Codex 的 namespace 工具形态被网关拒绝** | Codex 经 `/v1/responses` 接入整体 400，不是功能缺失而是整条路径不可用 | **已解决（2026-10-18，v1.6.4）**：`flattenNamespaceTools` 把 namespace 展平成平级 function（`父名__原名`），`tool_choice` 同步改名。展平让工具表变长但被上游前缀缓存完全吸收（实测 4531 token 里 4530 命中）。客户端侧无开关（`tool_namespace` 被 Codex 忽略）。见 §7.3 |
 | R16 | **Responses 流式 reasoning item 被逐增量切碎** | 客户端看到一串逐段变长、前缀重复的思考块；携带 sealed 载荷的那一片单独成 item，其余片对模型无意义且在历史里多出垃圾 item | **已解决（2026-10-18，v1.6.4）**：reasoning item 生命周期改为跨增量（首片 added、中间片 delta、末片或 `Finish` 才 done），`reasonItemID` 在 added/delta/done 里复用，`thinkText` 在开新 item 时 Reset。见 §7.4 与 §8.1 |
 | R17 | **客户端按模型目录声明的托管工具（`web_search`）被网关拒绝** | 走 Responses 接入时整体 400；客户端若不关该能力则无法使用任何走 Responses 的模型 | **有意接受（2026-10-18）**：托管搜索由 OpenAI 服务端执行，任何第三方上游都承接不了，网关无法代理。拒绝而非静默丢弃 —— 静默丢弃的症状是模型在多轮后说「我没有联网能力」，用户要过几轮才会怀疑是代理吞了工具。处置在客户端侧：模型目录（`supports_search_tool: false`）关掉该能力。注意 Magpie 会静默丢弃（200 但无 `web_search_call`），CC Switch 透传到网关导致 400。见 §7.3 |
-| R18 | **`/v1/responses` 的 reasoning item 回放到 chat 上游时被丢弃** | DeepSeek thinking 模式多轮（尤其带工具调用）第二轮 400：`The reasoning_content in the thinking mode must be passed back` | **已解决（2026-10-23，v1.6.6）**：SDK 的 chat 编码器丢弃 thinking 块，网关在存在可读 summary 时自行接管 `messages`（`internal/inwire/responses_chat_replay.go`），把 summary 回填为 `reasoning_content` 并把同一轮的正文 / tool_calls 合并为一条 assistant 消息；无 reasoning 的请求继续走 SDK 编码器，不认识的形状回退 SDK。anthropic 上游仍剥除（无法伪造签名）。见 §7.1 |
+| R18 | **`/v1/responses` 的 reasoning / 工具 turn 回放到 chat 上游时被拆散** | DeepSeek thinking 模式多轮（尤其带工具调用）第二轮 400：`The reasoning_content in the thinking mode must be passed back`，或工具调用记录不配对 | **已解决（2026-10-24，v1.6.7）**：SDK 的 chat 编码器既丢弃 thinking 块，又把 Responses 的 message / function_call 逐 item 输出成多条连续 assistant。网关现在对所有 Responses→chat 请求统一接管 `messages`（`internal/inwire/responses_chat_replay.go`），把同一轮合并成一条 assistant，并把可读 summary 回填为 `reasoning_content`；不认识的形状回退 SDK。anthropic 上游仍剥除（无法伪造签名）。见 §7.1 |
 
 ---
 

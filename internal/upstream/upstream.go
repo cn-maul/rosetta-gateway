@@ -21,6 +21,7 @@ import (
 	"github.com/cn-maul/rosetta-gateway/internal/config"
 	"github.com/cn-maul/rosetta-gateway/internal/crypto"
 	"github.com/cn-maul/rosetta-gateway/internal/httpx"
+	wireproto "github.com/cn-maul/rosetta-gateway/internal/protocol"
 	"github.com/cn-maul/rosetta-gateway/internal/store"
 )
 
@@ -132,6 +133,10 @@ type ProviderEntry struct {
 	// 它是**派生**的：provider 行上只存 network_id，实际地址由 networks 表
 	// 在读路径 JOIN 出来（见 store.Provider 的 ProxyURL 注释）。
 	ProxyURL string
+	// NetworkID is the configured outbound network id. Diagnostics report it
+	// as metadata; ProxyURL itself must never be logged because it may contain
+	// credentials.
+	NetworkID string
 	// ProxyConfigError 记录该 provider 的代理配置为什么没生效（URL 非法）。
 	// 非空时请求仍会发 —— 走直连 —— 但管理面据此把「代理没生效」说出来，
 	// 而不是让运维对着一个连不上的上游瞎猜。
@@ -228,7 +233,7 @@ func (p *Pool) BuildFromConfig(cfg *config.Config) error {
 				continue
 			}
 
-			client, err := buildClient(prov, apiKey, cfg)
+			client, err := buildClient(context.Background(), prov, apiKey, cfg)
 			if err != nil {
 				return fmt.Errorf("build client for %s/%s: %w", bp.Slug, bc.Label, err)
 			}
@@ -354,6 +359,7 @@ func (p *Pool) PrepareFromStore(ctx context.Context, st *store.Store, masterKey 
 			Enabled:    sp.Enabled,
 			Timeout:    timeout,
 			MaxRetries: maxRetries,
+			NetworkID:  sp.NetworkID,
 			ProxyURL:   sp.ProxyURL,
 		}
 
@@ -398,7 +404,7 @@ func (p *Pool) PrepareFromStore(ctx context.Context, st *store.Store, masterKey 
 				continue
 			}
 
-			client, err := buildClient(prov, apiKey, cfg, modelInfos...)
+			client, err := buildClient(ctx, prov, apiKey, cfg, modelInfos...)
 			if err != nil {
 				p.logger.Error("failed to build client", "provider", sp.Slug, "credential", sc.Label, "error", err)
 				credErrs++
@@ -529,6 +535,25 @@ func (p *Pool) ProvidersSnapshot() map[string]*ProviderEntry {
 		out[k] = v
 	}
 	return out
+}
+
+// ResolvedProtocol returns the protocol actually selected for a provider.
+//
+// The routing snapshot retains the configured value, which can still be
+// "auto"; buildClient resolves that value while constructing the pool entry.
+// Callers that need protocol-specific behavior must consult this method rather
+// than treating the configured "auto" as a synonym for Chat.
+func (p *Pool) ResolvedProtocol(providerSlug string) string {
+	if p == nil {
+		return ""
+	}
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	prov, ok := p.providers[providerSlug]
+	if !ok || prov == nil {
+		return ""
+	}
+	return wireproto.Normalize(prov.Protocol)
 }
 
 func (p *Pool) GetAnyClient(providerSlug string) (*rosetta.Client, string, error) {
@@ -972,7 +997,7 @@ func NewProviderClient(ctx context.Context, st *store.Store, providerID string, 
 	//
 	// 单模型探测之所以不受影响，还有 TestUpstreamModel 显式置
 	// Thinking=nil 那一条（闸门对 nil 直接放行）—— 见那里的成本分析。
-	return buildClient(entry, apiKey, cfg, modelInfosForProvider(ctx, st, p.ID, slog.Default())...)
+	return buildClient(ctx, entry, apiKey, cfg, modelInfosForProvider(ctx, st, p.ID, slog.Default())...)
 }
 
 // probeMaxTokens 是单模型可用性探测的 max_tokens。
@@ -1610,7 +1635,7 @@ func probeHTTPClientFor(proxyURL string, timeout time.Duration) (*http.Client, e
 	return &c, nil
 }
 
-func buildClient(prov *ProviderEntry, apiKey string, cfg *config.Config, modelInfos ...rosetta.ModelInfo) (*rosetta.Client, error) {
+func buildClient(ctx context.Context, prov *ProviderEntry, apiKey string, cfg *config.Config, modelInfos ...rosetta.ModelInfo) (*rosetta.Client, error) {
 	opts := []rosetta.Option{
 		rosetta.WithEndpoint(prov.Endpoint),
 		rosetta.WithAPIKey(apiKey),
@@ -1629,31 +1654,61 @@ func buildClient(prov *ProviderEntry, apiKey string, cfg *config.Config, modelIn
 		// still constructed by the SDK and never placed in Extra.
 		rosetta.WithExtraOverrides(true),
 	}
+	// WithTimeout also bounds DetectClient's /models probe. Install it before
+	// auto-detection so a hanging endpoint cannot hold pool construction for
+	// the probe's standalone default timeout.
+	if prov.Timeout > 0 {
+		opts = append(opts, rosetta.WithTimeout(prov.Timeout))
+	}
 	// 代理：为空走全局共享 client（读进程环境变量），否则用该 provider
 	// 独享的 client。代理配错时**不失败**，而是回落到全局 client 并把错误
 	// 记进 ProviderFailure —— 理由见 proxyHTTPClientFor 的注释。
 	hc, proxyErr := proxyHTTPClientFor(prov.ProxyURL)
-	opts = append(opts, rosetta.WithHTTPClient(withConversationAffinityTransport(hc, prov.Endpoint, prov.Protocol, prov.Slug)))
+	// Trace the transport for every protocol, including Anthropic. The
+	// conversation-affinity wrapper remains protocol-specific; observation
+	// must not be, because Anthropic and auto-probed providers otherwise have
+	// no network timings exactly when an operator needs them.
+	tracedHC := withHTTPTransport(hc, withAttemptTraceTransport(transportFor(hc)))
+	opts = append(opts, rosetta.WithHTTPClient(tracedHC))
 	prov.ProxyConfigError = proxyErr
-	if prov.Protocol != "" && prov.Protocol != "auto" {
-		switch prov.Protocol {
-		case "chat":
+	prov.Protocol = wireproto.Normalize(prov.Protocol)
+	if prov.Protocol == "" || prov.Protocol == wireproto.Auto {
+		// NewClient defaults to OpenAI Chat when no protocol is pinned; it does
+		// not probe. Use DetectClient explicitly so "auto" means what the config
+		// says. The probe inherits prov.Timeout installed above.
+		// A failed probe must not make reload/build fail: keep serving with the
+		// Chat fallback, then let the normal request path and failover logic
+		// report the real upstream failure.
+		detected, err := rosetta.DetectClient(ctx, opts...)
+		if err != nil {
+			prov.Protocol = wireproto.Chat
 			opts = append(opts, rosetta.WithProtocol(rosetta.ProtoOpenAIChat))
-		case "response":
+		} else {
+			prov.Protocol = gatewayProtocolName(detected.Protocol())
+			opts = append(opts, rosetta.WithProtocol(detected.Protocol()))
+		}
+	} else {
+		switch prov.Protocol {
+		case wireproto.Chat:
+			opts = append(opts, rosetta.WithProtocol(rosetta.ProtoOpenAIChat))
+		case wireproto.Response:
 			opts = append(opts, rosetta.WithProtocol(rosetta.ProtoOpenAIResponses))
-		case "anthropic":
+		case wireproto.Anthropic:
 			opts = append(opts, rosetta.WithProtocol(rosetta.ProtoAnthropic))
 		default:
 			// 拼错的协议名此前被静默忽略 —— 不加 WithProtocol，退化成 SDK 的
 			// 自动探测，请求打到错误的端点形态上，报出来的错误指向下游而非配置。
 			// 配置错了就说配置错了。管理 API 在写入时已用同一份白名单校验过，
 			// 这里是运行时（含 bootstrap 配置）的最后一道。
-			return nil, fmt.Errorf("provider %s: 未知的 protocol %q（合法值：auto / chat / response / anthropic）", prov.Slug, prov.Protocol)
+			return nil, fmt.Errorf("provider %s: 未知的 protocol %q（合法值：%s）",
+				prov.Slug, prov.Protocol, wireproto.AllowedValues)
 		}
 	}
-	if prov.Timeout > 0 {
-		opts = append(opts, rosetta.WithTimeout(prov.Timeout))
-	}
+	// The affinity wrapper must be selected from the resolved protocol, not
+	// the possibly-"auto" config value. Anthropic must not receive OpenAI's
+	// cache-affinity headers.
+	opts = append(opts, rosetta.WithHTTPClient(
+		withConversationAffinityTransport(tracedHC, prov.Endpoint, prov.Protocol, prov.Slug)))
 
 	// 把网关这一侧配好的模型能力注入 SDK 的模型档案。
 	//
@@ -1675,6 +1730,19 @@ func buildClient(prov *ProviderEntry, apiKey string, cfg *config.Config, modelIn
 	}
 
 	return rosetta.NewClient(opts...)
+}
+
+func gatewayProtocolName(p rosetta.Protocol) string {
+	switch p {
+	case rosetta.ProtoOpenAIChat:
+		return wireproto.Chat
+	case rosetta.ProtoOpenAIResponses:
+		return wireproto.Response
+	case rosetta.ProtoAnthropic:
+		return wireproto.Anthropic
+	default:
+		return string(p)
+	}
 }
 
 // modelInfosForProvider 把库里配好的模型思考能力转成 SDK 的 ModelInfo。

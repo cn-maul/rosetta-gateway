@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"net/http"
 	"regexp"
+	"strings"
 	"time"
 	"unicode/utf8"
 
@@ -130,11 +131,16 @@ func logUpstreamMalformed(err error) {
 // 供运维在调用历史里排查。两条职责分开 —— 客户端看到的和运维查到的
 // 不必是同一份文本，前者要克制，后者要够用。
 //
-// # 为什么用 apiErr.Message 而不是 apiErr.Raw
+// # 为什么 Message 与 Raw 都要截留
 //
-// Raw 是完整 JSON body（含 type/code/request_id 等），对「悬浮显示一句话」
-// 是过剩的；Message 是上游那句人话（「额度用完」「429 limit」），正是
-// 运维要的。Raw 只在 Message 为空时才退回去用。
+// Message 是上游那句人话（「额度用完」「429 limit」），排障时先看它；
+// Raw 是完整响应体，里面有 type / code / param / request_id —— 这些字段
+// 恰恰是「工具调用记录对不上」这类结构化 400 的关键。旧实现只在 Message
+// 为空时才退回 Raw，于是最常见的「有 message 但还带一堆结构化字段」
+// 错误只剩一句话，调用历史里看不到上游到底为何拒绝。
+//
+// 两段都保留，且用固定的分隔标题标明来源；前端据此分区展示，而不是把
+// 一段原始 JSON 直接塞给运维猜。
 //
 // # 为什么必须自己脱敏
 //
@@ -143,35 +149,74 @@ func logUpstreamMalformed(err error) {
 // 把调用方的 key 回显在错误里。这里用与 SDK 同一份正则（secretRe 的
 // 复制）做掩码，保证落库的文本不含明文凭据。
 //
-// # 截断到 1KB
+// # 截断到 8KB
 //
 // 上游错误体理论上可到 4KB（SDK 的 safeTruncateBody 上限）。usage_records
 // 是明细表，失败率通常 <1%，但最坏情况（100% 失败）下 4KB × 日请求量
-// 会让库体积失控。1KB 足够承载「额度用完 / 429 / 模型不存在」这类
-// 一句话诊断，与项目里 balance.go 的 256B body_preview 同一量级惯例。
+// 会让库体积失控。8KB 足以完整保留 SDK 的 Raw（4960 字节）与一段
+// message，同时仍把单条记录的膨胀压在上限内。旧实现的 1KB 会从中间
+// 截断结构化 400 的 JSON，正好丢掉 request_id / param 等排障字段。
 func UpstreamErrorDetail(err error) string {
 	if err == nil {
 		return ""
 	}
 	var apiErr *rosetta.APIError
-	if !errors.As(err, &apiErr) {
-		// TransportError / ErrUpstreamMalformed 没有可用的上游正文，
-		// 返回空串 —— 调用历史里这类失败就没有详情，这是有意的。
+	if errors.As(err, &apiErr) {
+		var parts []string
+		if msg := strings.TrimSpace(apiErr.Message); msg != "" {
+			parts = append(parts, "message: "+msg)
+		}
+		if raw := strings.TrimSpace(string(apiErr.Raw)); raw != "" && raw != strings.TrimSpace(apiErr.Message) {
+			// Raw 是原始响应体（json.RawMessage）。SDK 的 body redaction 已对
+			// 凭据形状做过掩码，这里再过一次 maskSecrets 是纵深防御 ——
+			// 落库文本绝不能含明文凭据。
+			parts = append(parts, "raw: "+raw)
+		}
+		return truncateErrorDetail(maskSecrets(strings.Join(parts, "\n")))
+	}
+	// TransportError 没有上游正文，但它的底层 err 正是 DNS / TCP / TLS /
+	// proxy / timeout 的现场。旧实现把这一类统一返回空串，调用历史只剩
+	// "upstream_timeout"，无法判断是域名解析失败、拒绝连接、证书错误，还是
+	// 代理不可达。这里只截留底层原因，不拼 TransportError.Error()（后者虽
+	// 已由 SDK 对 URL 做过处理，但没有必要把端点写进明细表）。
+	var transportErr *rosetta.TransportError
+	if errors.As(err, &transportErr) {
+		if transportErr.Err != nil {
+			return truncateErrorDetail(maskSecrets("transport: " + transportErr.Err.Error()))
+		}
+		return truncateErrorDetail("transport: connection failed")
+	}
+	// Malformed / truncated / overflow and local stream errors carry useful
+	// reason text but never the response body. Keep those reasons; otherwise
+	// the UI would show only a short code for exactly the failures operators
+	// most often need to diagnose.
+	if errors.Is(err, rosetta.ErrUpstreamMalformed) ||
+		errors.Is(err, rosetta.ErrStreamTruncated) ||
+		errors.Is(err, rosetta.ErrStreamOverflow) {
+		return truncateErrorDetail(maskSecrets(strings.TrimSpace(err.Error())))
+	}
+	return ""
+}
+
+// SafeErrorDetail returns a masked, truncated description for an arbitrary
+// local or downstream error. It is used for failures that have no upstream
+// response body (for example a failed write to the caller) but whose concrete
+// OS/network reason is still the most useful diagnostic. Never use it for a
+// client-facing response: the text is for logs and the usage detail drawer.
+func SafeErrorDetail(err error) string {
+	if err == nil {
 		return ""
 	}
-	detail := apiErr.Message
-	if detail == "" && len(apiErr.Raw) > 0 {
-		// Raw 是原始响应体（json.RawMessage）。SDK 的 body redaction 已对
-		// 凭据形状做过掩码，这里再过一次 maskSecrets 是纵深防御 ——
-		// 落库文本绝不能含明文凭据。
-		detail = string(apiErr.Raw)
-	}
-	detail = maskSecrets(detail)
-	if len(detail) > 1024 {
+	return truncateErrorDetail(maskSecrets(strings.TrimSpace(err.Error())))
+}
+
+func truncateErrorDetail(detail string) string {
+	const maxDetailBytes = 8 << 10
+	if len(detail) > maxDetailBytes {
 		// 按 rune 边界截：上游（DeepSeek / 月之暗面等）的报错常是中文，
 		// 按字节截会把最后一个汉字劈成残字节 —— 存进库再经 JSON 编码时
 		// 会变成 replacement char，界面上是「乱码尾巴」。宁可少截一个字。
-		end := 1024
+		end := maxDetailBytes
 		for end > 0 && !utf8.RuneStart(detail[end]) {
 			end--
 		}
@@ -327,14 +372,18 @@ func FailoverEligible(err error) bool {
 
 // CredentialCooldown 返回产出该错误的凭据应被踢出轮换多久；0 表示「不冷却」。
 //
-// 规则见 DESIGN §10：401/403→30min、402→1h、429→60s、408/5xx→60s、传输错误→60s。
+// 只有能归因到**这把凭据本身**的状态才冷却：401/403（key 无效/无权限）、
+// 402（账号额度耗尽）、429（账号级限流）。
+//
+// 408 / 5xx / 传输错误 / 超时一律返回 0：它们是目标或链路故障，由
+// RecordTargetFailure 的目标熔断负责。旧实现把这几种也冷却 60s，对单 key
+// provider 的后果是：链首抖动一次就把唯一一把 key 踢出轮换，故障转移到达
+// 下一跳时若那家也在冷却，整条链会直接返回 502，而且冷却期内没有任何请求
+// 能成功以触发 RecordCredentialSuccess 复苏。
+//
 // 429 本应按 Retry-After，但 rosetta v0.5.1 未把该 header 暴露到 APIError 上
 // （重试退避在 SDK 内部完成），故取 DESIGN 的 60s 上限作为保守值。
 func CredentialCooldown(err error) time.Duration {
-	var transportErr *rosetta.TransportError
-	if errors.As(err, &transportErr) {
-		return 60 * time.Second
-	}
 	var apiErr *rosetta.APIError
 	if errors.As(err, &apiErr) {
 		switch {
@@ -342,9 +391,7 @@ func CredentialCooldown(err error) time.Duration {
 			return 30 * time.Minute
 		case apiErr.StatusCode == http.StatusPaymentRequired:
 			return time.Hour
-		case apiErr.StatusCode == http.StatusTooManyRequests,
-			apiErr.StatusCode == http.StatusRequestTimeout,
-			apiErr.StatusCode >= 500:
+		case apiErr.StatusCode == http.StatusTooManyRequests:
 			return 60 * time.Second
 		}
 	}

@@ -23,20 +23,27 @@ import (
 // ToRosetta 处理完），编码规则与 SDK 的 encodeMessages 一一对应，只多写一个
 // `reasoning_content` 字段。
 //
-// # 触发条件与回退
+// # 为什么所有 Responses→chat 请求都要接管
 //
-// 只有请求里真的存在**带可读文本的 thinking 块**时才接管；没有 reasoning 的
-// 请求继续走 SDK 编码器，行为逐字不变。遇到本编码器不认识的形状时返回 false
-// 并回退到 SDK 路径（宁可维持修复前的行为，也不要在网关里静默改写内容）。
+// 不只是为了 reasoning。Responses 把一轮 assistant 拆成多个 item
+// （message / function_call / reasoning 各一条），而 SDK 的 chat 编码器会
+// **逐条**输出成连续多条 assistant 消息。OpenAI 兼容上游（DeepSeek、以及
+// 转发 DeepSeek 的中转站）要求 thinking 模式下的工具调用必须落在同一条
+// assistant 消息上，否则返回 400「对话里的工具调用记录对不上」。因此这里
+// 对所有 Responses→chat 请求做同一套 turn 合并，reasoning 只是顺便回填
+// `reasoning_content`，不再是接管与否的开关。
+//
+// 遇到本编码器不认识的形状时返回 false 并回退到 SDK 路径（宁可维持修复前
+// 的行为，也不要在网关里静默改写内容）。
 //
 // Anthropic 上游不在此列：它的 thinking 块必须带 Anthropic 自己签发的
 // signature，Responses 的 reasoning item（summary + encrypted_content）无法
 // 伪造签名，硬塞只会被上游拒绝，因此仍由 applyReplayGate 剥除。
 
-// responsesChatMessagesWithReasoning 在需要回放 thinking 时返回完整的
-// chat messages 数组；第二个返回值为 false 表示应继续走 SDK 编码器。
-func responsesChatMessagesWithReasoning(req *rosetta.ChatRequest) ([]map[string]any, bool) {
-	if req == nil || !hasReplayableResponsesReasoning(req.Messages) {
+// responsesChatMessages 返回合并 assistant turn 后的完整 chat messages；
+// 第二个返回值为 false 表示含无法等价表达的块，应继续走 SDK 编码器。
+func responsesChatMessages(req *rosetta.ChatRequest) ([]map[string]any, bool) {
+	if req == nil {
 		return nil, false
 	}
 
@@ -101,25 +108,6 @@ func responsesChatMessagesWithReasoning(req *rosetta.ChatRequest) ([]map[string]
 	}
 	flush()
 	return out, true
-}
-
-// hasReplayableResponsesReasoning 判断是否存在 chat 协议真的能回放的思考。
-//
-// 只认可读文本（thinking 块的 Thinking 字段）。encrypted_content 是 Responses
-// 自家的封装，chat 协议没有承载它的字段；没有文本时回放一份空
-// reasoning_content 既不满足上游，也会把「无状态可回放」伪装成已回放。
-func hasReplayableResponsesReasoning(messages []rosetta.Message) bool {
-	for _, m := range messages {
-		if m.Role != rosetta.RoleAssistant {
-			continue
-		}
-		for _, b := range m.Blocks {
-			if b.Type == rosetta.BlockThinking && strings.TrimSpace(b.Thinking) != "" {
-				return true
-			}
-		}
-	}
-	return false
 }
 
 type chatAssistantTurn struct {

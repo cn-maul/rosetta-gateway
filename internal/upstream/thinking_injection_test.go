@@ -137,7 +137,7 @@ func TestBuildClient_思考闸门因注入而生效(t *testing.T) {
 	addModel(t, st, pid, "m1", "gpt-4o", &no, nil)
 	addModel(t, st, pid, "m2", "o3", &yes, nil)
 
-	c, err := buildClient(&ProviderEntry{Protocol: "chat", Endpoint: "https://example.test"},
+	c, err := buildClient(context.Background(), &ProviderEntry{Protocol: "chat", Endpoint: "https://example.test"},
 		"sk-x", nil, modelInfosForProvider(context.Background(), st, pid, slog.Default())...)
 	if err != nil {
 		t.Fatalf("buildClient: %v", err)

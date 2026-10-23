@@ -22,11 +22,11 @@ import (
 //     工具结果；reasoning item 连同 id / encrypted_content / summary 搬进
 //     rosetta 的 thinking 块，供 Responses 上游跨轮原样回放。
 //
-//     chat 上游（2026-10-23 补齐）：DeepSeek 系要求 `reasoning_content`
-//     原样回传，而 SDK 的 chat 编码器会丢弃 thinking 块。存在可读思考文本时
-//     由 responsesChatMessagesWithReasoning 重新编码一份 chat messages，
-//     把 summary 回填成 `reasoning_content`；没有 reasoning 的请求继续走
-//     SDK 编码器。详见 responses_chat_replay.go。
+//     chat 上游（2026-10-23 补齐）：DeepSeek 系既要求 `reasoning_content`
+//     原样回传，也要求同一轮的正文与 tool_calls 落在同一条 assistant 消息上。
+//     所有 Responses→chat 请求统一由 responsesChatMessages
+//     重新编码 chat messages（合并 turn，并把 summary 回填成
+//     `reasoning_content`）。详见 responses_chat_replay.go。
 //
 //     anthropic 上游仍是已知缺口：thinking 块必须带 Anthropic 签发的
 //     signature，Responses 的 reasoning item 无法伪造，因此继续剥除。
@@ -1173,10 +1173,11 @@ func (a *ResponsesRequest) ApplyUpstreamExtras(req *rosetta.ChatRequest, protoco
 		if a.PromptCacheKey != "" {
 			extra["prompt_cache_key"] = a.PromptCacheKey
 		}
-		// thinking 回放：chat 上游唯一能承接 reasoning 的字段是
-		// `reasoning_content`，SDK 编码器会丢掉 thinking 块，所以有可读
-		// 思考文本时整份接管 messages。没有 reasoning 的请求不受影响。
-		if msgs, ok := responsesChatMessagesWithReasoning(req); ok {
+		// Responses→chat 的 turn 合并：SDK 编码器逐条输出 assistant，
+		// 会把 Responses 的 message + function_call 拆成两条连续 assistant
+		// 消息，DeepSeek 系上游因此报「工具调用记录对不上」。所有请求都
+		// 整份接管 messages；可读思考顺便回填 `reasoning_content`。
+		if msgs, ok := responsesChatMessages(req); ok {
 			extra["messages"] = msgs
 		}
 		if len(extra) > 0 {

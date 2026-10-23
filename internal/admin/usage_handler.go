@@ -394,15 +394,23 @@ func roundMillis(v sql.NullFloat64) float64 {
 // KeyName 来自 access_keys（密钥被删后为空，前端回退显示 KeyID）。
 // @ts-type UsageHistoryEntry
 type usageHistoryEntry struct {
-	Ts              int64  `json:"ts"`
-	PublicModel     string `json:"public_model"`
-	UpstreamModel   string `json:"upstream_model"`
-	ProviderID      string `json:"provider_id"`
+	Ts            int64  `json:"ts"`
+	PublicModel   string `json:"public_model"`
+	UpstreamModel string `json:"upstream_model"`
+	ProviderID    string `json:"provider_id"`
+	// ProviderName 是落库当时的 provider 展示名。旧记录没有固化值时为空，
+	// 前端回退到 ProviderID —— 不能 JOIN 当前 providers 行，否则改一次名
+	// 就把全部历史记录改写成「新名字」。
+	ProviderName    string `json:"provider_name"`
 	IngressProtocol string `json:"ingress_protocol"`
-	KeyName         string `json:"key_name"`
-	KeyID           string `json:"key_id"`
-	InputTokens     int64  `json:"input_tokens"`
-	TotalTokens     int64  `json:"total_tokens"`
+	// UpstreamProtocol 是实际目标的上游协议；IngressProtocol 是客户端入口
+	// 协议。列表把两者上下排显示，才能看出「Responses 进、Chat 出」这类
+	// 协议转换。
+	UpstreamProtocol string `json:"upstream_protocol"`
+	KeyName          string `json:"key_name"`
+	KeyID            string `json:"key_id"`
+	InputTokens      int64  `json:"input_tokens"`
+	TotalTokens      int64  `json:"total_tokens"`
 	// OutputTokens 是本次**生成**出来的 token 数（2026-10-11 新增）。
 	//
 	// 为什么必须单独下发、不能拿 TotalTokens 顶替：TotalTokens = 输入 + 输出，
@@ -469,6 +477,8 @@ type usageHistoryEntry struct {
 	// 为什么三个都下发：只有 status（ok/error/truncated…）回答不了
 	// 「为什么失败」。HTTPStatus 给量级（429 限流 vs 401 换 key vs 5xx 上游坏了），
 	// ErrorCode 给归一化短码，ErrorDetail 给上游原文（脱敏+截断后）。
+	// TransportError 没有上游正文时，这里保存底层 DNS / TCP / TLS /
+	// proxy / timeout 原因；流式失败保存截断、溢出或空闲超时的判定。
 	// 前端把它们挂在失败徽章的 title 上 —— 成功记录三者皆空，不占显示。
 	//
 	// 注意 ErrorDetail 只存在于明细层（随保留期一起剪枝）：30 天前的
@@ -494,7 +504,8 @@ type usageHistoryEntry struct {
 // 事实。CSV 表头仍保持原列的前 14 个下标不变，新列追加在末尾。
 const (
 	usageHistoryColumns = `u.ts, u.public_model, u.upstream_model,
-		COALESCE(u.provider_id, ''), COALESCE(u.ingress_protocol, ''),
+		COALESCE(u.provider_id, ''), COALESCE(u.provider_name, ''),
+		COALESCE(u.ingress_protocol, ''), COALESCE(u.upstream_protocol, ''),
 		COALESCE(a.name, ''), u.access_key_id,
 		u.input_tokens, u.output_tokens, u.total_tokens,
 		u.cached_tokens, u.cached_creation_tokens, u.reasoning_tokens,
@@ -512,7 +523,8 @@ type usageHistoryScanner interface {
 
 func scanUsageHistoryEntry(scanner usageHistoryScanner, e *usageHistoryEntry) error {
 	return scanner.Scan(
-		&e.Ts, &e.PublicModel, &e.UpstreamModel, &e.ProviderID, &e.IngressProtocol,
+		&e.Ts, &e.PublicModel, &e.UpstreamModel, &e.ProviderID, &e.ProviderName,
+		&e.IngressProtocol, &e.UpstreamProtocol,
 		&e.KeyName, &e.KeyID, &e.InputTokens, &e.OutputTokens, &e.TotalTokens,
 		&e.CachedTokens, &e.CachedCreationTokens, &e.ReasoningTokens, &e.TTFBMs, &e.LatencyMs,
 		&e.Status, &e.Stream, &e.Cost, &e.HTTPStatus, &e.ErrorCode, &e.ErrorDetail,
@@ -661,7 +673,8 @@ func (h *UsageHandler) ExportCSV(w http.ResponseWriter, r *http.Request) {
 		"total_tokens", "ttfb_ms", "latency_ms", "status", "stream", "cost",
 		"output_tokens", "tps", "route_trace", "provider_id", "ingress_protocol",
 		"input_tokens", "cached_tokens", "reasoning_tokens", "request_id",
-		"http_status", "error_code", "error_detail", "cached_creation_tokens"})
+		"http_status", "error_code", "error_detail", "cached_creation_tokens",
+		"provider_name", "upstream_protocol"})
 	for rows.Next() {
 		var e usageHistoryEntry
 		if err := scanUsageHistoryEntry(rows, &e); err != nil {
@@ -695,6 +708,7 @@ func (h *UsageHandler) ExportCSV(w http.ResponseWriter, r *http.Request) {
 			csvCell(e.RequestID), strconv.Itoa(e.HTTPStatus),
 			csvCell(e.ErrorCode), csvCell(e.ErrorDetail),
 			strconv.FormatInt(e.CachedCreationTokens, 10),
+			csvCell(e.ProviderName), csvCell(e.UpstreamProtocol),
 		})
 	}
 	cw.Flush()

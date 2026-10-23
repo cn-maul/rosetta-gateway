@@ -141,11 +141,13 @@ func buildSnapshotFromConfig(cfg *config.Config) *snapshot.Snapshot {
 			Enabled:  true,
 		}
 		snap.Routes.AddProvider(&routing.ProviderRef{
-			ID:       bp.Slug,
-			Slug:     bp.Slug,
-			Endpoint: bp.Endpoint,
-			Protocol: bp.Protocol,
-			Enabled:  true,
+			ID:              bp.Slug,
+			Slug:            bp.Slug,
+			Name:            bp.Name,
+			Endpoint:        bp.Endpoint,
+			Protocol:        bp.Protocol,
+			ProxyConfigured: bp.ProxyURL != "",
+			Enabled:         true,
 		})
 		for _, modelID := range bp.Models {
 			id := cfgModelID(bp.Slug, modelID)

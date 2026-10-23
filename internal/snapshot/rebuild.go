@@ -61,11 +61,14 @@ func RebuildFromDB(ctx context.Context, st *store.Store, failures []ProviderFail
 		}
 
 		snap.Routes.AddProvider(&routing.ProviderRef{
-			ID:       p.ID,
-			Slug:     p.Slug,
-			Endpoint: p.Endpoint,
-			Protocol: p.Protocol,
-			Enabled:  p.Enabled,
+			ID:              p.ID,
+			Slug:            p.Slug,
+			Endpoint:        p.Endpoint,
+			Protocol:        p.Protocol,
+			Name:            p.Name,
+			NetworkID:       p.NetworkID,
+			ProxyConfigured: p.ProxyURL != "",
+			Enabled:         p.Enabled,
 		})
 	}
 

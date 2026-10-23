@@ -134,6 +134,51 @@ func TestSchema_ReopensCurrentVersionAndKeepsData(t *testing.T) {
 	}
 }
 
+// v1.6.6 的 usage_records 没有 provider_name / upstream_protocol。
+// v1.6.7 必须给同版本旧库纯新增这两列，同时保留原有配置与历史数据。
+func TestSchema_AddsUsageHistoryColumnsToExistingCurrentDatabase(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "v166.db")
+	st := openSchemaTestStore(t, path)
+	if err := st.CreateNetwork(context.Background(), &Network{
+		ID: "n1", Name: "keep me", ProxyURL: "http://127.0.0.1:7897",
+	}); err != nil {
+		t.Fatalf("create network: %v", err)
+	}
+	if err := st.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+
+	// 去掉新增列，精确模拟 v1.6.6 已存在的当前版本库。
+	raw, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatalf("open raw database: %v", err)
+	}
+	for _, column := range []string{"provider_name", "upstream_protocol"} {
+		if _, err := raw.Exec(`ALTER TABLE usage_records DROP COLUMN ` + column); err != nil {
+			_ = raw.Close()
+			t.Fatalf("drop %s: %v", column, err)
+		}
+	}
+	if err := raw.Close(); err != nil {
+		t.Fatalf("close raw database: %v", err)
+	}
+
+	reopened := openSchemaTestStore(t, path)
+	columns := tableColumns(t, reopened, "usage_records")
+	for _, column := range []string{"provider_name", "upstream_protocol"} {
+		if !columns[column] {
+			t.Errorf("v1.6.6 database did not gain usage_records.%s", column)
+		}
+	}
+	networks, err := reopened.ListNetworks(context.Background())
+	if err != nil {
+		t.Fatalf("list networks after migration: %v", err)
+	}
+	if len(networks) != 1 || networks[0].Name != "keep me" {
+		t.Fatalf("migration changed existing data: %+v", networks)
+	}
+}
+
 func TestSchema_NormalizesLegacyProtocolValues(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "legacy-protocols.db")
 	st := openSchemaTestStore(t, path)
@@ -250,8 +295,11 @@ func TestSchema_CanonicalObjectsAndColumns(t *testing.T) {
 			"user_id", "rpm_limit", "tpm_limit", "allowed_models_json",
 			"expires_at", "allowed_ips", "group_id",
 		},
-		"usage_records": {"user_id", "error_detail", "route_trace", "cost_total"},
-		"users":         {"balance_cents", "balance_remainder", "group_id", "reserved_tokens"},
+		"usage_records": {
+			"user_id", "error_detail", "route_trace", "cost_total",
+			"provider_name", "upstream_protocol",
+		},
+		"users": {"balance_cents", "balance_remainder", "group_id", "reserved_tokens"},
 		"usage_daily_rollups": {
 			"upstream_model", "ok_ttfb_sum_ms", "ok_ttfb_count",
 			"ok_sample_count", "cost_pending_count",

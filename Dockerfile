@@ -22,9 +22,14 @@
 FROM golang:1.27.3-alpine3.24@sha256:d530cf60723abf1ffae0cd16bb546b379ec0550d2f3815e5b16ed69dbc00fba4 AS build
 WORKDIR /src
 
+# 禁止 Go 在构建时自动下载/切换工具链。go.mod 的 `go 1.27.3` 是模块
+# 最低版本要求；若基础镜像被误改成更旧的版本，构建应在这里明确失败，
+# 而不是悄悄联网拉一个未固定的补丁版本。
+ENV GOTOOLCHAIN=local
+
 # 依赖单独成层：go.mod / go.sum 没变就命中缓存
 COPY go.mod go.sum ./
-RUN go mod download
+RUN go version && go mod download
 
 COPY . .
 

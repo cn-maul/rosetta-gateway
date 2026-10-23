@@ -60,16 +60,22 @@ func withConversationAffinityTransport(client *http.Client, endpoint, protocol, 
 	if client == nil || protocol == "anthropic" {
 		return client
 	}
-
-	base := client.Transport
-	if base == nil {
-		base = http.DefaultTransport
-	}
-	cloned := *client
-	cloned.Transport = &conversationAffinityTransport{
-		base:     base,
+	return withHTTPTransport(client, &conversationAffinityTransport{
+		base:     transportFor(client),
 		openCode: isOpenCodeEndpoint(endpoint) || strings.Contains(strings.ToLower(providerSlug), "opencode"),
+	})
+}
+
+func transportFor(client *http.Client) http.RoundTripper {
+	if client.Transport == nil {
+		return http.DefaultTransport
 	}
+	return client.Transport
+}
+
+func withHTTPTransport(client *http.Client, transport http.RoundTripper) *http.Client {
+	cloned := *client
+	cloned.Transport = transport
 	return &cloned
 }
 

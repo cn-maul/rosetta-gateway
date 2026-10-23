@@ -918,12 +918,27 @@ export interface UsageHistoryEntry {
   /** 实际命中的上游配置 id；历史记录中可能为空。 */
   provider_id: string
   /**
+   * 实际命中的上游展示名，落库时固化。
+   *
+   * 旧记录（升级前）为空，页面回退到 provider_id，并明确标成未记录名称。
+   * 不能靠当前 providers 表反查：上游改名后历史会被改写成新名字，
+   * 删除后整列又会突然变成空。
+   */
+  provider_name: string
+  /**
    * 入站协议：chat / response / anthropic。
    *
    * 它回答的是“这次请求从哪个入口进来”，与 upstream_model 所属上游的
    * 协议不是同一个概念。页面用短标签展示，详情里保留原值。
    */
   ingress_protocol: string
+  /**
+   * 出站（连接上游）协议：chat / response / anthropic。
+   *
+   * 与 ingress_protocol 成对阅读：Responses 进、Chat 出说明网关做了协议
+   * 转换；两者相同则是同协议直通。
+   */
+  upstream_protocol: string
   key_name: string // 调用密钥名称（密钥删除后为空）
   key_id: string // 调用密钥 id（回退显示用）
   /** 输入侧 token（请求上下文、工具定义等）。 */
@@ -979,7 +994,7 @@ export interface UsageHistoryEntry {
    * 失败三件套（2026-10-14 新增）：成功记录三者皆空/0。
    *
    * http_status 给量级（429 限流 vs 401 换 key vs 5xx 上游坏了），
-   * error_code 是网关归一化短码，error_detail 是上游原文（脱敏 + 1KB 截断）。
+   * error_code 是网关归一化短码，error_detail 是上游原文（脱敏 + 8KB 截断）。
    * 详情只存在于明细层 —— 超出保留期（默认 30 天）的记录只有短码没有原文。
    */
   http_status: number

@@ -22,6 +22,7 @@ import (
 	"github.com/cn-maul/rosetta-gateway/internal/httpx"
 	"github.com/cn-maul/rosetta-gateway/internal/ingress"
 	"github.com/cn-maul/rosetta-gateway/internal/outwire"
+	wireproto "github.com/cn-maul/rosetta-gateway/internal/protocol"
 	"github.com/cn-maul/rosetta-gateway/internal/ratelimit"
 	"github.com/cn-maul/rosetta-gateway/internal/routing"
 	"github.com/cn-maul/rosetta-gateway/internal/snapshot"
@@ -183,12 +184,36 @@ func (h *Handler) Handle(codec ingress.Codec) http.HandlerFunc {
 	db, logger := h.db, h.logger
 	return func(w http.ResponseWriter, r *http.Request) {
 		start := time.Now()
+		diag := newRequestDiagnostics(r)
+		var decoded *ingress.Request
+		diag.setRemote(httpx.ClientIPOf(r))
+		diag.setRequestID(httpx.RequestIDFromContext(r.Context()))
+		diag.setIngressName(codec.Name())
+		obs := observeResponse(w)
+		w = obs
+		defer func() {
+			diag.observeResponse(obs)
+			if decoded != nil && !diag.hasAttempts() {
+				// The successful path gets request shape from the attempt itself.
+				// Build a second Rosetta view only for failures that never reach
+				// an upstream attempt, so diagnostics do not tax every request.
+				diag.setIngressRequest(decoded.BuildRosetta(), decoded.Stream)
+			}
+			if status, _, _ := diag.result(); status == "" {
+				diag.setResult(outcomeUsageStatus(obs.statusCode()), "", "")
+			}
+			logger.Info("gateway request diagnostic", diag.attrs()...)
+		}()
 
+		authStart := diag.begin("auth")
 		authCtx, err := auth.Authenticate(r)
+		diag.end("auth", authStart)
 		if err != nil {
+			diag.setResult("error", "invalid_api_key", err.Error())
 			authhttp.WriteAuthError(w, err, codec.WriteError)
 			return
 		}
+		diag.setAuth(authCtx.UserID, authCtx.KeyID)
 		r = withOpenCodeSession(r)
 
 		// RPM 限速（DESIGN §11.4）：额度随鉴权从快照带出（0 = 不限）。
@@ -200,6 +225,7 @@ func (h *Handler) Handle(codec ingress.Codec) http.HandlerFunc {
 		// （此前这里写的是「被拒的请求同样计数」，与实现相反。实现是对的，
 		//  错的是注释——留着会诱导后人「修反」成count-on-reject。）
 		if ok, retry := h.limiter.AllowRPM(authCtx.KeyID, authCtx.RPMLimit); !ok {
+			diag.setResult("error", "rate_limit_exceeded", "")
 			logger.Warn("rate limited (rpm)", "key_id", authCtx.KeyID,
 				"retry_after", retry.String(),
 				"request_id", httpx.RequestIDFromContext(r.Context()))
@@ -209,8 +235,11 @@ func (h *Handler) Handle(codec ingress.Codec) http.HandlerFunc {
 			return
 		}
 
+		decodeStart := diag.begin("decode")
 		ing, err := codec.Decode(r, int64(h.cfg.Defaults.MaxRequestBodyBytes))
+		diag.end("decode", decodeStart)
 		if err != nil {
+			diag.setResult("error", "invalid_request_error", err.Error())
 			// 超限时中间件的 MaxBytesReader 会返回 *http.MaxBytesError。
 			// 旧实现把它包成 "read body: ..." 一并当 400 回，客户端看不出
 			// 「是body太大」还是「body格式错」——两者要采取的行动完全不同。
@@ -223,9 +252,12 @@ func (h *Handler) Handle(codec ingress.Codec) http.HandlerFunc {
 			codec.WriteError(w, http.StatusBadRequest, "invalid_request_error", err.Error())
 			return
 		}
-
+		decoded = ing
+		diag.setPublicModel(ing.Model)
 		if ing.Stream {
+			admissionStart := diag.begin("admission")
 			if !h.acquireStreamSlot(r.Context()) {
+				diag.end("admission", admissionStart)
 				// 客户端已断开：不必再写任何响应。
 				if r.Context().Err() != nil {
 					return
@@ -249,8 +281,10 @@ func (h *Handler) Handle(codec ingress.Codec) http.HandlerFunc {
 				setRetryAfter(w, h.admissionTimeout)
 				codec.WriteError(w, http.StatusServiceUnavailable, "server_overloaded",
 					"too many concurrent streaming requests; retry shortly")
+				diag.setResult("error", "server_overloaded", "")
 				return
 			}
+			diag.end("admission", admissionStart)
 			defer func() { <-h.streams }()
 		}
 
@@ -271,15 +305,18 @@ func (h *Handler) Handle(codec ingress.Codec) http.HandlerFunc {
 		var rate *RateCommit
 		var est int64
 		needEstimate := authCtx.TPMLimit > 0
+		quotaStart := diag.begin("quota")
 		if needEstimate {
 			est = ingress.EstimateRequestTokens(ing.BuildRosetta())
 			if ok, retry := h.limiter.ReserveTPM(authCtx.KeyID, authCtx.TPMLimit, est); !ok {
+				diag.end("quota", quotaStart)
 				logger.Warn("rate limited (tpm)", "key_id", authCtx.KeyID,
 					"estimated_tokens", est, "retry_after", retry.String(),
 					"request_id", httpx.RequestIDFromContext(r.Context()))
 				setRetryAfter(w, retry)
 				codec.WriteError(w, http.StatusTooManyRequests, "rate_limit_exceeded",
 					"token rate limit exceeded for this API key")
+				diag.setResult("error", "rate_limit_exceeded", "")
 				return
 			}
 			rate = NewRateCommit(h.limiter, authCtx.KeyID, authCtx.TPMLimit, est, db, logger)
@@ -338,6 +375,8 @@ func (h *Handler) Handle(codec ingress.Codec) http.HandlerFunc {
 				rate.Commit(0)
 				codec.WriteError(w, http.StatusTooManyRequests, "insufficient_quota",
 					"this API key has exhausted its token quota")
+				diag.end("quota", quotaStart)
+				diag.setResult("error", "insufficient_quota", "")
 				return
 			default:
 				if rate == nil {
@@ -392,6 +431,8 @@ func (h *Handler) Handle(codec ingress.Codec) http.HandlerFunc {
 				rate.Commit(0)
 				codec.WriteError(w, http.StatusTooManyRequests, "insufficient_quota",
 					"this account has exhausted its token quota")
+				diag.end("quota", quotaStart)
+				diag.setResult("error", "insufficient_quota", "")
 				return
 			default:
 				if rate == nil {
@@ -400,12 +441,16 @@ func (h *Handler) Handle(codec ingress.Codec) http.HandlerFunc {
 				rate.SetUserQuotaReserved(authCtx.UserID, reserved)
 			}
 		}
+		diag.end("quota", quotaStart)
 
 		snap := h.snapshot()
+		routingStart := diag.begin("routing")
 		res, err := snap.Routes.Resolve(ing.Model)
+		diag.end("routing", routingStart)
 		if err != nil {
 			rate.Commit(0)
 			codec.WriteError(w, http.StatusNotFound, "model_not_found", ModelNotFoundMessage(snap, ing.Model))
+			diag.setResult("error", "model_not_found", "")
 			return
 		}
 		route := res.Route
@@ -429,6 +474,7 @@ func (h *Handler) Handle(codec ingress.Codec) http.HandlerFunc {
 		// 顺序只影响错误码优先级。
 		if !authCtx.AllowsModel(route.PublicName) {
 			rate.Commit(0)
+			diag.setResult("error", "model_not_allowed", "")
 			logger.Warn("model not allowed for caller",
 				"model", route.PublicName, "key_id", authCtx.KeyID, "user_id", authCtx.UserID,
 				"request_id", httpx.RequestIDFromContext(r.Context()))
@@ -477,12 +523,16 @@ func (h *Handler) Handle(codec ingress.Codec) http.HandlerFunc {
 		// 与配额预检的另一处不同：**不做预占**。余额是浮点量，估算与真实值
 		// 必然不等，预占了就得退款（等于把 ReserveQuota/ReleaseQuota 那套再
 		// 实现一遍，而那正是 2026-10-07 的 P0-2 教训）。所以这里是纯查询。
-		if bal := h.precheckBalance(w, r, authCtx, ing, res.Candidates, codec); !bal {
+		balanceStart := diag.begin("balance_precheck")
+		bal := h.precheckBalance(w, r, authCtx, ing, res.Candidates, codec)
+		diag.end("balance_precheck", balanceStart)
+		if !bal {
 			// 余额预检已写回 402/500。rate.Commit(0) 不能省：走到这里说明
 			// TPM/配额预占可能已经立起来了（needEstimate 为真时），不退的话
 			// 它们会一直占着窗口/终身额度直到过期。与上面 model_not_allowed
 			// 的收尾同口径。
 			rate.Commit(0)
+			diag.setResult("error", "balance_precheck_failed", "")
 			return
 		}
 
@@ -517,7 +567,9 @@ func (h *Handler) Handle(codec ingress.Codec) http.HandlerFunc {
 		}
 
 		// 硬约束过滤（2026-10-07 P1-8）：请求要求结构化输出（json_object /
-		// json_schema）而候选上游是 anthropic 协议时，跳过该候选。
+		// json_schema）而候选上游实际使用 anthropic 协议时，跳过该候选。
+		// "auto" 必须先取池中探测后的协议，否则自动识别出的 Anthropic
+		// 会被误当成 Chat 放行，导致约束静默丢失。
 		//
 		// 为什么不能放行：Anthropic 没有 response_format / text.format 的对应物，
 		// inwire 层已无处可翻；照发等于接受「200 但约束静默丢失」——尤其恶劣的
@@ -526,14 +578,14 @@ func (h *Handler) Handle(codec ingress.Codec) http.HandlerFunc {
 		// 安全 —— 客户端拿到明确错误，至少知道该改请求或改路由，而不是拿着
 		// 「看起来成功」的无约束输出去下游消费。
 		//
-		// "auto" / "" / openai 系协议不受影响：chat 与 response
-		// 都能表达这两类约束（inwire 层已做等价翻译）。放在熔断筛选之后、预算
+		// 探测结果为 chat / response 的候选不受影响：两种协议都能表达这两类
+		// 约束（inwire 层已做等价翻译）。放在熔断筛选之后、预算
 		// 截断之前：先剔除服务不了的目标，让 failover_max_targets 的预算花在
 		// 真正可服务的候选上。
 		if ing.RequiresStructuredOutput {
 			var serviceable []routing.Candidate
 			for _, c := range active {
-				if c.Provider != nil && c.Provider.Protocol != "anthropic" {
+				if c.Provider != nil && h.effectiveProviderProtocol(c) != wireproto.Anthropic {
 					serviceable = append(serviceable, c)
 				}
 			}
@@ -546,6 +598,7 @@ func (h *Handler) Handle(codec ingress.Codec) http.HandlerFunc {
 				codec.WriteError(w, http.StatusBadRequest, "invalid_request_error",
 					"this request requires structured output (json_object/json_schema), "+
 						"but no candidate upstream can serve it: the anthropic protocol has no equivalent of response_format")
+				diag.setResult("error", "invalid_request_error", "")
 				return
 			}
 			active = serviceable
@@ -564,6 +617,7 @@ func (h *Handler) Handle(codec ingress.Codec) http.HandlerFunc {
 		// Candidate 是值类型，额外用 evaluatedAny 区分“没评估”与“评估到零值”。
 		var lastTarget routing.Candidate
 		var evaluatedAny bool
+		var lastUpstreamProtocol string
 		// routeTrace 记录链上的失败决策（2026-10-17）。只在真的发生过转移时
 		// 才有内容 —— 单目标成功、首跳成功都不写，避免给每条记录加噪声。
 		// 由 AppendRouteTrace 统一格式化，保证「第几个目标」与失败原因成对出现。
@@ -572,6 +626,7 @@ func (h *Handler) Handle(codec ingress.Codec) http.HandlerFunc {
 			isLast := i == len(active)-1
 			lastTarget = cand
 			evaluatedAny = true
+			diag.setSelected(cand, "", h.effectiveProviderProtocol(cand))
 
 			// 客户端已断开就收手：半路跑掉的人不该消耗整条链的下游配额，
 			// 也不该把一次在途取消误记成目标的失败。此刻尚未写出任何字节，
@@ -610,6 +665,16 @@ func (h *Handler) Handle(codec ingress.Codec) http.HandlerFunc {
 					// 仍在冷却中，或探测名额已被同链的并发请求领走 —— 沿链继续。
 					// 没领到名额，也就没有归还义务。
 					routeTrace = AppendRouteTrace(routeTrace, i+1, cand, "skip", "probe_busy_or_cooling")
+					diag.addAttempt(attemptDiagnostics{
+						Index: i + 1, TargetID: cand.TargetID,
+						ProviderID: providerID(cand), ProviderName: providerName(cand),
+						ProviderSlug: providerSlug(cand), UpstreamModel: cand.UpstreamModel.ModelID,
+						Protocol: h.effectiveProviderProtocol(cand), EndpointHost: providerEndpointHost(cand),
+						NetworkID: providerNetworkID(cand), ProxyConfigured: providerProxyConfigured(cand),
+						Status: "skipped", ErrorCode: "probe_busy_or_cooling", Eligible: false,
+						FailureStage: "target_circuit_breaker", FailureAttribution: "target_configuration",
+						AttributionConfidence: "high",
+					})
 					if !isLast {
 						logger.Warn("failover: target not claiming a probe slot, switching target",
 							"model", ing.Model, "provider", cand.Provider.Slug, "attempt", i+1,
@@ -631,7 +696,9 @@ func (h *Handler) Handle(codec ingress.Codec) http.HandlerFunc {
 			if credentialAffinity == "" {
 				credentialAffinity = conversationSessionID(r)
 			}
+			credentialStart := diag.begin("credential_select")
 			client, credID, cerr := h.pool.GetAnyClientByAffinity(cand.Provider.Slug, credentialAffinity)
+			diag.end("credential_select", credentialStart)
 			if cerr != nil {
 				// 该目标当前无健康凭据：这是 provider 的凭据状态，不是目标/上游
 				// 故障。把目标熔断与凭据冷却叠加会延长恢复时间，而且下一次
@@ -643,6 +710,17 @@ func (h *Handler) Handle(codec ingress.Codec) http.HandlerFunc {
 				out = Outcome{Eligible: true, StatusCode: http.StatusBadGateway,
 					Code: "upstream_error", Message: "no available upstream provider"}
 				routeTrace = AppendRouteTrace(routeTrace, i+1, cand, "fail", "no_healthy_credential")
+				diag.addAttempt(attemptDiagnostics{
+					Index: i + 1, TargetID: cand.TargetID,
+					ProviderID: providerID(cand), ProviderName: providerName(cand),
+					ProviderSlug: providerSlug(cand), UpstreamModel: cand.UpstreamModel.ModelID,
+					Protocol: h.effectiveProviderProtocol(cand), EndpointHost: providerEndpointHost(cand),
+					NetworkID: providerNetworkID(cand), ProxyConfigured: providerProxyConfigured(cand),
+					Status: "failed", ErrorCode: "no_healthy_credential",
+					ErrorMessage: cerr.Error(), CredentialMs: 0, Eligible: true,
+					FailureStage: "target_credential_pool", FailureAttribution: "target_configuration",
+					AttributionConfidence: "high",
+				})
 				if !isLast {
 					logger.Warn("failover: no healthy credential, switching target",
 						"model", ing.Model, "provider", cand.Provider.Slug, "request_id", httpx.RequestIDFromContext(r.Context()))
@@ -650,11 +728,17 @@ func (h *Handler) Handle(codec ingress.Codec) http.HandlerFunc {
 				}
 				break
 			}
+			lastUpstreamProtocol = upstreamProtocolName(client.Protocol())
+			diag.setSelected(cand, credID, lastUpstreamProtocol)
 
+			attemptTrace := upstream.NewAttemptTrace()
+			attemptCtx := upstream.WithAttemptTrace(r.Context(), attemptTrace)
+			attemptReq := r.WithContext(attemptCtx)
+			attemptStart := time.Now()
 			if ing.Stream {
-				out = h.attemptStream(w, r, client, ing, cand, authCtx, codec, rate, snap, start, routeTrace)
+				out = h.attemptStream(w, attemptReq, client, ing, cand, authCtx, codec, rate, snap, start, routeTrace, diag, attemptTrace, i+1, attemptStart)
 			} else {
-				out = h.attemptNonStream(w, r, client, ing, cand, authCtx, codec, rate, snap, start, routeTrace)
+				out = h.attemptNonStream(w, attemptReq, client, ing, cand, authCtx, codec, rate, snap, start, routeTrace, diag, attemptTrace, i+1, attemptStart)
 			}
 			if out.Committed {
 				// 只有真成功才记成功 —— 断流/溢出/上游错误虽已提交，却是失败，
@@ -770,13 +854,21 @@ func (h *Handler) Handle(codec ingress.Codec) http.HandlerFunc {
 		if !clientGone {
 			codec.WriteError(w, statusCode, code, message)
 		}
+		diag.setResult(statusForDiagnostics(clientGone, gatewayTimeout), errorCodeForDiagnostics(clientGone, gatewayTimeout, code), out.Detail)
+		diag.setTerminal(clientGone, gatewayTimeout)
 		rate.Commit(0)
-		provID, upstreamModel := "", ""
+		provID, providerName, upstreamModel, upstreamProtocol := "", "", "", ""
 		// 归因到最后评估到的目标：即使失败发生在凭据选择阶段，这个目标仍是
 		// 本次请求真实命中的路由成员。Provider 判空防御 active 为空的理论
 		// 分支，避免解引用零值 Candidate 时 panic。
 		if evaluatedAny && lastTarget.Provider != nil {
-			provID, upstreamModel = lastTarget.Provider.ID, lastTarget.UpstreamModel.ModelID
+			provID = lastTarget.Provider.ID
+			providerName = lastTarget.Provider.Name
+			upstreamModel = lastTarget.UpstreamModel.ModelID
+			upstreamProtocol = h.effectiveProviderProtocol(lastTarget)
+			if lastUpstreamProtocol != "" {
+				upstreamProtocol = lastUpstreamProtocol
+			}
 		}
 		status := store.UsageStatusError
 		errorCode := code
@@ -795,23 +887,26 @@ func (h *Handler) Handle(codec ingress.Codec) http.HandlerFunc {
 				"model", ing.Model, "request_id", httpx.RequestIDFromContext(r.Context()))
 		}
 		h.usage.Record(&store.UsageRecord{
-			ID:              newID(),
-			AccessKeyID:     keyID,
-			UserID:          authCtx.UserID,
-			RequestID:       httpx.RequestIDFromContext(r.Context()),
-			PublicModel:     ing.Model,
-			ProviderID:      provID,
-			UpstreamModel:   upstreamModel,
-			IngressProtocol: codec.Name(),
-			Stream:          ing.Stream,
-			UsageState:      store.UsageStateNone,
-			Status:          status,
-			HTTPStatus:      statusCode,
-			ErrorCode:       errorCode,
-			ErrorDetail:     errorDetail,
-			LatencyMs:       time.Since(start).Milliseconds(),
-			RouteTrace:      strings.Join(routeTrace, "; "),
+			ID:               newID(),
+			AccessKeyID:      keyID,
+			UserID:           authCtx.UserID,
+			RequestID:        httpx.RequestIDFromContext(r.Context()),
+			PublicModel:      ing.Model,
+			ProviderID:       provID,
+			ProviderName:     providerName,
+			UpstreamModel:    upstreamModel,
+			IngressProtocol:  codec.Name(),
+			UpstreamProtocol: upstreamProtocol,
+			Stream:           ing.Stream,
+			UsageState:       store.UsageStateNone,
+			Status:           status,
+			HTTPStatus:       statusCode,
+			ErrorCode:        errorCode,
+			ErrorDetail:      errorDetail,
+			LatencyMs:        time.Since(start).Milliseconds(),
+			RouteTrace:       strings.Join(routeTrace, "; "),
 		})
+		diag.setRouteTrace(strings.Join(routeTrace, "; "))
 	}
 }
 
@@ -872,6 +967,22 @@ func ModelNotFoundMessage(snap *snapshot.Snapshot, requested string) string {
 	return fmt.Sprintf("%s。可用的相似模型：%s", base, strings.Join(sugg, ", "))
 }
 
+// effectiveProviderProtocol returns the protocol the pool actually resolved,
+// falling back to the routing snapshot while the pool has no entry yet. The
+// configured value may be "auto"; protocol-specific behavior must never treat
+// that as Chat.
+func (h *Handler) effectiveProviderProtocol(c routing.Candidate) string {
+	if c.Provider == nil {
+		return ""
+	}
+	if h.pool != nil {
+		if protocol := h.pool.ResolvedProtocol(c.Provider.Slug); protocol != "" {
+			return protocol
+		}
+	}
+	return wireproto.Normalize(c.Provider.Protocol)
+}
+
 // attemptStream 尝试在当前目标上完成一次流式响应。
 //
 // 关键：SSE 头与状态码**推迟到拿到第一个上游事件之后才写**。这样「建立失败」
@@ -884,11 +995,16 @@ func ModelNotFoundMessage(snap *snapshot.Snapshot, requested string) string {
 // 可转移」）。它必须带进来：本 attempt 一旦提交（写下首字节），usage 就在
 // 这里落库且不会再回到外层 —— 只写当前一跳会丢掉「为什么走到备用上游」，
 // 而那恰恰是这条记录最有价值的部分。
-func (h *Handler) attemptStream(w http.ResponseWriter, r *http.Request, client *rosetta.Client, ing *ingress.Request, cand routing.Candidate, authCtx *auth.Context, codec ingress.Codec, rate *RateCommit, snap *snapshot.Snapshot, start time.Time, priorTrace []string) Outcome {
+func (h *Handler) attemptStream(w http.ResponseWriter, r *http.Request, client *rosetta.Client, ing *ingress.Request, cand routing.Candidate, authCtx *auth.Context, codec ingress.Codec, rate *RateCommit, snap *snapshot.Snapshot, start time.Time, priorTrace []string, diag *requestDiagnostics, attemptTrace *upstream.AttemptTrace, attemptIndex int, attemptStart time.Time) Outcome {
 	ctx := r.Context()
-	ctx = withPromptCacheAffinity(ctx, ing, cand, conversationSessionID(r))
 	logger := h.usage.Logger()
 	publicModel := ing.Model
+	attempt := attemptFromCandidate(attemptIndex, cand, attemptTrace)
+	upstreamProtocol := upstreamProtocolName(client.Protocol())
+	ctx = withPromptCacheAffinity(ctx, ing, upstreamProtocol, conversationSessionID(r))
+	attempt.Protocol = upstreamProtocol
+	attempt.StartedAtMs = attemptStart.Sub(start).Milliseconds()
+	buildStart := time.Now()
 
 	// 每个 attempt 现造一份请求，并把公共别名换成该目标的上游 model_id、
 	// 挂上该上游协议的私有透传字段。必须在 attempt 内部做（而不是在调用点
@@ -896,11 +1012,13 @@ func (h *Handler) attemptStream(w http.ResponseWriter, r *http.Request, client *
 	// 会把 A 目标的字段泄漏给 B 目标。
 	upstreamReq := ing.BuildRosetta()
 	upstreamReq.Model = cand.UpstreamModel.ModelID
-	ing.ApplyUpstreamExtras(upstreamReq, cand.Provider.Protocol)
-	ing.ApplyThinkingCapability(upstreamReq, cand.UpstreamModel, cand.Provider.Protocol)
+	ing.ApplyUpstreamExtras(upstreamReq, upstreamProtocol)
+	ing.ApplyThinkingCapability(upstreamReq, cand.UpstreamModel, upstreamProtocol)
 	// 剥掉目标协议回放不了的思考块（chat 全剥 / anthropic 剥无签名的），
 	// 否则 harness 回传 thinking 后的第二轮必然 400。详见 replay_gate.go。
-	h.applyReplayGate(upstreamReq, cand.Provider.Protocol)
+	h.applyReplayGate(upstreamReq, upstreamProtocol)
+	attempt.RequestBuildMs = time.Since(buildStart).Milliseconds()
+	diag.setIngressRequest(upstreamReq, true)
 
 	// 首字预算只覆盖「等首个事件」这一段；建立连接那段交给 ResponseHeaderTimeout
 	// 与下面的总请求预算（2026-10-10 修复的 P2）。
@@ -932,11 +1050,17 @@ func (h *Handler) attemptStream(w http.ResponseWriter, r *http.Request, client *
 	// 并计入 TotalRequestBudget —— 它不会无限，只是比首字预算宽。
 	ttftTimeout := FirstTokenTimeout(snap, h.cfg)
 
+	callStart := time.Now()
+	attempt.UpstreamCallStarted = true
 	stream, err := client.ChatStream(ctx, upstreamReq)
 	if err != nil {
-		return OutcomeFromErrCtx(r.Context(), err)
+		out := OutcomeFromErrCtx(r.Context(), err)
+		attempt.UpstreamCallMs = time.Since(callStart).Milliseconds()
+		finishAttempt(&attempt, attemptTrace, attemptStart, out, err, diag)
+		return out
 	}
 	defer stream.Close()
+	attempt.UpstreamCallMs = time.Since(callStart).Milliseconds()
 
 	// 首字（TTFT）看门狗：只掐「一个事件都没等到」的慢上游，触发即关流，
 	// 尚未写头 → 未提交 → 外层可转移。与下面的 idle 看门狗是两回事。
@@ -964,23 +1088,38 @@ func (h *Handler) attemptStream(w http.ResponseWriter, r *http.Request, client *
 
 	if !gotFirst || ttftTimedOut.Load() {
 		if cerr := stream.Err(); cerr != nil {
-			return OutcomeFromErrCtx(r.Context(), cerr)
+			out := OutcomeFromErrCtx(r.Context(), cerr)
+			finishAttempt(&attempt, attemptTrace, attemptStart, out, cerr, diag)
+			return out
 		}
 		if ttftTimedOut.Load() {
 			logger.Warn("stream first-token timeout", "model", publicModel,
 				"provider", cand.Provider.Slug, "ttft_timeout_ms", ttftTimeout.Milliseconds())
-			return Outcome{Eligible: true, CredentialCooldown: 60 * time.Second,
+			// 首字超时是目标侧的性能/可用性问题，不是这把 key 失效：
+			// 只累计目标熔断，不冷却凭据。否则单 key provider 会在一次
+			// 慢响应后整家 60s 不可用。
+			out := Outcome{Eligible: true,
 				StatusCode: http.StatusGatewayTimeout, Code: "upstream_timeout",
-				Message: "upstream first-token timeout"}
+				Message: "upstream first-token timeout",
+				Detail:  "upstream did not produce its first stream event before the first-token timeout"}
+			finishAttempt(&attempt, attemptTrace, attemptStart, out, nil, diag)
+			return out
 		}
 		// 干净 EOF 却在首个事件之前（上游返回 200 后立刻空流）—— 按可转移的空响应处理。
-		return Outcome{Eligible: true, StatusCode: http.StatusBadGateway,
-			Code: "upstream_error", Message: "upstream returned empty response"}
+		out := Outcome{Eligible: true, StatusCode: http.StatusBadGateway,
+			Code: "upstream_error", Message: "upstream returned empty response",
+			Detail: "upstream closed the stream cleanly before producing its first event"}
+		finishAttempt(&attempt, attemptTrace, attemptStart, out, nil, diag)
+		return out
 	}
 
 	// —— 首个事件已到，自此提交：写 SSE 头，之后任何中断都只能如实 truncated 收尾 ——
-	var ttfbMs int64
-	ttfbMs = time.Since(start).Milliseconds()
+	ttfbMs := time.Since(start).Milliseconds()
+	firstEventAt := time.Now()
+	// usage 的 ttfbMs 保持「请求进入网关到首字」的端到端口径；
+	// attempt.TTFBMs 则只量上游调用开始到首字，避免把鉴权、排队和请求
+	// 构造算进上游性能。
+	attempt.TTFBMs = firstEventAt.Sub(callStart).Milliseconds()
 
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
@@ -1070,6 +1209,7 @@ func (h *Handler) attemptStream(w http.ResponseWriter, r *http.Request, client *
 	// canceled 更是客户端自己的行为，都不该有详情。
 	errorDetail := ""
 	httpStatus := 200
+	var terminalErr error
 
 	// partialOutRunes 累计本次流里**已经收到**的输出侧字符数（正文 + 思考）。
 	//
@@ -1086,6 +1226,7 @@ func (h *Handler) attemptStream(w http.ResponseWriter, r *http.Request, client *
 		heartbeatTicker.Reset(heartbeatInterval)
 		switch ev.Type {
 		case rosetta.EventMessageEnd:
+			attempt.StreamEvents++
 			if ev.Usage != nil {
 				lastUsage = *ev.Usage
 			}
@@ -1095,12 +1236,30 @@ func (h *Handler) attemptStream(w http.ResponseWriter, r *http.Request, client *
 			// 混进 token 估算会让数字失去意义（半个 JSON 对象既不是
 			// 中文也不是英文，按字符数估会离谱地偏高）。
 			partialOutRunes += len([]rune(ev.Text))
+			attempt.StreamEvents++
+		case rosetta.EventToolCall:
+			attempt.StreamEvents++
+			if attempt.FirstToolCallMs == 0 {
+				attempt.FirstToolCallMs = time.Since(attemptStart).Milliseconds()
+			}
+			if ev.ToolID != "" || ev.ToolName != "" {
+				attempt.ToolCalls++
+			}
+		case rosetta.EventMessageStart:
+			attempt.StreamEvents++
+			diag.setUpstreamResponse(ev.ID)
 		}
 		sink.Event(ev)
 	}
 
+	lastEvent := time.Now()
 	consume(stream.Event())
 	for stream.Next() {
+		now := time.Now()
+		if gap := now.Sub(lastEvent).Milliseconds(); gap > attempt.MaxEventGapMs {
+			attempt.MaxEventGapMs = gap
+		}
+		lastEvent = now
 		consume(stream.Event())
 		// 下游连接已不可用（2026-10-21 修 *X12）：继续把上游流读完只会把
 		// 字节写进一个死连接，而上游还在按 token 计费、我们还在为它付钱。
@@ -1114,6 +1273,7 @@ func (h *Handler) attemptStream(w http.ResponseWriter, r *http.Request, client *
 			break
 		}
 	}
+	attempt.PostTTFBMs = time.Since(firstEventAt).Milliseconds()
 
 	// 终态判定顺序（2026-10-21 修 *X12）——顺序本身就是 bug：
 	//
@@ -1144,6 +1304,8 @@ func (h *Handler) attemptStream(w http.ResponseWriter, r *http.Request, client *
 		// 区分「客户端自己走了」与「我们写不进去」。
 		status = store.UsageStatusCanceled
 		errorCode = "downstream_write_failed"
+		errorDetail = outwire.SafeErrorDetail(werr)
+		terminalErr = werr
 		if serr := stream.Err(); serr != nil {
 			logger.Debug("stream error observed after downstream write failure",
 				"model", publicModel, "key_id", authCtx.KeyID, "stream_error", serr)
@@ -1157,6 +1319,7 @@ func (h *Handler) attemptStream(w http.ResponseWriter, r *http.Request, client *
 				"model", publicModel, "key_id", authCtx.KeyID, "error", werr)
 		}
 	} else if err := stream.Err(); err != nil {
+		terminalErr = err
 		// 网关总预算到期不是上游故障（2026-10-22 修 *X11）。
 		// 必须排在 truncated / client-gone 之前：预算到期时上游流通常
 		// 也会报 TransportError，若先按上游错误归类，就会冷却凭据并累计
@@ -1165,6 +1328,9 @@ func (h *Handler) attemptStream(w http.ResponseWriter, r *http.Request, client *
 			status = store.UsageStatusTimeout
 			errorCode = "gateway_timeout"
 			errorDetail = "gateway request budget exceeded"
+			if detail := outwire.SafeErrorDetail(err); detail != "" && detail != errorDetail {
+				errorDetail += "\n" + detail
+			}
 			logger.Warn("stream cut by gateway total request budget",
 				"model", publicModel, "key_id", authCtx.KeyID,
 				"elapsed_ms", time.Since(start).Milliseconds(),
@@ -1175,10 +1341,12 @@ func (h *Handler) attemptStream(w http.ResponseWriter, r *http.Request, client *
 			case errors.Is(err, rosetta.ErrStreamTruncated):
 				status = store.UsageStatusTruncated
 				errorCode = "stream_truncated"
+				errorDetail = outwire.UpstreamErrorDetail(err)
 				logger.Warn("stream truncated", "model", publicModel, "key_id", authCtx.KeyID, "error", err)
 			case errors.Is(err, rosetta.ErrStreamOverflow):
 				status = store.UsageStatusOverflow
 				errorCode = "stream_overflow"
+				errorDetail = outwire.UpstreamErrorDetail(err)
 				logger.Error("stream overflow", "model", publicModel, "key_id", authCtx.KeyID, "error", err)
 			case IsClientGone(ctx, err):
 				// 客户端主动断开不是上游故障。此前一律记 error，后果是：后台错误率虚高、
@@ -1195,6 +1363,7 @@ func (h *Handler) attemptStream(w http.ResponseWriter, r *http.Request, client *
 	} else if idleTimedOut.Load() && !sink.SawTerminal() {
 		status = store.UsageStatusTruncated
 		errorCode = "stream_idle_timeout"
+		errorDetail = "upstream stream produced no event within the idle timeout"
 		logger.Warn("stream cut by idle watchdog without terminal event",
 			"model", publicModel, "key_id", authCtx.KeyID,
 			"idle_timeout_ms", idleTimeout.Milliseconds(),
@@ -1286,8 +1455,10 @@ func (h *Handler) attemptStream(w http.ResponseWriter, r *http.Request, client *
 		RequestID:            httpx.RequestIDFromContext(r.Context()),
 		PublicModel:          publicModel,
 		ProviderID:           cand.Provider.ID,
+		ProviderName:         cand.Provider.Name,
 		UpstreamModel:        cand.UpstreamModel.ModelID,
 		IngressProtocol:      codec.Name(),
+		UpstreamProtocol:     upstreamProtocol,
 		Stream:               true,
 		InputTokens:          lastUsage.InputTokens,
 		OutputTokens:         lastUsage.OutputTokens,
@@ -1326,44 +1497,78 @@ func (h *Handler) attemptStream(w http.ResponseWriter, r *http.Request, client *
 			rate.ReleaseQuota()
 		}
 	})
+	attempt.Status = status
+	attempt.ErrorCode = errorCode
+	attempt.ErrorDetail = errorDetail
+	attempt.Committed = true
+	attempt.Success = status == store.UsageStatusOK
+	attempt.DurationMs = time.Since(attemptStart).Milliseconds()
+	attempt.ToolCalls = maxInt(attempt.ToolCalls, 0)
+	attempt.OutputRunes = partialOutRunes
+	attempt.PostTTFBMs = time.Since(firstEventAt).Milliseconds()
+	applyTraceTimings(&attempt, attemptTrace)
+	out := Outcome{
+		Committed:         true,
+		Success:           status == store.UsageStatusOK,
+		ClientGone:        status == store.UsageStatusCanceled,
+		NoUpstreamPenalty: status == store.UsageStatusOverflow,
+		GatewayTimeout:    status == store.UsageStatusTimeout,
+		Code:              errorCode,
+	}
+	setAttemptDiagnosis(&attempt, out, terminalErr)
+	diag.addAttempt(attempt)
+	diag.setStreamOutput(partialOutRunes, attempt.ToolCalls, attempt.FirstToolCallMs)
+	diag.setStreamMetrics(attempt.StreamEvents, attempt.MaxEventGapMs)
+	diag.setUsage(lastUsage.OutputTokens)
+	diag.setResult(status, errorCode, errorDetail)
+	diag.setRouteTrace(strings.Join(AppendRouteTrace(priorTrace, len(priorTrace)+1, cand, StreamCommitOutcome(status), errorCode), "; "))
+	diag.setTerminal(status == store.UsageStatusCanceled, status == store.UsageStatusTimeout)
 	// committed=true（字节已写出、无法回退换目标）与「这一次算成功」是两件事：
 	// truncated / overflow / error / canceled 都已提交，但对上游而言是失败。
 	// 只有 status=="ok" 才允许外层记成功，否则「先200 再断流」这类最常见的
 	// 上游故障永远不累计失败、目标永不熔断。
 	// clientGone 只给「客户端自己走了」的那一种：它不该计入熔断计数
 	// （见 Outcome.ClientGone）。
-	return Outcome{
-		Committed:         true,
-		Success:           status == "ok",
-		ClientGone:        status == "canceled",
-		NoUpstreamPenalty: status == store.UsageStatusOverflow,
-		GatewayTimeout:    status == store.UsageStatusTimeout,
-	}
+	return out
 }
 
 // priorTrace 的含义与 attemptStream 相同：提交后的落库在这里发生，
 // 必须把此前目标的失败决策一并带上。
-func (h *Handler) attemptNonStream(w http.ResponseWriter, r *http.Request, client *rosetta.Client, ing *ingress.Request, cand routing.Candidate, authCtx *auth.Context, codec ingress.Codec, rate *RateCommit, snap *snapshot.Snapshot, start time.Time, priorTrace []string) Outcome {
+func (h *Handler) attemptNonStream(w http.ResponseWriter, r *http.Request, client *rosetta.Client, ing *ingress.Request, cand routing.Candidate, authCtx *auth.Context, codec ingress.Codec, rate *RateCommit, snap *snapshot.Snapshot, start time.Time, priorTrace []string, diag *requestDiagnostics, attemptTrace *upstream.AttemptTrace, attemptIndex int, attemptStart time.Time) Outcome {
 	publicModel := ing.Model
+	attempt := attemptFromCandidate(attemptIndex, cand, attemptTrace)
+	upstreamProtocol := upstreamProtocolName(client.Protocol())
+	attempt.Protocol = upstreamProtocol
+	attempt.StartedAtMs = attemptStart.Sub(start).Milliseconds()
+	buildStart := time.Now()
 	// 同attemptStream：别名 → 上游 model_id 的映射与协议私有字段的透传
 	// 必须在本次 attempt 内完成，不能由调用方造好传入。
 	upstreamReq := ing.BuildRosetta()
 	upstreamReq.Model = cand.UpstreamModel.ModelID
-	ing.ApplyUpstreamExtras(upstreamReq, cand.Provider.Protocol)
-	ing.ApplyThinkingCapability(upstreamReq, cand.UpstreamModel, cand.Provider.Protocol)
+	ing.ApplyUpstreamExtras(upstreamReq, upstreamProtocol)
+	ing.ApplyThinkingCapability(upstreamReq, cand.UpstreamModel, upstreamProtocol)
 	// 与 attemptStream 同一刀，理由见 replay_gate.go。
-	h.applyReplayGate(upstreamReq, cand.Provider.Protocol)
+	h.applyReplayGate(upstreamReq, upstreamProtocol)
+	attempt.RequestBuildMs = time.Since(buildStart).Milliseconds()
+	diag.setIngressRequest(upstreamReq, false)
 
 	// 绑定 r.Context() 而非 context.Background()：客户端断开时上游调用应随之取消，
 	// 否则断连请求会一直占用上游连接与配额直到超时（默认 120s）。
 	ctx, cancel := context.WithTimeout(r.Context(), NonStreamTimeout(snap, h.cfg))
-	ctx = withPromptCacheAffinity(ctx, ing, cand, conversationSessionID(r))
+	ctx = withPromptCacheAffinity(ctx, ing, upstreamProtocol, conversationSessionID(r))
 	defer cancel()
 
+	callStart := time.Now()
+	attempt.UpstreamCallStarted = true
 	resp, err := client.Chat(ctx, upstreamReq)
 	if err != nil {
-		return OutcomeFromErrCtx(r.Context(), err)
+		out := OutcomeFromErrCtx(r.Context(), err)
+		attempt.UpstreamCallMs = time.Since(callStart).Milliseconds()
+		finishAttempt(&attempt, attemptTrace, attemptStart, out, err, diag)
+		return out
 	}
+	attempt.UpstreamCallMs = time.Since(callStart).Milliseconds()
+	diag.setUpstreamResponse(resp.ID)
 
 	// 非流式响应一次性返回，拿不到"首字"这一独立时刻，用响应到达时刻近似（≈总耗时）。
 	latency := time.Since(start).Milliseconds()
@@ -1378,8 +1583,10 @@ func (h *Handler) attemptNonStream(w http.ResponseWriter, r *http.Request, clien
 		RequestID:            httpx.RequestIDFromContext(r.Context()),
 		PublicModel:          publicModel,
 		ProviderID:           cand.Provider.ID,
+		ProviderName:         cand.Provider.Name,
 		UpstreamModel:        cand.UpstreamModel.ModelID,
 		IngressProtocol:      codec.Name(),
+		UpstreamProtocol:     upstreamProtocol,
 		Stream:               false,
 		InputTokens:          resp.Usage.InputTokens,
 		OutputTokens:         resp.Usage.OutputTokens,
@@ -1402,6 +1609,15 @@ func (h *Handler) attemptNonStream(w http.ResponseWriter, r *http.Request, clien
 			rate.ReleaseQuota()
 		}
 	})
+	attempt.Status = store.UsageStatusOK
+	attempt.DurationMs = time.Since(attemptStart).Milliseconds()
+	attempt.TTFBMs = attempt.UpstreamCallMs
+	attempt.Committed = true
+	attempt.Success = true
+	finishAttempt(&attempt, attemptTrace, attemptStart, Outcome{Committed: true, Success: true}, nil, diag)
+	diag.setUsage(resp.Usage.OutputTokens)
+	diag.setResult(store.UsageStatusOK, "", "")
+	diag.setRouteTrace(strings.Join(AppendRouteTrace(priorTrace, len(priorTrace)+1, cand, "ok", ""), "; "))
 	// 非流式能走到这里就意味着上游完整返回了响应 —— 一定是成功。
 	// 漏写 Success 会让每次非流式成功都被外层记成「目标失败」，
 	// 健康的链首目标 3 个请求后就被误熔断（详见 Outcome.Success）。

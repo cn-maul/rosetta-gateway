@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/cn-maul/rosetta"
@@ -17,21 +18,55 @@ import (
 // AppendRouteTrace 记录一次链上决策：第几个目标、谁、结果、原因。
 //
 // 格式固定为 "N:provider/model -> outcome[:reason]"，按发生顺序用 "; " 连接。
+// provider 优先用人类可读的 Name（例如「肥鱼中转」），只有旧快照/测试
+// 没填 Name 时才退回 Slug。调用历史要回答「从谁切到了谁」，而 slug 往往是
+// 部署者随手写的英文短名，光看它认不出是哪家上游。
 // 固定格式是为了让运维能在调用明细里直接读，也方便将来需要时用简单切分做统计；
 // 不引入 JSON 是为了不为一次排障增加 schema 与查询复杂度。
+//
+// provider 名和 model 名都可能含 "/"、";" 或 "\\"：provider 名里的 "/" 会
+// 让解析器误把名字切成 provider/model，";" 又会被当成下一条轨迹。写入时
+// 对这两个字段做最小反斜杠转义，前端解析时还原，既保留原名的可读性，
+// 也不改变既有 "N:provider/model -> outcome:reason" 的格式。
 func AppendRouteTrace(trace []string, attempt int, cand routing.Candidate, outcome, reason string) []string {
 	provider, model := "?", "?"
 	if cand.Provider != nil {
-		provider = cand.Provider.Slug
+		provider = cand.Provider.Name
+		if provider == "" {
+			provider = cand.Provider.Slug
+		}
 	}
 	if cand.UpstreamModel.ModelID != "" {
 		model = cand.UpstreamModel.ModelID
 	}
-	entry := fmt.Sprintf("%d:%s/%s -> %s", attempt, provider, model, outcome)
+	entry := fmt.Sprintf("%d:%s/%s -> %s",
+		attempt, escapeRouteTraceComponent(provider, true), escapeRouteTraceComponent(model, false), outcome)
 	if reason != "" {
 		entry += ":" + reason
 	}
 	return append(trace, entry)
+}
+
+// escapeRouteTraceComponent 只转义会破坏轨迹语法的字符，不做 URL 编码：
+// 转义后的记录仍然一眼能看出是哪个上游/模型。模型名允许包含 "/"（例如
+// "org/model"），所以只有 provider 需要把 "/" 转义成 "\/"；分号与反斜杠
+// 对两者都必须转义，否则一条记录会被拆成多条或无法还原。
+func escapeRouteTraceComponent(value string, escapeSlash bool) string {
+	var b strings.Builder
+	b.Grow(len(value))
+	for _, r := range value {
+		switch {
+		case r == '\\':
+			b.WriteString(`\\`)
+		case r == ';':
+			b.WriteString(`\;`)
+		case r == '/' && escapeSlash:
+			b.WriteString(`\/`)
+		default:
+			b.WriteRune(r)
+		}
+	}
+	return b.String()
 }
 
 // StreamCommitOutcome 把已提交流式的终态映射成轨迹里的结果词。
@@ -82,7 +117,9 @@ type Outcome struct {
 	Message            string
 	// Detail 是上游失败详情（脱敏 + 截断），落进 usage_records.error_detail
 	// 供调用历史排查。与 Message 不同：Message 是给客户端的固定文案，
-	// Detail 是给运维的上游原文。空串 = 无正文可截（TransportError 等）。
+	// Detail 是给运维的完整原因。APIError 保留 message + raw；TransportError
+	// 保留底层 DNS/TCP/TLS/proxy/timeout 原因；流哨兵保留本地判定文案。
+	// 空串 = 该错误确实没有可提供的细节。
 	Detail string
 }
 
@@ -111,11 +148,13 @@ func OutcomeFromErr(err error) Outcome {
 	if errors.Is(err, rosetta.ErrStreamTruncated) || errors.Is(err, rosetta.ErrStreamOverflow) {
 		return Outcome{
 			// 首批事件之前就断流 = 这次尝试什么也没产出，值得换目标再试。
-			Eligible:           true,
-			CredentialCooldown: 60 * time.Second,
-			StatusCode:         http.StatusBadGateway,
-			Code:               "upstream_error",
-			Message:            "upstream stream failed before the first event",
+			// 但这是目标/链路故障，不是凭据故障：不冷却这把 key，
+			// 交给外层 RecordTargetFailure 熔断目标。
+			Eligible:   true,
+			StatusCode: http.StatusBadGateway,
+			Code:       "upstream_error",
+			Message:    "upstream stream failed before the first event",
+			Detail:     outwire.UpstreamErrorDetail(err),
 		}
 	}
 	eligible := outwire.FailoverEligible(err)

@@ -68,13 +68,59 @@ func TestResponsesChatReplay_ReasoningContent(t *testing.T) {
 	}
 }
 
-// 没有 reasoning 的请求不得接管 messages：继续走 SDK 编码器，行为不变。
-func TestResponsesChatReplay_NoReasoningKeepsSDK(t *testing.T) {
+// 即使没有 reasoning，多 item 的 assistant 轮也必须合并成一条消息。
+//
+// SDK 的 chat 编码器逐条输出 assistant 消息，Responses 的
+// message + function_call 于是变成两条连续的 assistant；DeepSeek 系上游
+// 会判定工具调用记录不配对并返回 400。合并与 reasoning 无关。
+func TestResponsesChatReplay_MergesToolTurnWithoutReasoning(t *testing.T) {
+	got := decodeResponses(t, `{
+		"model":"m",
+		"input":[
+			{"type":"message","role":"user","content":[{"type":"input_text","text":"weather?"}]},
+			{"type":"message","role":"assistant","content":[{"type":"output_text","text":"checking"}]},
+			{"type":"function_call","call_id":"call_1","name":"weather","arguments":"{\"city\":\"Paris\"}"},
+			{"type":"function_call_output","call_id":"call_1","output":"sunny"}
+		]
+	}`)
+	req := got.ToRosetta()
+	got.ApplyUpstreamExtras(req, "chat")
+
+	raw, ok := req.Extra["messages"]
+	if !ok {
+		t.Fatalf("messages override missing: %+v", req.Extra)
+	}
+	msgs, ok := raw.([]map[string]any)
+	if !ok {
+		t.Fatalf("messages override type = %T", raw)
+	}
+	if len(msgs) != 3 {
+		t.Fatalf("message count = %d, want 3: %+v", len(msgs), msgs)
+	}
+	assistant := msgs[1]
+	if assistant["role"] != "assistant" || assistant["content"] != "checking" {
+		t.Fatalf("assistant message: %+v", assistant)
+	}
+	calls, ok := assistant["tool_calls"].([]map[string]any)
+	if !ok || len(calls) != 1 || calls[0]["id"] != "call_1" {
+		t.Fatalf("tool_calls must live on the same assistant turn: %+v", assistant)
+	}
+	if _, has := assistant["reasoning_content"]; has {
+		t.Fatalf("no reasoning item => no reasoning_content: %+v", assistant)
+	}
+	if msgs[2]["role"] != "tool" || msgs[2]["tool_call_id"] != "call_1" {
+		t.Fatalf("tool message: %+v", msgs[2])
+	}
+}
+
+// 纯文本请求也必须能走合并编码器（而不是只在有工具时特判）。
+func TestResponsesChatReplay_SimpleText(t *testing.T) {
 	got := decodeResponses(t, `{"model":"m","input":"hi"}`)
 	req := got.ToRosetta()
 	got.ApplyUpstreamExtras(req, "chat")
-	if _, ok := req.Extra["messages"]; ok {
-		t.Fatalf("messages must not be overridden without reasoning: %+v", req.Extra)
+	msgs, ok := req.Extra["messages"].([]map[string]any)
+	if !ok || len(msgs) != 1 || msgs[0]["role"] != "user" || msgs[0]["content"] != "hi" {
+		t.Fatalf("simple text messages: %+v", req.Extra["messages"])
 	}
 }
 

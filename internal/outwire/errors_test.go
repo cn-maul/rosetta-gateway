@@ -53,9 +53,12 @@ func TestCredentialCooldown(t *testing.T) {
 		{"403", &rosetta.APIError{StatusCode: 403}, 30 * time.Minute},
 		{"402", &rosetta.APIError{StatusCode: 402}, time.Hour},
 		{"429", &rosetta.APIError{StatusCode: 429}, 60 * time.Second},
-		{"500", &rosetta.APIError{StatusCode: 500}, 60 * time.Second},
-		{"408", &rosetta.APIError{StatusCode: 408}, 60 * time.Second},
-		{"transport", &rosetta.TransportError{Err: errors.New("reset")}, 60 * time.Second},
+		// 5xx / 408 / 传输错误是目标或链路故障，不是这把 key 的问题。
+		// 给它们非零冷却会让单 key provider 在第一次抖动后整家消失，
+		// 而目标级熔断已经承担了隔离坏上游的职责。
+		{"500 no cooldown", &rosetta.APIError{StatusCode: 500}, 0},
+		{"408 no cooldown", &rosetta.APIError{StatusCode: 408}, 0},
+		{"transport no cooldown", &rosetta.TransportError{Err: errors.New("reset")}, 0},
 		{"400 no cooldown", &rosetta.APIError{StatusCode: 400}, 0},
 		// 404 可转移但**不冷却凭据**：key 是好的，错的是目标的模型配置。
 		// 若给 404 也罚 30 分钟，一个健康凭据会陪着一个配错的模型一起下线，

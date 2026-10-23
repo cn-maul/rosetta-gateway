@@ -107,6 +107,7 @@ async function loadKeys() {
 onMounted(loadKeys)
 
 const parsedTrace = computed(() => parseRouteTrace(selected.value?.route_trace))
+const copyNotice = ref('')
 
 /** 首字超过 10s 红，5–10s 橙，5s 内绿；没有样本保持中性。 */
 function firstTokenTone(h: UsageHistoryEntry): string {
@@ -134,6 +135,89 @@ function routeName(h: UsageHistoryEntry): string {
 
 function upstreamModelName(h: UsageHistoryEntry): string {
   return h.upstream_model || '实际模型未记录'
+}
+
+/**
+ * 实际接单的上游展示名。provider_name 是落库时固化的历史值；旧记录没有
+ * 这个字段，回退到 provider_id 并明确标注，避免让人误以为那就是名字。
+ */
+function upstreamName(h: UsageHistoryEntry): string {
+  return h.provider_name || h.provider_id || '上游未记录'
+}
+
+function upstreamNameTitle(h: UsageHistoryEntry): string {
+  if (h.provider_name) return h.provider_id ? `${h.provider_name}（provider_id: ${h.provider_id}）` : h.provider_name
+  if (h.provider_id) return `旧记录未固化上游名称，provider_id: ${h.provider_id}`
+  return '这条记录没有归因到具体上游'
+}
+
+function protocolPairTitle(h: UsageHistoryEntry): string {
+  return `上游协议：${protocolLabel(h.upstream_protocol, '未记录')}；入站协议：${protocolLabel(h.ingress_protocol, '未记录')}`
+}
+
+function traceSteps(h: UsageHistoryEntry) {
+  return parseRouteTrace(h.route_trace)
+}
+
+function traceNodeClass(step: ReturnType<typeof parseRouteTrace>[number]): string {
+  if (step.outcome === 'ok') return 'path-ok'
+  if (step.outcome === 'skip') return 'path-skip'
+  return 'path-fail'
+}
+
+function traceTitle(h: UsageHistoryEntry): string {
+  const steps = traceSteps(h)
+  if (!steps.length) return '这条记录没有转发决策轨迹'
+  return steps.map(step => {
+    if (!step.parsed) return step.raw
+    return `${step.attempt}. ${step.provider}/${step.model} · ${step.outcomeLabel}${step.reasonLabel ? ' · ' + step.reasonLabel : ''}`
+  }).join('\n')
+}
+
+/**
+ * 错误详情分两段：上游那句 message 与完整 raw body。老记录可能只有一段
+ * 裸文本/裸 JSON，这里统一识别，交给模板分区渲染。
+ */
+const errorView = computed(() => {
+  const value = selected.value?.error_detail?.trim() ?? ''
+  if (!value) return { message: '', raw: '', rawPretty: '' }
+  let message = ''
+  let raw = ''
+  if (value.startsWith('message: ')) {
+    const rawAt = value.indexOf('\nraw: ')
+    if (rawAt >= 0) {
+      message = value.slice('message: '.length, rawAt)
+      raw = value.slice(rawAt + '\nraw: '.length)
+    } else {
+      message = value.slice('message: '.length)
+    }
+  } else if (value.startsWith('raw: ')) {
+    raw = value.slice('raw: '.length)
+  } else {
+    message = value
+  }
+  const looksJSON = message.trimStart().startsWith('{') || message.trimStart().startsWith('[')
+  if (!raw && looksJSON) {
+    raw = message
+    message = ''
+  }
+  let rawPretty = raw
+  if (raw) {
+    try { rawPretty = JSON.stringify(JSON.parse(raw), null, 2) } catch { /* 不是合法 JSON 就保留原文 */ }
+  }
+  return { message, raw, rawPretty }
+})
+
+async function copyError() {
+  const text = selected.value?.error_detail ?? ''
+  if (!text) return
+  try {
+    await navigator.clipboard.writeText(text)
+    copyNotice.value = '已复制'
+  } catch {
+    copyNotice.value = '复制失败，请手动选择文本'
+  }
+  setTimeout(() => { copyNotice.value = '' }, 1800)
 }
 
 /**
@@ -197,24 +281,36 @@ async function exportCSV() {
     <DataTable class="panel table-panel" label="请求日志" :loading="loading" :error="err ? err + (rows.length ? '（近 ' + loadedDays + ' 天，第 ' + loadedPage + ' 页）' : '') : ''" :has-data="!!rows.length" :empty="!rows.length" empty-text="当前条件下没有调用记录" loading-text="正在加载请求日志…" @retry="load">
         <table class="tbl logs-table">
           <thead><tr>
-            <th class="time-column">时间</th><th class="status-column">状态</th><th class="mode-column">模式</th><th class="protocol-column">协议</th><th class="model-column">模型</th><th class="key-column">密钥</th><th class="token-column">Token 用量</th><th class="speed-column">速度</th><th class="timing-column">时间</th><th class="cost-column">费用</th><th class="detail-column">详情</th>
+            <th class="time-column">时间</th><th class="mode-column">模式</th><th class="protocol-column">协议</th><th class="upstream-column">上游</th><th class="model-column">模型</th><th class="path-column">上游路径</th><th class="key-column">密钥</th><th class="token-column">Token 用量</th><th class="speed-column">速度</th><th class="timing-column">时间</th><th class="cost-column">费用</th><th class="status-column">状态</th>
           </tr></thead>
           <tbody><tr v-for="(h, i) in rows" :key="h.ts + ':' + i">
             <td class="mono time-column">{{ fmtTimeMs(h.ts) }}</td>
-            <td class="status-column">
-              <button class="status-button" :title="statusHint(h)" :aria-label="'查看' + statusLabel(h.status) + '请求详情'" @click="selected = h">
-                <span class="badge" :class="statusBadge(h.status)">{{ statusLabel(h.status) }}</span>
-                <span v-if="h.http_status > 0" class="cell-note">HTTP {{ h.http_status }}</span>
-              </button>
-            </td>
             <td class="mode-column"><span class="badge" :class="h.stream ? 'badge-accent' : 'badge-dim'">{{ modeLabel(h) }}</span></td>
-            <td class="protocol-column"><span class="protocol-tag mono" :title="h.ingress_protocol || '入站协议未记录'">{{ protocolLabel(h.ingress_protocol, '未记录') }}</span></td>
+            <td class="protocol-column" :title="protocolPairTitle(h)">
+              <span class="protocol-stack">
+                <span class="protocol-line"><span class="protocol-dir">上游</span><span class="protocol-tag mono">{{ protocolLabel(h.upstream_protocol, '未记录') }}</span></span>
+                <span class="protocol-line"><span class="protocol-dir">下游</span><span class="protocol-tag mono">{{ protocolLabel(h.ingress_protocol, '未记录') }}</span></span>
+              </span>
+            </td>
+            <td class="upstream-column">
+              <span class="upstream-name" :title="upstreamNameTitle(h)">{{ upstreamName(h) }}</span>
+              <span v-if="!h.provider_name && h.provider_id" class="cell-note">名称未固化</span>
+            </td>
             <td class="model-column">
               <span class="mobile-log-time dim">{{ fmtTimeMs(h.ts) }}</span>
               <span class="model-stack">
                 <span class="model-route mono" :title="routeName(h)">{{ routeName(h) }}</span>
                 <span class="model-upstream mono" :title="upstreamModelName(h)">{{ upstreamModelName(h) }}</span>
               </span>
+            </td>
+            <td class="path-column" :title="traceTitle(h)">
+              <span v-if="traceSteps(h).length" class="path-flow">
+                <template v-for="(step, si) in traceSteps(h)" :key="si">
+                  <span class="path-node" :class="traceNodeClass(step)">{{ step.parsed ? step.provider : '记录异常' }}</span>
+                  <span v-if="si < traceSteps(h).length - 1" class="path-arrow" aria-hidden="true">→</span>
+                </template>
+              </span>
+              <span v-else class="dim">—</span>
             </td>
             <td class="key-column"><span class="key-name" :title="h.key_name || h.key_id || '—'">{{ h.key_name || h.key_id || '—' }}</span></td>
             <td class="token-column" :title="tokenTitle(h)">
@@ -230,7 +326,12 @@ async function exportCSV() {
               </span>
             </td>
             <td class="cost-column">¥{{ fmtMoney(h.cost) }}</td>
-            <td class="detail-column"><button class="btn btn-act" :aria-label="'查看 ' + (h.public_model || '请求') + ' 详情'" @click="selected = h">详情</button></td>
+            <td class="status-column">
+              <button class="status-button" :title="statusHint(h) + ' · 点击查看完整详情'" :aria-label="'查看' + statusLabel(h.status) + '请求详情'" @click="selected = h">
+                <span class="badge" :class="statusBadge(h.status)">{{ statusLabel(h.status) }}</span>
+                <span v-if="h.http_status > 0" class="cell-note">HTTP {{ h.http_status }}</span>
+              </button>
+            </td>
           </tr></tbody>
         </table>
       <template #footer><div class="pager"><button class="btn btn-sm" :disabled="request.page <= 1 || loading" @click="go(1)">首页</button><button class="btn btn-sm" :disabled="request.page <= 1 || loading" @click="go(request.page - 1)">上一页</button><span class="pager-info">第 {{ request.page }} / {{ totalPages }} 页</span><button class="btn btn-sm" :disabled="request.page >= totalPages || loading" @click="go(request.page + 1)">下一页</button><button class="btn btn-sm" :disabled="request.page >= totalPages || loading" @click="go(totalPages)">末页</button></div></template>
@@ -238,11 +339,11 @@ async function exportCSV() {
 
     <DetailDrawer :open="!!selected" title="请求详情" max-width="680px" @close="selected = null">
       <template v-if="selected">
-        <div class="request-heading"><span class="badge" :class="statusBadge(selected.status)">{{ statusLabel(selected.status) }}</span><span class="dim">{{ fmtTimeMs(selected.ts) }} · {{ modeLabel(selected) }} · {{ protocolLabel(selected.ingress_protocol) }}</span></div>
+        <div class="request-heading"><span class="badge" :class="statusBadge(selected.status)">{{ statusLabel(selected.status) }}</span><span class="dim">{{ fmtTimeMs(selected.ts) }} · {{ modeLabel(selected) }} · {{ protocolLabel(selected.ingress_protocol) }} → {{ protocolLabel(selected.upstream_protocol) }}</span></div>
         <dl class="request-facts">
           <div><dt>请求 ID</dt><dd class="mono">{{ selected.request_id || '未记录' }}</dd></div>
-          <div><dt>入站协议 / 模式</dt><dd>{{ protocolLabel(selected.ingress_protocol, '未记录') }} / {{ modeLabel(selected) }}</dd></div>
-          <div v-if="selected.provider_id"><dt>上游 Provider</dt><dd class="mono">{{ selected.provider_id }}</dd></div>
+          <div><dt>上游</dt><dd><span class="fact-strong">{{ upstreamName(selected) }}</span><span v-if="selected.provider_id" class="fact-note mono">provider_id: {{ selected.provider_id }}</span></dd></div>
+          <div><dt>上游协议 / 入站协议</dt><dd>{{ protocolLabel(selected.upstream_protocol, '未记录') }} / {{ protocolLabel(selected.ingress_protocol, '未记录') }}<span class="fact-note">上行是网关连接上游使用的协议；下行是客户端调用网关使用的协议。</span></dd></div>
           <div><dt>公开模型名</dt><dd class="mono">{{ selected.public_model || '—' }}</dd></div>
           <div><dt>实际模型</dt><dd class="mono">{{ selected.upstream_model || '未记录' }}</dd></div>
           <div><dt>调用密钥</dt><dd>{{ selected.key_name || selected.key_id || '未记录' }}</dd></div>
@@ -261,7 +362,7 @@ async function exportCSV() {
           <div v-if="selected.error_code"><dt>错误码</dt><dd class="mono">{{ selected.error_code }}</dd></div>
         </dl>
         <section class="detail-section">
-          <h2>转发决策轨迹</h2>
+          <div class="section-head"><h2>转发决策轨迹</h2><span v-if="parsedTrace.length > 1" class="section-note">共 {{ parsedTrace.length }} 个决策</span></div>
           <template v-if="parsedTrace.length">
             <p class="context-note">编号表示本次请求的决策顺序，包含跳过的目标。配置位置与实际调用次数可能不同。</p>
             <ol class="trace-list">
@@ -280,7 +381,23 @@ async function exportCSV() {
           </template>
           <p v-else class="context-note">此记录未提供转发轨迹，无法从中还原完整尝试过程。</p>
         </section>
-        <section v-if="selected.status !== 'ok' || selected.error_detail" class="detail-section"><h2>错误详情</h2><pre v-if="selected.error_detail" class="error-detail">{{ selected.error_detail }}</pre><p v-else class="context-note">没有更多错误详情：上游可能未返回正文，或原文已超出保留期。</p></section>
+        <section v-if="selected.status !== 'ok' || selected.error_detail || selected.error_code" class="detail-section">
+          <div class="section-head"><h2>错误详情</h2><button v-if="selected.error_detail" class="btn btn-ghost btn-sm" @click="copyError">{{ copyNotice || '复制完整错误' }}</button></div>
+          <div class="error-summary">
+            <div><span class="error-k">HTTP</span><strong>{{ selected.http_status || '—' }}</strong></div>
+            <div><span class="error-k">错误码</span><code>{{ selected.error_code || '未记录' }}</code></div>
+            <div><span class="error-k">终端</span><strong>{{ parsedTrace.at(-1)?.provider || upstreamName(selected) }}</strong></div>
+          </div>
+          <div v-if="errorView.message" class="error-block">
+            <h3>上游返回的说明</h3>
+            <pre class="error-message">{{ errorView.message }}</pre>
+          </div>
+          <div v-if="errorView.raw" class="error-block">
+            <h3>完整原始响应</h3>
+            <pre class="error-raw">{{ errorView.rawPretty }}</pre>
+          </div>
+          <p v-if="!errorView.message && !errorView.raw" class="context-note">没有可展示的上游正文：这类失败可能在连接阶段发生，或上游未返回错误体。上面的错误码与转发轨迹仍可用于定位。</p>
+        </section>
       </template>
     </DetailDrawer>
   </div>
@@ -295,7 +412,7 @@ async function exportCSV() {
 .log-toolbar { margin-bottom: 16px; }
 .log-actions, .request-heading { display: flex; justify-content: space-between; align-items: center; gap: 12px; flex-wrap: wrap; font-size: 12px; margin-bottom: 16px; }
 .w-auto { width: auto; }
-.logs-table { min-width: 1160px; table-layout: fixed; }
+.logs-table { min-width: 1420px; table-layout: fixed; }
 .logs-table th, .logs-table td { white-space: nowrap; }
 .logs-table th, .logs-table td { text-align: left; }
 /* 请求日志是逐条扫描为主，行密度优先。全局 .table-panel td 给 16px
@@ -306,18 +423,29 @@ async function exportCSV() {
 .mobile-log-time { display: none; }
 .logs-table .time-column { width: 126px; white-space: nowrap; }
 .logs-table th { overflow: hidden; text-overflow: ellipsis; }
-.status-column { width: 84px; }
 .mode-column { width: 70px; }
-.protocol-column { width: 86px; }
+.protocol-column { width: 104px; }
+.upstream-column { width: 132px; min-width: 0; }
+.upstream-name { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-weight: 600; }
 .model-column { width: 238px; min-width: 0; }
 .model-stack { display: grid; min-width: 0; gap: 3px; }
 .model-route, .model-upstream { display: block; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .model-route { font-weight: 650; }
 .model-upstream { color: var(--muted); font-size: 11.5px; }
+.path-column { width: 156px; min-width: 0; }
+.path-flow { display: flex; align-items: center; gap: 4px; min-width: 0; overflow: hidden; }
+.path-node { max-width: 76px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.path-arrow { color: var(--muted); flex-shrink: 0; }
+.path-ok { color: var(--success-soft-foreground); }
+.path-fail { color: var(--danger); }
+.path-skip { color: var(--muted); }
 .key-column { width: 112px; }
 .key-name { max-width: 100%; overflow: hidden; text-overflow: ellipsis; display: inline-block; vertical-align: bottom; }
 .cell-note { display: block; margin-top: 3px; color: var(--muted); font-size: 10.5px; line-height: 1.35; overflow: hidden; text-overflow: ellipsis; }
-.protocol-tag { display: inline-block; max-width: 92px; overflow: hidden; text-overflow: ellipsis; vertical-align: bottom; color: var(--muted); }
+.protocol-stack { display: grid; gap: 3px; }
+.protocol-line { display: flex; align-items: baseline; gap: 5px; min-width: 0; }
+.protocol-dir { flex-shrink: 0; color: var(--muted); font-size: 10.5px; }
+.protocol-tag { display: inline-block; max-width: 70px; overflow: hidden; text-overflow: ellipsis; vertical-align: bottom; color: var(--muted); }
 .token-column { width: 132px; }
 .token-top { display: flex; gap: 6px; white-space: nowrap; font-variant-numeric: tabular-nums; }
 .metric-sep { color: var(--separator); }
@@ -329,16 +457,21 @@ async function exportCSV() {
 .latency-bad { color: var(--danger); }
 .latency-none { color: var(--muted); }
 .cost-column { width: 84px; }
-.detail-column { width: 76px; }
-.status-button { border: 0; background: transparent; padding: 0; cursor: pointer; display: inline-flex; flex-direction: column; align-items: flex-start; gap: 2px; max-width: 82px; }
+.status-column { width: 92px; }
+.status-button { border: 0; background: transparent; padding: 0; cursor: pointer; display: inline-flex; flex-direction: column; align-items: flex-start; gap: 2px; max-width: 88px; }
+.status-button:hover .badge { filter: brightness(0.96); }
 .request-facts { margin: 20px 0; }
 .request-facts > div { display: grid; grid-template-columns: 120px minmax(0, 1fr); gap: 16px; padding: 12px 0; border-bottom: 1px solid var(--border); }
 .request-facts dt { color: var(--muted); font-size: 12px; }
 .request-facts dd { margin: 0; font-size: 13px; overflow-wrap: anywhere; }
 .fact-timing { display: flex; gap: 16px; flex-wrap: wrap; font-variant-numeric: tabular-nums; }
 .fact-note { display: block; margin-top: 6px; font-size: 11px; color: var(--muted); }
+.fact-strong { font-weight: 650; }
 .detail-section { margin: 24px 0; }
 .detail-section h2 { font-size: 14px; margin-bottom: 14px; }
+.section-head { display: flex; justify-content: space-between; align-items: center; gap: 12px; flex-wrap: wrap; margin-bottom: 14px; }
+.section-head h2 { margin: 0; }
+.section-note { color: var(--muted); font-size: 11.5px; }
 .trace-list { list-style: none; padding: 0; display: grid; gap: 10px; }
 .trace-list li { display: flex; gap: 12px; padding: 12px; background: var(--surface-secondary); border-radius: 10px; font-size: 12px; }
 .trace-list code { min-width: 0; white-space: pre-wrap; overflow-wrap: anywhere; }
@@ -351,22 +484,29 @@ async function exportCSV() {
 .trace-raw { margin-top: 8px; color: var(--muted); }
 .trace-raw summary { cursor: pointer; padding: 4px 0; }
 .trace-raw code { display: block; margin-top: 6px; }
-.error-detail { white-space: pre-wrap; overflow-wrap: anywhere; border-radius: 10px; padding: 14px; font-size: 12px; line-height: 1.7; background: var(--danger-soft); color: var(--danger-soft-foreground); }
+.error-summary { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 10px; margin-bottom: 14px; }
+.error-summary > div { min-width: 0; padding: 10px 12px; border-radius: 9px; background: var(--surface-secondary); }
+.error-k { display: block; color: var(--muted); font-size: 10.5px; margin-bottom: 4px; }
+.error-summary code, .error-summary strong { overflow-wrap: anywhere; }
+.error-block { margin-top: 14px; }
+.error-block h3 { margin: 0 0 8px; font-size: 12px; color: var(--muted); font-weight: 600; }
+.error-message, .error-raw { margin: 0; white-space: pre-wrap; overflow-wrap: anywhere; border-radius: 10px; padding: 14px; font-size: 12px; line-height: 1.7; }
+.error-message { background: var(--danger-soft); color: var(--danger-soft-foreground); }
+.error-raw { max-height: 52vh; overflow: auto; background: var(--surface-secondary); color: var(--text); font-family: var(--font-mono, monospace); }
 .notice-warn { margin: 12px 0; padding: 12px; display: flex; flex-wrap: wrap; align-items: center; gap: 12px; border-radius: 10px; background: var(--warning-soft); color: var(--warning-soft-foreground); font-size: 12px; }
 @media (max-width: 1500px) {
-  .logs-table { min-width: 1180px; }
+  .logs-table { min-width: 1420px; }
   .key-column { display: none; }
 }
 @media (max-width: 900px) {
-  .logs-table { min-width: 880px; }
-  .protocol-column, .cost-column { display: none; }
+  .logs-table { min-width: 980px; }
+  .speed-column, .timing-column, .cost-column, .key-column { display: none; }
 }
 @media (max-width: 640px) {
   .logs-table { min-width: 0; table-layout: fixed; }
-  .token-column, .speed-column, .timing-column, .cost-column, .protocol-column, .key-column { display: none; }
-  .logs-table th:first-child, .logs-table .time-column, .logs-table th:last-child, .logs-table td:last-child { display: none; }
-  .logs-table th:nth-child(2), .logs-table td:nth-child(2) { width: 76px; }
-  .logs-table th:nth-child(3), .logs-table td:nth-child(3) { width: 64px; }
+  .token-column, .speed-column, .timing-column, .cost-column, .protocol-column, .key-column, .path-column, .time-column { display: none; }
+  .mode-column { width: 64px; }
+  .upstream-column { width: 34%; }
   .model-column { min-width: 0; max-width: none; }
   .model-stack { display: block; }
   .model-route, .model-upstream { display: block; max-width: none; white-space: normal; overflow-wrap: anywhere; }
@@ -375,5 +515,6 @@ async function exportCSV() {
   .logs-table .mono { white-space: normal; overflow-wrap: anywhere; }
   .log-actions > .head-actions { flex-wrap: wrap; }
   .request-facts > div { grid-template-columns: 90px minmax(0, 1fr); gap: 10px; }
+  .error-summary { grid-template-columns: 1fr; }
 }
 </style>

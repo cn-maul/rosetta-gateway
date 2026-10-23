@@ -117,7 +117,7 @@ func TestBuildClient_SetsProxyConfigError(t *testing.T) {
 		Slug: "direct", Endpoint: "https://example.invalid/v1",
 		Protocol: "chat", MaxRetries: 0,
 	}
-	if _, err := buildClient(good, "sk-x", newTestConfig()); err != nil {
+	if _, err := buildClient(context.Background(), good, "sk-x", newTestConfig()); err != nil {
 		t.Fatalf("无代理的 client 应建成: %v", err)
 	}
 	if good.ProxyConfigError != nil {
@@ -128,7 +128,7 @@ func TestBuildClient_SetsProxyConfigError(t *testing.T) {
 		Slug: "badproxy", Endpoint: "https://example.invalid/v1",
 		Protocol: "chat", MaxRetries: 0, ProxyURL: "ftp://127.0.0.1:1",
 	}
-	if _, err := buildClient(bad, "sk-x", newTestConfig()); err != nil {
+	if _, err := buildClient(context.Background(), bad, "sk-x", newTestConfig()); err != nil {
 		t.Fatalf("代理配错不该让 client 构建失败: %v", err)
 	}
 	if bad.ProxyConfigError == nil {
@@ -168,7 +168,7 @@ func TestProxyHTTPClientFor_TrafficActuallyRouted(t *testing.T) {
 		Protocol: "chat", MaxRetries: 0,
 		ProxyURL: proxy.URL,
 	}
-	client, err := buildClient(prov, "sk-x", newTestConfig())
+	client, err := buildClient(context.Background(), prov, "sk-x", newTestConfig())
 	if err != nil {
 		t.Fatalf("build client: %v", err)
 	}
@@ -193,5 +193,87 @@ func TestProxyHTTPClientFor_TrafficActuallyRouted(t *testing.T) {
 	// 代理转发的 path 必须是上游的完整路径：证明它转发到了正确的目标。
 	if !strings.Contains(gotPath, "/v1/chat/completions") {
 		t.Fatalf("代理转发的 path = %q，期望含 /v1/chat/completions", gotPath)
+	}
+}
+
+// TestProxyHTTPClientFor_ProxiedAndDirectProvidersAreIsolated 把两条路径放在
+// 同一个场景里验证：配了代理的 provider 必须只走代理，没配代理的 provider
+// 必须直连自己的上游。分开测只能证明各自「看起来生效」，无法发现共享
+// Transport 或缓存键错误把直连流量误送进代理。
+func TestProxyHTTPClientFor_ProxiedAndDirectProvidersAreIsolated(t *testing.T) {
+	var proxyHits, proxiedUpstreamHits, directUpstreamHits int32
+
+	proxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&proxyHits, 1)
+		w.WriteHeader(http.StatusOK)
+		_, _ = io.WriteString(w, `{"id":"cmpl-proxy","object":"chat.completion","created":0,
+			"model":"upstream-model",
+			"choices":[{"index":0,"message":{"role":"assistant","content":"via-proxy"},"finish_reason":"stop"}],
+			"usage":{"prompt_tokens":5,"completion_tokens":2,"total_tokens":7}}`)
+	}))
+	defer proxy.Close()
+
+	proxiedUpstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&proxiedUpstreamHits, 1)
+		http.Error(w, "proxied upstream must not be reached directly", http.StatusBadGateway)
+	}))
+	defer proxiedUpstream.Close()
+
+	directUpstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&directUpstreamHits, 1)
+		w.WriteHeader(http.StatusOK)
+		_, _ = io.WriteString(w, `{"id":"cmpl-direct","object":"chat.completion","created":0,
+			"model":"upstream-model",
+			"choices":[{"index":0,"message":{"role":"assistant","content":"direct"},"finish_reason":"stop"}],
+			"usage":{"prompt_tokens":5,"completion_tokens":1,"total_tokens":6}}`)
+	}))
+	defer directUpstream.Close()
+
+	proxiedProv := &ProviderEntry{
+		Slug: "proxied", Endpoint: proxiedUpstream.URL + "/v1",
+		Protocol: "chat", MaxRetries: 0, ProxyURL: proxy.URL,
+	}
+	proxiedClient, err := buildClient(context.Background(), proxiedProv, "sk-proxied", newTestConfig())
+	if err != nil {
+		t.Fatalf("build proxied client: %v", err)
+	}
+	directProv := &ProviderEntry{
+		Slug: "direct", Endpoint: directUpstream.URL + "/v1",
+		Protocol: "chat", MaxRetries: 0,
+	}
+	directClient, err := buildClient(context.Background(), directProv, "sk-direct", newTestConfig())
+	if err != nil {
+		t.Fatalf("build direct client: %v", err)
+	}
+
+	ctx := context.Background()
+	proxiedResp, err := proxiedClient.Chat(ctx, &rosetta.ChatRequest{
+		Model: "upstream-model", Messages: []rosetta.Message{rosetta.User("proxied")},
+	})
+	if err != nil {
+		t.Fatalf("proxied chat: %v", err)
+	}
+	if proxiedResp.Text() != "via-proxy" {
+		t.Fatalf("proxied response = %q", proxiedResp.Text())
+	}
+
+	directResp, err := directClient.Chat(ctx, &rosetta.ChatRequest{
+		Model: "upstream-model", Messages: []rosetta.Message{rosetta.User("direct")},
+	})
+	if err != nil {
+		t.Fatalf("direct chat: %v", err)
+	}
+	if directResp.Text() != "direct" {
+		t.Fatalf("direct response = %q", directResp.Text())
+	}
+
+	if got := atomic.LoadInt32(&proxyHits); got != 1 {
+		t.Fatalf("proxy hits = %d, want 1", got)
+	}
+	if got := atomic.LoadInt32(&proxiedUpstreamHits); got != 0 {
+		t.Fatalf("proxied upstream direct hits = %d, want 0", got)
+	}
+	if got := atomic.LoadInt32(&directUpstreamHits); got != 1 {
+		t.Fatalf("direct upstream hits = %d, want 1", got)
 	}
 }

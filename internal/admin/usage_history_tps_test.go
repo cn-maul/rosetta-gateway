@@ -62,7 +62,8 @@ func seedTpsHistory(t *testing.T, st *store.Store) int64 {
 	for _, r := range rows {
 		if err := st.CreateUsageRecord(ctx, &store.UsageRecord{
 			ID: r.id, Ts: ts, AccessKeyID: "kTps", PublicModel: "code",
-			ProviderID: "p1", UpstreamModel: "cn:glm", Stream: r.stream,
+			ProviderID: "p1", ProviderName: "肥鱼中转", UpstreamModel: "cn:glm",
+			IngressProtocol: "response", UpstreamProtocol: "chat", Stream: r.stream,
 			// input 刻意给非零值：这样 total_tokens != output_tokens，
 			// 「用错分子」的回归会被下面 TestUsage_History_TpsUsesOutputTokensNotTotal 抓住。
 			InputTokens:  900,
@@ -71,12 +72,38 @@ func seedTpsHistory(t *testing.T, st *store.Store) int64 {
 			TTFBMs:       r.ttfbMs,
 			LatencyMs:    r.latencyMs,
 			Status:       r.status, HTTPStatus: http.StatusOK,
-			IngressProtocol: "chat", UsageState: "reported",
+			UsageState: "reported",
 		}); err != nil {
 			t.Fatalf("seed %s: %v", r.id, err)
 		}
 	}
 	return ts
+}
+
+// 调用历史必须下发「落库当时的」上游名与上下游协议。
+//
+// 这三者都是历史事实：provider 改名后旧记录不能跟着变，页面也不能靠
+// provider_id 再查当前配置。这里直接断言接口字段，防止 SQL 列和扫描顺序
+// 某天改动后静默错位。
+func TestUsage_History_ExposesProviderNameAndProtocolPair(t *testing.T) {
+	st := newScopeStore(t)
+	ts := seedTpsHistory(t, st)
+
+	resp := fetchHistory(t, st, fmt.Sprintf("?from=0&to=%d&limit=100", ts+1))
+	if len(resp.Records) == 0 {
+		t.Fatal("没有历史记录")
+	}
+	for i, e := range resp.Records {
+		if e.ProviderName != "肥鱼中转" {
+			t.Errorf("第 %d 行 provider_name=%q, want 肥鱼中转", i, e.ProviderName)
+		}
+		if e.UpstreamProtocol != "chat" {
+			t.Errorf("第 %d 行 upstream_protocol=%q, want chat", i, e.UpstreamProtocol)
+		}
+		if e.IngressProtocol != "response" {
+			t.Errorf("第 %d 行 ingress_protocol=%q, want response", i, e.IngressProtocol)
+		}
+	}
 }
 
 // fetchHistory 拉一次调用历史并解出响应。

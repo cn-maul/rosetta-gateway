@@ -5,7 +5,7 @@ import (
 	"strings"
 
 	"github.com/cn-maul/rosetta-gateway/internal/ingress"
-	"github.com/cn-maul/rosetta-gateway/internal/routing"
+	wireproto "github.com/cn-maul/rosetta-gateway/internal/protocol"
 	"github.com/cn-maul/rosetta-gateway/internal/upstream"
 )
 
@@ -18,10 +18,10 @@ import (
 func withPromptCacheAffinity(
 	ctx context.Context,
 	ing *ingress.Request,
-	cand routing.Candidate,
+	protocol string,
 	stableSessionID string,
 ) context.Context {
-	if ing == nil || cand.Provider.Protocol == "anthropic" {
+	if ing == nil || wireproto.Normalize(protocol) == wireproto.Anthropic {
 		return ctx
 	}
 	key := strings.TrimSpace(ing.CacheKey)

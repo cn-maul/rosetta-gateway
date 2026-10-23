@@ -14,8 +14,11 @@ func TestOutcomeFromErrCtx_GatewayBudgetIsNotUpstreamFailure(t *testing.T) {
 	err := &rosetta.TransportError{Method: "POST", URL: "https://upstream.example", Err: context.DeadlineExceeded}
 
 	plain := OutcomeFromErr(err)
-	if !plain.Eligible || plain.CredentialCooldown == 0 {
-		t.Fatalf("前置假设不成立：普通 TransportError 应是可转移且罚凭据，实际 %+v", plain)
+	if !plain.Eligible {
+		t.Fatalf("前置假设不成立：普通 TransportError 应是可转移，实际 %+v", plain)
+	}
+	if plain.CredentialCooldown != 0 {
+		t.Fatalf("传输错误只能熔断目标，不应冷却凭据，实际 %+v", plain)
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 0)

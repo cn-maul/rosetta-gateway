@@ -90,6 +90,11 @@ func (s *Store) ensureCompatibleSchema(ctx context.Context) error {
 		{"usage_records", "cached_creation_tokens", "INTEGER NOT NULL DEFAULT 0"},
 		{"usage_daily_rollups", "cached_creation_tokens", "INTEGER NOT NULL DEFAULT 0"},
 		{"usage_totals", "cached_creation_tokens", "INTEGER NOT NULL DEFAULT 0"},
+		// 2026-10-23：调用历史要回答「实际是谁接的、上下游各是什么协议」。
+		// 这两列都是**固化值**，不是 JOIN 当前配置：provider 改名/删除、
+		// 路由改协议后，旧记录仍应显示当时的事实。
+		{"usage_records", "provider_name", "TEXT"},
+		{"usage_records", "upstream_protocol", "TEXT"},
 	} {
 		if err := s.ensureAdditiveColumn(ctx, col.table, col.column, col.decl); err != nil {
 			return err
@@ -402,8 +407,10 @@ var canonicalSchemaStatements = []string{
 		user_id           TEXT,
 		public_model      TEXT NOT NULL,
 		provider_id       TEXT NOT NULL,
+		provider_name     TEXT,
 		upstream_model    TEXT NOT NULL,
 		ingress_protocol  TEXT NOT NULL,
+		upstream_protocol TEXT,
 		stream            INTEGER NOT NULL,
 		input_tokens      INTEGER NOT NULL DEFAULT 0,
 		output_tokens     INTEGER NOT NULL DEFAULT 0,

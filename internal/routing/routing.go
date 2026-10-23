@@ -51,15 +51,23 @@ type Target struct {
 }
 
 type ProviderRef struct {
-	ID       string
-	Slug     string
+	ID   string
+	Slug string
+	// Name 是运维填写的人类可读名称，供调用历史的 route_trace 与固化归因
+	// 使用。Slug 是路由标识，Name 才是「实际是哪家上游」的可读答案。
+	Name     string
 	Endpoint string
 	// Protocol is the upstream wire protocol ("chat",
 	// "response", "anthropic", or "auto"/"" to let the SDK probe).
 	// Request construction needs it: protocol-private fields are only valid
 	// on the dialect that defines them.
 	Protocol string
-	Enabled  bool
+	// NetworkID and ProxyConfigured are runtime facts for diagnostics. They
+	// never contain a proxy URL or credentials: an operator only needs to know
+	// whether the outbound path used a configured network.
+	NetworkID       string
+	ProxyConfigured bool
+	Enabled         bool
 }
 
 type UpstreamModel struct {

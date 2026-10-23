@@ -41,21 +41,21 @@ function unparsed(raw: string): TraceStep {
 
 export function parseTraceStep(raw: string): TraceStep {
   const value = raw.trim()
-  // 模型名可含 / 和 :，只拆第一个 /；结果以最后的箭头为界。
-  const arrow = value.lastIndexOf(' -> ')
-  const colon = value.indexOf(':')
+  // 转义的 "/"、";"、"\"" 不能参与分隔；用 unescape 后的逻辑读取字段。
+  const arrow = findUnescapedLast(value, ' -> ')
+  const colon = findUnescaped(value, ':', 0)
   if (colon <= 0 || arrow <= colon) return unparsed(value)
   const index = value.slice(0, colon)
   if (!/^[1-9]\d*$/.test(index)) return unparsed(value)
   const attempt = Number(index)
   if (!Number.isSafeInteger(attempt)) return unparsed(value)
   const target = value.slice(colon + 1, arrow)
-  const slash = target.indexOf('/')
+  const slash = findUnescaped(target, '/', 0)
   if (slash <= 0 || slash === target.length - 1) return unparsed(value)
-  const provider = target.slice(0, slash)
-  const model = target.slice(slash + 1)
+  const provider = unescapeRouteTraceComponent(target.slice(0, slash))
+  const model = unescapeRouteTraceComponent(target.slice(slash + 1))
   const result = value.slice(arrow + 4)
-  const separator = result.indexOf(':')
+  const separator = findUnescaped(result, ':', 0)
   const outcome = separator < 0 ? result : result.slice(0, separator)
   const reason = separator < 0 ? '' : result.slice(separator + 1)
   if (!outcome) return unparsed(value)
@@ -69,6 +69,54 @@ export function parseTraceStep(raw: string): TraceStep {
   }
 }
 
+/** 找第一个未转义的分隔符；反斜杠用于转义下一个字符。 */
+function findUnescaped(value: string, needle: string, from: number): number {
+  for (let i = from; i <= value.length - needle.length; i++) {
+    if (isEscaped(value, i)) continue
+    if (value.startsWith(needle, i)) return i
+  }
+  return -1
+}
+
+/** 找最后一个未转义的分隔符；模型名中的箭头不能成为结果分隔点。 */
+function findUnescapedLast(value: string, needle: string): number {
+  for (let i = value.length - needle.length; i >= 0; i--) {
+    if (isEscaped(value, i)) continue
+    if (value.startsWith(needle, i)) return i
+  }
+  return -1
+}
+
+function isEscaped(value: string, index: number): boolean {
+  let backslashes = 0
+  for (let i = index - 1; i >= 0 && value[i] === '\\'; i--) backslashes++
+  return backslashes % 2 === 1
+}
+
+/** 与 Go 侧 escapeRouteTraceComponent 对称：只还原本格式用到的转义。 */
+function unescapeRouteTraceComponent(value: string): string {
+  let out = ''
+  for (let i = 0; i < value.length; i++) {
+    const ch = value[i]
+    if (ch === '\\' && i + 1 < value.length && ['\\', ';', '/'].includes(value[i + 1])) {
+      out += value[++i]
+    } else {
+      out += ch
+    }
+  }
+  return out
+}
+
 export function parseRouteTrace(raw: string | null | undefined): TraceStep[] {
-  return (raw ?? '').split(';').map(v => v.trim()).filter(Boolean).map(parseTraceStep)
+  const steps: string[] = []
+  let start = 0
+  const value = raw ?? ''
+  for (let i = 0; i < value.length; i++) {
+    if (value[i] === ';' && !isEscaped(value, i)) {
+      steps.push(value.slice(start, i).trim())
+      start = i + 1
+    }
+  }
+  steps.push(value.slice(start).trim())
+  return steps.filter(Boolean).map(parseTraceStep)
 }
