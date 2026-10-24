@@ -2,11 +2,11 @@
 
 镜像：`ghcr.io/cn-maul/rosetta-gateway`
 
-**镜像版本号 = 软件版本号**，两者都取自 `web/package.json` 的 `version`（当前 **1.6.7**）。
-发布 `v1.6.7` tag 会得到 `:1.6.7` 与 `:latest` 两个标签；CI 会校验 tag 与
+**镜像版本号 = 软件版本号**，两者都取自 `web/package.json` 的 `version`（当前 **1.6.8**）。
+发布 `v1.6.8` tag 会得到 `:1.6.8` 与 `:latest` 两个标签；CI 会校验 tag 与
 `package.json` 一致，不一致直接构建失败（防止打出名不副实的镜像）。
 
-> 下文示例中的 `:1.6.7` 是**编写时的当前版本**。实际部署请先 `docker pull ghcr.io/cn-maul/rosetta-gateway:1.6.7`
+> 下文示例中的 `:1.6.8` 是**编写时的当前版本**。实际部署请先 `docker pull ghcr.io/cn-maul/rosetta-gateway:1.6.8`
 > 确认该 tag 存在，或直接用 `:latest`。
 
 架构：`linux/amd64`（`docker.yml` 的 buildx 只构建这一种；需要 arm64 再说）。
@@ -22,7 +22,7 @@ docker run -d \
   -p 127.0.0.1:8666:8666 \
   -v rosetta-gateway-data:/data \
   --restart unless-stopped \
-  ghcr.io/cn-maul/rosetta-gateway:1.6.7
+  ghcr.io/cn-maul/rosetta-gateway:1.6.8
 ```
 
 然后打开 `http://127.0.0.1:8666/admin/` —— 首次进入会显示「首次设置密码」表单，
@@ -160,7 +160,7 @@ Chrome / Edge / Brave / Opera 一律硬拦；Firefox 也拦，只是报错文案
 > 第一次可以这样初始化：
 > ```bash
 > mkdir -p /srv/rosetta/data
-> docker run --rm ghcr.io/cn-maul/rosetta-gateway:1.6.7 \
+> docker run --rm ghcr.io/cn-maul/rosetta-gateway:1.6.8 \
 >   cat /app/config.default.json > /srv/rosetta/config.json
 > ```
 > （`mkdir` 了 `data`，因为 `db_path` 指向 `/data/data/gateway.db`，父目录必须存在；
@@ -180,7 +180,7 @@ Chrome / Edge / Brave / Opera 一律硬拦；Firefox 也拦，只是报错文案
 ```yaml
 services:
   rosetta-gateway:
-    image: ghcr.io/cn-maul/rosetta-gateway:1.6.7
+    image: ghcr.io/cn-maul/rosetta-gateway:1.6.8
     container_name: rosetta-gateway
     restart: unless-stopped
     # 优雅关停的总预算是 24s（剪枝 5s + 费用重算 2s + 探测 2s +
@@ -362,6 +362,11 @@ docker compose pull && docker compose up -d
 `provider_name` 与 `upstream_protocol` 两个可空列，启动时会做纯新增迁移，
 不改写或删除已有数据。旧调用记录没有这两个字段，界面会回退显示 `provider_id`
 并标注「名称未固化」；升级后新产生的记录才会固化当时的实际上游名与上下游协议。
+
+**v1.6.7 → v1.6.8 可以直接原地升级。** 这一版只调整请求日志展示：合并重复的
+上游列、在故障转移时直接展示 `A → B` 路径，并把 Token 明细中的“输入”改为
+“新增输入”（输入总量扣除缓存命中与缓存写入）。数据库结构与配置格式不变。
+
 升级前仍建议按上面的步骤备份 `/data`。
 
 ## 以非 root 运行（2026-10-07 起）

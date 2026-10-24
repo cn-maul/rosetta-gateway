@@ -151,6 +151,11 @@ function upstreamNameTitle(h: UsageHistoryEntry): string {
   return '这条记录没有归因到具体上游'
 }
 
+function upstreamPathTitle(h: UsageHistoryEntry): string {
+  const steps = traceSteps(h)
+  return steps.length ? traceTitle(h) : upstreamNameTitle(h)
+}
+
 function protocolPairTitle(h: UsageHistoryEntry): string {
   return `上游协议：${protocolLabel(h.upstream_protocol, '未记录')}；入站协议：${protocolLabel(h.ingress_protocol, '未记录')}`
 }
@@ -232,8 +237,16 @@ function modeLabel(h: UsageHistoryEntry): string {
   return h.stream ? '流式' : '非流式'
 }
 
+/**
+ * 统一 Usage 的 input_tokens 是输入总量，包含缓存命中和缓存写入。
+ * 页面上的“新增输入”只展示本次真正新增处理、未命中缓存的输入 token。
+ */
+function newInputTokens(h: UsageHistoryEntry): number {
+  return Math.max(0, h.input_tokens - h.cached_tokens - h.cached_creation_tokens)
+}
+
 function tokenTitle(h: UsageHistoryEntry): string {
-  return '输入 ' + fmtNum(h.input_tokens) +
+  return '新增输入 ' + fmtNum(newInputTokens(h)) +
     ' · 输出 ' + fmtNum(h.output_tokens) +
     ' · 缓存命中 ' + fmtNum(h.cached_tokens) +
     ' · 缓存写入 ' + fmtNum(h.cached_creation_tokens) +
@@ -281,7 +294,7 @@ async function exportCSV() {
     <DataTable class="panel table-panel" label="请求日志" :loading="loading" :error="err ? err + (rows.length ? '（近 ' + loadedDays + ' 天，第 ' + loadedPage + ' 页）' : '') : ''" :has-data="!!rows.length" :empty="!rows.length" empty-text="当前条件下没有调用记录" loading-text="正在加载请求日志…" @retry="load">
         <table class="tbl logs-table">
           <thead><tr>
-            <th class="time-column">时间</th><th class="mode-column">模式</th><th class="protocol-column">协议</th><th class="upstream-column">上游</th><th class="model-column">模型</th><th class="path-column">上游路径</th><th class="key-column">密钥</th><th class="token-column">Token 用量</th><th class="speed-column">速度</th><th class="timing-column">时间</th><th class="cost-column">费用</th><th class="status-column">状态</th>
+            <th class="time-column">时间</th><th class="mode-column">模式</th><th class="protocol-column">协议</th><th class="upstream-column">上游</th><th class="model-column">模型</th><th class="key-column">密钥</th><th class="token-column">Token 用量</th><th class="speed-column">速度</th><th class="timing-column">时间</th><th class="cost-column">费用</th><th class="status-column">状态</th>
           </tr></thead>
           <tbody><tr v-for="(h, i) in rows" :key="h.ts + ':' + i">
             <td class="mono time-column">{{ fmtTimeMs(h.ts) }}</td>
@@ -292,9 +305,17 @@ async function exportCSV() {
                 <span class="protocol-line"><span class="protocol-dir">下游</span><span class="protocol-tag mono">{{ protocolLabel(h.ingress_protocol, '未记录') }}</span></span>
               </span>
             </td>
-            <td class="upstream-column">
-              <span class="upstream-name" :title="upstreamNameTitle(h)">{{ upstreamName(h) }}</span>
-              <span v-if="!h.provider_name && h.provider_id" class="cell-note">名称未固化</span>
+            <td class="upstream-column" :title="upstreamPathTitle(h)">
+              <span v-if="traceSteps(h).length" class="path-flow">
+                <template v-for="(step, si) in traceSteps(h)" :key="si">
+                  <span class="path-node" :class="traceNodeClass(step)">{{ step.parsed ? step.provider : '记录异常' }}</span>
+                  <span v-if="si < traceSteps(h).length - 1" class="path-arrow" aria-hidden="true">→</span>
+                </template>
+              </span>
+              <template v-else>
+                <span class="upstream-name">{{ upstreamName(h) }}</span>
+                <span v-if="!h.provider_name && h.provider_id" class="cell-note">名称未固化</span>
+              </template>
             </td>
             <td class="model-column">
               <span class="mobile-log-time dim">{{ fmtTimeMs(h.ts) }}</span>
@@ -303,19 +324,10 @@ async function exportCSV() {
                 <span class="model-upstream mono" :title="upstreamModelName(h)">{{ upstreamModelName(h) }}</span>
               </span>
             </td>
-            <td class="path-column" :title="traceTitle(h)">
-              <span v-if="traceSteps(h).length" class="path-flow">
-                <template v-for="(step, si) in traceSteps(h)" :key="si">
-                  <span class="path-node" :class="traceNodeClass(step)">{{ step.parsed ? step.provider : '记录异常' }}</span>
-                  <span v-if="si < traceSteps(h).length - 1" class="path-arrow" aria-hidden="true">→</span>
-                </template>
-              </span>
-              <span v-else class="dim">—</span>
-            </td>
             <td class="key-column"><span class="key-name" :title="h.key_name || h.key_id || '—'">{{ h.key_name || h.key_id || '—' }}</span></td>
             <td class="token-column" :title="tokenTitle(h)">
-              <span class="token-top"><span>{{ fmtTokens(h.input_tokens) }}</span><span class="metric-sep">|</span><span>{{ fmtTokens(h.output_tokens) }}</span></span>
-              <span class="cell-note">{{ fmtTokens(h.cached_tokens) }}</span>
+              <span class="token-top"><span class="token-label">新增输入</span><span>{{ fmtTokens(newInputTokens(h)) }}</span><span class="metric-sep">|</span><span class="token-label">输出</span><span>{{ fmtTokens(h.output_tokens) }}</span></span>
+              <span class="cell-note">缓存命中 {{ fmtTokens(h.cached_tokens) }}</span>
             </td>
             <td class="speed-column">{{ speedText(h) }}</td>
             <td class="timing-column">
@@ -347,7 +359,7 @@ async function exportCSV() {
           <div><dt>公开模型名</dt><dd class="mono">{{ selected.public_model || '—' }}</dd></div>
           <div><dt>实际模型</dt><dd class="mono">{{ selected.upstream_model || '未记录' }}</dd></div>
           <div><dt>调用密钥</dt><dd>{{ selected.key_name || selected.key_id || '未记录' }}</dd></div>
-          <div><dt>Token 用量</dt><dd>输入 {{ fmtNum(selected.input_tokens) }} · 输出 {{ fmtNum(selected.output_tokens) }} · 总计 {{ fmtNum(selected.total_tokens) }}</dd></div>
+          <div><dt>Token 用量</dt><dd>新增输入 {{ fmtNum(newInputTokens(selected)) }} · 输出 {{ fmtNum(selected.output_tokens) }} · 总计 {{ fmtNum(selected.total_tokens) }}<span class="fact-note">新增输入 = 输入总量 - 缓存命中 - 缓存写入</span></dd></div>
           <div><dt>缓存命中 / 写入 / 推理</dt><dd>{{ fmtNum(selected.cached_tokens) }} / {{ fmtNum(selected.cached_creation_tokens) }} / {{ fmtNum(selected.reasoning_tokens) }} Tokens</dd></div>
           <div><dt>记录费用</dt><dd>¥{{ fmtMoney(selected.cost) }}<span class="fact-note">按调用当时单价固化；0 元不能单独说明是否配价</span></dd></div>
           <div>
@@ -412,7 +424,7 @@ async function exportCSV() {
 .log-toolbar { margin-bottom: 16px; }
 .log-actions, .request-heading { display: flex; justify-content: space-between; align-items: center; gap: 12px; flex-wrap: wrap; font-size: 12px; margin-bottom: 16px; }
 .w-auto { width: auto; }
-.logs-table { min-width: 1420px; table-layout: fixed; }
+.logs-table { min-width: 1360px; table-layout: fixed; }
 .logs-table th, .logs-table td { white-space: nowrap; }
 .logs-table th, .logs-table td { text-align: left; }
 /* 请求日志是逐条扫描为主，行密度优先。全局 .table-panel td 给 16px
@@ -425,14 +437,13 @@ async function exportCSV() {
 .logs-table th { overflow: hidden; text-overflow: ellipsis; }
 .mode-column { width: 70px; }
 .protocol-column { width: 104px; }
-.upstream-column { width: 132px; min-width: 0; }
+.upstream-column { width: 190px; min-width: 0; }
 .upstream-name { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-weight: 600; }
 .model-column { width: 238px; min-width: 0; }
 .model-stack { display: grid; min-width: 0; gap: 3px; }
 .model-route, .model-upstream { display: block; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .model-route { font-weight: 650; }
 .model-upstream { color: var(--muted); font-size: 11.5px; }
-.path-column { width: 156px; min-width: 0; }
 .path-flow { display: flex; align-items: center; gap: 4px; min-width: 0; overflow: hidden; }
 .path-node { max-width: 76px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .path-arrow { color: var(--muted); flex-shrink: 0; }
@@ -446,8 +457,9 @@ async function exportCSV() {
 .protocol-line { display: flex; align-items: baseline; gap: 5px; min-width: 0; }
 .protocol-dir { flex-shrink: 0; color: var(--muted); font-size: 10.5px; }
 .protocol-tag { display: inline-block; max-width: 70px; overflow: hidden; text-overflow: ellipsis; vertical-align: bottom; color: var(--muted); }
-.token-column { width: 132px; }
+.token-column { width: 164px; }
 .token-top { display: flex; gap: 6px; white-space: nowrap; font-variant-numeric: tabular-nums; }
+.token-label { color: var(--muted); font-size: 10.5px; }
 .metric-sep { color: var(--separator); }
 .speed-column { width: 82px; }
 .timing-column { width: 96px; }
@@ -495,16 +507,16 @@ async function exportCSV() {
 .error-raw { max-height: 52vh; overflow: auto; background: var(--surface-secondary); color: var(--text); font-family: var(--font-mono, monospace); }
 .notice-warn { margin: 12px 0; padding: 12px; display: flex; flex-wrap: wrap; align-items: center; gap: 12px; border-radius: 10px; background: var(--warning-soft); color: var(--warning-soft-foreground); font-size: 12px; }
 @media (max-width: 1500px) {
-  .logs-table { min-width: 1420px; }
+  .logs-table { min-width: 1360px; }
   .key-column { display: none; }
 }
 @media (max-width: 900px) {
-  .logs-table { min-width: 980px; }
+  .logs-table { min-width: 920px; }
   .speed-column, .timing-column, .cost-column, .key-column { display: none; }
 }
 @media (max-width: 640px) {
   .logs-table { min-width: 0; table-layout: fixed; }
-  .token-column, .speed-column, .timing-column, .cost-column, .protocol-column, .key-column, .path-column, .time-column { display: none; }
+  .token-column, .speed-column, .timing-column, .cost-column, .protocol-column, .key-column, .time-column { display: none; }
   .mode-column { width: 64px; }
   .upstream-column { width: 34%; }
   .model-column { min-width: 0; max-width: none; }

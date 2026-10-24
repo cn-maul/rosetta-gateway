@@ -941,7 +941,11 @@ export interface UsageHistoryEntry {
   upstream_protocol: string
   key_name: string // 调用密钥名称（密钥删除后为空）
   key_id: string // 调用密钥 id（回退显示用）
-  /** 输入侧 token（请求上下文、工具定义等）。 */
+  /**
+   * 输入侧 token 总量（请求上下文、工具定义等），包含缓存命中与缓存写入。
+   * 页面上的“新增输入”按 input_tokens - cached_tokens - cached_creation_tokens
+   * 展示，避免把缓存 token 误读成本次新增处理的输入。
+   */
   input_tokens: number
   total_tokens: number
   /**

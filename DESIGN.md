@@ -7,7 +7,7 @@
 | module path | `github.com/cn-maul/rosetta-gateway` |
 | 运行时依赖 | `github.com/cn-maul/rosetta` v1.2.1（上游 SDK）、`modernc.org/sqlite`（纯 Go SQLite）、`github.com/golang-jwt/jwt/v5`（管理会话） |
 | 工具链 | **Go 1.27.3 起**（`go.mod` 的 `go` 指令是唯一来源，CI 用 `go-version-file` 读取；1.27.3 之前的版本带已知安全漏洞，不得使用，本地也勿用更早的 1.27.x）。镜像构建固定 `golang:1.27.3-alpine3.24` 的 digest，并设 `GOTOOLCHAIN=local`，版本不足时构建直接失败，不会静默下载其他工具链 |
-| 版本 | 与 `web/package.json` 同源（当前 1.6.7），镜像与二进制共用 |
+| 版本 | 与 `web/package.json` 同源（当前 1.6.8），镜像与二进制共用 |
 | 状态 | **已实现**（P0–P3 全部落地，多用户、用量归档、配置导入导出均已上线） |
 | 更新 | 2026-10-24 |
 
