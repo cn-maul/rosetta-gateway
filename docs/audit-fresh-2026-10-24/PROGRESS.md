@@ -1680,3 +1680,18 @@ the ordering fix.
 `go test ./internal/store -count=1`, `go test ./internal/gatewayapp -count=1`,
 and `go build ./cmd/gateway` pass. The fix is released as v1.7.1 because the
 original v1.7.0 image contains the startup failure.
+
+## v1.7.1 Release Gate Follow-up
+
+The v1.7.1 Docker workflow failed its pre-release gate in F1b. The prior
+`DELIVERY-03` recorder fix was valid but incomplete: the product stream path
+also dropped the committed bit when it returned the terminal cancellation
+outcome, so the outer lane added a second 502/zero-token usage row after the
+committed 200 stream record.
+
+F1b now waits for both asynchronous rows and requires exactly one. A failing
+200-run reproduction showed two rows on nearly every request; after preserving
+`Committed: true` on the post-WriteHeader return, F1b passed 200 runs and the
+F1b/F1d pair passed 100 non-race plus 100 race runs. The non-scratch short suite,
+vet, frontend tests/typecheck/build, and embedded-asset sync pass. The existing
+untracked `home/` and `work-r7-store-api.txt` remain untouched.

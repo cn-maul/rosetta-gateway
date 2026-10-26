@@ -1482,6 +1482,25 @@ want ["alice" "admin1" "admin1"]
   change. The complete non-short Go race suite, short suite, and frontend
   tests/typecheck remain required before tagging.
 
+- v1.7.1 CI follow-up: the recorder synchronization was not the only defect.
+  The next full CI run still observed F1b's zero-token 502 row while
+  `used_tokens` increased by six. Repeating F1b 200 times locally reproduced
+  two rows for every request: an already-persisted committed
+  `canceled/200/reported/6` stream row and a later uncommitted
+  `canceled/502/none/0` summary with the same request ID.
+- Root cause: `attemptStream` set the diagnostic attempt's `Committed` bit but
+  constructed its return value without it. `OutcomeClientAborted` therefore
+  normalized as uncommitted, and the outer lane executed the final-error path
+  after the stream had already recorded its terminal usage.
+- Direction: construct the post-WriteHeader outcome with `Committed: true`.
+  The test now requires exactly one usage row after a short drain window; its
+  recorder also follows `net/http` semantics by treating `Header()` as
+  non-committing and an implicit first `Write` as HTTP 200.
+- Verification: F1b passed 200 consecutive runs; F1b/F1d passed 100 non-race
+  and 100 race runs. The complete short non-race suite and `go vet` passed for
+  all non-scratch packages; frontend tests, typecheck, build, and embedded-asset
+  sync passed.
+
 ### DELIVERY-04 - v1.6.8 database upgrade creates the retry index before its column
 
 - Status: fixed after a real v1.7.0 container startup failed; shipped in v1.7.1

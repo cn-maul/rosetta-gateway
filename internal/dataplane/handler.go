@@ -1506,7 +1506,15 @@ func (h *Handler) attemptStream(w http.ResponseWriter, r *http.Request, client *
 	attempt.OutputRunes = partialOutRunes
 	attempt.PostTTFBMs = time.Since(firstEventAt).Milliseconds()
 	applyTraceTimings(&attempt, attemptTrace)
-	out := Outcome{Kind: committedKindForStatus(status), Code: errorCode}.normalize()
+	// This return point is only reachable after WriteHeader(200): the stream is
+	// committed even when the client then cancels. Dropping that bit makes the
+	// outer lane treat the already-recorded stream as an uncommitted failure and
+	// write a second 502/zero-token usage row for the same request.
+	out := Outcome{
+		Kind:      committedKindForStatus(status),
+		Committed: true,
+		Code:      errorCode,
+	}.normalize()
 	setAttemptDiagnosis(&attempt, out, terminalErr)
 	diag.addAttempt(attempt)
 	diag.setStreamOutput(partialOutRunes, attempt.ToolCalls, attempt.FirstToolCallMs)

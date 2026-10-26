@@ -1242,6 +1242,14 @@ func TestE2E_F1b_ClientDisconnectStillConsumesTokenQuota(t *testing.T) {
 	wg.Wait()
 
 	rows := e2eWaitUsageCount(t, db, "k1", 1)
+	// 首条已提交流式记录与错误收尾记录都由异步 worker 落库。
+	// 只看「至少一行」会在第二条写入前抢跑，让重复记账偶发假绿。
+	time.Sleep(100 * time.Millisecond)
+	rows = e2eUsageRows(t, db, "k1")
+	if len(rows) != 1 {
+		t.Fatalf("F1b usage 行数=%d，期望恰好 1 行（已提交流只允许一条终态账）: %+v",
+			len(rows), rows)
+	}
 	t.Logf("F1b usage 行: %+v", rows[0])
 
 	// 断言 1：落库的 token 数不是 0。
@@ -2394,16 +2402,14 @@ func (s *committedSignalRecorder) Write(b []byte) (int, error) {
 }
 
 func (s *signalingRecorder) Header() http.Header {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.code == 0 {
-		s.code = http.StatusOK
-	}
 	return http.Header{}
 }
 
 func (s *signalingRecorder) Write(b []byte) (int, error) {
 	s.mu.Lock()
+	if s.code == 0 {
+		s.code = http.StatusOK
+	}
 	n, err := s.buf.Write(b)
 	s.mu.Unlock()
 	s.wroteOnce.Do(func() { close(s.wrote) })

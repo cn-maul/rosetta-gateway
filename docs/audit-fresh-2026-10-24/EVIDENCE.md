@@ -2697,3 +2697,54 @@ go build ./cmd/gateway
 ```
 
 All passed.
+
+## v1.7.1 F1b Release-gate Follow-up
+
+The Docker workflow stopped at its pre-release gate with:
+
+```text
+--- FAIL: TestE2E_F1b_ClientDisconnectStillConsumesTokenQuota
+    e2e_datapath_test.go:1245: F1b usage 行:
+      {Status:canceled UsageState:none TotalTokens:0 HTTPStatus:502}
+    e2e_datapath_test.go:1249: 客户端中断后 total_tokens=0
+    e2e_datapath_test.go:1258: F1b used_tokens: 0 -> 6
+```
+
+A failure-first change made F1b wait briefly after the first row and require
+exactly one:
+
+```text
+go test ./cmd/gateway -run '^TestE2E_F1b_ClientDisconnectStillConsumesTokenQuota$' -count=200
+```
+
+Before the product fix it failed on nearly every run with two rows sharing one
+request ID:
+
+```text
+F1b usage 行数=2, 期望恰好 1 行:
+  {Status:canceled UsageState:none TotalTokens:0 HTTPStatus:502}
+  {Status:canceled UsageState:reported TotalTokens:6 HTTPStatus:200}
+```
+
+`attemptStream` set `attempt.Committed = true` but returned
+`Outcome{Kind: OutcomeClientAborted}` without that bit. Normalization therefore
+classified the already-persisted stream as an uncommitted client abort and the
+outer lane wrote the second 502 row. The return value now includes
+`Committed: true`. `signalingRecorder.Header()` no longer synthesizes a status
+and its first implicit body write records HTTP 200, matching `net/http`.
+
+Verification after the fix:
+
+```text
+go test ./cmd/gateway -run '^TestE2E_F1b_ClientDisconnectStillConsumesTokenQuota$' -count=200
+go test ./cmd/gateway -run '^TestE2E_F1[bd]' -count=100
+go test -race ./cmd/gateway -run '^TestE2E_F1[bd]' -count=100
+go test ./internal/dataplane -run '^(TestR5_AttemptOutcomeProjectsOneLaneDecision|TestR5_DownstreamWriteFailureKeepsItsCommittedKind|TestR5_FirstSinkWriteFailureTerminatesTheAttempt)$' -count=1
+go test -short -count=1 -timeout 300s <all non-work packages>
+go vet <all non-work packages>
+cd web; npm test -- --run; npm run typecheck; npm run build; node sync-embed.mjs
+```
+
+All passed. The ignored scratch `work/` tree remains outside the release
+command set because its old probe test no longer compiles against the current
+`ClaimTargetProbe` signature.
