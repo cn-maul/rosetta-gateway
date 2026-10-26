@@ -2520,3 +2520,44 @@ Residual: Docker could not be executed on this host, so this smoke test does
 not replace the already documented live image/Compose verification residual.
 No commit, push, tag, deployment, or production database operation was
 performed.
+
+## v1.7.0 Release CI Finding
+
+The first CI run for release commit `01b0b9c` exposed one Linux-only failure in
+the full short suite:
+
+```text
+--- FAIL: TestE2E_F1c_DownstreamWriteFailureMarksCanceled
+    e2e_datapath_test.go:1293: F1c 写失败后 usage 行数 = 2，期望恰好 1 行（重复记账）
+```
+
+### Failure-first reproduction
+
+The regression test calls `normalize` on the exact production shape: a
+committed client-abort outcome carrying the more specific
+`downstream_write_failed` code.
+
+```text
+--- FAIL: TestR5_DownstreamWriteFailureKeepsItsCommittedKind
+    outcome_lane_test.go:143: downstream write failure normalized to client_aborted,
+    want downstream_write_failed
+```
+
+### Implementation
+
+`Outcome.normalizedKind` now upgrades a committed client abort with code
+`downstream_write_failed` to `OutcomeDownstreamWriteFailed`. The outer lane
+then recognizes the already-persisted terminal result instead of adding a
+second uncommitted-failure usage row.
+
+### Verification
+
+```text
+go test ./internal/dataplane -run
+  'TestR5_(AttemptOutcomeProjectsOneLaneDecision|DownstreamWriteFailureKeepsItsCommittedKind)' -count=1
+go test ./cmd/gateway -run
+  'TestE2E_F1c_DownstreamWriteFailureMarksCanceled|TestR0AC13_NonStream|TestR0AC14_NonStream' -count=20
+go test ./internal/dataplane ./internal/usage ./internal/outwire -count=10
+```
+
+All passed. Tagging remains gated on a new green CI run and the GHCR workflow.

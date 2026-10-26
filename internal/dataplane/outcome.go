@@ -218,6 +218,9 @@ func (o Outcome) normalize() Outcome {
 }
 
 func (o Outcome) normalizedKind() OutcomeKind {
+	if o.Kind == OutcomeClientAborted && o.Committed && o.Code == "downstream_write_failed" {
+		return OutcomeDownstreamWriteFailed
+	}
 	if o.Kind != OutcomeUpstreamFailed {
 		// A committed client abort is a distinct terminal state from a request
 		// abandoned before any downstream bytes.

@@ -1636,3 +1636,12 @@ Status: the post-remediation smoke finding is fixed and verified in the working
 tree. The original 54 findings remain closed. Browser and API smoke coverage
 found no additional defect. No commit, push, tag, deployment, or production
 database operation was performed.
+
+## v1.7.0 Release Verification
+
+Release commit `01b0b9c` was pushed to `main`. The first CI run (`#51`) failed
+the full short suite on Linux because a committed streamed downstream-write
+failure was normalized as an ordinary client abort, causing a second usage row.
+`DELIVERY-01` records the failure-first test, the minimal outcome-kind fix, and
+its verification. The tag and GHCR publication are intentionally blocked until
+the fix passes a fresh complete CI run.

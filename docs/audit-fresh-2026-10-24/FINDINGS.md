@@ -1393,3 +1393,31 @@ want ["alice" "admin1" "admin1"]
 - Verification: the targeted test, full short suite, race short suite, and
   frontend tests/typecheck pass. Real isolated HTTP evidence records
   `smokeuser` for a user key PATCH while old `anonymous` rows remain unchanged.
+
+### DELIVERY-01 - Streamed downstream write failures were folded into client aborts
+
+- Status: fixed after the first v1.7.0 CI run exposed the failure on Linux
+- Evidence: `internal/dataplane/outcome.go`,
+  `internal/dataplane/outcome_lane_test.go`,
+  `TestR5_DownstreamWriteFailureKeepsItsCommittedKind`,
+  `TestE2E_F1c_DownstreamWriteFailureMarksCanceled`
+- Trigger: a streamed response committed its headers and first chunk, then the
+  downstream connection rejected a later write.
+- Failure-first result from CI:
+
+```text
+--- FAIL: TestE2E_F1c_DownstreamWriteFailureMarksCanceled
+    e2e_datapath_test.go:1293: F1c 写失败后 usage 行数 = 2，期望恰好 1 行（重复记账）
+```
+
+- Root cause: `attemptStream` persisted one terminal row and returned
+  `OutcomeClientAborted` with code `downstream_write_failed`.
+  `normalizedKind` did not preserve the more specific downstream-write kind,
+  so the outer orchestration treated the committed result as an ordinary
+  client abort and appended a second terminal row.
+- Direction: preserve `OutcomeDownstreamWriteFailed` when a committed client
+  abort carries `downstream_write_failed`; ordinary client cancellation keeps
+  its neutral completion behavior.
+- Verification: the targeted regression, the Linux-failing E2E repeated 20
+  times, and dataplane/usage/outwire repeated 10 times pass. Full gates and a
+  fresh CI run are required before tagging.

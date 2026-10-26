@@ -132,6 +132,21 @@ func TestR5_AttemptOutcomeProjectsOneLaneDecision(t *testing.T) {
 	}
 }
 
+func TestR5_DownstreamWriteFailureKeepsItsCommittedKind(t *testing.T) {
+	got := committedKindForStatus(store.UsageStatusCanceled)
+	if got != OutcomeClientAborted {
+		t.Fatalf("committedKindForStatus(canceled) = %v, want client_aborted without a more specific code", got)
+	}
+
+	out := Outcome{Kind: OutcomeClientAborted, Committed: true, Code: "downstream_write_failed"}.normalize()
+	if out.Kind != OutcomeDownstreamWriteFailed {
+		t.Fatalf("downstream write failure normalized to %v, want downstream_write_failed", out.Kind)
+	}
+	if !out.Committed || out.LaneDecision().PenalizeUpstream || !out.ClientGone {
+		t.Fatalf("downstream write failure flags = %+v, want committed, no upstream penalty, client gone", out)
+	}
+}
+
 func TestR5_OutcomeConstructorsCannotExpressConflictingBooleans(t *testing.T) {
 	upstream := OutcomeFromErrCtx(context.Background(), errors.New("upstream failed"))
 	if upstream.Kind != OutcomeUpstreamFailed || upstream.Committed || upstream.Success {
