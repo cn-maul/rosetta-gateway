@@ -116,12 +116,12 @@ func TestFetchCustomBalance(t *testing.T) {
 
 	t.Run("嵌套字段", func(t *testing.T) {
 		spec := &BalanceSpec{Path: "/credits", Field: "data.remaining", Currency: "USD", Auth: "bearer"}
-		amt, cur, detail, err := fetchCustomBalance(ctx, p, "sk-x", spec)
+		reading, err := fetchCustomBalance(ctx, p, "sk-x", spec)
 		if err != nil {
 			t.Fatalf("查询失败：%v", err)
 		}
-		if amt != 42.5 || cur != "USD" {
-			t.Fatalf("金额/币种不对：%v %s", amt, cur)
+		if reading.Amount == nil || *reading.Amount != 42.5 || reading.Currency != "USD" {
+			t.Fatalf("金额/币种不对：%+v", reading)
 		}
 		if gotAuth != "Bearer sk-x" {
 			t.Fatalf("鉴权头不对：%q", gotAuth)
@@ -129,43 +129,43 @@ func TestFetchCustomBalance(t *testing.T) {
 		if gotPath != "/credits" {
 			t.Fatalf("路径不对：%q", gotPath)
 		}
-		if detail == "" {
+		if reading.Detail == "" {
 			t.Fatal("detail 应带上取值路径")
 		}
 	})
 
 	t.Run("数组下标", func(t *testing.T) {
 		spec := &BalanceSpec{Path: "/list", Field: "items.0.amount", Currency: "USD", Auth: "bearer"}
-		amt, _, _, err := fetchCustomBalance(ctx, p, "sk-x", spec)
+		reading, err := fetchCustomBalance(ctx, p, "sk-x", spec)
 		if err != nil {
 			t.Fatalf("查询失败：%v", err)
 		}
-		if amt != 7.25 {
-			t.Fatalf("字符串数值未被解析：%v", amt)
+		if reading.Amount == nil || *reading.Amount != 7.25 {
+			t.Fatalf("字符串数值未被解析：%+v", reading)
 		}
 	})
 
 	t.Run("字符串数值", func(t *testing.T) {
 		spec := &BalanceSpec{Path: "/as-string", Field: "balance", Currency: "CNY", Auth: "bearer"}
-		amt, _, _, err := fetchCustomBalance(ctx, p, "sk-x", spec)
+		reading, err := fetchCustomBalance(ctx, p, "sk-x", spec)
 		if err != nil {
 			t.Fatalf("查询失败：%v", err)
 		}
-		if amt != 19.99 {
-			t.Fatalf("金额不对：%v", amt)
+		if reading.Amount == nil || *reading.Amount != 19.99 {
+			t.Fatalf("金额不对：%+v", reading)
 		}
 	})
 
 	t.Run("字段不存在", func(t *testing.T) {
 		spec := &BalanceSpec{Path: "/missing", Field: "balance", Currency: "USD", Auth: "bearer"}
-		if _, _, _, err := fetchCustomBalance(ctx, p, "sk-x", spec); err == nil {
+		if _, err := fetchCustomBalance(ctx, p, "sk-x", spec); err == nil {
 			t.Fatal("应当报错并指出缺哪个字段")
 		}
 	})
 
 	t.Run("404归为不支持", func(t *testing.T) {
 		spec := &BalanceSpec{Path: "/nope", Field: "balance", Currency: "USD", Auth: "bearer"}
-		_, _, _, err := fetchCustomBalance(ctx, p, "sk-x", spec)
+		_, err := fetchCustomBalance(ctx, p, "sk-x", spec)
 		if err == nil || !isUnsupportedBalanceErr(err) {
 			t.Fatalf("404 应归为 unsupported，实际 %v", err)
 		}

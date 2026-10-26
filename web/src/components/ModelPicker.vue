@@ -11,6 +11,7 @@
  * 白名单是精确匹配，拼错一个字符的后果是「这个模型谁都看不到」而界面毫无异常。
  */
 import { computed, ref } from 'vue'
+import { unionSelection } from '../modelSelection'
 
 const props = defineProps<{
   modelValue: string[]
@@ -66,7 +67,9 @@ function toggle(name: string) {
 /**
  * 全选：按 options 的顺序给出确定性结果，避免出现「顺序取决于勾选顺序」的集合。
  *
- * 有搜索词时只全选**当前可见**的那些（2026-10-10 修复的 P2）。
+ * 有搜索词时只**追加当前可见**的那些（2026-10-10 修复的 P2；2026-10-26
+ * 由 R10 收紧为集合并集）。隐藏的已选项必须原样保留：这个组件写回的是
+ * key / group 的模型白名单，丢掉隐藏项等于在不展示的情况下撤销权限。
  *
  * 原实现无条件发整个 sortedOptions，于是「打了搜索词 → 点全选」这个完全
  * 自然的操作，实际效果是勾中**所有**模型。对「配置模型」这个用例（给
@@ -78,7 +81,7 @@ function toggle(name: string) {
  */
 function selectAll() {
   const q = query.value.trim()
-  emit('update:modelValue', q ? [...visible.value] : [...sortedOptions.value])
+  emit('update:modelValue', q ? unionSelection(props.modelValue, visible.value) : [...sortedOptions.value])
 }
 
 function clearAll() {

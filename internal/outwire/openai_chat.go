@@ -462,7 +462,7 @@ func OpenAIFinishReason(s rosetta.StopReason) string {
 	}
 }
 
-func WriteNonStreamResponse(w http.ResponseWriter, resp *rosetta.ChatResponse, model string) {
+func WriteNonStreamResponse(w http.ResponseWriter, resp *rosetta.ChatResponse, model string) NonStreamWriteResult {
 	choices := make([]OpenAIChatChoice, 0)
 	finishReason := OpenAIFinishReason(resp.StopReason)
 
@@ -485,10 +485,12 @@ func WriteNonStreamResponse(w http.ResponseWriter, resp *rosetta.ChatResponse, m
 		}
 		raw, _ := json.Marshal(tcs)
 		msg.ToolCalls = raw
-		// OpenAI 的语义是「带 tool_calls 时 content 为 null」，而不是整个字段消失。
-		// 置 nil 会被 omitempty 连字段一起抹掉，客户端拿不到 content 键 ——
-		// 部分 SDK 会把它判成响应结构不合法。
-		msg.Content = json.RawMessage("null")
+		// OpenAI permits text alongside tool_calls. Keep non-empty text;
+		// use an explicit null only when there is no text, rather than
+		// letting omitempty remove the key entirely.
+		if len(resp.Text()) == 0 {
+			msg.Content = json.RawMessage("null")
+		}
 	}
 
 	choices = append(choices, OpenAIChatChoice{
@@ -525,8 +527,7 @@ func WriteNonStreamResponse(w http.ResponseWriter, resp *rosetta.ChatResponse, m
 		Usage:   usage,
 	}
 
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(out)
+	return encodeNonStreamPayload(w, out)
 }
 
 // jsonString 把字符串编码成一个完整的 JSON 字面量（含引号与转义）。

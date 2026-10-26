@@ -1,6 +1,11 @@
 package config
 
-import "testing"
+import (
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+)
 
 // usage_retention_days 的三项契约：缺省值、范围校验、与「配额预检成本」的关系。
 //
@@ -45,6 +50,61 @@ func TestUsageRetentionDays_越界被拒(t *testing.T) {
 				t.Fatalf("%s 应被 validate 挡下：剪枝会静默停摆或行为反直觉", c.json)
 			}
 		})
+	}
+}
+
+func TestBootstrapCredential_ResolveAPIKeyPrecedence(t *testing.T) {
+	env := func(name string) string {
+		if name == "SET_KEY" {
+			return "from-env"
+		}
+		return ""
+	}
+	for _, tc := range []struct {
+		name string
+		cred BootstrapCredential
+		want string
+	}{
+		{"explicit key wins", BootstrapCredential{APIKey: "from-config", APIKeyEnv: "SET_KEY"}, "from-config"},
+		{"env used when key empty", BootstrapCredential{APIKeyEnv: "SET_KEY"}, "from-env"},
+		{"unset env does not erase key", BootstrapCredential{APIKey: "from-config", APIKeyEnv: "UNSET_KEY"}, "from-config"},
+		{"no source", BootstrapCredential{APIKeyEnv: "UNSET_KEY"}, ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := tc.cred.ResolveAPIKey(env); got != tc.want {
+				t.Fatalf("ResolveAPIKey() = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestR2_DeploymentDocsMatchEffectiveContracts(t *testing.T) {
+	read := func(name string) string {
+		t.Helper()
+		data, err := os.ReadFile(filepath.Join("..", "..", name))
+		if err != nil {
+			t.Fatalf("read %s: %v", name, err)
+		}
+		return string(data)
+	}
+
+	docker := read("DOCKER.md")
+	if !strings.Contains(docker, "非空的 `config.json.timezone` 最高") {
+		t.Fatal("DOCKER.md must document config timezone as the final override")
+	}
+	if !strings.Contains(docker, "`usage_retention_days` 到期后") {
+		t.Fatal("DOCKER.md must describe retention as configurable, not fixed at 30 days")
+	}
+
+	readme := read("README.md")
+	if !strings.Contains(readme, "默认保留 30 天") ||
+		!strings.Contains(readme, "`usage_retention_days` 可配置") {
+		t.Fatal("README.md must describe 30 days as a configurable default")
+	}
+
+	design := read("DESIGN.md")
+	if !strings.Contains(design, "写 `0` 或 `-1` 都显式关闭剪枝") {
+		t.Fatal("DESIGN.md must document 0 and -1 as disabling audit pruning")
 	}
 }
 

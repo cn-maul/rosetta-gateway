@@ -32,6 +32,41 @@ func newTestConfig() *config.Config {
 	return cfg
 }
 
+func TestR2_M02_01ConfigPoolUsesExplicitKeyWhenEnvironmentIsUnset(t *testing.T) {
+	const envName = "ROSETTA_GATEWAY_TEST_M02_01_POOL_UNSET"
+	t.Setenv(envName, "")
+
+	cfg := config.Default()
+	cfg.Bootstrap.Providers = []config.BootstrapProvider{{
+		Slug:     "testprov",
+		Name:     "Test Provider",
+		Protocol: "chat",
+		Endpoint: "https://example.invalid/v1",
+		Credentials: []config.BootstrapCredential{{
+			Label:     "main",
+			APIKey:    "explicit-config-key",
+			APIKeyEnv: envName,
+		}},
+		Models: []string{"test-model"},
+	}}
+
+	p := newTestPool()
+	if err := p.BuildFromConfig(cfg); err != nil {
+		t.Fatalf("build from config: %v", err)
+	}
+	snapshot := p.ProvidersSnapshot()
+	prov := snapshot["testprov"]
+	if prov == nil {
+		t.Fatal("provider missing from pool")
+	}
+	if len(prov.Credentials) != 1 {
+		t.Fatalf("credentials = %d, want 1: explicit api_key must not be erased by an unset env", len(prov.Credentials))
+	}
+	if got := prov.Credentials[0].APIKey; got != "explicit-config-key" {
+		t.Fatalf("pool API key = %q, want explicit-config-key", got)
+	}
+}
+
 // 已从配置中删除的 target，其熔断态必须在重建时被丢弃。
 //
 // 这条测试原先断言的是相反的行为（重建清空全部熔断态），理由是

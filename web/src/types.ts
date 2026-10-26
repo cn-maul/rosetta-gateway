@@ -325,8 +325,11 @@ export interface ModelTestResult {
 export interface CredentialBalance {
   credential_id: string
   label: string
-  /** ok=查到；error=查了但失败（凭据/网络）；unsupported=这个上游没有余额查询方式。 */
-  status: 'ok' | 'error' | 'unsupported'
+  /**
+   * ok=额度与用量都已确认；unknown=只拿到部分事实，不能给出精确可用额；
+   * error=查了但失败（凭据/网络）；unsupported=这个上游没有余额查询方式。
+   */
+  status: 'ok' | 'unknown' | 'error' | 'unsupported'
   message?: string
   /**
    * 上游报告的可用额度，**未换算成元**（上游可能报 USD，汇率随时在动，
@@ -344,8 +347,8 @@ export interface CredentialBalance {
 export interface ProviderBalance {
   provider_id: string
   provider: string
-  /** ok=全部查到；partial=部分失败；error=全部失败；unsupported=该上游不支持。 */
-  status: 'ok' | 'partial' | 'error' | 'unsupported'
+  /** ok=全部确认；partial=部分失败或未知；unknown=全部未知；error=全部失败；unsupported=该上游不支持。 */
+  status: 'ok' | 'partial' | 'unknown' | 'error' | 'unsupported'
   message?: string
   results: CredentialBalance[]
 }

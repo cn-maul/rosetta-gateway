@@ -75,6 +75,28 @@ func (s *Store) ensureCompatibleSchema(ctx context.Context) error {
 	if _, err := s.db.ExecContext(ctx, userPasswordSetupTokensDDL); err != nil {
 		return fmt.Errorf("ensure user password setup token schema: %w", err)
 	}
+	// R3 adds durable quota-lease and charge-retry state. Both objects are
+	// additive, so a database already stamped with currentSchemaVersion can
+	// acquire them in place. Keep this in compatibility setup rather than the
+	// canonical-only path: otherwise an upgraded database succeeds at startup
+	// and then fails on the first request that touches the new state.
+	if _, err := s.db.ExecContext(ctx, `CREATE TABLE IF NOT EXISTS quota_reservation_leases (
+		request_id    TEXT NOT NULL,
+		scope         TEXT NOT NULL,
+		target_id     TEXT NOT NULL,
+		reserved      INTEGER NOT NULL,
+		released      INTEGER NOT NULL DEFAULT 0,
+		lease_until   INTEGER NOT NULL,
+		last_error    TEXT,
+		created_at    INTEGER NOT NULL,
+		PRIMARY KEY (request_id, scope, target_id)
+	)`); err != nil {
+		return fmt.Errorf("ensure quota reservation lease table: %w", err)
+	}
+	if _, err := s.db.ExecContext(ctx, `CREATE INDEX IF NOT EXISTS idx_usage_charge_retry
+		ON usage_records(usage_state, charge_next_at, ts)`); err != nil {
+		return fmt.Errorf("ensure usage charge retry index: %w", err)
+	}
 	// 2026-10-22 修 F2：cache creation 的独立单价与归档列。
 	//
 	// 这些是**带默认值的纯新增列**，旧库可以原地升级，不需要提升
@@ -95,6 +117,12 @@ func (s *Store) ensureCompatibleSchema(ctx context.Context) error {
 		// 路由改协议后，旧记录仍应显示当时的事实。
 		{"usage_records", "provider_name", "TEXT"},
 		{"usage_records", "upstream_protocol", "TEXT"},
+		// 2026-10-25 R3: recoverable accounting retry state. The defaults
+		// preserve existing behavior: every historical row is immediately
+		// eligible, has made no retry attempts, and has no recorded error.
+		{"usage_records", "charge_attempts", "INTEGER NOT NULL DEFAULT 0"},
+		{"usage_records", "charge_next_at", "INTEGER NOT NULL DEFAULT 0"},
+		{"usage_records", "charge_last_error", "TEXT"},
 	} {
 		if err := s.ensureAdditiveColumn(ctx, col.table, col.column, col.decl); err != nil {
 			return err
@@ -427,7 +455,12 @@ var canonicalSchemaStatements = []string{
 		ttfb_ms           INTEGER NOT NULL DEFAULT 0,
 		request_id        TEXT,
 		route_trace       TEXT,
-		cost_total        REAL NOT NULL DEFAULT 0
+		cost_total        REAL NOT NULL DEFAULT 0,
+		-- Accounting retry state. These columns are additive and default to
+		-- the existing "eligible now" behavior for every historical row.
+		charge_attempts   INTEGER NOT NULL DEFAULT 0,
+		charge_next_at    INTEGER NOT NULL DEFAULT 0,
+		charge_last_error TEXT
 	)`,
 	`CREATE TABLE user_usage_totals (
 		user_id      TEXT PRIMARY KEY,
@@ -479,6 +512,17 @@ var canonicalSchemaStatements = []string{
 		ts            INTEGER NOT NULL,
 		PRIMARY KEY (request_id, user_id)
 	)`,
+	`CREATE TABLE quota_reservation_leases (
+		request_id    TEXT NOT NULL,
+		scope         TEXT NOT NULL,
+		target_id     TEXT NOT NULL,
+		reserved      INTEGER NOT NULL,
+		released      INTEGER NOT NULL DEFAULT 0,
+		lease_until   INTEGER NOT NULL,
+		last_error    TEXT,
+		created_at    INTEGER NOT NULL,
+		PRIMARY KEY (request_id, scope, target_id)
+	)`,
 	`CREATE TABLE balance_topups (
 		id                TEXT PRIMARY KEY,
 		user_id           TEXT NOT NULL,
@@ -507,6 +551,8 @@ var canonicalSchemaStatements = []string{
 	`CREATE INDEX idx_usage_model_ts ON usage_records(public_model, ts)`,
 	`CREATE INDEX idx_usage_prov_ts ON usage_records(provider_id, ts)`,
 	`CREATE INDEX idx_usage_user_ts ON usage_records(user_id, ts)`,
+	`CREATE INDEX idx_usage_charge_retry
+		ON usage_records(usage_state, charge_next_at, ts)`,
 	`CREATE INDEX idx_access_keys_user ON access_keys(user_id)`,
 	`CREATE INDEX idx_users_group ON users(group_id)`,
 	`CREATE INDEX idx_route_targets_route ON route_targets(route_id, position)`,

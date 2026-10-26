@@ -73,6 +73,20 @@ jobs:
         working-directory: web
         run: npm ci
 
+      # 发布门禁不能弱于日常 CI：tag 可以指向任意历史提交，生成物、
+      # 依赖清单是否与源码一致必须在这个 workflow 自己证明。
+      - name: 生成物与依赖清单一致
+        run: |
+          set -euo pipefail
+          go generate ./internal/config
+          git diff --exit-code -- web/src/generated/defaults.ts
+          go generate ./cmd/gateway
+          git diff --exit-code -- web/src/generated/routes.ts
+          go generate ./internal/admin
+          git diff --exit-code -- web/src/generated/dto-contract.ts
+          go mod tidy -diff
+          go mod verify
+
       - name: 前端门禁（typecheck / test / build / embed sync）
         working-directory: web
         run: |
@@ -153,14 +167,13 @@ jobs:
         with:
           images: ${{ env.IMAGE }}
           tags: |
-            type=raw,value=${{ steps.ver.outputs.version }}
+            type=raw,value=${{ steps.ver.outputs.version }},enable=${{ github.ref_type == 'tag' }}
             type=raw,value=latest,enable=${{ github.ref_type == 'tag' }}
             type=raw,value=edge,enable=${{ github.ref_type != 'tag' }}
           labels: |
             org.opencontainers.image.title=rosetta-gateway
             org.opencontainers.image.description=LLM API gateway: OpenAI Chat Completions in, multi-protocol upstreams out
             org.opencontainers.image.version=${{ steps.ver.outputs.version }}
-            org.opencontainers.image.licenses=MIT
             org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
 
       - name: 构建并推送

@@ -105,6 +105,28 @@ var nowLocal = time.Now
 // 状态 —— 而这类不一致没有任何报错。
 const DefaultRetentionDays = 30
 
+// pruneSettledFilter excludes successful positive-cost usage whose charge has
+// not yet been recorded. Such a row is the only durable copy of the request
+// data needed by reconciliation; archiving it would turn a recoverable debt
+// into a permanent zero-cost aggregate. A pending ledger row is sufficient
+// evidence that the debt has already been handed to the settlement path.
+const pruneSettledFilter = `
+	AND NOT (
+		status = 'ok'
+		AND cost_total > 0
+		AND COALESCE(request_id, '') <> ''
+		AND NOT EXISTS (
+			SELECT 1 FROM balance_charges c
+			 WHERE c.request_id = usage_records.request_id
+			   AND c.user_id = COALESCE(usage_records.user_id, '')
+		)
+		AND NOT EXISTS (
+			SELECT 1 FROM balance_pending p
+			 WHERE p.request_id = usage_records.request_id
+			   AND p.user_id = COALESCE(usage_records.user_id, '')
+		)
+	)`
+
 // PruneResult 是一次剪枝的影响面，回给管理端点。
 // @ts-type PruneResult
 type PruneResult struct {
@@ -241,10 +263,19 @@ func (s *Store) PruneOldUsage(ctx context.Context, keepDays int) (*PruneResult, 
 	//
 	// 圈批到删除之间没有写入竞争：rowid 只会因本事务自己的 DELETE 而消失，
 	// 而那发生在圈批的用途全部完成之后。
+	// Only terminal, settled usage is retention-eligible. A cost_pending row
+	// still carries the only copy of the tokens and pricing identity needed to
+	// repair its charge, so archiving it would turn recoverable work into a
+	// permanent zero-cost aggregate.
 	if _, err := tx.ExecContext(ctx,
 		`INSERT INTO prune_batch (rid)
-		     SELECT rowid FROM usage_records WHERE ts < ? ORDER BY ts LIMIT ?`,
-		cutoffTs, maxPruneDelete); err != nil {
+		     SELECT rowid FROM usage_records
+		      WHERE ts < ?
+		        AND usage_state <> ?
+		        `+pruneSettledFilter+`
+		      ORDER BY ts
+		      LIMIT ?`,
+		cutoffTs, UsageStateCostPending, maxPruneDelete); err != nil {
 		return nil, fmt.Errorf("select prune batch: %w", err)
 	}
 
@@ -369,8 +400,10 @@ func (s *Store) PruneOldUsage(ctx context.Context, keepDays int) (*PruneResult, 
 	// 所以必须先确认 cutoffTs 之前已无残留行。
 	var remaining int64
 	if err := tx.QueryRowContext(ctx,
-		`SELECT EXISTS(SELECT 1 FROM usage_records WHERE ts < ? LIMIT 1)`,
-		cutoffTs).Scan(&remaining); err != nil {
+		`SELECT EXISTS(SELECT 1 FROM usage_records
+		                WHERE ts < ? AND usage_state <> ?
+		                `+pruneSettledFilter+` LIMIT 1)`,
+		cutoffTs, UsageStateCostPending).Scan(&remaining); err != nil {
 		return nil, fmt.Errorf("check prune remainder: %w", err)
 	}
 	if remaining == 0 {

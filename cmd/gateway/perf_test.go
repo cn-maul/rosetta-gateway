@@ -728,6 +728,9 @@ func TestPerfConcurrencyScaling(t *testing.T) {
 // 且都在鉴权附近，未来把数据面也接上它是个很自然的"加固"动作 ——
 // 而那会让 200 并发直接退化成 4 并发。这条断言就是那种改动的红灯。
 func TestPerfDataPlaneNotLimitedByAuthConcurrencyCap(t *testing.T) {
+	if testing.Short() {
+		t.Skip("鉴权并发上限对照在 -short 下跳过")
+	}
 	good := fakeGood()
 	defer good.Close()
 
@@ -776,6 +779,9 @@ func countGoroutines() int {
 // 单条泄漏 × 1000 是 +1000 条 goroutine，任何量的泄漏都藏不住；
 // 而少于几百次时，「泄漏 1 条」与「运行时懒创建的 1 条」无法区分。
 func TestPerfGoroutineLeak(t *testing.T) {
+	if testing.Short() {
+		t.Skip("goroutine 泄漏检测在 -short 下跳过")
+	}
 	good := fakeGood()
 	defer good.Close()
 
@@ -817,6 +823,9 @@ func TestPerfGoroutineLeak(t *testing.T) {
 // goroutine），且心跳 goroutine 的退出靠 quit channel + WaitGroup ——
 // 这条测试就是那个收尾逻辑的泄漏探针。非流式测试覆盖不到它。
 func TestPerfGoroutineLeakStream(t *testing.T) {
+	if testing.Short() {
+		t.Skip("流式 goroutine 泄漏检测在 -short 下跳过")
+	}
 	good := fakeStreamGood()
 	defer good.Close()
 
@@ -867,6 +876,9 @@ func TestPerfGoroutineLeakStream(t *testing.T) {
 //  1. **复用生效**：累计建立 total 远小于请求数;
 //  2. **峰值有界**：peak 不超过并发数的一个小倍数（连接在并发内铺开）。
 func TestPerfUpstreamConnectionRelease(t *testing.T) {
+	if testing.Short() {
+		t.Skip("上游连接复用测量在 -short 下跳过")
+	}
 	up, cs := newFakeUpstreamWithConnStats()
 	defer up.Close()
 
@@ -935,6 +947,9 @@ func max64(a, b int64) int64 {
 // 手法：上游发慢流（每事件 5ms），客户端在读到第一个事件后立刻
 // cancel/关闭，然后看 goroutine 是否回落。
 func TestPerfClientDisconnectReleasesResources(t *testing.T) {
+	if testing.Short() {
+		t.Skip("客户端断开资源测量在 -short 下跳过")
+	}
 	slow := fakeStreamMany(200, 5*time.Millisecond)
 	defer slow.Close()
 
@@ -1008,6 +1023,9 @@ func TestPerfClientDisconnectReleasesResources(t *testing.T) {
 //
 // 段间用同一个已预热的进程，排除了「套件里别的测试抬高了堆」这个干扰。
 func TestPerfMemoryGrowth(t *testing.T) {
+	if testing.Short() {
+		t.Skip("内存增长测量在 -short 下跳过")
+	}
 	good := fakeGood()
 	defer good.Close()
 
@@ -1102,6 +1120,9 @@ func safeRatio(a, b int64) float64 {
 // （那会占住下游连接 + 上游连接 + 配额预占）。
 // 所以断言 elapsed 落在 [ttft, ttft+slack] 内，且**并发下每条都如此**。
 func TestPerfTTFTWatchdogOnHangingUpstream(t *testing.T) {
+	if testing.Short() {
+		t.Skip("固定 TTFT 预算与 50 并发测量在 -short 下跳过")
+	}
 	hang := fakeStreamHang()
 	defer hang.Close()
 
@@ -1296,6 +1317,9 @@ func TestPerfSlowUpstreamHighConcurrency(t *testing.T) {
 //
 // 规模取 1024（队列容量）+ 500 溢出量，确保一定能触发队列满。
 func TestPerfUsageQueueSaturation(t *testing.T) {
+	if testing.Short() {
+		t.Skip("usage 队列饱和测量在 -short 下跳过")
+	}
 	good := fakeGood()
 	defer good.Close()
 

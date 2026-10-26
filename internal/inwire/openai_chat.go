@@ -579,17 +579,37 @@ func assistantText(m OpenAIMessage) string {
 }
 
 // openAIContentPart 是 OpenAI「内容块数组」里的一块。
-// 只声明我们真的会透传的字段：多出来的（image_url.detail / input_audio / file…）
-// 由 encoding/json 忽略，不会被误当成正文。
+//
+// image_url.detail 不在 rosetta 的通用模型里，仍由 encoding/json 忽略；
+// 输入媒体本身（input_audio / file）必须保留，不能再静默丢掉。
 type openAIContentPart struct {
 	Type     string `json:"type"`
 	Text     string `json:"text"`
 	ImageURL *struct {
 		URL string `json:"url"`
 	} `json:"image_url"`
+	InputAudio *struct {
+		Data   string `json:"data"`
+		Format string `json:"format"`
+	} `json:"input_audio"`
+	File *struct {
+		FileData string `json:"file_data"`
+		FileID   string `json:"file_id"`
+		Filename string `json:"filename"`
+	} `json:"file"`
 }
 
-// extractUserContent 拆开一条消息的 content：文本拼成一段，图像 URL 原样收集。
+// userContent 是一条 Chat 消息里可代理的内容。文本拼成一段，媒体保持
+// 输入顺序，供 user 消息和 tool 结果共用。
+type userContent struct {
+	Text   string
+	Blocks []rosetta.Block
+	// Dropped 记录识别为媒体、但缺少可代理载荷的分块。它单独存在是为了
+	// 让入口能返回 400，而不是把这种块当成“没有内容”继续转发。
+	Dropped []string
+}
+
+// extractUserContent 拆开一条消息的 content：文本拼成一段，媒体按顺序收集。
 //
 // 旧实现只抽文本，把 image_url **静默丢掉**：客户端发多模态请求，网关照单全收
 // 并回 200，而上游只看到文字 —— 用户以为模型「看不懂图」，实际是网关半路把图删了，
@@ -599,17 +619,17 @@ type openAIContentPart struct {
 // 非法 URL（file:// 之类）不在这里白名单：rosetta 的 validate 会拦下并返回
 // ErrInvalidRequest，网关已有的错误映射把它变成 400。
 //
-// 都认不出来时返回空串。旧实现 `return string(raw)` 会把畸形 JSON **原样当正文**
+// 都认不出来时不产生内容。旧实现 `return string(raw)` 会把畸形 JSON **原样当正文**
 // 发给上游：客户端传个数字或嵌套对象，上游收到一段 JSON 字面量文本，
 // 而链路上看不出任何异常（它确实是一段"合法的"文本），排查时只能靠肉眼比对话。
-func extractUserContent(raw json.RawMessage) (string, []string) {
+func extractUserContent(raw json.RawMessage) userContent {
 	if len(raw) == 0 {
-		return "", nil
+		return userContent{}
 	}
 
 	var s string
 	if err := json.Unmarshal(raw, &s); err == nil {
-		return s, nil
+		return userContent{Text: s}
 	}
 
 	var parts []openAIContentPart
@@ -617,37 +637,113 @@ func extractUserContent(raw json.RawMessage) (string, []string) {
 		// 单块的「对象形态」：非标准，但手写请求里很常见，尽力提取。
 		var single openAIContentPart
 		if err := json.Unmarshal(raw, &single); err != nil {
-			return "", nil
+			return userContent{}
 		}
 		if single.Type == "image_url" && single.ImageURL != nil && single.ImageURL.URL != "" {
-			return "", []string{single.ImageURL.URL}
+			return userContent{Blocks: []rosetta.Block{{
+				Type: rosetta.BlockImage, ImageURL: single.ImageURL.URL,
+			}}}
 		}
 		if single.Text != "" {
-			return single.Text, nil
+			return userContent{Text: single.Text}
 		}
-		return "", nil
+		return chatContentBlock(single)
 	}
 
+	var out userContent
 	var text strings.Builder
-	var images []string
 	for _, p := range parts {
 		switch p.Type {
 		case "text":
 			text.WriteString(p.Text)
 		case "image_url":
 			if p.ImageURL != nil && p.ImageURL.URL != "" {
-				images = append(images, p.ImageURL.URL)
+				out.Blocks = append(out.Blocks, rosetta.Block{
+					Type: rosetta.BlockImage, ImageURL: p.ImageURL.URL,
+				})
+			} else {
+				out.Dropped = append(out.Dropped, p.Type)
+			}
+		case "input_audio":
+			if p.InputAudio != nil && p.InputAudio.Data != "" {
+				out.Blocks = append(out.Blocks, rosetta.Block{
+					Type:        rosetta.BlockAudio,
+					AudioData:   stripDataURLPrefix(p.InputAudio.Data),
+					AudioFormat: p.InputAudio.Format,
+				})
+			} else {
+				out.Dropped = append(out.Dropped, p.Type)
+			}
+		case "file":
+			if b, ok := chatFileBlock(p); ok {
+				out.Blocks = append(out.Blocks, b)
+			} else {
+				out.Dropped = append(out.Dropped, p.Type)
 			}
 		}
 	}
-	return text.String(), images
+	out.Text = text.String()
+	return out
+}
+
+func chatContentBlock(p openAIContentPart) userContent {
+	switch p.Type {
+	case "image_url":
+		if p.ImageURL != nil && p.ImageURL.URL != "" {
+			return userContent{Blocks: []rosetta.Block{{
+				Type: rosetta.BlockImage, ImageURL: p.ImageURL.URL,
+			}}}
+		}
+	case "input_audio":
+		if p.InputAudio != nil && p.InputAudio.Data != "" {
+			return userContent{Blocks: []rosetta.Block{{
+				Type:        rosetta.BlockAudio,
+				AudioData:   stripDataURLPrefix(p.InputAudio.Data),
+				AudioFormat: p.InputAudio.Format,
+			}}}
+		}
+	case "file":
+		if b, ok := chatFileBlock(p); ok {
+			return userContent{Blocks: []rosetta.Block{b}}
+		}
+	default:
+		return userContent{}
+	}
+	return userContent{Dropped: []string{p.Type}}
+}
+
+func chatFileBlock(p openAIContentPart) (rosetta.Block, bool) {
+	if p.File == nil {
+		return rosetta.Block{}, false
+	}
+	// Chat has no mime_type field in the common file part. The filename lets
+	// rosetta derive it where possible.
+	b := rosetta.Block{
+		Type:     rosetta.BlockFile,
+		FileName: p.File.Filename,
+	}
+	switch {
+	case p.File.FileID != "":
+		b.FileID = p.File.FileID
+	case p.File.FileData != "":
+		b.FileData = stripDataURLPrefix(p.File.FileData)
+	default:
+		return rosetta.Block{}, false
+	}
+	return b, true
+}
+
+func stripDataURLPrefix(data string) string {
+	if idx := strings.Index(data, ","); strings.HasPrefix(data, "data:") && idx > 0 {
+		return data[idx+1:]
+	}
+	return data
 }
 
 // extractText 只要文本，丢弃图像。用于 system / assistant / tool —— 这三个角色的
 // 内容在 OpenAI 协议里本就是纯文本，图像只对 user 有意义。
 func extractText(raw json.RawMessage) string {
-	text, _ := extractUserContent(raw)
-	return text
+	return extractUserContent(raw).Text
 }
 
 // userMessage 组装 user 消息。
@@ -656,16 +752,14 @@ func extractText(raw json.RawMessage) string {
 // 带图像时才构造多块消息。只有在 rosetta 的 validate 允许的角色-块组合内
 // （RoleUser 支持 text / image / audio / file）才可能通过。
 func userMessage(raw json.RawMessage) rosetta.Message {
-	text, images := extractUserContent(raw)
-	if len(images) == 0 {
-		return rosetta.User(text)
+	content := extractUserContent(raw)
+	if len(content.Blocks) == 0 {
+		return rosetta.User(content.Text)
 	}
-	blocks := make([]rosetta.Block, 0, len(images)+1)
-	if text != "" {
-		blocks = append(blocks, rosetta.Block{Type: rosetta.BlockText, Text: text})
+	blocks := make([]rosetta.Block, 0, len(content.Blocks)+1)
+	if content.Text != "" {
+		blocks = append(blocks, rosetta.Block{Type: rosetta.BlockText, Text: content.Text})
 	}
-	for _, u := range images {
-		blocks = append(blocks, rosetta.Block{Type: rosetta.BlockImage, ImageURL: u})
-	}
+	blocks = append(blocks, content.Blocks...)
 	return rosetta.Message{Role: rosetta.RoleUser, Blocks: blocks}
 }

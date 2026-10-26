@@ -19,6 +19,7 @@ import (
 	"github.com/cn-maul/rosetta-gateway/internal/config"
 	"github.com/cn-maul/rosetta-gateway/internal/dataplane"
 	"github.com/cn-maul/rosetta-gateway/internal/ingress"
+	"github.com/cn-maul/rosetta-gateway/internal/lifecycle"
 	"github.com/cn-maul/rosetta-gateway/internal/ratelimit"
 	"github.com/cn-maul/rosetta-gateway/internal/runtime"
 	"github.com/cn-maul/rosetta-gateway/internal/server"
@@ -42,6 +43,7 @@ type Deps struct {
 	SessionMgr  *userauth.Manager
 	RateLimiter *ratelimit.Limiter
 	Usage       *usage.Recorder
+	Lifecycle   *lifecycle.Manager
 }
 
 // routeScope selects the production mux that owns a route. The zero value is
@@ -489,9 +491,13 @@ func BuildApp(d Deps) *App {
 	// SQLite 的错误字符串可以含数据库路径、驱动内部信息、文件系统错误。
 	// 同网段的主动探测者能拿它做环境枚举。现在只返回稳定的
 	// error_code，完整错误只进服务端日志。
+	healthzHandler := HealthzHandler(db, reloader, logger)
+	if d.Lifecycle != nil {
+		healthzHandler = HealthzReadinessHandler(d.Lifecycle, logger)
+	}
 	routeSpecs = append(routeSpecs,
 		routeSpec{Pattern: "GET /admin/", Handler: webHandler, Scope: routeRoot},
-		routeSpec{Pattern: "GET /healthz", Handler: HealthzHandler(db, reloader, logger), Scope: routeRoot},
+		routeSpec{Pattern: "GET /healthz", Handler: healthzHandler, Scope: routeRoot},
 	)
 	registerRoutes(mux, adminMux, publicAdminMux, routeSpecs)
 

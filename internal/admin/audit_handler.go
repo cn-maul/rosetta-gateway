@@ -34,9 +34,12 @@ type auditEntryResponse struct {
 func (h *AuditHandler) List(w http.ResponseWriter, r *http.Request) {
 	limit := 50
 	if v := r.URL.Query().Get("limit"); v != "" {
-		if n, err := strconv.Atoi(v); err == nil {
-			limit = n
+		n, err := strconv.Atoi(v)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, "limit must be an integer")
+			return
 		}
+		limit = n
 	}
 	if limit < 1 {
 		limit = 1

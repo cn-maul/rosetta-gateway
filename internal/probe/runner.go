@@ -69,10 +69,11 @@ type Runner struct {
 	cfg       *config.Config
 	masterKey []byte
 	logger    *slog.Logger
+	stagger   time.Duration
 }
 
 func NewRunner(st *store.Store, cfg *config.Config, masterKey []byte, logger *slog.Logger) *Runner {
-	return &Runner{store: st, cfg: cfg, masterKey: masterKey, logger: logger}
+	return &Runner{store: st, cfg: cfg, masterKey: masterKey, logger: logger, stagger: intervalStagger}
 }
 
 // Run 阻塞执行探测循环，直到 ctx 取消。
@@ -138,14 +139,24 @@ func (r *Runner) runOnce(ctx context.Context) {
 			defer func() { <-sem }()
 
 			// 每个模型随机偏移，避免同一秒全打上游。
-			time.Sleep(time.Duration(rand.Int63n(int64(intervalStagger))))
+			stagger := r.stagger
+			if stagger <= 0 {
+				stagger = intervalStagger
+			}
+			timer := time.NewTimer(time.Duration(rand.Int63n(int64(stagger))))
+			select {
+			case <-timer.C:
+			case <-ctx.Done():
+				timer.Stop()
+				return
+			}
 			r.probeOne(ctx, m, timeout)
 		}()
 	}
 	wg.Wait()
 
 	// 顺带剪枝超期探测记录（保留期独立配置）。
-	if r.cfg.Probes.RetentionDays > 0 {
+	if ctx.Err() == nil && r.cfg.Probes.RetentionDays > 0 {
 		if n, err := r.store.PruneOldProbes(ctx, r.cfg.Probes.RetentionDays); err != nil {
 			r.logger.Warn("probe: prune failed", "error", err)
 		} else if n > 0 {
@@ -177,6 +188,11 @@ func (r *Runner) probeOne(ctx context.Context, m store.UpstreamModel, timeout ti
 	if !res.OK {
 		rec.ErrorKind = classifyError(res.Err)
 		rec.ErrorDetail = outwire.UpstreamErrorDetail(res.Err)
+	}
+	// Cancellation is a lifecycle stop, not a probe result. Do not mutate
+	// probe history after the owner has begun shutdown.
+	if ctx.Err() != nil {
+		return
 	}
 	if err := r.store.RecordProbe(ctx, rec); err != nil {
 		r.logger.Warn("probe: record failed", "model", m.ModelID, "error", err)

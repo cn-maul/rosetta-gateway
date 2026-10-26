@@ -177,6 +177,12 @@ func createRouteTarget(ctx context.Context, ex execer, t *RouteTarget) error {
 	return err
 }
 
+// CreateRouteTargetTx is the transaction-scoped primitive used by the
+// bootstrap graph command. The target chain remains ordered by position.
+func (s *Store) CreateRouteTargetTx(ctx context.Context, tx Tx, t *RouteTarget) error {
+	return createRouteTarget(ctx, tx, t)
+}
+
 // generateTargetID 生成 32 位十六进制主键，与网关各处 ID 同构。
 func generateTargetID() string {
 	b := make([]byte, 16)

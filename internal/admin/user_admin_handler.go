@@ -274,7 +274,7 @@ func (h *UserHandler) CreateUser(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	username := strings.TrimSpace(req.Username)
+	username := store.CanonicalUsername(req.Username)
 	if !validUsername(username) {
 		writeError(w, http.StatusBadRequest,
 			"用户名需为 3-32 位的字母、数字、下划线、连字符或点")

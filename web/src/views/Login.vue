@@ -28,15 +28,16 @@
  */
 import { computed, ref } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
-import { ApiFail, bootstrapSetup, login, session } from '../api'
+import { ApiFail, bootstrapSetup, loadSession, login, session } from '../api'
 import { toast } from '../ui'
 import { checkPasswordStrength } from '../password'
 
 const route = useRoute()
 const router = useRouter()
 
-const mode = computed<'offline' | 'setup' | 'login'>(() => {
+const mode = computed<'offline' | 'degraded' | 'setup' | 'login'>(() => {
   if (!session.backendReady) return 'offline'
+  if (session.bootstrapCheckFailed) return 'degraded'
   if (session.needsSetup) return 'setup'
   return 'login'
 })
@@ -137,6 +138,12 @@ async function submitSetup() {
     submitting.value = false
   }
 }
+
+async function retryStartup() {
+  error.value = ''
+  session.checked = false
+  await loadSession()
+}
 </script>
 
 <template>
@@ -153,6 +160,12 @@ async function submitSetup() {
         <p class="login-hd">无法连接到网关</p>
         <p>本机服务没有响应，或当前页面指向的地址不对。</p>
         <p>请确认网关进程正在运行、监听地址正确，然后刷新本页面。</p>
+      </div>
+
+      <div v-else-if="mode === 'degraded'" class="login-hint">
+        <p class="login-hd">无法读取启动状态</p>
+        <p>网关已响应，但首次设置状态读取失败，暂时无法确定应显示登录还是设密。</p>
+        <button class="btn btn-primary login-btn" type="button" @click="retryStartup">重试</button>
       </div>
 
       <!-- 形态 2：首次部署设密码。没有用户名输入框 —— 账号由 /bootstrap

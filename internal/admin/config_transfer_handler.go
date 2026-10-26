@@ -392,7 +392,10 @@ func (h *ConfigTransferHandler) apply(ctx context.Context, in *configExport, dry
 		resp.ProvidersCreated = len(newProviders)
 		placeholder := make(map[string]string, len(newProviders))
 		for _, n := range newProviders {
-			placeholder[n.origSlug] = "dry-run-placeholder"
+			// Every pending provider needs a distinct identity. A shared
+			// placeholder makes the provider-scoped model dedup set collapse
+			// same-named models that the real import will create twice.
+			placeholder[n.origSlug] = "dry-run:" + n.provider.Slug
 		}
 		out := h.attach(ctx, in, bySlug, placeholder, true, resp, nil)
 		resp.ModelsCreated, resp.CredentialsAdded = out.models, out.creds

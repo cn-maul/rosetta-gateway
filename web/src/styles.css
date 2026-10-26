@@ -1520,11 +1520,11 @@ textarea {
 }
 
 /* 诊断结果行（上游模型探测 / 凭据余额）。
-   .test-ok / .test-err / .bal-ok / .bal-na / .bal-line / .bal-cell 这组类名
+   .test-ok / .test-err / .bal-ok / .bal-na / .bal-unknown / .bal-line / .bal-cell 这组类名
    在组件里被使用，但此前**没有任何样式表定义过它们** —— 于是「模型探测失败」
    与「探测成功」、以及「该上游不支持余额查询」与「余额为 0」在页面上完全同形。
-   这类诊断信息的价值全部来自可区分性，所以补齐四个状态类：
-   ok（成功）/ na（不适用，不算失败）/ err（失败）。 */
+   这类诊断信息的价值全部来自可区分性，所以补齐五个状态类：
+   ok（成功）/ unknown（事实不完整，不能当成功数）/ na（不适用，不算失败）/ err（失败）。 */
 .test-ok,
 .bal-ok {
   color: var(--success-soft-foreground);
@@ -1534,6 +1534,9 @@ textarea {
 }
 .bal-na {
   color: var(--text-3);
+}
+.bal-unknown {
+  color: var(--warning-soft-foreground);
 }
 .bal-cell {
   display: flex;

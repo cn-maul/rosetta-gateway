@@ -285,7 +285,7 @@ func validateResponsesTool(t ResponsesTool, path string) error {
 		return nil
 	default:
 		return fmt.Errorf("%s: unsupported tool type %q "+
-			"(only \"function\" and \"namespace\" can be proxied to upstreams)",
+			"(supported types: function, custom, local_shell, namespace)",
 			path, t.Type)
 	}
 }

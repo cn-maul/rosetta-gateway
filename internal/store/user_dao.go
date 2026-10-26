@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"strings"
 	"time"
 )
 
@@ -159,12 +160,29 @@ func (s *Store) GetUser(ctx context.Context, id string) (*User, error) {
 // 用户名即登录标识，故此处大小写不敏感（避免 Admin / admin 两个账号）。
 func (s *Store) GetUserByUsername(ctx context.Context, username string) (*User, error) {
 	row := s.read.QueryRowContext(ctx,
-		`SELECT `+userColumns+` FROM users WHERE username = ? COLLATE NOCASE`, username)
+		`SELECT `+userColumns+` FROM users WHERE username = ? COLLATE NOCASE`,
+		CanonicalUsername(username))
 	u, err := scanUser(row)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil
 	}
 	return u, err
+}
+
+// CanonicalUsername returns the one persisted spelling of a login identity.
+//
+// users.username uses SQLite NOCASE, which folds ASCII A-Z but not arbitrary
+// Unicode. Lowercasing the whole string would disagree with that rule.
+// Trimming is additive: the unique index cannot normalize surrounding spaces,
+// and they must not create a second account or throttle bucket.
+func CanonicalUsername(raw string) string {
+	name := []byte(strings.TrimSpace(raw))
+	for i, c := range name {
+		if c >= 'A' && c <= 'Z' {
+			name[i] = c + ('a' - 'A')
+		}
+	}
+	return string(name)
 }
 
 // CountUsers 返回用户总数，供 bootstrap 判定「库是否为空」。
@@ -202,6 +220,7 @@ func (s *Store) FindUninitializedAdmin(ctx context.Context) (*User, error) {
 // 状态：「不限额」与「余额为零」，不可合并。
 func (s *Store) CreateUser(ctx context.Context, u *User) error {
 	now := time.Now().UnixMilli()
+	u.Username = CanonicalUsername(u.Username)
 	if u.CreatedAt == 0 {
 		u.CreatedAt = now
 	}

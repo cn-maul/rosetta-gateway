@@ -183,6 +183,10 @@ func (h *GroupHandler) Update(w http.ResponseWriter, r *http.Request, id string)
 	}
 	if req.Name != nil {
 		name := strings.TrimSpace(*req.Name)
+		if name == "" {
+			writeError(w, http.StatusBadRequest, "组名必填")
+			return
+		}
 		if len(name) > 64 {
 			writeError(w, http.StatusBadRequest, "组名不能超过 64 个字符")
 			return

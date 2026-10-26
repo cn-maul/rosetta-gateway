@@ -731,6 +731,72 @@ func TestLogin_AccountDimensionThrottle_ClearedBySuccess(t *testing.T) {
 	}
 }
 
+// R0-AC-05：SQLite 的用户名查询和唯一约束是 NOCASE，账号限速也必须
+// 使用同一套 ASCII 大小写语义。每次更换拼写和来源 IP 都不能扩充额度。
+func TestR0AC05_LoginAccountThrottleUsesCanonicalCaseAcrossIPs(t *testing.T) {
+	st := newScopeStore(t)
+	seedTwoUsers(t, st)
+	h := NewUserHandler(st, newTestManager(t))
+
+	variants := []string{"alice", "Alice", "ALICE", "aLiCe", "alice", "Alice"}
+	for i, username := range variants {
+		code, msg := loginThrottled(t, h, username, 1,
+			fmt.Sprintf("10.1.0.%d:1234", i+1))
+		if i < loginAccountFailLimit {
+			if code != http.StatusUnauthorized {
+				t.Fatalf("attempt %d (%q) status = %d, want 401 (%s)",
+					i+1, username, code, msg)
+			}
+			continue
+		}
+		if code != http.StatusTooManyRequests {
+			t.Fatalf("attempt %d (%q) status = %d, want 429: case variants "+
+				"must share one account failure budget", i+1, username, code)
+		}
+	}
+}
+
+// R0-AC-06：成功登录必须清零该账号的规范身份键，即使登录拼写与之前
+// 失败时不同；否则旧拼写的失败计数仍会把合法用户挡在冷却里。
+func TestR0AC06_SuccessfulLoginClearsCanonicalAccountBudget(t *testing.T) {
+	st := newScopeStore(t)
+	ctx := context.Background()
+	const user, pass = "dave", "correct-horse-battery"
+	hash, err := userauth.HashPassword(pass)
+	if err != nil {
+		t.Fatalf("hash: %v", err)
+	}
+	if err := st.CreateUser(ctx, &store.User{
+		ID: "u10", Username: user, PasswordHash: hash,
+		Role: store.RoleUser, Status: store.UserStatusActive, AuthVersion: 1,
+	}); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	h := NewUserHandler(st, newTestManager(t))
+
+	_, _ = loginThrottled(t, h, user, loginAccountFailLimit-1, "10.2.0.1:1234")
+
+	// 用大小写不同的拼写成功登录。数据库按 NOCASE 解析到同一账号，
+	// 账号限速的规范化键也必须指向同一个预算。
+	rec := httptest.NewRecorder()
+	req := jsonRequest(http.MethodPost, "/admin/api/login",
+		strings.NewReader(`{"username":"DAVE","password":"`+pass+`"}`))
+	req.RemoteAddr = "10.2.0.2:1234"
+	h.Login(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("canonical-case login status = %d, want 200: %s",
+			rec.Code, rec.Body.String())
+	}
+
+	// 旧拼写再用满一整轮预算都应是普通 401；若成功没有清零规范键，
+	// 第一轮残留的 4 次会使第二次失败立即进入冷却并返回 429。
+	code, msg := loginThrottled(t, h, user, loginAccountFailLimit, "10.2.0.3:1234")
+	if code != http.StatusUnauthorized {
+		t.Fatalf("post-success failures status = %d, want 401: success must "+
+			"clear the canonical account budget (%s)", code, msg)
+	}
+}
+
 func newTestManager(t *testing.T) *userauth.Manager {
 	t.Helper()
 	t.Setenv(userauth.SecretEnvName, "test-secret-that-is-at-least-32-characters-long")

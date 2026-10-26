@@ -5,7 +5,6 @@ import (
 	"log/slog"
 	"net/http"
 	"strconv"
-	"strings"
 	"sync"
 	"time"
 
@@ -189,7 +188,7 @@ func (h *UserHandler) Login(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	username := strings.TrimSpace(req.Username)
+	username := store.CanonicalUsername(req.Username)
 	if username == "" || req.Password == "" {
 		writeError(w, http.StatusBadRequest, "用户名与密码必填")
 		return
@@ -214,9 +213,8 @@ func (h *UserHandler) Login(w http.ResponseWriter, r *http.Request) {
 	if th != nil {
 		defer th.Release(ip)
 	}
-	// 用户名已 trim，与下面查库用的是同一个值 —— 两处必须一致，
-	// 否则「限速键」与「实际登录的账号」会分叉（带空格的用户名
-	// 限速算在 A 头上、登录却落到 B）。
+	// 用户名已按 SQLite NOCASE 的 ASCII 语义规范化，与查库用同一个值。
+	// 否则 alice / Alice / ALICE 会解析到同一账号，却各自获得一份失败预算。
 	if accThr != nil && !accThr.Allow(username) {
 		writeTooMany(w, accThr.RetryAfter(username))
 		return

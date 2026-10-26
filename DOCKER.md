@@ -148,29 +148,25 @@ Chrome / Edge / Brave / Opera 一律硬拦；Firefox 也拦，只是报错文案
 -v rosetta-gateway-data:/data
 ```
 
-或者按需精细挂载 —— 把配置和数据库分别落到宿主机目录：
+或者把整个状态目录落到宿主机目录：
 
 ```bash
--v /srv/rosetta/config.json:/data/config.json \
--v /srv/rosetta/data:/data/data
+-v /srv/rosetta:/data
 ```
 
-> **注意**：bind mount 单个**文件**时，宿主机上的该文件必须**先存在**，
-> 否则 Docker 会把它当成目录创建，程序会读到「is a directory」而启动失败。
-> 第一次可以这样初始化：
-> ```bash
-> mkdir -p /srv/rosetta/data
-> docker run --rm ghcr.io/cn-maul/rosetta-gateway:1.6.8 \
->   cat /app/config.default.json > /srv/rosetta/config.json
-> ```
-> （`mkdir` 了 `data`，因为 `db_path` 指向 `/data/data/gateway.db`，父目录必须存在；
-> 若你的 `config.json` 是旧模板生成的、`db_path` 仍为 `./db/gateway.db`，则挂 `/data/db`。）
+> **不要把 `master.key` 或 `session_secret` 单独 bind mount 到一个尚不存在的
+> 宿主机文件。** Docker 会先把缺失的文件创建成目录，而网关会拒绝以目录或
+> 空文件作为密钥。整体挂载 `/data` 时，两个密钥由网关首次启动自动生成并原子
+> 落盘，后续重建容器继续复用。
+>
+> 如果必须精细挂载，只能分别挂**已存在且有效**的文件，或者先让容器在
+> 一个完整挂载的 `/data` 里完成首次启动、生成密钥后再拆分。不要用 `touch`
+> 创建空占位：空密钥会被明确拒绝。
 
 主密钥 `master.key` 与会话密钥 `session_secret` 也都在 `/data` 下，
-**跟着 `/data` 一起持久化。** 若只单独挂了 `config.json` 和 `db/` 而没挂 `/data`，
-这两者会落在容器可写层、随容器重建丢失 —— `master.key` 丢了上游凭据将无法解密；
-`session_secret` 丢了所有登录会话立即失效（用户被登出，重新登录即可，数据无损）。
-要精细挂载就把它们也一起挂上。
+**必须跟着 `/data` 一起持久化。** 只挂 `config.json` 和数据库而漏掉它们时，
+密钥会落在容器可写层并在重建时丢失：`master.key` 丢了上游凭据无法解密；
+`session_secret` 丢了所有登录会话立即失效（用户重新登录即可，数据无损）。
 
 > **`config.json` 一旦生成就不会跟镜像更新。** 升级镜像后它仍然是老内容
 > （包括 `listen` 端口）。换过默认端口的话，要么手工改这一行，要么删掉它让入口脚本重新播种。
@@ -183,23 +179,24 @@ services:
     image: ghcr.io/cn-maul/rosetta-gateway:1.6.8
     container_name: rosetta-gateway
     restart: unless-stopped
-    # 优雅关停的总预算是 24s（剪枝 5s + 费用重算 2s + 探测 2s +
-    # HTTP 10s + 用量落库 5s），而 docker compose 的默认宽限期只有 **10s**。
+    # 正常关停的名义预算是 26s（剪枝 5s + 费用重算 2s + 对账 2s +
+    # 探测 join 2s + HTTP 10s + 用量落库 5s）；仅在前置 join 超时后，
+    # 才会再追加用量 abort join 2s 与运行时重试 join 2s，故上界为 30s。
+    # docker compose 的默认宽限期只有 **10s**，这里显式留到 31s。
     # 不调大的话 `docker compose down` 会在用量队列还在落库时 SIGKILL，
     # 表现为「最后几次调用的用量查不到」（这些请求因此免单且配额被放宽）。
-    stop_grace_period: 30s
+    stop_grace_period: 31s
     ports:
       # 绑回环：网关自身不做 TLS，对外访问请走宿主机上的 TLS 反代
       # （反代回连 127.0.0.1:8666）。详见「快速开始」的说明。
       - "127.0.0.1:8666:8666"
     volumes:
-      - ./rosetta/config.json:/data/config.json   # 配置文件
-      - ./rosetta/data:/data/data                 # 数据库目录（旧模板路径为 /data/db）
-      - ./rosetta/master.key:/data/master.key     # 凭据加密主密钥
-      - ./rosetta/session_secret:/data/session_secret  # 会话签名密钥
+      # 整个状态目录一起挂：首次启动自动生成 config.json 与两把密钥，
+      # 不会遇到「单文件 mount 先被 Docker 建成目录」的问题。
+      - ./rosetta:/data
 ```
 
-（若不需要精细控制，把上面四条换成一个 `- ./rosetta:/data` 即可。）
+`./rosetta` 只需先 `mkdir -p`；里面不需要预先放任何密钥文件。
 
 > `ports:` 才是发布端口；写成 `expose:` 只在容器网络内可见，**宿主机访问不到**。
 > `"8666"`（只写一个数）会随机分配宿主端口，别这么写。
@@ -278,16 +275,17 @@ docker logs rosetta-gateway 2>&1 | jq -r '"\(.time) \(.level) \(.msg)"'
 
 东八区用户在 UTC 容器里的典型表现：0:00–8:00 的调用全被算进前一天。
 
-设置方式（三种，任选，优先级从高到低）：
+设置方式（三种，任选）。**优先级：非空的 `config.json.timezone` 最高，
+未配置时才使用容器/进程的 `TZ` 环境变量。**
 
 ```bash
-# 1. 容器级（推荐）—— 同时影响日志时间戳
-docker run -e TZ=Asia/Shanghai ...
-
-# 2. config.json 里配 —— 只影响按天统计的日界，不依赖容器环境
+# 1. config.json 里配 —— 非空时是最终口径，同时覆盖日志与按天统计
 { "timezone": "Asia/Shanghai" }
 
-# 3. 裸机部署 —— 设进程环境即可，无需改配置
+# 2. 容器级 TZ —— config.json.timezone 为空时生效
+docker run -e TZ=Asia/Shanghai ...
+
+# 3. 裸机部署 —— config.json.timezone 为空时设进程环境即可
 TZ=Asia/Shanghai ./gateway
 ```
 
@@ -305,7 +303,7 @@ docker run -e TZ=Asia/Tokyo ...
 
 **改时区不会损坏数据**：按天的 `day` 是查询时由 `usage_records.ts` 现算的
 （`strftime`），`ts` 是绝对时刻、与时区无关。改完重启，历史的按天数字会按新
-日界重新分桶。唯一例外是**已经归档**的行（明细保留 30 天后转入日聚合表），
+日界重新分桶。唯一例外是**已经归档**的行（按 `usage_retention_days` 到期后转入日聚合表），
 它们的 `day` 是归档那一刻固化的值 —— 那部分历史不会跟着变。
 
 ## 数据与升级

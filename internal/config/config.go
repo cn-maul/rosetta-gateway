@@ -122,8 +122,10 @@ type Config struct {
 	//
 	// 缺省 20000 行 ≈ 每行 100 字节也才 2MB，而覆盖掉的问题要连续写上
 	// 几个月才出现；设成 0 则**关闭剪枝**（保留全部），供合规审计要求
-	// 全量留存的部署点显式声明。
+	// 全量留存的部署点显式声明。字段损坏或读取失败时也视为显式关闭，
+	// 不能把无法确认的保留策略改成默认剪枝。
 	AuditLogKeepRows int `json:"audit_log_keep_rows"`
+	auditKeepRowsSet bool
 
 	// Probes 是上游模型定时探测的配置（2026-10-14）。
 	//
@@ -161,6 +163,9 @@ type ProbeConfig struct {
 	// 发一次真实推理并向上游付费，而配置文件里明明写着关闭。
 	// 布尔值天然无法区分「显式 false」与「缺省」，只能靠 key 是否出现来判断。
 	configured bool
+	// enabledSet 记录 enabled 这个键本身是否出现。只出现 interval_sec 等
+	// 子字段时，enabled 仍须按缺省 true 处理，而不是布尔零值 false。
+	enabledSet bool
 }
 
 // UnmarshalJSON 记录 key 是否出现过。
@@ -179,6 +184,7 @@ func (p *ProbeConfig) UnmarshalJSON(b []byte) error {
 	}
 	*p = ProbeConfig(v)
 	p.configured = len(keys) > 0
+	_, p.enabledSet = keys["enabled"]
 	return nil
 }
 
@@ -235,6 +241,22 @@ type BootstrapCredential struct {
 	Label     string `json:"label"`
 	APIKeyEnv string `json:"api_key_env"`
 	APIKey    string `json:"api_key"`
+}
+
+// ResolveAPIKey resolves the one credential precedence shared by database
+// bootstrap and the config-only runtime pool.
+//
+// A non-empty api_key is final. api_key_env is consulted only when api_key is
+// empty, so an explicitly configured key cannot be replaced by an unset
+// environment variable.
+func (c BootstrapCredential) ResolveAPIKey(getenv func(string) string) string {
+	if c.APIKey != "" {
+		return c.APIKey
+	}
+	if c.APIKeyEnv == "" || getenv == nil {
+		return ""
+	}
+	return getenv(c.APIKeyEnv)
 }
 
 type BootstrapRoute struct {
@@ -309,6 +331,23 @@ func Parse(data []byte) (*Config, error) {
 	return &c, nil
 }
 
+// UnmarshalJSON 在默认解码之外记录 audit_log_keep_rows 是否出现。
+// 0 同时可能是「字段缺失」和「显式永久留存」，不能只靠零值区分。
+func (c *Config) UnmarshalJSON(b []byte) error {
+	type plain Config
+	var v plain
+	if err := json.Unmarshal(b, &v); err != nil {
+		return err
+	}
+	var keys map[string]json.RawMessage
+	if err := json.Unmarshal(b, &keys); err != nil {
+		return err
+	}
+	*c = Config(v)
+	_, c.auditKeepRowsSet = keys["audit_log_keep_rows"]
+	return nil
+}
+
 func (c *Config) setDefaults() {
 	if c.Listen == "" {
 		// 默认只监听回环。网关对外提供 /v1 是常态，但**首次启动时第一个管理员的密码还没设**，
@@ -375,9 +414,9 @@ func (c *Config) setDefaults() {
 	if c.UsageRetentionDays == 0 {
 		c.UsageRetentionDays = 30
 	}
-	// 审计日志保留行数：0 是「没配过」的缺省形态，填成 20000。
-	// 显式关闭剪枝的部署写 -1，不会被这里改回（见 validate）。
-	if c.AuditLogKeepRows == 0 {
+	// 审计日志保留行数：只有字段完全缺失才使用缺省 20000。显式 0 与 -1
+	// 都表示关闭剪枝（保留全部），必须在默认化阶段保留下来。
+	if !c.auditKeepRowsSet {
 		c.AuditLogKeepRows = 20000
 	}
 
@@ -390,7 +429,7 @@ func (c *Config) setDefaults() {
 	// 曾用 `c.Probes == (ProbeConfig{})` 判断，而 `{"probes":{"enabled":false}}`
 	// 反序列化后正好等于零值结构体，于是用户明确写的 false 被静默改回 true
 	// —— 之后每 10 分钟对每个模型发一次真实推理并向上游付费。
-	if !c.Probes.configured {
+	if !c.Probes.enabledSet {
 		c.Probes.Enabled = true
 	}
 	if c.Probes.IntervalSec == 0 {
@@ -500,10 +539,10 @@ func (c *Config) validate() error {
 	if c.UsageRetentionDays < 1 || c.UsageRetentionDays > 3650 {
 		return fmt.Errorf("usage_retention_days: must be 1..3650, got %d", c.UsageRetentionDays)
 	}
-	// -1 是「关闭剪枝、永久留存」的显式声明；其余非正取值都是笔误
-	// （0 走不到这里，setDefaults 已填成 20000）。
+	// 0 与 -1 都是「关闭剪枝、永久留存」的显式声明，保留 0 以兼容既有
+	// 文档与部署；其余负值才是笔误。
 	if c.AuditLogKeepRows < -1 || c.AuditLogKeepRows > 10000000 {
-		return fmt.Errorf("audit_log_keep_rows: must be -1 (keep all) or 1..10000000, got %d", c.AuditLogKeepRows)
+		return fmt.Errorf("audit_log_keep_rows: must be 0 or -1 (keep all) or 1..10000000, got %d", c.AuditLogKeepRows)
 	}
 
 	// 探测配置校验。这些值会喂给 time.NewTicker / context.WithTimeout /

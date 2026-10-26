@@ -333,7 +333,7 @@ CREATE TABLE usage_records (
   error_code        TEXT,
   latency_ms        INTEGER NOT NULL,
   ttfb_ms           INTEGER NOT NULL DEFAULT 0,
-  request_id        TEXT                   -- 与访问日志同 ID，30 天内按库追查单次调用
+  request_id        TEXT                   -- 与访问日志同 ID；明细保留期内按库追查单次调用
 );
 
 CREATE INDEX idx_usage_ts        ON usage_records(ts);
@@ -342,7 +342,8 @@ CREATE INDEX idx_usage_model_ts  ON usage_records(public_model, ts);
 CREATE INDEX idx_usage_prov_ts   ON usage_records(provider_id, ts);
 ```
 
-**保留与归档（已实现，MULTIUSER.md §4.8）**：`usage_records` 明细保留 30 天，
+**保留与归档（已实现，MULTIUSER.md §4.8）**：`usage_records` 明细默认保留 30 天
+（`usage_retention_days`，可配置 1–3650 天），
 超期由每日剪枝聚合进 `usage_daily_rollups`（按维度按天的表 A）后删除；
 `usage_totals`（恒定单行的表 B）由触发器在落库时实时累加，**与剪枝完全解耦**，
 保证「明细可删、终身累计不变」。聚合与删除在同一事务内对**同一批行**执行
@@ -1459,7 +1460,8 @@ AES-256-GCM 密文。无主密钥、密文损坏、主密钥不匹配或历史�
 （管理面只看最近几十条），更早的行没有任何下游消费者 —— 与 `usage_records`
 （超期数据会折叠进 `usage_daily_rollups`）和 `model_probes`（超期数据喂连通率
 趋势图）不同，审计日志没有聚合去向。此前只插不删，表随写操作次数无界增长。
-取值 1~10000000，缺省 20000；写 `-1` 显式关闭剪枝（合规审计要求全量留存时用）。
+取值 1~10000000，缺省 20000；写 `0` 或 `-1` 都显式关闭剪枝
+（合规审计要求全量留存时用）。
 
 **`require_strong_master_key`（2026-10-18 新增）**：
 缺省 `false` = 低熵主密钥（< 32 字符，`crypto.WeakMaterial`）只告警，这是既有
@@ -1477,7 +1479,8 @@ Windows 上才跟 `time.Local`，**只设一个会跨平台失效**（第一版�
 **`probes`（2026-10-14 新增，连通率探测）**：定时对上游模型发最小真实推理
 （`max_tokens=1`、不走 usage_recorder，**不扣网关用户的钱**，但上游侧照常计费
 几 token），结果落 `model_probes`，「可用模型」页每张卡片画的就是这条曲线。
-**默认开**（`enabled` 缺省 true，且 `interval_sec` 为 0 时也按「没配过」处理）——
+**默认开**（只有显式 `enabled:false` 才关闭；对象存在但缺省 `enabled`
+时仍按 true 处理）——
 用户明确要这个功能。其余默认值：间隔 600s、超时 30s、并发 4、连续 3 次失败判 down、
 窗口 10 次、成功率阈值 0.8、探测记录保留 30 天。
 两个必须说清的边界：探测**绝不写 pool 的冷却/熔断**（隔离红线，见
@@ -1897,6 +1900,6 @@ rosetta-gateway/
 | 删库 = 失明 | 身份、配额、路由、key 全部绑在同一个 SQLite 文件上（§12.1） | 不可重建的身份状态只有 `master.key` 与 `session_secret` 两把密钥，独立于库存放；删库后重新走首次初始化 |
 | `audit.actor` 恒为 "admin" | `WriteAuditor` 回调未透传会话身份，普通用户对自己资源的写操作也落 "admin" 记录 | **刻意不修**（2026-10 决策）：审计无 UI 入口，唯一消费方式是运维直接调 API 取证，单管理员场景下不影响取证。修法需改 `WriteAuditor` 签名并波及全部调用点 |
 | 配额预占 est 是预估值 | 预占含 `max_tokens` 全额，请求收尾按真实 usage 退预占；上游不回 usage 时退预占、漏账以 `usage_state="missing"` 显形（§11.1/§11.2） | 在途瞬间不精确，终态正确；漏账可从界面察觉 |
-| 归档明细的可见性边界 | 明细只保留 30 天，更老区间的分组统计从日归档表取，按「宁可少算」口径（§4） | 极老日期的部分维度不可查；30 天内可按 `request_id` 查明细 |
-| `-race` 本机不可用 | Windows 开发机无 gcc | 并发修复靠人工审查 + 反向验证测试，CI 环境兜底 |
+| 归档明细的可见性边界 | 明细按 `usage_retention_days` 保留（缺省 30 天），更老区间的分组统计从日归档表取，按「宁可少算」口径（§4） | 极老日期的部分维度不可查；明细保留期内可按 `request_id` 查明细 |
+| `-race` 的 Windows 本机前置条件 | 需显式设置 `CC` 指向可用的 MinGW gcc；路径含空格时需按 [CONTRIBUTING.md](CONTRIBUTING.md) 的引号形式设置。这是机器本地前置条件，不是仓库保证 | 按 CONTRIBUTING.md 的 `CC` 说明执行本机 `go test -race`；CI 在 ubuntu 上使用默认 gcc 独立兜底 |
 

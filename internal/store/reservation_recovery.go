@@ -41,8 +41,16 @@ package store
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"time"
 )
+
+// ErrNoOwnedQuotaReservations means the request had a quota reservation in
+// memory but no durable lease row was written. RateCommit uses this signal to
+// perform a checked fallback release instead of clearing its counters as if
+// the database had been updated.
+var ErrNoOwnedQuotaReservations = errors.New("no owned quota reservations")
 
 // recoverStaleReservations 把所有 key / 用户的在途预占清零。
 //
@@ -78,6 +86,11 @@ func (s *Store) recoverStaleReservations(ctx context.Context) (int64, error) {
 		`UPDATE users SET reserved_tokens = 0 WHERE reserved_tokens > 0`); err != nil {
 		return 0, fmt.Errorf("clear user reservations: %w", err)
 	}
+	if _, err := tx.ExecContext(ctx,
+		`UPDATE quota_reservation_leases SET released = 1, lease_until = 0
+		  WHERE released = 0`); err != nil {
+		return 0, fmt.Errorf("close prior-run reservation leases: %w", err)
+	}
 	if err := tx.Commit(); err != nil {
 		return 0, fmt.Errorf("commit reservation recovery: %w", err)
 	}
@@ -88,4 +101,176 @@ func (s *Store) recoverStaleReservations(ctx context.Context) (int64, error) {
 			"reason", "进程重启后没有在途请求，预占必须清零否则终身额度被永久冻结")
 	}
 	return keys + users, nil
+}
+
+// ReleaseOwnedQuotaReservations releases every outstanding reservation owned
+// by requestID in one transaction. A transport or store error leaves the lease
+// rows intact so a later retry (or the startup/periodic sweep) can finish the
+// complete set. Successful rows are marked released, not immediately deleted,
+// so callers can observe exactly-once release evidence.
+func (s *Store) ReleaseOwnedQuotaReservations(ctx context.Context, requestID string) error {
+	if requestID == "" {
+		return ErrNoOwnedQuotaReservations
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }() //nolint:errcheck // no-op after commit
+
+	type lease struct {
+		scope, target string
+		reserved      int64
+	}
+	rows, err := tx.QueryContext(ctx,
+		`SELECT scope, target_id, reserved
+		   FROM quota_reservation_leases
+		  WHERE request_id = ? AND released = 0
+		  ORDER BY scope, target_id`, requestID)
+	if err != nil {
+		return err
+	}
+	var leases []lease
+	for rows.Next() {
+		var l lease
+		if err := rows.Scan(&l.scope, &l.target, &l.reserved); err != nil {
+			rows.Close()
+			return err
+		}
+		leases = append(leases, l)
+	}
+	if err := rows.Close(); err != nil {
+		return err
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	if len(leases) == 0 {
+		return ErrNoOwnedQuotaReservations
+	}
+	for _, l := range leases {
+		var sqlText string
+		switch l.scope {
+		case "key":
+			sqlText = `UPDATE access_keys
+			              SET reserved_tokens = MAX(0, reserved_tokens - ?)
+			            WHERE id = ?`
+		case "user":
+			sqlText = `UPDATE users
+			              SET reserved_tokens = MAX(0, reserved_tokens - ?)
+			            WHERE id = ?`
+		default:
+			return fmt.Errorf("unknown quota reservation scope %q", l.scope)
+		}
+		if _, err := tx.ExecContext(ctx, sqlText, l.reserved, l.target); err != nil {
+			if _, uerr := tx.ExecContext(ctx,
+				`UPDATE quota_reservation_leases SET last_error = ? WHERE request_id = ? AND scope = ? AND target_id = ?`,
+				err.Error(), requestID, l.scope, l.target); uerr != nil {
+				s.logger.Warn("record quota release failure also failed",
+					"request_id", requestID, "scope", l.scope, "target_id", l.target, "error", uerr)
+			}
+			return err
+		}
+		if _, err := tx.ExecContext(ctx,
+			`UPDATE quota_reservation_leases
+			    SET released = 1, lease_until = 0, last_error = NULL
+			  WHERE request_id = ? AND scope = ? AND target_id = ?`,
+			requestID, l.scope, l.target); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
+}
+
+// SweepExpiredQuotaReservations releases only leases whose owning process had
+// time to finish. It runs at startup and periodically, so a transient release
+// failure does not strand quota until restart.
+func (s *Store) SweepExpiredQuotaReservations(ctx context.Context, now time.Time) (int, error) {
+	if _, err := s.db.ExecContext(ctx,
+		`DELETE FROM quota_reservation_leases WHERE released = 1 AND lease_until = 0`); err != nil {
+		return 0, err
+	}
+	rows, err := s.read.QueryContext(ctx,
+		`SELECT DISTINCT request_id
+		   FROM quota_reservation_leases
+		  WHERE released = 0 AND lease_until < ?`, now.UnixMilli())
+	if err != nil {
+		return 0, err
+	}
+	var ids []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			rows.Close()
+			return 0, err
+		}
+		ids = append(ids, id)
+	}
+	if err := rows.Close(); err != nil {
+		return 0, err
+	}
+	if err := rows.Err(); err != nil {
+		return 0, err
+	}
+	released := 0
+	for _, id := range ids {
+		if err := s.ReleaseOwnedQuotaReservations(ctx, id); err != nil {
+			s.logger.Warn("expired quota reservation sweep failed",
+				"request_id", id, "error", err)
+			continue
+		}
+		released++
+	}
+	return released, nil
+}
+
+const (
+	quotaReservationLeaseTTL = 30 * time.Minute
+)
+
+// RecordQuotaReservationLease persists ownership for a reservation made by the
+// current request. Once both key and user reservations have been recorded, the
+// finalizer can release the complete set in one transaction and a maintenance
+// sweep can later recover only leases whose owner is provably gone.
+func (s *Store) RecordQuotaReservationLease(ctx context.Context, requestID, keyID, userID string,
+	keyReserved, userReserved int64) error {
+	if requestID == "" {
+		return nil
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }() //nolint:errcheck // no-op after commit
+	now := time.Now().UnixMilli()
+	until := time.Now().Add(quotaReservationLeaseTTL).UnixMilli()
+	if keyReserved > 0 && keyID != "" {
+		if _, err := tx.ExecContext(ctx,
+			`INSERT INTO quota_reservation_leases
+			   (request_id, scope, target_id, reserved, released, lease_until, created_at)
+			 VALUES (?, 'key', ?, ?, 0, ?, ?)
+			 ON CONFLICT(request_id, scope, target_id) DO UPDATE SET
+			   reserved = excluded.reserved,
+			   released = 0,
+			   lease_until = excluded.lease_until,
+			   last_error = NULL`,
+			requestID, keyID, keyReserved, until, now); err != nil {
+			return err
+		}
+	}
+	if userReserved > 0 && userID != "" {
+		if _, err := tx.ExecContext(ctx,
+			`INSERT INTO quota_reservation_leases
+			   (request_id, scope, target_id, reserved, released, lease_until, created_at)
+			 VALUES (?, 'user', ?, ?, 0, ?, ?)
+			 ON CONFLICT(request_id, scope, target_id) DO UPDATE SET
+			   reserved = excluded.reserved,
+			   released = 0,
+			   lease_until = excluded.lease_until,
+			   last_error = NULL`,
+			requestID, userID, userReserved, until, now); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
 }

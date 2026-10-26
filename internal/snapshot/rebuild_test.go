@@ -235,6 +235,31 @@ func TestRebuildFromDB_UnknownSlugFailureIsIgnored(t *testing.T) {
 	}
 }
 
+func TestR2_M02_02CorruptModelDefaultsDoNotPublishZeroCapacity(t *testing.T) {
+	ctx := context.Background()
+	db := openTestStore(t)
+	if _, err := db.DB().ExecContext(ctx,
+		`INSERT INTO app_settings (key, value, updated_at) VALUES ('model_defaults', '{broken', 0)`); err != nil {
+		t.Fatalf("seed corrupt model defaults: %v", err)
+	}
+
+	snap, err := RebuildFromDB(ctx, db, nil)
+	if err == nil {
+		t.Fatal("corrupt model_defaults must fail the rebuild so the degraded state is visible")
+	}
+	if snap != nil {
+		t.Fatalf("failed rebuild published a snapshot: %+v", snap)
+	}
+
+	fallback, ferr := db.GetModelDefaults(ctx)
+	if ferr == nil {
+		t.Fatal("fixture did not leave corrupt model_defaults")
+	}
+	if fallback.ContextWindow <= 0 || fallback.MaxOutputTokens <= 0 {
+		t.Fatalf("store fallback lost its positive capacity defaults: %+v", fallback)
+	}
+}
+
 func openTestStore(t *testing.T) *store.Store {
 	t.Helper()
 	st, err := store.Open(filepath.Join(t.TempDir(), "gw.db"),

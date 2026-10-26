@@ -179,6 +179,49 @@ func TestSchema_AddsUsageHistoryColumnsToExistingCurrentDatabase(t *testing.T) {
 	}
 }
 
+func TestSchema_AddsR3AccountingObjectsToExistingCurrentDatabase(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "r3-upgrade.db")
+	st := openSchemaTestStore(t, path)
+	if err := st.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+
+	raw, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatalf("open raw database: %v", err)
+	}
+	if _, err := raw.Exec(`DROP TABLE quota_reservation_leases`); err != nil {
+		_ = raw.Close()
+		t.Fatalf("drop lease table: %v", err)
+	}
+	if _, err := raw.Exec(`DROP INDEX idx_usage_charge_retry`); err != nil {
+		_ = raw.Close()
+		t.Fatalf("drop retry index: %v", err)
+	}
+	if err := raw.Close(); err != nil {
+		t.Fatalf("close raw database: %v", err)
+	}
+
+	reopened := openSchemaTestStore(t, path)
+	var n int
+	if err := reopened.DB().QueryRow(
+		`SELECT COUNT(*) FROM sqlite_master
+		  WHERE type = 'table' AND name = 'quota_reservation_leases'`).Scan(&n); err != nil {
+		t.Fatalf("inspect lease table: %v", err)
+	}
+	if n != 1 {
+		t.Fatal("existing current-version database did not gain quota_reservation_leases")
+	}
+	if err := reopened.DB().QueryRow(
+		`SELECT COUNT(*) FROM sqlite_master
+		  WHERE type = 'index' AND name = 'idx_usage_charge_retry'`).Scan(&n); err != nil {
+		t.Fatalf("inspect retry index: %v", err)
+	}
+	if n != 1 {
+		t.Fatal("existing current-version database did not gain idx_usage_charge_retry")
+	}
+}
+
 func TestSchema_NormalizesLegacyProtocolValues(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "legacy-protocols.db")
 	st := openSchemaTestStore(t, path)
@@ -298,11 +341,16 @@ func TestSchema_CanonicalObjectsAndColumns(t *testing.T) {
 		"usage_records": {
 			"user_id", "error_detail", "route_trace", "cost_total",
 			"provider_name", "upstream_protocol",
+			"charge_attempts", "charge_next_at", "charge_last_error",
 		},
 		"users": {"balance_cents", "balance_remainder", "group_id", "reserved_tokens"},
 		"usage_daily_rollups": {
 			"upstream_model", "ok_ttfb_sum_ms", "ok_ttfb_count",
 			"ok_sample_count", "cost_pending_count",
+		},
+		"quota_reservation_leases": {
+			"request_id", "scope", "target_id", "reserved", "released",
+			"lease_until", "last_error", "created_at",
 		},
 	}
 	for table, columns := range requiredColumns {

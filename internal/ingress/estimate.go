@@ -1,6 +1,7 @@
 package ingress
 
 import (
+	"strings"
 	"unicode/utf8"
 
 	"github.com/cn-maul/rosetta"
@@ -12,8 +13,23 @@ import (
 // Precision is not required here: the reservation is corrected with actual
 // usage after the request finishes. The estimate only needs the right order of
 // magnitude so TPM is neither bypassed nor needlessly rejected.
-func EstimateRequestTokens(req *rosetta.ChatRequest) int64 {
-	return EstimateInputTokensOnly(req) + int64(req.MaxOutputTokens)
+func EstimateRequestTokens(req *rosetta.ChatRequest, outputCeiling int64) int64 {
+	return EstimateInputTokensOnly(req) + outputCeiling
+}
+
+// RequestOutputCeiling returns the client's cap when present, otherwise the
+// largest configured output ceiling in the resolved candidate chain.
+func RequestOutputCeiling(req *rosetta.ChatRequest, maxByCandidate []int) int64 {
+	if req != nil && req.MaxOutputTokens > 0 {
+		return int64(req.MaxOutputTokens)
+	}
+	var ceiling int
+	for _, n := range maxByCandidate {
+		if n > ceiling {
+			ceiling = n
+		}
+	}
+	return int64(ceiling)
 }
 
 // EstimateInputTokensOnly estimates only the input side, excluding
@@ -36,10 +52,31 @@ func EstimateInputTokensOnly(req *rosetta.ChatRequest) int64 {
 	add(req.System)
 	for _, m := range req.Messages {
 		for _, blk := range m.Blocks {
-			add(blk.Text)
-			add(blk.Thinking)
-			add(blk.Content)
-			add(blk.Arguments)
+			switch blk.Type {
+			case rosetta.BlockImage:
+				ascii += 1500 * 4
+			case rosetta.BlockAudio:
+				// The normalized model carries the bytes, not duration.
+				// Charge both the flat clip estimate and the inline payload.
+				ascii += 500 * 4
+				add(blk.AudioData)
+			case rosetta.BlockFile:
+				// Remote file references keep the policy floor. Inline
+				// payloads additionally scale with their serialized bytes.
+				ascii += 3000 * 4
+				if !isRemoteReference(blk.FileData) {
+					add(blk.FileData)
+				}
+			default:
+				add(blk.Text)
+				add(blk.Thinking)
+				add(blk.Signature)
+				add(blk.Sealed)
+				add(blk.Content)
+				add(blk.Arguments)
+			}
+			add(blk.FileName)
+			add(blk.MimeType)
 		}
 	}
 	for _, t := range req.Tools {
@@ -48,6 +85,10 @@ func EstimateInputTokensOnly(req *rosetta.ChatRequest) int64 {
 		add(string(t.Parameters))
 	}
 	return int64((ascii+3)/4 + other)
+}
+
+func isRemoteReference(value string) bool {
+	return strings.HasPrefix(value, "http://") || strings.HasPrefix(value, "https://")
 }
 
 // PartialOutTokens converts already-received output characters into a

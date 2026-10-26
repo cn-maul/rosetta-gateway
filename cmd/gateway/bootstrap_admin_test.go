@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -145,5 +146,151 @@ func TestEnsureBootstrapAdmin_SkipsWhenUsersExist(t *testing.T) {
 	}
 	if users[0].Username != "alice" {
 		t.Errorf("existing user replaced by bootstrap: got %q", users[0].Username)
+	}
+}
+
+type bootstrapStoreStub struct {
+	*store.Store
+	countUsersErr  error
+	findPendingErr error
+	createUserErr  error
+	onCreateUser   func(context.Context, *store.User) error
+}
+
+func (s *bootstrapStoreStub) CountUsers(ctx context.Context) (int, error) {
+	if s.countUsersErr != nil {
+		return 0, s.countUsersErr
+	}
+	return s.Store.CountUsers(ctx)
+}
+
+func (s *bootstrapStoreStub) CreateUser(ctx context.Context, u *store.User) error {
+	if s.onCreateUser != nil {
+		return s.onCreateUser(ctx, u)
+	}
+	if s.createUserErr != nil {
+		return s.createUserErr
+	}
+	return s.Store.CreateUser(ctx, u)
+}
+
+func (s *bootstrapStoreStub) FindUninitializedAdmin(ctx context.Context) (*store.User, error) {
+	if s.findPendingErr != nil {
+		return nil, s.findPendingErr
+	}
+	return s.Store.FindUninitializedAdmin(ctx)
+}
+
+// R0-AC-07：bootstrap 状态不可读取时必须返回 failed，而不是假装成功。
+func TestR0AC07_BootstrapReadFailureIsFatal(t *testing.T) {
+	ctx := context.Background()
+	logger := slog.New(slog.NewTextHandler(os.Stderr, nil))
+	readErr := errors.New("database unavailable")
+
+	t.Run("count users", func(t *testing.T) {
+		db := &bootstrapStoreStub{
+			Store:         newTestStore(t),
+			countUsersErr: readErr,
+		}
+		outcome, err := ensureBootstrapAdmin(ctx, db, logger)
+		if !errors.Is(err, readErr) {
+			t.Fatalf("outcome = %q, err = %v, want failed with %v",
+				outcome, err, readErr)
+		}
+		if outcome != adminBootstrapFailed {
+			t.Fatalf("outcome = %q, want %q", outcome, adminBootstrapFailed)
+		}
+	})
+
+	t.Run("uninitialized admin lookup", func(t *testing.T) {
+		db := &bootstrapStoreStub{
+			Store:          newTestStore(t),
+			findPendingErr: readErr,
+		}
+		outcome, err := ensureBootstrapAdmin(ctx, db, logger)
+		if !errors.Is(err, readErr) {
+			t.Fatalf("outcome = %q, err = %v, want failed with %v",
+				outcome, err, readErr)
+		}
+		if outcome != adminBootstrapFailed {
+			t.Fatalf("outcome = %q, want %q", outcome, adminBootstrapFailed)
+		}
+	})
+}
+
+// R0-AC-08：空库上的非唯一写入失败必须阻断 bootstrap。
+func TestR0AC08_NonUniqueCreateFailureIsFatal(t *testing.T) {
+	ctx := context.Background()
+	createErr := errors.New("disk I/O error")
+	db := &bootstrapStoreStub{
+		Store:         newTestStore(t),
+		createUserErr: createErr,
+	}
+	outcome, err := ensureBootstrapAdmin(ctx, db,
+		slog.New(slog.NewTextHandler(os.Stderr, nil)))
+	if !errors.Is(err, createErr) {
+		t.Fatalf("outcome = %q, err = %v, want failed with %v",
+			outcome, err, createErr)
+	}
+	if outcome != adminBootstrapFailed {
+		t.Fatalf("outcome = %q, want %q", outcome, adminBootstrapFailed)
+	}
+}
+
+// R0-AC-09：唯一冲突只有在重读证明并发实例确实建出管理员后才可接受。
+func TestR0AC09_ConcurrentCreateIsVerifiedByReRead(t *testing.T) {
+	ctx := context.Background()
+	base := newTestStore(t)
+	conflict := errors.New("UNIQUE constraint failed: users.username")
+	db := &bootstrapStoreStub{
+		Store: base,
+		onCreateUser: func(ctx context.Context, u *store.User) error {
+			// 模拟另一个实例在本实例写入前已成功创建了带密码的管理员。
+			winner := *u
+			winner.ID = "concurrent-admin"
+			winner.PasswordHash = "pbkdf2-sha256$210000$c2FsdA==$aGFzaA=="
+			if err := base.CreateUser(ctx, &winner); err != nil {
+				t.Fatalf("seed concurrent winner: %v", err)
+			}
+			return conflict
+		},
+	}
+
+	outcome, err := ensureBootstrapAdmin(ctx, db,
+		slog.New(slog.NewTextHandler(os.Stderr, nil)))
+	if err != nil {
+		t.Fatalf("verified concurrent create failed bootstrap: %v", err)
+	}
+	if outcome != adminBootstrapReady {
+		t.Fatalf("outcome = %q, want %q", outcome, adminBootstrapReady)
+	}
+}
+
+// 唯一冲突后重读仍为空，说明错误码本身不能证明 bootstrap 成功。
+func TestR0AC09_UnverifiedUniqueConflictIsFatal(t *testing.T) {
+	ctx := context.Background()
+	conflict := errors.New("UNIQUE constraint failed: users.username")
+	db := &bootstrapStoreStub{
+		Store:         newTestStore(t),
+		createUserErr: conflict,
+	}
+	outcome, err := ensureBootstrapAdmin(ctx, db,
+		slog.New(slog.NewTextHandler(os.Stderr, nil)))
+	if err == nil {
+		t.Fatal("unverified unique conflict was accepted as success")
+	}
+	if outcome != adminBootstrapFailed {
+		t.Fatalf("outcome = %q, want %q", outcome, adminBootstrapFailed)
+	}
+}
+
+func TestInitializeAdminBootstrap_PropagatesFailure(t *testing.T) {
+	db := newTestStore(t)
+	if err := db.Close(); err != nil {
+		t.Fatalf("close store: %v", err)
+	}
+	_, err := initializeAdminBootstrap(context.Background(), db, slog.Default())
+	if err == nil {
+		t.Fatal("initializeAdminBootstrap returned nil after a read failure")
 	}
 }

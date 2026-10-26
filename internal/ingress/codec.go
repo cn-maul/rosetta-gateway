@@ -24,7 +24,7 @@ type Codec interface {
 	// WriteError renders a gateway error code in the protocol's envelope.
 	WriteError(w http.ResponseWriter, status int, code, message string)
 	// WriteNonStream encodes a successful non-stream response.
-	WriteNonStream(w http.ResponseWriter, resp *rosetta.ChatResponse, model string, req *Request)
+	WriteNonStream(w http.ResponseWriter, resp *rosetta.ChatResponse, model string, req *Request) outwire.NonStreamWriteResult
 	// NewSink constructs the stream encoder after SSE headers are written.
 	NewSink(w http.ResponseWriter, model string, req *Request) outwire.StreamSink
 }
@@ -69,8 +69,8 @@ func (openaiChatCodec) WriteError(w http.ResponseWriter, status int, code, messa
 	outwire.WriteOpenAIError(w, status, code, message)
 }
 
-func (openaiChatCodec) WriteNonStream(w http.ResponseWriter, resp *rosetta.ChatResponse, model string, _ *Request) {
-	outwire.WriteNonStreamResponse(w, resp, model)
+func (openaiChatCodec) WriteNonStream(w http.ResponseWriter, resp *rosetta.ChatResponse, model string, _ *Request) outwire.NonStreamWriteResult {
+	return outwire.WriteNonStreamResponse(w, resp, model)
 }
 
 func (openaiChatCodec) NewSink(w http.ResponseWriter, model string, _ *Request) outwire.StreamSink {
@@ -103,8 +103,8 @@ func (anthropicMessagesCodec) WriteError(w http.ResponseWriter, status int, code
 	outwire.WriteAnthropicError(w, status, code, message)
 }
 
-func (anthropicMessagesCodec) WriteNonStream(w http.ResponseWriter, resp *rosetta.ChatResponse, model string, _ *Request) {
-	outwire.WriteAnthropicResponse(w, resp, model)
+func (anthropicMessagesCodec) WriteNonStream(w http.ResponseWriter, resp *rosetta.ChatResponse, model string, _ *Request) outwire.NonStreamWriteResult {
+	return outwire.WriteAnthropicResponse(w, resp, model)
 }
 
 func (anthropicMessagesCodec) NewSink(w http.ResponseWriter, model string, _ *Request) outwire.StreamSink {
@@ -138,8 +138,8 @@ func (openaiResponsesCodec) WriteError(w http.ResponseWriter, status int, code, 
 	outwire.WriteOpenAIError(w, status, code, message)
 }
 
-func (openaiResponsesCodec) WriteNonStream(w http.ResponseWriter, resp *rosetta.ChatResponse, model string, req *Request) {
-	outwire.WriteResponsesResponseWithTools(w, resp, model, req.DowngradedTools)
+func (openaiResponsesCodec) WriteNonStream(w http.ResponseWriter, resp *rosetta.ChatResponse, model string, req *Request) outwire.NonStreamWriteResult {
+	return outwire.WriteResponsesResponseWithTools(w, resp, model, req.DowngradedTools)
 }
 
 func (openaiResponsesCodec) NewSink(w http.ResponseWriter, model string, req *Request) outwire.StreamSink {

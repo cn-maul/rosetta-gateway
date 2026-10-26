@@ -45,6 +45,7 @@ const TABS = [
 ] as const
 
 const tab = ref<TabKey>('providers')
+const tabsRef = ref<{ panelIdFor: (k: string) => string; tabIdFor: (k: string) => string } | null>(null)
 
 /** 每个页签的副标题。 */
 const SUB = computed(() => {
@@ -87,9 +88,16 @@ const currentPanel = computed(() => {
       </div>
     </div>
 
-    <Tabs v-model="tab" :tabs="TABS" aria-label="上游与模型 / 路由 / 模型归组" />
+    <Tabs ref="tabsRef" v-model="tab" :tabs="TABS" aria-label="上游与模型 / 路由 / 模型归组" />
 
-    <component :is="currentPanel" :key="panelKey" />
+    <div
+      :id="tabsRef?.panelIdFor(tab)"
+      role="tabpanel"
+      :aria-labelledby="tabsRef?.tabIdFor(tab)"
+      tabindex="0"
+    >
+      <component :is="currentPanel" :key="panelKey" />
+    </div>
   </div>
 </template>
 

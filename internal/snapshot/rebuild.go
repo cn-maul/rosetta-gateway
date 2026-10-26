@@ -2,6 +2,7 @@ package snapshot
 
 import (
 	"context"
+	"fmt"
 
 	"github.com/cn-maul/rosetta-gateway/internal/routing"
 	"github.com/cn-maul/rosetta-gateway/internal/store"
@@ -219,9 +220,15 @@ func RebuildFromDB(ctx context.Context, st *store.Store, failures []ProviderFail
 	} else {
 		return nil, err
 	}
-	if md, err := st.GetModelDefaults(ctx); err == nil {
-		snap.Runtime.DefaultContextWindow = md.ContextWindow
-		snap.Runtime.DefaultMaxOutputTokens = md.MaxOutputTokens
+	md, mdErr := st.GetModelDefaults(ctx)
+	snap.Runtime.DefaultContextWindow = md.ContextWindow
+	snap.Runtime.DefaultMaxOutputTokens = md.MaxOutputTokens
+	if mdErr != nil {
+		// GetModelDefaults returns the built-in 128K/64K fallback together with
+		// the decode error. Keep that documented fallback instead of publishing
+		// zero capacity, but fail convergence so the degraded state is visible
+		// and a later repair retries the rebuild.
+		return nil, fmt.Errorf("read model defaults: %w", mdErr)
 	}
 
 	return snap, nil

@@ -25,6 +25,8 @@ import (
 	"github.com/cn-maul/rosetta-gateway/internal/store"
 )
 
+const anthropicVersion = "2023-06-01"
+
 type CredentialEntry struct {
 	ID            string
 	Label         string
@@ -224,10 +226,7 @@ func (p *Pool) BuildFromConfig(cfg *config.Config) error {
 		}
 
 		for _, bc := range bp.Credentials {
-			apiKey := bc.APIKey
-			if bc.APIKeyEnv != "" {
-				apiKey = resolveEnv(bc.APIKeyEnv)
-			}
+			apiKey := bc.ResolveAPIKey(resolveEnv)
 			if apiKey == "" {
 				p.logger.Warn("skipping credential with empty key", "provider", bp.Slug, "label", bc.Label)
 				continue
@@ -1341,13 +1340,17 @@ func DiscoverUpstreamModels(ctx context.Context, st *store.Store, providerID str
 	if err != nil {
 		return nil, err
 	}
+	protocol, err := resolveDiscoveryProtocol(ctx, p, apiKey, client)
+	if err != nil {
+		return nil, err
+	}
 	var lastErr error
 	// triedErrs 按候选顺序留痕：全部候选都失败时，管理员需要知道网关
 	// **试过哪些路径**，否则「endpoint 填错了」与「上游不提供模型列表」
 	// 在界面上是同一句话，只能靠猜。
 	triedErrs := make([]string, 0, len(urls))
 	for _, u := range urls {
-		cands, err := fetchModels(ctx, client, u, p.Protocol, apiKey)
+		cands, err := fetchModels(ctx, client, u, protocol, apiKey)
 		if err != nil {
 			lastErr = err
 			triedErrs = append(triedErrs, fmt.Sprintf("%s → %v", u, err))
@@ -1366,6 +1369,32 @@ func DiscoverUpstreamModels(ctx context.Context, st *store.Store, providerID str
 	}
 	parts = append(parts, lastErr)
 	return nil, fmt.Errorf("模型列表探测失败（已尝试 %d 个路径）：%w", len(urls), errors.Join(parts...))
+}
+
+// resolveDiscoveryProtocol resolves the same configured protocol value that
+// buildClient resolves for the data plane. Discovery must not independently
+// guess an auth scheme from the raw store value.
+func resolveDiscoveryProtocol(ctx context.Context, p *store.Provider, apiKey string, client *http.Client) (string, error) {
+	configured := wireproto.Normalize(p.Protocol)
+	if configured != "" && configured != wireproto.Auto {
+		if !wireproto.Valid(configured) {
+			return "", fmt.Errorf("provider %s: 未知的 protocol %q（合法值：%s）",
+				p.Slug, configured, wireproto.AllowedValues)
+		}
+		return configured, nil
+	}
+
+	opts := []rosetta.Option{
+		rosetta.WithEndpoint(p.Endpoint),
+		rosetta.WithAPIKey(apiKey),
+		rosetta.WithHTTPClient(client),
+		rosetta.WithTimeout(15 * time.Second),
+	}
+	rosettaClient, err := rosetta.DetectClient(ctx, opts...)
+	if err != nil {
+		return "", err
+	}
+	return wireproto.Normalize(gatewayProtocolName(rosettaClient.Protocol())), nil
 }
 
 // modelListURLs 给出模型列表端点的候选路径，按「最可能命中」排序。
@@ -1428,7 +1457,7 @@ func fetchModels(ctx context.Context, client *http.Client, url, protocol, apiKey
 	}
 	if protocol == "anthropic" {
 		req.Header.Set("x-api-key", apiKey)
-		req.Header.Set("anthropic-version", "2023-06-01")
+		req.Header.Set("anthropic-version", anthropicVersion)
 	} else {
 		req.Header.Set("Authorization", "Bearer "+apiKey)
 	}

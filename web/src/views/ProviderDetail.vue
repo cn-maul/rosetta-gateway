@@ -31,6 +31,7 @@ import CredentialPanel from '../components/CredentialPanel.vue'
 import UpstreamModelPanel from '../components/UpstreamModelPanel.vue'
 import { useNetworks, NETWORK_DIRECT_ID } from '../composables/useNetworks'
 import { PROTOCOL_OPTIONS, protocolLabel } from '../protocols'
+import { RequestGeneration } from '../asyncState'
 
 const route = useRoute()
 const router = useRouter()
@@ -416,26 +417,39 @@ async function toggleCred(c: Credential) {
 // 可能显示十分钟前的值比不显示更糟。所以只在点时取，并把取数时刻一起显示。
 const balance = ref<ProviderBalance | undefined>(undefined)
 const balanceBusy = ref(false)
+const balanceRequests = new RequestGeneration()
 
 async function queryBalance() {
   if (balanceBusy.value) return
+  const id = providerId.value
+  const generation = balanceRequests.begin()
   balanceBusy.value = true
   try {
-    balance.value = await api.providerBalance(providerId.value)
+    const result = await api.providerBalance(id)
+    if (!balanceRequests.isCurrent(generation) || id !== providerId.value || result.provider_id !== id) return
+    balance.value = result
   } catch (e) {
     if (is401(e)) return
+    if (!balanceRequests.isCurrent(generation) || id !== providerId.value) return
     // 管理接口失败与「上游余额查不到」是两件事：后者在响应里是
     // status=error。分开显示，否则管理员会去换 key 而真正该做的是重试。
     balance.value = {
-      provider_id: providerId.value,
+      provider_id: id,
       provider: '',
       status: 'error',
       message: '管理接口调用失败：' + (e as Error).message,
       results: [],
     }
   } finally {
-    balanceBusy.value = false
+    if (balanceRequests.isCurrent(generation)) balanceBusy.value = false
   }
+}
+
+function credentialBalanceFor(credentialId: string) {
+  const current = provider.value
+  const result = balance.value
+  if (!current || !result || result.provider_id !== current.id) return undefined
+  return result.results.find((x) => x.credential_id === credentialId)
 }
 
 const balanceSpecConfigured = computed(() => !!provider.value?.balance_spec_json?.trim())
@@ -684,6 +698,9 @@ onMounted(() => {
 // 换 URL 里的 id 时重载：详情页可以被直接链接到任意上游，也可以在本页
 // 与列表之间来回跳。不监听的话，上一次的数据会留在页面上配到另一个 id。
 watch(providerId, () => {
+  balanceRequests.invalidate()
+  balance.value = undefined
+  balanceBusy.value = false
   mForm.open = false
   pForm.open = false
   cForm.open = false

@@ -421,10 +421,10 @@ func TestKeyHandler_AllowedModels(t *testing.T) {
 		t.Fatalf("unknown model: code = %d body = %s, want 400", rec2.Code, rec2.Body.String())
 	}
 
-	// PATCH 传空数组 = 清除限制。
+	// 管理者（不是普通 owner）可以用显式空数组清除限制。
 	rec3 := httptest.NewRecorder()
-	h.Update(rec3, asUser(jsonRequest(http.MethodPatch, "/admin/api/keys/"+created.ID,
-		strings.NewReader(`{"allowed_models":[]}`)), "u1"), created.ID)
+	h.Update(rec3, asAdmin(jsonRequest(http.MethodPatch, "/admin/api/keys/"+created.ID,
+		strings.NewReader(`{"allowed_models":[]}`))), created.ID)
 	if rec3.Code != http.StatusOK {
 		t.Fatalf("clear: code = %d body = %s", rec3.Code, rec3.Body.String())
 	}

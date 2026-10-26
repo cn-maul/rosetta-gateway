@@ -4,7 +4,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"log/slog"
 	"net/http"
 	"strings"
 	"sync"
@@ -132,7 +131,7 @@ func anthropicUsageFields(u rosetta.Usage, emitInput bool) map[string]any {
 // WriteAnthropicResponse 编码 Anthropic Messages 形状的非流式响应。
 // content 块按 rosetta 统一内容的原始顺序输出（thinking → text → tool_use），
 // 上游是 OpenAI 系时 thinking 以 reasoning_content 聚合而来，天然只有一块。
-func WriteAnthropicResponse(w http.ResponseWriter, resp *rosetta.ChatResponse, model string) {
+func WriteAnthropicResponse(w http.ResponseWriter, resp *rosetta.ChatResponse, model string) NonStreamWriteResult {
 	content := make([]map[string]any, 0, len(resp.Content))
 	for _, blk := range resp.Content {
 		switch blk.Type {
@@ -182,12 +181,7 @@ func WriteAnthropicResponse(w http.ResponseWriter, resp *rosetta.ChatResponse, m
 		id = fmt.Sprintf("msg_%d", time.Now().UnixNano())
 	}
 
-	w.Header().Set("Content-Type", "application/json")
-	// 编码错误**不能丢**：丢了就是「200 + 空响应体」且服务端无日志
-	// （2026-10-21 修 A3-P1-5 / 汇总 O5）。到这一步载荷已经全部
-	// 规范化过（每个字段都是可序列化的基本类型），所以真失败只可能是
-	// 底层 writer 出错 —— 那时客户端已经断了，日志留痕就够了。
-	if err := json.NewEncoder(w).Encode(map[string]any{
+	return encodeNonStreamPayload(w, map[string]any{
 		"id":            id,
 		"type":          "message",
 		"role":          "assistant",
@@ -196,10 +190,7 @@ func WriteAnthropicResponse(w http.ResponseWriter, resp *rosetta.ChatResponse, m
 		"stop_reason":   AnthropicStopReason(resp.StopReason),
 		"stop_sequence": nil,
 		"usage":         usage,
-	}); err != nil {
-		slog.Error("anthropic non-stream response encode failed",
-			"response_id", id, "model", model, "error", err)
-	}
+	})
 }
 
 // anthropicToolInput 把上游给的工具参数规范化成 Anthropic 的 input 对象。
@@ -503,6 +494,10 @@ func (s *AnthropicSSE) Finish(status string, stop rosetta.StopReason, usage rose
 		})
 		return
 	}
+	// A terminal-only empty reply still needs the protocol opening event.
+	// Clients reject message_delta/message_stop without message_start even
+	// though the HTTP response itself was committed as 200.
+	s.ensureStarted("")
 
 	// message_start 时 input 未知发了 0，这里补权威值。Anthropic 的增量
 	// usage 是累计口径，客户端以最终值计算成本。缓存 token 必须从 input_tokens

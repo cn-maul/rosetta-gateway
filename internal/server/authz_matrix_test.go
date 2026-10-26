@@ -382,6 +382,12 @@ func (h *authzHarness) chain(mux *http.ServeMux) http.Handler {
 	return server.AutoReload(guarded, reload, audit, slog.New(slog.NewTextHandler(io.Discard, nil)), nil)
 }
 
+func (h *authzHarness) chainWithAudit(mux *http.ServeMux, audit server.WriteAuditor) http.Handler {
+	reload := func(context.Context) error { return nil }
+	guarded := server.NewUserAuth(h.mgr, h.db).Guard(server.AdminGateGuard(mux, mux))
+	return server.AutoReload(guarded, reload, audit, slog.New(slog.NewTextHandler(io.Discard, nil)), nil)
+}
+
 // do 以指定身份发一次请求。
 func (h *authzHarness) do(handler http.Handler, identity, method, path, body string) probeResult {
 	h.t.Helper()
@@ -405,6 +411,68 @@ func (h *authzHarness) do(handler http.Handler, identity, method, path, body str
 	rec := httptest.NewRecorder()
 	handler.ServeHTTP(rec, req)
 	return classify(rec)
+}
+
+// TestAuthzAuditActor_UsesAuthenticatedIdentity covers the real middleware
+// ordering: AutoReload wraps UserAuth, which authenticates and injects the
+// user into a derived request context. The outer AutoReload request must still
+// see that identity when it records the audit entry.
+func TestAuthzAuditActor_UsesAuthenticatedIdentity(t *testing.T) {
+	h := newAuthzHarness(t)
+	mux := http.NewServeMux()
+	keyH := admin.NewKeyHandler(h.db)
+	groupH := admin.NewGroupHandler(h.db)
+	userH := admin.NewUserHandler(h.db, h.mgr)
+	mux.HandleFunc("POST /admin/api/keys", keyH.Create)
+	mux.HandleFunc("POST /admin/api/groups", groupH.Create)
+	mux.HandleFunc("POST /admin/api/users", userH.CreateUser)
+
+	var actors []string
+	audit := func(actor, method, path string, status int, remote, fields string) {
+		actors = append(actors, actor)
+		if err := h.db.CreateAuditEntry(context.Background(), &store.AuditEntry{
+			Ts: time.Now().UnixMilli(), Actor: actor, Remote: remote,
+			Method: method, Path: path, Status: status, Fields: fields,
+		}); err != nil {
+			t.Errorf("create audit entry: %v", err)
+		}
+	}
+	handler := h.chainWithAudit(mux, audit)
+
+	cases := []struct {
+		identity string
+		path     string
+		body     string
+		want     string
+	}{
+		{idUser, "/admin/api/keys", `{"name":"actor-probe-key"}`, idUser},
+		{idAdmin, "/admin/api/groups", `{"name":"actor-probe-group"}`, idAdmin},
+		{idAdmin, "/admin/api/users", `{"username":"actorprobe","password":"Probe-Passw0rd!"}`, idAdmin},
+	}
+	for _, tc := range cases {
+		res := h.do(handler, tc.identity, http.MethodPost, tc.path, tc.body)
+		if res.Status != http.StatusCreated {
+			t.Fatalf("%s %s status=%d body=%s", tc.identity, tc.path, res.Status, truncate(res.Body))
+		}
+	}
+
+	want := []string{idUser, idAdmin, idAdmin}
+	if strings.Join(actors, ",") != strings.Join(want, ",") {
+		t.Fatalf("audit actors = %q, want %q", actors, want)
+	}
+
+	entries, err := h.db.ListAuditEntries(context.Background(), 3)
+	if err != nil {
+		t.Fatalf("list audit entries: %v", err)
+	}
+	if len(entries) != len(want) {
+		t.Fatalf("audit rows = %d, want %d", len(entries), len(want))
+	}
+	for i, entry := range entries {
+		if got, wantActor := entry.Actor, want[len(want)-1-i]; got != wantActor {
+			t.Errorf("DB audit row %d actor = %q, want %q", i, got, wantActor)
+		}
+	}
 }
 
 // ---------------------------------------------------------------------------

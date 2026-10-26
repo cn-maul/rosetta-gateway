@@ -56,6 +56,266 @@ func seedPending(t *testing.T, st *Store, userID, requestID string, micros int64
 	}
 }
 
+// completionMarkerCount 读某个原始请求的规范化完成标记数量。
+func completionMarkerCount(t *testing.T, st *Store, requestID, userID string) int {
+	t.Helper()
+	var n int
+	if err := st.read.QueryRowContext(context.Background(),
+		`SELECT COUNT(*) FROM balance_charges WHERE request_id = ? AND user_id = ?`,
+		requestID, userID).Scan(&n); err != nil {
+		t.Fatalf("count completion markers: %v", err)
+	}
+	return n
+}
+
+// seedUsageForR0AC 造一条可供对账查询的用量记录。
+//
+// 这里直接写 SQL，刻意绕开计价：这些用例验的是「扣费完成标记」与
+// 「usage/cost 已落库」之间的一致性，不需要再测一次 priceUsage。
+func seedUsageForR0AC(t *testing.T, st *Store, recordID, userID, requestID string,
+	cost float64, state string) {
+	t.Helper()
+	if _, err := st.db.ExecContext(context.Background(),
+		`INSERT INTO usage_records (id, ts, access_key_id, user_id, public_model,
+		   provider_id, upstream_model, ingress_protocol, stream,
+		   input_tokens, output_tokens, total_tokens, usage_state, status, http_status,
+		   latency_ms, cost_total, request_id)
+		 VALUES (?, 1700000000000, 'k1', ?, 'priced', 'p1', 'priced', 'chat', 0,
+		         0, 0, 0, ?, 'ok', 200, 10, ?, ?)`,
+		recordID, userID, state, cost, requestID); err != nil {
+		t.Fatalf("seed usage %s: %v", recordID, err)
+	}
+}
+
+// R0-AC-01：充值结转待结算欠款时，必须创建原始请求的完成标记。
+//
+// 否则对账会在下一次维护周期把同一笔成功请求当成「从未扣费」，再扣一遍。
+func TestR0AC01_PendingSettlementCreatesCanonicalCompletionMarker(t *testing.T) {
+	ctx := context.Background()
+	st := testStore(t, t.TempDir()+"/gw.db")
+	mustUser(t, st, "u1", 0, false)
+
+	const reqID = "r0-ac01-req"
+	if err := st.ChargeBalance(ctx, "u1", 3.0, reqID); !errors.Is(err, ErrInsufficientBalance) {
+		t.Fatalf("initial charge: want ErrInsufficientBalance, got %v", err)
+	}
+	seedUsageForR0AC(t, st, "r0-ac01-rec", "u1", reqID, 3.0, UsageStateReported)
+
+	if _, err := st.AdjustBalanceWithLedger(ctx, "u1", 1000, "op", "admin", "R0-AC-01"); err != nil {
+		t.Fatalf("topup and settle: %v", err)
+	}
+	if got := completionMarkerCount(t, st, reqID, "u1"); got != 1 {
+		t.Fatalf("completion markers = %d, want 1", got)
+	}
+	if rows, micros := pendingRows(t, st, "u1"); rows != 0 || micros != 0 {
+		t.Fatalf("pending after settlement = (%d rows, %d micros), want empty", rows, micros)
+	}
+	assertBalance(t, st, "u1", 700, true) // 充值 1000 分，结算欠款 300 分。
+
+	found, err := st.FindUnchargedUsage(ctx, 100)
+	if err != nil {
+		t.Fatalf("FindUnchargedUsage: %v", err)
+	}
+	if len(found) != 0 {
+		t.Fatalf("reconciliation still sees %+v after settlement", found)
+	}
+}
+
+// R0-AC-02：重算补扣成功后，必须同时创建原始请求的完成标记。
+//
+// recompute:<record_id>:<cost> 只负责重算本身的幂等，不能让对账误以为
+// 原始请求从未收费。
+func TestR0AC02_RecomputeCreatesCanonicalCompletionMarker(t *testing.T) {
+	ctx := context.Background()
+	st := testStore(t, t.TempDir()+"/gw.db")
+	seedPricedModel(t, st, 0.2, 0.02, 0.8)
+	mustUser(t, st, "u1", 10000, false)
+
+	const recordID = "r0-ac02-rec"
+	const reqID = "r0-ac02-req"
+	seedUsageForR0AC(t, st, recordID, "u1", reqID, 0, usageStateCostPending)
+	if _, err := st.db.ExecContext(ctx,
+		`UPDATE usage_records SET input_tokens = 1000, output_tokens = 500, total_tokens = 1500
+		  WHERE id = ?`, recordID); err != nil {
+		t.Fatalf("set usage tokens: %v", err)
+	}
+	if _, err := st.db.ExecContext(ctx,
+		`UPDATE upstream_models SET price_input = 100 WHERE model_id = 'priced'`); err != nil {
+		t.Fatalf("update price: %v", err)
+	}
+
+	ok, err := st.RecomputeCost(ctx, recordID)
+	if err != nil {
+		t.Fatalf("RecomputeCost: %v", err)
+	}
+	if !ok {
+		t.Fatal("RecomputeCost did not report a repaired record")
+	}
+	if got := completionMarkerCount(t, st, reqID, "u1"); got != 1 {
+		t.Fatalf("canonical completion markers = %d, want 1", got)
+	}
+	var recomputeMarkers int
+	if err := st.read.QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM balance_charges
+		  WHERE user_id = 'u1' AND request_id LIKE 'recompute:%'`).Scan(&recomputeMarkers); err != nil {
+		t.Fatalf("count recompute markers: %v", err)
+	}
+	if recomputeMarkers != 1 {
+		t.Fatalf("recompute idempotency markers = %d, want 1", recomputeMarkers)
+	}
+	assertBalance(t, st, "u1", 9990, true)
+
+	found, err := st.FindUnchargedUsage(ctx, 100)
+	if err != nil {
+		t.Fatalf("FindUnchargedUsage: %v", err)
+	}
+	if len(found) != 0 {
+		t.Fatalf("reconciliation still sees %+v after recomputation", found)
+	}
+}
+
+// R0-AC-03：完成标记写失败时，关联的钱包扣款与账本变更必须一起回滚。
+func TestR0AC03_CompletionMarkerFailureRollsBackAssociatedDebit(t *testing.T) {
+	t.Run("pending settlement", func(t *testing.T) {
+		ctx := context.Background()
+		st := testStore(t, t.TempDir()+"/gw.db")
+		mustUser(t, st, "u1", 1000, false)
+
+		const reqID = "r0-ac03-pending"
+		seedPending(t, st, "u1", reqID, 300*MicrosPerCent)
+		if _, err := st.db.ExecContext(ctx,
+			`CREATE TRIGGER reject_r0_ac03_pending BEFORE INSERT ON balance_charges
+			 WHEN NEW.request_id = '`+reqID+`'
+			 BEGIN SELECT RAISE(ABORT, 'completion marker rejected'); END`); err != nil {
+			t.Fatalf("create trigger: %v", err)
+		}
+
+		if _, err := st.AdjustBalanceWithLedger(ctx, "u1", 100, "op", "admin", "R0-AC-03"); err == nil {
+			t.Fatal("topup succeeded although the completion marker write failed")
+		}
+		// 充值与原始完成标记在同一事务内：标记失败时，连本次充值也回滚。
+		assertBalance(t, st, "u1", 1000, true)
+		var topups int
+		if err := st.read.QueryRowContext(ctx,
+			`SELECT COUNT(*) FROM balance_topups WHERE user_id = 'u1'`).Scan(&topups); err != nil {
+			t.Fatalf("count topups: %v", err)
+		}
+		if topups != 0 {
+			t.Fatalf("topup ledger rows = %d, want 0 after transaction rollback", topups)
+		}
+		if rows, micros := pendingRows(t, st, "u1"); rows != 1 || micros != 300*MicrosPerCent {
+			t.Fatalf("pending after rollback = (%d rows, %d micros), want (1, %d)",
+				rows, micros, 300*MicrosPerCent)
+		}
+		if got := completionMarkerCount(t, st, reqID, "u1"); got != 0 {
+			t.Fatalf("completion markers after rollback = %d, want 0", got)
+		}
+	})
+
+	t.Run("cost recompute", func(t *testing.T) {
+		ctx := context.Background()
+		st := testStore(t, t.TempDir()+"/gw.db")
+		seedPricedModel(t, st, 0.2, 0.02, 0.8)
+		mustUser(t, st, "u1", 10000, false)
+
+		const recordID = "r0-ac03-rec"
+		const reqID = "r0-ac03-recompute"
+		seedUsageForR0AC(t, st, recordID, "u1", reqID, 0, usageStateCostPending)
+		if _, err := st.db.ExecContext(ctx,
+			`UPDATE usage_records SET input_tokens = 1000, output_tokens = 500, total_tokens = 1500
+			  WHERE id = ?`, recordID); err != nil {
+			t.Fatalf("set usage tokens: %v", err)
+		}
+		if _, err := st.db.ExecContext(ctx,
+			`UPDATE upstream_models SET price_input = 100 WHERE model_id = 'priced'`); err != nil {
+			t.Fatalf("update price: %v", err)
+		}
+		if _, err := st.db.ExecContext(ctx,
+			`CREATE TRIGGER reject_r0_ac03_recompute BEFORE INSERT ON balance_charges
+			 WHEN NEW.request_id = '`+reqID+`'
+			 BEGIN SELECT RAISE(ABORT, 'completion marker rejected'); END`); err != nil {
+			t.Fatalf("create trigger: %v", err)
+		}
+
+		if _, err := st.RecomputeCost(ctx, recordID); err == nil {
+			t.Fatal("recompute succeeded although the completion marker write failed")
+		}
+		state, cost := usageStateOf(t, st, recordID)
+		if state != usageStateCostPending || cost != 0 {
+			t.Fatalf("usage after rollback = (%q, %v), want (%q, 0)",
+				state, cost, usageStateCostPending)
+		}
+		assertBalance(t, st, "u1", 10000, true)
+		if got := readRemainder(t, st, "u1"); got != 0 {
+			t.Fatalf("balance remainder after rollback = %d, want 0", got)
+		}
+		if got := completionMarkerCount(t, st, reqID, "u1"); got != 0 {
+			t.Fatalf("completion markers after rollback = %d, want 0", got)
+		}
+	})
+}
+
+// R0-AC-04：待结算与对账并发处理同一笔请求时，只能产生一次扣款和一个标记。
+//
+// 先让第一次对账与充值结转并发，再让第二次对账与第一次对账并发：
+// 这里构造的是真正会重复扣款的窗口，而不是顺序执行后的幂等复查。
+func TestR0AC04_SettlementAndReconciliationRemainIdempotent(t *testing.T) {
+	for i := 0; i < 8; i++ {
+		t.Run("round-"+itoa(i), func(t *testing.T) {
+			ctx := context.Background()
+			st := testStore(t, t.TempDir()+"/gw.db")
+			mustUser(t, st, "u1", 1000, false)
+
+			reqID := "r0-ac04-req-" + itoa(i)
+			seedPending(t, st, "u1", reqID, 300*MicrosPerCent)
+			seedUsageForR0AC(t, st, "r0-ac04-rec-"+itoa(i), "u1", reqID, 3.0, UsageStateReported)
+
+			run := func(settle bool) error {
+				if !settle {
+					found, err := st.FindUnchargedUsage(ctx, 100)
+					if err != nil {
+						return err
+					}
+					for _, u := range found {
+						if err := st.ChargeUnchargedUsage(ctx, u); err != nil {
+							return err
+						}
+					}
+					return nil
+				}
+				_, err := st.AdjustBalanceWithLedger(ctx, "u1", 1, "op", "admin", "R0-AC-04")
+				return err
+			}
+			runConcurrently := func(a, b bool) {
+				t.Helper()
+				start := make(chan struct{})
+				errs := make(chan error, 2)
+				go func() { <-start; errs <- run(a) }()
+				go func() { <-start; errs <- run(b) }()
+				close(start)
+				for n := 0; n < 2; n++ {
+					if err := <-errs; err != nil {
+						t.Fatalf("concurrent operation: %v", err)
+					}
+				}
+			}
+
+			runConcurrently(true, false)
+			// 充值路径只借记本次充值额；pending 300 分超过了它，但当前
+			// 余额已有 1000 分，所以可以从余额中结清。若两条路径都收了
+			// 这 300 分，余额会再少 300。
+			runConcurrently(false, false)
+			assertBalance(t, st, "u1", 701, true) // 1000 + 1 - 300，只能扣一次。
+			if got := completionMarkerCount(t, st, reqID, "u1"); got != 1 {
+				t.Fatalf("completion markers = %d, want 1", got)
+			}
+			if rows, _ := pendingRows(t, st, "u1"); rows != 0 {
+				t.Fatalf("pending rows = %d, want 0", rows)
+			}
+		})
+	}
+}
+
 // P0-1：并发充值不得把同一笔欠款结转两次（多收用户的钱）。
 //
 // 旧实现的复现率是 59/60（98%）。修好后**一次**欠款只能被扣一次。

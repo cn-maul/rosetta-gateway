@@ -25,6 +25,7 @@
  */
 import { ref, computed, watch, onMounted, onBeforeUnmount, nextTick } from 'vue'
 import type { ProbeTimelineBucket } from '../types'
+import { heartbeatBucketTexts } from '../heartbeatText'
 
 const props = defineProps<{
   /** 探测桶（稀疏：无记录的桶不在其中），由调用方填满时间轴。 */
@@ -62,6 +63,7 @@ const canvas = ref<HTMLCanvasElement | null>(null)
 // 下面的 ResizeObserver 也就不可能自我触发。
 const boxWidth = ref(0)
 const hovered = ref(-1)
+const focused = ref(-1)
 
 interface Beat {
   /** null = 该桶无探测记录（不是 0%，必须与失败区分）。 */
@@ -308,6 +310,28 @@ function tipText(beat: Beat): string {
   return `${fmtTs(beat.bucket.ts)} · 成功率 ${pct}% (${beat.bucket.ok}/${beat.bucket.count}) · 平均 ${beat.bucket.latency}ms`
 }
 
+const bucketTexts = computed(() => heartbeatBucketTexts(visible.value.map((v) => v.beat), fmtTs))
+
+function onBucketKey(e: KeyboardEvent, index: number) {
+  const n = bucketTexts.value.length
+  if (n === 0) return
+  let next = index
+  if (e.key === 'ArrowRight' || e.key === 'ArrowDown') next = (index + 1) % n
+  else if (e.key === 'ArrowLeft' || e.key === 'ArrowUp') next = (index - 1 + n) % n
+  else if (e.key === 'Home') next = 0
+  else if (e.key === 'End') next = n - 1
+  else if (e.key === 'Escape') {
+    focused.value = -1
+    return
+  } else return
+  e.preventDefault()
+  focused.value = next
+  const nodes = e.currentTarget instanceof HTMLElement
+    ? e.currentTarget.parentElement?.querySelectorAll<HTMLElement>('[data-bucket-index]')
+    : undefined
+  nodes?.[next]?.focus()
+}
+
 function onMove(e: MouseEvent) {
   const c = canvas.value
   if (!c) return
@@ -419,6 +443,23 @@ watch(
         @mouseleave="onLeave"
       />
     </div>
+    <!-- 键盘与读屏的等价视图：每根条都是可聚焦列表项，左右/Home/End
+         在桶之间移动。它同时承担 hover tooltip 的文本替代，不依赖指针。 -->
+    <div class="hb-accessible" role="list" aria-label="连通率探测桶明细">
+      <div
+        v-for="(text, i) in bucketTexts"
+        :key="visible[i]?.beat.ts"
+        class="hb-bucket"
+        role="listitem"
+        data-bucket-index
+        :tabindex="i === focused ? 0 : -1"
+        :aria-label="text"
+        @focus="focused = i"
+        @keydown="onBucketKey($event, i)"
+      >
+        {{ text }}
+      </div>
+    </div>
     <!-- 左右两端的时间标注：只有一根根条时，「哪边是现在」是读不出来的。
      单位跟着 bucketMinutes 走：按天分桶时写「7 天前」而不是「168 小时前」
      —— 后者要心算一次才知道跨度，且与页面上的「近 7 天」选择器对不上。 -->
@@ -477,6 +518,23 @@ watch(
   position: absolute;
   inset-inline-start: 0;
   top: 0;
+}
+/* Visually hidden but focusable: the rendered bars remain the visual contract,
+   while every interval stays reachable by keyboard and screen readers. */
+.hb-accessible {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
+}
+.hb-bucket:focus {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
 }
 [data-theme='dark'] .hb-wrap {
   /* 暗色下「无记录」要能看出是色块而不是破洞。 */

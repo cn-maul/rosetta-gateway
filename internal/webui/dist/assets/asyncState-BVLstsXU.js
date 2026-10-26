@@ -1,0 +1,1 @@
+var e=class{current=0;begin(){return this.current+=1,this.current}invalidate(){return this.begin()}isCurrent(e){return e===this.current}};function t(e,t,n){return`${t}:${n}:${[...new Set(e)].sort().join(`\0`)}`}export{t as n,e as t};

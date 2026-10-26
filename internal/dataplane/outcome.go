@@ -69,9 +69,69 @@ func escapeRouteTraceComponent(value string, escapeSlash bool) string {
 	return b.String()
 }
 
-// StreamCommitOutcome 把已提交流式的终态映射成轨迹里的结果词。
-// 用 "ok" / "committed_fail" 与未提交路径保持同一套词汇，避免同一种
-// 「流断了」在不同路径里出现两种叫法（status 本身只用于计费判读）。
+// OutcomeKind is the single terminal classification for one upstream attempt.
+// The compatibility booleans on Outcome are projections of this value; request
+// orchestration must branch on the kind rather than infer meaning from a
+// combination of independent flags.
+type OutcomeKind uint8
+
+const (
+	// OutcomeUpstreamFailed is an uncommitted upstream/target failure. It may
+	// fail over when Eligible is true.
+	OutcomeUpstreamFailed OutcomeKind = iota
+	OutcomeClientAborted
+	OutcomeCommittedSuccess
+	OutcomeCommittedPartial
+	OutcomeGatewayOverflow
+	OutcomeGatewayTimeout
+	OutcomeDownstreamWriteFailed
+	OutcomeEncodeFailed
+)
+
+func (k OutcomeKind) String() string {
+	switch k {
+	case OutcomeUpstreamFailed:
+		return "upstream_failed"
+	case OutcomeClientAborted:
+		return "client_aborted"
+	case OutcomeCommittedSuccess:
+		return "committed_success"
+	case OutcomeCommittedPartial:
+		return "committed_partial"
+	case OutcomeGatewayOverflow:
+		return "gateway_overflow"
+	case OutcomeGatewayTimeout:
+		return "gateway_timeout"
+	case OutcomeDownstreamWriteFailed:
+		return "downstream_write_failed"
+	case OutcomeEncodeFailed:
+		return "encode_failed"
+	default:
+		return "unknown"
+	}
+}
+
+// LaneDecision is the projection consumed by failover, diagnostics, route
+// tracing, and accounting. Deriving all of them here keeps stream and
+// non-stream commits on the same rules.
+type LaneDecision struct {
+	Kind             OutcomeKind
+	Committed        bool
+	Success          bool
+	Eligible         bool
+	PenalizeUpstream bool
+	DownstreamClient bool
+	GatewayTimeout   bool
+	Billable         bool
+	UsageStatus      string
+	TraceOutcome     string
+	TraceReason      string
+	DiagnosticStatus string
+	DiagnosticError  string
+}
+
+// StreamCommitOutcome maps a persisted terminal status into the trace
+// vocabulary. It is retained for callers that only have the status value.
 func StreamCommitOutcome(status string) string {
 	if status == store.UsageStatusOK {
 		return store.UsageStatusOK
@@ -86,6 +146,9 @@ func StreamCommitOutcome(status string) string {
 // Committed=false 时 attempt 未碰过 ResponseWriter，由外层循环决定「换下一个目标」还是
 // 「把这次错误写回客户端」。Eligible 告诉外层这次失败值不值得转移。
 type Outcome struct {
+	// Kind is authoritative. Constructors and all request-lane producers set
+	// it; the boolean fields below remain as compatibility projections.
+	Kind      OutcomeKind
 	Committed bool
 	// Success 表示本次 attempt 真的成功抵达上游（流式仅 status=="ok" 为真）。
 	// Committed 只说明「字节已写出、不能回退」，断流/溢出同样是 Committed
@@ -109,8 +172,12 @@ type Outcome struct {
 	// count toward target circuit-breaking, and it must not trigger failover:
 	// the shared deadline is already gone, so trying another target can only
 	// consume the remaining budget of a request that is already over.
-	GatewayTimeout     bool
-	Eligible           bool
+	GatewayTimeout bool
+	Eligible       bool
+	// UsageStatus is the exact persisted usage status selected by the attempt.
+	// Keeping it on the outcome prevents the outer lane from re-deriving it from
+	// booleans and error text.
+	UsageStatus        string
 	CredentialCooldown time.Duration
 	StatusCode         int
 	Code               string
@@ -121,6 +188,205 @@ type Outcome struct {
 	// 保留底层 DNS/TCP/TLS/proxy/timeout 原因；流哨兵保留本地判定文案。
 	// 空串 = 该错误确实没有可提供的细节。
 	Detail string
+}
+
+// normalize fills the compatibility fields from Kind. Producers set Kind once;
+// consumers can still use the old fields without each caller inventing a
+// different truth table.
+func (o Outcome) normalize() Outcome {
+	kind := o.normalizedKind()
+	o.Kind = kind
+	d := LaneDecisionFor(kind, o.Committed, o.Eligible, o.Code)
+	o.Committed = d.Committed
+	o.Success = d.Success
+	if kind == OutcomeUpstreamFailed {
+		// Upstream failure eligibility comes from the error mapper; the
+		// projection only reports it.
+	} else {
+		o.Eligible = d.Eligible
+	}
+	o.ClientGone = d.DownstreamClient
+	o.NoUpstreamPenalty = kind == OutcomeGatewayOverflow
+	o.GatewayTimeout = d.GatewayTimeout || kind == OutcomeGatewayTimeout
+	if kind == OutcomeClientAborted && o.UsageStatus == store.UsageStatusError {
+		o.UsageStatus = ""
+	}
+	if o.UsageStatus == "" {
+		o.UsageStatus = d.UsageStatus
+	}
+	return o
+}
+
+func (o Outcome) normalizedKind() OutcomeKind {
+	if o.Kind != OutcomeUpstreamFailed {
+		// A committed client abort is a distinct terminal state from a request
+		// abandoned before any downstream bytes.
+		return o.Kind
+	}
+	// Legacy struct literals (notably diagnostic unit tests) only set fields.
+	switch {
+	case o.Committed && o.Success:
+		return OutcomeCommittedSuccess
+	case o.Committed && o.GatewayTimeout:
+		return OutcomeGatewayTimeout
+	case o.Committed && o.NoUpstreamPenalty:
+		return OutcomeGatewayOverflow
+	case o.Committed && o.ClientGone:
+		return OutcomeClientAborted
+	case o.Committed:
+		return OutcomeCommittedPartial
+	case o.ClientGone:
+		return OutcomeClientAborted
+	case o.GatewayTimeout:
+		return OutcomeGatewayTimeout
+	default:
+		return OutcomeUpstreamFailed
+	}
+}
+
+func usageStatusForOutcome(kind OutcomeKind, explicit, code string) string {
+	if explicit != "" {
+		return explicit
+	}
+	switch kind {
+	case OutcomeCommittedSuccess:
+		return store.UsageStatusOK
+	case OutcomeClientAborted, OutcomeDownstreamWriteFailed:
+		return store.UsageStatusCanceled
+	case OutcomeGatewayTimeout:
+		return store.UsageStatusTimeout
+	case OutcomeGatewayOverflow:
+		return store.UsageStatusOverflow
+	case OutcomeCommittedPartial:
+		switch code {
+		case "stream_truncated", "stream_idle_timeout":
+			return store.UsageStatusTruncated
+		case "stream_overflow":
+			return store.UsageStatusOverflow
+		case "gateway_timeout":
+			return store.UsageStatusTimeout
+		default:
+			return store.UsageStatusError
+		}
+	default:
+		return store.UsageStatusError
+	}
+}
+
+// LaneDecisionFor derives the common lane projection from a kind.
+func LaneDecisionFor(kind OutcomeKind, committed, eligible bool, code string) LaneDecision {
+	d := LaneDecision{Kind: kind, Committed: committed, Eligible: eligible}
+	switch kind {
+	case OutcomeCommittedSuccess:
+		d.Committed, d.Success, d.Billable = true, true, true
+		d.TraceOutcome = store.UsageStatusOK
+		d.DiagnosticStatus = "ok"
+	case OutcomeCommittedPartial:
+		d.Committed, d.PenalizeUpstream = true, true
+		d.TraceOutcome = "committed_fail"
+		d.TraceReason = code
+		d.DiagnosticStatus = "committed_fail"
+		d.DiagnosticError = code
+	case OutcomeGatewayOverflow:
+		d.Committed = true
+		d.TraceOutcome = "committed_fail"
+		d.TraceReason = code
+		d.DiagnosticStatus = "committed_fail"
+		d.DiagnosticError = code
+	case OutcomeGatewayTimeout:
+		d.Committed, d.GatewayTimeout = true, true
+		d.TraceOutcome = "committed_fail"
+		d.TraceReason = "gateway_timeout"
+		d.DiagnosticStatus = "timeout"
+		d.DiagnosticError = "gateway_timeout"
+	case OutcomeClientAborted:
+		d.DownstreamClient = true
+		d.TraceReason = "client_canceled"
+		d.TraceOutcome = "fail_terminal"
+		if d.Committed {
+			d.TraceOutcome = "committed_fail"
+		}
+		d.DiagnosticStatus = "canceled"
+	case OutcomeDownstreamWriteFailed:
+		d.Committed = true
+		d.DownstreamClient = true
+		d.TraceOutcome = "committed_fail"
+		d.TraceReason = "downstream_write_failed"
+		d.DiagnosticStatus = "canceled"
+		d.DiagnosticError = "downstream_write_failed"
+	case OutcomeEncodeFailed:
+		d.Committed = true
+		d.TraceOutcome = "fail_terminal"
+		d.TraceReason = code
+		d.DiagnosticStatus = "committed_fail"
+		d.DiagnosticError = code
+	default:
+		d.TraceOutcome = "fail_terminal"
+		d.TraceReason = code
+		d.DiagnosticStatus = "failed"
+		d.DiagnosticError = code
+	}
+	d.UsageStatus = usageStatusForOutcome(kind, "", code)
+	if d.TraceReason == "" {
+		d.TraceReason = code
+	}
+	if d.DiagnosticError == "" && kind != OutcomeCommittedSuccess {
+		d.DiagnosticError = code
+	}
+	return d
+}
+
+// LaneDecision is the only supported interpretation of an Outcome.
+func (o Outcome) LaneDecision() LaneDecision {
+	o = o.normalize()
+	d := LaneDecisionFor(o.Kind, o.Committed, o.Eligible, o.Code)
+	if o.Kind == OutcomeClientAborted && o.Committed {
+		d.Committed = true
+		d.TraceOutcome = "committed_fail"
+	}
+	if o.Kind == OutcomeUpstreamFailed {
+		d.Eligible = o.Eligible
+		d.PenalizeUpstream = o.Eligible
+		if o.Eligible {
+			d.TraceOutcome = "fail_switch"
+		}
+	}
+	if !o.Eligible && o.Kind == OutcomeUpstreamFailed {
+		d.Eligible = false
+		d.PenalizeUpstream = false
+		d.TraceOutcome = "fail_terminal"
+	}
+	if o.UsageStatus != "" {
+		d.UsageStatus = o.UsageStatus
+	}
+	return d
+}
+
+// WithRequestContext upgrades a generic uncommitted failure when the shared
+// request context proves that the client or the gateway budget ended first.
+func (o Outcome) WithRequestContext(ctx context.Context) Outcome {
+	// An uncommitted attempt that failed while the caller was already gone is
+	// a client abort regardless of which error surfaced first. The SDK can
+	// wrap context cancellation as a transport/API error; the shared request
+	// context is the higher-authority fact.
+	if !o.Committed && IsClientGone(ctx, nil) {
+		o.Kind = OutcomeClientAborted
+		o.Eligible = false
+		o.CredentialCooldown = 0
+		return o.normalize()
+	}
+	if o.Committed {
+		return o.normalize()
+	}
+	if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+		o.Kind = OutcomeGatewayTimeout
+		o.Eligible = false
+		o.CredentialCooldown = 0
+		o.StatusCode = http.StatusGatewayTimeout
+		o.Code = "gateway_timeout"
+		o.Message = "gateway request budget exceeded"
+	}
+	return o.normalize()
 }
 
 // OutcomeFromErr 把一次上游 err 归类成「未提交」的结果。
@@ -147,6 +413,7 @@ type Outcome struct {
 func OutcomeFromErr(err error) Outcome {
 	if errors.Is(err, rosetta.ErrStreamTruncated) || errors.Is(err, rosetta.ErrStreamOverflow) {
 		return Outcome{
+			Kind: OutcomeUpstreamFailed,
 			// 首批事件之前就断流 = 这次尝试什么也没产出，值得换目标再试。
 			// 但这是目标/链路故障，不是凭据故障：不冷却这把 key，
 			// 交给外层 RecordTargetFailure 熔断目标。
@@ -155,18 +422,19 @@ func OutcomeFromErr(err error) Outcome {
 			Code:       "upstream_error",
 			Message:    "upstream stream failed before the first event",
 			Detail:     outwire.UpstreamErrorDetail(err),
-		}
+		}.normalize()
 	}
 	eligible := outwire.FailoverEligible(err)
 	statusCode, code, message := outwire.MapUpstreamError(err)
 	return Outcome{
+		Kind:               OutcomeUpstreamFailed,
 		Eligible:           eligible,
 		CredentialCooldown: outwire.CredentialCooldown(err),
 		StatusCode:         statusCode,
 		Code:               code,
 		Message:            message,
 		Detail:             outwire.UpstreamErrorDetail(err),
-	}
+	}.normalize()
 }
 
 // OutcomeFromErrCtx 在 OutcomeFromErr 之上区分「网关总预算到期」。
@@ -178,15 +446,7 @@ func OutcomeFromErr(err error) Outcome {
 // 需要调整的是网关的超时/负载。
 func OutcomeFromErrCtx(ctx context.Context, err error) Outcome {
 	out := OutcomeFromErr(err)
-	if errors.Is(ctx.Err(), context.DeadlineExceeded) {
-		out.GatewayTimeout = true
-		out.Eligible = false
-		out.CredentialCooldown = 0
-		out.StatusCode = http.StatusGatewayTimeout
-		out.Code = "gateway_timeout"
-		out.Message = "gateway request budget exceeded"
-	}
-	return out
+	return out.WithRequestContext(ctx)
 }
 
 // IsClientGone 判断一次流式中断是否源于**客户端**断开，而不是上游故障。

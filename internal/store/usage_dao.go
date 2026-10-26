@@ -404,8 +404,10 @@ func (s *Store) freezeUsageCost(ctx context.Context, r *UsageRecord) (float64, b
 		}
 		return 0, false
 	}
-	return priceUsage(pin, phit, pcreate, pout,
-		float64(r.InputTokens), float64(r.CachedTokens), float64(r.CachedCreationTokens), float64(r.OutputTokens)), false
+	return PriceUsageWithPrices(Prices{
+		Input: pin, CacheHit: phit, CacheCreation: pcreate, Output: pout,
+	}, float64(r.InputTokens), float64(r.CachedTokens),
+		float64(r.CachedCreationTokens), float64(r.OutputTokens)), false
 }
 
 // RecomputePendingCosts 重算所有 usage_state='cost_pending' 的记录（2026-10-12 修 P1-2）。
@@ -424,9 +426,15 @@ func (s *Store) RecomputePendingCosts(ctx context.Context, limit int) (int64, bo
 	if limit <= 0 {
 		limit = 500
 	}
+	now := time.Now().UnixMilli()
 	rows, err := s.read.QueryContext(ctx,
-		`SELECT id FROM usage_records WHERE usage_state = ? LIMIT ?`,
-		usageStateCostPending, limit)
+		`SELECT id FROM usage_records
+		  WHERE usage_state = ?
+		    AND status = ?
+		    AND charge_next_at <= ?
+		  ORDER BY charge_next_at, ts, id
+		  LIMIT ?`,
+		usageStateCostPending, UsageStatusOK, now, limit)
 	if err != nil {
 		return 0, false, fmt.Errorf("scan cost_pending: %w", err)
 	}
@@ -477,6 +485,13 @@ type UnchargedUsage struct {
 	CostYuan  float64
 }
 
+// ReconcileResult reports typed outcomes for one reconciliation page.
+type ReconcileResult struct {
+	Charged  int
+	Deferred int
+	Failed   int
+}
+
 // FindUnchargedUsage 找出「已落库、有费用、但 balance_charges 里没有对应
 // 扣费流水」的用量记录（2026-10-21 修 A4-P1-4 / 汇总 F4）。
 //
@@ -491,6 +506,8 @@ type UnchargedUsage struct {
 //     那类记录被排除在外的理由见 usageRecorder.charge 里同名的分支。
 //   - balance_charges 里没有 (request_id, user_id)：这正是「没扣过」的证据。
 //     ChargeBalance 的占位行是幂等键，扣费成功必有占位行。
+//   - 没有同键的 balance_pending：那表示这笔费用仍有未结清的欠款，
+//     已由充值结转路径持有，不允许对账再按完整费用补扣一次。
 //
 // # 为什么用 LEFT JOIN 而不是先查再逐条比对
 //
@@ -516,8 +533,14 @@ func (s *Store) FindUnchargedUsage(ctx context.Context, limit int) ([]UnchargedU
 		    AND u.cost_total > 0
 		    AND COALESCE(u.request_id, '') <> ''
 		    AND c.request_id IS NULL
-		  ORDER BY u.ts
-		  LIMIT ?`, limit)
+		    AND u.charge_next_at <= ?
+		    AND NOT EXISTS (
+		      SELECT 1 FROM balance_pending p
+		       WHERE p.request_id = u.request_id
+		         AND p.user_id = COALESCE(u.user_id, '')
+		    )
+		  ORDER BY u.charge_next_at, u.ts, u.id
+		  LIMIT ?`, time.Now().UnixMilli(), limit)
 	if err != nil {
 		return nil, err
 	}
@@ -545,14 +568,86 @@ func (s *Store) FindUnchargedUsage(ctx context.Context, limit int) ([]UnchargedU
 // 「处理过了」—— 否则它会每轮都把同一笔捞出来重试，而重试永远不会
 // 成功（欠费不是瞬时故障）。
 func (s *Store) ChargeUnchargedUsage(ctx context.Context, u UnchargedUsage) error {
+	_, err := s.ReconcileOneUnchargedUsage(ctx, u)
+	return err
+}
+
+// ReconcileOneUnchargedUsage settles one reconciliation candidate and records
+// its typed outcome. A deferred result is durable retry state, not a success:
+// the row receives a bounded backoff so it cannot occupy every subsequent page.
+func (s *Store) ReconcileOneUnchargedUsage(ctx context.Context, u UnchargedUsage) (string, error) {
 	if u.UserID == "" || u.RequestID == "" || u.CostYuan <= 0 {
-		return nil
+		return "ignored", nil
 	}
 	err := s.ChargeBalance(ctx, u.UserID, u.CostYuan, u.RequestID)
 	if errors.Is(err, ErrInsufficientBalance) {
+		if rerr := s.noteChargeRetry(ctx, u.RecordID, "insufficient_balance", 6*time.Hour); rerr != nil {
+			return "", rerr
+		}
+		return "deferred", nil
+	}
+	if err != nil {
+		if rerr := s.noteChargeRetry(ctx, u.RecordID, err.Error(), 10*time.Minute); rerr != nil {
+			return "", errors.Join(err, rerr)
+		}
+		return "failed", err
+	}
+	if _, err := s.db.ExecContext(ctx,
+		`UPDATE usage_records
+		    SET charge_attempts = charge_attempts + 1,
+		        charge_next_at = 0,
+		        charge_last_error = NULL
+		  WHERE id = ?`, u.RecordID); err != nil {
+		return "", err
+	}
+	return "charged", nil
+}
+
+// noteChargeRetry persists a bounded retry deadline for a settlement failure.
+// The next scan pages past this row until the deadline, so a permanently
+// unaffordable or transiently failing head cannot starve later records.
+func (s *Store) noteChargeRetry(ctx context.Context, recordID, reason string, delay time.Duration) error {
+	if recordID == "" {
 		return nil
 	}
+	next := time.Now().Add(delay).UnixMilli()
+	_, err := s.db.ExecContext(ctx,
+		`UPDATE usage_records
+		    SET charge_attempts = charge_attempts + 1,
+		        charge_next_at = ?,
+		        charge_last_error = ?
+		  WHERE id = ?`, next, reason, recordID)
 	return err
+}
+
+// ReconcileUnchargedUsage processes one bounded page and keeps retryable rows
+// out of the immediate head. It is the single command used by the maintenance
+// worker; callers must not count deferred rows as successful collections.
+func (s *Store) ReconcileUnchargedUsage(ctx context.Context, limit int) (ReconcileResult, error) {
+	var result ReconcileResult
+	found, err := s.FindUnchargedUsage(ctx, limit)
+	if err != nil {
+		return result, err
+	}
+	for _, u := range found {
+		outcome, err := s.ReconcileOneUnchargedUsage(ctx, u)
+		if err != nil {
+			result.Failed++
+			s.logger.Error("charge reconciliation failed",
+				"record_id", u.RecordID, "user_id", u.UserID,
+				"request_id", u.RequestID, "cost_yuan", u.CostYuan, "error", err)
+			continue
+		}
+		switch outcome {
+		case "charged":
+			result.Charged++
+		case "deferred":
+			result.Deferred++
+		case "failed":
+			result.Failed++
+		}
+	}
+	return result, nil
 }
 
 // recomputeChargeKey 生成「重算补扣」的幂等键。
@@ -689,8 +784,9 @@ func (s *Store) RecomputeCost(ctx context.Context, recordID string) (bool, error
 	insufficient := false
 	if delta := cost - r.PreviousCost; delta > 0 && r.UserID != "" {
 		// 幂等键用**重算专属的键**，不用 request_id（见 recomputeChargeKey）。
-		if _, cerr := s.chargeBalanceTx(ctx, tx, r.UserID, delta,
-			recomputeChargeKey(recordID, cost)); cerr != nil {
+		_, cerr := s.chargeBalanceTx(ctx, tx, r.UserID, delta,
+			recomputeChargeKey(recordID, cost))
+		if cerr != nil {
 			switch {
 			case errors.Is(cerr, ErrInsufficientBalance):
 				insufficient = true
@@ -706,11 +802,25 @@ func (s *Store) RecomputeCost(ctx context.Context, recordID string) (bool, error
 			default:
 				return false, cerr
 			}
+		} else if !insufficient && r.RequestID != "" {
+			// 只有扣费成功（包括 recompute 键的幂等命中）才能写原始完成
+			// 标记。ErrNotFound 说明钱没有扣到任何账户，不能把记录伪装成
+			// 已结清；否则对账以后也不会再发现它。
+			if err := s.ensureUsageCompletionTx(ctx, tx, r.RequestID, r.UserID); err != nil {
+				return false, err
+			}
 		}
 	}
 	if insufficient {
-		// 回滚，让这条记录留在待重算队列里。
-		// （defer 里的 tx.Rollback() 兜底，这里不重复调用。）
+		// Release the single write connection before recording retry state.
+		// The write pool has MaxOpenConns(1); an Exec here while tx is still
+		// open blocks on the same connection and never returns.
+		if rerr := tx.Rollback(); rerr != nil && !errors.Is(rerr, sql.ErrTxDone) {
+			return false, rerr
+		}
+		if rerr := s.noteChargeRetry(ctx, recordID, "insufficient_balance", 6*time.Hour); rerr != nil {
+			return false, rerr
+		}
 		s.logger.Warn("recompute cost: insufficient balance, keeping record pending",
 			"record_id", recordID, "user_id", r.UserID,
 			"delta", cost-r.PreviousCost, "request_id", r.RequestID)

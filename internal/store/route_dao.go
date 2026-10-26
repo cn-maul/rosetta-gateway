@@ -84,6 +84,13 @@ func (s *Store) CreateRoute(ctx context.Context, r *Route) error {
 	return s.CreateRouteWithHeadTarget(ctx, r)
 }
 
+// CreateRouteTx creates only the route row in the caller's transaction. The
+// bootstrap command adds its head target explicitly so the complete graph
+// shares one commit boundary.
+func (s *Store) CreateRouteTx(ctx context.Context, tx Tx, r *Route) error {
+	return createRoute(ctx, tx, r)
+}
+
 // createRoute 接受 execer，以便在事务里与「种链首目标」原子地一起完成。
 func createRoute(ctx context.Context, ex execer, r *Route) error {
 	now := time.Now().UnixMilli()

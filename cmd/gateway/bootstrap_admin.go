@@ -2,8 +2,11 @@ package main
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"log/slog"
 
+	"github.com/cn-maul/rosetta-gateway/internal/lifecycle"
 	"github.com/cn-maul/rosetta-gateway/internal/store"
 )
 
@@ -14,12 +17,32 @@ import (
 // 引导会跳过并记 WARN，绝不覆盖别人的账号。
 const bootstrapAdminUsername = "admin"
 
+type adminBootstrapOutcome string
+
+const (
+	adminBootstrapSetupRequired adminBootstrapOutcome = "setup_required"
+	adminBootstrapReady         adminBootstrapOutcome = "ready"
+	adminBootstrapFailed        adminBootstrapOutcome = "failed"
+)
+
+type adminBootstrapStore interface {
+	CountUsers(ctx context.Context) (int, error)
+	CreateUser(ctx context.Context, u *store.User) error
+	GetUserByUsername(ctx context.Context, username string) (*store.User, error)
+	FindUninitializedAdmin(ctx context.Context) (*store.User, error)
+}
+
 // initializeAdminBootstrap is the startup hook injected into gatewayapp.Run.
 // The implementation stays in this package so bootstrap tests can exercise
 // the exact production function.
-func initializeAdminBootstrap(ctx context.Context, db *store.Store, logger *slog.Logger) error {
-	ensureBootstrapAdmin(ctx, db, logger)
-	return nil
+func initializeAdminBootstrap(ctx context.Context, db *store.Store,
+	logger *slog.Logger) (lifecycle.BootstrapState, error) {
+	outcome, err := ensureBootstrapAdmin(ctx, db, logger)
+	if err != nil {
+		return lifecycle.BootstrapFailed, err
+	}
+	logger.Info("admin bootstrap state resolved", "outcome", outcome)
+	return lifecycle.BootstrapState(outcome), nil
 }
 
 // ensureBootstrapAdmin 在 users 表为空时建出一个待初始化的 admin 账号。
@@ -57,16 +80,15 @@ func initializeAdminBootstrap(ctx context.Context, db *store.Store, logger *slog
 //
 // 判定条件是「users 表为空」，不写任何标记位。重复调用是 no-op ——
 // 用户自己建了账号之后就不再引导，不会把他们的库搅乱。
-func ensureBootstrapAdmin(ctx context.Context, db *store.Store, logger *slog.Logger) {
+func ensureBootstrapAdmin(ctx context.Context, db adminBootstrapStore,
+	logger *slog.Logger) (adminBootstrapOutcome, error) {
 	n, err := db.CountUsers(ctx)
 	if err != nil {
-		// 读不到用户数是个异常状态（数据库层面的问题）。此时**不做引导**：
-		// 宁可让人手工建管理员，也不要在状态不明时往库里塞一个身份。
-		logger.Error("bootstrap admin: cannot count users; skipping", "error", err)
-		return
+		// 状态未知时既不能引导，也不能让进程假装已经就绪。
+		return adminBootstrapFailed, fmt.Errorf("read bootstrap user count: %w", err)
 	}
 	if n > 0 {
-		return // 已有用户，不引导
+		return resolveExistingAdminBootstrap(ctx, db)
 	}
 
 	u := &store.User{
@@ -81,16 +103,60 @@ func ensureBootstrapAdmin(ctx context.Context, db *store.Store, logger *slog.Log
 		Remark:       "首次启动自动创建；请在登录页设置密码",
 	}
 	if err := db.CreateUser(ctx, u); err != nil {
-		// 唯一约束冲突说明并发启动时另一个实例已经建好了 —— 不是错误。
+		// 唯一约束冲突只在重读证明另一个实例确实建出了管理员后才可接受。
 		if store.IsUniqueViolation(err) {
-			logger.Info("bootstrap admin skipped: created concurrently by another instance")
-			return
+			return resolveConcurrentAdminBootstrap(ctx, db, err)
 		}
-		logger.Error("bootstrap admin: create failed", "error", err)
-		return
+		return adminBootstrapFailed, fmt.Errorf("create initial administrator: %w", err)
 	}
 
 	logger.Info("created initial administrator account; set its password on first visit",
 		"username", u.Username,
 		"next_step", "打开管理后台的登录页会显示「首次设置密码」表单；设置完成后即可登录")
+	return resolveExistingAdminBootstrap(ctx, db)
+}
+
+// resolveExistingAdminBootstrap turns the existing durable user state into the
+// explicit setup/ready outcome. A required post-bootstrap read failure is fatal:
+// callers must not infer "ready" from an unknown identity state.
+func resolveExistingAdminBootstrap(ctx context.Context, db adminBootstrapStore) (
+	adminBootstrapOutcome, error) {
+	pending, err := db.FindUninitializedAdmin(ctx)
+	if err != nil {
+		return adminBootstrapFailed, fmt.Errorf("read uninitialized administrator: %w", err)
+	}
+	if pending != nil {
+		return adminBootstrapSetupRequired, nil
+	}
+	return adminBootstrapReady, nil
+}
+
+// resolveConcurrentAdminBootstrap accepts a unique create conflict only when a
+// re-read proves that the expected administrator now exists. The original
+// error code alone is not evidence that bootstrap completed.
+func resolveConcurrentAdminBootstrap(ctx context.Context, db adminBootstrapStore,
+	createErr error) (adminBootstrapOutcome, error) {
+	n, err := db.CountUsers(ctx)
+	if err != nil {
+		return adminBootstrapFailed, fmt.Errorf(
+			"verify concurrently-created administrator count after %v: %w", createErr, err)
+	}
+	if n == 0 {
+		return adminBootstrapFailed, fmt.Errorf(
+			"initial administrator insert conflicted but users table is still empty: %w", createErr)
+	}
+	admin, err := db.GetUserByUsername(ctx, bootstrapAdminUsername)
+	if err != nil {
+		return adminBootstrapFailed, fmt.Errorf(
+			"verify concurrently-created administrator after %v: %w", createErr, err)
+	}
+	if admin == nil || admin.Role != store.RoleAdmin {
+		return adminBootstrapFailed, fmt.Errorf(
+			"initial administrator insert conflicted but no administrator exists: %w", createErr)
+	}
+	outcome, err := resolveExistingAdminBootstrap(ctx, db)
+	if err != nil {
+		return adminBootstrapFailed, errors.Join(createErr, err)
+	}
+	return outcome, nil
 }

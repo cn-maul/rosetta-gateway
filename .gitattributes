@@ -5,6 +5,9 @@
 # 直接报 "/bin/sh^M: bad interpreter"。仓库里存 LF 才能让本地构建也正常。
 # 本文件自身也必须 LF：带 CR 签出时，模式里的 "eol=lf" 会变成 "lf\r" 而失效。
 .gitattributes text eol=lf
+.gitignore text eol=lf
+.dockerignore text eol=lf
+.zcodeignore text eol=lf
 
 docker/** text eol=lf
 Dockerfile text eol=lf

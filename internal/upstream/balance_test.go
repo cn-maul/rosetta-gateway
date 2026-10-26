@@ -72,10 +72,10 @@ func balanceFor(t *testing.T, st *store.Store, pid string, master []byte) *Provi
 
 // asDialect 让本进程内的 provider 走指定方言（见 balanceDialect 的注释）。
 // 用 t.Cleanup 复原，保证测试之间互不污染。
-func asDialect(t *testing.T, f func(context.Context, *store.Provider, string) (float64, string, string, error)) {
+func asDialect(t *testing.T, f balanceFetcher) {
 	t.Helper()
 	prev := balanceDialect
-	balanceDialect = func() func(context.Context, *store.Provider, string) (float64, string, string, error) {
+	balanceDialect = func() balanceFetcher {
 		return f
 	}
 	t.Cleanup(func() { balanceDialect = prev })
@@ -100,7 +100,7 @@ func TestQueryProviderBalance_OpenAI(t *testing.T) {
 
 	st, pid, master := balanceFixture(t)
 	setEndpoint(t, st, pid, srv.URL)
-	asDialect(t, func(ctx context.Context, p *store.Provider, key string) (float64, string, string, error) {
+	asDialect(t, func(ctx context.Context, p *store.Provider, key string) (balanceReading, error) {
 		return fetchOpenAIBalance(ctx, p, key)
 	})
 
@@ -141,7 +141,7 @@ func TestQueryProviderBalance_DeepSeek(t *testing.T) {
 
 	st, pid, master := balanceFixture(t)
 	setEndpoint(t, st, pid, srv.URL)
-	asDialect(t, func(ctx context.Context, p *store.Provider, key string) (float64, string, string, error) {
+	asDialect(t, func(ctx context.Context, p *store.Provider, key string) (balanceReading, error) {
 		return fetchDeepSeekBalance(ctx, p, key)
 	})
 
@@ -182,13 +182,20 @@ func TestQueryProviderBalance_凭据级失败互不影响(t *testing.T) {
 			w.WriteHeader(http.StatusUnauthorized)
 			return
 		}
-		fmt.Fprint(w, `{"hard_limit_usd":50}`)
+		switch r.URL.Path {
+		case "/dashboard/billing/subscription":
+			fmt.Fprint(w, `{"hard_limit_usd":50}`)
+		case "/dashboard/billing/usage":
+			fmt.Fprint(w, `{"total_usage":20}`)
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
 	}))
 	defer srv.Close()
 
 	st, pid, master := balanceFixture(t)
 	setEndpoint(t, st, pid, srv.URL)
-	asDialect(t, func(ctx context.Context, p *store.Provider, key string) (float64, string, string, error) {
+	asDialect(t, func(ctx context.Context, p *store.Provider, key string) (balanceReading, error) {
 		return fetchOpenAIBalance(ctx, p, key)
 	})
 
@@ -214,8 +221,8 @@ func TestQueryProviderBalance_凭据级失败互不影响(t *testing.T) {
 	if byID["c1"].Status != "error" {
 		t.Fatalf("c1 应为 error，实际 %+v", byID["c1"])
 	}
-	if byID["c2"].Status != "ok" || byID["c2"].Amount != 50 {
-		t.Fatalf("c2 应查到 50，实际 %+v", byID["c2"])
+	if byID["c2"].Status != "ok" || byID["c2"].Amount != 30 {
+		t.Fatalf("c2 应查到 30（额度 50、已用 20），实际 %+v", byID["c2"])
 	}
 }
 
@@ -230,7 +237,7 @@ func TestQueryProviderBalance_停用凭据不查(t *testing.T) {
 
 	st, pid, master := balanceFixture(t)
 	setEndpoint(t, st, pid, srv.URL)
-	asDialect(t, func(ctx context.Context, p *store.Provider, key string) (float64, string, string, error) {
+	asDialect(t, func(ctx context.Context, p *store.Provider, key string) (balanceReading, error) {
 		return fetchOpenAIBalance(ctx, p, key)
 	})
 
@@ -263,7 +270,7 @@ func TestQueryProviderBalance_不跟随重定向(t *testing.T) {
 
 	st, pid, master := balanceFixture(t)
 	setEndpoint(t, st, pid, redir.URL)
-	asDialect(t, func(ctx context.Context, p *store.Provider, key string) (float64, string, string, error) {
+	asDialect(t, func(ctx context.Context, p *store.Provider, key string) (balanceReading, error) {
 		return fetchOpenAIBalance(ctx, p, key)
 	})
 
@@ -283,7 +290,14 @@ func TestQueryProviderBalance_UsesProviderProxy(t *testing.T) {
 	var proxyHits atomic.Int32
 	proxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		proxyHits.Add(1)
-		_, _ = io.WriteString(w, `{"hard_limit_usd":12}`)
+		switch r.URL.Path {
+		case "/dashboard/billing/subscription":
+			_, _ = io.WriteString(w, `{"hard_limit_usd":12}`)
+		case "/dashboard/billing/usage":
+			_, _ = io.WriteString(w, `{"total_usage":0}`)
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
 	}))
 	defer proxy.Close()
 
@@ -309,7 +323,7 @@ func TestQueryProviderBalance_UsesProviderProxy(t *testing.T) {
 	if err := st.UpdateProvider(context.Background(), pid, p); err != nil {
 		t.Fatalf("update provider: %v", err)
 	}
-	asDialect(t, func(ctx context.Context, p *store.Provider, key string) (float64, string, string, error) {
+	asDialect(t, func(ctx context.Context, p *store.Provider, key string) (balanceReading, error) {
 		return fetchOpenAIBalance(ctx, p, key)
 	})
 

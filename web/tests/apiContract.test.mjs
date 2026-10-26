@@ -149,6 +149,67 @@ test('401 清令牌并清身份，抛出带 401 的 ApiFail', async () => {
   resetResponder()
 })
 
+test('login 401 preserves credential message and unrelated local session', async () => {
+  installGlobals({ token: 'existing-admin-token' })
+  globalThis.__responder = () =>
+    jsonResponse(401, { error: { message: '用户名或密码错误' } })
+  const { login, ApiFail } = await freshApi()
+
+  await assert.rejects(() => login('alice', 'wrong'), (err) => {
+    assert.ok(err instanceof ApiFail)
+    assert.equal(err.status, 401)
+    assert.equal(err.message, '用户名或密码错误')
+    return true
+  })
+  assert.equal(globalThis.sessionStorage.getItem(TOKEN_KEY), 'existing-admin-token')
+  resetResponder()
+})
+
+test('bootstrap setup keeps successful password result when profile refresh fails', async () => {
+  installGlobals()
+  let call = 0
+  globalThis.__responder = () => {
+    call++
+    if (call === 1) {
+      return jsonResponse(200, {
+        token: 'new-token',
+        expires_at: Date.now() + 3600_000,
+        username: 'admin',
+        role: 'admin',
+        must_set_password: false,
+      })
+    }
+    return jsonResponse(500, { error: { message: 'profile failed' } })
+  }
+  const { bootstrapSetup, ApiFail, session } = await freshApi()
+
+  await assert.rejects(() => bootstrapSetup('Long-enough-pass-1'), (err) => {
+    assert.ok(err instanceof ApiFail)
+    assert.equal(err.status, 500)
+    assert.match(err.message, /密码已设置/)
+    return true
+  })
+  assert.equal(globalThis.sessionStorage.getItem(TOKEN_KEY), 'new-token')
+  assert.equal(session.needsSetup, false)
+  resetResponder()
+})
+
+test('loadSession distinguishes bootstrap read failure from setup not needed', async () => {
+  installGlobals()
+  globalThis.__responder = (url) => {
+    if (url.endsWith('/session')) return jsonResponse(200, { enabled: true })
+    if (url.endsWith('/bootstrap')) return jsonResponse(500, { error: { message: 'db down' } })
+    return jsonResponse(401, { error: { message: '需要登录' } })
+  }
+  const { loadSession, session } = await freshApi()
+
+  await loadSession()
+  assert.equal(session.backendReady, true)
+  assert.equal(session.bootstrapCheckFailed, true)
+  assert.equal(session.needsSetup, false)
+  resetResponder()
+})
+
 test('错误信封的 message 被翻成 ApiFail.message', async () => {
   installGlobals()
   globalThis.__responder = () =>

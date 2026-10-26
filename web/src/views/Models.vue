@@ -53,6 +53,7 @@ import { unitPrice, cacheUnitPrice } from '../modelPrice'
 import { toast } from '../ui'
 import AppModal from '../components/AppModal.vue'
 import HeartbeatBar from '../components/HeartbeatBar.vue'
+import { RequestGeneration, selectionKey } from '../asyncState'
 
 const models = ref<string[]>([])
 /** 清单是否已被所属分组的白名单收窄。false = 这是你此刻能看到的全部。 */
@@ -95,6 +96,9 @@ const bucketsByUpstream = ref<Record<string, ProbeTimelineBucket[]>>({})
 const days = ref(7)
 const granularity = ref<'hour' | 'day'>('hour')
 const timelineLoading = ref(false)
+const timelineRequests = new RequestGeneration()
+const timelineSelectionKey = ref('')
+let pageGeneration = 0
 /** 探测数据是否失败。**与「探测不出问题」分开**：前者要提示，后者照常显示曲线。 */
 const probeErr = ref('')
 const probeLoading = ref(false)
@@ -162,23 +166,34 @@ function drawnIds(): string[] {
 
 async function loadTimeline() {
   const ids = drawnIds()
+  const requestedDays = days.value
+  const requestedGranularity = granularity.value
+  const requestedSelection = selectionKey(ids, requestedDays, requestedGranularity)
+  const generation = timelineRequests.begin()
+  timelineSelectionKey.value = requestedSelection
   if (ids.length === 0) {
     bucketsByUpstream.value = {}
+    probeErr.value = ''
+    timelineLoading.value = false
     return
   }
   timelineLoading.value = true
   probeErr.value = ''
   try {
-    const all = await api.probeTimeline(ids, days.value, granularity.value)
+    const all = await api.probeTimeline(ids, requestedDays, requestedGranularity)
+    const currentKey = selectionKey(drawnIds(), days.value, granularity.value)
+    if (!timelineRequests.isCurrent(generation) || timelineSelectionKey.value !== currentKey) return
     const grouped: Record<string, ProbeTimelineBucket[]> = {}
     for (const b of all) (grouped[b.model_id] ??= []).push(b)
     bucketsByUpstream.value = grouped
   } catch (e) {
+    const currentKey = selectionKey(drawnIds(), days.value, granularity.value)
+    if (!timelineRequests.isCurrent(generation) || timelineSelectionKey.value !== currentKey) return
     // 失败必须**可见**：曲线区会显示成「没有记录」，而那与「真的没记录」
     // 含义完全相反 —— 用户会把一次网关故障读成模型停了。
     probeErr.value = '加载连通率失败：' + (e instanceof Error ? e.message : String(e))
   } finally {
-    timelineLoading.value = false
+    if (timelineRequests.isCurrent(generation)) timelineLoading.value = false
   }
 }
 
@@ -207,44 +222,52 @@ function clearDrawn(): void {
   loadTimeline()
 }
 
-async function loadProbes() {
+async function loadProbes(page = pageGeneration) {
+  const generation = timelineRequests.begin()
   probeLoading.value = true
   try {
     // 探测摘要可能失败（后端老版本没这个端点、或权限收窄）。这不该让整页
     // 进错误态 —— 价格仍然完全可用。所以失败只记 probeErr，卡片上的连通率
     // 一行显示原因，其余照常。
-    healths.value = await api.probeModels()
+    const nextHealths = await api.probeModels()
+    if (page !== pageGeneration || !timelineRequests.isCurrent(generation)) return
+    healths.value = nextHealths
     probeErr.value = ''
     if (drawn.value.length === 0) defaultDrawn()
     await loadTimeline()
   } catch (e) {
+    if (!timelineRequests.isCurrent(generation)) return
     if (e instanceof ApiFail && e.status === 401) return
     probeErr.value = '加载连通率失败：' + (e instanceof Error ? e.message : String(e))
   } finally {
-    probeLoading.value = false
+    if (page === pageGeneration && timelineRequests.isCurrent(generation)) probeLoading.value = false
   }
 }
 
 async function load() {
+  const generation = ++pageGeneration
+  timelineRequests.invalidate()
   loading.value = true
   err.value = ''
   try {
     const r = await api.modelNames()
+    if (generation !== pageGeneration) return
     models.value = r.models
     restricted.value = r.restricted
     priceMap.value = new Map(r.prices.map((p) => [p.name, p]))
     metaMap.value = new Map(r.meta.map((m) => [m.name, m]))
     // 清单变了就重算默认勾选：否则会拿着上一轮的模型名去查曲线。
     defaultDrawn()
-    await loadProbes()
+    await loadProbes(generation)
   } catch (e) {
+    if (generation !== pageGeneration) return
     if (e instanceof ApiFail && e.status === 401) return
     // 失败必须留下可见错误态：只弹 toast 的话，页面会渲染成空清单，
     // 而空清单在这页有明确含义（「你一个模型都调不了」）。
     err.value = '加载可用模型失败：' + (e instanceof Error ? e.message : String(e))
     toast('加载可用模型失败：' + (e instanceof Error ? e.message : String(e)), 'err')
   } finally {
-    loading.value = false
+    if (generation === pageGeneration) loading.value = false
   }
 }
 

@@ -128,6 +128,7 @@ func (r *Reloader) Reload(ctx context.Context) error {
 
 	providers, poolFailures, err := r.pool.PrepareFromStore(ctx, r.db, r.masterKey, r.cfg)
 	if err != nil {
+		r.MarkDirty()
 		return fmt.Errorf("prepare upstream pool: %w", err)
 	}
 
@@ -156,6 +157,7 @@ func (r *Reloader) Reload(ctx context.Context) error {
 
 	snap, err := snapshot.RebuildFromDB(ctx, r.db, failures)
 	if err != nil {
+		r.MarkDirty()
 		return fmt.Errorf("rebuild snapshot: %w", err)
 	}
 	r.pool.Install(providers, liveTargetIDs(ctx, r.db))

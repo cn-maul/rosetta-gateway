@@ -2,6 +2,7 @@ package dataplane
 
 import (
 	"context"
+	"errors"
 	"log/slog"
 
 	"github.com/cn-maul/rosetta-gateway/internal/ratelimit"
@@ -33,6 +34,9 @@ type RateCommit struct {
 	userQuotaReserved int64
 	// userID 是 userQuotaReserved 的归属用户；退预占时必须用它定位行。
 	userID string
+	// requestID owns the durable reservation lease. Without it we retain the
+	// legacy best-effort release, but production request paths always set it.
+	requestID string
 }
 
 // Commit 用量已知时的**全量**收尾：TPM 按真实用量校正 + 退配额预占。
@@ -61,26 +65,72 @@ func (rc *RateCommit) ReleaseQuota() {
 	if rc == nil || rc.store == nil {
 		return
 	}
+	if rc.requestID != "" {
+		if err := rc.store.ReleaseOwnedQuotaReservations(context.Background(), rc.requestID); err != nil {
+			if errors.Is(err, store.ErrNoOwnedQuotaReservations) {
+				rc.releaseWithoutLease()
+				return
+			}
+			if rc.logger != nil {
+				rc.logger.Warn("release owned quota reservations failed; lease retained for retry",
+					"request_id", rc.requestID, "error", err)
+			}
+			return
+		}
+		rc.quotaReserved = 0
+		rc.userQuotaReserved = 0
+		return
+	}
 	// 两级预占各自「先取后清零」，让释放天然幂等：任何路径重复收尾（或未来
 	// 重构引入第二次调用）时第二次是空操作，不会把别的请求刚立起来的预占退掉。
 	if rc.quotaReserved > 0 {
 		reserved := rc.quotaReserved
-		rc.quotaReserved = 0
 		if err := rc.store.ReleaseQuota(context.Background(), rc.keyID, reserved); err != nil {
 			if rc.logger != nil {
 				rc.logger.Warn("release quota reservation failed",
 					"key_id", rc.keyID, "reserved", reserved, "error", err)
 			}
+		} else {
+			rc.quotaReserved = 0
 		}
 	}
 	if rc.userQuotaReserved > 0 {
 		reserved := rc.userQuotaReserved
-		rc.userQuotaReserved = 0
 		if err := rc.store.ReleaseUserQuota(context.Background(), rc.userID, reserved); err != nil {
 			if rc.logger != nil {
 				rc.logger.Warn("release user quota reservation failed",
 					"user_id", rc.userID, "reserved", reserved, "error", err)
 			}
+		} else {
+			rc.userQuotaReserved = 0
+		}
+	}
+}
+
+// releaseWithoutLease is the recovery path for a reservation whose lease
+// insert was lost. It is deliberately checked: a failed write leaves the
+// in-memory reservation intact so a later finalizer retry can finish it.
+func (rc *RateCommit) releaseWithoutLease() {
+	if rc.quotaReserved > 0 {
+		reserved := rc.quotaReserved
+		if err := rc.store.ReleaseQuota(context.Background(), rc.keyID, reserved); err != nil {
+			if rc.logger != nil {
+				rc.logger.Warn("fallback quota release failed; retaining reservation",
+					"key_id", rc.keyID, "reserved", reserved, "error", err)
+			}
+		} else {
+			rc.quotaReserved = 0
+		}
+	}
+	if rc.userQuotaReserved > 0 {
+		reserved := rc.userQuotaReserved
+		if err := rc.store.ReleaseUserQuota(context.Background(), rc.userID, reserved); err != nil {
+			if rc.logger != nil {
+				rc.logger.Warn("fallback user quota release failed; retaining reservation",
+					"user_id", rc.userID, "reserved", reserved, "error", err)
+			}
+		} else {
+			rc.userQuotaReserved = 0
 		}
 	}
 }
@@ -93,10 +143,27 @@ func NewRateCommit(limiter *ratelimit.Limiter, keyID string, limit int, reserved
 	}
 }
 
+// setTPMReserved records a TPM reservation made after quota admission. It is
+// intentionally separate from the constructor because quota checks and quota
+// rejection ordering can both precede the TPM reservation.
+func (rc *RateCommit) setTPMReserved(reserved int64) {
+	if rc != nil {
+		rc.reserved = reserved
+	}
+}
+
+// SetRequestID enables durable, complete-set quota reservation ownership.
+func (rc *RateCommit) SetRequestID(requestID string) {
+	if rc != nil {
+		rc.requestID = requestID
+	}
+}
+
 // SetKeyQuotaReserved records the key-level lifetime quota reservation.
 func (rc *RateCommit) SetKeyQuotaReserved(reserved int64) {
 	if rc != nil {
 		rc.quotaReserved = reserved
+		rc.syncLease()
 	}
 }
 
@@ -105,5 +172,19 @@ func (rc *RateCommit) SetUserQuotaReserved(userID string, reserved int64) {
 	if rc != nil {
 		rc.userID = userID
 		rc.userQuotaReserved = reserved
+		rc.syncLease()
+	}
+}
+
+func (rc *RateCommit) syncLease() {
+	if rc == nil || rc.store == nil || rc.requestID == "" {
+		return
+	}
+	if err := rc.store.RecordQuotaReservationLease(context.Background(),
+		rc.requestID, rc.keyID, rc.userID, rc.quotaReserved, rc.userQuotaReserved); err != nil {
+		if rc.logger != nil {
+			rc.logger.Warn("record quota reservation lease failed",
+				"request_id", rc.requestID, "error", err)
+		}
 	}
 }

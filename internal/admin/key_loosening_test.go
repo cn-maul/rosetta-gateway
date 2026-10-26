@@ -188,6 +188,47 @@ func TestKeyUpdate_OwnerCannotWidenIPAllowlist(t *testing.T) {
 	}
 }
 
+// An administrator can apply a model allowlist to someone else's key. The
+// owner may narrow that restriction, but cannot clear it or replace it with a
+// different/wider set. Only an admin-authorized PATCH may widen it.
+func TestR8_OwnerCannotRemoveAdminModelAllowlist(t *testing.T) {
+	initRouteSnapshot(t, "flash", "pro")
+	st, h := newLooseningStore(t)
+	if err := st.CreateAccessKey(context.Background(), &store.AccessKey{
+		ID: "kr", KeyHash: "h-kr", KeyPrefix: "sk-", Name: "models",
+		Enabled: true, UserID: "u1",
+	}); err != nil {
+		t.Fatalf("seed key: %v", err)
+	}
+
+	if rec := patchKey(h, asAdmin, `{"allowed_models":["flash"]}`); rec.Code != http.StatusOK {
+		t.Fatalf("admin apply allowlist: code=%d body=%s", rec.Code, rec.Body.String())
+	}
+
+	asU := func(r *http.Request) *http.Request { return asUser(r, "u1") }
+	if rec := patchKey(h, asU, `{"allowed_models":[]}`); rec.Code != http.StatusForbidden {
+		t.Errorf("owner clear admin allowlist: code=%d body=%s, want 403", rec.Code, rec.Body.String())
+	}
+	if rec := patchKey(h, asU, `{"allowed_models":["pro"]}`); rec.Code != http.StatusForbidden {
+		t.Errorf("owner replace admin allowlist: code=%d body=%s, want 403", rec.Code, rec.Body.String())
+	}
+	if rec := patchKey(h, asU, `{"allowed_models":["flash"]}`); rec.Code != http.StatusOK {
+		t.Errorf("owner preserve/narrow admin allowlist: code=%d body=%s, want 200", rec.Code, rec.Body.String())
+	}
+	got, _ := st.GetAccessKey(context.Background(), "kr")
+	if got == nil || len(got.AllowedModels) != 1 || got.AllowedModels[0] != "flash" {
+		t.Fatalf("allowlist after owner PATCH = %+v, want [flash]", got)
+	}
+
+	if rec := patchKey(h, asAdmin, `{"allowed_models":[]}`); rec.Code != http.StatusOK {
+		t.Fatalf("admin clear allowlist: code=%d body=%s, want 200", rec.Code, rec.Body.String())
+	}
+	got, _ = st.GetAccessKey(context.Background(), "kr")
+	if got == nil || got.AllowedModels != nil {
+		t.Fatalf("allowlist after admin clear = %+v, want nil", got)
+	}
+}
+
 func TestKeyUpdate_AdminBypassesLooseningGuard(t *testing.T) {
 	st, h := newLooseningStore(t)
 	seedRestrictedKey(t, st)

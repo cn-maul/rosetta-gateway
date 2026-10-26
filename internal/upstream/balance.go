@@ -52,7 +52,7 @@ const balanceTimeout = 15 * time.Second
 type CredentialBalance struct {
 	CredentialID string `json:"credential_id"`
 	Label        string `json:"label"`
-	Status       string `json:"status"` // "ok" | "error" | "unsupported"
+	Status       string `json:"status"` // "ok" | "unknown" | "error" | "unsupported"
 	Message      string `json:"message,omitempty"`
 	// Amount 是上游报告的可用额度，单位与 Currency 一致（未换算成元 ——
 	// 上游可能报美元，汇率随时在动，网关编一个换算值等于撒谎）。
@@ -67,12 +67,27 @@ type CredentialBalance struct {
 	FetchedAt int64 `json:"fetched_at,omitempty"`
 }
 
+// balanceUnknownErr marks a successful subscription read whose usage is not
+// known. It is not a network/credential error and must not be rendered as an
+// exact available amount.
+type balanceUnknownErr struct{ msg string }
+
+func (e *balanceUnknownErr) Error() string { return e.msg }
+
+// balanceReading carries the fields shared by every dialect. A nil *float64
+// amount means the upstream did not establish a trustworthy balance.
+type balanceReading struct {
+	Amount   *float64
+	Currency string
+	Detail   string
+}
+
 // ProviderBalance 是一个上游下全部凭据的查询结果。
 // @ts-type ProviderBalance
 type ProviderBalance struct {
 	ProviderID string              `json:"provider_id"`
 	Provider   string              `json:"provider"`
-	Status     string              `json:"status"` // "ok" | "partial" | "error" | "unsupported"
+	Status     string              `json:"status"` // "ok" | "partial" | "unknown" | "error" | "unsupported"
 	Message    string              `json:"message,omitempty"`
 	Results    []CredentialBalance `json:"results"`
 }
@@ -103,7 +118,7 @@ func QueryProviderBalance(ctx context.Context, st *store.Store, providerID strin
 		Results:    make([]CredentialBalance, 0, len(creds)),
 	}
 
-	ok, failed, unsupported := 0, 0, 0
+	ok, unknown, failed, unsupported := 0, 0, 0, 0
 	for _, c := range creds {
 		res := CredentialBalance{
 			CredentialID: c.ID,
@@ -126,12 +141,16 @@ func QueryProviderBalance(ctx context.Context, st *store.Store, providerID strin
 			out.Results = append(out.Results, res)
 			continue
 		}
-		amount, currency, detail, perr := fetchCredentialBalance(ctx, p, key)
+		reading, perr := fetchCredentialBalance(ctx, p, key)
 		if perr != nil {
 			res.Message = perr.Error()
 			if isUnsupportedBalanceErr(perr) {
 				res.Status = "unsupported"
 				unsupported++
+			} else if isBalanceUnknownErr(perr) {
+				res.Status = "unknown"
+				res.FetchedAt = time.Now().UnixMilli()
+				unknown++
 			} else {
 				failed++
 			}
@@ -139,9 +158,11 @@ func QueryProviderBalance(ctx context.Context, st *store.Store, providerID strin
 			continue
 		}
 		res.Status = "ok"
-		res.Amount = amount
-		res.Currency = currency
-		res.Detail = detail
+		if reading.Amount != nil {
+			res.Amount = *reading.Amount
+		}
+		res.Currency = reading.Currency
+		res.Detail = reading.Detail
 		res.FetchedAt = time.Now().UnixMilli()
 		ok++
 		out.Results = append(out.Results, res)
@@ -150,9 +171,11 @@ func QueryProviderBalance(ctx context.Context, st *store.Store, providerID strin
 	switch {
 	case ok == 0 && unsupported == len(out.Results) && unsupported > 0:
 		out.Status = "unsupported"
+	case ok == 0 && unknown == len(out.Results) && unknown > 0:
+		out.Status = "unknown"
 	case ok == 0 && failed > 0:
 		out.Status = "error"
-	case failed > 0 || unsupported > 0:
+	case failed > 0 || unsupported > 0 || unknown > 0:
 		out.Status = "partial"
 	default:
 		out.Status = "ok"
@@ -173,8 +196,13 @@ func isUnsupportedBalanceErr(err error) bool {
 	return errorsAs(err, &e)
 }
 
+func isBalanceUnknownErr(err error) bool {
+	var e *balanceUnknownErr
+	return errorsAsError(err, &e)
+}
+
 // fetchCredentialBalance 按 provider 的协议与端点形状选择余额查询方式。
-func fetchCredentialBalance(ctx context.Context, p *store.Provider, apiKey string) (amount float64, currency, detail string, err error) {
+func fetchCredentialBalance(ctx context.Context, p *store.Provider, apiKey string) (balanceReading, error) {
 	return balanceDialect()(ctx, p, apiKey)
 }
 
@@ -189,6 +217,8 @@ func fetchCredentialBalance(ctx context.Context, p *store.Provider, apiKey strin
 // 余额是**只读的辅助信息**，为它加一列就多一个需要有人维护的配置项，而
 // 绝大多数 provider 压根不需要它（不支持的那些如实报 unsupported 即可）。
 // 自动判定让「新建上游」这个动作不需要附带任何新知识。
+type balanceFetcher func(context.Context, *store.Provider, string) (balanceReading, error)
+
 var balanceDialect = detectBalanceDialect
 
 // detectBalanceDialect 按「先看端点特征、再回落协议」的顺序选择查询方式。
@@ -202,12 +232,12 @@ var balanceDialect = detectBalanceDialect
 // 就走自定义路径，没填才落到这里（OpenAI 官方 / DeepSeek / 明确不支持）。
 // 自动判定只覆盖「内置已知的少数几家」，长尾（中转站、自建网关、以及
 // Moonshot/OpenRouter 这类有自己的 credits 端点的）一律靠显式配置。
-func detectBalanceDialect() func(context.Context, *store.Provider, string) (float64, string, string, error) {
-	return func(ctx context.Context, p *store.Provider, apiKey string) (float64, string, string, error) {
+func detectBalanceDialect() balanceFetcher {
+	return func(ctx context.Context, p *store.Provider, apiKey string) (balanceReading, error) {
 		if spec, err := ParseBalanceSpec(p.BalanceSpecJSON); err != nil {
 			// 配置错了就如实报错，不静默回落到自动判定：那会让管理员以为
 			// 改配置没生效，从而反复排查一个「看起来被忽略了」的问题。
-			return 0, "", "", fmt.Errorf("余额查询配置无效：%w", err)
+			return balanceReading{}, fmt.Errorf("余额查询配置无效：%w", err)
 		} else if spec != nil {
 			return fetchCustomBalance(ctx, p, apiKey, spec)
 		}
@@ -226,11 +256,11 @@ func detectBalanceDialect() func(context.Context, *store.Provider, string) (floa
 			// Anthropic 至今没有公开的余额查询 API（组织用量要走管理后台/
 			// 合同）。如实说「不支持」而不是去猜一个端点打过去：猜出来的 404
 			// 与真正的 404 无法区分，会把管理员引向错误的排查方向。
-			return 0, "", "", &unsupportedBalanceErr{
+			return balanceReading{}, &unsupportedBalanceErr{
 				msg: "Anthropic 未提供公开的余额查询接口，额度请在其管理后台查看",
 			}
 		default:
-			return 0, "", "", &unsupportedBalanceErr{
+			return balanceReading{}, &unsupportedBalanceErr{
 				msg: "该上游没有已知的余额查询方式（内置支持 OpenAI 官方与 DeepSeek）",
 			}
 		}
@@ -345,23 +375,27 @@ func ParseBalanceSpec(raw string) (*BalanceSpec, error) {
 //
 // 走通用的「取 JSON → 按点号路径取数值」而不是每家一个函数：自定义配置的
 // 用途就是长尾，而长尾的共同点正是「响应形状各不相同」。
-func fetchCustomBalance(ctx context.Context, p *store.Provider, apiKey string, spec *BalanceSpec) (float64, string, string, error) {
+func fetchCustomBalance(ctx context.Context, p *store.Provider, apiKey string, spec *BalanceSpec) (balanceReading, error) {
 	base := strings.TrimRight(p.Endpoint, "/")
 	body, err := doBalanceGET(ctx, p, base+spec.Path, apiKey, spec.Auth == "anthropic")
 	if err != nil {
-		return 0, "", "", err
+		return balanceReading{}, err
 	}
 	var payload any
 	if err := json.Unmarshal(body, &payload); err != nil {
-		return 0, "", "", fmt.Errorf("解析余额响应失败：%w", err)
+		return balanceReading{}, fmt.Errorf("解析余额响应失败：%w", err)
 	}
 	amount, ok := lookupNumber(payload, spec.Field)
 	if !ok {
-		return 0, "", "", fmt.Errorf("响应里没有字段 %q（或它不是数值）", spec.Field)
+		return balanceReading{}, fmt.Errorf("响应里没有字段 %q（或它不是数值）", spec.Field)
 	}
 	// detail 带上「取了哪个字段」：自定义配置下管理员可能配错路径而恰好
 	// 命中另一个数字，此时能看到取值路径才有法自查。
-	return amount, spec.Currency, fmt.Sprintf("取自 %s.%s", spec.Path, spec.Field), nil
+	return balanceReading{
+		Amount:   &amount,
+		Currency: spec.Currency,
+		Detail:   fmt.Sprintf("取自 %s.%s", spec.Path, spec.Field),
+	}, nil
 }
 
 // lookupNumber 按点号路径从任意 JSON 里取数值。
@@ -444,11 +478,11 @@ func doBalanceGET(ctx context.Context, p *store.Provider, url, apiKey string, an
 // 取「总额度 − 已用」而不是只报总额度：管理员的问题是「还能花多少」，
 // 报一个更大的数字会让他以为比实际宽裕。优先用 hard_limit_usd，退回
 // hard_limit（早期字段没有货币单位）；两者都没有就报错而不是编一个值。
-func fetchOpenAIBalance(ctx context.Context, p *store.Provider, apiKey string) (float64, string, string, error) {
+func fetchOpenAIBalance(ctx context.Context, p *store.Provider, apiKey string) (balanceReading, error) {
 	base := strings.TrimRight(p.Endpoint, "/")
 	body, err := doBalanceGET(ctx, p, base+"/dashboard/billing/subscription", apiKey, false)
 	if err != nil {
-		return 0, "", "", err
+		return balanceReading{}, err
 	}
 	var sub struct {
 		HardLimitUSD *float64 `json:"hard_limit_usd"`
@@ -456,7 +490,7 @@ func fetchOpenAIBalance(ctx context.Context, p *store.Provider, apiKey string) (
 		SoftLimitUSD *float64 `json:"soft_limit_usd"`
 	}
 	if err := json.Unmarshal(body, &sub); err != nil {
-		return 0, "", "", fmt.Errorf("解析 OpenAI 订阅信息失败：%w", err)
+		return balanceReading{}, fmt.Errorf("解析 OpenAI 订阅信息失败：%w", err)
 	}
 
 	limit := sub.HardLimitUSD
@@ -464,26 +498,40 @@ func fetchOpenAIBalance(ctx context.Context, p *store.Provider, apiKey string) (
 		limit = sub.HardLimit
 	}
 	if limit == nil {
-		return 0, "", "", &unsupportedBalanceErr{
+		return balanceReading{}, &unsupportedBalanceErr{
 			msg: "OpenAI 订阅响应里没有额度上限字段（该 key 可能不是标准 API 计费账号）",
+		}
+	}
+
+	usageBody, err := doBalanceGET(ctx, p, base+"/dashboard/billing/usage", apiKey, false)
+	if err != nil {
+		return balanceReading{}, &balanceUnknownErr{
+			msg: "额度上限已读取，但本月用量未知：" + err.Error(),
+		}
+	}
+	var usage struct {
+		TotalUsage *float64 `json:"total_usage"`
+	}
+	if err := json.Unmarshal(usageBody, &usage); err != nil {
+		return balanceReading{}, &balanceUnknownErr{
+			msg: "额度上限已读取，但本月用量响应无法解析：" + err.Error(),
+		}
+	}
+	if usage.TotalUsage == nil {
+		return balanceReading{}, &balanceUnknownErr{
+			msg: "额度上限已读取，但本月用量响应缺少 total_usage",
 		}
 	}
 
 	// 已用额是**当月**的，7 月订阅的余额不会在 8 月被扣 —— 所以拿它算
 	// 「可用」在跨月时会偏大。detail 里把两个原始值都带出，让管理员自己
 	// 判断，界面上不该出现一个看起来精确、实际有口径问题的可用余额。
-	used := 0.0
-	if b, err := doBalanceGET(ctx, p, base+"/dashboard/billing/usage", apiKey, false); err == nil {
-		var usage struct {
-			TotalUsage *float64 `json:"total_usage"`
-		}
-		if json.Unmarshal(b, &usage) == nil && usage.TotalUsage != nil {
-			used = *usage.TotalUsage
-		}
-	}
-
-	detail := fmt.Sprintf("总额度 %.2f USD，本月已用 %.2f USD", *limit, used)
-	return *limit - used, "USD", detail, nil
+	available := *limit - *usage.TotalUsage
+	return balanceReading{
+		Amount:   &available,
+		Currency: "USD",
+		Detail:   fmt.Sprintf("总额度 %.2f USD，本月已用 %.2f USD", *limit, *usage.TotalUsage),
+	}, nil
 }
 
 // fetchDeepSeekBalance 走 DeepSeek 公开的 /user/balance。
@@ -492,26 +540,26 @@ func fetchOpenAIBalance(ctx context.Context, p *store.Provider, apiKey string) (
 // 两种都试：取不到数值时按 is_available=false 报「已无可用余额」，
 // 而不是返回「查不到」—— 前者是真实答案，后者是网关的失败，混为一谈会让
 // 管理员以为要换 key 而其实只是该充值了。
-func fetchDeepSeekBalance(ctx context.Context, p *store.Provider, apiKey string) (float64, string, string, error) {
+func fetchDeepSeekBalance(ctx context.Context, p *store.Provider, apiKey string) (balanceReading, error) {
 	base := strings.TrimRight(p.Endpoint, "/")
 	body, err := doBalanceGET(ctx, p, base+"/user/balance", apiKey, false)
 	if err != nil {
-		return 0, "", "", err
+		return balanceReading{}, err
 	}
 	var payload struct {
 		IsAvailable *bool `json:"is_available"`
 		Balance     any   `json:"balance_infos"`
 	}
 	if err := json.Unmarshal(body, &payload); err != nil {
-		return 0, "", "", fmt.Errorf("解析 DeepSeek 余额失败：%w", err)
+		return balanceReading{}, fmt.Errorf("解析 DeepSeek 余额失败：%w", err)
 	}
 	if payload.Balance == nil {
-		return 0, "", "", &unsupportedBalanceErr{msg: "DeepSeek 余额响应里没有 balance_infos 字段"}
+		return balanceReading{}, &unsupportedBalanceErr{msg: "DeepSeek 余额响应里没有 balance_infos 字段"}
 	}
 
 	amount, ok := firstNumericIn(payload.Balance)
 	if !ok {
-		return 0, "", "", fmt.Errorf("无法从 balance_infos 中读出余额数值")
+		return balanceReading{}, fmt.Errorf("无法从 balance_infos 中读出余额数值")
 	}
 
 	detail := ""
@@ -520,7 +568,7 @@ func fetchDeepSeekBalance(ctx context.Context, p *store.Provider, apiKey string)
 		detail = "上游标记该账号余额不足/不可用"
 		amount = 0
 	}
-	return amount, "CNY", detail, nil
+	return balanceReading{Amount: &amount, Currency: "CNY", Detail: detail}, nil
 }
 
 // firstNumericIn 从 balance_infos 里取第一个可解析的数值。
@@ -555,6 +603,21 @@ func firstNumericIn(v any) (float64, bool) {
 func errorsAs(err error, target **unsupportedBalanceErr) bool {
 	for err != nil {
 		if e, ok := err.(*unsupportedBalanceErr); ok {
+			*target = e
+			return true
+		}
+		u, ok := err.(interface{ Unwrap() error })
+		if !ok {
+			return false
+		}
+		err = u.Unwrap()
+	}
+	return false
+}
+
+func errorsAsError(err error, target **balanceUnknownErr) bool {
+	for err != nil {
+		if e, ok := err.(*balanceUnknownErr); ok {
 			*target = e
 			return true
 		}

@@ -305,21 +305,30 @@ func (h *Handler) Handle(codec ingress.Codec) http.HandlerFunc {
 		var rate *RateCommit
 		var est int64
 		needEstimate := authCtx.TPMLimit > 0
+		// Route resolution must precede estimation: an omitted client cap
+		// reserves against the largest output ceiling in the candidate chain.
+		snap := h.snapshot()
+		routingStart := diag.begin("routing")
+		res, err := snap.Routes.Resolve(ing.Model)
+		diag.end("routing", routingStart)
+		if err != nil {
+			codec.WriteError(w, http.StatusNotFound, "model_not_found", ModelNotFoundMessage(snap, ing.Model))
+			diag.setResult("error", "model_not_found", "")
+			return
+		}
+		route := res.Route
+		outCeilings := make([]int, 0, len(res.Candidates))
+		for _, cand := range res.Candidates {
+			if cand.UpstreamModel != nil {
+				outCeilings = append(outCeilings, cand.UpstreamModel.MaxOutputTokens)
+			}
+		}
+		outputCeiling := ingress.RequestOutputCeiling(ing.BuildRosetta(), outCeilings)
 		quotaStart := diag.begin("quota")
 		if needEstimate {
-			est = ingress.EstimateRequestTokens(ing.BuildRosetta())
-			if ok, retry := h.limiter.ReserveTPM(authCtx.KeyID, authCtx.TPMLimit, est); !ok {
-				diag.end("quota", quotaStart)
-				logger.Warn("rate limited (tpm)", "key_id", authCtx.KeyID,
-					"estimated_tokens", est, "retry_after", retry.String(),
-					"request_id", httpx.RequestIDFromContext(r.Context()))
-				setRetryAfter(w, retry)
-				codec.WriteError(w, http.StatusTooManyRequests, "rate_limit_exceeded",
-					"token rate limit exceeded for this API key")
-				diag.setResult("error", "rate_limit_exceeded", "")
-				return
-			}
-			rate = NewRateCommit(h.limiter, authCtx.KeyID, authCtx.TPMLimit, est, db, logger)
+			est = ingress.EstimateRequestTokens(ing.BuildRosetta(), outputCeiling)
+			rate = NewRateCommit(h.limiter, authCtx.KeyID, authCtx.TPMLimit, 0, db, logger)
+			rate.SetRequestID(httpx.RequestIDFromContext(r.Context()))
 		}
 
 		// 终身 token 配额**原子预占**（DESIGN §11.2）。
@@ -350,7 +359,7 @@ func (h *Handler) Handle(codec ingress.Codec) http.HandlerFunc {
 			logger.Error("quota lookup failed (fail-open)", "error", qerr, "key_id", authCtx.KeyID)
 		} else if quota > 0 {
 			if !needEstimate {
-				est = ingress.EstimateRequestTokens(ing.BuildRosetta())
+				est = ingress.EstimateRequestTokens(ing.BuildRosetta(), outputCeiling)
 			}
 			reserved, rok, rerr := db.ReserveQuota(r.Context(), authCtx.KeyID, est)
 			switch {
@@ -381,6 +390,7 @@ func (h *Handler) Handle(codec ingress.Codec) http.HandlerFunc {
 			default:
 				if rate == nil {
 					rate = NewRateCommit(h.limiter, authCtx.KeyID, 0, 0, db, logger)
+					rate.SetRequestID(httpx.RequestIDFromContext(r.Context()))
 				}
 				rate.SetKeyQuotaReserved(reserved)
 			}
@@ -412,7 +422,7 @@ func (h *Handler) Handle(codec ingress.Codec) http.HandlerFunc {
 		// 配置了额度」—— 与 key 级用 GetKeyQuota 判 quota>0 完全对称。
 		if u := h.snapshot().UsersByID[authCtx.UserID]; u != nil && u.QuotaTokens > 0 {
 			if !needEstimate {
-				est = ingress.EstimateRequestTokens(ing.BuildRosetta())
+				est = ingress.EstimateRequestTokens(ing.BuildRosetta(), outputCeiling)
 			}
 			reserved, rok, rerr := db.ReserveUserQuota(r.Context(), authCtx.UserID, est)
 			switch {
@@ -437,23 +447,29 @@ func (h *Handler) Handle(codec ingress.Codec) http.HandlerFunc {
 			default:
 				if rate == nil {
 					rate = NewRateCommit(h.limiter, authCtx.KeyID, 0, 0, db, logger)
+					rate.SetRequestID(httpx.RequestIDFromContext(r.Context()))
 				}
 				rate.SetUserQuotaReserved(authCtx.UserID, reserved)
 			}
 		}
 		diag.end("quota", quotaStart)
-
-		snap := h.snapshot()
-		routingStart := diag.begin("routing")
-		res, err := snap.Routes.Resolve(ing.Model)
-		diag.end("routing", routingStart)
-		if err != nil {
-			rate.Commit(0)
-			codec.WriteError(w, http.StatusNotFound, "model_not_found", ModelNotFoundMessage(snap, ing.Model))
-			diag.setResult("error", "model_not_found", "")
-			return
+		// TPM is reserved last among admission checks with the same estimate.
+		// Quota exhaustion must remain visible as insufficient_quota rather
+		// than being masked by a TPM rejection caused by that same request.
+		if needEstimate {
+			if ok, retry := h.limiter.ReserveTPM(authCtx.KeyID, authCtx.TPMLimit, est); !ok {
+				rate.ReleaseQuota()
+				logger.Warn("rate limited (tpm)", "key_id", authCtx.KeyID,
+					"estimated_tokens", est, "retry_after", retry.String(),
+					"request_id", httpx.RequestIDFromContext(r.Context()))
+				setRetryAfter(w, retry)
+				codec.WriteError(w, http.StatusTooManyRequests, "rate_limit_exceeded",
+					"token rate limit exceeded for this API key")
+				diag.setResult("error", "rate_limit_exceeded", "")
+				return
+			}
+			rate.setTPMReserved(est)
 		}
-		route := res.Route
 
 		// 模型白名单（多用户改造 P1）：组白名单 ∩ key 白名单，任一非空即生效。
 		//
@@ -508,6 +524,18 @@ func (h *Handler) Handle(codec ingress.Codec) http.HandlerFunc {
 			"model", ing.Model,
 			"request_id", httpx.RequestIDFromContext(r.Context()))
 
+		// 尝试预算：链上按 position 升序最多打 maxTargets 个目标。
+		// 未开启故障转移 → 只打主目标（等价于改造前的单目标行为，零回归）。
+		// 策略值统一来自「设置」页写入的全局默认（快照），config 只作兜底。
+		cands := res.Candidates
+		limit := len(cands)
+		if !route.FailoverEnabled {
+			limit = 1
+		} else if budget := FailoverMaxTargets(snap, h.cfg); budget < limit {
+			limit = budget
+		}
+		preflight := preflightCandidates(route.FailoverEnabled, limit, cands)
+
 		// 余额预检（Lead 与用户确认的口径：预检拒绝，不做预占/退款）。
 		//
 		// 位置：白名单之后、触碰上游之前。理由与上面的白名单同级 —— 白名单
@@ -524,7 +552,7 @@ func (h *Handler) Handle(codec ingress.Codec) http.HandlerFunc {
 		// 必然不等，预占了就得退款（等于把 ReserveQuota/ReleaseQuota 那套再
 		// 实现一遍，而那正是 2026-10-07 的 P0-2 教训）。所以这里是纯查询。
 		balanceStart := diag.begin("balance_precheck")
-		bal := h.precheckBalance(w, r, authCtx, ing, res.Candidates, codec)
+		bal := h.precheckBalance(w, r, authCtx, ing, preflight, codec)
 		diag.end("balance_precheck", balanceStart)
 		if !bal {
 			// 余额预检已写回 402/500。rate.Commit(0) 不能省：走到这里说明
@@ -536,16 +564,9 @@ func (h *Handler) Handle(codec ingress.Codec) http.HandlerFunc {
 			return
 		}
 
-		// 尝试预算：链上按 position 升序最多打 maxTargets 个目标。
-		// 未开启故障转移 → 只打主目标（等价于改造前的单目标行为，零回归）。
-		// 策略值统一来自「设置」页写入的全局默认（快照），config 只作兜底。
-		cands := res.Candidates
-		limit := len(cands)
-		if !route.FailoverEnabled {
-			limit = 1
-		} else if budget := FailoverMaxTargets(snap, h.cfg); budget < limit {
-			limit = budget
-		}
+		// The same attempt budget is used by balance preflight and the actual
+		// lane. It is computed above, before any admission query that depends
+		// on which upstream models can actually serve this request.
 
 		// 开故障转移时，跳过正被熔断的目标（若全被熔断则退回整条链，宁可打也不 404）。
 		//
@@ -740,38 +761,10 @@ func (h *Handler) Handle(codec ingress.Codec) http.HandlerFunc {
 			} else {
 				out = h.attemptNonStream(w, attemptReq, client, ing, cand, authCtx, codec, rate, snap, start, routeTrace, diag, attemptTrace, i+1, attemptStart)
 			}
-			if out.Committed {
-				// 只有真成功才记成功 —— 断流/溢出/上游错误虽已提交，却是失败，
-				// 必须让目标熔断计数与凭据健康照常累计，否则故障永不转移。
-				if out.Success {
-					h.pool.RecordCredentialSuccess(credID)
-					h.pool.RecordTargetSuccess(cand.TargetID, probeToken)
-					routeTrace = AppendRouteTrace(routeTrace, i+1, cand, "ok", "")
-				} else if out.NoUpstreamPenalty {
-					// gateway-local overflow is not evidence that the target or
-					// credential is unhealthy. Clear a half-open probe and keep
-					// the serving target available.
-					routeTrace = AppendRouteTrace(routeTrace, i+1, cand, "committed_fail", out.Code)
-					h.pool.RecordTargetSuccess(cand.TargetID, probeToken)
-					h.pool.RecordCredentialSuccess(credID)
-				} else if out.GatewayTimeout {
-					// 网关总预算到期同样不是上游不健康的证据（2026-10-22 修 *X11）。
-					// 与 overflow 一样按「不罚上游」收尾；usage 已经按 timeout 落库。
-					routeTrace = AppendRouteTrace(routeTrace, i+1, cand, "committed_fail", out.Code)
-					h.pool.RecordTargetSuccess(cand.TargetID, probeToken)
-					h.pool.RecordCredentialSuccess(credID)
-				} else if out.ClientGone {
-					// 客户端自己走了（用户点停止 / 进程退出 / 网络切换）。
-					// 这既不是上游故障也不该罚凭据：照记的话，连续三次
-					// 取消就会把健康目标熔断一整个冷却窗口，期间该路由
-					// 全量 502。凭据同样不冷却 —— key 本身没问题。
-					routeTrace = AppendRouteTrace(routeTrace, i+1, cand, "committed_fail", "client_canceled")
-					h.pool.RecordTargetSuccess(cand.TargetID, probeToken)
-					h.pool.RecordCredentialSuccess(credID)
-				} else {
-					h.pool.RecordTargetFailure(cand.TargetID, probeToken, threshold)
-					routeTrace = AppendRouteTrace(routeTrace, i+1, cand, "committed_fail", out.Code)
-				}
+			decision := out.LaneDecision()
+			if decision.Committed {
+				recordCommittedOutcome(h.pool, decision, cand.TargetID, credID, probeToken, threshold)
+				routeTrace = AppendRouteTrace(routeTrace, i+1, cand, decision.TraceOutcome, decision.TraceReason)
 				probeRecorded = true // 名额由记账释放
 				return
 			}
@@ -792,7 +785,7 @@ func (h *Handler) Handle(codec ingress.Codec) http.HandlerFunc {
 			// 用 ctx.Err()==nil 会把「预算到期」也一起放过去 —— 那是网关侧的
 			// 事件，但请求确实已经打到了这个目标，用它当「上游健康」的证据
 			// 同样不成立，所以这里只排除真正的客户端取消。
-			if out.Eligible && !IsClientGone(r.Context(), nil) {
+			if decision.PenalizeUpstream {
 				h.pool.RecordTargetFailure(cand.TargetID, probeToken, threshold)
 				probeRecorded = true // 名额由记账释放
 				if out.CredentialCooldown > 0 {
@@ -802,11 +795,7 @@ func (h *Handler) Handle(codec ingress.Codec) http.HandlerFunc {
 
 			// 未提交的失败：记下「哪个目标、什么原因、是否可转移」。
 			// 不可转移同样要记 —— 运维最常问的正是「为什么这次没换上游」。
-			if out.Eligible {
-				routeTrace = AppendRouteTrace(routeTrace, i+1, cand, "fail_switch", out.Code)
-			} else {
-				routeTrace = AppendRouteTrace(routeTrace, i+1, cand, "fail_terminal", out.Code)
-			}
+			routeTrace = AppendRouteTrace(routeTrace, i+1, cand, decision.TraceOutcome, decision.TraceReason)
 
 			// 没走到记账的两种形态 —— 不可转移错误（out.Eligible==false）与
 			// 客户端中断（ctx 已取消）—— 在此归还探测名额，否则 halfOpen 卡死、
@@ -816,7 +805,7 @@ func (h *Handler) Handle(codec ingress.Codec) http.HandlerFunc {
 				h.pool.ReleaseTargetProbe(cand.TargetID, probeToken)
 			}
 
-			if !out.Eligible || isLast {
+			if !decision.Eligible || isLast {
 				break
 			}
 			logger.Warn("failover: switching to next target",
@@ -833,9 +822,10 @@ func (h *Handler) Handle(codec ingress.Codec) http.HandlerFunc {
 		// TotalRequestBudget 的超时（DeadlineExceeded），那是网关侧事件，
 		// 记成 canceled 会让网关自己的超时在报表里与用户主动取消混为一谈，
 		// 并让「写不写错误响应」这个决定被预算到期误触发。
-		clientGone := IsClientGone(r.Context(), r.Context().Err())
-		gatewayTimeout := out.GatewayTimeout ||
-			(out.Eligible && errors.Is(r.Context().Err(), context.DeadlineExceeded))
+		out = out.WithRequestContext(r.Context())
+		decision := out.LaneDecision()
+		clientGone := decision.DownstreamClient
+		gatewayTimeout := decision.GatewayTimeout
 
 		statusCode, code, message := out.StatusCode, out.Code, out.Message
 		// 兜底：不许把 200 或 0 当作「失败结果」发出去。
@@ -854,7 +844,7 @@ func (h *Handler) Handle(codec ingress.Codec) http.HandlerFunc {
 		if !clientGone {
 			codec.WriteError(w, statusCode, code, message)
 		}
-		diag.setResult(statusForDiagnostics(clientGone, gatewayTimeout), errorCodeForDiagnostics(clientGone, gatewayTimeout, code), out.Detail)
+		diag.setResult(decision.DiagnosticStatus, decision.DiagnosticError, out.Detail)
 		diag.setTerminal(clientGone, gatewayTimeout)
 		rate.Commit(0)
 		provID, providerName, upstreamModel, upstreamProtocol := "", "", "", ""
@@ -870,17 +860,16 @@ func (h *Handler) Handle(codec ingress.Codec) http.HandlerFunc {
 				upstreamProtocol = lastUpstreamProtocol
 			}
 		}
-		status := store.UsageStatusError
-		errorCode := code
+		status := decision.UsageStatus
+		errorCode := decision.DiagnosticError
 		errorDetail := out.Detail
-		if clientGone {
-			status = store.UsageStatusCanceled
+		switch decision.Kind {
+		case OutcomeClientAborted:
 			logger.Info("client disconnected before any response was written",
 				"model", ing.Model, "request_id", httpx.RequestIDFromContext(r.Context()))
 			errorCode = ""
 			errorDetail = ""
-		} else if gatewayTimeout {
-			status = store.UsageStatusTimeout
+		case OutcomeGatewayTimeout:
 			errorCode = "gateway_timeout"
 			errorDetail = "gateway request budget exceeded"
 			logger.Warn("request cut by gateway total request budget",
@@ -1098,7 +1087,8 @@ func (h *Handler) attemptStream(w http.ResponseWriter, r *http.Request, client *
 			// 首字超时是目标侧的性能/可用性问题，不是这把 key 失效：
 			// 只累计目标熔断，不冷却凭据。否则单 key provider 会在一次
 			// 慢响应后整家 60s 不可用。
-			out := Outcome{Eligible: true,
+			out := Outcome{Kind: OutcomeUpstreamFailed,
+				Eligible:   true,
 				StatusCode: http.StatusGatewayTimeout, Code: "upstream_timeout",
 				Message: "upstream first-token timeout",
 				Detail:  "upstream did not produce its first stream event before the first-token timeout"}
@@ -1106,7 +1096,8 @@ func (h *Handler) attemptStream(w http.ResponseWriter, r *http.Request, client *
 			return out
 		}
 		// 干净 EOF 却在首个事件之前（上游返回 200 后立刻空流）—— 按可转移的空响应处理。
-		out := Outcome{Eligible: true, StatusCode: http.StatusBadGateway,
+		out := Outcome{Kind: OutcomeUpstreamFailed,
+			Eligible: true, StatusCode: http.StatusBadGateway,
 			Code: "upstream_error", Message: "upstream returned empty response",
 			Detail: "upstream closed the stream cleanly before producing its first event"}
 		finishAttempt(&attempt, attemptTrace, attemptStart, out, nil, diag)
@@ -1507,14 +1498,7 @@ func (h *Handler) attemptStream(w http.ResponseWriter, r *http.Request, client *
 	attempt.OutputRunes = partialOutRunes
 	attempt.PostTTFBMs = time.Since(firstEventAt).Milliseconds()
 	applyTraceTimings(&attempt, attemptTrace)
-	out := Outcome{
-		Committed:         true,
-		Success:           status == store.UsageStatusOK,
-		ClientGone:        status == store.UsageStatusCanceled,
-		NoUpstreamPenalty: status == store.UsageStatusOverflow,
-		GatewayTimeout:    status == store.UsageStatusTimeout,
-		Code:              errorCode,
-	}
+	out := Outcome{Kind: committedKindForStatus(status), Code: errorCode}.normalize()
 	setAttemptDiagnosis(&attempt, out, terminalErr)
 	diag.addAttempt(attempt)
 	diag.setStreamOutput(partialOutRunes, attempt.ToolCalls, attempt.FirstToolCallMs)
@@ -1574,7 +1558,21 @@ func (h *Handler) attemptNonStream(w http.ResponseWriter, r *http.Request, clien
 	latency := time.Since(start).Milliseconds()
 	ttfbMs := latency
 
-	codec.WriteNonStream(w, resp, publicModel, ing)
+	writeResult := codec.WriteNonStream(w, resp, publicModel, ing)
+	if writeResult.Err != nil {
+		if writeResult.EncodeError() {
+			return h.finishNonStreamEncodeFailure(
+				w, r, cand, authCtx, codec, rate, publicModel,
+				start, priorTrace, diag, &attempt, attemptTrace, attemptStart,
+				writeResult,
+			)
+		}
+		return h.finishNonStreamWriteFailure(
+			r, resp, cand, authCtx, codec, rate, publicModel, upstreamProtocol,
+			start, priorTrace, diag, &attempt, attemptTrace, attemptStart,
+			latency, ttfbMs, writeResult,
+		)
+	}
 
 	h.usage.RecordWithCallback(&store.UsageRecord{
 		ID:                   newID(),
@@ -1614,14 +1612,154 @@ func (h *Handler) attemptNonStream(w http.ResponseWriter, r *http.Request, clien
 	attempt.TTFBMs = attempt.UpstreamCallMs
 	attempt.Committed = true
 	attempt.Success = true
-	finishAttempt(&attempt, attemptTrace, attemptStart, Outcome{Committed: true, Success: true}, nil, diag)
+	success := Outcome{Kind: OutcomeCommittedSuccess}.normalize()
+	finishAttempt(&attempt, attemptTrace, attemptStart, success, nil, diag)
 	diag.setUsage(resp.Usage.OutputTokens)
 	diag.setResult(store.UsageStatusOK, "", "")
 	diag.setRouteTrace(strings.Join(AppendRouteTrace(priorTrace, len(priorTrace)+1, cand, "ok", ""), "; "))
 	// 非流式能走到这里就意味着上游完整返回了响应 —— 一定是成功。
 	// 漏写 Success 会让每次非流式成功都被外层记成「目标失败」，
 	// 健康的链首目标 3 个请求后就被误熔断（详见 Outcome.Success）。
-	return Outcome{Committed: true, Success: true}
+	return success
+}
+
+func (h *Handler) finishNonStreamEncodeFailure(
+	w http.ResponseWriter,
+	r *http.Request,
+	cand routing.Candidate,
+	authCtx *auth.Context,
+	codec ingress.Codec,
+	rate *RateCommit,
+	publicModel string,
+	start time.Time,
+	priorTrace []string,
+	diag *requestDiagnostics,
+	attempt *attemptDiagnostics,
+	attemptTrace *upstream.AttemptTrace,
+	attemptStart time.Time,
+	writeResult outwire.NonStreamWriteResult,
+) Outcome {
+	code := "response_encode_failed"
+	message := "gateway failed to encode the upstream response"
+	detail := outwire.SafeErrorDetail(writeResult.Err)
+	h.logger.Error("non-stream response encoding failed",
+		"model", publicModel, "key_id", authCtx.KeyID, "error", writeResult.Err)
+	codec.WriteError(w, http.StatusInternalServerError, code, message)
+
+	h.usage.Record(&store.UsageRecord{
+		ID:               newID(),
+		AccessKeyID:      authCtx.KeyID,
+		UserID:           authCtx.UserID,
+		RequestID:        httpx.RequestIDFromContext(r.Context()),
+		PublicModel:      publicModel,
+		ProviderID:       cand.Provider.ID,
+		ProviderName:     cand.Provider.Name,
+		UpstreamModel:    cand.UpstreamModel.ModelID,
+		IngressProtocol:  codec.Name(),
+		UpstreamProtocol: h.effectiveProviderProtocol(cand),
+		Stream:           false,
+		UsageState:       store.UsageStateNone,
+		Status:           store.UsageStatusError,
+		HTTPStatus:       http.StatusInternalServerError,
+		ErrorCode:        code,
+		ErrorDetail:      detail,
+		LatencyMs:        time.Since(start).Milliseconds(),
+		RouteTrace: strings.Join(AppendRouteTrace(
+			priorTrace, len(priorTrace)+1, cand, "fail_terminal", code), "; "),
+	})
+	rate.Commit(0)
+
+	out := Outcome{Kind: OutcomeEncodeFailed, Code: code}.normalize()
+	finishAttempt(attempt, attemptTrace, attemptStart, out, writeResult.Err, diag)
+	diag.setResult(store.UsageStatusError, code, detail)
+	diag.setRouteTrace(strings.Join(AppendRouteTrace(
+		priorTrace, len(priorTrace)+1, cand, "fail_terminal", code), "; "))
+	diag.setTerminal(false, false)
+	return out
+}
+
+func (h *Handler) finishNonStreamWriteFailure(
+	r *http.Request,
+	resp *rosetta.ChatResponse,
+	cand routing.Candidate,
+	authCtx *auth.Context,
+	codec ingress.Codec,
+	rate *RateCommit,
+	publicModel, upstreamProtocol string,
+	start time.Time,
+	priorTrace []string,
+	diag *requestDiagnostics,
+	attempt *attemptDiagnostics,
+	attemptTrace *upstream.AttemptTrace,
+	attemptStart time.Time,
+	latency, ttfbMs int64,
+	writeResult outwire.NonStreamWriteResult,
+) Outcome {
+	writeErr := writeResult.Err
+	status := store.UsageStatusCanceled
+	errorCode := "downstream_write_failed"
+	errorDetail := outwire.SafeErrorDetail(writeErr)
+	httpStatus := http.StatusOK
+	logger := h.logger
+
+	if outwire.IsDownstreamWriteError(writeErr) {
+		logger.Info("downstream write failed after non-stream response",
+			"model", publicModel, "key_id", authCtx.KeyID, "error", writeErr)
+	} else {
+		logger.Error("unexpected non-stream response write error",
+			"model", publicModel, "key_id", authCtx.KeyID, "error", writeErr)
+	}
+
+	h.usage.RecordWithCallback(&store.UsageRecord{
+		ID:                   newID(),
+		AccessKeyID:          authCtx.KeyID,
+		UserID:               authCtx.UserID,
+		RequestID:            httpx.RequestIDFromContext(r.Context()),
+		PublicModel:          publicModel,
+		ProviderID:           cand.Provider.ID,
+		ProviderName:         cand.Provider.Name,
+		UpstreamModel:        cand.UpstreamModel.ModelID,
+		IngressProtocol:      codec.Name(),
+		UpstreamProtocol:     upstreamProtocol,
+		Stream:               false,
+		InputTokens:          resp.Usage.InputTokens,
+		OutputTokens:         resp.Usage.OutputTokens,
+		TotalTokens:          resp.Usage.TotalTokens,
+		ReasoningTokens:      resp.Usage.ReasoningTokens,
+		CachedTokens:         resp.Usage.CachedInputTokens,
+		CachedCreationTokens: resp.Usage.CachedCreationTokens,
+		UsageState:           usageStateFor(resp.Usage),
+		Status:               status,
+		HTTPStatus:           httpStatus,
+		ErrorCode:            errorCode,
+		ErrorDetail:          errorDetail,
+		LatencyMs:            latency,
+		TTFBMs:               ttfbMs,
+		RouteTrace: strings.Join(AppendRouteTrace(
+			priorTrace, len(priorTrace)+1, cand, "committed_fail", errorCode), "; "),
+	}, func() {
+		if !resp.Usage.IsZero() {
+			rate.Commit(resp.Usage.TotalTokens)
+		} else {
+			rate.ReleaseQuota()
+		}
+	})
+
+	out := Outcome{Kind: OutcomeDownstreamWriteFailed, Code: errorCode}.normalize()
+	attempt.Status = status
+	attempt.ErrorCode = errorCode
+	attempt.ErrorDetail = errorDetail
+	attempt.DurationMs = time.Since(attemptStart).Milliseconds()
+	attempt.TTFBMs = attempt.UpstreamCallMs
+	attempt.Committed = true
+	attempt.Success = false
+	finishAttempt(attempt, attemptTrace, attemptStart, out, writeErr, diag)
+	diag.setUsage(resp.Usage.OutputTokens)
+	diag.setResult(status, errorCode, errorDetail)
+	diag.setRouteTrace(strings.Join(AppendRouteTrace(
+		priorTrace, len(priorTrace)+1, cand, "committed_fail", errorCode), "; "))
+	diag.setTerminal(true, false)
+	return out
 }
 
 // usageStateFor 区分「上游报了用量」与「上游一个 token 数都没给」。

@@ -3,6 +3,7 @@ package admin
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"strings"
@@ -131,10 +132,18 @@ func decodeJSON(w http.ResponseWriter, r *http.Request, v any) error {
 			"Content-Type 必须是 application/json")
 		return errUnsupportedMediaType
 	}
-	return json.NewDecoder(r.Body).Decode(v)
+	err := json.NewDecoder(r.Body).Decode(v)
+	var tooLarge *http.MaxBytesError
+	if errors.As(err, &tooLarge) {
+		writeError(w, http.StatusRequestEntityTooLarge,
+			fmt.Sprintf("request body exceeds %d bytes", tooLarge.Limit))
+		return errRequestTooLarge
+	}
+	return err
 }
 
 var errUnsupportedMediaType = errors.New("unsupported media type")
+var errRequestTooLarge = errors.New("request body too large")
 
 // isJSONContentType 报告请求的 Content-Type 是否是 JSON。
 //

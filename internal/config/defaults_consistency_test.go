@@ -8,7 +8,7 @@ import (
 	"testing"
 )
 
-// TestProbes_显式关闭不被改回开启 钉住「probes 块全零才算没配过」这条判据。
+// TestProbes_显式关闭不被改回开启 钉住「enabled 键是否出现」这条判据。
 //
 // 此前 setDefaults 用的是 `if !c.Probes.Enabled { c.Probes.Enabled = true }`，
 // 于是运维写 `{"probes":{"enabled":false}}`（最自然的关法）会被静默改回开启
@@ -39,6 +39,19 @@ func TestProbes_整块缺失默认开启(t *testing.T) {
 	}
 }
 
+func TestProbes_部分对象仍默认开启(t *testing.T) {
+	c, err := Parse([]byte(`{"listen":"127.0.0.1:8666","probes":{"interval_sec":300}}`))
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	if !c.Probes.Enabled {
+		t.Fatal("probes 对象缺省 enabled 时必须默认开启")
+	}
+	if c.Probes.IntervalSec != 300 {
+		t.Fatalf("显式 interval_sec 未保留，实际 %d", c.Probes.IntervalSec)
+	}
+}
+
 // TestAuditLogKeepRows 覆盖新配置项的缺省与关闭语义。
 func TestAuditLogKeepRows(t *testing.T) {
 	t.Run("缺省 20000", func(t *testing.T) {
@@ -57,6 +70,15 @@ func TestAuditLogKeepRows(t *testing.T) {
 		}
 		if c.AuditLogKeepRows != -1 {
 			t.Fatalf("-1 不应被默认值覆盖，实际 %d", c.AuditLogKeepRows)
+		}
+	})
+	t.Run("0 表示永久留存", func(t *testing.T) {
+		c, err := Parse([]byte(`{"listen":"127.0.0.1:8666","audit_log_keep_rows":0}`))
+		if err != nil {
+			t.Fatalf("0 应合法（关闭剪枝）: %v", err)
+		}
+		if c.AuditLogKeepRows != 0 {
+			t.Fatalf("显式 0 不应被默认值覆盖，实际 %d", c.AuditLogKeepRows)
 		}
 	})
 	t.Run("正数原样保留", func(t *testing.T) {

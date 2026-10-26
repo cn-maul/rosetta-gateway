@@ -28,6 +28,13 @@ const settingModelDefaultsKey = "model_defaults"
 // 设完即永久关闭。
 const settingBootstrapCompletedKey = "bootstrap_completed"
 
+// settingConfigBootstrapCompletedKey marks completion of the provider graph
+// imported from config. It is deliberately independent from the first-run
+// administrator marker above: an installation can finish administrator setup
+// on an empty catalog, and a catalog can be imported before the administrator
+// password is set.
+const settingConfigBootstrapCompletedKey = "config_bootstrap_completed"
+
 // BootstrapCompleted 报告本安装是否已完成过首次引导。
 // 未写过标记返回 false —— 此时窗口是否开放仍由
 // FindUninitializedAdmin 的旧判定兜底。
@@ -37,6 +44,24 @@ func (s *Store) BootstrapCompleted(ctx context.Context) (bool, error) {
 		return false, err
 	}
 	return v == "1", nil
+}
+
+// ConfigBootstrapCompleted reports whether the provider graph imported from
+// config completed. A legacy installation may have a complete graph without
+// this marker; the bootstrap command verifies that graph before backfilling it.
+func (s *Store) ConfigBootstrapCompleted(ctx context.Context) (bool, error) {
+	v, ok, err := s.getSetting(ctx, settingConfigBootstrapCompletedKey)
+	if err != nil || !ok {
+		return false, err
+	}
+	return v == "1", nil
+}
+
+// MarkConfigBootstrapCompletedTx writes the durable "complete provider graph
+// installed" marker in the caller's transaction. The first-run administrator
+// marker is a different state machine and must never be reused here.
+func (s *Store) MarkConfigBootstrapCompletedTx(ctx context.Context, tx Tx) error {
+	return setSettingExec(ctx, tx, settingConfigBootstrapCompletedKey, "1")
 }
 
 // 未显式配置时的兜底默认：探测不到模型容量时使用。

@@ -55,39 +55,10 @@ jobs:
           fetch-depth: 0
 
       - name: 检查已入库文件不含产物 / 密钥 / 数据
-        run: |
-          set -uo pipefail
-          # 先把匹配打出来再判失败。只给一句「有文件不该入库」是不够的：
-          # 没人知道该去删哪个，而修复动作是 `git rm --cached <file>`，
-          # 漏掉文件名就得靠人去猜。
-          bad="$(git ls-files \
-                  | grep -Ei '\.(exe|dll|so|db|db-shm|db-wal|sqlite|sqlite3|key|pem|crt|log|bak|bak-[0-9].*|oldbak)$' \
-                  || true)"
-          bad="$bad
-          $(git ls-files | grep -Ex 'session_secret(\.oldbak)?' || true)"
-          bad="$bad
-          $(git ls-files | grep -Ex 'master\.key' || true)"
-          bad="$bad
-          $(git ls-files | grep -Ex '(admin_auth|config)\.json' || true)"
-          bad="$bad
-          $(git ls-files | grep -E '^(data|bin|work|tools)/' || true)"
-
-          # 去掉上面若干次 grep 叠出来的空行，只留真正的命中
-          bad="$(printf '%s\n' "$bad" | sed '/^$/d' | sort -u)"
-
-          if [ -n "$bad" ]; then
-            echo "::error::以下文件已被 git 跟踪，但它们属于构建产物 / 数据库 / 密钥 / 运行数据，绝不应入库："
-            printf '%s\n' "$bad" | sed 's/^/    /'
-            echo ""
-            echo "修复（保留本地文件、只从索引移除）："
-            printf '%s\n' "$bad" | sed 's|^|    git rm --cached |'
-            echo ""
-            echo "若这些文件已在历史里，删当前文件不足以消除泄露："
-            echo "    git filter-repo --path <file> --invert-paths"
-            echo "  （会重写历史，需要强推，并让所有协作者重新 clone）"
-            exit 1
-          fi
-          echo "已入库文件干净：无 exe / db / 密钥 / 数据文件。"
+        # 复用本地脚本，而不是在 YAML 里维护一份更弱的 grep。脚本还检查
+        # ignore 探针与 CRLF 空行陷阱；只查 git ls-files 会漏掉后者。
+        # ubuntu-latest 自带 PowerShell，不需要额外安装。
+        run: pwsh -NoProfile -File scripts/check-repo-hygiene.ps1
 
   go:
     runs-on: ubuntu-latest

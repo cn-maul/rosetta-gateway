@@ -33,13 +33,37 @@ const maxAuditBodyBytes = 64 << 10
 // fields 是请求体顶层字段名（不含值 —— body 里会有 api_key/密码明文）。
 type WriteAuditor func(actor, method, path string, status int, remote, fields string)
 
+// auditActorSlot carries the authenticated actor across middleware contexts.
+//
+// UserAuth authenticates on a derived request context, while AutoReload wraps
+// UserAuth and sees the original request context. A per-request slot created
+// by AutoReload lets UserAuth record the identity once authentication succeeds
+// without making failed authentication trigger a reload.
+type auditActorSlot struct {
+	actor string
+}
+
+type auditActorSlotKey struct{}
+
+func recordAuditActor(ctx context.Context, actor string) {
+	if slot, ok := ctx.Value(auditActorSlotKey{}).(*auditActorSlot); ok && slot != nil {
+		slot.actor = strings.TrimSpace(actor)
+	}
+}
+
 // auditActor 从请求上下文取操作者身份。
 //
 // 审计曾经把 actor 写死成 "admin"：AutoReload 的回调没有透传会话身份，
 // 于是普通用户改自己的 key、管理员改别人的配额，落库后都叫 "admin"。
 // 事后追责时只能看到 IP，无法回答「是谁把这条路由切到无效上游的」。
-// 身份已经在鉴权链里注入 context，这里直接读，不额外查库。
+// 身份由 UserAuth 在鉴权成功时写进本请求的 slot；直接挂在外层
+// AutoReload 上的请求仍回退到 context 里的用户，便于既有调用方使用。
 func auditActor(ctx context.Context) string {
+	if slot, ok := ctx.Value(auditActorSlotKey{}).(*auditActorSlot); ok && slot != nil {
+		if actor := strings.TrimSpace(slot.actor); actor != "" {
+			return actor
+		}
+	}
 	if u := identity.UserFromContext(ctx); u != nil {
 		if name := strings.TrimSpace(u.Username); name != "" {
 			return name
@@ -82,6 +106,8 @@ func auditActor(ctx context.Context) string {
 // 传 nil 表示不兜底（测试里用普通 reload 桩即可，无需实现任何接口）。
 func AutoReload(next http.Handler, reload func(context.Context) error, audit WriteAuditor, logger *slog.Logger, onFail func()) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		r = r.WithContext(context.WithValue(r.Context(), auditActorSlotKey{}, &auditActorSlot{}))
+
 		// 请求体只在此处缓存一份（上限 maxAuditBodyBytes）：handler 要读，审计要字段名。
 		// 超过上限时**必须原样放行**：body 被截断后 handler 会拿残缺 JSON 去解析，
 		// 报出一个与真实原因无关的 400（大 provider 的模型批量导入就会这样失败）。

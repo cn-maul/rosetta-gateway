@@ -170,9 +170,19 @@ func PriceUsage(priceInput, priceCacheHit, priceCacheCreation, priceOutput, inpu
 	return total
 }
 
-// PriceUsageWithPrices 是 PriceUsage 的 Prices 版本。
+// PriceUsageWithPrices is the Prices version used by the actual-cost path.
+// It resolves fallback prices through EffectivePrices so precheck and stored
+// usage cannot disagree about which token buckets are billable.
 func PriceUsageWithPrices(p Prices, inputTokens, cachedTokens, cachedCreationTokens, outputTokens float64) float64 {
-	return PriceUsage(p.Input, p.CacheHit, p.CacheCreation, p.Output, inputTokens, cachedTokens, cachedCreationTokens, outputTokens)
+	eff, priced := p.EffectivePrices()
+	if !priced {
+		// An explicitly unpriced model stays free. The difference between
+		// "no price configured" and "configured to zero for this bucket" is
+		// decided once, in EffectivePrices.
+		return 0
+	}
+	return PriceUsage(eff.Input, eff.CacheHit, eff.CacheCreation, eff.Output,
+		inputTokens, cachedTokens, cachedCreationTokens, outputTokens)
 }
 
 // EstimateUpperBoundCost 估算「一次调用最多可能花多少钱」（元）。

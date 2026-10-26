@@ -375,22 +375,35 @@ func (u *Recorder) Logger() *slog.Logger { return u.logger }
 // 关停超时可能发生在整批重试阶段，那些记录还没有逐条尝试过，若不在这里
 // 汇总，日志里就只剩下一句「records were lost」，无法知道丢了哪几次调用。
 func (u *Recorder) logPendingAbandoned(jobs []persistJob) {
-	if len(jobs) == 0 {
-		return
-	}
 	const maxSample = 10
 	sample := make([]string, 0, maxSample)
-	for _, job := range jobs {
-		if len(sample) == maxSample {
-			break
+	count := 0
+	finish := func(job persistJob) {
+		count++
+		if len(sample) < maxSample {
+			sample = append(sample, job.rec.RequestID)
 		}
-		sample = append(sample, job.rec.RequestID)
 		// 关停已放弃：这些记录不会再有落库机会，配额预占必须释放，
 		// 否则进程若继续存活（或下次启动读到同一库）会永久冻结额度。
 		job.finish()
 	}
+	for _, job := range jobs {
+		finish(job)
+	}
+	// CloseQueue runs before Abort. Jobs still buffered in the closed channel
+	// are already admitted; abandoning the worker must not silently skip
+	// their quota callbacks. The worker is the sole consumer, so draining
+	// here cannot race with another worker.
+	if !u.Accepting() {
+		for job := range u.queue {
+			finish(job)
+		}
+	}
+	if count == 0 {
+		return
+	}
 	u.logger.Error("usage recorder aborted with unpersisted records",
-		"count", len(jobs), "request_id_sample", sample,
+		"count", count, "request_id_sample", sample,
 		"hint", "persistent write failure or shutdown deadline; reconcile these request_ids manually")
 }
 
@@ -793,8 +806,9 @@ func (u *Recorder) RecordWithCallback(rec *store.UsageRecord, done func()) {
 	}
 	job := persistJob{rec: rec, done: done}
 
-	// 「判关闭 + 入队」必须在同一把锁里完成，否则会与 wait 的 close 竞争，
-	// 产生 send on closed channel（见 mu 的注释）。锁外的同步写只碰 DB。
+	// Admission and close share mu. Queue-full synchronous backpressure is
+	// attempted only while admission was observed open; shutdown never starts
+	// a new DB write behind the join barrier.
 	u.mu.Lock()
 	if !u.closed {
 		select {
@@ -802,22 +816,23 @@ func (u *Recorder) RecordWithCallback(rec *store.UsageRecord, done func()) {
 			u.mu.Unlock()
 			return
 		default:
-			// 队列已满 —— 落到下面同步写（背压）。
+			u.mu.Unlock()
+			cost, err := u.db.CreateUsageRecordWithCost(context.Background(), rec)
+			if err != nil {
+				u.logger.Error("failed to record usage (sync fallback)",
+					"error", err, "key_id", rec.AccessKeyID)
+			} else {
+				u.charge(rec, cost)
+			}
+			job.finish()
+			return
 		}
 	}
 	u.mu.Unlock()
 
-	// 到这里有两种可能：队列满（背压），或队列已关闭（关停收尾）。
-	// 后者仍走同步写而不是丢弃：这条记录对应的是一次**已经发生的调用**，
-	// 而关停 drain 的全部意义就是别把它弄丢。
-	cost, err := u.db.CreateUsageRecordWithCost(context.Background(), rec)
-	if err != nil {
-		u.logger.Error("failed to record usage (sync fallback)", "error", err, "key_id", rec.AccessKeyID)
-		// 同步路径没有重试队列；不释放就会永久冻结预占。
-		job.finish()
-		return
-	}
-	u.charge(rec, cost)
+	u.logger.Error("usage record rejected after recorder shutdown",
+		"request_id", rec.RequestID, "key_id", rec.AccessKeyID,
+		"user_id", rec.UserID)
 	job.finish()
 }
 
@@ -858,21 +873,42 @@ func (u *Recorder) HasPendingUsage() bool {
 // 调用方（main 的关停流程）应当据此打一条 ERROR —— 那是**真丢了计费记录**，
 // 不能像原来那样无声无息。
 func (u *Recorder) Wait(ctx context.Context) bool {
-	u.mu.Lock()
-	u.closed = true
-	close(u.queue)
-	u.mu.Unlock()
-
-	done := make(chan struct{})
-	go func() {
-		u.wg.Wait()
-		close(done)
-	}()
-	select {
-	case <-done:
-	case <-ctx.Done():
-		// 超时放弃：可能 worker 还在重试循环里。此时 flushFailed 仍为 true，
-		// 返回 false 让调用方知道「这批没落干净」。
+	u.CloseQueue()
+	joined := u.Join(ctx)
+	if !joined {
+		// A live worker may still be inside a DB call. The absence of a
+		// flush-failure marker is not exit evidence.
+		return false
 	}
 	return !u.HasPendingUsage()
+}
+
+// CloseQueue stops accepting new asynchronous jobs. Calls that arrive after
+// this point are rejected rather than synchronously writing behind a drain
+// deadline, so lifecycle shutdown can join every writer before closing store.
+func (u *Recorder) CloseQueue() {
+	u.mu.Lock()
+	if !u.closed {
+		u.closed = true
+		close(u.queue)
+	}
+	u.mu.Unlock()
+}
+
+// Join waits for every worker to exit. A false return means the caller must
+// not close the store; the worker may still be inside database/sql.
+func (u *Recorder) Join(ctx context.Context) bool {
+	select {
+	case <-u.done:
+		return true
+	case <-ctx.Done():
+		return false
+	}
+}
+
+// Accepting reports whether asynchronous queue admission is still open.
+func (u *Recorder) Accepting() bool {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	return !u.closed
 }

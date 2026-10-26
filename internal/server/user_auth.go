@@ -131,6 +131,11 @@ func (a *UserAuthMiddleware) ServeHTTP(w http.ResponseWriter, r *http.Request, n
 		return
 	}
 
+	// AutoReload sits outside this middleware and records the audit entry after
+	// the handler returns. Persist the authenticated actor in that request's
+	// slot; the derived context below is not visible to the outer middleware.
+	recordAuditActor(r.Context(), u.Username)
+
 	ctx := identity.WithSession(r.Context(), sess, u)
 	next.ServeHTTP(w, r.WithContext(ctx))
 }

@@ -9,11 +9,13 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/cn-maul/rosetta-gateway/internal/api"
 	"github.com/cn-maul/rosetta-gateway/internal/billing"
 	"github.com/cn-maul/rosetta-gateway/internal/config"
 	"github.com/cn-maul/rosetta-gateway/internal/crypto"
+	"github.com/cn-maul/rosetta-gateway/internal/lifecycle"
 	"github.com/cn-maul/rosetta-gateway/internal/ratelimit"
 	"github.com/cn-maul/rosetta-gateway/internal/runtime"
 	"github.com/cn-maul/rosetta-gateway/internal/snapshot"
@@ -28,7 +30,7 @@ const HomeEnvVar = "ROSETTA_GW_HOME"
 
 // BootstrapFunc initializes first-run administrator credentials. It remains an
 // injected concern so gatewayapp does not depend on the command package.
-type BootstrapFunc func(context.Context, *store.Store, *slog.Logger) error
+type BootstrapFunc func(context.Context, *store.Store, *slog.Logger) (lifecycle.BootstrapState, error)
 
 // Options are the process-level hooks supplied by cmd/gateway.
 type Options struct {
@@ -39,7 +41,7 @@ type Options struct {
 // Run initializes the gateway and serves traffic until shutdown. Configuration,
 // storage, runtime state, and session initialization are owned here; the
 // command package only supplies version and handler/bootstrapping hooks.
-func Run(opts Options) error {
+func Run(opts Options) (retErr error) {
 	logLevel := new(slog.LevelVar)
 	logLevel.Set(slog.LevelInfo)
 	logger := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{
@@ -117,13 +119,30 @@ func Run(opts Options) error {
 		logger.Error("failed to open database", "error", err)
 		return err
 	}
-	defer db.Close()
+	// Never close storage unless every worker and writer has proven that it
+	// exited. On an unproven join the process returns with an error and lets
+	// process exit close the OS resources instead of racing a live SQL call.
+	closeStore := false
+	defer func() {
+		if !closeStore {
+			return
+		}
+		if err := db.Close(); err != nil {
+			retErr = errors.Join(retErr, fmt.Errorf("close store: %w", err))
+		}
+	}()
 
-	bootstrapDB(db, cfg, logger, masterKey)
+	if err := bootstrapDB(context.Background(), db, cfg, logger, masterKey); err != nil {
+		logger.Error("database bootstrap failed, refusing to start",
+			"error", err,
+			"impact", "配置中的上游、凭据、模型或路由未能作为完整图提交")
+		return err
+	}
 
 	pool := upstream.NewPool(logger)
 	pool.SetCooldownStore(db)
 	reloader := runtime.New(db, masterKey, pool, cfg, logger)
+	lifecycleState := lifecycle.NewManager(db, reloader)
 	if err := reloader.Reload(context.Background()); err != nil {
 		logger.Warn("failed to build runtime from DB, falling back to config", "error", err)
 		if err := pool.BuildFromConfig(cfg); err != nil {
@@ -134,38 +153,58 @@ func Run(opts Options) error {
 
 	reloadCtx, stopReloadRetry := context.WithCancel(context.Background())
 	defer stopReloadRetry()
-	go reloader.WatchRetry(reloadCtx)
+	reloadRetryDone := make(chan struct{})
+	lifecycleState.AddWorkers(1)
+	go func() {
+		defer close(reloadRetryDone)
+		defer lifecycleState.WorkerExited()
+		reloader.WatchRetry(reloadCtx)
+	}()
 
 	recorder := usage.New(usage.Config{
 		DB:              db,
 		Logger:          logger,
 		IsBalanceExempt: balanceExempt,
 	})
-	defer recorder.Abort()
+	lifecycleState.AddWorkers(1)
+	go func() {
+		<-recorder.Done()
+		lifecycleState.WorkerExited()
+	}()
 
+	bootstrapState := lifecycle.BootstrapUnknown
 	if opts.Bootstrap != nil {
-		if err := opts.Bootstrap(context.Background(), db, logger); err != nil {
+		outcome, err := opts.Bootstrap(context.Background(), db, logger)
+		if err != nil {
 			logger.Error("bootstrap initialization failed, refusing to start",
 				"error", err,
+				"outcome", outcome,
 				"impact", "无法安全地建立首次管理员账号；继续监听会让初始化状态不确定",
 				"hint", "检查数据库可用性与状态目录权限后重启")
 			return fmt.Errorf("bootstrap initialization failed, refusing to start: %w", err)
 		}
+		bootstrapState = outcome
 	}
 
 	pending, err := db.FindUninitializedAdmin(context.Background())
 	if err != nil {
-		logger.Error("cannot read bootstrap state; admin UI may be unreachable", "error", err)
+		logger.Error("cannot read bootstrap state, refusing to start",
+			"error", err,
+			"impact", "无法确认首次管理员账号是否可用，继续监听会产生错误的就绪状态")
+		return fmt.Errorf("read bootstrap state: %w", err)
 	} else if pending != nil && !isLoopbackListen(cfg.Listen) {
+		bootstrapState = lifecycle.BootstrapSetupRequired
 		logger.Error("SECURITY: admin password not yet set AND listening on a non-loopback address — "+
 			"anyone who can reach this port can attempt to become the first administrator; "+
 			"complete first-run setup immediately",
 			"listen", cfg.Listen,
 			"immediate_action", "立即在浏览器打开 /admin/ 完成首次设置密码")
 	} else if pending != nil {
+		bootstrapState = lifecycle.BootstrapSetupRequired
 		logger.Warn("admin password not set yet; open the admin UI to complete first-run setup",
 			"note", "监听地址是回环，仅本机可访问；一旦改为 0.0.0.0 暴露到网络，请立即完成设置")
 	}
+	lifecycleState.SetBootstrap(bootstrapState)
 
 	// TLS 契约（2026-10-22 修 A10-P0-1 残留）。
 	//
@@ -200,17 +239,69 @@ func Run(opts Options) error {
 		SessionMgr:  sessionMgr,
 		RateLimiter: ratelimit.New(),
 		Usage:       recorder,
+		Lifecycle:   lifecycleState,
 	})
 
-	return Serve(ServeDeps{
-		DB:        db,
-		Config:    cfg,
-		Logger:    logger,
-		MasterKey: masterKey,
-		Reloader:  reloader,
-		Usage:     recorder,
-		Handler:   handler,
+	retErr = Serve(ServeDeps{
+		DB:              db,
+		Config:          cfg,
+		Logger:          logger,
+		MasterKey:       masterKey,
+		Reloader:        reloader,
+		Usage:           recorder,
+		Handler:         handler,
+		Lifecycle:       lifecycleState,
+		ReloadRetryDone: reloadRetryDone,
 	})
+
+	lifecycleState.SetPhase(lifecycle.PhaseStopping)
+	stopReloadRetry()
+	allJoined := retErr == nil || !errors.Is(retErr, ErrWorkersNotJoined)
+	select {
+	case <-reloadRetryDone:
+	default:
+		select {
+		case <-reloadRetryDone:
+		case <-time.After(lifecycle.DefaultShutdownBudget().RuntimeRetryJoin):
+			allJoined = false
+		}
+	}
+
+	drainCtx, drainCancel := context.WithTimeout(
+		context.Background(), lifecycle.DefaultShutdownBudget().UsageDrain)
+	usageDrained := recorder.Wait(drainCtx)
+	drainCancel()
+	if !usageDrained {
+		recorder.Abort()
+		joinCtx, joinCancel := context.WithTimeout(
+			context.Background(), lifecycle.DefaultShutdownBudget().UsageAbortJoin)
+		if !recorder.Join(joinCtx) {
+			allJoined = false
+		}
+		joinCancel()
+		logger.Error("usage drain incomplete: records were lost during shutdown",
+			"hint", "check earlier 'usage record lost' / 'usage recorder aborted' errors for request_id")
+	} else {
+		recorder.CloseQueue()
+		if !recorder.Join(context.Background()) {
+			allJoined = false
+		}
+	}
+
+	if allJoined && lifecycleState.WorkersJoined() == false &&
+		lifecycleState.PendingWorkers() == 0 {
+		lifecycleState.MarkWorkersJoined()
+	}
+	if !lifecycleState.WorkersJoined() {
+		allJoined = false
+	}
+	lifecycleState.SetPhase(lifecycle.PhaseStopped)
+	if !allJoined {
+		retErr = errors.Join(retErr, ErrWorkersNotJoined)
+		return retErr
+	}
+	closeStore = true
+	return retErr
 }
 
 func resolveHome(exeDir string) string {

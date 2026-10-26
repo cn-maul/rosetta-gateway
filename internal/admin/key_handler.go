@@ -403,9 +403,9 @@ func callerIsAdmin(r *http.Request) bool {
 //   - IP 白名单：现值为空（不限）时可任意收紧；现值非空时新集合必须 ⊆ 现集合
 //     （每个新网段都落在某个现有网段内），且不能清空。
 //
-// allowed_models 刻意不在此列：它有组白名单兜底（管理员控制的有效上限），
-// 且自助建 key 本来就能建出一把无白名单的 key —— 只拦这里的「清空」拦不住
-// 任何真实威胁，却会破坏「取消所有勾选后保存」的既有界面流程。
+// allowed_models follows the same monotonic rule: the current key-level set is
+// an existing restriction. An owner may preserve it or narrow it, but cannot
+// clear, replace, or widen it; only an admin may remove or broaden it.
 //
 // 返回 false 表示已写出 403，调用方应立即 return。必须在任何字段写入前调用。
 func (h *KeyHandler) guardNoLoosening(w http.ResponseWriter, r *http.Request, req keyRequest, existing *store.AccessKey) bool {
@@ -435,6 +435,33 @@ func (h *KeyHandler) guardNoLoosening(w http.ResponseWriter, r *http.Request, re
 	if req.AllowedIPs != nil {
 		if msg := ipAllowlistWidened(existing.AllowedIPs, *req.AllowedIPs); msg != "" {
 			writeError(w, http.StatusForbidden, msg)
+			return false
+		}
+	}
+	if req.AllowedModels != nil && !modelAllowlistCanTighten(existing.AllowedModels, *req.AllowedModels) {
+		writeError(w, http.StatusForbidden,
+			"模型白名单只能收紧不能清空或更换（需管理员修改）")
+		return false
+	}
+	return true
+}
+
+// modelAllowlistCanTighten reports whether next preserves or narrows the
+// existing key-level allowlist. nil and a decoded empty slice both grant all
+// models in store.AccessKey; a non-nil slice is the restricted set.
+func modelAllowlistCanTighten(existing, next []string) bool {
+	if existing == nil {
+		return true
+	}
+	current := make(map[string]struct{}, len(existing))
+	for _, m := range existing {
+		current[m] = struct{}{}
+	}
+	if len(next) == 0 {
+		return false
+	}
+	for _, m := range store.NormalizeModelNames(next) {
+		if _, ok := current[m]; !ok {
 			return false
 		}
 	}

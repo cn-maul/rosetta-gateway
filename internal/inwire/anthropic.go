@@ -539,6 +539,11 @@ func convertUserMessage(raw json.RawMessage) []rosetta.Message {
 		case "document":
 			if blk, ok := fileBlock(b); ok {
 				rest = append(rest, blk)
+			} else {
+				// A legal document shape we cannot translate must not become
+				// "no content" silently. Preserve it as an invalid file block
+				// so rosetta validation returns an explicit 400.
+				rest = append(rest, rosetta.Block{Type: rosetta.BlockFile})
 			}
 		default:
 			// 未知块类型（各家私有扩展）：交给 rosetta validate 报 400，
@@ -668,6 +673,17 @@ func fileBlock(b anthropicBlock) (rosetta.Block, bool) {
 		media = "application/pdf"
 	}
 	switch b.Source.Type {
+	case "text":
+		// Anthropic defines a text document source as inline plain text.
+		// The normalized model has no separate text-document block, but a
+		// text block preserves the actual readable content instead of
+		// dropping the attachment.
+		if b.Source.Data == "" {
+			return rosetta.Block{}, false
+		}
+		return rosetta.Block{
+			Type: rosetta.BlockText, Text: b.Source.Data, CacheControl: b.cacheControl(),
+		}, true
 	case "base64":
 		if b.Source.Data == "" {
 			return rosetta.Block{}, false

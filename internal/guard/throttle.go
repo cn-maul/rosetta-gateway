@@ -119,8 +119,16 @@ const maxConcurrentAttempts = 4
 func (t *FailureThrottle) Release(ip string) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	if e, ok := t.fails[ip]; ok && e.inflight > 0 {
-		e.inflight--
+	if e, ok := t.fails[ip]; ok {
+		if e.inflight > 0 {
+			e.inflight--
+		}
+		if e.inflight == 0 && e.count == 0 && e.until.IsZero() {
+			delete(t.fails, ip)
+		}
+	}
+	if len(t.fails) >= maxEntries {
+		t.sweepLocked()
 	}
 }
 
@@ -194,7 +202,6 @@ func (t *FailureThrottle) Success(ip string) {
 // 代价是攻击者换个 IP 就能重置计数 —— 可接受，这个限速的目标是挡住单个来源的
 // 暴力枚举，不是分布式防护。
 func (t *FailureThrottle) sweepLocked() {
-	const maxEntries = 4096
 	if len(t.fails) < maxEntries {
 		return
 	}
@@ -244,3 +251,6 @@ func (t *FailureThrottle) sweepLocked() {
 	// （map 非空就能删到一半）。
 	evictTo(false)
 }
+
+// maxEntries bounds successful and failed authentication paths alike.
+const maxEntries = 4096

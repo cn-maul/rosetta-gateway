@@ -4,7 +4,9 @@ package gatewayapp
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
@@ -12,6 +14,7 @@ import (
 	"time"
 
 	"github.com/cn-maul/rosetta-gateway/internal/config"
+	"github.com/cn-maul/rosetta-gateway/internal/lifecycle"
 	"github.com/cn-maul/rosetta-gateway/internal/probe"
 	"github.com/cn-maul/rosetta-gateway/internal/runtime"
 	"github.com/cn-maul/rosetta-gateway/internal/store"
@@ -21,13 +24,19 @@ import (
 // ServeDeps contains the initialized dependencies needed to serve traffic and
 // run the periodic maintenance loops.
 type ServeDeps struct {
-	DB        *store.Store
-	Config    *config.Config
-	Logger    *slog.Logger
-	MasterKey []byte
-	Reloader  *runtime.Reloader
-	Usage     *usage.Recorder
-	Handler   http.Handler
+	DB              *store.Store
+	Config          *config.Config
+	Logger          *slog.Logger
+	MasterKey       []byte
+	Reloader        *runtime.Reloader
+	Usage           *usage.Recorder
+	Handler         http.Handler
+	Lifecycle       *lifecycle.Manager
+	Budget          lifecycle.ShutdownBudget
+	ReloadRetryDone <-chan struct{}
+	// Stop lets tests drive the same shutdown path as a termination signal.
+	// Production leaves it nil and listens for SIGINT/SIGTERM.
+	Stop <-chan struct{}
 }
 
 // Serve starts the HTTP server and maintenance loops, then blocks until a
@@ -35,10 +44,25 @@ type ServeDeps struct {
 // stop writers before closing the store, then drain pending usage.
 func Serve(deps ServeDeps) error {
 	db, cfg, logger := deps.DB, deps.Config, deps.Logger
+	budget := deps.Budget
+	if budget.Nominal() == 0 {
+		budget = lifecycle.DefaultShutdownBudget()
+	}
+	if deps.Lifecycle != nil {
+		deps.Lifecycle.SetPhase(lifecycle.PhaseStarting)
+	}
 	shutdown := make(chan struct{})
 
 	probeCtx, stopProbe := context.WithCancel(context.Background())
 	defer stopProbe()
+
+	// Bind before starting any maintenance worker or publishing ready. A
+	// startup failure must not leave a ready window or untracked background
+	// writes behind.
+	listener, err := net.Listen("tcp", cfg.Listen)
+	if err != nil {
+		return fmt.Errorf("listen %s: %w", cfg.Listen, err)
+	}
 
 	srv := &http.Server{
 		Addr:        cfg.Listen,
@@ -55,41 +79,48 @@ func Serve(deps ServeDeps) error {
 	serverErr := make(chan error, 1)
 	go func() {
 		logger.Info("server starting", "addr", cfg.Listen)
-		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+		if err := srv.Serve(listener); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			serverErr <- err
 		}
 	}()
 
-	pruneDone := startPruner(db, cfg, logger, shutdown)
-	recomputeDone := startRecompute(db, logger, shutdown)
-	reconcileDone := startReconcile(db, logger, shutdown)
-	probeDone := startProbe(db, cfg, deps.MasterKey, logger, probeCtx)
+	pruneDone := startPruner(db, cfg, logger, shutdown, deps.Lifecycle)
+	recomputeDone := startRecompute(db, logger, shutdown, deps.Lifecycle)
+	reconcileDone := startReconcile(db, logger, shutdown, deps.Lifecycle)
+	probeDone := startProbe(db, cfg, deps.MasterKey, logger, probeCtx, deps.Lifecycle)
 
 	quit := make(chan os.Signal, 1)
 	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
 	defer signal.Stop(quit)
 
 	var runErr error
+	if deps.Lifecycle != nil {
+		deps.Lifecycle.SetPhase(lifecycle.PhaseReady)
+	}
 	select {
 	case <-quit:
+	case <-deps.Stop:
 	case runErr = <-serverErr:
 		logger.Error("server error", "error", runErr)
 	}
 
 	// Stop every background writer before closing the store.
+	if deps.Lifecycle != nil {
+		deps.Lifecycle.SetPhase(lifecycle.PhaseStopping)
+	}
 	close(shutdown)
 	stopProbe()
-	waitLoop(pruneDone, 5*time.Second,
+	allJoined := waitLoop(pruneDone, budget.UsagePrune,
 		logger, "usage prune still running at shutdown; exiting anyway")
-	waitLoop(recomputeDone, 2*time.Second,
-		logger, "cost recompute still running at shutdown; exiting anyway")
-	waitLoop(reconcileDone, 2*time.Second,
-		logger, "charge reconciliation still running at shutdown; exiting anyway")
-	waitLoop(probeDone, 2*time.Second,
-		logger, "probe runner still running at shutdown; exiting anyway")
+	allJoined = waitLoop(recomputeDone, budget.CostRecompute,
+		logger, "cost recompute still running at shutdown; exiting anyway") && allJoined
+	allJoined = waitLoop(reconcileDone, budget.ChargeReconcile,
+		logger, "charge reconciliation still running at shutdown; exiting anyway") && allJoined
+	allJoined = waitLoop(probeDone, budget.ProbeJoin,
+		logger, "probe runner still running at shutdown") && allJoined
 
 	logger.Info("shutting down...")
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), budget.HTTPDrain)
 	defer cancel()
 	if err := srv.Shutdown(ctx); err != nil {
 		logger.Error("graceful shutdown incomplete; forcing close of in-flight connections",
@@ -99,22 +130,24 @@ func Serve(deps ServeDeps) error {
 		}
 	}
 
-	drainCtx, drainCancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer drainCancel()
-	if !deps.Usage.Wait(drainCtx) {
-		deps.Usage.Abort()
-		logger.Error("usage drain incomplete: records were lost during shutdown",
-			"hint", "check earlier 'usage record lost' / 'usage recorder aborted' errors for request_id")
+	if !allJoined {
+		runErr = errors.Join(runErr, ErrWorkersNotJoined)
 	}
 	logger.Info("server stopped")
 	return runErr
 }
 
-func waitLoop(done <-chan struct{}, timeout time.Duration, logger *slog.Logger, message string) {
+// ErrWorkersNotJoined prevents the owning process from closing storage while
+// a registered worker may still be inside database/sql.
+var ErrWorkersNotJoined = errors.New("background workers did not join before shutdown deadline")
+
+func waitLoop(done <-chan struct{}, timeout time.Duration, logger *slog.Logger, message string) bool {
 	select {
 	case <-done:
+		return true
 	case <-time.After(timeout):
 		logger.Warn(message)
+		return false
 	}
 }
 
@@ -130,14 +163,23 @@ func maintenanceContext(shutdown <-chan struct{}) (context.Context, context.Canc
 	return ctx, cancel
 }
 
-func startPruner(db *store.Store, cfg *config.Config, logger *slog.Logger, shutdown <-chan struct{}) <-chan struct{} {
+func startPruner(db *store.Store, cfg *config.Config, logger *slog.Logger,
+	shutdown <-chan struct{}, lifecycle *lifecycle.Manager) <-chan struct{} {
 	done := make(chan struct{})
+	if lifecycle != nil {
+		lifecycle.AddWorkers(1)
+	}
 	go func() {
 		defer close(done)
+		if lifecycle != nil {
+			defer lifecycle.WorkerExited()
+		}
 		ctx, cancel := maintenanceContext(shutdown)
 		defer cancel()
 		pruneAudit := func(reason string) {
-			if cfg.AuditLogKeepRows <= 0 {
+			// 0 and -1 both mean permanent retention. Treating 0 as an
+			// omitted value here would silently prune a compliance setting.
+			if cfg.AuditLogKeepRows == 0 || cfg.AuditLogKeepRows < 0 {
 				return
 			}
 			n, err := db.PruneAuditLog(ctx, cfg.AuditLogKeepRows)
@@ -151,6 +193,12 @@ func startPruner(db *store.Store, cfg *config.Config, logger *slog.Logger, shutd
 			}
 		}
 		runPrune := func(reason string) bool {
+			if n, err := db.SweepExpiredQuotaReservations(ctx, time.Now()); err != nil {
+				logger.Warn("expired quota reservation sweep failed", "error", err, "trigger", reason)
+			} else if n > 0 {
+				logger.Warn("recovered expired quota reservation leases",
+					"requests", n, "trigger", reason)
+			}
 			started := time.Now()
 			var deleted, rollups int64
 			for batch := 0; batch < 10 && time.Since(started) < 30*time.Second; batch++ {
@@ -205,10 +253,17 @@ func startPruner(db *store.Store, cfg *config.Config, logger *slog.Logger, shutd
 	return done
 }
 
-func startRecompute(db *store.Store, logger *slog.Logger, shutdown <-chan struct{}) <-chan struct{} {
+func startRecompute(db *store.Store, logger *slog.Logger, shutdown <-chan struct{},
+	lifecycle *lifecycle.Manager) <-chan struct{} {
 	done := make(chan struct{})
+	if lifecycle != nil {
+		lifecycle.AddWorkers(1)
+	}
 	go func() {
 		defer close(done)
+		if lifecycle != nil {
+			defer lifecycle.WorkerExited()
+		}
 		ctx, cancel := maintenanceContext(shutdown)
 		defer cancel()
 		runRecompute := func(reason string) {
@@ -246,35 +301,31 @@ func startRecompute(db *store.Store, logger *slog.Logger, shutdown <-chan struct
 	return done
 }
 
-func startReconcile(db *store.Store, logger *slog.Logger, shutdown <-chan struct{}) <-chan struct{} {
+func startReconcile(db *store.Store, logger *slog.Logger, shutdown <-chan struct{},
+	lifecycle *lifecycle.Manager) <-chan struct{} {
 	done := make(chan struct{})
+	if lifecycle != nil {
+		lifecycle.AddWorkers(1)
+	}
 	go func() {
 		defer close(done)
+		if lifecycle != nil {
+			defer lifecycle.WorkerExited()
+		}
 		ctx, cancel := maintenanceContext(shutdown)
 		defer cancel()
 		runReconcile := func(reason string) {
-			found, err := db.FindUnchargedUsage(ctx, 500)
+			result, err := db.ReconcileUnchargedUsage(ctx, 500)
 			if err != nil {
 				logger.Error("charge reconciliation scan failed", "error", err, "trigger", reason)
 				return
 			}
-			if len(found) == 0 {
+			if result.Charged == 0 && result.Deferred == 0 && result.Failed == 0 {
 				return
 			}
-			var charged, failed int
-			for _, u := range found {
-				if cerr := db.ChargeUnchargedUsage(ctx, u); cerr != nil {
-					failed++
-					logger.Error("charge reconciliation failed to charge",
-						"error", cerr, "record_id", u.RecordID,
-						"user_id", u.UserID, "request_id", u.RequestID,
-						"cost_yuan", u.CostYuan)
-					continue
-				}
-				charged++
-			}
 			logger.Warn("reconciled uncharged usage records",
-				"trigger", reason, "found", len(found), "charged", charged, "failed", failed)
+				"trigger", reason, "charged", result.Charged,
+				"deferred", result.Deferred, "failed", result.Failed)
 		}
 		// Last of the three: reconciliation rewrites money, so let the pruner
 		// and recompute finish their first pass first.
@@ -293,14 +344,21 @@ func startReconcile(db *store.Store, logger *slog.Logger, shutdown <-chan struct
 	return done
 }
 
-func startProbe(db *store.Store, cfg *config.Config, masterKey []byte, logger *slog.Logger, ctx context.Context) <-chan struct{} {
+func startProbe(db *store.Store, cfg *config.Config, masterKey []byte, logger *slog.Logger,
+	ctx context.Context, lifecycle *lifecycle.Manager) <-chan struct{} {
 	done := make(chan struct{})
 	if !cfg.Probes.Enabled {
 		close(done)
 		return done
 	}
+	if lifecycle != nil {
+		lifecycle.AddWorkers(1)
+	}
 	go func() {
 		defer close(done)
+		if lifecycle != nil {
+			defer lifecycle.WorkerExited()
+		}
 		probe.NewRunner(db, cfg, masterKey, logger).Run(ctx)
 	}()
 	return done

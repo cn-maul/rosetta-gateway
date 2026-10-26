@@ -346,6 +346,9 @@ func TestStress_ConcurrentCharge_MixedAmountsStayExactAndNonNegative(t *testing.
 //
 // 顺带覆盖「跨过一分时正确清零」：余数在过程中必然会多次跨越 10000。
 func TestStress_RemainderAccumulationIsExact(t *testing.T) {
+	if testing.Short() {
+		t.Skip("该用例要执行上万次独立扣费事务，-short 下跳过")
+	}
 	ctx := context.Background()
 	st := testStore(t, t.TempDir()+"/gw.db")
 
@@ -385,6 +388,9 @@ func TestStress_RemainderAccumulationIsExact(t *testing.T) {
 //
 // 断言：N 次 0.0000001 元 = N 微元。取 N = 10000 → 恰好 1 分。
 func TestStress_TinyAmountsAreNotLost(t *testing.T) {
+	if testing.Short() {
+		t.Skip("该用例要执行上万次亚微元扣费事务，-short 下跳过")
+	}
 	ctx := context.Background()
 	st := testStore(t, t.TempDir()+"/gw.db")
 
@@ -830,6 +836,9 @@ func (p *phase) record(err error) {
 //  3. 全部结束后核对：余额减少 == floor(Σ微元 / 每分微元)、
 //     余数 == Σ微元 mod 每分微元、且从库里读回固化费用重算一遍也一致。
 func TestStress_FullLifecycle_ChargeMatchesFrozenCostExactly(t *testing.T) {
+	if testing.Short() {
+		t.Skip("100 路完整扣费生命周期压测在 -short 下跳过")
+	}
 	ctx := context.Background()
 	st := testStore(t, t.TempDir()+"/gw.db")
 	seedPricedModel(t, st, 0.2, 0.02, 0.8)

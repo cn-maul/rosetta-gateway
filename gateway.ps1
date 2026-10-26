@@ -1,4 +1,4 @@
-#Requires -Version 5.1
+﻿#Requires -Version 5.1
 <#
 gateway.ps1 — rosetta-gateway 一键脚本：编译 + 启动 + 停止
 
@@ -42,6 +42,11 @@ $LogDir  = Join-Path $Root 'bin\logs'
 
 function Die([string]$msg) { Write-Host "[X] $msg" -ForegroundColor Red; exit 1 }
 
+# Process ownership rules live in a small compiled type so they can be tested
+# without launching or terminating a real gateway. This dot-source must run
+# before any -Stop or port-owner branch.
+. (Join-Path $Root 'gateway-launcher.ps1')
+
 # ---------- 配置：由网关自身管理，位于可执行文件同级（bin\config.json） ----------
 # 网关不接受命令行参数；首次启动若无配置会自动生成默认文件。
 # 这里只为端口探测 / 停止旧进程读取该配置，缺失时按默认 8666 处理即可。
@@ -78,6 +83,50 @@ function Get-ListenerPid([int]$P) {
   return $null
 }
 
+# ---------- 进程身份 ----------
+# 只结束能证明属于本项目的进程。仅凭「占用了配置端口」或 pid 文件里的数字
+# 不足以判断身份：端口可能配错，Windows 也会回收 PID。
+function Get-ProcessIdentity([int]$ProcessId) {
+  $p = Get-Process -Id $ProcessId -ErrorAction SilentlyContinue
+  if (-not $p) { return $null }
+  $path = $null
+  try { $path = $p.Path } catch {}
+  $cmd = $null
+  try {
+    $cmd = (Get-CimInstance Win32_Process -Filter "ProcessId = $ProcessId" -ErrorAction Stop).CommandLine
+  } catch {}
+  return [pscustomobject]@{
+    Id          = $ProcessId
+    Name        = $p.ProcessName
+    Path        = $path
+    CommandLine = $cmd
+  }
+}
+
+function Test-GatewayProcess($Identity) {
+  if (-not $Identity -or -not $Identity.Path) { return $false }
+  return [RosettaGatewayLauncher.ProcessOwnership]::IsGatewayExecutable(
+    [string]$Identity.Path, $Bin)
+}
+
+function Test-GatewayWrapper($Identity) {
+  if (-not $Identity) { return $false }
+  if (-not ($Identity.Name -match '^(cmd|pwsh|powershell)(\.exe)?$')) { return $false }
+  if (-not $Identity.CommandLine) { return $false }
+  return [RosettaGatewayLauncher.ProcessOwnership]::IsLauncherWrapper(
+    [string]$Identity.CommandLine, $Bin)
+}
+
+function Format-ProcessIdentity($Identity) {
+  if (-not $Identity) { return '(进程已不存在)' }
+  $path = if ($Identity.Path) { $Identity.Path } else { '(路径不可读)' }
+  return "PID $($Identity.Id) $($Identity.Name) 路径=$path"
+}
+
+function Stop-VerifiedGatewayProcess([int]$Id) {
+  Stop-Process -Id $Id -Force -ErrorAction SilentlyContinue
+}
+
 # ---------- -Stop：停止网关 ----------
 if ($Stop) {
   $stopped = $false
@@ -94,16 +143,30 @@ if ($Stop) {
   if (Test-Path $PidFile) {
     $oldPid = (Get-Content $PidFile -ErrorAction SilentlyContinue) -join ''
     if ($oldPid -match '^\d+$') {
-      Stop-Process -Id ([int]$oldPid) -Force -ErrorAction SilentlyContinue
+      $identity = Get-ProcessIdentity ([int]$oldPid)
+      if (Test-GatewayWrapper $identity) {
+        $pidToStop = [int]$oldPid
+      Stop-VerifiedGatewayProcess -Id $pidToStop
+        Write-Host "[OK] 已停止网关包装进程（PID $pidToStop）" -ForegroundColor Green
+        $stopped = $true
+      } elseif ($identity) {
+        Write-Host "[!] 忽略陈旧 pid 文件：$(Format-ProcessIdentity $identity) 不是本项目启动器" -ForegroundColor Yellow
+      }
     }
     Remove-Item $PidFile -Force -ErrorAction SilentlyContinue
   }
   # 双保险：按端口兜底（覆盖改名/复制出去的二进制）
   $lp = Get-ListenerPid $Port
   if ($lp -and $lp -ne $PID) {
-    Stop-Process -Id $lp -Force -ErrorAction SilentlyContinue
-    Write-Host "[OK] 已停止占用端口 $Port 的进程（PID $lp）" -ForegroundColor Green
-    $stopped = $true
+    $identity = Get-ProcessIdentity $lp
+    if (Test-GatewayProcess $identity) {
+      $pidToStop = $lp
+        Stop-VerifiedGatewayProcess -Id $pidToStop
+      Write-Host "[OK] 已停止占用端口 $Port 的网关（PID $lp）" -ForegroundColor Green
+      $stopped = $true
+    } elseif ($identity) {
+      Write-Host "[!] 端口 $Port 被无关进程占用：$(Format-ProcessIdentity $identity)；未结束它。请改配置端口或自行停止该进程。" -ForegroundColor Yellow
+    }
   }
   if (-not $stopped) { Write-Host "[i] 没有发现正在运行的网关" }
   exit 0
@@ -200,9 +263,15 @@ $env:ANTHROPIC_API_KEY     = $AnthropicKey
 # ---------- 启动前：清掉占用端口的旧进程（避免"改了代码却连到旧二进制"） ----------
 $lp = Get-ListenerPid $Port
 if ($lp -and $lp -ne $PID) {
-  Write-Host "-> 端口 $Port 被占用（PID $lp），先停止旧进程"
-  Stop-Process -Id $lp -Force -ErrorAction SilentlyContinue
-  Start-Sleep -Milliseconds 800
+  $identity = Get-ProcessIdentity $lp
+  if (Test-GatewayProcess $identity) {
+    Write-Host "-> 端口 $Port 被旧网关占用（PID $lp），先停止它"
+    $pidToStop = $lp
+    Stop-VerifiedGatewayProcess -Id $pidToStop
+    Start-Sleep -Milliseconds 800
+  } elseif ($identity) {
+    Die "端口 $Port 被无关进程占用：$(Format-ProcessIdentity $identity)。未结束它；请改配置端口或自行停止该进程。"
+  }
 }
 
 # ---------- 启动 ----------
@@ -245,10 +314,22 @@ if ($proc.HasExited) {
 $gwPid = Get-ListenerPid $Port
 $health = '[?] 未知'
 try {
-  $null = Invoke-WebRequest -Uri "http://127.0.0.1:$Port/admin/" -UseBasicParsing -TimeoutSec 5
-  $health = '[OK] 健康检查通过'
+  $healthResp = Invoke-WebRequest -Uri "http://127.0.0.1:$Port/healthz" -UseBasicParsing -TimeoutSec 5
+  if ($healthResp.StatusCode -eq 200) {
+    $health = '[OK] 健康检查通过（/healthz）'
+  } else {
+    $health = "[!] 健康检查未通过：/healthz 返回 HTTP $($healthResp.StatusCode)"
+  }
 } catch {
-  $health = '[!] 健康检查未通过：' + $_.Exception.Message
+  $code = $null
+  if ($_.Exception.Response) {
+    try { $code = [int]$_.Exception.Response.StatusCode } catch {}
+  }
+  if ($code) {
+    $health = "[!] 健康检查未通过：/healthz 返回 HTTP $code"
+  } else {
+    $health = '[!] 健康检查未通过：' + $_.Exception.Message
+  }
 }
 
 Write-Host ""

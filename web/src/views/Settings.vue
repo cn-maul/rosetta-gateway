@@ -16,6 +16,7 @@ import type {
   ConfigImportResult,
   PruneResult,
 } from '../types'
+import type { LoadState } from '../asyncState'
 
 // ---------- 分类页：设置项按分类分页展示，一次只看一类 ----------
 //
@@ -41,6 +42,7 @@ const TABS: { key: TabKey; label: string; sub: string }[] = [
 ]
 const route = useRoute()
 const router = useRouter()
+const tabsRef = ref<{ panelIdFor: (k: string) => string; tabIdFor: (k: string) => string } | null>(null)
 const tab = computed<TabKey>({
   get: () => TABS.find(t => t.key === route.query.tab)?.key ?? 'model',
   set: key => { void router.push({ query: { ...route.query, tab: key } }) },
@@ -400,6 +402,12 @@ const modelsMap = reactive<Record<string, UpstreamModel[]>>({})
 const pricesLoading = ref(false)
 const pricesLoaded = ref(false)
 const pricesErr = ref('')
+const pricesState = computed<LoadState>(() => {
+  if (pricesLoading.value) return 'loading'
+  if (pricesErr.value) return 'error'
+  if (pricesLoaded.value) return 'ready'
+  return 'not-loaded'
+})
 
 const priceProvider = ref('') // '' = 全部供应商
 const priceSearch = ref('')
@@ -460,6 +468,7 @@ const totalModelCount = computed(() =>
 
 async function loadPrices() {
   pricesLoading.value = true
+  pricesErr.value = ''
   try {
     providers.value = await api.providers()
     // 一次取回全部模型再本地按 provider_id 分组，替代逐 provider 取模型的 1+N 请求
@@ -483,9 +492,16 @@ async function loadPrices() {
 }
 
 // 价格分类懒加载：进页面不必为一个可能不看的分类多打一轮接口。
-watch(tab, (k) => {
-  if (k === 'price' && !pricesLoaded.value) loadPrices()
-})
+// immediate 必须为 true：直接打开 /settings?tab=price 时 tab 在挂载前
+// 就已经是 price，非 immediate 的 watcher 不会触发，页面会把“尚未加载”
+// 呈现成“没有任何模型”。
+watch(
+  tab,
+  (k) => {
+    if (k === 'price' && !pricesLoaded.value && !pricesLoading.value) loadPrices()
+  },
+  { immediate: true },
+)
 
 const pForm = reactive({
   open: false,
@@ -838,10 +854,17 @@ onMounted(() => {
     <!-- 分类页签：设置项按类别分页，避免一页塞满互不相干的表单 -->
     <!-- 页签改用共享 Tabs（2026-10-12）：原先是 .set-tabs + 手写 v-for，
          与 Wallet / UsersGroups 各写一份。 -->
-    <Tabs v-model="tab" :tabs="TABS" aria-label="设置分区"/>
+    <Tabs ref="tabsRef" v-model="tab" :tabs="TABS" aria-label="设置分区"/>
 
     <!-- 分类 1：模型默认 -->
-    <div v-if="tab === 'model'" class="panel">
+    <div
+      v-if="tab === 'model'"
+      :id="tabsRef?.panelIdFor(tab)"
+      class="panel"
+      role="tabpanel"
+      :aria-labelledby="tabsRef?.tabIdFor(tab)"
+      tabindex="0"
+    >
       <div v-if="loading" class="loading">加载中…</div>
       <!-- 读取失败：显示持久错误态而不是那组兜底常量。
            必须让「没读到」与「读到了」在界面上明确区分 —— 这里的表单可写，
@@ -888,7 +911,14 @@ onMounted(() => {
     </div>
 
     <!-- 分类 2：运行时（超时 + 故障转移） -->
-    <div v-else-if="tab === 'runtime'" class="panel">
+    <div
+      v-else-if="tab === 'runtime'"
+      :id="tabsRef?.panelIdFor(tab)"
+      class="panel"
+      role="tabpanel"
+      :aria-labelledby="tabsRef?.tabIdFor(tab)"
+      tabindex="0"
+    >
       <div v-if="loading" class="loading">加载中…</div>
       <div v-else-if="err" class="empty">
         <div class="big">⚠</div>
@@ -1092,7 +1122,14 @@ onMounted(() => {
     </div>
 
     <!-- 分类 3：导入 / 导出（页签顺序见 TABS） -->
-    <div v-else-if="tab === 'transfer'" class="panel">
+    <div
+      v-else-if="tab === 'transfer'"
+      :id="tabsRef?.panelIdFor(tab)"
+      class="panel"
+      role="tabpanel"
+      :aria-labelledby="tabsRef?.tabIdFor(tab)"
+      tabindex="0"
+    >
       <div class="xfer-grid">
         <!-- 导出 -->
         <section class="card xfer-card">
@@ -1234,7 +1271,14 @@ onMounted(() => {
     </div>
 
     <!-- 分类 4：模型价格（兜底分支 v-else，页签顺序见 TABS） -->
-    <div v-else class="panel">
+    <div
+      v-else
+      :id="tabsRef?.panelIdFor(tab)"
+      class="panel"
+      role="tabpanel"
+      :aria-labelledby="tabsRef?.tabIdFor(tab)"
+      tabindex="0"
+    >
       <div class="price-head">
         <div>
           <div class="price-title">模型价格</div>
@@ -1247,7 +1291,7 @@ onMounted(() => {
         <button
           class="btn btn-primary"
           type="button"
-          :disabled="providers.length === 0"
+          :disabled="pricesState !== 'ready' || providers.length === 0"
           @click="openAddPrice"
         >
           新增价格
@@ -1267,12 +1311,12 @@ onMounted(() => {
         <span v-if="priceSelected.size > 0" class="dim">已勾选 {{ priceSelected.size }} 个（将带入弹窗）</span>
       </div>
 
-      <div v-if="pricesLoading" class="loading">加载中…</div>
+      <div v-if="pricesState === 'loading' || pricesState === 'not-loaded'" class="loading">加载中…</div>
       <p v-else-if="pricesErr" class="notice-warn" role="alert">
         {{ pricesErr }}
         <button class="btn btn-sm" :disabled="pricesLoading" @click="loadPrices">重试</button>
       </p>
-      <div v-else-if="totalModelCount === 0" class="empty">还没有任何模型 —— 请先在「上游」页添加模型</div>
+      <div v-else-if="pricesLoaded && totalModelCount === 0" class="empty">还没有任何模型 —— 请先在「上游」页添加模型</div>
       <div v-else-if="priceRows.length === 0" class="empty">
         <template v-if="priceProvider || priceSearch.trim()">没有匹配的价格条目</template>
         <template v-else>

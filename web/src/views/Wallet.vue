@@ -487,6 +487,7 @@ const TABS = computed<{ key: TabKey; label: string }[]>(() =>
       ],
 )
 const tab = ref<TabKey>('usage')
+const tabsRef = ref<{ panelIdFor: (k: string) => string; tabIdFor: (k: string) => string } | null>(null)
 
 const router = useRouter()
 function gotoHistory() {
@@ -636,7 +637,7 @@ onMounted(load)
       <!-- ---------- 页签 ---------- -->
       <!-- 页签改用共享 Tabs（2026-10-12）：原先此处是 .wallet-tabs +
            手写 v-for，与 Settings / UsersGroups 各写一份。 -->
-      <Tabs v-model="tab" :tabs="TABS" aria-label="钱包分区" />
+      <Tabs ref="tabsRef" v-model="tab" :tabs="TABS" aria-label="钱包分区" />
 
       <!-- ---------- 消耗记录 / 消费汇总 ---------- -->
       <!--
@@ -648,7 +649,14 @@ onMounted(load)
         状态/模型/密钥过滤、CSV 导出）。所以管理员这一格必须给出那个入口，
         否则「不要放消费记录」就变成了「管理员从此看不到任何明细」。
       -->
-      <div v-if="tab === 'usage'" class="panel">
+      <div
+        v-if="tab === 'usage'"
+        :id="tabsRef?.panelIdFor(tab)"
+        class="panel"
+        role="tabpanel"
+        :aria-labelledby="tabsRef?.tabIdFor(tab)"
+        tabindex="0"
+      >
         <!-- 管理员：消费汇总 —— **一行一个用户，每行是该用户的总消费**。
              金额紧跟用户名放在第二列：用户要的就是「谁花了多少钱」，
              金额是这张表的主角，把它推到最右边会让人先读一堆次数/token
@@ -837,7 +845,14 @@ onMounted(load)
         列是同一套，所以这里只写一遍 —— 两套列定义早晚会漂移出
         「金额列对不齐」的界面。
       -->
-      <div v-else-if="tab === 'topup'" class="panel">
+      <div
+        v-else-if="tab === 'topup'"
+        :id="tabsRef?.panelIdFor(tab)"
+        class="panel"
+        role="tabpanel"
+        :aria-labelledby="tabsRef?.tabIdFor(tab)"
+        tabindex="0"
+      >
         <div class="panel-title">
           充值记录
           <span class="hint">

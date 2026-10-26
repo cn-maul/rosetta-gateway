@@ -34,25 +34,6 @@ const emit = defineEmits<{
   toggle: [cred: Credential]
 }>()
 
-// balanceMode 说明这次查询走的是哪条路径。
-//
-// 为什么要显示：自动判定只覆盖 OpenAI 官方与 DeepSeek 两家，其余上游
-// 一律「不支持」。当管理员看到「不支持」时，他需要知道的是「这是内置判定
-// 的结论」还是「我配了但没匹配上」—— 两者的下一步完全不同
-// （前者去填 balance_spec_json，后者去改配置）。
-//
-// props.balance.status === 'unsupported' 且没配 spec 时，提示直接给出
-// 「去编辑上游填配置」这个动作，而不是让用户自己猜。
-const balanceMode = computed(() => {
-  if (!props.balance) return ''
-  if (props.balance.status === 'unsupported') {
-    return props.balanceSpecConfigured
-      ? '按自定义配置查询，但上游没有返回可用数据 —— 检查 path / field 是否与上游文档一致'
-      : '未配置余额查询方式，且内置判定不认识这个上游（内置支持 OpenAI 官方与 DeepSeek）'
-  }
-  return ''
-})
-
 // isPending 判某一行是否正在提交启停。
 //
 // 启停是「切换」语义（同一上游同时只启用一把），所以连点一次的后果是
@@ -72,6 +53,10 @@ function isPending(id: string): boolean {
 // 混成一句「查询失败」会让管理员在三种完全不同的排查方向之间瞎猜。
 function balanceLine(r: CredentialBalance): string {
   if (r.status === 'unsupported') return r.message || '该上游不支持余额查询'
+  if (r.status === 'unknown') {
+    const at = r.fetched_at ? new Date(r.fetched_at).toLocaleTimeString() : ''
+    return [r.message || '余额不足以下结论', r.detail, at].filter(Boolean).join(' · ')
+  }
   if (r.status === 'error') return r.message || '查询失败'
   const at = r.fetched_at ? new Date(r.fetched_at).toLocaleTimeString() : ''
   const head = `${(r.amount ?? 0).toFixed(2)} ${r.currency ?? ''}`.trim()
@@ -80,7 +65,32 @@ function balanceLine(r: CredentialBalance): string {
 
 function balanceClass(r: CredentialBalance): string {
   if (r.status === 'ok') return 'bal-ok'
-  return r.status === 'unsupported' ? 'bal-na' : 'test-err'
+  if (r.status === 'unsupported') return 'bal-na'
+  if (r.status === 'unknown') return 'bal-unknown'
+  return 'test-err'
+}
+
+/** 只接受属于当前上游的响应；跨 provider 的旧响应一律视为没有结果。 */
+const currentBalance = computed(() =>
+  props.balance && props.balance.provider_id === props.providerId ? props.balance : undefined,
+)
+
+function balanceFor(credentialId: string): CredentialBalance | undefined {
+  return currentBalance.value?.results.find((x) => x.credential_id === credentialId)
+}
+
+// balanceModeFor 说明这次查询走的是哪条路径。
+//
+// 为什么要显示：自动判定只覆盖 OpenAI 官方与 DeepSeek 两家，其余上游
+// 一律「不支持」。当管理员看到「不支持」时，他需要知道的是「这是内置判定
+// 的结论」还是「我配了但没匹配上」—— 两者的下一步完全不同
+// （前者去填 balance_spec_json，后者去改配置）。
+function balanceModeFor(): string {
+  if (!currentBalance.value) return ''
+  if (currentBalance.value.status !== 'unsupported') return ''
+  return props.balanceSpecConfigured
+    ? '按自定义配置查询，但上游没有返回可用数据 —— 检查 path / field 是否与上游文档一致'
+    : '未配置余额查询方式，且内置判定不认识这个上游（内置支持 OpenAI 官方与 DeepSeek）'
 }
 </script>
 
@@ -118,8 +128,8 @@ function balanceClass(r: CredentialBalance): string {
       <!-- 查询方式的说明：只在查过且拿到「不支持」时出现。它的价值在于
            区分「内置判定不认识这个上游」与「配了但没匹配上」—— 下一步动作
            完全不同（去填配置 vs 去改配置），而两者在界面上原本是同一句话。 -->
-      <p v-if="balanceMode" class="dim sub-line">
-        {{ balanceMode }}
+      <p v-if="balanceModeFor()" class="dim sub-line">
+        {{ balanceModeFor() }}
       </p>
       <!-- tbl-wrap 不能省：操作列是 .c-act（不换行），余额列里的附注也整段读。
            在详情页这张表只占半屏宽，不裹 overflow-x 的话会把右侧的操作
@@ -151,18 +161,15 @@ function balanceClass(r: CredentialBalance): string {
                  没点过「查余额」时留白 —— 它不是 0，
                  两者必须可区分：一个是「没查」，一个是「确实没钱」。 -->
             <td>
-              <div v-if="balance" class="bal-cell">
+              <div v-if="currentBalance" class="bal-cell">
                 <div
-                  v-for="r in balance.results.filter((x) => x.credential_id === c.id)"
-                  :key="r.credential_id"
+                  v-if="balanceFor(c.id)"
                   class="bal-line"
-                  :class="balanceClass(r)"
+                  :class="balanceClass(balanceFor(c.id)!)"
                 >
-                  {{ balanceLine(r) }}
+                  {{ balanceLine(balanceFor(c.id)!) }}
                 </div>
-                <span v-if="!balance.results.some((x) => x.credential_id === c.id)" class="dim">
-                  —（无结果）
-                </span>
+                <span v-else class="dim">—（无结果）</span>
               </div>
               <span v-else class="dim">—</span>
             </td>

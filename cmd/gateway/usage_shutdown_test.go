@@ -47,9 +47,10 @@ func shutdownTestRec(id string) *store.UsageRecord {
 // 运行时 panic。触发路径是正常时序：Shutdown 的 10s 预算到期只是**返回错误**、
 // 不终止 handler，紧接着 wait 关闭队列，那条流收尾时正好撞上。
 //
-// 现在「判关闭 + 入队」在同一把锁里，关停后 record 改走同步写。
-func TestRecordAfterWaitDoesNotPanic(t *testing.T) {
+// 现在「判关闭 + 入队」在同一把锁里，关停后 record 明确拒绝。
+func TestRecordAfterWaitIsRejectedWithoutPanic(t *testing.T) {
 	u := newShutdownTestRecorder(t)
+	var callbacks int
 
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
@@ -60,7 +61,13 @@ func TestRecordAfterWaitDoesNotPanic(t *testing.T) {
 			t.Fatalf("关停后 record 触发 panic: %v", r)
 		}
 	}()
-	u.Record(shutdownTestRec("after-wait"))
+	u.RecordWithCallback(shutdownTestRec("after-wait"), func() { callbacks++ })
+	if callbacks != 1 {
+		t.Fatalf("post-shutdown callback count = %d, want 1", callbacks)
+	}
+	if u.Accepting() {
+		t.Fatal("recorder still accepts asynchronous jobs after drain")
+	}
 }
 
 // TestRecordConcurrentWithWait 压力版：一边关停一边狂记，覆盖「判关闭」与

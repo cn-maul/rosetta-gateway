@@ -272,14 +272,18 @@ func orgQueryWindow(r *http.Request) (bucketSec, from, to int64, bad bool) {
 	to = time.Now().UnixMilli()
 	from = to - 30*86400_000
 	if v := r.URL.Query().Get("start_time"); v != "" {
-		if n, err := strconv.ParseInt(v, 10, 64); err == nil && n > 0 {
-			from = n * 1000
+		n, err := strconv.ParseInt(v, 10, 64)
+		if err != nil || n <= 0 {
+			return 0, 0, 0, true
 		}
+		from = n * 1000
 	}
 	if v := r.URL.Query().Get("end_time"); v != "" {
-		if n, err := strconv.ParseInt(v, 10, 64); err == nil && n > 0 {
-			to = n * 1000
+		n, err := strconv.ParseInt(v, 10, 64)
+		if err != nil || n <= 0 {
+			return 0, 0, 0, true
 		}
+		to = n * 1000
 	}
 	if from >= to {
 		return 0, 0, 0, true

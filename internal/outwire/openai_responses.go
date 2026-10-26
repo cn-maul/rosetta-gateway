@@ -629,6 +629,9 @@ func (s *ResponsesSSE) Finish(status string, stop rosetta.StopReason, usage rose
 		s.writeEvent("response.failed", map[string]any{"response": resp})
 		return
 	}
+	// Terminal-only empty replies need response.created before the final
+	// lifecycle event, just like content-bearing streams.
+	s.ensureStarted("")
 
 	eventName := "response.completed"
 	resp := s.responseSkeleton("completed")
@@ -718,14 +721,14 @@ func (s *ResponsesSSE) SawTerminal() bool {
 }
 
 // WriteResponsesResponse 编码 Responses 非流式响应对象。
-func WriteResponsesResponse(w http.ResponseWriter, resp *rosetta.ChatResponse, model string) {
-	WriteResponsesResponseWithTools(w, resp, model, nil)
+func WriteResponsesResponse(w http.ResponseWriter, resp *rosetta.ChatResponse, model string) NonStreamWriteResult {
+	return WriteResponsesResponseWithTools(w, resp, model, nil)
 }
 
 // WriteResponsesResponseWithTools 是 WriteResponsesResponse 的带降级表版本：
 // downgraded 把降级过的工具名映射回原生类型，输出的 item 相应地写成
 // custom_tool_call / local_shell_call 而非普通 function_call。
-func WriteResponsesResponseWithTools(w http.ResponseWriter, resp *rosetta.ChatResponse, model string, downgraded map[string]string) {
+func WriteResponsesResponseWithTools(w http.ResponseWriter, resp *rosetta.ChatResponse, model string, downgraded map[string]string) NonStreamWriteResult {
 	id := resp.ID
 	if id == "" {
 		id = fmt.Sprintf("resp_%d", time.Now().UnixNano())
@@ -822,8 +825,7 @@ func WriteResponsesResponseWithTools(w http.ResponseWriter, resp *rosetta.ChatRe
 		}
 	}
 
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]any{
+	return encodeNonStreamPayload(w, map[string]any{
 		"id":                  id,
 		"object":              "response",
 		"created_at":          time.Now().Unix(),

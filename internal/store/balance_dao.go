@@ -866,27 +866,37 @@ func (s *Store) settlePendingForUser(ctx context.Context, tx *sql.Tx, userID str
 		//
 		// 覆盖规则：从最早的一行开始扣（按 ts 排序 —— 欠费是有先后的，
 		// 先欠的先结），扣到余额用完为止。
+		//
+		// 完全结清的行写原键完成标记；部分结清的行继续以 balance_pending
+		// 作为「仍有未收金额」的权威状态，不能提前标记完成。对账查询会
+		// 排除仍存在 pending 的用量，因此两条恢复路径不会同时收费。
+		// 原键标记、钱包扣款、pending 删除/减额仍在同一事务内。
 		var settled []pendingRow
 		budget := deduct * MicrosPerCent
 		for _, it := range items {
 			if budget <= 0 {
 				break
 			}
-			if it.micros <= budget {
-				budget -= it.micros
+			covered := it.micros
+			if covered > budget {
+				covered = budget
+			}
+			budget -= covered
+			if covered == it.micros {
+				if err := s.ensureUsageCompletionTx(ctx, tx, it.requestID, userID); err != nil {
+					return 0, fmt.Errorf("mark pending usage complete: %w", err)
+				}
 				settled = append(settled, it)
 				continue
 			}
 			// 这一行只能扣一部分：把已扣的部分扣掉，剩下的留账本。
-			if budget > 0 {
-				if _, err := tx.ExecContext(ctx,
-					`UPDATE balance_pending SET amount_micros = amount_micros - ?
-					  WHERE request_id = ? AND user_id = ?`,
-					budget, it.requestID, userID); err != nil {
-					return 0, fmt.Errorf("settle pending partial: %w", err)
-				}
-				budget = 0
+			if _, err := tx.ExecContext(ctx,
+				`UPDATE balance_pending SET amount_micros = amount_micros - ?
+				  WHERE request_id = ? AND user_id = ?`,
+				covered, it.requestID, userID); err != nil {
+				return 0, fmt.Errorf("settle pending partial: %w", err)
 			}
+			budget = 0
 		}
 		if len(settled) > 0 {
 			if err := s.deletePendingRows(ctx, tx, settled); err != nil {
@@ -897,7 +907,35 @@ func (s *Store) settlePendingForUser(ctx context.Context, tx *sql.Tx, userID str
 	}
 
 	// 总额不足一分：直接核销（充值是结清时刻，见函数头说明）。
+	for _, it := range items {
+		if err := s.ensureUsageCompletionTx(ctx, tx, it.requestID, userID); err != nil {
+			return 0, fmt.Errorf("mark fully written-off pending usage complete: %w", err)
+		}
+	}
 	return 0, s.deletePendingRows(ctx, tx, items)
+}
+
+// ensureUsageCompletionTx 写原始用量请求的兼容完成标记。
+//
+// 标记表仍是 balance_charges，主键是 (request_id, user_id)。R0 不引入
+// 新表：已扣费的历史行本来就在这里，对账也按这个原键 JOIN。待结算结转
+// 与重算补扣必须与钱包扣款、usage/账本变更处于同一事务，否则会留下
+// 「钱扣了、对账仍认为没扣」的窗口。
+//
+// 空 request_id 不写：它不是可对账的用量请求键；调用方已经为内部空键
+// 生成 non-empty 的 pending key，正常用量也要求 request_id 非空。
+func (s *Store) ensureUsageCompletionTx(ctx context.Context, tx *sql.Tx,
+	requestID, userID string) error {
+	if requestID == "" || userID == "" {
+		return nil
+	}
+	if _, err := tx.ExecContext(ctx,
+		`INSERT OR IGNORE INTO balance_charges (request_id, user_id, amount_cents, ts)
+		 VALUES (?, ?, 0, ?)`,
+		requestID, userID, time.Now().UnixMilli()); err != nil {
+		return err
+	}
+	return nil
 }
 
 // deletePendingRows 精确删除给定的那几行 pending。

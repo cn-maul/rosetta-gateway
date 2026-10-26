@@ -77,6 +77,11 @@ export const session = reactive({
   setupUsername: '',
   /** /session 探测是否成功。false 时界面显示「无法连接」而不是登录框。 */
   backendReady: false,
+  /**
+   * bootstrapCheckFailed means /session succeeded but /bootstrap failed.
+   * This degraded startup state must not collapse into an ordinary login form.
+   */
+  bootstrapCheckFailed: false,
   checked: false,
 })
 
@@ -126,11 +131,13 @@ export async function loadSession(): Promise<void> {
     const bs = await get<BootstrapStatus>('/bootstrap')
     session.needsSetup = bs.needs_setup
     session.setupUsername = bs.username ?? ''
+    session.bootstrapCheckFailed = false
   } catch {
-    // 拿不到引导状态不是致命问题：按「已初始化」处理，用户会看到登录表单。
-    // 真实情况下（全新部署）它一定能拿到 —— 该端点免鉴权。
+    // A 500 here is not "setup not needed". The login form would be
+    // misleading when the service cannot even read its startup state.
     session.needsSetup = false
     session.setupUsername = ''
+    session.bootstrapCheckFailed = true
   }
 
   try {
@@ -152,7 +159,8 @@ export async function loadSession(): Promise<void> {
  * 不能只信 token 里那份签发时的快照。
  */
 export async function login(username: string, password: string) {
-  const r = await post<LoginResult>('/login', { username, password })
+  // Login is public. Its 401 means bad credentials, not expired local session.
+  const r = await publicPost<LoginResult>('/login', { username, password })
   saveToken(r.token)
   session.me = await get<Me>('/me')
   return r
@@ -169,11 +177,19 @@ export async function login(username: string, password: string) {
  * 界面上不该再有任何「设密码」的入口。
  */
 export async function bootstrapSetup(password: string) {
-  const r = await post<LoginResult>('/bootstrap', { password })
+  const r = await publicPost<LoginResult>('/bootstrap', { password })
   saveToken(r.token)
-  session.me = await get<Me>('/me')
   session.needsSetup = false
   session.setupUsername = ''
+  session.bootstrapCheckFailed = false
+  try {
+    session.me = await get<Me>('/me')
+  } catch (e) {
+    // Password change and window close already succeeded. Keep the issued
+    // session and expose profile refresh as a separate, retryable failure.
+    if (!(e instanceof ApiFail)) throw e
+    throw new ApiFail(e.status, '密码已设置，但加载账号信息失败，请刷新页面重试')
+  }
   return r
 }
 
