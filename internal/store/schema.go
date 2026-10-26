@@ -93,10 +93,6 @@ func (s *Store) ensureCompatibleSchema(ctx context.Context) error {
 	)`); err != nil {
 		return fmt.Errorf("ensure quota reservation lease table: %w", err)
 	}
-	if _, err := s.db.ExecContext(ctx, `CREATE INDEX IF NOT EXISTS idx_usage_charge_retry
-		ON usage_records(usage_state, charge_next_at, ts)`); err != nil {
-		return fmt.Errorf("ensure usage charge retry index: %w", err)
-	}
 	// 2026-10-22 修 F2：cache creation 的独立单价与归档列。
 	//
 	// 这些是**带默认值的纯新增列**，旧库可以原地升级，不需要提升
@@ -127,6 +123,12 @@ func (s *Store) ensureCompatibleSchema(ctx context.Context) error {
 		if err := s.ensureAdditiveColumn(ctx, col.table, col.column, col.decl); err != nil {
 			return err
 		}
+	}
+	// This index depends on charge_next_at, so it must be created after the
+	// additive-column pass above. v1.6.8 has neither the column nor the index.
+	if _, err := s.db.ExecContext(ctx, `CREATE INDEX IF NOT EXISTS idx_usage_charge_retry
+		ON usage_records(usage_state, charge_next_at, ts)`); err != nil {
+		return fmt.Errorf("ensure usage charge retry index: %w", err)
 	}
 	// 旧库的 trg_update_usage_totals 不包含新列，DROP + CREATE 让新增列
 	// 从下一行明细开始进入终身累计。DROP/CREATE 都是幂等的，且触发器只

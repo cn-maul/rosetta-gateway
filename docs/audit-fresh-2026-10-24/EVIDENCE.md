@@ -2581,6 +2581,15 @@ go test ./internal/dataplane ./internal/usage ./internal/outwire -count=20
 
 All passed.
 
+The v1.7.1 release rebuild also passed:
+
+```text
+go test ./internal/store ./internal/gatewayapp ./internal/config \
+  ./internal/webui ./cmd/gateway -count=1
+cd web && npm test && npm run typecheck
+cd web && npm run build && node sync-embed.mjs
+```
+
 ## v1.7.0 Race-only CI Finding
 
 The second full CI run reached `nightly-long` and exposed a race-only test
@@ -2652,3 +2661,39 @@ go test -race ./cmd/gateway -run
 ```
 
 All passed. Tagging remains gated on complete CI and GHCR success.
+
+## v1.6.8 In-place Upgrade Finding
+
+A real v1.7.0 container pointed at a v1.6.8 state directory failed during store
+initialization:
+
+```text
+failed to open database: initialize database:
+ensure usage charge retry index: SQL logic error:
+no such column: charge_next_at (1)
+```
+
+The failure was first reproduced without Docker by adding the v1.6.8-specific
+columns to the upgrade fixture:
+
+```text
+--- FAIL: TestSchema_AddsR3AccountingObjectsToExistingV168Database
+    Open(...): initialize database: ensure usage charge retry index:
+    SQL logic error: no such column: charge_next_at (1)
+```
+
+`ensureCompatibleSchema` created the v1.7.0 retry index before adding the
+columns it references. The implementation now performs the additive-column
+pass first, then creates `idx_usage_charge_retry`.
+
+Verification:
+
+```text
+go test ./internal/store -run
+  'TestSchema_AddsR3AccountingObjectsToExistingV168Database|TestSchema_AddsUsageHistoryColumnsToExistingCurrentDatabase' -count=1
+go test ./internal/store -count=1
+go test ./internal/gatewayapp -count=1
+go build ./cmd/gateway
+```
+
+All passed.

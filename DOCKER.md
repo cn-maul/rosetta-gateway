@@ -365,7 +365,10 @@ docker compose pull && docker compose up -d
 上游列、在故障转移时直接展示 `A → B` 路径，并把 Token 明细中的“输入”改为
 “新增输入”（输入总量扣除缓存命中与缓存写入）。数据库结构与配置格式不变。
 
-升级前仍建议按上面的步骤备份 `/data`。
+**v1.6.8 → v1.7.1 可以直接原地升级。** 这一版会为用量明细纯新增
+`provider_name`、`upstream_protocol` 与记账重试状态列，并新增
+`quota_reservation_leases`；已有配置、余额、密钥和历史用量都会保留。
+升级前请按上面的步骤完整备份 `/data`。
 
 ## 以非 root 运行（2026-10-07 起）
 

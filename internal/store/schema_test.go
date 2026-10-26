@@ -179,8 +179,8 @@ func TestSchema_AddsUsageHistoryColumnsToExistingCurrentDatabase(t *testing.T) {
 	}
 }
 
-func TestSchema_AddsR3AccountingObjectsToExistingCurrentDatabase(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "r3-upgrade.db")
+func TestSchema_AddsR3AccountingObjectsToExistingV168Database(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "v168-upgrade.db")
 	st := openSchemaTestStore(t, path)
 	if err := st.Close(); err != nil {
 		t.Fatalf("close: %v", err)
@@ -197,6 +197,14 @@ func TestSchema_AddsR3AccountingObjectsToExistingCurrentDatabase(t *testing.T) {
 	if _, err := raw.Exec(`DROP INDEX idx_usage_charge_retry`); err != nil {
 		_ = raw.Close()
 		t.Fatalf("drop retry index: %v", err)
+	}
+	// v1.6.8 has the current schema version and usage-history attribution,
+	// but none of the R3 accountable-charge columns or objects.
+	for _, column := range []string{"charge_attempts", "charge_next_at", "charge_last_error"} {
+		if _, err := raw.Exec(`ALTER TABLE usage_records DROP COLUMN ` + column); err != nil {
+			_ = raw.Close()
+			t.Fatalf("drop %s: %v", column, err)
+		}
 	}
 	if err := raw.Close(); err != nil {
 		t.Fatalf("close raw database: %v", err)
@@ -219,6 +227,12 @@ func TestSchema_AddsR3AccountingObjectsToExistingCurrentDatabase(t *testing.T) {
 	}
 	if n != 1 {
 		t.Fatal("existing current-version database did not gain idx_usage_charge_retry")
+	}
+	columns := tableColumns(t, reopened, "usage_records")
+	for _, column := range []string{"charge_attempts", "charge_next_at", "charge_last_error"} {
+		if !columns[column] {
+			t.Errorf("v1.6.8 database did not gain usage_records.%s", column)
+		}
 	}
 }
 

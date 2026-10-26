@@ -1481,3 +1481,32 @@ want ["alice" "admin1" "admin1"]
 - Verification: F1b/F1c/F1d passed 300 race runs after the synchronization
   change. The complete non-short Go race suite, short suite, and frontend
   tests/typecheck remain required before tagging.
+
+### DELIVERY-04 - v1.6.8 database upgrade creates the retry index before its column
+
+- Status: fixed after a real v1.7.0 container startup failed; shipped in v1.7.1
+- Evidence: `internal/store/schema.go`,
+  `TestSchema_AddsR3AccountingObjectsToExistingV168Database`
+- Trigger: starting v1.7.0 against a v1.6.8 `/data` directory.
+- Failure-first result:
+
+```text
+failed to open database: initialize database:
+ensure usage charge retry index: SQL logic error:
+no such column: charge_next_at (1)
+```
+
+- Root cause: both releases stamp `PRAGMA user_version = 2`, so the schema gate
+  correctly treats v1.6.8 as an in-place-compatible database. However,
+  `ensureCompatibleSchema` created `idx_usage_charge_retry` before the additive
+  column pass added `usage_records.charge_next_at`. The earlier upgrade test
+  removed the index and lease table but not the R3 columns, so it did not model
+  a real v1.6.8 database.
+- Direction: create the retry index only after the additive columns exist. The
+  test now drops `charge_attempts`, `charge_next_at`, and `charge_last_error`
+  as well as the v1.7.0-only table and index before reopening the store.
+- Verification: the failure-first test reproduced the container error, then
+  passed after the ordering change. `go test ./internal/store -count=1`,
+  `go test ./internal/gatewayapp -count=1`, and `go build ./cmd/gateway` pass.
+  The v1.7.1 release rebuild repeats the store, gatewayapp, cmd/gateway,
+  webui, frontend test, and typecheck gates.

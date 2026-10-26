@@ -1667,3 +1667,16 @@ could exercise the uncommitted HTTP 502 path. `DELIVERY-03` records a
 test-recorder change that signals only after both the committed 200 and the
 first body write are visible. F1b/F1c/F1d passed 300 race runs. Complete CI and
 GHCR success still gate the tag.
+
+## Post-Release v1.6.8 Upgrade Fix
+
+A real v1.7.0 container starting against a v1.6.8 `/data` directory failed
+because `ensureCompatibleSchema` created `idx_usage_charge_retry` before adding
+`usage_records.charge_next_at`. The upgrade fixture now models a real v1.6.8
+database by removing all three v1.7.0 accounting columns as well as the lease
+table and retry index. `DELIVERY-04` records the failure-first reproduction and
+the ordering fix.
+
+`go test ./internal/store -count=1`, `go test ./internal/gatewayapp -count=1`,
+and `go build ./cmd/gateway` pass. The fix is released as v1.7.1 because the
+original v1.7.0 image contains the startup failure.
