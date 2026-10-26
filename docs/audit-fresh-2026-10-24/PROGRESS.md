@@ -1660,3 +1660,10 @@ and a test-only wait for the accumulated charge to reach `cost_total`. The
 A1/A2 race pair passed 200 runs, followed by the complete non-short Go race
 suite, short suite, and frontend tests/typecheck. The tag remains gated on a
 fresh complete CI run and GHCR success.
+
+The next full CI run exposed a second low-frequency test synchronization issue
+in F1b: `Write` signaled before `WriteHeader(200)` was recorded, so cancellation
+could exercise the uncommitted HTTP 502 path. `DELIVERY-03` records a
+test-recorder change that signals only after both the committed 200 and the
+first body write are visible. F1b/F1c/F1d passed 300 race runs. Complete CI and
+GHCR success still gate the tag.

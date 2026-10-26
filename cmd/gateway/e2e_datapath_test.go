@@ -1215,7 +1215,7 @@ func TestE2E_F1b_ClientDisconnectStillConsumesTokenQuota(t *testing.T) {
 	// 用带信号的自定义 writer，而不是 httptest.ResponseRecorder：
 	// ResponseRecorder 的 Body 不是并发安全的，而这里要在**另一个 goroutine**
 	// 正在写的同时读「网关是否已经吐出第一片」。
-	w := newSignalingRecorder()
+	w := newCommittedSignalRecorder()
 	var wg sync.WaitGroup
 	wg.Add(1)
 	go func() {
@@ -1223,21 +1223,20 @@ func TestE2E_F1b_ClientDisconnectStillConsumesTokenQuota(t *testing.T) {
 		middlewareForTest(h).ServeHTTP(w, req)
 	}()
 
-	// 必须等到**网关已经把首片写给下游**才能取消。
+	// 必须等到**网关已经把 SSE 200 提交并写出首片**才能取消。
 	//
-	// 只等「上游收到了请求」是不够的：上游写完首片只说明字节进了 socket，
-	// 网关可能还没消费到它。此时 cancel() 会让网关在「拿到首个事件之前」
-	// 就走掉 —— 那条路径根本没提交（usage_state="none"、total_tokens=0），
-	// 测的就不是「已提交后被中断」这条路径了。
+	// 只等「上游收到了请求」或「第一次 Write 发出信号」都不够：WriteHeader
+	// 与首片写入之间还有一个窗口，此时 cancel() 会让网关在提交之前走掉。
+	// 那条路径没有已提交的 HTTP 200（usage_state="none"、total_tokens=0），
+	// 测的就不是「已提交后被中断」这条路径。
 	//
-	// 等「下游收到了首片」才是正确的同步点：它证明网关已经消费了首个事件、
-	// 已经写了 SSE 头、已经进入事件循环。
+	// 等「下游收到 WriteHeader(200) 之后的第一个字节」才是正确的同步点。
 	select {
-	case <-w.wrote:
+	case <-w.committed:
 	case <-time.After(5 * time.Second):
 		cancel()
 		wg.Wait()
-		t.Fatal("网关一直没把首片写给下游 —— harness 或链路有问题，没测到目标路径")
+		t.Fatal("网关一直没提交 SSE 200 并写出首片 —— harness 或链路有问题，没测到目标路径")
 	}
 	cancel()
 	wg.Wait()
@@ -2364,6 +2363,34 @@ type signalingRecorder struct {
 
 func newSignalingRecorder() *signalingRecorder {
 	return &signalingRecorder{wrote: make(chan struct{})}
+}
+
+// committedSignalRecorder signals only after WriteHeader(200) has been
+// followed by a body write. A plain first-write signal is racy because
+// WriteHeader and Write are separate calls; canceling between them exercises
+// the uncommitted path.
+type committedSignalRecorder struct {
+	*signalingRecorder
+	committed     chan struct{}
+	committedOnce sync.Once
+}
+
+func newCommittedSignalRecorder() *committedSignalRecorder {
+	return &committedSignalRecorder{
+		signalingRecorder: newSignalingRecorder(),
+		committed:         make(chan struct{}),
+	}
+}
+
+func (s *committedSignalRecorder) Write(b []byte) (int, error) {
+	n, err := s.signalingRecorder.Write(b)
+	s.mu.Lock()
+	code := s.code
+	s.mu.Unlock()
+	if code == http.StatusOK {
+		s.committedOnce.Do(func() { close(s.committed) })
+	}
+	return n, err
 }
 
 func (s *signalingRecorder) Header() http.Header {

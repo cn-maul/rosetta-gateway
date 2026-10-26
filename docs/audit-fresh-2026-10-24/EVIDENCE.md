@@ -2621,3 +2621,34 @@ cd web; npm run typecheck
 ```
 
 All passed locally. Tagging remains gated on a fresh complete CI run.
+
+## v1.7.0 F1b CI Finding
+
+A fresh full CI run passed the A1/A2 synchronization change but failed F1b in
+the non-race long suite:
+
+```text
+--- FAIL: TestE2E_F1b_ClientDisconnectStillConsumesTokenQuota
+    e2e_datapath_test.go:1246: F1b usage 行:
+      {Status:canceled UsageState:none TotalTokens:0 HTTPStatus:502}
+    e2e_datapath_test.go:1250: 客户端中断后 total_tokens=0
+```
+
+The recorder emitted its signal from `Write`, but `WriteHeader(200)` is a
+separate call. A cancel between those calls records an uncommitted 502 rather
+than a committed HTTP 200 with a partial stream.
+
+### Implementation
+
+`committedSignalRecorder` closes its channel only after a body write observes
+a recorded status of 200. F1b now waits for that signal before canceling.
+There is no product-code change.
+
+### Verification
+
+```text
+go test -race ./cmd/gateway -run
+  'TestE2E_F1b|TestE2E_F1c|TestE2E_F1d' -count=300
+```
+
+All passed. Tagging remains gated on complete CI and GHCR success.

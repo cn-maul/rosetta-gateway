@@ -1455,3 +1455,29 @@ want ["alice" "admin1" "admin1"]
 - Verification: the A1/A2 race pair passed 200 runs; the complete non-short Go
   race suite, short suite, and frontend tests/typecheck passed locally. A fresh
   complete CI run remains required before tagging.
+
+### DELIVERY-03 - F1b canceled between WriteHeader(200) and the first body write
+
+- Status: fixed after a fresh v1.7.0 CI run exposed the low-frequency failure
+- Evidence: `cmd/gateway/e2e_datapath_test.go`,
+  `TestE2E_F1b_ClientDisconnectStillConsumesTokenQuota`
+- Trigger: the full non-race Linux suite canceled F1b after the first
+  `Write` returned, without waiting for a recorded `WriteHeader(200)`.
+- Failure-first result from CI:
+
+```text
+--- FAIL: TestE2E_F1b_ClientDisconnectStillConsumesTokenQuota
+    e2e_datapath_test.go:1246: F1b usage 行:
+      {Status:canceled UsageState:none TotalTokens:0 HTTPStatus:502}
+    e2e_datapath_test.go:1250: 客户端中断后 total_tokens=0
+```
+
+- Root cause: `signalingRecorder` closed its signal inside `Write`, while
+  `WriteHeader` is a separate call. The cancel could land before the recorder
+  showed the committed 200, so the test exercised the uncommitted cancel path
+  (`usage_state=none`, HTTP 502) instead of the committed partial-stream path.
+- Direction: signal only after an HTTP 200 has been recorded and a body byte
+  has been written. Product stream and quota logic are unchanged.
+- Verification: F1b/F1c/F1d passed 300 race runs after the synchronization
+  change. The complete non-short Go race suite, short suite, and frontend
+  tests/typecheck remain required before tagging.
