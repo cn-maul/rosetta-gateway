@@ -1645,3 +1645,9 @@ failure was normalized as an ordinary client abort, causing a second usage row.
 `DELIVERY-01` records the failure-first test, the minimal outcome-kind fix, and
 its verification. The tag and GHCR publication are intentionally blocked until
 the fix passes a fresh complete CI run.
+
+The follow-up first-write check and explicit lane mapping now cover the narrow
+window after a committed SSE 200 but before the event loop sees a second
+write. The F1b/F1c/F1d group passed 100 non-race runs (50 mixed with
+non-stream cases) and 50 race runs; dataplane/usage/outwire passed 20 runs.
+The tag remains gated on CI and GHCR success.

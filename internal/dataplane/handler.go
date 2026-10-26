@@ -1245,7 +1245,15 @@ func (h *Handler) attemptStream(w http.ResponseWriter, r *http.Request, client *
 
 	lastEvent := time.Now()
 	consume(stream.Event())
-	for stream.Next() {
+	// The first event can fail after WriteHeader has committed a 200 response.
+	// In that case the stream loop would otherwise exit through the generic
+	// client-abort path and the outer request lane would append a second usage
+	// row as an uncommitted 502. Treat the first write failure as terminal here.
+	firstWriteFailed := outwire.FirstWriteError(sink) != nil
+	if firstWriteFailed {
+		_ = stream.Close()
+	}
+	for !firstWriteFailed && stream.Next() {
 		now := time.Now()
 		if gap := now.Sub(lastEvent).Milliseconds(); gap > attempt.MaxEventGapMs {
 			attempt.MaxEventGapMs = gap

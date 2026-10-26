@@ -1305,6 +1305,45 @@ func TestE2E_F1c_DownstreamWriteFailureMarksCanceled(t *testing.T) {
 	e2eWaitReservedZero(t, db, "k1", "F1c 写失败收尾")
 }
 
+// A failure on the very first sink write happens after WriteHeader(200) but
+// before the event loop can observe a second write. It must still be a single
+// committed downstream-write terminal, never an uncommitted 502 summary.
+func TestE2E_F1d_FirstDownstreamWriteFailureIsSingleTerminal(t *testing.T) {
+	up := newTrickleUpstream(t, 12, 10*time.Millisecond)
+	h, db := buildHarness(t, []struct {
+		slug, url string
+		fail      bool
+	}{{slug: "slow", url: up.srv.URL}}, false)
+
+	if err := db.UpdateAccessKey(context.Background(), "k1", &store.AccessKey{
+		ID: "k1", Name: "t", Enabled: true, QuotaTokens: 100_000, UserID: testUserID,
+	}); err != nil {
+		t.Fatalf("set quota: %v", err)
+	}
+
+	w := newFailingWriterAfter(0, errors.New("write: broken pipe"))
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		middlewareForTest(h).ServeHTTP(w, streamingChatRequest("flash"))
+	}()
+	wg.Wait()
+
+	rows := e2eWaitUsageCount(t, db, "k1", 1)
+	time.Sleep(100 * time.Millisecond)
+	rows = e2eUsageRows(t, db, "k1")
+	if len(rows) != 1 {
+		t.Fatalf("F1d 首写失败后 usage 行数 = %d，期望恰好 1 行: %+v", len(rows), rows)
+	}
+	got := rows[0]
+	if got.Status != store.UsageStatusCanceled || got.ErrorCode != "downstream_write_failed" {
+		t.Fatalf("F1d usage = status %q code %q, want canceled/downstream_write_failed",
+			got.Status, got.ErrorCode)
+	}
+	e2eWaitReservedZero(t, db, "k1", "F1d 首写失败收尾")
+}
+
 // failingWriter 是一个受控失败的 ResponseWriter：failNow 之后的每次写都
 // 返回错误，之前的写正常收集。
 //

@@ -147,6 +147,21 @@ func TestR5_DownstreamWriteFailureKeepsItsCommittedKind(t *testing.T) {
 	}
 }
 
+func TestR5_FirstSinkWriteFailureTerminatesTheAttempt(t *testing.T) {
+	out := Outcome{Kind: OutcomeDownstreamWriteFailed, Committed: true, Code: "downstream_write_failed"}.normalize()
+	decision := out.LaneDecision()
+	if !decision.Committed {
+		t.Fatal("first sink write failure must be committed after the status line")
+	}
+	if decision.Eligible || decision.TraceOutcome != "committed_fail" {
+		t.Fatalf("first sink write failure decision = %+v, want terminal committed failure", decision)
+	}
+	if decision.UsageStatus != store.UsageStatusCanceled ||
+		decision.DiagnosticError != "downstream_write_failed" {
+		t.Fatalf("first sink write failure accounting = status %q code %q", decision.UsageStatus, decision.DiagnosticError)
+	}
+}
+
 func TestR5_OutcomeConstructorsCannotExpressConflictingBooleans(t *testing.T) {
 	upstream := OutcomeFromErrCtx(context.Background(), errors.New("upstream failed"))
 	if upstream.Kind != OutcomeUpstreamFailed || upstream.Committed || upstream.Success {

@@ -342,6 +342,9 @@ func LaneDecisionFor(kind OutcomeKind, committed, eligible bool, code string) La
 // LaneDecision is the only supported interpretation of an Outcome.
 func (o Outcome) LaneDecision() LaneDecision {
 	o = o.normalize()
+	if o.Code == "downstream_write_failed" {
+		return LaneDecisionFor(OutcomeDownstreamWriteFailed, true, false, o.Code)
+	}
 	d := LaneDecisionFor(o.Kind, o.Committed, o.Eligible, o.Code)
 	if o.Kind == OutcomeClientAborted && o.Committed {
 		d.Committed = true

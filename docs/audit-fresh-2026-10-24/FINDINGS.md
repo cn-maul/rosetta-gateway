@@ -1421,3 +1421,11 @@ want ["alice" "admin1" "admin1"]
 - Verification: the targeted regression, the Linux-failing E2E repeated 20
   times, and dataplane/usage/outwire repeated 10 times pass. Full gates and a
   fresh CI run are required before tagging.
+
+- Follow-up: the first write can fail after a committed SSE 200 response but
+  before the event loop sees a second write. `attemptStream` now checks the
+  first sink write immediately and `LaneDecision` treats the explicit
+  `downstream_write_failed` code as committed, terminal, and ineligible for
+  failover. `TestE2E_F1d_FirstDownstreamWriteFailureIsSingleTerminal` pins the
+  single-row result. The F1b/F1c/F1d group then passed 50 mixed runs (20 with
+  `-race`), and dataplane/usage/outwire passed 20 runs.

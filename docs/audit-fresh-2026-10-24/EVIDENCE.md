@@ -2561,3 +2561,22 @@ go test ./internal/dataplane ./internal/usage ./internal/outwire -count=10
 ```
 
 All passed. Tagging remains gated on a new green CI run and the GHCR workflow.
+
+### First-write follow-up
+
+The first sink `Event` write can fail after `WriteHeader(200)` but before the
+loop observes a later write. A dedicated E2E reproduced two rows: an
+uncommitted 502 summary plus the committed 200 downstream-write row. The lane
+now checks `FirstWriteError` immediately after the first event and
+`LaneDecision` maps the explicit `downstream_write_failed` code to a
+committed, terminal, non-failover outcome.
+
+```text
+go test ./cmd/gateway -run
+  'TestE2E_F1b_ClientDisconnectStillConsumesTokenQuota|TestE2E_F1c_DownstreamWriteFailureMarksCanceled|TestE2E_F1d_FirstDownstreamWriteFailureIsSingleTerminal' -count=100
+go test -race ./cmd/gateway -run
+  'TestE2E_F1b_ClientDisconnectStillConsumesTokenQuota|TestE2E_F1c_DownstreamWriteFailureMarksCanceled|TestE2E_F1d_FirstDownstreamWriteFailureIsSingleTerminal|TestR0AC13_NonStream|TestR0AC14_NonStream' -count=50
+go test ./internal/dataplane ./internal/usage ./internal/outwire -count=20
+```
+
+All passed.
