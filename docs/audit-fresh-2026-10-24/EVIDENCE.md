@@ -2580,3 +2580,44 @@ go test ./internal/dataplane ./internal/usage ./internal/outwire -count=20
 ```
 
 All passed.
+
+## v1.7.0 Race-only CI Finding
+
+The second full CI run reached `nightly-long` and exposed a race-only test
+synchronization failure after the non-race suite passed:
+
+```text
+--- FAIL: TestE2E_A2_StreamHappyPathRecordsAndCharges
+    e2e_datapath_test.go:442: A2 成功流式请求没被扣费
+```
+
+The response and usage row were already complete:
+
+```text
+Status:ok UsageState:reported TotalTokens:8 CostTotal:8
+```
+
+`FindUnchargedUsage` and the recorder implementation confirm that the worker
+first persists the usage row and then performs `chargeBatch`. A1/A2 called
+`e2eWaitBalanceDrop(..., want=0)`, which returned as soon as it read the
+unchanged balance, before that second step on the slower race build.
+
+### Implementation
+
+`e2eWaitCharged` polls until
+`(startCents-cents)*0.01 + (rem-startRem)/1e6` reaches the persisted
+`row.CostTotal`. This also handles costs that accumulate in the remainder
+without immediately changing the integer balance. No product charging code
+changed.
+
+### Verification
+
+```text
+go test -race ./cmd/gateway -run 'TestE2E_A[12]' -count=200
+go test -race -count=1 -timeout 1800s ./cmd/... ./internal/...
+go test -short -count=1 -timeout 300s ./cmd/... ./internal/...
+cd web; npm test -- --run
+cd web; npm run typecheck
+```
+
+All passed locally. Tagging remains gated on a fresh complete CI run.

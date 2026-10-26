@@ -1429,3 +1429,29 @@ want ["alice" "admin1" "admin1"]
   failover. `TestE2E_F1d_FirstDownstreamWriteFailureIsSingleTerminal` pins the
   single-row result. The F1b/F1c/F1d group then passed 50 mixed runs (20 with
   `-race`), and dataplane/usage/outwire passed 20 runs.
+
+### DELIVERY-02 - A1/A2 read the balance before asynchronous charging
+
+- Status: fixed after the second v1.7.0 CI run exposed a race-only failure
+- Evidence: `cmd/gateway/e2e_datapath_test.go`,
+  `TestE2E_A1_NonStreamHappyPathChargesAndRecords`,
+  `TestE2E_A2_StreamHappyPathRecordsAndCharges`
+- Trigger: the full non-short suite ran A2 under `-race` on Linux.
+- Failure-first result from CI:
+
+```text
+--- FAIL: TestE2E_A2_StreamHappyPathRecordsAndCharges
+    e2e_datapath_test.go:442: A2 成功流式请求没被扣费
+```
+
+- Root cause: the usage row and its charge are both written by the asynchronous
+  recorder worker, in that order. A1/A2 waited with a zero-cent threshold, so
+  they could observe the visible usage row and read the unchanged balance before
+  the worker reached the charge step. The slower race build made that existing
+  test window fail intermittently.
+- Direction: wait for the observed balance movement to reach the persisted
+  `cost_total`, including remainder-only sub-cent charges. Product charging and
+  recorder ordering are unchanged.
+- Verification: the A1/A2 race pair passed 200 runs; the complete non-short Go
+  race suite, short suite, and frontend tests/typecheck passed locally. A fresh
+  complete CI run remains required before tagging.

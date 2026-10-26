@@ -1651,3 +1651,12 @@ window after a committed SSE 200 but before the event loop sees a second
 write. The F1b/F1c/F1d group passed 100 non-race runs (50 mixed with
 non-stream cases) and 50 race runs; dataplane/usage/outwire passed 20 runs.
 The tag remains gated on CI and GHCR success.
+
+The second full CI run passed the non-race long tests but failed A2 under
+`-race`: the test observed the usage row before the asynchronous recorder
+worker charged it and returned immediately from a zero-cent balance wait.
+`DELIVERY-02` records the CI failure, the recorder's usage-then-charge ordering,
+and a test-only wait for the accumulated charge to reach `cost_total`. The
+A1/A2 race pair passed 200 runs, followed by the complete non-short Go race
+suite, short suite, and frontend tests/typecheck. The tag remains gated on a
+fresh complete CI run and GHCR success.

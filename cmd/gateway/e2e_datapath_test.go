@@ -101,6 +101,33 @@ func e2eWaitBalanceDrop(t *testing.T, db *store.Store, startCents, want int64) (
 	}
 }
 
+// e2eWaitCharged polls until the accumulated balance movement reaches the
+// persisted cost. Usage rows become visible before the recorder worker charges
+// them, and sub-cent costs accumulate in the remainder instead of changing the
+// integer balance immediately.
+func e2eWaitCharged(
+	t *testing.T,
+	db *store.Store,
+	startCents, startRem int64,
+	wantYuan float64,
+) (int64, int64) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	var cents, rem int64
+	for {
+		cents, rem = e2eBalance(t, db)
+		charged := float64(startCents-cents)*0.01 + float64(rem-startRem)/1e6
+		if charged+1e-6 >= wantYuan {
+			return cents, rem
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("等待扣费 %.6f 元超时：起始 %d分/%d微元，现在 %d分/%d微元，已扣 %.6f 元",
+				wantYuan, startCents, startRem, cents, rem, charged)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
 // e2eUsageRows 读某把 key 的 usage_records 行（倒序）。
 // 返回可断言的字段集合，避免测试里散落一堆 SQL。
 type e2eUsageRow struct {
@@ -344,7 +371,7 @@ func TestE2E_A1_NonStreamHappyPathChargesAndRecords(t *testing.T) {
 	//
 	// 扣费是「累进余数、满一分才动余额」，所以断言写成「余额减少 + 余数补足」
 	// 的合计等于 cost_total，而不是直接比某个整数分。
-	endCents, endRem := e2eWaitBalanceDrop(t, db, startCents, 0)
+	endCents, endRem := e2eWaitCharged(t, db, startCents, startRem, row.CostTotal)
 	chargedYuan := float64(startCents-endCents)*0.01 +
 		float64(endRem-startRem)/1e6
 	t.Logf("A1 余额: %d分/%d微元 → %d分/%d微元，合计扣费≈%.6f 元；cost_total=%.6f 元",
@@ -434,7 +461,7 @@ func TestE2E_A2_StreamHappyPathRecordsAndCharges(t *testing.T) {
 		t.Errorf("A2 cost_total=%v，必须 > 0", row.CostTotal)
 	}
 
-	endCents, endRem := e2eWaitBalanceDrop(t, db, startCents, 0)
+	endCents, endRem := e2eWaitCharged(t, db, startCents, startRem, row.CostTotal)
 	charged := float64(startCents-endCents)*0.01 + float64(endRem-startRem)/1e6
 	t.Logf("A2 余额: %d分/%d微元 → %d分/%d微元，合计扣费≈%.6f 元；cost_total=%.6f",
 		startCents, startRem, endCents, endRem, charged, row.CostTotal)
