@@ -89,6 +89,7 @@ export const DTO_CONTRACTS: readonly DTOFieldContract[] = [
   { goType: "internal/admin.keyCreateResponse", tsType: "KeyCreateResponse", fields: [
     "id",
     "key_prefix",
+    "can_copy",
     "name",
     "enabled",
     "user_id",
@@ -107,6 +108,7 @@ export const DTO_CONTRACTS: readonly DTOFieldContract[] = [
   { goType: "internal/admin.keyResponse", tsType: "AccessKey", fields: [
     "id",
     "key_prefix",
+    "can_copy",
     "name",
     "enabled",
     "user_id",
@@ -120,6 +122,9 @@ export const DTO_CONTRACTS: readonly DTOFieldContract[] = [
     "allowed_ips",
     "group_id",
     "created_at",
+  ] },
+  { goType: "internal/admin.keySecretResponse", tsType: "KeySecretResponse", fields: [
+    "plaintext_key",
   ] },
   { goType: "internal/admin.loginResponse", tsType: "LoginResult", fields: [
     "token",
@@ -484,6 +489,7 @@ export const DTO_CONTRACTS: readonly DTOFieldContract[] = [
     "error_detail",
     "route_trace",
     "request_id",
+    "request_ip",
   ] },
   { goType: "internal/admin.usageHistoryResponse", tsType: "UsageHistoryPage", fields: [
     "records",

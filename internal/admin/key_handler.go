@@ -14,11 +14,19 @@ import (
 )
 
 type KeyHandler struct {
-	store *store.Store
+	store     *store.Store
+	masterKey []byte
 }
 
-func NewKeyHandler(st *store.Store) *KeyHandler {
-	return &KeyHandler{store: st}
+// NewKeyHandler 接受可选主密钥：生产装配必须传入，才有「再次复制」能力；
+// 大量既有单元测试只关心配额、归属等逻辑，不传时仍可运行，但创建出来的
+// key 不会保存加密副本，Secret 端点也会明确拒绝。
+func NewKeyHandler(st *store.Store, masterKey ...[]byte) *KeyHandler {
+	h := &KeyHandler{store: st}
+	if len(masterKey) > 0 {
+		h.masterKey = masterKey[0]
+	}
+	return h
 }
 
 // keyRequest 是访问密钥的创建 / PATCH 输入。
@@ -67,8 +75,11 @@ type keyRequest struct {
 type keyResponse struct {
 	ID        string `json:"id"`
 	KeyPrefix string `json:"key_prefix"`
-	Name      string `json:"name"`
-	Enabled   bool   `json:"enabled"`
+	// CanCopy 表示这把 key 有加密副本，可以通过列表里的「复制」再次取得
+	// 明文。升级前创建的 key 只有哈希，因此为 false。
+	CanCopy bool   `json:"can_copy"`
+	Name    string `json:"name"`
+	Enabled bool   `json:"enabled"`
 	// UserID 是归属用户。空串 = **无归属**：鉴权直接 401。
 	// 界面上必须显式标注
 	// 「无归属（不可用）」，否则运维会以为它还能用。
@@ -92,6 +103,11 @@ type keyResponse struct {
 // @ts-type KeyCreateResponse
 type keyCreateResponse struct {
 	keyResponse
+	PlaintextKey string `json:"plaintext_key"`
+}
+
+// @ts-type KeySecretResponse
+type keySecretResponse struct {
 	PlaintextKey string `json:"plaintext_key"`
 }
 
@@ -188,6 +204,16 @@ func (h *KeyHandler) Create(w http.ResponseWriter, r *http.Request) {
 	hash := sha256.Sum256([]byte(plainKey))
 	keyHash := hex.EncodeToString(hash[:])
 	keyPrefix := plainKey[:11] + "..."
+
+	var keyEnc []byte
+	if len(h.masterKey) > 0 {
+		enc, err := encryptSecret(plainKey, h.masterKey)
+		if err != nil {
+			writeServerError(w, "encrypt access key", err)
+			return
+		}
+		keyEnc = enc
+	}
 
 	enabled := true
 	if req.Enabled != nil {
@@ -291,6 +317,7 @@ func (h *KeyHandler) Create(w http.ResponseWriter, r *http.Request) {
 		ID:          generateID(),
 		KeyHash:     keyHash,
 		KeyPrefix:   keyPrefix,
+		KeyEnc:      keyEnc,
 		Name:        name,
 		Enabled:     enabled,
 		QuotaTokens: quota,
@@ -740,6 +767,52 @@ func (h *KeyHandler) Delete(w http.ResponseWriter, r *http.Request, id string) {
 	writeJSON(w, http.StatusOK, map[string]string{"status": "deleted"})
 }
 
+// Secret 返回一把访问密钥的明文，供管理界面再次复制。
+//
+// 明文不可从哈希反推：本端点只对创建时保存了 key_enc 的密钥有效。升级前
+// 创建的历史密钥没有密文，明确返回 409，而不是伪装成「密钥不存在」——
+// 后者会让用户反复刷新，且无法理解为什么同一行仍能正常调用。
+func (h *KeyHandler) Secret(w http.ResponseWriter, r *http.Request, id string) {
+	existing, err := h.store.GetAccessKey(r.Context(), id)
+	if err != nil {
+		writeServerError(w, "get key", err)
+		return
+	}
+	if existing == nil {
+		writeError(w, http.StatusNotFound, "key not found")
+		return
+	}
+	if !h.ownedByCaller(w, r, existing) {
+		return
+	}
+	if len(h.masterKey) == 0 {
+		writeError(w, http.StatusConflict, "主密钥不可用，无法读取密钥明文")
+		return
+	}
+	enc, found, err := h.store.AccessKeySecret(r.Context(), id)
+	if err != nil {
+		writeServerError(w, "read access key secret", err)
+		return
+	}
+	if !found {
+		writeError(w, http.StatusNotFound, "key not found")
+		return
+	}
+	if len(enc) == 0 {
+		writeError(w, http.StatusConflict,
+			"这把密钥创建于「再次复制」上线之前，明文已不可恢复；请新建一把密钥")
+		return
+	}
+	plain, err := decryptSecret(enc, h.masterKey)
+	if err != nil {
+		writeServerError(w, "decrypt access key", err)
+		return
+	}
+	// 密钥明文不得进入浏览器缓存或中间缓存。
+	w.Header().Set("Cache-Control", "no-store")
+	writeJSON(w, http.StatusOK, keySecretResponse{PlaintextKey: plain})
+}
+
 // RecomputeUsage 从 usage_records 重算该密钥的已用量并覆盖 used_tokens。
 //
 // 存在的理由：used_tokens 由数据库触发器单调累加，没有任何回退路径。
@@ -789,6 +862,7 @@ func toKeyResponse(k store.AccessKey) keyResponse {
 	return keyResponse{
 		ID:            k.ID,
 		KeyPrefix:     k.KeyPrefix,
+		CanCopy:       k.HasSecret,
 		Name:          k.Name,
 		Enabled:       k.Enabled,
 		UserID:        k.UserID,

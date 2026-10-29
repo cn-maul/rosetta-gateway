@@ -467,6 +467,7 @@ import type {
   AccessKey,
   AuditEntry,
   KeyCreateResponse,
+  KeySecretResponse,
   Settings,
   Stats,
   StatsOverview,
@@ -611,6 +612,13 @@ export const api = {
 
   // access keys
   keys: () => get<AccessKey[]>('/keys'),
+  /**
+   * 再次读取一把密钥的明文。
+   *
+   * 不改变状态，所以用 GET；响应带 no-store。调用方只应把它交给剪贴板，
+   * 不要写入 localStorage、URL 或日志。
+   */
+  keySecret: (id: string) => get<KeySecretResponse>(`/keys/${id}/secret`),
   createKey: (b: {
     name: string
     quota_tokens?: number

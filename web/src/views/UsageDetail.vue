@@ -294,7 +294,7 @@ async function exportCSV() {
     <DataTable class="panel table-panel" label="请求日志" :loading="loading" :error="err ? err + (rows.length ? '（近 ' + loadedDays + ' 天，第 ' + loadedPage + ' 页）' : '') : ''" :has-data="!!rows.length" :empty="!rows.length" empty-text="当前条件下没有调用记录" loading-text="正在加载请求日志…" @retry="load">
         <table class="tbl logs-table">
           <thead><tr>
-            <th class="time-column">时间</th><th class="mode-column">模式</th><th class="protocol-column">协议</th><th class="upstream-column">上游</th><th class="model-column">模型</th><th class="key-column">密钥</th><th class="token-column">Token 用量</th><th class="speed-column">速度</th><th class="timing-column">时间</th><th class="cost-column">费用</th><th class="status-column">状态</th>
+            <th class="time-column">时间</th><th class="mode-column">模式</th><th class="protocol-column">协议</th><th class="request-ip-column">请求 IP</th><th class="upstream-column">上游</th><th class="model-column">模型</th><th class="key-column">密钥</th><th class="token-column">Token 用量</th><th class="speed-column">速度</th><th class="timing-column">时间</th><th class="cost-column">费用</th><th class="status-column">状态</th>
           </tr></thead>
           <tbody><tr v-for="(h, i) in rows" :key="h.ts + ':' + i">
             <td class="mono time-column">{{ fmtTimeMs(h.ts) }}</td>
@@ -305,6 +305,7 @@ async function exportCSV() {
                 <span class="protocol-line"><span class="protocol-dir">下游</span><span class="protocol-tag mono">{{ protocolLabel(h.ingress_protocol, '未记录') }}</span></span>
               </span>
             </td>
+            <td class="request-ip-column"><span class="request-ip mono" :title="h.request_ip || '未记录'">{{ h.request_ip || '—' }}</span></td>
             <td class="upstream-column" :title="upstreamPathTitle(h)">
               <span v-if="traceSteps(h).length" class="path-flow">
                 <template v-for="(step, si) in traceSteps(h)" :key="si">
@@ -354,6 +355,7 @@ async function exportCSV() {
         <div class="request-heading"><span class="badge" :class="statusBadge(selected.status)">{{ statusLabel(selected.status) }}</span><span class="dim">{{ fmtTimeMs(selected.ts) }} · {{ modeLabel(selected) }} · {{ protocolLabel(selected.ingress_protocol) }} → {{ protocolLabel(selected.upstream_protocol) }}</span></div>
         <dl class="request-facts">
           <div><dt>请求 ID</dt><dd class="mono">{{ selected.request_id || '未记录' }}</dd></div>
+          <div><dt>请求 IP</dt><dd class="mono">{{ selected.request_ip || '未记录' }}</dd></div>
           <div><dt>上游</dt><dd><span class="fact-strong">{{ upstreamName(selected) }}</span><span v-if="selected.provider_id" class="fact-note mono">provider_id: {{ selected.provider_id }}</span></dd></div>
           <div><dt>上游协议 / 入站协议</dt><dd>{{ protocolLabel(selected.upstream_protocol, '未记录') }} / {{ protocolLabel(selected.ingress_protocol, '未记录') }}<span class="fact-note">上行是网关连接上游使用的协议；下行是客户端调用网关使用的协议。</span></dd></div>
           <div><dt>公开模型名</dt><dd class="mono">{{ selected.public_model || '—' }}</dd></div>
@@ -424,7 +426,7 @@ async function exportCSV() {
 .log-toolbar { margin-bottom: 16px; }
 .log-actions, .request-heading { display: flex; justify-content: space-between; align-items: center; gap: 12px; flex-wrap: wrap; font-size: 12px; margin-bottom: 16px; }
 .w-auto { width: auto; }
-.logs-table { min-width: 1360px; table-layout: fixed; }
+.logs-table { min-width: 1490px; table-layout: fixed; }
 .logs-table th, .logs-table td { white-space: nowrap; }
 .logs-table th, .logs-table td { text-align: left; }
 /* 请求日志是逐条扫描为主，行密度优先。全局 .table-panel td 给 16px
@@ -437,6 +439,8 @@ async function exportCSV() {
 .logs-table th { overflow: hidden; text-overflow: ellipsis; }
 .mode-column { width: 70px; }
 .protocol-column { width: 104px; }
+.request-ip-column { width: 132px; min-width: 0; }
+.request-ip { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .upstream-column { width: 190px; min-width: 0; }
 .upstream-name { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-weight: 600; }
 .model-column { width: 238px; min-width: 0; }
@@ -507,17 +511,18 @@ async function exportCSV() {
 .error-raw { max-height: 52vh; overflow: auto; background: var(--surface-secondary); color: var(--text); font-family: var(--font-mono, monospace); }
 .notice-warn { margin: 12px 0; padding: 12px; display: flex; flex-wrap: wrap; align-items: center; gap: 12px; border-radius: 10px; background: var(--warning-soft); color: var(--warning-soft-foreground); font-size: 12px; }
 @media (max-width: 1500px) {
-  .logs-table { min-width: 1360px; }
+  .logs-table { min-width: 1490px; }
   .key-column { display: none; }
 }
 @media (max-width: 900px) {
-  .logs-table { min-width: 920px; }
+  .logs-table { min-width: 1120px; }
   .speed-column, .timing-column, .cost-column, .key-column { display: none; }
 }
 @media (max-width: 640px) {
   .logs-table { min-width: 0; table-layout: fixed; }
   .token-column, .speed-column, .timing-column, .cost-column, .protocol-column, .key-column, .time-column { display: none; }
   .mode-column { width: 64px; }
+  .request-ip-column { width: 104px; }
   .upstream-column { width: 34%; }
   .model-column { min-width: 0; max-width: none; }
   .model-stack { display: block; }

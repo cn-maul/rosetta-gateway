@@ -186,7 +186,8 @@ func (h *Handler) Handle(codec ingress.Codec) http.HandlerFunc {
 		start := time.Now()
 		diag := newRequestDiagnostics(r)
 		var decoded *ingress.Request
-		diag.setRemote(httpx.ClientIPOf(r))
+		requestIP := httpx.ClientIPOf(r)
+		diag.setRemote(requestIP)
 		diag.setRequestID(httpx.RequestIDFromContext(r.Context()))
 		diag.setIngressName(codec.Name())
 		obs := observeResponse(w)
@@ -880,6 +881,7 @@ func (h *Handler) Handle(codec ingress.Codec) http.HandlerFunc {
 			AccessKeyID:      keyID,
 			UserID:           authCtx.UserID,
 			RequestID:        httpx.RequestIDFromContext(r.Context()),
+			RequestIP:        requestIP,
 			PublicModel:      ing.Model,
 			ProviderID:       provID,
 			ProviderName:     providerName,
@@ -1452,6 +1454,7 @@ func (h *Handler) attemptStream(w http.ResponseWriter, r *http.Request, client *
 		AccessKeyID:          authCtx.KeyID,
 		UserID:               authCtx.UserID,
 		RequestID:            httpx.RequestIDFromContext(r.Context()),
+		RequestIP:            httpx.ClientIPOf(r),
 		PublicModel:          publicModel,
 		ProviderID:           cand.Provider.ID,
 		ProviderName:         cand.Provider.Name,
@@ -1595,6 +1598,7 @@ func (h *Handler) attemptNonStream(w http.ResponseWriter, r *http.Request, clien
 		AccessKeyID:          authCtx.KeyID,
 		UserID:               authCtx.UserID,
 		RequestID:            httpx.RequestIDFromContext(r.Context()),
+		RequestIP:            httpx.ClientIPOf(r),
 		PublicModel:          publicModel,
 		ProviderID:           cand.Provider.ID,
 		ProviderName:         cand.Provider.Name,
@@ -1667,6 +1671,7 @@ func (h *Handler) finishNonStreamEncodeFailure(
 		AccessKeyID:      authCtx.KeyID,
 		UserID:           authCtx.UserID,
 		RequestID:        httpx.RequestIDFromContext(r.Context()),
+		RequestIP:        httpx.ClientIPOf(r),
 		PublicModel:      publicModel,
 		ProviderID:       cand.Provider.ID,
 		ProviderName:     cand.Provider.Name,
@@ -1731,6 +1736,7 @@ func (h *Handler) finishNonStreamWriteFailure(
 		AccessKeyID:          authCtx.KeyID,
 		UserID:               authCtx.UserID,
 		RequestID:            httpx.RequestIDFromContext(r.Context()),
+		RequestIP:            httpx.ClientIPOf(r),
 		PublicModel:          publicModel,
 		ProviderID:           cand.Provider.ID,
 		ProviderName:         cand.Provider.Name,

@@ -30,6 +30,10 @@ web/** text eol=lf
 # go:embed 的数据源同理：入库产物也锁 LF，避免签出后与构建结果不一致。
 internal/webui/dist/** text eol=lf
 
+# 图片是二进制，不能被上面 web/** 的 LF 规则改写。
+# 该规则必须放在文本规则之后，确保覆盖更宽的通配符。
+*.png binary
+
 # Go 源码锁 LF：gofmt 以 LF 为准，CRLF 文件会被 gofmt -l 判为待格式化
 #（实测 `printf 'package x\r\n' > x.go; gofmt -l x.go` 必定输出该文件），
 # 也会让 go vet / golangci-lint 与 CI 的格式校验口径不一致。

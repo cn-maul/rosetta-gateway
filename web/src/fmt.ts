@@ -293,7 +293,7 @@ export async function copyText(text: string): Promise<boolean> {
     //
     // 注意这条路径在本项目的部署形态下是**常用路径**（局域网 HTTP，
     // clipboard 要求安全上下文），而它的唯一用途之一是复制那把
-    // 一次性展示的明文网关密钥 —— 所以明文会短暂进入 DOM。
+    // 明文网关密钥 —— 所以明文会短暂进入 DOM。
     // 清除 value 再移除节点：能让明文在 DOM 里停留的时间尽量短，
     // 且不依赖节点被 GC 才消失（devtools / 扩展仍可读到节点的话，
     // 读到的是空值而不是密钥）。

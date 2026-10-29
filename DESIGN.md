@@ -239,8 +239,10 @@ CREATE TABLE access_keys (
   user_id         TEXT REFERENCES users(id) ON DELETE CASCADE,
                   -- 当前写入路径必须提供归属用户；NULL 不是受支持的业务状态，
                   -- 鉴权遇到它 fail-closed（ErrKeyUnowned）
-  key_hash        TEXT NOT NULL UNIQUE,      -- SHA-256(明文)，不存明文
+  key_hash        TEXT NOT NULL UNIQUE,      -- SHA-256(明文)，鉴权只查这一列
   key_prefix      TEXT NOT NULL,             -- 形如 "sk-gw-a1b2"，用于界面展示
+  key_enc         BLOB,                      -- 明文的可选加密副本，仅用于再次复制；
+                                             -- 2026-10-29 前创建的 key 为 NULL，不可回读
   name            TEXT NOT NULL,
   enabled         INTEGER NOT NULL DEFAULT 1,
   quota_tokens    INTEGER NOT NULL DEFAULT 0,     -- 0 = 不限；终身累计 input+output 上限
@@ -452,6 +454,8 @@ resolve(model):
 | Anthropic 风格 | `x-api-key: sk-gw-...` |
 
 校验：`SHA-256(明文)` 查 `access_keys.key_hash` 索引。上游 Key 是高熵随机串，无需 bcrypt 类慢哈希。
+`key_enc` 不参与鉴权热路径，只保存可用 `master.key` 解开的加密副本，供登录用户在
+密钥列表里再次复制。升级前创建的历史 key 没有该副本，界面隐藏复制按钮并提示重建。
 
 **刻意不支持 `?key=sk-gw-...`**（早期文档里有，现已移除）：query 串会被写进访问日志、
 反向代理日志与 `Referer`，等于把凭据复制到系统里每一个会记录 URL 的地方
@@ -592,6 +596,8 @@ GET    /admin/api/groups                        分组与组级模型白名单�
 PUT    /admin/api/groups/{id}/models            设置分组模型白名单（写入口，**仅管理员**）
 
 GET    /admin/api/keys                          列表（普通用户只看到自己的）
+GET    /admin/api/keys/{id}/secret              再次读取明文（归属校验；no-store）；
+                                                历史 key 无 key_enc → 409
 POST   /admin/api/keys                          普通用户自助发 key；归属恒为创建者自己，
                                                  请求里的 `user_id` 被忽略。
                                                  **管理员被路由层 403**（denyAdminKeyCreate）——

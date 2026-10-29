@@ -134,8 +134,8 @@ func TestSchema_ReopensCurrentVersionAndKeepsData(t *testing.T) {
 	}
 }
 
-// v1.6.6 的 usage_records 没有 provider_name / upstream_protocol。
-// v1.6.7 必须给同版本旧库纯新增这两列，同时保留原有配置与历史数据。
+// 旧版 usage_records 没有 provider_name / upstream_protocol / request_ip。
+// 当前版本必须给同版本旧库纯新增这些列，同时保留原有配置与历史数据。
 func TestSchema_AddsUsageHistoryColumnsToExistingCurrentDatabase(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "v166.db")
 	st := openSchemaTestStore(t, path)
@@ -153,7 +153,7 @@ func TestSchema_AddsUsageHistoryColumnsToExistingCurrentDatabase(t *testing.T) {
 	if err != nil {
 		t.Fatalf("open raw database: %v", err)
 	}
-	for _, column := range []string{"provider_name", "upstream_protocol"} {
+	for _, column := range []string{"provider_name", "upstream_protocol", "request_ip"} {
 		if _, err := raw.Exec(`ALTER TABLE usage_records DROP COLUMN ` + column); err != nil {
 			_ = raw.Close()
 			t.Fatalf("drop %s: %v", column, err)
@@ -165,7 +165,7 @@ func TestSchema_AddsUsageHistoryColumnsToExistingCurrentDatabase(t *testing.T) {
 
 	reopened := openSchemaTestStore(t, path)
 	columns := tableColumns(t, reopened, "usage_records")
-	for _, column := range []string{"provider_name", "upstream_protocol"} {
+	for _, column := range []string{"provider_name", "upstream_protocol", "request_ip"} {
 		if !columns[column] {
 			t.Errorf("v1.6.6 database did not gain usage_records.%s", column)
 		}
@@ -350,11 +350,11 @@ func TestSchema_CanonicalObjectsAndColumns(t *testing.T) {
 	requiredColumns := map[string][]string{
 		"access_keys": {
 			"user_id", "rpm_limit", "tpm_limit", "allowed_models_json",
-			"expires_at", "allowed_ips", "group_id",
+			"expires_at", "allowed_ips", "group_id", "key_enc",
 		},
 		"usage_records": {
 			"user_id", "error_detail", "route_trace", "cost_total",
-			"provider_name", "upstream_protocol",
+			"provider_name", "upstream_protocol", "request_ip",
 			"charge_attempts", "charge_next_at", "charge_last_error",
 		},
 		"users": {"balance_cents", "balance_remainder", "group_id", "reserved_tokens"},

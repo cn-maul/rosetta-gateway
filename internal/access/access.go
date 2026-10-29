@@ -53,6 +53,7 @@ var userAccessibleRoutes = map[string]bool{
 	// 访问密钥：普通用户自助管理自己的 key（handler 按 user_id 收窄）。
 	"GET /admin/api/keys":                       true,
 	"POST /admin/api/keys":                      true,
+	"GET /admin/api/keys/{id}/secret":           true,
 	"PATCH /admin/api/keys/{id}":                true,
 	"DELETE /admin/api/keys/{id}":               true,
 	"POST /admin/api/keys/{id}/recompute-usage": true,

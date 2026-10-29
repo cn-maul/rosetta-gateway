@@ -422,6 +422,8 @@ export interface RouteTargetInput {
 export interface AccessKey {
   id: string
   key_prefix: string
+  /** 是否有加密副本可再次读取明文。升级前的历史密钥为 false。 */
+  can_copy: boolean
   name: string
   enabled: boolean
   /**
@@ -708,7 +710,11 @@ export interface AuditEntry {
 }
 
 export interface KeyCreateResponse extends AccessKey {
-  plaintext_key: string // 仅创建时返回一次
+  plaintext_key: string // 创建响应里的明文；之后可通过 /keys/{id}/secret 再取
+}
+
+export interface KeySecretResponse {
+  plaintext_key: string
 }
 
 export interface Stats {
@@ -942,6 +948,13 @@ export interface UsageHistoryEntry {
    * 转换；两者相同则是同协议直通。
    */
   upstream_protocol: string
+  /**
+   * 客户端来源地址，落库时固化。
+   *
+   * 后端按 trusted_proxy_cidrs 解析可信代理链后记录；旧记录为空，
+   * 页面显示为未记录，不能用当前部署配置反推。
+   */
+  request_ip: string
   key_name: string // 调用密钥名称（密钥删除后为空）
   key_id: string // 调用密钥 id（回退显示用）
   /**

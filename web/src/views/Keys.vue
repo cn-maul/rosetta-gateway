@@ -1,10 +1,17 @@
 <script setup lang="ts">
 import DataTable from '../components/DataTable.vue'
-import { computed, onMounted, reactive, ref } from 'vue'
+import { computed, onBeforeUnmount, onMounted, reactive, ref } from 'vue'
 import { api, isAdmin, session } from '../api'
 import { toast, confirmBox } from '../ui'
 import { fmtDateTime, fmtTokens, copyText } from '../fmt'
 import type { AccessKey, Group, KeyCreateResponse, User } from '../types'
+import { buildCcSwitchImportLink, buildMagpieImportLink, type CcSwitchApp } from '../importLinks'
+import ccSwitchIcon from '../assets/icons/cc-switch.png'
+import magpieIcon from '../assets/icons/magpie.svg'
+import codexIcon from '../assets/icons/codex.svg'
+import claudeIcon from '../assets/icons/claude.svg'
+import opencodeIcon from '../assets/icons/opencode.svg'
+import hermesIcon from '../assets/icons/hermes.png'
 import AppModal from '../components/AppModal.vue'
 import ModelPicker from '../components/ModelPicker.vue'
 
@@ -109,8 +116,12 @@ async function ensureModelOptions() {
   }
 }
 
-// 一次性明文密钥展示
+// 明文密钥展示：创建后立即展示，也可以在列表里再次读取。
 const plainKeyBox = reactive<{ open: boolean; key: string; name: string }>({ open: false, key: '', name: '' })
+const copyingId = ref('')
+type ImportTool = 'ccswitch' | 'magpie'
+const importingAction = ref('')
+const ccPicker = reactive<{ open: boolean; key: AccessKey | null }>({ open: false, key: null })
 
 // ---------- 按用户筛选 + 按用量降序 ----------
 //
@@ -260,6 +271,9 @@ function onUserFilterOpen() {
 
 onMounted(() => {
   void load()
+  // 导入链接里的 model 只在本地已有清单里选，不在点击后临时等一个请求：
+  // 自定义协议必须尽量保持同一次用户手势内触发，多一个 await 就多一次被浏览器拦下的机会。
+  void ensureModelOptions()
   // 管理员进页面就把筛选用的用户清单拉好：下拉是这一页的新增控件，
   // 第一次点开时若还没加载，选项会是空的「只有全部用户」，看起来像
   // 「没有别的用户」。一次请求换掉这个首屏惊喜，代价可以接受
@@ -372,20 +386,141 @@ async function copyKey() {
 }
 
 /**
+ * 从列表里再次复制完整密钥。
+ *
+ * 明文只在本函数的局部变量与剪贴板里存在：不写进组件的响应式状态，
+ * 避免它随列表一起长期驻留、被 devtools 或同源脚本读到第二个副本。
+ */
+async function copyExistingKey(k: AccessKey) {
+  if (copyingId.value) return
+  copyingId.value = k.id
+  try {
+    const { plaintext_key } = await api.keySecret(k.id)
+    const ok = await copyText(plaintext_key)
+    toast(ok ? '完整密钥已复制到剪贴板' : '读取成功，但复制失败，请检查浏览器剪贴板权限',
+      ok ? 'ok' : 'err')
+  } catch (e) {
+    if ((e as { status?: number }).status === 401) return
+    toast('复制失败：' + (e as Error).message, 'err')
+  } finally {
+    copyingId.value = ''
+  }
+}
+
+function importBusy(k: AccessKey): boolean {
+  return importingAction.value.startsWith(`${k.id}:`)
+}
+
+const ccApps: { id: CcSwitchApp; name: string; icon: string; detail: string }[] = [
+  { id: 'codex', name: 'Codex', icon: codexIcon, detail: 'OpenAI Responses' },
+  { id: 'claude', name: 'Claude Code', icon: claudeIcon, detail: 'Anthropic Messages' },
+  { id: 'opencode', name: 'OpenCode', icon: opencodeIcon, detail: 'OpenAI Chat' },
+  { id: 'hermes', name: 'Hermes', icon: hermesIcon, detail: 'OpenAI Chat' },
+]
+
+const ccImportingApp = ref<CcSwitchApp | null>(null)
+
+function openCcPicker(k: AccessKey) {
+  if (importingAction.value) return
+  ccPicker.key = k
+  ccPicker.open = true
+}
+
+function closeCcPicker() {
+  if (importingAction.value) return
+  ccPicker.open = false
+  ccPicker.key = null
+}
+
+/** 打开导入链接。链接只存在于本次点击和本机应用之间，不写入组件状态或持久化存储。 */
+function openImportLink(href: string) {
+  const a = document.createElement('a')
+  a.href = href
+  a.hidden = true
+  document.body.appendChild(a)
+  a.click()
+  a.remove()
+}
+
+/**
+ * CC Switch 只能导入到具体应用（没有通用供应商）。模型不是必填，
+ * 但空着会让部分应用导入后没有可选模型，所以优先带一把当前可用模型。
+ */
+function preferredImportModel(k: AccessKey): string {
+  if (k.allowed_models.length) return k.allowed_models[0]
+  return modelOptions.value[0] ?? ''
+}
+
+async function importKey(k: AccessKey, tool: ImportTool, ccApp?: CcSwitchApp) {
+  if (importingAction.value) return
+  // 先把待开启的窗口放到用户手势的同一个调用栈里。Magpie 要先经过自己的
+  // usemagpie.ai/import 页面再唤起桌面应用；等拿到密钥后才 window.open 会被
+  // 弹窗拦截器当成非用户触发的行为。CC Switch 是自定义协议，不需要预开标签页。
+  const magpieWindow = tool === 'magpie' ? window.open('', '_blank') : null
+  if (tool === 'magpie' && !magpieWindow) {
+    toast('浏览器拦截了导入页，请允许本站打开新窗口后重试', 'err')
+    return
+  }
+  importingAction.value = `${k.id}:${tool}`
+  ccImportingApp.value = tool === 'ccswitch' ? (ccApp ?? 'codex') : null
+  try {
+    const { plaintext_key } = await api.keySecret(k.id)
+    const origin = window.location.origin
+    if (tool === 'ccswitch') {
+      openImportLink(
+        buildCcSwitchImportLink({
+          origin,
+          apiKey: plaintext_key,
+          name: k.name,
+          app: ccApp ?? 'codex',
+          model: preferredImportModel(k),
+        }),
+      )
+      ccPicker.open = false
+      ccPicker.key = null
+      toast('已发起唤起 CC Switch，请在其中核对后确认导入')
+    } else {
+      const href = buildMagpieImportLink({
+        origin,
+        apiKey: plaintext_key,
+        name: k.name,
+        models: k.allowed_models,
+      })
+      // 空白页只是同一标签页的占位；导航后才把带密钥的链接交给 Magpie 页面。
+      // 显式清空 opener，避免导入页反过来操作网关管理界面。
+      if (magpieWindow) {
+        magpieWindow.opener = null
+        magpieWindow.location.replace(href)
+      }
+      toast('已打开 Magpie 导入页，请在其中核对后确认添加')
+    }
+  } catch (e) {
+    magpieWindow?.close()
+    if ((e as { status?: number }).status === 401) return
+    toast(`导入 ${tool === 'ccswitch' ? 'CC Switch' : 'Magpie'} 失败：` + (e as Error).message, 'err')
+  } finally {
+    importingAction.value = ''
+    ccImportingApp.value = null
+  }
+}
+
+/**
  * 关闭明文弹窗，并**抹掉明文**（2026-10-11 前端审计 M5）。
  *
  * 原先关闭只置 `open = false`，`plainKeyBox.key` 里的明文在整个组件生命周期
  * 内一直留着：页面不刷新就一直能被 devtools、浏览器扩展或同源脚本读到。
- * 「明文只在创建时显示一次」是**后端**的语义，前端却让它在关掉弹窗后继续
- * 驻留，与该语义相悖。
+ * 明文不应在弹窗关闭后继续驻留；即使后端保留了加密副本，也没有必要
+ * 让第二份明文长期留在组件状态里。
  *
- * 抹值不破坏任何功能：后端不再保存明文，关掉就意味着用户已自行保存，
- * 再次打开也拿不到（只能重新建一把）。
+ * 抹值不破坏任何功能：后端保留了加密副本，用户仍可从列表里再次复制；
+ * 弹窗关闭后没有必要继续在组件里驻留第二份明文。
  */
 function closePlainKeyBox() {
   plainKeyBox.open = false
   plainKeyBox.key = ''
 }
+
+onBeforeUnmount(closePlainKeyBox)
 
 // ---------- 编辑表单 ----------
 
@@ -681,6 +816,38 @@ async function recomputeUsage(k: AccessKey) {
               </td>
               <td class="c-act">
                 <div class="row-actions">
+                  <!-- 三个操作固定显示在每行末尾。老密钥只有哈希、没有可回读
+                       的密文，按钮保留但禁用，避免整列操作随密钥创建时间跳变。 -->
+                  <button
+                    class="btn btn-icon btn-ghost"
+                    :disabled="!k.can_copy || copyingId === k.id"
+                    aria-label="复制 Key"
+                    :title="k.can_copy ? '把完整密钥复制到剪贴板' : '这把密钥创建于加密副本功能上线前，明文已不可恢复；请新建密钥'"
+                    @click="copyExistingKey(k)"
+                  >
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                      <rect x="8" y="8" width="12" height="12" rx="2" />
+                      <path d="M16 8V6a2 2 0 0 0-2-2H6a2 2 0 0 0-2 2v8a2 2 0 0 0 2 2h2" />
+                    </svg>
+                  </button>
+                  <button
+                    class="btn btn-icon btn-ghost"
+                    :disabled="!k.can_copy || importBusy(k)"
+                    aria-label="导入 CC Switch"
+                    :title="k.can_copy ? '选择要导入 CC Switch 的客户端' : '这把密钥的明文已不可恢复，无法导入；请新建密钥'"
+                    @click="openCcPicker(k)"
+                  >
+                    <img class="app-icon" :src="ccSwitchIcon" alt="" width="16" height="16" />
+                  </button>
+                  <button
+                    class="btn btn-icon btn-ghost"
+                    :disabled="!k.can_copy || importBusy(k)"
+                    aria-label="导入 Magpie"
+                    :title="k.can_copy ? '把网关地址和这把密钥添加到本机 Magpie' : '这把密钥的明文已不可恢复，无法导入；请新建密钥'"
+                    @click="importKey(k, 'magpie')"
+                  >
+                    <img class="app-icon magpie-icon" :src="magpieIcon" alt="" width="17" height="17" />
+                  </button>
                   <!--
                     不按身份隐藏：端点在白名单内，普通用户有权自查。
                     但要说清它修的是什么 —— 否则普通用户看到「配额计数异常」
@@ -709,6 +876,37 @@ async function recomputeUsage(k: AccessKey) {
         </table>
       </DataTable>
     </div>
+
+    <AppModal :open="ccPicker.open" title="导入 CC Switch" max-width="520px" @close="closeCcPicker">
+      <p class="cc-picker-lead">选择要添加为供应商的客户端。导入后会打开 CC Switch 让你核对配置。</p>
+      <div class="cc-picker" role="group" aria-label="CC Switch 客户端">
+        <button
+          v-for="app in ccApps"
+          :key="app.id"
+          type="button"
+          class="cc-picker-option"
+          :disabled="!!importingAction"
+          @click="ccPicker.key && importKey(ccPicker.key, 'ccswitch', app.id)"
+        >
+          <span class="cc-picker-app">
+            <img
+              :class="['cc-picker-icon', `cc-picker-icon-${app.id}`]"
+              :src="app.icon"
+              alt=""
+              width="34"
+              height="34"
+            />
+            <span class="cc-picker-copy">
+              <strong>{{ app.name }}</strong>
+              <span>{{ app.detail }}</span>
+            </span>
+          </span>
+          <span v-if="ccImportingApp === app.id" class="cc-picker-state">导入中…</span>
+          <span v-else class="cc-picker-arrow" aria-hidden="true">→</span>
+        </button>
+      </div>
+      <div class="cc-picker-note">每次只导入一个客户端；点击后请以 CC Switch 中显示的地址和密钥为准。</div>
+    </AppModal>
 
     <!-- 创建表单：表单填一半别丢，遮罩/Esc 都不关 -->
     <AppModal :open="form.open" title="新建访问密钥" max-width="500px" :dismissable="false">
@@ -789,12 +987,12 @@ async function recomputeUsage(k: AccessKey) {
       </form>
     </AppModal>
 
-    <!-- 一次性明文展示 -->
-    <!-- dismissable=false：明文密钥只展示一次，误点遮罩就再也看不到了 ——
-     必须显式走「我已保存」。这也是 AppModal dismissable prop 的第一个使用者。 -->
+    <!-- 创建后的明文展示；之后仍可从列表再次复制 -->
+    <!-- dismissable=false：明文弹窗必须由用户显式关闭，避免误点遮罩后
+     还得重新发起读取请求。这也是 AppModal dismissable prop 的第一个使用者。 -->
     <AppModal :open="plainKeyBox.open" title="密钥已创建" max-width="520px" :dismissable="false">
       <div class="sheet-body">
-        「{{ plainKeyBox.name }}」的完整密钥如下，<b>仅此一次展示</b>，关闭后无法再次查看：
+        「{{ plainKeyBox.name }}」的完整密钥如下。密钥已加密保存，之后仍可在列表里点「复制」再次获取：
       </div>
       <div class="plainkey">
         <div class="mono">{{ plainKeyBox.key }}</div>
@@ -894,5 +1092,112 @@ async function recomputeUsage(k: AccessKey) {
   margin-left: auto;
   font-size: 12px;
   color: var(--text-3);
+}
+.app-icon {
+  display: block;
+  width: 16px;
+  height: 16px;
+  object-fit: contain;
+}
+.magpie-icon {
+  width: 17px;
+  height: 17px;
+}
+/* 官方鸟标是单色黑；暗色主题下反相，保持它在按钮上的对比度。 */
+[data-theme='dark'] .magpie-icon {
+  filter: invert(1);
+}
+.cc-picker-lead {
+  margin: 0 0 14px;
+  color: var(--text-2);
+  font-size: 13px;
+  line-height: 1.55;
+}
+.cc-picker {
+  display: grid;
+  gap: 8px;
+}
+.cc-picker-option {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  width: 100%;
+  min-height: 64px;
+  padding: 11px 14px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-xl);
+  background: var(--surface);
+  color: var(--foreground);
+  text-align: left;
+  cursor: pointer;
+  transition:
+    border-color 120ms ease,
+    background-color 120ms ease,
+    transform 120ms ease;
+}
+.cc-picker-option:hover {
+  border-color: var(--accent);
+  background: var(--accent-soft);
+}
+.cc-picker-option:active {
+  transform: scale(0.99);
+}
+.cc-picker-option:focus-visible {
+  outline: 2px solid var(--focus);
+  outline-offset: 2px;
+}
+.cc-picker-option:disabled {
+  opacity: var(--disabled-opacity);
+  cursor: wait;
+}
+.cc-picker-app {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  min-width: 0;
+}
+.cc-picker-icon {
+  flex: 0 0 34px;
+  width: 34px;
+  height: 34px;
+  object-fit: contain;
+}
+[data-theme='dark'] .cc-picker-icon-codex {
+  filter: invert(1);
+}
+.cc-picker-icon-hermes {
+  border-radius: 7px;
+}
+.cc-picker-copy {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  min-width: 0;
+}
+.cc-picker-copy strong {
+  font-size: 14px;
+  font-weight: 600;
+  line-height: 1.3;
+}
+.cc-picker-copy span {
+  color: var(--text-3);
+  font-size: 12px;
+  line-height: 1.35;
+}
+.cc-picker-arrow,
+.cc-picker-state {
+  flex: 0 0 auto;
+  color: var(--text-3);
+  font-size: 15px;
+}
+.cc-picker-state {
+  font-size: 12px;
+}
+.cc-picker-note {
+  margin-top: 12px;
+  color: var(--text-3);
+  font-size: 12px;
+  line-height: 1.5;
 }
 </style>

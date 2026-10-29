@@ -64,6 +64,7 @@ func seedTpsHistory(t *testing.T, st *store.Store) int64 {
 			ID: r.id, Ts: ts, AccessKeyID: "kTps", PublicModel: "code",
 			ProviderID: "p1", ProviderName: "肥鱼中转", UpstreamModel: "cn:glm",
 			IngressProtocol: "response", UpstreamProtocol: "chat", Stream: r.stream,
+			RequestIP: "192.168.1.25",
 			// input 刻意给非零值：这样 total_tokens != output_tokens，
 			// 「用错分子」的回归会被下面 TestUsage_History_TpsUsesOutputTokensNotTotal 抓住。
 			InputTokens:  900,
@@ -102,6 +103,9 @@ func TestUsage_History_ExposesProviderNameAndProtocolPair(t *testing.T) {
 		}
 		if e.IngressProtocol != "response" {
 			t.Errorf("第 %d 行 ingress_protocol=%q, want response", i, e.IngressProtocol)
+		}
+		if e.RequestIP != "192.168.1.25" {
+			t.Errorf("第 %d 行 request_ip=%q, want 192.168.1.25", i, e.RequestIP)
 		}
 	}
 }

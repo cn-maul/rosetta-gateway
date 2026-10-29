@@ -59,6 +59,10 @@ type UsageRecord struct {
 	LatencyMs   int64
 	TTFBMs      int64
 	RequestID   string
+	// RequestIP 是客户端来源地址，落库当时固化。它来自入口处的
+	// httpx.ClientIPOf（可信代理链已解析），不是上游地址；空串表示旧记录
+	// 或调用方未提供，不能从当前配置反推。
+	RequestIP string
 	// PreviousCost 是**落库前**已有的 cost_total，只在重算路径上被读
 	// （见 RecomputeCost）。
 	//
@@ -178,8 +182,8 @@ func (s *Store) CreateUsageRecordWithCost(ctx context.Context, r *UsageRecord) (
 		usageState = usageStateCostPending
 	}
 	_, err := s.db.ExecContext(ctx,
-		`INSERT INTO usage_records (id, ts, access_key_id, user_id, public_model, provider_id, provider_name, upstream_model, ingress_protocol, upstream_protocol, stream, input_tokens, output_tokens, total_tokens, reasoning_tokens, cached_tokens, cached_creation_tokens, usage_state, status, http_status, error_code, error_detail, latency_ms, ttfb_ms, request_id, route_trace, cost_total) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		r.ID, ts, r.AccessKeyID, nullIfEmpty(r.UserID), r.PublicModel, r.ProviderID, nullIfEmpty(r.ProviderName), r.UpstreamModel, r.IngressProtocol, nullIfEmpty(r.UpstreamProtocol), stream, r.InputTokens, r.OutputTokens, r.TotalTokens, r.ReasoningTokens, r.CachedTokens, r.CachedCreationTokens, usageState, r.Status, r.HTTPStatus, nullIfEmpty(r.ErrorCode), nullIfEmpty(r.ErrorDetail), r.LatencyMs, r.TTFBMs, nullIfEmpty(r.RequestID), nullIfEmpty(r.RouteTrace), cost)
+		`INSERT INTO usage_records (id, ts, access_key_id, user_id, public_model, provider_id, provider_name, upstream_model, ingress_protocol, upstream_protocol, stream, input_tokens, output_tokens, total_tokens, reasoning_tokens, cached_tokens, cached_creation_tokens, usage_state, status, http_status, error_code, error_detail, latency_ms, ttfb_ms, request_id, request_ip, route_trace, cost_total) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		r.ID, ts, r.AccessKeyID, nullIfEmpty(r.UserID), r.PublicModel, r.ProviderID, nullIfEmpty(r.ProviderName), r.UpstreamModel, r.IngressProtocol, nullIfEmpty(r.UpstreamProtocol), stream, r.InputTokens, r.OutputTokens, r.TotalTokens, r.ReasoningTokens, r.CachedTokens, r.CachedCreationTokens, usageState, r.Status, r.HTTPStatus, nullIfEmpty(r.ErrorCode), nullIfEmpty(r.ErrorDetail), r.LatencyMs, r.TTFBMs, nullIfEmpty(r.RequestID), nullIfEmpty(r.RequestIP), nullIfEmpty(r.RouteTrace), cost)
 	if err != nil {
 		// 落库失败：费用随记录一起作废。返回 0 而不是 cost —— 调用方若误用
 		// 这个值去扣费，扣的金额必须与「库里真实存在的记录」对应，
@@ -247,14 +251,14 @@ func (s *Store) CreateUsageRecordsBatched(ctx context.Context, recs []*UsageReco
 		(id, ts, access_key_id, user_id, public_model, provider_id, provider_name,
 		 upstream_model, ingress_protocol, upstream_protocol, stream, input_tokens, output_tokens, total_tokens,
 		 reasoning_tokens, cached_tokens, cached_creation_tokens, usage_state, status, http_status,
-		 error_code, error_detail, latency_ms, ttfb_ms, request_id, route_trace,
+		 error_code, error_detail, latency_ms, ttfb_ms, request_id, request_ip, route_trace,
 		 cost_total) VALUES `)
 
 	for i, r := range recs {
 		if i > 0 {
 			sb.WriteByte(',')
 		}
-		sb.WriteString("(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)")
+		sb.WriteString("(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)")
 		args = append(args, usageInsertArgs(r, costs[i], costPending[i])...)
 	}
 
@@ -269,7 +273,7 @@ func (s *Store) CreateUsageRecordsBatched(ctx context.Context, recs []*UsageReco
 }
 
 // usageInsertColumns 是 usage_records 写入路径的列数（仅用于容量预估）。
-const usageInsertColumns = 27
+const usageInsertColumns = 28
 
 // batchComputeCosts 逐条算固化费用，并顺带完成 token 负值归一与 ts 兜底。
 //
@@ -332,7 +336,8 @@ func usageInsertArgs(r *UsageRecord, cost float64, costPending bool) []any {
 		r.InputTokens, r.OutputTokens, r.TotalTokens,
 		r.ReasoningTokens, r.CachedTokens, r.CachedCreationTokens, usageState, r.Status,
 		r.HTTPStatus, nullIfEmpty(r.ErrorCode), nullIfEmpty(r.ErrorDetail),
-		r.LatencyMs, r.TTFBMs, nullIfEmpty(r.RequestID), nullIfEmpty(r.RouteTrace), cost,
+		r.LatencyMs, r.TTFBMs, nullIfEmpty(r.RequestID), nullIfEmpty(r.RequestIP),
+		nullIfEmpty(r.RouteTrace), cost,
 	}
 }
 

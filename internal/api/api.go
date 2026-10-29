@@ -175,7 +175,7 @@ func BuildApp(d Deps) *App {
 	probeHandler := admin.NewProbeHandler(db, cfg)
 	routeHandler := admin.NewRouteHandler(db)
 	routeTargetHandler := admin.NewRouteTargetHandler(db)
-	keyHandler := admin.NewKeyHandler(db)
+	keyHandler := admin.NewKeyHandler(db, masterKey)
 	statsHandler := admin.NewStatsHandler(db)
 	settingsHandler := admin.NewSettingsHandler(db, cfg)
 	reloadHandler := admin.NewReloadHandler(reloader.Reload)
@@ -340,6 +340,7 @@ func BuildApp(d Deps) *App {
 		// internal/admin/key_handler.go 的 Create 保持「普通用户自助」原样。
 		// **若将来另有代码直接用 keyHandler.Create 组路由，必须同样套本包装。**
 		{Pattern: "POST /admin/api/keys", Handler: server.DenyAdminKeyCreate(keyHandler.Create), Public: false},
+		{Pattern: "GET /admin/api/keys/{id}/secret", Handler: func(w http.ResponseWriter, r *http.Request) { keyHandler.Secret(w, r, r.PathValue("id")) }, Public: false},
 		{Pattern: "PATCH /admin/api/keys/{id}", Handler: func(w http.ResponseWriter, r *http.Request) { keyHandler.Update(w, r, r.PathValue("id")) }, Public: false},
 		{Pattern: "DELETE /admin/api/keys/{id}", Handler: func(w http.ResponseWriter, r *http.Request) { keyHandler.Delete(w, r, r.PathValue("id")) }, Public: false},
 		// 重算 used_tokens：触发器维护的派生值没有自愈路径，偏高后 key 会变成死 key。

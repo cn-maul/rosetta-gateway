@@ -113,6 +113,14 @@ func (s *Store) ensureCompatibleSchema(ctx context.Context) error {
 		// 路由改协议后，旧记录仍应显示当时的事实。
 		{"usage_records", "provider_name", "TEXT"},
 		{"usage_records", "upstream_protocol", "TEXT"},
+		// 调用历史要能回答「这次请求来自哪个客户端」。值来自入口处的
+		// httpx.ClientIPOf（已按 trusted_proxy_cidrs 解析可信转发链）；
+		// 旧记录为空，界面显示为未记录，不能拿当前配置反推。
+		{"usage_records", "request_ip", "TEXT"},
+		// 2026-10-29：访问密钥支持在列表里再次复制。key_hash 仍然只用于
+		// 鉴权查询；key_enc 是明文的可选加密副本，旧库补列后历史行为空，
+		// 因此老密钥仍然不可回读，也没有任何明文回退路径。
+		{"access_keys", "key_enc", "BLOB"},
 		// 2026-10-25 R3: recoverable accounting retry state. The defaults
 		// preserve existing behavior: every historical row is immediately
 		// eligible, has made no retry attempts, and has no recorded error.
@@ -393,6 +401,7 @@ var canonicalSchemaStatements = []string{
 		id                  TEXT PRIMARY KEY,
 		key_hash            TEXT NOT NULL UNIQUE,
 		key_prefix          TEXT NOT NULL,
+		key_enc             BLOB,
 		name                TEXT NOT NULL,
 		enabled             INTEGER NOT NULL DEFAULT 1,
 		quota_tokens        INTEGER NOT NULL DEFAULT 0,
@@ -456,6 +465,7 @@ var canonicalSchemaStatements = []string{
 		latency_ms        INTEGER NOT NULL,
 		ttfb_ms           INTEGER NOT NULL DEFAULT 0,
 		request_id        TEXT,
+		request_ip        TEXT,
 		route_trace       TEXT,
 		cost_total        REAL NOT NULL DEFAULT 0,
 		-- Accounting retry state. These columns are additive and default to

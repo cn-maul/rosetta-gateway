@@ -22,6 +22,7 @@ export const API_ROUTES: readonly ApiRouteContract[] = [
   { pattern: "GET /admin/api/bootstrap", public: true },
   { pattern: "GET /admin/api/groups", public: false },
   { pattern: "GET /admin/api/keys", public: false },
+  { pattern: "GET /admin/api/keys/{id}/secret", public: false },
   { pattern: "GET /admin/api/me", public: false },
   { pattern: "GET /admin/api/model-groups", public: false },
   { pattern: "GET /admin/api/model-groups/{id}/members", public: false },

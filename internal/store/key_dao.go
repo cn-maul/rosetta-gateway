@@ -12,9 +12,17 @@ import (
 )
 
 type AccessKey struct {
-	ID          string
-	KeyHash     string
-	KeyPrefix   string
+	ID        string
+	KeyHash   string
+	KeyPrefix string
+	// KeyEnc 是明文访问密钥的可选加密副本，仅用于「再次复制」。
+	//
+	// 鉴权始终只查 KeyHash；KeyEnc 不参与数据面热路径。旧库补列后历史行为
+	// NULL，这些密钥保持不可回读，不会为了兼容而保存或返回明文。
+	KeyEnc []byte
+	// HasSecret 表示该行是否有可回读的加密密钥。列表响应据此决定是否
+	// 显示复制按钮，不把 BLOB 本身带进每次列表查询。
+	HasSecret   bool
 	Name        string
 	Enabled     bool
 	QuotaTokens int64
@@ -68,20 +76,22 @@ type AccessKey struct {
 // user_id 必须用 COALESCE 兜成空串：它是外键列，无归属 key 在 SQLite 里
 // 是真 NULL，而把 NULL 扫进 string 会报
 // "converting NULL to string is unsupported"（见 model_dao 的同款注释）。
-const keyColumns = `id, key_hash, key_prefix, name, enabled, quota_tokens, used_tokens, COALESCE(user_id, '') AS user_id, rpm_limit, tpm_limit, allowed_models_json, expires_at, COALESCE(allowed_ips, '') AS allowed_ips, COALESCE(group_id, '') AS group_id, created_at`
+const keyColumns = `id, key_hash, key_prefix, (key_enc IS NOT NULL) AS has_secret, name, enabled, quota_tokens, used_tokens, COALESCE(user_id, '') AS user_id, rpm_limit, tpm_limit, allowed_models_json, expires_at, COALESCE(allowed_ips, '') AS allowed_ips, COALESCE(group_id, '') AS group_id, created_at`
 
 func scanAccessKey(sc scanner) (*AccessKey, error) {
 	var k AccessKey
 	var enabled int
+	var hasSecret int
 	// allowed_models_json 可空，先用 NullString 承接再解析 —— 直接扫进 string
 	// 会在 NULL 上报 "converting NULL to string is unsupported"。
 	var allowedJSON sql.NullString
-	if err := sc.Scan(&k.ID, &k.KeyHash, &k.KeyPrefix, &k.Name, &enabled,
+	if err := sc.Scan(&k.ID, &k.KeyHash, &k.KeyPrefix, &hasSecret, &k.Name, &enabled,
 		&k.QuotaTokens, &k.UsedTokens, &k.UserID, &k.RPMLimit, &k.TPMLimit,
 		&allowedJSON, &k.ExpiresAt, &k.AllowedIPs, &k.GroupID, &k.CreatedAt); err != nil {
 		return nil, err
 	}
 	k.Enabled = enabled == 1
+	k.HasSecret = hasSecret == 1
 	k.AllowedModels = decodeAllowedModels(allowedJSON)
 	k.AllowedNets = parseAllowedNets(k.AllowedIPs)
 	return &k, nil
@@ -213,6 +223,13 @@ func encodeAllowedModels(models []string) any {
 	return string(b)
 }
 
+func nullableBytes(b []byte) any {
+	if len(b) == 0 {
+		return nil
+	}
+	return b
+}
+
 func (s *Store) ListAccessKeys(ctx context.Context) ([]AccessKey, error) {
 	rows, err := s.read.QueryContext(ctx,
 		`SELECT `+keyColumns+` FROM access_keys ORDER BY created_at`)
@@ -287,17 +304,34 @@ func (s *Store) CreateAccessKey(ctx context.Context, k *AccessKey) error {
 		enabled = 1
 	}
 	_, err := s.db.ExecContext(ctx,
-		`INSERT INTO access_keys (id, key_hash, key_prefix, name, enabled, quota_tokens, user_id, rpm_limit, tpm_limit, allowed_models_json, expires_at, allowed_ips, group_id, created_at)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		k.ID, k.KeyHash, k.KeyPrefix, k.Name, enabled, k.QuotaTokens, nullIfEmpty(k.UserID),
+		`INSERT INTO access_keys (id, key_hash, key_prefix, key_enc, name, enabled, quota_tokens, user_id, rpm_limit, tpm_limit, allowed_models_json, expires_at, allowed_ips, group_id, created_at)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		k.ID, k.KeyHash, k.KeyPrefix, nullableBytes(k.KeyEnc), k.Name, enabled, k.QuotaTokens, nullIfEmpty(k.UserID),
 		k.RPMLimit, k.TPMLimit, encodeAllowedModels(k.AllowedModels), k.ExpiresAt,
 		nullIfEmpty(k.AllowedIPs), nullIfEmpty(k.GroupID), now)
 	// 回写时间戳：落库用的是局部变量 now，结构体仍是零值 → 创建响应里的
 	// created_at 会是 0，与随后 GET 到的同一条记录不一致（前端会显示「建于 1970」）。
 	if err == nil {
 		k.CreatedAt = now
+		k.HasSecret = len(k.KeyEnc) > 0
 	}
 	return err
+}
+
+// AccessKeySecret 返回访问密钥的加密副本。
+//
+// found=false 表示该 key 不存在；found=true 且 enc 为空表示这把 key
+// 创建于「可回读」上线之前，只有哈希没有密文。
+func (s *Store) AccessKeySecret(ctx context.Context, id string) (blob []byte, found bool, err error) {
+	err = s.read.QueryRowContext(ctx,
+		`SELECT key_enc FROM access_keys WHERE id = ?`, id).Scan(&blob)
+	if err == sql.ErrNoRows {
+		return nil, false, nil
+	}
+	if err != nil {
+		return nil, false, err
+	}
+	return blob, true, nil
 }
 
 // UpdateAccessKey 更新 key 的可管理字段。

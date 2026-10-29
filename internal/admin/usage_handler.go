@@ -495,6 +495,9 @@ type usageHistoryEntry struct {
 	// RequestID 是网关/上游链路使用的请求标识，详情抽屉里用于和日志对号。
 	// 旧记录可能没有值，因此空串是正常的“未记录”，不是损坏。
 	RequestID string `json:"request_id"`
+	// RequestIP 是这次请求的客户端地址，落库时固化。它来自入口处的
+	// httpx.ClientIPOf（可信代理链已解析），不是上游地址；旧记录为空。
+	RequestIP string `json:"request_ip"`
 }
 
 // usageHistoryColumns / usageHistorySource 是 History 与 CSV 共用的读取口径。
@@ -512,7 +515,8 @@ const (
 		u.ttfb_ms, u.latency_ms, u.status, u.stream,
 		COALESCE(u.cost_total, 0), u.http_status,
 		COALESCE(u.error_code, ''), COALESCE(u.error_detail, ''),
-		COALESCE(u.route_trace, ''), COALESCE(u.request_id, '')`
+		COALESCE(u.route_trace, ''), COALESCE(u.request_id, ''),
+		COALESCE(u.request_ip, '')`
 	usageHistorySource = ` FROM usage_records u
 		LEFT JOIN access_keys a ON a.id = u.access_key_id`
 )
@@ -528,7 +532,7 @@ func scanUsageHistoryEntry(scanner usageHistoryScanner, e *usageHistoryEntry) er
 		&e.KeyName, &e.KeyID, &e.InputTokens, &e.OutputTokens, &e.TotalTokens,
 		&e.CachedTokens, &e.CachedCreationTokens, &e.ReasoningTokens, &e.TTFBMs, &e.LatencyMs,
 		&e.Status, &e.Stream, &e.Cost, &e.HTTPStatus, &e.ErrorCode, &e.ErrorDetail,
-		&e.RouteTrace, &e.RequestID,
+		&e.RouteTrace, &e.RequestID, &e.RequestIP,
 	)
 }
 
@@ -674,7 +678,7 @@ func (h *UsageHandler) ExportCSV(w http.ResponseWriter, r *http.Request) {
 		"output_tokens", "tps", "route_trace", "provider_id", "ingress_protocol",
 		"input_tokens", "cached_tokens", "reasoning_tokens", "request_id",
 		"http_status", "error_code", "error_detail", "cached_creation_tokens",
-		"provider_name", "upstream_protocol"})
+		"provider_name", "upstream_protocol", "request_ip"})
 	for rows.Next() {
 		var e usageHistoryEntry
 		if err := scanUsageHistoryEntry(rows, &e); err != nil {
@@ -709,6 +713,7 @@ func (h *UsageHandler) ExportCSV(w http.ResponseWriter, r *http.Request) {
 			csvCell(e.ErrorCode), csvCell(e.ErrorDetail),
 			strconv.FormatInt(e.CachedCreationTokens, 10),
 			csvCell(e.ProviderName), csvCell(e.UpstreamProtocol),
+			csvCell(e.RequestIP),
 		})
 	}
 	cw.Flush()
