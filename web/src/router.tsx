@@ -4,6 +4,7 @@ import { AppRoot, Splash } from './ui/AppRoot'
 import { Login } from './ui/Login'
 import { PasswordSetup } from './ui/PasswordSetup'
 import { Networks, networksLoader } from './pages/Networks'
+import { UsageStats } from './pages/UsageStats'
 import { Placeholder } from './ui/Placeholder'
 
 export interface RouteHandle {
@@ -79,7 +80,12 @@ export const router = createHashRouter([
       { path: '/set-password', element: <PasswordSetup />, handle: { title: '设置密码', public: true } },
       { index: true, ...page('网关总览', { title: '网关总览' }) },
       { path: '/history', ...page('请求日志', { title: '请求日志' }) },
-      { path: '/usage', ...page('用量与费用', { title: '用量与费用' }) },
+      {
+        path: '/usage',
+        element: <UsageStats />,
+        handle: { title: '用量与费用' },
+        loader: authedLoader(false),
+      },
       { path: '/models', ...page('可用模型', { title: '可用模型' }) },
       { path: '/wallet', ...page('余额与账单', { title: '余额与账单' }) },
       { path: '/profile', element: <Navigate to="/wallet" replace /> },
