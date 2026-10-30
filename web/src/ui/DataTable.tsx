@@ -17,6 +17,8 @@ interface DataTableProps {
   hasData?: boolean
   empty?: boolean
   emptyText?: string
+  /** 空态文案下方的动作区（如「清除筛选」）。仅空态（非错误/加载）时渲染。 */
+  emptyAction?: ReactNode
   onRetry?: () => void
   toolbar?: ReactNode
   footer?: ReactNode
@@ -30,6 +32,7 @@ export function DataTable({
   hasData = false,
   empty = false,
   emptyText = '暂无数据',
+  emptyAction,
   onRetry,
   toolbar,
   footer,
@@ -60,7 +63,10 @@ export function DataTable({
           <Spinner size="sm" /> 加载中…
         </div>
       ) : empty && !error ? (
-        <EmptyState>{emptyText}</EmptyState>
+        <EmptyState>
+          {emptyText}
+          {emptyAction ? <div className="mt-4">{emptyAction}</div> : null}
+        </EmptyState>
       ) : (
         <>
           {loading && hasData && (

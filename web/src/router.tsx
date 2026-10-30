@@ -7,12 +7,15 @@ import { Networks, networksLoader } from './pages/Networks'
 import { UsageStats } from './pages/UsageStats'
 import { Overview } from './pages/Overview'
 import { Models } from './pages/Models'
+import { Providers } from './pages/Providers'
 import { Placeholder } from './ui/Placeholder'
 
 export interface RouteHandle {
   title: string
   public?: boolean
   adminOnly?: boolean
+  /** 内容区是否放开 max-w-app（如请求日志的宽表）。 */
+  wide?: boolean
 }
 
 // 进程内只探测一次 /session + /me + /bootstrap（对齐旧版「启动时 loadSession 一次」）。
@@ -110,7 +113,7 @@ export const router = createHashRouter([
       { path: '/users', ...page('用户与权限', { title: '用户与权限', adminOnly: true }) },
       {
         path: '/providers',
-        element: <Placeholder name="上游服务" />,
+        element: <Providers />,
         handle: { title: '上游服务', adminOnly: true },
         loader: providersLoader,
       },
