@@ -11,6 +11,8 @@ import { Providers } from './pages/Providers'
 import { Routes } from './pages/Routes'
 import { ProviderDetail } from './pages/ProviderDetail'
 import { Settings } from './pages/Settings'
+import { AccessControl } from './pages/AccessControl'
+import { AccountSettings } from './pages/AccountSettings'
 import { Placeholder } from './ui/Placeholder'
 
 export interface RouteHandle {
@@ -112,8 +114,18 @@ export const router = createHashRouter([
       },
       { path: '/wallet', ...page('余额与账单', { title: '余额与账单' }) },
       { path: '/profile', element: <Navigate to="/wallet" replace /> },
-      { path: '/keys', ...page('API 密钥', { title: 'API 密钥' }) },
-      { path: '/users', ...page('用户与权限', { title: '用户与权限', adminOnly: true }) },
+      {
+        path: '/keys',
+        element: <AccessControl />,
+        handle: { title: 'API 密钥' },
+        loader: authedLoader(false),
+      },
+      {
+        path: '/users',
+        element: <AccessControl />,
+        handle: { title: '用户与权限', adminOnly: true },
+        loader: authedLoader(true),
+      },
       {
         path: '/providers',
         element: <Providers />,
@@ -140,7 +152,12 @@ export const router = createHashRouter([
         loader: authedLoader(true),
       },
       { path: '/health', element: <Navigate to="/models" replace /> },
-      { path: '/account', ...page('账号设置', { title: '账号设置' }) },
+      {
+        path: '/account',
+        element: <AccountSettings />,
+        handle: { title: '账号设置' },
+        loader: authedLoader(false),
+      },
       {
         path: '/settings',
         element: <Settings />,

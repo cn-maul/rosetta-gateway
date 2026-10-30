@@ -31,3 +31,8 @@ body {
 [data-theme="dark"] {
   --hb-empty: oklch(0.34 0.008 286);
 }
+
+/* Magpie 等 SVG 图标是深色描边，暗色主题下反相才能看清。 */
+[data-theme="dark"] .icon-invert-dark {
+  filter: invert(1);
+}
