@@ -3,8 +3,8 @@ import { useLocation, useNavigate } from 'react-router-dom'
 import { Tabs, Button } from '@heroui/react'
 import { isAdmin } from '../api'
 import { PageHeader } from '../ui/PageHeader'
-import { Placeholder } from '../ui/Placeholder'
 import { Keys } from '../components/Keys'
+import { UsersGroups } from '../components/UsersGroups'
 
 type TabKey = 'users' | 'groups' | 'keys'
 
@@ -83,7 +83,7 @@ export function AccessControl() {
               {tab === 'keys' ? (
                 <Keys />
               ) : (
-                <Placeholder name={tab === 'users' ? '用户管理' : '权限分组'} />
+                <UsersGroups tab={tab === 'users' ? 'users' : 'groups'} />
               )}
             </div>
           </Tabs.Panel>
