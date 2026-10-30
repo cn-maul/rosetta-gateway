@@ -13,6 +13,7 @@ import { ProviderDetail } from './pages/ProviderDetail'
 import { Settings } from './pages/Settings'
 import { AccessControl } from './pages/AccessControl'
 import { AccountSettings } from './pages/AccountSettings'
+import { Wallet } from './pages/Wallet'
 import { Placeholder } from './ui/Placeholder'
 
 export interface RouteHandle {
@@ -112,7 +113,12 @@ export const router = createHashRouter([
         handle: { title: '可用模型' },
         loader: authedLoader(false),
       },
-      { path: '/wallet', ...page('余额与账单', { title: '余额与账单' }) },
+      {
+        path: '/wallet',
+        element: <Wallet />,
+        handle: { title: '余额与账单' },
+        loader: authedLoader(false),
+      },
       { path: '/profile', element: <Navigate to="/wallet" replace /> },
       {
         path: '/keys',
