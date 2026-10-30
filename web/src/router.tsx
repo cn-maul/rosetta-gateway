@@ -3,6 +3,7 @@ import { isAdmin, loadSession, session } from './api'
 import { AppRoot, Splash } from './ui/AppRoot'
 import { Login } from './ui/Login'
 import { PasswordSetup } from './ui/PasswordSetup'
+import { Networks, networksLoader } from './pages/Networks'
 import { Placeholder } from './ui/Placeholder'
 
 export interface RouteHandle {
@@ -92,7 +93,12 @@ export const router = createHashRouter([
       },
       { path: '/routes', ...page('模型与路由', { title: '模型与路由', adminOnly: true }) },
       { path: '/model-groups', element: <Navigate to="/usage?tab=groups" replace /> },
-      { path: '/networks', ...page('代理', { title: '代理', adminOnly: true }) },
+      {
+        path: '/networks',
+        element: <Networks />,
+        handle: { title: '代理', adminOnly: true },
+        loader: networksLoader,
+      },
       { path: '/providers/:id', ...page('上游详情', { title: '上游详情', adminOnly: true }) },
       { path: '/health', element: <Navigate to="/models" replace /> },
       { path: '/account', ...page('账号设置', { title: '账号设置' }) },

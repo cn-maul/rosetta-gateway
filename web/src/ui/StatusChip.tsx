@@ -16,14 +16,17 @@ export type StatusTone = keyof typeof TONE_VARIANT
 export function StatusChip({
   tone,
   size = 'sm',
+  title,
   children,
 }: {
   tone: StatusTone
   size?: 'sm' | 'md' | 'lg'
+  /** 悬浮说明（如连通性测试的失败原因）。 */
+  title?: string
   children: ReactNode
 }) {
   return (
-    <Chip color={TONE_VARIANT[tone]} size={size}>
+    <Chip color={TONE_VARIANT[tone]} size={size} title={title}>
       {children}
     </Chip>
   )
