@@ -415,19 +415,12 @@ Plan B 下它的角色是：分支上随便跑、只看趋势，**合并前必�
 
 实际结果：typecheck / 43 tests / build×2 字节一致 / go webui 守护全绿；Shell 页脚已渲染版本号。守卫以 loader 落地（`ensureSession` 进程内单次探测 + `redirect`），旧 `reapplyGuard` 已删除；401 掉登录由 AppRoot 的 watcher 统一导航。**浏览器内的完整链路走查（登录→探测→守卫→登出）需要 dev 环境手工做一次**，自动化只覆盖到构建与类型层面。
 
-### P3 · 全局原语清扫（2 天，机械但面广）
+### P3 · 全局原语清扫 —— ✅ 已并入 P4（2026-10-30 定案）
 
-28 个页面批量替换，每类一个 commit，每个 commit 都要 typecheck 通过：
-1. `<button>` → `<Button>`（185）
-2. `<input>` / `<select>` / `<textarea>` → TextField / NumberField / Select / TextArea / SearchField（86 / 27 / 1）
-3. `<form>` → `<Form>`（17）+ Checkbox / Switch（7）
-4. `toast(t, 'ok'|'err')` → `toast.success/danger`（145 调用点）
-5. 状态徽章 `.badge` → `<Chip>`（37）
-
-此阶段**只换组件、不动布局**。每类完成后立即删 `styles.css` 里对应的规则组（`.btn*`、`.field/.input/.select`、`.badge`），
-并跑 legacy-audit 确认数字下降。
-
-**门槛**：legacy-audit 里按钮/输入/下拉/徽章四类归零；页面能点、能提交。视觉短时不协调是预期的，不做对齐。
+P1 的一次性换血删光了所有页面，本阶段失去对象：重建时直接使用 HeroUI 组件与工具类，
+不存在「先清扫、再重建」的存量。本阶段的**验收职责**由两处继承：
+`tests/noHandWrittenPrimitives.test.mjs`（每一步都跑）与 P4 每页固定动作清单。
+P0 基线里那 1 943 处旧类名与 318 个裸原语，随 P4 按页归零，由 legacy-audit 看板跟踪。
 
 ### P4 · 页面重建（主工作量）
 
