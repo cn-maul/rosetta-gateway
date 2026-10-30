@@ -30,7 +30,7 @@ import { API_ROUTES } from '../src/generated/routes.ts'
 //
 // `api.ts` 依赖三个全局：`fetch`、`sessionStorage`、`AbortSignal.timeout`。
 // Node 22+ 三者都有（sessionStorage 没有，用一个最小 stub 代替）。
-// 这里不 import vue —— `auth`/`session` 是从 'vue' 的 reactive 造的，
+// 这里不 import 任何框架 —— `auth`/`session` 现在是 src/store.ts 的外部可订阅 store，
 // 而 Node 跑不了 SFC；用一个等价的 stub 注入即可（见下面的 installGlobals）。
 
 const TOKEN_KEY = 'rosetta_gw_admin_token'
@@ -190,7 +190,7 @@ test('bootstrap setup keeps successful password result when profile refresh fail
     return true
   })
   assert.equal(globalThis.sessionStorage.getItem(TOKEN_KEY), 'new-token')
-  assert.equal(session.needsSetup, false)
+  assert.equal(session.get().needsSetup, false)
   resetResponder()
 })
 
@@ -204,9 +204,9 @@ test('loadSession distinguishes bootstrap read failure from setup not needed', a
   const { loadSession, session } = await freshApi()
 
   await loadSession()
-  assert.equal(session.backendReady, true)
-  assert.equal(session.bootstrapCheckFailed, true)
-  assert.equal(session.needsSetup, false)
+  assert.equal(session.get().backendReady, true)
+  assert.equal(session.get().bootstrapCheckFailed, true)
+  assert.equal(session.get().needsSetup, false)
   resetResponder()
 })
 

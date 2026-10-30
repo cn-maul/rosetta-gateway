@@ -1,5 +1,6 @@
-// resolver hook 本体：补扩展名 + 把 vue 换成 stub。
+// resolver hook 本体：补扩展名（相对 import 不带 .ts 时补全）。
 // 由 tsResolve.mjs 经 module.register 加载，不要直接 import 它。
+// （曾在这里把 'vue' 换成 stub —— React 重构后 src 不再依赖任何 UI 框架，映射随之删除。）
 
 import { existsSync } from 'node:fs'
 import { fileURLToPath, pathToFileURL } from 'node:url'
@@ -24,14 +25,6 @@ function tryResolve(specifier, context) {
 }
 
 export async function resolve(specifier, context, next) {
-  // `vue` 在测试里只用到 reactive()。给一个最小实现，避免把整个 Vue
-  // 运行时拖进 Node 测试进程（那会带来 SFC 编译等一堆无关依赖）。
-  if (specifier === 'vue') {
-    return {
-      url: pathToFileURL(path.join(STUB_DIR, 'vue.mjs')).href,
-      shortCircuit: true,
-    }
-  }
   const hit = tryResolve(specifier, context)
   if (hit) return hit
   return next(specifier, context)

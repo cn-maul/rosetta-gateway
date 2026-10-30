@@ -1,6 +1,7 @@
 import { readFileSync } from 'node:fs'
 import { defineConfig } from 'vite'
-import vue from '@vitejs/plugin-vue'
+import react from '@vitejs/plugin-react'
+import tailwindcss from '@tailwindcss/vite'
 
 // 读取同工程内的文件（路径相对本配置文件，即 web/）
 function readText(rel: string): string {
@@ -33,7 +34,7 @@ function gatewayTarget(): string {
 // 相对资源路径才能在任意挂载点正确解析。
 export default defineConfig({
   base: './',
-  plugins: [vue()],
+  plugins: [react(), tailwindcss()],
   define: {
     __APP_VERSION__: JSON.stringify(pkgVersion),
     __ROSETTA_VERSION__: JSON.stringify(rosettaVersion),

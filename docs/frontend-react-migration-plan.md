@@ -105,9 +105,7 @@ BEM 样式 `packages/styles/**`。无外网时兜底：`pnpm build && pnpm pack`
 
 - 分支 `feat/react-rewrite`，基线 tag `pre-react-rewrite`（@ `bbe9b08`）；`main` 保持 Vue 版可发版、可热修。
 - 分支上 `styles.css` **直接删除**：没有 `@layer legacy` 垫片，也没有「未迁页面先跑起来」的阶段。代价是分支在页面迁完前不可部署，这是明确接受的。
-- 分支如何保持「随时能打开看」：走 §12 的双入口脚手架 —— 分支期间 `index.html` 仍指向 Vue 入口，
-  React 侧用 `index.react.html` + `src/main.react.tsx` 独立跑；全部页面迁完后一次性 flip，删 Vue 入口与 `@vitejs/plugin-vue`。
-  这样既有「每步都能在浏览器里验证」，又保证**合并结果里零共存**。
+- 2026-10-30 追加定案：**连双入口脚手架也不要**（原 §12.2 作废）。分支上一次性换血 —— `P1` 就删光 `.vue`、`styles.css` 与 vue 系依赖，页面重建完成前分支不可运行，这是明确接受的成本。旧实现随时可从 `git show pre-react-rewrite:web/src/<path>` 取阅。
 - 因此本方案没有「过渡期倒计时」这种机制：`legacy-audit` 在分支上是进度看板，在合并点是硬门禁（§6）。
 
 ### D2 路由：react-router 7 数据路由，loader 取代手写守卫
@@ -387,20 +385,24 @@ Plan B 下它的角色是：分支上随便跑、只看趋势，**合并前必�
 
 这五个数字就是本次重构要清零的对象；最重的三个文件是 Settings（275 处）、ProviderDetail（188）、UsersGroups（182）。
 
-### P1 · 工具链与双入口骨架（1.5 天）
+### P1 · 工具链与一次性换血（2 天）— ✅ 已完成 2026-10-30
 
-- 依赖替换（§2）；lockfile 重生成（**根 version 仍是 1.7.2**，lockfile 守护测试会查）
-- `vite.config.ts`：加 `react()` + `tailwindcss()`，**分支期间保留 `vue()`**（双入口脚手架，§12.2；两个插件只在分支共存，P5 删）
-- `tsconfig.json`：`jsx: react-jsx`；`index.html` **不动**（仍指 Vue 入口），新增 `index.react.html`（`#root` + 同一份 theme-init.js）
-- `src/theme.css`（D1）、`src/main.react.tsx`（createRoot + RouterProvider + Toast.Provider，App 静态导入）、`src/store.ts`、App.tsx 骨架
-- `api.ts` 去 `reactive`（其余 900 行不动）。**注意联动**：这一步会让 Vue 侧的 `session` 失去响应式，
-  必须同批把 Vue 页面的读取点（`isAdmin()`、`session.me`，集中在 api.ts 导出与 App.vue）接到新 store；
-  若想完全不动 Vue 侧，替代做法是 P1 另建 `api.react.ts` 给 React 用、P5 合并 —— 二选一，P1 开工时定，不要并行两套。
-- 同批删掉 `tests/tsResolve.mjs` 里的 `vue` → stub 映射（api.ts 不再依赖框架）
-- 骨架验证：访问 `/index.react.html`，Tailwind 类生效、HeroUI Button 与 Modal 可用、hash 路由可跳、暗色 `data-theme` 生效
+- 依赖换血：卸载 `vue` / `vue-router` / `@vitejs/plugin-vue` / `vue-tsc`；安装 §2 全部依赖（lockfile 根 version 仍为 1.7.2）
+- `vite.config.ts`：`react()` + `tailwindcss()`（保留 `base: './'`、`define`、`/admin/api` 代理）
+- `index.html`：`#root` + `/src/main.tsx`；theme-init.js 原样保留（非 module、同步、无内联）
+- 新建 `src/theme.css`（D1）、`src/store.ts`、`src/main.tsx`、`src/router.tsx`（18 条真实路径全指向占位组件）
+- `api.ts` 去 `reactive`（store 化）；`tests/tsResolveHooks.mjs` 删 vue stub 映射
+- **删除**：28 个 `.vue`、`styles.css`、`ui.ts`、`composables/`、旧 `router.ts`、`App.vue`
+- 测试改造：删 `tests/accessibilityContract.test.mjs` 的 .vue 源码断言（保留 heartbeat 文案用例，挪进新文件），
+  新增 `tests/noHandWrittenPrimitives.test.mjs`（禁止裸原语 / 禁止手写 CSS / 禁止 .vue 回潮）
+- 骨架验证：占位页里 Button + Modal + toast 全链路可用；暗色 `data-theme` 生效
 
-**门槛**：`npm run typecheck`、`npm test`、`npm run build`（Vue 入口仍可构建）、`go test ./internal/webui/...` 全绿；
-`legacy-audit` 数字不变（P1 只搭架子，不消灭存量）。产物确定性与 CSP／入口 chunk 版本号的正式校验放在 P5 flip 之后。
+实际结果（2026-10-30）：typecheck 一次通过；`npm test` 43 passed（旧 47 = 删 7 个读 `.vue` 源码的契约断言、新增 5 个门禁/文案用例）；build 连跑两次产物逐字节一致；`go test ./internal/webui/...` 全绿（embed 里仍是 Vue 版产物，未动）。入口 chunk 473 KB（HeroUI 全量进入口，P4 路由级拆分后回落）。
+
+同批把 `apiContract` 的 4 处状态读取改成 `session.get()…`（store 语义）；`asyncIntegration`（R10 源码形状契约）随 `.vue` 删除而移除，**P4 每页重建后补回对应断言**。骨架占位页渲染 `__APP_VERSION__`，保住「入口 chunk 必须含版本号字面量」这条 `version_test` 链路。
+
+**门槛**：`npm run typecheck` / `npm test` / `npm run build`（连跑两次产物字节一致）/ `go test ./internal/webui/...` 全绿；
+`legacy-audit` 中 `.vue` 与 `styles.css` 归零（旧类名与裸原语的清除在 P3/P4）。
 
 ### P2 · 设计基座与应用组合件（2.5 天）
 
@@ -409,7 +411,7 @@ Plan B 下它的角色是：分支上随便跑、只看趋势，**合并前必�
 - ConfirmDialog 接上 Promise 版 `confirmBox`；**`ui.ts` 删除**
 - 手写删除量：`ui.ts` 67 行、`AppModal.vue` 174、`DetailDrawer.vue` 19、`Tabs.vue` 142、`DataTable.vue` 41、App.vue 里的图标 path 与媒体查询约 80
 
-**门槛**：登录 / 设密码 / 会话探测 / 守卫跳转 / 登出 全链路可用；ConfirmDialog 在删除、登出、危险操作三处手工验证。
+**门槛**：登录 / 设密码 / 会话探测 / 守卫跳转 / 登出 全链路可用；ConfirmDialog 在删除、登出、危险操作三处手工验证。 Shell 页脚必须渲染 `__APP_VERSION__` / `__ROSETTA_VERSION__`（占位页的版本页脚在 P2 移交给 Shell，`version_test` 链路不能断）。
 
 ### P3 · 全局原语清扫（2 天，机械但面广）
 
@@ -440,13 +442,14 @@ Plan B 下它的角色是：分支上随便跑、只看趋势，**合并前必�
 3. 读数据改 loader、写数据改 `useActionState`；
 4. 交互件按 §4 映射；
 5. 连带删除 `styles.css` 中已无人引用的规则。
+6. 该页若有 R10 异步所有权契约，重建后补回 source-shape 断言（原 `asyncIntegration.test.mjs`，可从 git 历史取参考）。
 
 **门槛**：每批结束 `npm run build && node sync-embed.mjs` + `go test ./...`；
 手工走查：能筛、能翻、能开弹窗提交、错误态能显示、纯键盘能走完一遍。
 
-### P5 · 收尾与入口切换（2 天）
+### P5 · 收尾与入库（1.5 天）
 
-- **flip 入口**：`index.react.html` → `index.html`（`#root` + theme-init.js 原样保留）；删 `index.react.html`、Vue 入口 `main.ts`、双插件里的 `vue()`
+- 复核：`index.html` 指向 React 入口、无 `index.react.html`、无任何 `.vue` 与 vue 依赖（P1 已换血，此处只复核）
 - 删 `src/styles.css`、删 `src/**/*.vue`、移除 `vue` / `vue-router` / `vue-tsc` / `@vitejs/plugin-vue`
 - `legacy-audit --gate` 接进 CI 硬门禁；CI 增加「无 .vue／无手写 CSS」断言
 - 产物确定性：连续两次 `npm run build` 字节一致；`go test ./internal/webui/...`（CSP／入口 chunk 版本号／lockfile 三守）
@@ -467,11 +470,11 @@ Plan B 下它的角色是：分支上随便跑、只看趋势，**合并前必�
 | 阶段 | 估时 |
 | --- | --- |
 | P0 基线 | 0.5 d |
-| P1 工具链与双入口骨架 | 1.5 d |
+| P1 工具链与一次性换血 | 2 d |
 | P2 设计基座 + 组合件 + Shell | 2.5 d |
 | P3 全局原语清扫 | 2 d |
 | P4 页面重建（B1 4 + B2 7 + B3 5 + C 3） | 19 d |
-| P5 收尾与入口切换 | 2 d |
+| P5 收尾与入库 | 1.5 d |
 | P6 发布 | 0.5 d |
 | 漂移控制（每周 rebase main、热修 cherry-pick、合并彩排） | 1.5 d |
 | **合计** | **约 29.5 人日**（建议按 34 人日排期） |
@@ -491,7 +494,7 @@ Plan B 比 Plan A 多出约 1.5 天（周 rebase / cherry-pick / 合并彩排）
 
 | # | 风险 | 影响 | 对策 |
 | --- | --- | --- | --- |
-| R1 | 分支上长期存在「半 Vue 半 React」（双入口） | 中 | 双入口脚手架只在分支存在（§12.2），合并前必须 flip 并删除；`legacy-audit --gate` 作为合并门禁 |
+| R1 | 分支在 P4 完成前不可运行、不可演示 | 中 | 已接受（无过渡期定案）。二进制部署不受影响：embed 里仍是 Vue 版产物，P5 之前不提交新 dist；旧实现可从 tag 取阅 |
 | R2 | HeroUI `Table` 的排序/列配置语义与现有"服务端已排好序"的表格不同 | 中 | 只把"展示 + 行操作"迁到 Table；排序与分页仍走服务端（searchParams + loader 重取）；不为用而用 RAC 的客户端排序 |
 | R3 | loader 与 401／重定向交互出错，出现跳登录死循环 | 高 | loader 只做"判定 + throw redirect"；401 只由 api.ts 处理并跳一次；redirect 目标沿用现有"单斜杠开头且非 //"校验 |
 | R4 | 表单值类型变化导致 PATCH 语义漂移（空值被当 0 发、空串被静默丢弃） | 高（数据损坏） | `api.ts` 边界统一规约 `undefined / null / ''`；新增 `apiPatchSemantics.test.mjs`；每个写表单迁移时手工验证一次"清空字段" |
@@ -517,7 +520,7 @@ Plan B 比 Plan A 多出约 1.5 天（周 rebase / cherry-pick / 合并彩排）
 - [ ] index.html 无内联脚本／内联事件；theme-init.js 仍为同步外链
 - [ ] 版本号单一来源成立（页脚／二进制／lockfile）
 - [ ] AGENTS.md 补两条规则（禁止裸交互原语、禁止新建 CSS 文件）；DESIGN.md、build.ps1、CI 注释已更新
-- [ ] `index.react.html` 与双入口脚手架已删除，`index.html` 指向 React 入口
+- [ ] `index.html` 指向 React 入口；全仓无 `index.react.html`、无 `.vue`、无 vue 依赖
 - [ ] 已从最新 `main` 彩排合并一次（`feat/react-rewrite-rehearsal`）并通过全套 CI（§12.5）
 - [ ] XERJ 索引已重建
 
@@ -556,28 +559,19 @@ v3 与 v2 的关键差别（别用旧记忆）：
 
 - 工作分支 `feat/react-rewrite`；基线 tag `pre-react-rewrite`（@ `bbe9b08`）。
 - 分支**开启 CI**（typecheck／test／build 三步），但 `webui-sync` 这个 job 在分支上不判红：
-  它守的是「入库产物与源码一致」，而分支产物在 flip 之前不提交。合并时必须转绿（§12.5）。
+  它守的是「入库产物与源码一致」，而分支在 P5 之前不提交新 dist。合并时必须转绿（§12.5）。
 - 分支期间**不提交** `internal/webui/dist`；P5 一次性提交新产物。
 - 合并形态：**squash 合并**为一条 `feat: 前端迁移到 React 19 + Tailwind v4 + HeroUI v3`；
   完整提交历史另存 tag `react-rewrite-history`，便于日后 bisect。
 
-### 12.2 双入口脚手架（只在分支存在，合并前删除）
+### 12.2 无过渡期（2026-10-30 用户定案，原「双入口脚手架」方案作废）
 
-目的：让分支**每一步都能在浏览器里打开验证**，同时不产生「新旧页面同入口共存」的最终状态。
-
-| 文件 | 作用 | 生命周期 |
-| --- | --- | --- |
-| `index.html` | 保持不变，仍加载 Vue 入口 `src/main.ts` | 到 P5 flip 前 |
-| `index.react.html` | React 入口：root 容器 + 同一份 `theme-init.js` | P1 建，P5 删 |
-| `src/main.react.tsx` | `createRoot` + `RouterProvider` + `Toast.Provider` | P1 建，P5 改名 `main.tsx` |
-| `vite.config.ts` | 同时挂 `vue()` 与 `react()` 两个插件 | P1 起，P5 删 `vue()` |
-
-两个入口共享 `src/api.ts` 与 `src/types.ts`，但**不共享页面组件**（Vue 页面留在 `.vue` 里直到被替换）。
-由此有一个必须提前决策的点：`api.ts` 从 `reactive` 改成 store 的那一刻，Vue 侧的响应式会失效。
-两条路二选一，**P1 开工时定，不要并行两套**：
-
-1. 同批把 Vue 侧的读取点改成新 store（`isAdmin()`、`session.me` 的读取集中在 api.ts 导出与 App.vue，改动面很小）；
-2. P1 保留 `api.ts` 原样、另建 `api.react.ts` 只给 React 用，P5 合并回一个。
+- 分支上不做 Vue/React 并存：P1 一次性删除全部 `.vue`、`styles.css`、`ui.ts`、`composables` 与 vue 系依赖，
+  `index.html` 直接切到 React 入口，`vite.config.ts` 只挂 `react()` + `tailwindcss()`。
+- 代价：在 P4 页面重建完成之前，分支的前端不可运行、不可演示。验收靠 `typecheck`/`npm test`/`npm run build` 三关，
+  以及每落一个页面就在 dev server 里看一个页面。
+- `api.ts` 的 `reactive` → store 改造因此是 P1 的必做项（不再存在"保留 Vue 侧响应式"的选项）。
+- 旧实现的取阅方式：`git show pre-react-rewrite:web/src/views/Settings.vue`（tag 里全都在），工作区不留副本。
 
 ### 12.3 漂移控制（Plan B 的主要风险）
 

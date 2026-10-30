@@ -20,7 +20,7 @@
 // 4. 鉴权头：Authorization: Bearer <会话令牌>。401 只有一个含义——会话无效，
 //    清本地令牌并把人送回登录页。
 
-import { reactive } from 'vue'
+import { createStore } from './store'
 import { rangeBounds } from './range'
 import type {
   ApiError, BootstrapStatus, Me, SessionStatus, LoginResult, ConfigImportResult,
@@ -45,12 +45,12 @@ const TOKEN_KEY = 'rosetta_gw_admin_token'
 // 「清本地令牌 + 跳登录页」路径。为此在浏览器里维护一份跨标签页的
 // 「登出了」标记是多余的 —— 标记本身还要处理「什么时候该清」的边界，
 // 而服务端已经给了唯一权威答案。
-export const auth = reactive({
+export const auth = createStore({
   token: sessionStorage.getItem(TOKEN_KEY) ?? '',
 })
 
 export function saveToken(t: string) {
-  auth.token = t
+  auth.set({ token: t })
   if (t) sessionStorage.setItem(TOKEN_KEY, t)
   else sessionStorage.removeItem(TOKEN_KEY)
 }
@@ -63,7 +63,7 @@ export function saveToken(t: string) {
  * 把 is_admin 缓存起来是刻意的 —— 界面要据此隐藏 admin-only 入口，
  * 而每次渲染都问一遍后端既慢又会让模板难写。
  */
-export const session = reactive({
+export const session = createStore({
   me: null as Me | null,
   /**
    * needsSetup 为真表示系统里存在一个「已建出但还没设密码」的管理员，
@@ -92,7 +92,7 @@ export const session = reactive({
  * 看当前身份是不是管理员。未登录时为 false。
  */
 export function isAdmin(): boolean {
-  return session.me?.is_admin ?? false
+  return session.get().me?.is_admin ?? false
 }
 
 /**
@@ -117,10 +117,10 @@ export async function loadSession(): Promise<void> {
   // 于是已登录用户被踢回登录页，且没有任何错误信息。
   try {
     await get<SessionStatus>('/session')
-    session.backendReady = true
+session.set({ backendReady: true })
   } catch {
-    session.backendReady = false
-    session.checked = true
+session.set({ backendReady: false })
+session.set({ checked: true })
     return
   }
 
@@ -129,25 +129,25 @@ export async function loadSession(): Promise<void> {
     // 我们会在「未登录」的错误分支里提前 return，needs_setup 永远拿不到，
     // 登录页就会显示一个永远登不进去的输入框。
     const bs = await get<BootstrapStatus>('/bootstrap')
-    session.needsSetup = bs.needs_setup
-    session.setupUsername = bs.username ?? ''
-    session.bootstrapCheckFailed = false
+session.set({ needsSetup: bs.needs_setup })
+session.set({ setupUsername: bs.username ?? '' })
+session.set({ bootstrapCheckFailed: false })
   } catch {
     // A 500 here is not "setup not needed". The login form would be
     // misleading when the service cannot even read its startup state.
-    session.needsSetup = false
-    session.setupUsername = ''
-    session.bootstrapCheckFailed = true
+session.set({ needsSetup: false })
+session.set({ setupUsername: '' })
+session.set({ bootstrapCheckFailed: true })
   }
 
   try {
-    session.me = await get<Me>('/me')
+session.set({ me: await get<Me>('/me') })
   } catch {
     // 未登录（401）是正常状态，不是错误 —— 交给调用方渲染登录页。
     // 其余状态码（429/500）同样只表示「拿不到身份」，一律降级成未登录。
-    session.me = null
+session.set({ me: null })
   } finally {
-    session.checked = true
+session.set({ checked: true })
   }
 }
 
@@ -162,7 +162,7 @@ export async function login(username: string, password: string) {
   // Login is public. Its 401 means bad credentials, not expired local session.
   const r = await publicPost<LoginResult>('/login', { username, password })
   saveToken(r.token)
-  session.me = await get<Me>('/me')
+session.set({ me: await get<Me>('/me') })
   return r
 }
 
@@ -179,11 +179,11 @@ export async function login(username: string, password: string) {
 export async function bootstrapSetup(password: string) {
   const r = await publicPost<LoginResult>('/bootstrap', { password })
   saveToken(r.token)
-  session.needsSetup = false
-  session.setupUsername = ''
-  session.bootstrapCheckFailed = false
+session.set({ needsSetup: false })
+session.set({ setupUsername: '' })
+session.set({ bootstrapCheckFailed: false })
   try {
-    session.me = await get<Me>('/me')
+session.set({ me: await get<Me>('/me') })
   } catch (e) {
     // Password change and window close already succeeded. Keep the issued
     // session and expose profile refresh as a separate, retryable failure.
@@ -239,7 +239,7 @@ export function checkPasswordSetup(token: string) {
 export async function completePasswordSetup(token: string, password: string) {
   const r = await publicPost<LoginResult>('/password-setup', { token, password })
   saveToken(r.token)
-  session.me = await get<Me>('/me')
+session.set({ me: await get<Me>('/me') })
   return r
 }
 
@@ -253,7 +253,7 @@ export async function completePasswordSetup(token: string, password: string) {
 export async function logout() {
   await post('/logout')
   saveToken('')
-  session.me = null
+session.set({ me: null })
 }
 
 export class ApiFail extends Error {
@@ -266,7 +266,7 @@ export class ApiFail extends Error {
 
 async function request<T>(method: string, path: string, body?: unknown, timeoutMs = 30_000): Promise<T> {
   const headers: Record<string, string> = {}
-  if (auth.token) headers['Authorization'] = 'Bearer ' + auth.token
+  if (auth.get().token) headers['Authorization'] = 'Bearer ' + auth.get().token
   if (body !== undefined) headers['Content-Type'] = 'application/json'
 
   // 超时：网关若挂起（连接不响应），没有 signal 的 fetch 会一直 pending，
@@ -298,7 +298,7 @@ async function request<T>(method: string, path: string, body?: unknown, timeoutM
     // 清掉本地令牌并把 me 置空，让 App.vue 的 watch 把人送回登录页。
     // 不能「什么都不做只弹框」：界面会停在一个永远 401 的空壳上。
     saveToken('')
-    session.me = null
+session.set({ me: null })
     throw new ApiFail(401, '登录已失效，请重新登录')
   }
 
@@ -339,7 +339,7 @@ export interface DownloadResult {
  */
 async function download(method: string, path: string, body?: unknown, fallbackName = 'rosetta-config.json'): Promise<DownloadResult> {
   const headers: Record<string, string> = {}
-  if (auth.token) headers['Authorization'] = 'Bearer ' + auth.token
+  if (auth.get().token) headers['Authorization'] = 'Bearer ' + auth.get().token
   if (body !== undefined) headers['Content-Type'] = 'application/json'
 
   let res: Response
@@ -362,7 +362,7 @@ async function download(method: string, path: string, body?: unknown, fallbackNa
     // 与 request() 同语义：401 只代表会话失效，必须原样处理，
     // 否则页面停在一个永远失败的导出按钮上。
     saveToken('')
-    session.me = null
+session.set({ me: null })
     throw new ApiFail(401, '登录已失效，请重新登录')
   }
   if (!res.ok) {

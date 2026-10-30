@@ -1,0 +1,23 @@
+/* 全站唯一样式入口（重构方案 D1）：
+   Tailwind v4 + HeroUI v3 令牌，应用自身不再维护任何组件 CSS。
+   主题覆盖只允许出现在这里的 @theme / :root，不允许在组件里写魔法值。 */
+@import "tailwindcss";
+@import "@heroui/styles";
+
+/* HeroUI 认 [data-theme=dark]（与 public/theme-init.js 一致）；
+   tailwind 的 dark: 变体默认只看系统偏好，这里对齐到属性 */
+@custom-variant dark (&:where([data-theme="dark"], [data-theme="dark"] *));
+
+@theme {
+  /* HeroUI 不声明字体，中文字体栈由应用定义（旧 styles.css 的 --sans） */
+  --font-sans: "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", ui-sans-serif, system-ui, sans-serif;
+  --font-mono: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+
+  /* 全站常量做成令牌，避免各页写 max-w-[1180px] 之类魔法值 */
+  --container-app: 1180px;
+  --spacing-gutter: 1.375rem;
+}
+
+body {
+  font-family: var(--font-sans);
+}
