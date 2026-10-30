@@ -6,6 +6,7 @@ import { PasswordSetup } from './ui/PasswordSetup'
 import { Networks, networksLoader } from './pages/Networks'
 import { UsageStats } from './pages/UsageStats'
 import { Overview } from './pages/Overview'
+import { Models } from './pages/Models'
 import { Placeholder } from './ui/Placeholder'
 
 export interface RouteHandle {
@@ -92,7 +93,12 @@ export const router = createHashRouter([
         handle: { title: '用量与费用' },
         loader: authedLoader(false),
       },
-      { path: '/models', ...page('可用模型', { title: '可用模型' }) },
+      {
+        path: '/models',
+        element: <Models />,
+        handle: { title: '可用模型' },
+        loader: authedLoader(false),
+      },
       { path: '/wallet', ...page('余额与账单', { title: '余额与账单' }) },
       { path: '/profile', element: <Navigate to="/wallet" replace /> },
       { path: '/keys', ...page('API 密钥', { title: 'API 密钥' }) },

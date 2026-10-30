@@ -21,3 +21,13 @@
 body {
   font-family: var(--font-sans);
 }
+
+/* 连通率条（HeartbeatBar）「无探测记录」档的底色；成功/部分失败/失败走
+   HeroUI 语义 token（--color-success 等），只有这一档 HeroUI 没有，沿用
+   旧 styles.css 的两个值（亮 / 暗各一）。 */
+:root {
+  --hb-empty: oklch(0.78 0.004 286);
+}
+[data-theme="dark"] {
+  --hb-empty: oklch(0.34 0.008 286);
+}
