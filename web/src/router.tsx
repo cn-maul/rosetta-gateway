@@ -14,7 +14,6 @@ import { Settings } from './pages/Settings'
 import { AccessControl } from './pages/AccessControl'
 import { AccountSettings } from './pages/AccountSettings'
 import { Wallet } from './pages/Wallet'
-import { Placeholder } from './ui/Placeholder'
 
 export interface RouteHandle {
   title: string
@@ -61,12 +60,7 @@ const loginLoader = async ({ request }: LoaderFunctionArgs) => {
   throw redirect(r && r.startsWith('/') && !r.startsWith('//') ? r : '/')
 }
 
-// P2：页面尚未重建的路由统一指向占位组件，P4 逐个替换。
-const page = (name: string, handle: RouteHandle) => ({
-  element: <Placeholder name={name} />,
-  handle,
-  loader: authedLoader(handle.adminOnly === true),
-})
+// P2 的占位组件辅助：P4/P5 已让全部路由指向真实页面，占位件连同本辅助一起移除。
 
 // 旧 /providers?tab=… 地址兼容（原 beforeEnter）
 const providersLoader = async (args: LoaderFunctionArgs) => {

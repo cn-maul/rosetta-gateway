@@ -9,7 +9,7 @@ build.ps1 — rosetta-gateway 纯编译脚本（只构建，不启动）
   .\build.ps1                # 构建前端（npm build + sync）+ 编译 Go
   .\build.ps1 -NoWeb         # 跳过前端，用现有 internal\webui\dist 编译 Go
   .\build.ps1 -SkipInstall   # 已装过依赖时跳过 npm install
-  .\build.ps1 -Typecheck     # 前端构建前先跑 vue-tsc --noEmit
+  .\build.ps1 -Typecheck     # 前端构建前先跑 tsc --noEmit
   .\build.ps1 -Vet           # Go 编译前先跑 go vet ./...
   .\build.ps1 -Out ..\x\g.exe # 自定义产物路径（默认 bin\gateway.exe）
 #>
@@ -68,7 +68,7 @@ if ($NoWeb) {
     }
 
     if ($Typecheck) {
-      Write-Host "-> 类型检查（vue-tsc）..."
+      Write-Host "-> 类型检查（tsc）..."
       Invoke-Native { npm run typecheck } "类型检查失败"
     }
 

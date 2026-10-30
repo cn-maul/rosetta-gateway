@@ -3,6 +3,7 @@ import { Outlet, useLocation, useMatches, useNavigate } from 'react-router-dom'
 import { Spinner } from '@heroui/react'
 import { isAdmin, session } from '../api'
 import { ConfirmDialog } from './ConfirmDialog'
+import { Shell } from './Shell'
 import type { RouteHandle } from '../router'
 
 // 角色相关的标题与旧 router.ts 的 updateDocumentTitle 对齐：
@@ -48,10 +49,14 @@ function useSessionExpiryWatcher() {
 export function AppRoot() {
   useDocumentTitle()
   useSessionExpiryWatcher()
+  const location = useLocation()
+  // 登录 / 首次设密没有侧栏可言；其余路由都住在 Shell（侧栏 + 顶栏 +
+  // 页脚版本号）里。Shell 渲染 <Outlet/>，页面组件由此进入内容区。
+  const isPublic = location.pathname === '/login' || location.pathname === '/set-password'
   return (
     <>
       <ConfirmDialog />
-      <Outlet />
+      {isPublic ? <Outlet /> : <Shell />}
     </>
   )
 }

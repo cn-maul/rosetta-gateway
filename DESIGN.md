@@ -56,7 +56,7 @@
 | D7 | 配额检查时机 | **请求前原子预占（used+reserved vs quota）+ 请求后按真实 usage 记账、退预占** | 纯 check-then-act 在并发下会整体放行；预占把「检查+占用」合并进同一条写事务（§11.2） |
 | D8 | 流空闲超时 | **网关自己实现看门狗** | Rosetta 无此能力（已核实，全仓无 idle 相关实现） |
 | D9 | `/v1/models` 形状冲突 | 按认证头分流 + 显式别名路径 | OpenAI 与 Anthropic 的该路径完全相同、响应形状不同 |
-| D10 | 前端形态 | `go:embed` + **Vue 3 + Vite + TS**（原定原生 HTML/fetch，预设的升级边界触发后迁移，见 §13.1） | 产物仍进二进制单文件交付 |
+| D10 | 前端形态 | `go:embed` + **React 19 + Vite + TS + HeroUI**（原定原生 HTML/fetch，预设的升级边界触发后引入框架，2026-10 重写为 React，见 §13.1） | 产物仍进二进制单文件交付 |
 | D11 | 配置格式 | JSON | 零依赖，与 Rosetta 的 models 文件一致 |
 | D12 | SQLite 驱动 | `modernc.org/sqlite`（纯 Go） | 交叉编译无 cgo，保持单二进制干净 |
 
@@ -1515,7 +1515,7 @@ Windows 上才跟 `time.Local`，**只设一个会跨平台失效**（第一版�
 120s / 60s / 30s）：对非流式长回复与带思考的上游，旧值会把**正常请求**判成
 超时并触发故障转移，用户侧看到的是「无故变慢 + 结果不对」而不是明确报错。
 三处必须保持同一个口径：`internal/config` 的 `setDefaults`、`config.example.json`、
-web 设置页的 `RUNTIME_DEFAULTS`（`web/src/views/Settings.vue`）——
+web 设置页的 `RUNTIME_DEFAULTS`（`web/src/generated/defaults.ts`）——
 界面回显的是生效值，DB 未配置时生效值就来自 `setDefaults`，三处不一致会让运维
 照着界面推理出错误的预期。
 
@@ -1548,9 +1548,9 @@ Docker 侧对齐，且避开浏览器的保留端口表（6666 是 IRC 段，浏
 
 ### 13.1 形态
 
-`go:embed` 打包静态资源（`internal/webui/dist`），`web/` 下是 **Vue 3 + Vite + TS** 工程，`fetch` 调 `/admin/api/*`。
+`go:embed` 打包静态资源（`internal/webui/dist`），`web/` 下是 **React 19 + Vite + TS + HeroUI** 工程，`fetch` 调 `/admin/api/*`。
 
-> 历史沿革：早期是单个 `index.html` 内联全部逻辑，理由写的是「内网管理页不超过 8 个，引入框架收益不成比例」，并预设了升级边界「一旦出现多页 + 复杂表单联动 + 图表就换框架」。边界随后真的被触发了（六页 + 表单弹窗 + 图表），于是按当初的约定迁到 Vue 3。构建链：`cd web && npm run build && npm run sync`（`sync` 把产物同步进 `internal/webui/dist` 供 embed），`gateway.ps1` 已编排。
+> 历史沿革：早期是单个 `index.html` 内联全部逻辑，理由写的是「内网管理页不超过 8 个，引入框架收益不成比例」，并预设了升级边界「一旦出现多页 + 复杂表单联动 + 图表就换框架」。边界随后真的被触发了（六页 + 表单弹窗 + 图表），于是按当初的约定引入框架（Vue 3）；2026-10 前端整体重写为 React 19 + HeroUI（页签/表格/表单弹窗组件化，路由 react-router，数据获取走 loader/useRevalidator，迁移记录见 docs/react-migration-handoff.md 与 docs/frontend-react-migration-plan.md）。构建链：`cd web && npm run build && npm run sync`（`sync` 把产物同步进 `internal/webui/dist` 供 embed），`gateway.ps1` 已编排。
 >
 > **CI 会校验产物同步**（`.github/workflows/ci.yml`，2026-10-02 起）：push/PR 时重新
 > `npm build + sync` 一遍，与入库的 `internal/webui/dist` 做 `git diff --exit-code`，
@@ -1611,16 +1611,16 @@ Docker 侧对齐，且避开浏览器的保留端口表（6666 是 IRC 段，浏
 | `/login` | 登录 | 公开 | 账号密码换 JWT；未初始化时改走引导设密 |
 | `/set-password` | 设置密码 | 公开 | 一次性设密链接落地页；`token` 位于 hash query，校验后设置密码并直接登录。登录用户也可访问，完成设置会切换为该账号的会话 |
 | `/` | 总览 | 全体 | 管理员首屏分两块：当前启用的上游/总数、上游模型总数、用户数、Key 数、累计 token 费用；以及所选区间请求数、成功率、平均首字、平均输出速度、费用、token 与缓存命中率。另有趋势、待处理项；普通用户看自己的区间质量指标、余额与配额 |
-| `/history` | 请求日志 | 全体 | `UsageStats.vue` 固定渲染逐条 `UsageDetail.vue`：时间、状态、流式/非流式、入站协议、公开路由名（下行显示实际上游模型）、密钥、新增输入 / 新增输出（下行显示缓存数）、输出速度、首字 / 总耗时、费用和详情。首字与总耗时按阈值着色：首字 5s / 10s、总耗时 10s / 30s 分别对应绿 / 橙 / 红。支持按时间范围 / 状态 / 模型 / key 过滤、分页和 CSV 导出 |
-| `/usage` | 用量与费用 | 全体 | `UsageStats.vue` 的非日志形态：默认近 1 天，也可切到近 7 / 30 天。按上游、模型、密钥三个维度用排行表汇总，顶部先给出范围总计，每行展示请求量、成功 / 失败数、Tokens、固化费用、成功率进度条以及首字 / 输出速度；管理员另有「统计归并」（`ModelGroups.vue`）。所有子页共用父页面的时间范围，避免切换页签后两页数字对不上 |
+| `/history` | 请求日志 | 全体 | `UsageStats.tsx` 固定渲染逐条 `UsageDetailDrawer.tsx`：时间、状态、流式/非流式、入站协议、公开路由名（下行显示实际上游模型）、密钥、新增输入 / 新增输出（下行显示缓存数）、输出速度、首字 / 总耗时、费用和详情。首字与总耗时按阈值着色：首字 5s / 10s、总耗时 10s / 30s 分别对应绿 / 橙 / 红。支持按时间范围 / 状态 / 模型 / key 过滤、分页和 CSV 导出 |
+| `/usage` | 用量与费用 | 全体 | `UsageStats.tsx` 的非日志形态：默认近 1 天，也可切到近 7 / 30 天。按上游、模型、密钥三个维度用排行表汇总，顶部先给出范围总计，每行展示请求量、成功 / 失败数、Tokens、固化费用、成功率进度条以及首字 / 输出速度；管理员另有「统计归并」（`ModelGroups.tsx`）。所有子页共用父页面的时间范围，避免切换页签后两页数字对不上 |
 | `/models` | 可用模型 | 全体 | **只读**清单：`GET /admin/api/model-names` 按身份收窄后的模型名（普通用户 = 所属组白名单 ∩ 全部路由名）+ 输入/输出/缓存命中三项单价；`restricted=true` 时显式提示「已被分组收窄」。每张模型卡同时画**连通率曲线**（探测数据，2026-10-14 并表）。刻意不给勾选控件 —— 白名单的写入口在 `/keys`（只能收紧）与 `/groups`（管理员按组收紧），且**空清单一律解释为「一个模型都调不了」而非 ModelPicker 的「一个都不选 = 不限制」**（后者只属于配置态）。未配置的单价显示「未配置」并弱化，**不显示 0.00**（会被读成「确认免费」） |
 | `/wallet` | 钱包与充值 | 全体 | **按身份分两种形态的同一页**：管理员看到全站的用户消费汇总 + 全部充值流水 + 充值入口（没有消耗记录，明细在「用量统计」页）；普通用户看到自己的余额、按天消耗与充值记录。自改密码已迁到「设置」页（2026-10-13）。余额（`balance_cents`）在 `balance_unlimited` 时显示「不限」而非 0.00 元，为 0 时显式提示「余额已用尽，请联系管理员充值」，对应数据面真实的 402 |
-| `/keys` | API 密钥 | 全体 | `AccessControl.vue` 的密钥页签：普通用户只看到并管理自己的 `sk-gw-` key；管理员可查看/调整归属与限制，但不能给自己新建 key。密钥创建与页签路由分离，`/keys` 是可停留地址 |
-| `/users` | 用户与权限 | admin | `AccessControl.vue` 的「用户 / 权限分组」两个页签。用户页含 CRUD、角色、启停、一次性设密/改密、余额充值；空密码普通用户可签发 24 小时设密链接，admin 新建时仍必须带初始密码。分组页维护成员与组级模型白名单 `PUT /admin/api/groups/{id}/models`。`delta_cents` 是相对金额，误操作不会把余额清零 |
-| `/networks` | 代理 | admin | 组件是 `Networks.vue`：可复用的代理地址清单（2026-10-20）。provider 只存 `network_id`，实际地址由读路径 JOIN 派生。直连是保留 id `direct`，不是一行记录。删网络让引用它的上游回到直连，不删上游。列表可按行发起连通性测试并显示正常/失败状态 |
-| `/providers` | 上游服务 | admin | `Providers.vue` 列表：类型用 `Chat / Response / Anthropic` 展示，紧跟一列用胶囊标出「直连」或「代理 · 名称」，模型/凭据摘要右对齐，操作列保留配置与删除，启停开关独立成最后一列；新建时可选择代理 |
-| `/providers/:id` | 上游详情 | admin | `ProviderDetail.vue`：凭据、模型发现/导入、余额查询、连通性测试、批量改价与协议配置。模型测试结果通过页面底部的临时 toast 展示，不嵌入模型行。协议值在 API/DB 中仍为 `chat / response / anthropic` |
-| `/routes` | 模型与路由 | admin | `Routes.vue`：公开模型名到有序上游链；`PUT /admin/api/routes/{id}/targets` 原子替换整条链。跨上游同名模型的统计归并在 `/usage?tab=groups`，不改变转发 |
+| `/keys` | API 密钥 | 全体 | `AccessControl.tsx` 的密钥页签：普通用户只看到并管理自己的 `sk-gw-` key；管理员可查看/调整归属与限制，但不能给自己新建 key。密钥创建与页签路由分离，`/keys` 是可停留地址 |
+| `/users` | 用户与权限 | admin | `AccessControl.tsx` 的「用户 / 权限分组」两个页签。用户页含 CRUD、角色、启停、一次性设密/改密、余额充值；空密码普通用户可签发 24 小时设密链接，admin 新建时仍必须带初始密码。分组页维护成员与组级模型白名单 `PUT /admin/api/groups/{id}/models`。`delta_cents` 是相对金额，误操作不会把余额清零 |
+| `/networks` | 代理 | admin | 组件是 `Networks.tsx`：可复用的代理地址清单（2026-10-20）。provider 只存 `network_id`，实际地址由读路径 JOIN 派生。直连是保留 id `direct`，不是一行记录。删网络让引用它的上游回到直连，不删上游。列表可按行发起连通性测试并显示正常/失败状态 |
+| `/providers` | 上游服务 | admin | `Providers.tsx` 列表：类型用 `Chat / Response / Anthropic` 展示，紧跟一列用胶囊标出「直连」或「代理 · 名称」，模型/凭据摘要右对齐，操作列保留配置与删除，启停开关独立成最后一列；新建时可选择代理 |
+| `/providers/:id` | 上游详情 | admin | `ProviderDetail.tsx`：凭据、模型发现/导入、余额查询、连通性测试、批量改价与协议配置。模型测试结果通过页面底部的临时 toast 展示，不嵌入模型行。协议值在 API/DB 中仍为 `chat / response / anthropic` |
+| `/routes` | 模型与路由 | admin | `Routes.tsx`：公开模型名到有序上游链；`PUT /admin/api/routes/{id}/targets` 原子替换整条链。跨上游同名模型的统计归并在 `/usage?tab=groups`，不改变转发 |
 | `/account` | 账号设置 | 全体 | 当前用户自助改密、查看账号信息；管理员和普通用户都可访问 |
 | `/settings` | 系统设置 | admin | 五个页签：模型默认、运行时、模型价格、修改密码、导入导出（§13.3）。**审计日志页签已移除**（用户要求）—— 后端 `GET /admin/api/audit` 端点与 `api.ts` 的 `api.audit()` 都保留，那是运维取证的正路，删的只是界面那一块 |
 
@@ -1632,7 +1632,7 @@ Docker 侧对齐，且避开浏览器的保留端口表（6666 是 IRC 段，浏
 >
 > `/models` 页要显示单价，于是该端点的响应加了 `prices`。但它有**三个**调用方，
 > 其中两个（`/keys` 的 ModelPicker、`/groups`）只要模型名：ModelPicker 的选项是
-> `string[]`（`v-model` + `Set` 去重 + `includes` 判定），Groups.vue 同样。改成
+> `string[]`（受控 value/onChange + Set 去重 + includes 判定），`ModelGroups.tsx` 同样。改成
 > `[{name, …}]` 会同时打破这两处，而它们并不需要价格 —— 为一个页面的展示去改
 > 两个组件的数据契约，收益与风险不成比例。
 >
@@ -1708,7 +1708,7 @@ Docker 侧对齐，且避开浏览器的保留端口表（6666 是 IRC 段，浏
 | 密钥加密 | `crypto/aes` + GCM（标准库） | 主密钥来自环境变量或 0600 权限文件 |
 | Key 哈希 | `crypto/sha256`（标准库） | 高熵随机串，不需要慢哈希 |
 | UUID | `crypto/rand` 自造 16 字节 hex | 避免引入依赖 |
-| 前端 | **Vue 3 + Vite + TS**，`go:embed` 打包 | 原定原生 HTML + JS，理由是「内网管理页不超过 8 个，引入框架收益不成比例」，并预设升级边界「一旦出现多页 + 复杂表单联动 + 图表就换框架」。**该边界后来真的被触发了**（六页 + 表单弹窗 + 图表），于是按当初约定迁到 Vue 3（见 §13.1） |
+| 前端 | **React 19 + Vite + TS + HeroUI**，`go:embed` 打包 | 原定原生 HTML + JS，理由是「内网管理页不超过 8 个，引入框架收益不成比例」，并预设升级边界「一旦出现多页 + 复杂表单联动 + 图表就换框架」。**该边界后来真的被触发了**（六页 + 表单弹窗 + 图表），于是按当初约定引入框架（先 Vue 3，2026-10 重写为 React + HeroUI，见 §13.1） |
 | 上游调用 | `github.com/cn-maul/rosetta` | 本项目存在的理由 |
 | 部署 | 单个二进制 + 一个 SQLite 文件 + 一个配置文件 | `scp` 过去就能跑 |
 
@@ -1786,7 +1786,7 @@ rosetta-gateway/
 │   ├── guard/                      登录失败限速
 │   ├── access/                     普通用户路由白名单与 AdminGateGuard
 │   └── server/                     HTTP 装配、中间件、请求 ID、访问日志、管理面授权门
-└── web/                            Vue 3 + Vite + TS 工程（npm run build && npm run sync）
+└── web/                            React 19 + Vite + TS + HeroUI 工程（npm run build && npm run sync）
 ```
 
 ---
