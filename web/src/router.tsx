@@ -1,45 +1,103 @@
-import { createHashRouter, Navigate } from 'react-router-dom'
+import { createHashRouter, Navigate, redirect, type LoaderFunctionArgs } from 'react-router-dom'
+import { isAdmin, loadSession, session } from './api'
+import { AppRoot, Splash } from './ui/AppRoot'
+import { Login } from './ui/Login'
+import { PasswordSetup } from './ui/PasswordSetup'
 import { Placeholder } from './ui/Placeholder'
 
-/**
- * 路由骨架（P1）：路径与元信息逐条对齐旧 router.ts 的路由表，
- * 页面全部暂指 Placeholder，P2 起逐个替换成真实组件。
- *
- * 与旧版的差异（方案 D2）：
- *  - hash 路由保留（go:embed 单二进制无服务端 fallback）；
- *  - meta 改叫 handle（react-router 惯例），adminOnly/public 沿用；
- *  - 旧 beforeEach 守卫（guardDecision/reapplyGuard）将在 P2 改写为
- *    路由级 loader：loader 在首次渲染前执行，硬刷新不再有「守卫没跑」窗口。
- */
 export interface RouteHandle {
   title: string
   public?: boolean
   adminOnly?: boolean
 }
 
+// 进程内只探测一次 /session + /me + /bootstrap（对齐旧版「启动时 loadSession 一次」）。
+// 登出/登录只改 store 状态，不需要重新探测。
+let sessionProbe: Promise<void> | null = null
+export function ensureSession(): Promise<void> {
+  sessionProbe ??= loadSession()
+  return sessionProbe
+}
+
+// 旧守卫的等价物，但以 loader 形式在**首次渲染前**执行 ——
+// 硬刷新不再有「beforeEach 没跑到」的窗口，旧版的 reapplyGuard 因此可以删除。
+const authedLoader = (adminOnly: boolean) => async ({ request }: LoaderFunctionArgs) => {
+  await ensureSession()
+  const url = new URL(request.url)
+  if (!session.get().me) {
+    // redirect 只接受站内相对路径（在 loginLoader 里二次校验），防开放重定向
+    throw redirect('/login?redirect=' + encodeURIComponent(url.pathname + url.search))
+  }
+  // 个人改密的旧地址对两种角色都映射到账号页（先于管理员判断，对齐旧守卫）
+  if (url.pathname === '/settings' && url.searchParams.get('tab') === 'password') {
+    throw redirect('/account')
+  }
+  if (adminOnly && !isAdmin()) {
+    // 旧守卫：普通用户撞 admin-only 页 → /users 回密钥页，其余回总览
+    throw redirect(url.pathname === '/users' ? '/keys' : '/')
+  }
+  return null
+}
+
+const loginLoader = async ({ request }: LoaderFunctionArgs) => {
+  await ensureSession()
+  if (!session.get().me) return null
+  // 已登录的人不该停在登录页；回跳目标只接受站内相对路径（单斜杠开头且非 //）
+  const url = new URL(request.url)
+  const r = url.searchParams.get('redirect')
+  throw redirect(r && r.startsWith('/') && !r.startsWith('//') ? r : '/')
+}
+
+// P2：页面尚未重建的路由统一指向占位组件，P4 逐个替换。
 const page = (name: string, handle: RouteHandle) => ({
   element: <Placeholder name={name} />,
   handle,
+  loader: authedLoader(handle.adminOnly === true),
 })
 
+// 旧 /providers?tab=… 地址兼容（原 beforeEnter）
+const providersLoader = async (args: LoaderFunctionArgs) => {
+  const url = new URL(args.request.url)
+  const tab = url.searchParams.get('tab')
+  if (tab === 'routes') throw redirect('/routes')
+  if (tab === 'model-groups') throw redirect('/usage?tab=groups')
+  return authedLoader(true)(args)
+}
+
 export const router = createHashRouter([
-  { path: '/login', ...page('登录', { title: '登录', public: true }) },
-  { path: '/set-password', ...page('设置密码', { title: '设置密码', public: true }) },
-  { index: true, ...page('网关总览', { title: '网关总览' }) },
-  { path: '/history', ...page('请求日志', { title: '请求日志' }) },
-  { path: '/usage', ...page('用量与费用', { title: '用量与费用' }) },
-  { path: '/models', ...page('可用模型', { title: '可用模型' }) },
-  { path: '/wallet', ...page('余额与账单', { title: '余额与账单' }) },
-  { path: '/profile', element: <Navigate to="/wallet" replace /> },
-  { path: '/keys', ...page('API 密钥', { title: 'API 密钥' }) },
-  { path: '/users', ...page('用户与权限', { title: '用户与权限', adminOnly: true }) },
-  { path: '/providers', ...page('上游服务', { title: '上游服务', adminOnly: true }) },
-  { path: '/routes', ...page('模型与路由', { title: '模型与路由', adminOnly: true }) },
-  { path: '/model-groups', element: <Navigate to="/usage?tab=groups" replace /> },
-  { path: '/networks', ...page('代理', { title: '代理', adminOnly: true }) },
-  { path: '/providers/:id', ...page('上游详情', { title: '上游详情', adminOnly: true }) },
-  { path: '/health', element: <Navigate to="/models" replace /> },
-  { path: '/account', ...page('账号设置', { title: '账号设置' }) },
-  { path: '/settings', ...page('系统设置', { title: '系统设置', adminOnly: true }) },
-  { path: '*', element: <Navigate to="/" replace /> },
+  {
+    element: <AppRoot />,
+    HydrateFallback: Splash,
+    // 根 loader 保证任何导航（含登录页）之前会话探测已完成
+    loader: async () => {
+      await ensureSession()
+      return null
+    },
+    children: [
+      { path: '/login', element: <Login />, handle: { title: '登录', public: true }, loader: loginLoader },
+      { path: '/set-password', element: <PasswordSetup />, handle: { title: '设置密码', public: true } },
+      { index: true, ...page('网关总览', { title: '网关总览' }) },
+      { path: '/history', ...page('请求日志', { title: '请求日志' }) },
+      { path: '/usage', ...page('用量与费用', { title: '用量与费用' }) },
+      { path: '/models', ...page('可用模型', { title: '可用模型' }) },
+      { path: '/wallet', ...page('余额与账单', { title: '余额与账单' }) },
+      { path: '/profile', element: <Navigate to="/wallet" replace /> },
+      { path: '/keys', ...page('API 密钥', { title: 'API 密钥' }) },
+      { path: '/users', ...page('用户与权限', { title: '用户与权限', adminOnly: true }) },
+      {
+        path: '/providers',
+        element: <Placeholder name="上游服务" />,
+        handle: { title: '上游服务', adminOnly: true },
+        loader: providersLoader,
+      },
+      { path: '/routes', ...page('模型与路由', { title: '模型与路由', adminOnly: true }) },
+      { path: '/model-groups', element: <Navigate to="/usage?tab=groups" replace /> },
+      { path: '/networks', ...page('代理', { title: '代理', adminOnly: true }) },
+      { path: '/providers/:id', ...page('上游详情', { title: '上游详情', adminOnly: true }) },
+      { path: '/health', element: <Navigate to="/models" replace /> },
+      { path: '/account', ...page('账号设置', { title: '账号设置' }) },
+      { path: '/settings', ...page('系统设置', { title: '系统设置', adminOnly: true }) },
+      { path: '*', element: <Navigate to="/" replace /> },
+    ],
+  },
 ])

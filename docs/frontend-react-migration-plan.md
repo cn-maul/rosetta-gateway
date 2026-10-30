@@ -404,7 +404,7 @@ Plan B 下它的角色是：分支上随便跑、只看趋势，**合并前必�
 **门槛**：`npm run typecheck` / `npm test` / `npm run build`（连跑两次产物字节一致）/ `go test ./internal/webui/...` 全绿；
 `legacy-audit` 中 `.vue` 与 `styles.css` 归零（旧类名与裸原语的清除在 P3/P4）。
 
-### P2 · 设计基座与应用组合件（2.5 天）
+### P2 · 设计基座与应用组合件（2.5 天）— ✅ 代码完成 2026-10-30（浏览器走查待做）
 
 - `src/ui/`：PageHeader、SectionCard、DataTable、ConfirmDialog、AppModal、AppDrawer、FormField、StatusChip
 - `src/ui/Shell.tsx`：侧栏（NavLink + lucide + Tailwind）、顶栏（Header/Toolbar + Avatar + Dropdown 登出 + 主题切换 ToggleButton）
@@ -412,6 +412,8 @@ Plan B 下它的角色是：分支上随便跑、只看趋势，**合并前必�
 - 手写删除量：`ui.ts` 67 行、`AppModal.vue` 174、`DetailDrawer.vue` 19、`Tabs.vue` 142、`DataTable.vue` 41、App.vue 里的图标 path 与媒体查询约 80
 
 **门槛**：登录 / 设密码 / 会话探测 / 守卫跳转 / 登出 全链路可用；ConfirmDialog 在删除、登出、危险操作三处手工验证。 Shell 页脚必须渲染 `__APP_VERSION__` / `__ROSETTA_VERSION__`（占位页的版本页脚在 P2 移交给 Shell，`version_test` 链路不能断）。
+
+实际结果：typecheck / 43 tests / build×2 字节一致 / go webui 守护全绿；Shell 页脚已渲染版本号。守卫以 loader 落地（`ensureSession` 进程内单次探测 + `redirect`），旧 `reapplyGuard` 已删除；401 掉登录由 AppRoot 的 watcher 统一导航。**浏览器内的完整链路走查（登录→探测→守卫→登出）需要 dev 环境手工做一次**，自动化只覆盖到构建与类型层面。
 
 ### P3 · 全局原语清扫（2 天，机械但面广）
 
@@ -545,6 +547,15 @@ v3 与 v2 的关键差别（别用旧记忆）：
 - 浮层层级 `--z-index-overlay: 100000`，toast 为其 +1（旧的 `--z-modal: 90` 那套随 `styles.css` 一起消失）；
 - 图标只自带 15 个（chevron／search／plus／minus／status／calendar），其余自备（D8）；
 - `@heroui/styles` 不声明字体，中文字体栈必须在 `theme.css` 的 `@theme` 里给。
+
+**实测 API 更正（P2 落地时用类型系统验证过，文档没写清的）：**
+
+- `Alert` 用 `status`（default/accent/success/warning/danger），不是 `variant`；
+- `Chip` 是 `color`（accent/success/warning/danger/default）× `variant`（primary/secondary/soft/tertiary）× `size`；
+- `TextField` 受控用 `value/onChange`，放在 `TextField` 上；`Input` 只是字段壳，吃原生属性（type/autoComplete/autoFocus）；
+- `Button` **没有** `title` 属性（用 aria-label；悬浮提示交给 Tooltip）；
+- `Drawer.Content` 用 `placement='right'` + className 定宽，无 style；`Modal.Dialog` 有 style；
+- `Checkbox` 无 size；`Menu` 用 `onAction` + `Dropdown.Item id`；
 
 本地资料位置：`apps/docs/content/docs/en/react/components/**`（MDX 文档，含 anatomy／props／BEM 类名／交互状态）、
 `packages/react/src/components/**`（真实实现，判断受控与否的最快途径）、
