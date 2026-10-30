@@ -86,7 +86,12 @@ export const router = createHashRouter([
         handle: { title: '网关总览' },
         loader: authedLoader(false),
       },
-      { path: '/history', ...page('请求日志', { title: '请求日志' }) },
+      {
+        path: '/history',
+        element: <UsageStats />,
+        handle: { title: '请求日志', wide: true },
+        loader: authedLoader(false),
+      },
       {
         path: '/usage',
         element: <UsageStats />,

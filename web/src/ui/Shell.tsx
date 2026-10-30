@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState, useSyncExternalStore } from 'react'
-import { NavLink, Outlet, useLocation, useNavigate } from 'react-router-dom'
+import { NavLink, Outlet, useLocation, useMatches, useNavigate } from 'react-router-dom'
 import { Avatar, Button, Dropdown, Label, toast } from '@heroui/react'
 import { LogOut, Moon, PanelLeft, Sun, UserRound } from 'lucide-react'
 import { ApiFail, isAdmin, logout, session } from '../api'
@@ -242,7 +242,7 @@ export function Shell() {
         </header>
 
         <main ref={contentRef} className="min-h-0 flex-1 overflow-y-auto">
-          <div className="mx-auto max-w-app p-gutter">
+          <div className={useMatches().some((m) => (m.handle as { wide?: boolean } | null)?.wide) ? 'p-gutter' : 'mx-auto max-w-app p-gutter'}>
             <Outlet />
           </div>
         </main>
