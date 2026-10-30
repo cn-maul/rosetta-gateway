@@ -18,10 +18,14 @@ const SRC = fileURLToPath(new URL('../src', import.meta.url))
 const EXCLUDE_DIRS = new Set(['node_modules', 'dist'])
 const ALLOWED_CSS = new Set(['theme.css'])
 
-// 路径前缀 -> 允许的原语正则（每条都要有理由；当前为空）
-const PRIMITIVE_ALLOWLIST = []
+// 路径前缀 -> 允许的原语正则（每条都要有理由）
+const PRIMITIVE_ALLOWLIST = [
+  // 系统文件对话框只能由原生 <input type="file"> 触发，HeroUI 无等价组件；
+  // 封装在 ui/FileImport.tsx 一处（与 scripts/legacy-audit.mjs 的白名单同源）。
+  { prefix: 'ui/FileImport', pattern: /^<input[^>]*type=["']file["']/ },
+]
 
-const RAW_PRIMITIVE = /<(button|input|select|textarea|table|details|dialog)\b/g
+const RAW_PRIMITIVE = /<(button|input|select|textarea|table|details|dialog)\b[^>]*>/g
 
 async function walk(dir, out = []) {
   for (const e of await readdir(dir, { withFileTypes: true })) {
@@ -58,7 +62,9 @@ test('R-sweep tsx 里没有裸原生交互原语', async () => {
     const src = await readFile(f, 'utf8')
     for (const m of src.matchAll(RAW_PRIMITIVE)) {
       const name = rel(f)
-      const allowed = PRIMITIVE_ALLOWLIST.some((a) => name.startsWith(a.prefix) && a.pattern.test(m[0] + '>'))
+      // m[0] 是整个开标签（含属性），与 scripts/legacy-audit.mjs 同形；
+      // 白名单 pattern 才能对 type="file" 这类属性做判断。
+      const allowed = PRIMITIVE_ALLOWLIST.some((a) => name.startsWith(a.prefix) && a.pattern.test(m[0]))
       if (!allowed) violations.push(name + ': ' + m[0])
     }
   }

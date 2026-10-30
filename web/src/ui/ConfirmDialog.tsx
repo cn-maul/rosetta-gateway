@@ -14,7 +14,10 @@ export function ConfirmDialog() {
             <AlertDialog.Header>
               <AlertDialog.Heading>{pending?.title ?? ''}</AlertDialog.Heading>
             </AlertDialog.Header>
-            {pending?.body ? <AlertDialog.Body>{pending.body}</AlertDialog.Body> : null}
+            {/* 保留换行：导入确认等长正文用 \n 分段（对齐旧 .sheet-body 的 pre-line）。 */}
+            {pending?.body ? (
+              <AlertDialog.Body className="whitespace-pre-line">{pending.body}</AlertDialog.Body>
+            ) : null}
             <AlertDialog.Footer>
               <Button variant="tertiary" onPress={() => settleConfirm(false)}>
                 取消

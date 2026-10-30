@@ -10,6 +10,7 @@ import { Models } from './pages/Models'
 import { Providers } from './pages/Providers'
 import { Routes } from './pages/Routes'
 import { ProviderDetail } from './pages/ProviderDetail'
+import { Settings } from './pages/Settings'
 import { Placeholder } from './ui/Placeholder'
 
 export interface RouteHandle {
@@ -140,7 +141,12 @@ export const router = createHashRouter([
       },
       { path: '/health', element: <Navigate to="/models" replace /> },
       { path: '/account', ...page('账号设置', { title: '账号设置' }) },
-      { path: '/settings', ...page('系统设置', { title: '系统设置', adminOnly: true }) },
+      {
+        path: '/settings',
+        element: <Settings />,
+        handle: { title: '系统设置', adminOnly: true },
+        loader: authedLoader(true),
+      },
       { path: '*', element: <Navigate to="/" replace /> },
     ],
   },
