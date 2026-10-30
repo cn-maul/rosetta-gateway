@@ -8,6 +8,7 @@ import { UsageStats } from './pages/UsageStats'
 import { Overview } from './pages/Overview'
 import { Models } from './pages/Models'
 import { Providers } from './pages/Providers'
+import { Routes } from './pages/Routes'
 import { Placeholder } from './ui/Placeholder'
 
 export interface RouteHandle {
@@ -117,7 +118,12 @@ export const router = createHashRouter([
         handle: { title: '上游服务', adminOnly: true },
         loader: providersLoader,
       },
-      { path: '/routes', ...page('模型与路由', { title: '模型与路由', adminOnly: true }) },
+      {
+        path: '/routes',
+        element: <Routes />,
+        handle: { title: '模型与路由', adminOnly: true },
+        loader: authedLoader(true),
+      },
       { path: '/model-groups', element: <Navigate to="/usage?tab=groups" replace /> },
       {
         path: '/networks',

@@ -306,7 +306,6 @@ export function Providers() {
                     <Table.Cell>
                       <Button
                         variant="ghost"
-                        title={`查看 ${p.name} 详情`}
                         aria-label={`查看 ${p.name} 详情`}
                         onPress={() => goDetail(p)}
                         className="block h-auto w-full px-2 py-1 text-left"
