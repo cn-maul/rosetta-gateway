@@ -9,6 +9,7 @@ import { Overview } from './pages/Overview'
 import { Models } from './pages/Models'
 import { Providers } from './pages/Providers'
 import { Routes } from './pages/Routes'
+import { ProviderDetail } from './pages/ProviderDetail'
 import { Placeholder } from './ui/Placeholder'
 
 export interface RouteHandle {
@@ -131,7 +132,12 @@ export const router = createHashRouter([
         handle: { title: '代理', adminOnly: true },
         loader: networksLoader,
       },
-      { path: '/providers/:id', ...page('上游详情', { title: '上游详情', adminOnly: true }) },
+      {
+        path: '/providers/:id',
+        element: <ProviderDetail />,
+        handle: { title: '上游详情', adminOnly: true },
+        loader: authedLoader(true),
+      },
       { path: '/health', element: <Navigate to="/models" replace /> },
       { path: '/account', ...page('账号设置', { title: '账号设置' }) },
       { path: '/settings', ...page('系统设置', { title: '系统设置', adminOnly: true }) },
