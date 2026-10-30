@@ -5,6 +5,7 @@ import { Login } from './ui/Login'
 import { PasswordSetup } from './ui/PasswordSetup'
 import { Networks, networksLoader } from './pages/Networks'
 import { UsageStats } from './pages/UsageStats'
+import { Overview } from './pages/Overview'
 import { Placeholder } from './ui/Placeholder'
 
 export interface RouteHandle {
@@ -78,7 +79,12 @@ export const router = createHashRouter([
     children: [
       { path: '/login', element: <Login />, handle: { title: '登录', public: true }, loader: loginLoader },
       { path: '/set-password', element: <PasswordSetup />, handle: { title: '设置密码', public: true } },
-      { index: true, ...page('网关总览', { title: '网关总览' }) },
+      {
+        index: true,
+        element: <Overview />,
+        handle: { title: '网关总览' },
+        loader: authedLoader(false),
+      },
       { path: '/history', ...page('请求日志', { title: '请求日志' }) },
       {
         path: '/usage',
