@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"fmt"
 	"strings"
 	"time"
 )
@@ -486,6 +487,67 @@ func (s *Store) SumUserUsedTokens(ctx context.Context, userID string) (int64, er
 		return 0, qerr
 	}
 	return fallback, nil
+}
+
+// UserUsageCounts 一次性取回用户列表需要的两个派生量：每人已用 token
+// （user_usage_totals 累加列）与每人名下的密钥把数。
+//
+// # 为什么不循环里各查一次
+//
+// 管理列表原来对每个用户调 SumUserUsedTokens + ListAccessKeysByUser，即
+// 1+2N 条查询；后者为了取一个计数，把每把密钥的完整行（含 key_hash /
+// key_enc）读进内存 —— 这些列既不该进浏览器，也不该为计数付出解码成本。
+// 用户数上百之后，打开「用户与权限」就是几百次查询。
+//
+// # 缺失行的口径
+//
+// user_usage_totals 的行由 usage_records 触发器维护，「查不到行」= 该用户
+// 从未产生过用量，按 0 处理 —— 与配额预检的 COALESCE(..., 0) 逐字一致
+// （见 ReserveUserQuota 的读法）。SumUserUsedTokens 对缺失行还有一条
+// 「实时 SUM」回退，那是为**已被删除的用户**保底的；列表是展示面而非配额
+// 闸门，不复制那条回退：为一个已删除用户扫全表明细不值得。
+func (s *Store) UserUsageCounts(ctx context.Context) (map[string]int64, map[string]int, error) {
+	used := make(map[string]int64)
+	rows, err := s.read.QueryContext(ctx,
+		`SELECT user_id, total_tokens FROM user_usage_totals`)
+	if err != nil {
+		return nil, nil, fmt.Errorf("list user usage totals: %w", err)
+	}
+	for rows.Next() {
+		var userID string
+		var tokens int64
+		if err := rows.Scan(&userID, &tokens); err != nil {
+			rows.Close()
+			return nil, nil, fmt.Errorf("scan user usage totals: %w", err)
+		}
+		used[userID] = tokens
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return nil, nil, fmt.Errorf("iterate user usage totals: %w", err)
+	}
+	// 必须先关行集再发下一条查询：读池连接数有限，行集未释放时会占着连接。
+	rows.Close()
+
+	keys := make(map[string]int)
+	keyRows, err := s.read.QueryContext(ctx,
+		`SELECT COALESCE(user_id, ''), COUNT(*) FROM access_keys GROUP BY 1`)
+	if err != nil {
+		return nil, nil, fmt.Errorf("count user access keys: %w", err)
+	}
+	defer keyRows.Close()
+	for keyRows.Next() {
+		var userID string
+		var n int
+		if err := keyRows.Scan(&userID, &n); err != nil {
+			return nil, nil, fmt.Errorf("scan user access key counts: %w", err)
+		}
+		keys[userID] = n
+	}
+	if err := keyRows.Err(); err != nil {
+		return nil, nil, fmt.Errorf("iterate user access key counts: %w", err)
+	}
+	return used, keys, nil
 }
 
 // ReserveUserQuota 为一次请求**原子地**预占 est 个 token 的用户级配额。

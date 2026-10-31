@@ -361,3 +361,70 @@ func TestAdjustBalance_DoesNotRebuildInline(t *testing.T) {
 		t.Fatalf("status = %d body=%s, want 200", rec.Code, rec.Body.String())
 	}
 }
+
+// TestListUsers_ReportsUsedTokensAndKeyCounts 回归「用户列表的派生量」：
+// 已用量来自 user_usage_totals 累加列，密钥数是每人的把数。
+//
+// 这两个数字原来由 1+2N 条查询逐用户算出（循环里 SumUserUsedTokens +
+// ListAccessKeysByUser，后者为取计数把每把密钥的完整行读进内存）。改成
+// 两条批量查询之后，逐个用户的结果必须仍然对得上 —— 一旦口径漂了，
+// 界面上就是「显示已用 0 / 实际被拦」这类最难解释的差异。
+func TestListUsers_ReportsUsedTokensAndKeyCounts(t *testing.T) {
+	st := newScopeStore(t)
+	h := NewUserHandler(st, newTestManager(t))
+	ctx := t.Context()
+
+	for _, id := range []string{"u1", "u2", "u3"} {
+		if err := st.CreateUser(ctx, &store.User{
+			ID: id, Username: id, PasswordHash: "x",
+			Role: store.RoleUser, Status: store.UserStatusActive, AuthVersion: 1,
+		}); err != nil {
+			t.Fatalf("create %s: %v", id, err)
+		}
+	}
+	for _, k := range []struct{ id, user string }{
+		{"k1", "u1"}, {"k2", "u1"}, {"k3", "u2"},
+	} {
+		if err := st.CreateAccessKey(ctx, &store.AccessKey{
+			ID: k.id, UserID: k.user, Name: k.id, KeyHash: "h-" + k.id, Enabled: true,
+		}); err != nil {
+			t.Fatalf("create key %s: %v", k.id, err)
+		}
+	}
+	seedUsageRow(t, st, "x1", "k1", "u1", 100)
+	seedUsageRow(t, st, "x2", "k2", "u1", 50)
+	seedUsageRow(t, st, "x3", "k3", "u2", 999)
+
+	rec := httptest.NewRecorder()
+	h.ListUsers(rec, asAdminID(jsonRequest(http.MethodGet, "/admin/api/users", nil), "boss"))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d body=%s, want 200", rec.Code, rec.Body.String())
+	}
+	var got []userResponse
+	decodeBody(t, rec, &got)
+
+	byID := map[string]userResponse{}
+	for _, u := range got {
+		byID[u.ID] = u
+	}
+	want := map[string]struct {
+		used int64
+		keys int
+	}{
+		"u1": {150, 2},
+		"u2": {999, 1},
+		"u3": {0, 0}, // 从未产生用量、也没有密钥：必须是 0 而不是空缺
+	}
+	for id, w := range want {
+		u, ok := byID[id]
+		if !ok {
+			t.Fatalf("%s 不在列表里", id)
+		}
+		if u.UsedTokens != w.used {
+			t.Errorf("%s used_tokens = %d，want %d", id, u.UsedTokens, w.used)
+		}
+		if u.KeyCount != w.keys {
+			t.Errorf("%s key_count = %d，want %d", id, u.KeyCount, w.keys)
+		}
+	}
+}

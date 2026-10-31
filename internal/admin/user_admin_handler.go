@@ -187,19 +187,26 @@ func (h *UserHandler) ListUsers(w http.ResponseWriter, r *http.Request) {
 		self = u.ID
 	}
 	out := make([]userResponse, 0, len(users))
+	// 已用量与密钥把数走**两条批量查询**，不再对每个用户各查两次。
+	//
+	// 循环里的 SumUserUsedTokens + ListAccessKeysByUser 是 1+2N 条查询，而
+	// 后者为了取一个计数把每把密钥的完整行（含 key_hash / key_enc）读进
+	// 内存 —— 既慢又读了不该读的列。用户数一多，打开本页就是几百条查询。
+	usedByUser, keysByUser, cerr := h.store.UserUsageCounts(ctx)
+	if cerr != nil {
+		// 保持与旧实现相同的降级口径：派生量取不到时**只退这一块**，
+		// 列表本身照常返回（已用量回落到导入快照，密钥数回落 0）。
+		usedByUser, keysByUser = nil, nil
+	}
 	for i := range users {
-		// 已用量走 SUM 而非读库里的 used_tokens：后者是导入时的快照，
-		// 与预检口径（SUM）不一致会让界面数字与实际拦截对不上。
-		used, uerr := h.store.SumUserUsedTokens(ctx, users[i].ID)
-		if uerr != nil {
+		// 已用量优先用累加列的批量结果（与配额预检同一个数据源），
+		// 取不到才回落到 users.used_tokens —— 后者是导入时的快照，
+		// 与预检口径不一致，只能当兜底。
+		used, ok := usedByUser[users[i].ID]
+		if !ok {
 			used = users[i].UsedTokens
 		}
-		keys, kerr := h.store.ListAccessKeysByUser(ctx, users[i].ID)
-		count := 0
-		if kerr == nil {
-			count = len(keys)
-		}
-		resp := toUserResponse(&users[i], self, count)
+		resp := toUserResponse(&users[i], self, keysByUser[users[i].ID])
 		resp.UsedTokens = used
 		out = append(out, resp)
 	}

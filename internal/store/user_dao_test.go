@@ -504,3 +504,61 @@ func TestCountUsers(t *testing.T) {
 }
 
 // ---- 无归属 key 的退役（2026-10-05 决策）----
+
+// TestUserUsageCounts_BatchMatchesPerUser 钉住批量派生量与逐用户查询的等价性。
+//
+// 用户列表原来对每个用户各查两次（已用量 + 密钥行），是典型的 1+2N；
+// 改成两条批量查询后，这两个数字必须**逐个对上** —— 一旦口径漂了，界面
+// 上就是「显示已用 0 / 实际被拦」这种最难解释的差异。
+func TestUserUsageCounts_BatchMatchesPerUser(t *testing.T) {
+	db := newStore(t)
+	ctx := context.Background()
+
+	for _, id := range []string{"u1", "u2", "u3"} { // u3 没有任何用量与密钥
+		if err := db.CreateUser(ctx, &User{ID: id, Username: id}); err != nil {
+			t.Fatalf("create %s: %v", id, err)
+		}
+	}
+	for _, k := range []struct{ id, user string }{
+		{"k1", "u1"}, {"k2", "u1"}, {"k3", "u2"},
+	} {
+		if err := db.CreateAccessKey(ctx, &AccessKey{
+			ID: k.id, UserID: k.user, Name: k.id, KeyHash: "h-" + k.id, Enabled: true,
+		}); err != nil {
+			t.Fatalf("create key %s: %v", k.id, err)
+		}
+	}
+	seedUsage(t, db, "x1", "k1", "u1", 100)
+	seedUsage(t, db, "x2", "k2", "u1", 50)
+	seedUsage(t, db, "x3", "k3", "u2", 999)
+	seedUsage(t, db, "x4", "k0", "", 7) // 无归属 key 的用量，不算到任何人头上
+
+	used, keys, err := db.UserUsageCounts(ctx)
+	if err != nil {
+		t.Fatalf("batch: %v", err)
+	}
+	for _, id := range []string{"u1", "u2", "u3"} {
+		wantUsed, err := db.SumUserUsedTokens(ctx, id)
+		if err != nil {
+			t.Fatalf("sum %s: %v", id, err)
+		}
+		if used[id] != wantUsed {
+			t.Errorf("%s 已用量 = %d，逐用户查询是 %d", id, used[id], wantUsed)
+		}
+		keyRows, err := db.ListAccessKeysByUser(ctx, id)
+		if err != nil {
+			t.Fatalf("list keys %s: %v", id, err)
+		}
+		if keys[id] != len(keyRows) {
+			t.Errorf("%s 密钥数 = %d，逐用户查询是 %d", id, keys[id], len(keyRows))
+		}
+	}
+	// 从未产生用量的用户不在这张表里（触发器只在插入明细时建行），
+	// 调用方按 0 处理 —— 这里把「不在表里」这个事实本身钉住。
+	if _, ok := used["u3"]; ok {
+		t.Error("u3 没有任何用量，不应出现在累加表里")
+	}
+	if _, ok := keys[""]; ok {
+		t.Log("无归属密钥计入空 id 桶，调用方不会读它")
+	}
+}
