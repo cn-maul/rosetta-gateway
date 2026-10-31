@@ -410,17 +410,25 @@ function targetRoutable(
   return !!p?.enabled && !!m
 }
 
+// 「这一行还不能上线」的原因。空串 = 没问题。
+//
+// 空 provider / 空模型是**尚未填完**，不是「上游不存在」：新建路由时第一行
+// 本来就是空白的，直接按查表落空来判会显示「上游不存在」——读起来像上游被
+// 删了，而实际上只是还没选。两者要分开：没填是提示（中性），填了却查不到
+// 才是异常（告警）。
 function targetIssue(
   providerMap: Record<string, RouteCatalogProvider>,
   mmap: Record<string, UpstreamModel>,
   providerId: string,
   modelId: string,
 ): string {
+  if (!providerId) return ''
   const p = providerMap[providerId]
-  const m = mmap[modelId]
   if (!p) return '上游不存在'
   if (!p.enabled) return '上游已停用'
   if (p.ready === false) return p.ready_reason || '上游凭据未就绪'
+  if (!modelId) return ''
+  const m = mmap[modelId]
   if (!m) return '上游模型不存在'
   if (typeof p.ready !== 'boolean') return '凭据状态未知'
   return ''
