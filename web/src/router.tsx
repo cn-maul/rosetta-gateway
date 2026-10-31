@@ -1,19 +1,20 @@
+import { lazy } from 'react'
 import { createHashRouter, Navigate, redirect, type LoaderFunctionArgs } from 'react-router-dom'
 import { isAdmin, loadSession, session } from './api'
 import { AppRoot, Splash } from './ui/AppRoot'
 import { Login } from './ui/Login'
 import { PasswordSetup } from './ui/PasswordSetup'
 import { Networks, networksLoader } from './pages/Networks'
-import { UsageStats } from './pages/UsageStats'
-import { Overview } from './pages/Overview'
-import { Models } from './pages/Models'
-import { Providers } from './pages/Providers'
-import { Routes } from './pages/Routes'
-import { ProviderDetail } from './pages/ProviderDetail'
-import { Settings } from './pages/Settings'
-import { AccessControl } from './pages/AccessControl'
-import { AccountSettings } from './pages/AccountSettings'
-import { Wallet } from './pages/Wallet'
+const UsageStats = lazy(() => import('./pages/UsageStats').then((m) => ({ default: m.UsageStats })))
+const Overview = lazy(() => import('./pages/Overview').then((m) => ({ default: m.Overview })))
+const Models = lazy(() => import('./pages/Models').then((m) => ({ default: m.Models })))
+const Providers = lazy(() => import('./pages/Providers').then((m) => ({ default: m.Providers })))
+const Routes = lazy(() => import('./pages/Routes').then((m) => ({ default: m.Routes })))
+const ProviderDetail = lazy(() => import('./pages/ProviderDetail').then((m) => ({ default: m.ProviderDetail })))
+const Settings = lazy(() => import('./pages/Settings').then((m) => ({ default: m.Settings })))
+const AccessControl = lazy(() => import('./pages/AccessControl').then((m) => ({ default: m.AccessControl })))
+const AccountSettings = lazy(() => import('./pages/AccountSettings').then((m) => ({ default: m.AccountSettings })))
+const Wallet = lazy(() => import('./pages/Wallet').then((m) => ({ default: m.Wallet })))
 
 export interface RouteHandle {
   title: string

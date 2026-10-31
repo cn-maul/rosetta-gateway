@@ -1,0 +1,1 @@
+var e=[{value:`chat`,label:`Chat`},{value:`response`,label:`Response`},{value:`anthropic`,label:`Anthropic`}],t={chat:`Chat`,response:`Response`,anthropic:`Anthropic`,auto:`Auto`};function n(e,n=`—`){return t[e]??(e||n)}export{n,e as t};

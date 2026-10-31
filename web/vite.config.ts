@@ -53,5 +53,27 @@ export default defineConfig({
     outDir: 'dist',
     emptyOutDir: true,
     sourcemap: false,
+    // 分包策略：入口只留应用外壳（Shell / 路由 / 主题 / 版本号），页面按路由懒加载，
+    // 第三方按「一起升级、一起失效」的边界切两块 —— 改业务代码时 vendor 缓存仍然有效。
+    // Vite 8 用 Rolldown 构建器，manualChunks 已废弃，对应写法是 codeSplitting.groups。
+    rolldownOptions: {
+      output: {
+        codeSplitting: {
+          groups: [
+            // React 运行时 + 路由：升级节奏与 UI 库无关，单独一块
+            {
+              name: 'react',
+              test: /node_modules[\\/](react|react-dom|scheduler|react-router|react-router-dom|@remix-run)[\\/]/,
+            },
+            // HeroUI 全家桶（含 react-aria / react-stately 底座）：体积最大、同批升级
+            {
+              name: 'heroui',
+              test: /node_modules[\\/](@heroui|@react-aria|@react-stately|@internationalized|react-aria|react-stately|@formatjs|intl-messageformat)[\\/]/,
+            },
+            // 其余第三方（lucide 图标等）交给默认自动分包，不硬捆成大块
+          ],
+        },
+      },
+    },
   },
 })

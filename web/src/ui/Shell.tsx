@@ -1,10 +1,11 @@
-import { useEffect, useRef, useState, useSyncExternalStore } from 'react'
+import { Suspense, useEffect, useRef, useState, useSyncExternalStore } from 'react'
 import { NavLink, Outlet, useLocation, useMatches, useNavigate } from 'react-router-dom'
 import { Avatar, Button, Dropdown, Label, toast } from '@heroui/react'
 import { LogOut, Moon, PanelLeft, Sun, UserRound } from 'lucide-react'
 import { ApiFail, isAdmin, logout, session } from '../api'
 import { useTheme } from './theme'
 import { ADMIN_NAV, USER_NAV, type NavGroup } from './nav'
+import { PageFallback } from './PageFallback'
 
 const COLLAPSE_KEY = 'rosetta_gw_sidebar_collapsed'
 
@@ -243,7 +244,10 @@ export function Shell() {
 
         <main ref={contentRef} className="min-h-0 flex-1 overflow-y-auto">
           <div className={useMatches().some((m) => (m.handle as { wide?: boolean } | null)?.wide) ? 'p-gutter' : 'mx-auto max-w-app p-gutter'}>
-            <Outlet />
+            {/* 路由级懒加载：页面 chunk 到齐前先铺骨架，内容区不会空白 */}
+            <Suspense fallback={<PageFallback />}>
+              <Outlet />
+            </Suspense>
           </div>
         </main>
       </div>
