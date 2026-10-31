@@ -93,10 +93,20 @@ export function Routes() {
   const modelsOf = (providerId: string): UpstreamModel[] =>
     Object.values(mmap).filter((m) => m.provider_id === providerId)
 
-  // 兜底：外键悬空时至少显示路由自身信息
+  // 兜底：外键悬空时至少显示路由自身信息。
+  //
+  // display_name 与 model_id 多数时候只差大小写（「GLM-5.3-Flash」vs
+  // 「glm-5.3-flash」），无条件拼成 `名字 (id)` 只是把同一个词排两遍。只有
+  // 两者确实不同（例如显示名取了中文别名）时才值得并排给出。
   const modelLabel = (r: RouteCatalogEntry): string => {
     const m = mmap[r.upstream_model_id]
-    if (m) return m.display_name ? `${m.display_name} (${m.model_id})` : m.model_id
+    if (m) {
+      const shown = (m.display_name ?? '').trim()
+      if (shown && shown.toLowerCase() !== m.model_id.toLowerCase()) {
+        return `${shown} (${m.model_id})`
+      }
+      return m.model_id
+    }
     return r.upstream_model_id
   }
 
@@ -745,8 +755,10 @@ function RouteEditor({
                               <SelectPopover>
                                 <ListBox aria-label="上游服务">
                                   {providers.map((p) => (
+                                    // 只写名字：slug 会自动生成（未填就是 "provider"），
+                                    // 与名字并列时多半只是把同一串再写一遍。
                                     <ListBoxItem key={p.id} id={p.id}>
-                                      {p.name} ({p.slug})
+                                      {p.name}
                                     </ListBoxItem>
                                   ))}
                                 </ListBox>
@@ -768,8 +780,12 @@ function RouteEditor({
                               <SelectPopover>
                                 <ListBox aria-label="上游模型">
                                   {modelsOf(t.provider_id).map((m) => (
+                                    // 只写真实模型名（model_id）：display_name 多数时候
+                                    // 与它只差大小写，`名字 (id)` 的写法等于把同一个值
+                                    // 排两遍。这里要选的是「转发给上游哪一个模型」，
+                                    // 该看的本来就是 id。
                                     <ListBoxItem key={m.id} id={m.id}>
-                                      {m.display_name ? `${m.display_name} (${m.model_id})` : m.model_id}
+                                      {m.model_id}
                                     </ListBoxItem>
                                   ))}
                                 </ListBox>
