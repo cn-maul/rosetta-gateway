@@ -12,6 +12,7 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/cn-maul/rosetta-gateway/internal/config"
 	"github.com/cn-maul/rosetta-gateway/internal/ingress"
@@ -193,7 +194,18 @@ func buildHarnessFull(t *testing.T, chain []struct {
 	snapshot.Init(snap)
 
 	rl := ratelimit.New()
-	return handleIngress(pool, cfg, newUsageRecorder(db, logger), rl, codec), db, pool
+	usageRec := newUsageRecorder(db, logger)
+	// Cleanup runs LIFO. Stop the usage worker before the store cleanup above
+	// closes SQLite; otherwise the worker can still be writing when TempDir
+	// removes the directory, which fails on Linux with "directory not empty".
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if !usageRec.Wait(ctx) {
+			t.Errorf("usage recorder did not drain before test cleanup")
+		}
+	})
+	return handleIngress(pool, cfg, usageRec, rl, codec), db, pool
 }
 
 func postChat(h http.HandlerFunc, model string) *httptest.ResponseRecorder {
