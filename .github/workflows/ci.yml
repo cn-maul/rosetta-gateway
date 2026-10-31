@@ -268,6 +268,16 @@ jobs:
       - name: 前端单测
         run: npm test
 
+      # 反手写存量门禁（2026-10-31，Vue 换血收尾）。
+      #
+      # 换血完成后，裸 <button>/<input>/<select>/<table>、新 CSS 文件、
+      # 旧类名引用都必须为 0。这类回退有个共同的坏性质：**能编译、能过
+      # 单测、界面上也看不出来**，只会在下一次有人改样式时才发现「为什么
+      # 这条按钮不吃主题」。tests/noHandWrittenPrimitives 覆盖的是 tsx 抽查
+      # 层面，这里是全量扫描（含手写 CSS 与旧类名），两档互补。
+      - name: 反手写存量门禁
+        run: node scripts/legacy-audit.mjs --gate
+
       - name: 构建前端并同步到 go:embed 目录
         run: |
           set -euo pipefail

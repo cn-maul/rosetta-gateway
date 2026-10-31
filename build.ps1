@@ -10,6 +10,7 @@ build.ps1 — rosetta-gateway 纯编译脚本（只构建，不启动）
   .\build.ps1 -NoWeb         # 跳过前端，用现有 internal\webui\dist 编译 Go
   .\build.ps1 -SkipInstall   # 已装过依赖时跳过 npm install
   .\build.ps1 -Typecheck     # 前端构建前先跑 tsc --noEmit
+  .\build.ps1 -Audit         # 前端构建前跑反手写存量门禁（裸原语/手写 CSS/旧类名必须为 0）
   .\build.ps1 -Vet           # Go 编译前先跑 go vet ./...
   .\build.ps1 -Out ..\x\g.exe # 自定义产物路径（默认 bin\gateway.exe）
 #>
@@ -17,6 +18,7 @@ param(
   [switch]$NoWeb,
   [switch]$SkipInstall,
   [switch]$Typecheck,
+  [switch]$Audit,
   [switch]$Vet,
   [string]$Out = ""
 )
@@ -70,6 +72,11 @@ if ($NoWeb) {
     if ($Typecheck) {
       Write-Host "-> 类型检查（tsc）..."
       Invoke-Native { npm run typecheck } "类型检查失败"
+    }
+
+    if ($Audit) {
+      Write-Host "-> 反手写存量门禁（legacy-audit --gate）..."
+      Invoke-Native { node scripts/legacy-audit.mjs --gate } "反手写存量门禁未通过"
     }
 
     Write-Host "-> 构建管理界面（vite build）..."
