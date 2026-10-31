@@ -586,7 +586,7 @@ export function ProviderDetail() {
       ) : null}
 
       <ProviderEditModal
-        provider={provider!}
+        provider={provider}
         open={editOpen && !!provider}
         networks={networks}
         onClose={() => setEditOpen(false)}

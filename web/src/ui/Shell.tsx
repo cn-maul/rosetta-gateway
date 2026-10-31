@@ -161,19 +161,7 @@ export function Shell() {
         </nav>
 
         <div className="border-separator border-t px-2 py-3">
-          <NavLink
-            to="/account"
-            title={railCollapsed ? '账号设置' : undefined}
-            aria-label="账号设置"
-            className={
-              'flex items-center gap-2.5 rounded-lg px-2.5 py-2 text-sm text-muted hover:bg-surface-secondary/60 hover:text-foreground ' +
-              (railCollapsed ? 'justify-center' : '')
-            }
-          >
-            <UserRound size={18} strokeWidth={1.75} aria-hidden />
-            {!railCollapsed && <span>账号设置</span>}
-          </NavLink>
-          <div className={'flex items-center gap-1 px-2.5 pt-2 ' + (railCollapsed ? 'flex-col' : 'justify-between')}>
+          <div className={'flex items-center gap-1 px-2.5 ' + (railCollapsed ? 'flex-col' : 'justify-between')}>
             <span className={railCollapsed ? 'hidden' : 'text-muted text-[10.5px]'}>
               v{__APP_VERSION__} · rosetta {__ROSETTA_VERSION__}
             </span>
@@ -216,11 +204,20 @@ export function Shell() {
                   </Button>
                 </Dropdown.Trigger>
                 <Dropdown.Popover>
-                  <Dropdown.Menu onAction={(key) => key === 'logout' && void doLogout()}>
+                  <Dropdown.Menu
+                    onAction={(key) => {
+                      if (key === 'account') void navigate({ pathname: '/account' })
+                      else if (key === 'logout') void doLogout()
+                    }}
+                  >
                     <Dropdown.Item id="who" textValue={me.username}>
                       <Label>
                         {me.username}（{me.role === 'admin' ? '管理员' : '普通用户'}）
                       </Label>
+                    </Dropdown.Item>
+                    <Dropdown.Item id="account" textValue="账号设置">
+                      <UserRound size={14} aria-hidden />
+                      <Label>账号设置</Label>
                     </Dropdown.Item>
                     <Dropdown.Item id="logout" textValue="退出登录">
                       <LogOut size={14} aria-hidden />

@@ -36,7 +36,10 @@ export function ProviderEditModal({
   networks,
   onSaved,
 }: {
-  provider: Provider
+  // 允许传 null：主文件在 provider 还没加载出来时就渲染了这个弹窗（open 为
+  // false）。渲染期必须能在没有 provider 的情况下安全返回，否则点「配置」
+  // 会在首次加载的瞬间读到 null.name 把整页炸掉。
+  provider: Provider | null
   open: boolean
   onClose: () => void
   networks: Network[]
@@ -52,7 +55,7 @@ export function ProviderEditModal({
   const [saving, setSaving] = useState(false)
 
   useEffect(() => {
-    if (!open) return
+    if (!open || !provider) return
     setName(provider.name)
     setProtocol(provider.protocol || 'chat')
     setEndpoint(provider.endpoint)
@@ -61,6 +64,10 @@ export function ProviderEditModal({
     setNetworkId(provider.network_id || NETWORK_DIRECT_ID)
     setBalanceSpec(provider.balance_spec_json)
   }, [open, provider])
+
+  // 没有 provider 就没有表单可填 —— 直接不渲染。所有 hook 已在此之上调用完毕，
+  // 提前返回不会破坏 hook 顺序。
+  if (!provider) return null
 
   // dirty 是「保存」按钮的启用条件。表单里存字符串、比较时按提交口径解析，
   // 两边必须同一套换算（秒 ↔ 毫秒、Number() 的 0 兜底）。

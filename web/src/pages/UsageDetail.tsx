@@ -390,107 +390,109 @@ export function UsageDetail({ days }: { days: number }) {
         toolbar={toolbar}
         footer={footer}
       >
-        <Table.ScrollContainer>
-          <Table.Content aria-label="请求日志" className="min-w-[1490px] text-[13px]">
-            <Table.Header>
-              <Table.Column isRowHeader>时间</Table.Column>
-              <Table.Column>模式</Table.Column>
-              <Table.Column>协议</Table.Column>
-              <Table.Column>请求 IP</Table.Column>
-              <Table.Column>上游</Table.Column>
-              <Table.Column>模型</Table.Column>
-              <Table.Column>密钥</Table.Column>
-              <Table.Column>Token 用量</Table.Column>
-              <Table.Column>速度</Table.Column>
-              <Table.Column>时间</Table.Column>
-              <Table.Column>费用</Table.Column>
-              <Table.Column>状态</Table.Column>
-            </Table.Header>
-            <Table.Body>
-              {rows.map((h, i) => (
-                <Table.Row key={h.ts + ':' + i}>
-                  <Table.Cell>
-                    <span className="font-mono">{fmtTimeMs(h.ts)}</span>
-                  </Table.Cell>
-                  <Table.Cell>
-                    <StatusChip tone={h.stream ? 'info' : 'dim'}>{h.stream ? '流式' : '非流式'}</StatusChip>
-                  </Table.Cell>
-                  <Table.Cell>
-                    <span title={`上游协议：${protocolLabel(h.upstream_protocol, '未记录')}；入站协议：${protocolLabel(h.ingress_protocol, '未记录')}`} className="flex flex-col gap-0.5 text-[11.5px]">
-                      <span className="flex gap-1.5">
-                        <span className="text-muted">上游</span>
-                        <span className="font-mono">{protocolLabel(h.upstream_protocol, '未记录')}</span>
+        <Table aria-label="请求日志">
+          <Table.ScrollContainer>
+            <Table.Content className="min-w-[1490px] text-[13px]">
+              <Table.Header>
+                <Table.Column isRowHeader>时间</Table.Column>
+                <Table.Column>模式</Table.Column>
+                <Table.Column>协议</Table.Column>
+                <Table.Column>请求 IP</Table.Column>
+                <Table.Column>上游</Table.Column>
+                <Table.Column>模型</Table.Column>
+                <Table.Column>密钥</Table.Column>
+                <Table.Column>Token 用量</Table.Column>
+                <Table.Column>速度</Table.Column>
+                <Table.Column>时间</Table.Column>
+                <Table.Column>费用</Table.Column>
+                <Table.Column>状态</Table.Column>
+              </Table.Header>
+              <Table.Body>
+                {rows.map((h, i) => (
+                  <Table.Row key={h.ts + ':' + i}>
+                    <Table.Cell>
+                      <span className="font-mono">{fmtTimeMs(h.ts)}</span>
+                    </Table.Cell>
+                    <Table.Cell>
+                      <StatusChip tone={h.stream ? 'info' : 'dim'}>{h.stream ? '流式' : '非流式'}</StatusChip>
+                    </Table.Cell>
+                    <Table.Cell>
+                      <span title={`上游协议：${protocolLabel(h.upstream_protocol, '未记录')}；入站协议：${protocolLabel(h.ingress_protocol, '未记录')}`} className="flex flex-col gap-0.5 text-[11.5px]">
+                        <span className="flex gap-1.5">
+                          <span className="text-muted">上游</span>
+                          <span className="font-mono">{protocolLabel(h.upstream_protocol, '未记录')}</span>
+                        </span>
+                        <span className="flex gap-1.5">
+                          <span className="text-muted">下游</span>
+                          <span className="font-mono">{protocolLabel(h.ingress_protocol, '未记录')}</span>
+                        </span>
                       </span>
-                      <span className="flex gap-1.5">
-                        <span className="text-muted">下游</span>
-                        <span className="font-mono">{protocolLabel(h.ingress_protocol, '未记录')}</span>
+                    </Table.Cell>
+                    <Table.Cell>
+                      <span className="font-mono" title={h.request_ip || '未记录'}>{h.request_ip || '—'}</span>
+                    </Table.Cell>
+                    <Table.Cell>
+                      {parseRouteTrace(h.route_trace).length ? (
+                        <PathFlow entry={h} />
+                      ) : (
+                        <span title={upstreamNameTitle(h)} className="flex flex-col">
+                          <span>{upstreamName(h)}</span>
+                          {!h.provider_name && h.provider_id ? <span className="text-[11px] text-muted">名称未固化</span> : null}
+                        </span>
+                      )}
+                    </Table.Cell>
+                    <Table.Cell>
+                      <span className="flex flex-col">
+                        <span className="font-mono" title={h.public_model || '—'}>{h.public_model || '—'}</span>
+                        <span className="font-mono text-[11.5px] text-muted" title={h.upstream_model || '实际模型未记录'}>
+                          {h.upstream_model || '实际模型未记录'}
+                        </span>
                       </span>
-                    </span>
-                  </Table.Cell>
-                  <Table.Cell>
-                    <span className="font-mono" title={h.request_ip || '未记录'}>{h.request_ip || '—'}</span>
-                  </Table.Cell>
-                  <Table.Cell>
-                    {parseRouteTrace(h.route_trace).length ? (
-                      <PathFlow entry={h} />
-                    ) : (
-                      <span title={upstreamNameTitle(h)} className="flex flex-col">
-                        <span>{upstreamName(h)}</span>
-                        {!h.provider_name && h.provider_id ? <span className="text-[11px] text-muted">名称未固化</span> : null}
+                    </Table.Cell>
+                    <Table.Cell>
+                      <span title={h.key_name || h.key_id || '—'}>{h.key_name || h.key_id || '—'}</span>
+                    </Table.Cell>
+                    <Table.Cell>
+                      <span title={tokenTitle(h)} className="flex flex-col">
+                        <span className="tabular-nums">
+                          <span className="text-muted">新增输入</span> {fmtTokens(newInputTokens(h))} <span className="text-muted">|</span>{' '}
+                          <span className="text-muted">输出</span> {fmtTokens(h.output_tokens)}
+                        </span>
+                        <span className="text-[11px] text-muted">缓存命中 {fmtTokens(h.cached_tokens)}</span>
                       </span>
-                    )}
-                  </Table.Cell>
-                  <Table.Cell>
-                    <span className="flex flex-col">
-                      <span className="font-mono" title={h.public_model || '—'}>{h.public_model || '—'}</span>
-                      <span className="font-mono text-[11.5px] text-muted" title={h.upstream_model || '实际模型未记录'}>
-                        {h.upstream_model || '实际模型未记录'}
+                    </Table.Cell>
+                    <Table.Cell>{speedText(h)}</Table.Cell>
+                    <Table.Cell>
+                      <span title={timingTitle(h)} className="flex items-center gap-1.5 tabular-nums">
+                        <span className={h.ttfb_ms <= 0 ? 'text-muted' : h.ttfb_ms <= 5000 ? 'text-success' : h.ttfb_ms <= 10000 ? 'text-warning' : 'text-danger'}>
+                          {h.ttfb_ms > 0 ? fmtSec(h.ttfb_ms) : '—'}
+                        </span>
+                        <span className="text-muted">|</span>
+                        <span className={totalTimeTone(h)}>
+                          {h.latency_ms > 0 ? fmtSec(h.latency_ms) : '—'}
+                        </span>
                       </span>
-                    </span>
-                  </Table.Cell>
-                  <Table.Cell>
-                    <span title={h.key_name || h.key_id || '—'}>{h.key_name || h.key_id || '—'}</span>
-                  </Table.Cell>
-                  <Table.Cell>
-                    <span title={tokenTitle(h)} className="flex flex-col">
-                      <span className="tabular-nums">
-                        <span className="text-muted">新增输入</span> {fmtTokens(newInputTokens(h))} <span className="text-muted">|</span>{' '}
-                        <span className="text-muted">输出</span> {fmtTokens(h.output_tokens)}
-                      </span>
-                      <span className="text-[11px] text-muted">缓存命中 {fmtTokens(h.cached_tokens)}</span>
-                    </span>
-                  </Table.Cell>
-                  <Table.Cell>{speedText(h)}</Table.Cell>
-                  <Table.Cell>
-                    <span title={timingTitle(h)} className="flex items-center gap-1.5 tabular-nums">
-                      <span className={h.ttfb_ms <= 0 ? 'text-muted' : h.ttfb_ms <= 5000 ? 'text-success' : h.ttfb_ms <= 10000 ? 'text-warning' : 'text-danger'}>
-                        {h.ttfb_ms > 0 ? fmtSec(h.ttfb_ms) : '—'}
-                      </span>
-                      <span className="text-muted">|</span>
-                      <span className={totalTimeTone(h)}>
-                        {h.latency_ms > 0 ? fmtSec(h.latency_ms) : '—'}
-                      </span>
-                    </span>
-                  </Table.Cell>
-                  <Table.Cell>¥{fmtMoney(h.cost)}</Table.Cell>
-                  <Table.Cell>
-                    <Button
-                      variant="ghost"
-                      size="sm"
-                      aria-label={'查看' + statusLabel(h.status) + '请求详情'}
-                      onPress={() => setSelected(h)}
-                    >
-                      <span title={statusHint(h) + ' · 点击查看完整详情'} className="flex items-center gap-2">
-                        <StatusChip tone={statusTone(h.status)}>{statusLabel(h.status)}</StatusChip>
-                        {h.http_status > 0 ? <span className="text-[11px] text-muted">HTTP {h.http_status}</span> : null}
-                      </span>
-                    </Button>
-                  </Table.Cell>
-                </Table.Row>
-              ))}
-            </Table.Body>
-          </Table.Content>
-        </Table.ScrollContainer>
+                    </Table.Cell>
+                    <Table.Cell>¥{fmtMoney(h.cost)}</Table.Cell>
+                    <Table.Cell>
+                      <Button
+                        variant="ghost"
+                        size="sm"
+                        aria-label={'查看' + statusLabel(h.status) + '请求详情'}
+                        onPress={() => setSelected(h)}
+                      >
+                        <span title={statusHint(h) + ' · 点击查看完整详情'} className="flex items-center gap-2">
+                          <StatusChip tone={statusTone(h.status)}>{statusLabel(h.status)}</StatusChip>
+                          {h.http_status > 0 ? <span className="text-[11px] text-muted">HTTP {h.http_status}</span> : null}
+                        </span>
+                      </Button>
+                    </Table.Cell>
+                  </Table.Row>
+                ))}
+              </Table.Body>
+            </Table.Content>
+          </Table.ScrollContainer>
+        </Table>
       </DataTable>
       <UsageDetailDrawer entry={selected} onClose={() => setSelected(null)} />
     </div>
