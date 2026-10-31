@@ -51,10 +51,17 @@ typecheck / 51 tests / build / legacy-audit / Go 三项嵌入守护全绿。剩�
 1. **浏览器手工走查**（唯一没做过的验证）：`cd web && npm run dev`（`/admin/api` 代理到
    `bin/config.json` 的网关端口，需先起 `bin/gateway.exe`）。重点看：路由懒加载首屏骨架、偏好在刷新后
    是否保留、深链 `?tab=` / `?model=` / `?range=` / `?days=` / `?size=`、暗色切换、401 静默、登出
-2. **CI / build.ps1 接 `legacy-audit --gate`**（白名单 2 处需在脚本注释里写明为什么留）
+2. ~~CI / build.ps1 接 `legacy-audit --gate`~~（已做：`.github/workflows/ci.yml` 的 webui-sync job
+   与 `build.ps1 -Audit`）
 3. **文档收口**：本文件、方案 §7「实际结果」、`AGENTS.md`、`DESIGN.md`
 4. **XERJ 重建索引**：`%LOCALAPPDATA%\Programs\xerj\xerj-index.ps1 .`
 5. **合并彩排与发布**（§12.5）：rebase main → 全量 `go test ./...` → 二进制冒烟 → 合并
+   （彩排已过：`main...feat/react-rewrite` 为 `0 35` 且 `git merge-tree` 无冲突；等手工走查后推）
+
+**后端那一侧**：前端收尾期间做过一轮接口审计（缺陷 / 可合并 / 性能）—— 13 条已修，另有若干条
+判定「不是 bug」与「刻意不做」，全部记录在 `docs/api-audit-2026-10-31.md`。落地在独立分支
+`fix/api-audit-p0`（14 个提交，未推送、未合回 main）。发布时两条分支要对齐：后端那支的 API
+改动已同步改完前端（四个 `by-*` 统一成 `{records, total}`）。
 
 ## 4. 每页重建的标准模式
 
