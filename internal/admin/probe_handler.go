@@ -232,12 +232,24 @@ func (h *ProbeHandler) Timeline(w http.ResponseWriter, r *http.Request) {
 		days = n
 	}
 	bucketMs := int64(3600 * 1000) // 默认按小时
-	if g := r.URL.Query().Get("granularity"); g == "day" {
+	byDay := r.URL.Query().Get("granularity") == "day"
+	if byDay {
 		bucketMs = int64(24 * 3600 * 1000)
 	}
 
+	// 窗口口径（2026-10-31 修，审计 #4）：桶按**本地时区**切分（见
+	// store.probeBucket），所以天粒度必须从「本地日界」起算 —— 否则
+	// 滚动 now-days*24h 会把首尾两天切成半个桶，而前端按「最近 N 天」
+	// 画 N 根柱子，首尾那两根就成了不完整的一天。小时粒度保持滚动窗口
+	// （前端就是按「最近 days*24 小时」铺格子的，整点对齐已经天然成立）。
 	now := time.Now().UnixMilli()
 	from := now - int64(days)*24*3600*1000
+	if byDay {
+		today := time.Now()
+		first := time.Date(today.Year(), today.Month(), today.Day(), 0, 0, 0, 0, time.Local).
+			AddDate(0, 0, -(days - 1))
+		from = first.UnixMilli()
+	}
 	buckets, err := h.store.ProbeTimeline(r.Context(), modelIDs, from, now, bucketMs)
 	if err != nil {
 		writeServerError(w, "probe timeline", err)

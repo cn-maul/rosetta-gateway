@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"database/sql"
+	"fmt"
 	"strings"
 	"time"
 )
@@ -133,10 +134,43 @@ type ProbeTimelineBucket struct {
 	Latency int64  `json:"latency"` // 平均延迟（毫秒）
 }
 
+// probeBucket 描述一种探测分桶粒度：把 ts 归到**本地时区**的桶起点。
+//
+// 2026-10-31 修（后端接口审计 #4）：这里原先用 `(ts / ?) * ?`，即按 UTC
+// epoch 的整倍数分桶。小时桶在东八区恰好等于本地整点（偏移是整小时），
+// 天桶却是 UTC 午夜＝本地 08:00 —— 与全仓其余日界口径分叉（dayExpr、
+// usage_daily_rollups.day、前端 localDayKey 都是本地日界），于是「按天
+// 用量」与「按天探测」两张图上同一天会落在不同的桶里。
+//
+// 改法：用 strftime 的 'localtime' 取本地桶键（与 dayExpr 同一套时区语义，
+// 本地时区偏移/夏令时由 SQLite 自己算），再在 Go 侧把桶键解析回**本地**
+// 桶起点毫秒 —— 与 usageSourceRollupCols 里 bucket_ts 取「当天本地午夜」
+// 是同一个选法，两边可互相加总。
+type probeBucket struct {
+	expr   string // SQL 表达式：ts → 本地桶键（字符串）
+	layout string // 桶键的 Go 时间布局，用来解析回毫秒
+}
+
+// probeBucketFor 按请求的桶宽选出分桶粒度。只支持按小时与按天（管理面
+// /admin/api/probes/timeline 的 granularity 就这两种），其它宽度直接报错，
+// 而不是悄悄退回 UTC 整倍数分桶 —— 那正是这次要消除的偏差。
+func probeBucketFor(bucketMs int64) (probeBucket, error) {
+	switch {
+	case bucketMs >= 24*3600*1000:
+		return probeBucket{`strftime('%Y-%m-%d', ts / 1000, 'unixepoch', 'localtime')`, "2006-01-02"}, nil
+	case bucketMs >= 3600*1000:
+		return probeBucket{`strftime('%Y-%m-%d %H', ts / 1000, 'unixepoch', 'localtime')`, "2006-01-02 15"}, nil
+	}
+	return probeBucket{}, fmt.Errorf("不支持的分桶宽度 %dms：探测时间轴只支持按小时或按天（本地时区对齐）", bucketMs)
+}
+
 // ProbeTimeline 返回给定模型在 [from,to] 内按 bucketMs 分桶的连通率。
 //
 // 时间轴页按小时/天画曲线用。桶内没有探测记录的行**不返回**（前端断开
 // 折线），而不是填 0 —— 没探测 ≠ 全失败，两者必须可区分。
+//
+// 桶边界按**本地时区**对齐（见 probeBucket），返回的 Ts 是桶起点的毫秒
+// 时间戳：小时桶＝本地整点，天桶＝本地午夜。
 //
 // modelIDs 支持**多个**：一次查询覆盖用户勾选的若干模型，返回值带
 // ModelID 让前端分流。多模型时用 IN (...) 而不是循环逐个查 —— 前端
@@ -147,52 +181,66 @@ func (s *Store) ProbeTimeline(ctx context.Context, modelIDs []string, from, to, 
 	if len(modelIDs) == 0 {
 		return nil, nil
 	}
+	bucket, err := probeBucketFor(bucketMs)
+	if err != nil {
+		return nil, err
+	}
+	// 桶键是本地日期/小时串，按字符串排序即按时间排序，所以 ORDER BY bucket
+	// 与按毫秒排序等价（'2006-01-02' 与 '2006-01-02 15' 都是定宽零填充）。
+	const queryTail = `
+		   FROM model_probes
+		  WHERE `
 	var (
 		rows *sql.Rows
-		err  error
+		qerr error
 	)
 	// 单个模型：等值比较（索引最左前缀）。
 	if len(modelIDs) == 1 {
-		rows, err = s.read.QueryContext(ctx,
-			`SELECT model_id, (ts / ?) * ? AS bucket, COUNT(*), SUM(ok), AVG(latency_ms)
-			   FROM model_probes
-			  WHERE model_id = ? AND ts >= ? AND ts <= ?
+		rows, qerr = s.read.QueryContext(ctx,
+			`SELECT model_id, `+bucket.expr+` AS bucket, COUNT(*), SUM(ok), AVG(latency_ms)`+
+				queryTail+`model_id = ? AND ts >= ? AND ts <= ?
 			  GROUP BY model_id, bucket ORDER BY model_id, bucket`,
-			bucketMs, bucketMs, modelIDs[0], from, to)
+			modelIDs[0], from, to)
 	} else {
 		// 多模型：IN 查询。占位符按 len(modelIDs) 拼，不能写成固定个数。
 		//
-		// 参数绑定顺序必须**逐字匹配占位符在 SQL 中出现的顺序**：
-		// SELECT 里的 bucketMs、bucketMs 先，然后 WHERE 里 model_id IN 的
-		// 各 id，最后才是 ts >= ? / ts <= ?。早先把 from,to 放在 id 前面，
-		// 导致时间值被绑给了 model_id 占位符，查询恒返回 0 行（且不报错，
-		// 因为「时间戳恰好等于某个模型 id」永远不成立，是静默的空结果）。
+		// 参数绑定顺序必须**逐字匹配占位符在 SQL 中出现的顺序**：WHERE 里
+		// model_id IN 的各 id 先，最后才是 ts >= ? / ts <= ?。早先把 from,to
+		// 放在 id 前面，导致时间值被绑给了 model_id 占位符，查询恒返回 0 行
+		// （且不报错，因为「时间戳恰好等于某个模型 id」永远不成立，是静默的
+		// 空结果）。
 		ph := strings.TrimSuffix(strings.Repeat("?,", len(modelIDs)), ",")
-		args := make([]any, 0, len(modelIDs)+4)
-		args = append(args, bucketMs, bucketMs)
+		args := make([]any, 0, len(modelIDs)+2)
 		for _, id := range modelIDs {
 			args = append(args, id)
 		}
 		args = append(args, from, to)
-		rows, err = s.read.QueryContext(ctx,
-			`SELECT model_id, (ts / ?) * ? AS bucket, COUNT(*), SUM(ok), AVG(latency_ms)
-			   FROM model_probes
-			  WHERE model_id IN (`+ph+`) AND ts >= ? AND ts <= ?
+		rows, qerr = s.read.QueryContext(ctx,
+			`SELECT model_id, `+bucket.expr+` AS bucket, COUNT(*), SUM(ok), AVG(latency_ms)`+
+				queryTail+`model_id IN (`+ph+`) AND ts >= ? AND ts <= ?
 			  GROUP BY model_id, bucket ORDER BY model_id, bucket`,
 			args...)
 	}
-	if err != nil {
-		return nil, err
+	if qerr != nil {
+		return nil, qerr
 	}
 	defer rows.Close()
 
 	out := make([]ProbeTimelineBucket, 0)
 	for rows.Next() {
-		var b ProbeTimelineBucket
-		var avg sql.NullFloat64
-		if err := rows.Scan(&b.ModelID, &b.Ts, &b.Count, &b.OK, &avg); err != nil {
+		var (
+			b   ProbeTimelineBucket
+			key string
+			avg sql.NullFloat64
+		)
+		if err := rows.Scan(&b.ModelID, &key, &b.Count, &b.OK, &avg); err != nil {
 			return nil, err
 		}
+		start, err := time.ParseInLocation(bucket.layout, key, time.Local)
+		if err != nil {
+			return nil, fmt.Errorf("解析探测分桶键 %q: %w", key, err)
+		}
+		b.Ts = start.UnixMilli()
 		if avg.Valid {
 			b.Latency = int64(avg.Float64)
 		}

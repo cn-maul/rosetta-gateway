@@ -272,8 +272,15 @@ func TestProbeTimeline_FrontendJSONContract(t *testing.T) {
 		t.Fatalf("wrong model_id: %s", rows[0]["model_id"])
 	}
 	var ts int64
-	if err := json.Unmarshal(rows[0]["ts"], &ts); err != nil || ts <= 0 || ts%3600000 != 0 {
-		t.Fatalf("want hour-aligned millisecond timestamp, got %s", rows[0]["ts"])
+	if err := json.Unmarshal(rows[0]["ts"], &ts); err != nil || ts <= 0 {
+		t.Fatalf("want millisecond timestamp, got %s", rows[0]["ts"])
+	}
+	// 桶必须落在**本地整点**上（不是 UTC 整倍数 —— 半小时偏移的时区里两者
+	// 不同，见 store.probeBucket 的说明）。本机时区下两者恰好重合，但断言
+	// 写成「本地整点」才是这条契约的真意。
+	if b := time.UnixMilli(ts).In(time.Local); b.Minute() != 0 || b.Second() != 0 || b.Nanosecond() != 0 {
+		t.Fatalf("want hour-aligned millisecond timestamp, got %s (%s)",
+			rows[0]["ts"], b.Format(time.RFC3339))
 	}
 	for key, want := range map[string]int64{"count": 1, "ok": 1, "latency": 12} {
 		var got int64
