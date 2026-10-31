@@ -26,10 +26,10 @@ func TestBuildApp_RegistersEveryCataloguedRoute(t *testing.T) {
 		usage: newUsageRecorder(db, discardLogger()),
 	})
 
-	// 112 是当前真实生产契约（含 5 条 /admin/api/ 方法兜底与 3 条 /v1
+	// 115 是当前真实生产契约（含 5 条 /admin/api/ 方法兜底与 3 条 /v1
 	// 子树兜底）。端点增删必须显式更新这个数，不能靠测试里手抄第三份清单。
-	if len(app.Routes) != 112 {
-		t.Fatalf("生产路由契约应为 112 条，实际 %d 条", len(app.Routes))
+	if len(app.Routes) != 115 {
+		t.Fatalf("生产路由契约应为 115 条，实际 %d 条", len(app.Routes))
 	}
 	seen := make(map[string]registeredRoute)
 	for _, r := range app.Routes {
@@ -59,6 +59,10 @@ func TestBuildApp_RegistersEveryCataloguedRoute(t *testing.T) {
 		"GET /admin/api/usage/history.csv",
 		"PUT /admin/api/routes/{id}/targets",
 		"POST /admin/api/config-export/export",
+		// 站点品牌：GET 免鉴权（登录页用），PUT 管理员。
+		"GET /admin/api/site", "PUT /admin/api/site",
+		// 协议探测：创建上游之前先问「这个中转支持哪几种协议」。
+		"POST /admin/api/providers/probe-protocols",
 	}
 	for _, pattern := range required {
 		if _, ok := seen[pattern]; !ok {
@@ -74,6 +78,9 @@ func TestBuildApp_RegistersEveryCataloguedRoute(t *testing.T) {
 		"POST /admin/api/bootstrap":            true,
 		"POST /admin/api/password-setup/check": true,
 		"POST /admin/api/password-setup":       true,
+		// 站点品牌 GET 必须免鉴权：登录页在拿到会话之前就要渲染站名/LOGO，
+		// 要求带凭据才能取品牌是死循环。它只回名称与 LOGO。
+		"GET /admin/api/site": true,
 	}
 	for pattern, wantPublic := range public {
 		if got := seen[pattern].Public; got != wantPublic {

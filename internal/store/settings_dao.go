@@ -207,3 +207,50 @@ func (s *Store) SetRuntimeDefaults(ctx context.Context, d RuntimeDefaults) error
 	}
 	return s.setSetting(ctx, settingRuntimeDefaultsKey, string(b))
 }
+
+// settingSiteKey 是「站点品牌」（站点名称 + LOGO）的 app_settings 键。
+//
+// 为什么不复用 settingRuntimeDefaultsKey：那一块是**转发路径**的运行时默认，
+// 每个字段都参与快照构建；品牌只是展示层数据，混进去会让「保存设置」这个
+// 动作把两个毫无关系的失效面绑在一起（品牌写坏了不该影响转发）。
+const settingSiteKey = "site_branding"
+
+// SiteBranding 是可热改的站点品牌（站点名称 + LOGO）。
+//
+// 单独一张表不值得，而 app_settings 的 value 是 JSON，正好容纳两个字段。
+// 两个字段都用空串表示「未配置」，由前端回落到默认名/首字母方块 ——
+// 后端不替前端决定默认文案，否则改默认名要发版。
+type SiteBranding struct {
+	Name string `json:"name"`
+	Logo string `json:"logo"`
+}
+
+// GetSiteBranding 返回站点品牌；未配置或存储损坏都返回零值 + nil error。
+//
+// 容错口径与 GetRuntimeDefaults 一致而不是与 GetModelDefaults 一致：这个
+// 值只驱动登录页与侧边栏的展示。让它返回 error 的后果是**登录页整体挂掉**
+// —— 为了一个 LOGO 把唯一的登入口打不开，是典型的小问题放大成事故。
+// 损坏时回落到「未配置」，前端照样能渲染默认品牌。
+func (s *Store) GetSiteBranding(ctx context.Context) (SiteBranding, error) {
+	var b SiteBranding
+	raw, ok, err := s.getSetting(ctx, settingSiteKey)
+	if err != nil || !ok {
+		return b, err
+	}
+	if err := json.Unmarshal([]byte(raw), &b); err != nil {
+		return SiteBranding{}, nil
+	}
+	return b, nil
+}
+
+// SetSiteBranding 覆盖写入站点品牌。
+//
+// 不做 read-modify-write：两个字段永远一起由 PUT 全量提交，分开读改写
+// 只会多出一个「并发保存互相覆盖中间态」的窗口。
+func (s *Store) SetSiteBranding(ctx context.Context, b SiteBranding) error {
+	raw, err := json.Marshal(b)
+	if err != nil {
+		return err
+	}
+	return s.setSetting(ctx, settingSiteKey, string(raw))
+}

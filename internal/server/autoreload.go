@@ -144,7 +144,14 @@ func AutoReload(next http.Handler, reload func(context.Context) error, audit Wri
 			return
 		}
 		p := r.URL.Path
-		if p == "/admin/api/reload" ||
+		// 只读探测一律不重建运行时：
+		//   - /test 与 /discover 是既有的连通性探测；
+		//   - /admin/api/providers/probe-protocols 是协议探测，它连 provider
+		//     都不需要存在（管理员在创建上游之前就要用它），更谈不上改配置。
+		// 漏掉这条的后果不是数据不一致，而是每次点「探测」都白跑一次池重建：
+		// 多一次开销、多一次失败机会（重建失败还会点亮 dirty 标志，让后台
+		// 兜底重试被一个与配置无关的探测请求触发）。
+		if p == "/admin/api/reload" || p == "/admin/api/providers/probe-protocols" ||
 			strings.HasSuffix(p, "/test") || strings.HasSuffix(p, "/discover") {
 			return
 		}

@@ -178,6 +178,10 @@ func BuildApp(d Deps) *App {
 	keyHandler := admin.NewKeyHandler(db, masterKey)
 	statsHandler := admin.NewStatsHandler(db)
 	settingsHandler := admin.NewSettingsHandler(db, cfg)
+	// 站点品牌（名称 + LOGO）。与 settingsHandler 分开：它的 GET 必须免鉴权
+	// —— 登录页在拿到会话之前就要渲染品牌，放在需要会话的 settings 里会让
+	// 登录页永远显示默认名。见 admin/site_handler.go 的注释。
+	siteHandler := admin.NewSiteHandler(db)
 	reloadHandler := admin.NewReloadHandler(reloader.Reload)
 	auditHandler := admin.NewAuditHandler(db)
 	usageHandler := admin.NewUsageHandler(db, cfg)
@@ -284,6 +288,12 @@ func BuildApp(d Deps) *App {
 		{Pattern: "PATCH /admin/api/providers/{id}", Handler: func(w http.ResponseWriter, r *http.Request) { providerHandler.Update(w, r, r.PathValue("id")) }, Public: false},
 		{Pattern: "DELETE /admin/api/providers/{id}", Handler: func(w http.ResponseWriter, r *http.Request) { providerHandler.Delete(w, r, r.PathValue("id")) }, Public: false},
 		{Pattern: "POST /admin/api/providers/{id}/test", Handler: func(w http.ResponseWriter, r *http.Request) { providerHandler.Test(w, r, r.PathValue("id")) }, Public: false},
+		// 协议探测：对同一个 endpoint 并发试 chat / response / anthropic 三条
+		// 路径，回答「这个中转支持哪几种协议」。与 {id}/test 不同，它不依赖
+		// 任何已配置的 provider —— 管理员在创建上游**之前**就要用。
+		// 纯读操作（只发探测请求，不改任何配置），因此明确不参与 AutoReload；
+		// 豁免在 internal/server/autoreload.go 里，理由见 handler 注释。
+		{Pattern: "POST /admin/api/providers/probe-protocols", Handler: providerHandler.ProbeProtocols, Public: false},
 		// 出站网络（2026-10-20）：代理地址的共享清单。直连不是一条记录，
 		// 而是保留 id store.NetworkDirectID，不在此处出现。
 		{Pattern: "GET /admin/api/networks", Handler: networkHandler.List, Public: false},
@@ -374,6 +384,13 @@ func BuildApp(d Deps) *App {
 		{Pattern: "POST /admin/api/usage/prune", Handler: usageHandler.Prune, Public: false},
 		{Pattern: "GET /admin/api/settings", Handler: settingsHandler.Get, Public: false},
 		{Pattern: "PUT /admin/api/settings", Handler: settingsHandler.Update, Public: false},
+		// 站点品牌。GET 必须免鉴权（Public: true → 挂免鉴权 mux，且额外挂到
+		// root mux 供登录页直接取）：登录页渲染发生在取得会话之前，要求带
+		// 凭据才能拿到站点名称是死循环。它只回名称与 LOGO，不涉及任何部署
+		// 细节 —— 见 admin/site_handler.go 的注释。
+		// PUT 需要管理员：改品牌等于改所有人（含未登录访客）看到的内容。
+		{Pattern: "GET /admin/api/site", Handler: siteHandler.Get, Public: true},
+		{Pattern: "PUT /admin/api/site", Handler: siteHandler.Update, Public: false},
 		// 供应商 + 模型的导入导出。admin-only 由 handler 内的 requireAdmin 把关
 		// —— 路径在 /admin/api/config- 前缀下，白名单管不到这里，而导出体里
 		// 可能含全部上游凭据，绝不能落到普通用户手里。

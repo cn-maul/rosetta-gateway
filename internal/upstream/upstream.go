@@ -1664,6 +1664,24 @@ func probeHTTPClientFor(proxyURL string, timeout time.Duration) (*http.Client, e
 	return &c, nil
 }
 
+// ProbeHTTPClientFor 供管理面做「协议探测」这类一次性探测用的 client。
+//
+// 为什么导出而不是让 admin 自己搓一个：出站网络（proxy）的 transport 参数
+// 必须与数据面逐字一致（见 proxyHTTPClientFor 的注释）—— 探测「这条 endpoint
+// 能不能走通」却用了另一套连接参数，结论就无法迁移到真实转发上，用户会看到
+// 「探测通过但请求失败」。
+//
+// 重定向策略直接沿用 probeHTTPClientFor 的 http.ErrUseLastResponse：探测请求
+// 携带 api_key，跟随跳转等于把凭据重发到响应头指定的任意地址（其中可能包含
+// 内网主机），所以宁可把 3xx 当作这条路径的真实状态码上报，也不跟跳。
+//
+// timeout 由调用方给（协议探测用 10s），不复用 balance 那套常量：单条探测的
+// 时间上限是编排层（三条并发 + 总超时）的事，写死在 transport 层会让两层超时
+// 打架。
+func ProbeHTTPClientFor(proxyURL string, timeout time.Duration) (*http.Client, error) {
+	return probeHTTPClientFor(proxyURL, timeout)
+}
+
 func buildClient(ctx context.Context, prov *ProviderEntry, apiKey string, cfg *config.Config, modelInfos ...rosetta.ModelInfo) (*rosetta.Client, error) {
 	opts := []rosetta.Option{
 		rosetta.WithEndpoint(prov.Endpoint),

@@ -274,6 +274,15 @@ export const DTO_CONTRACTS: readonly DTOFieldContract[] = [
     "username",
     "expires_at",
   ] },
+  { goType: "internal/admin.protocolProbeEntry", tsType: "ProtocolProbeEntry", fields: [
+    "protocol",
+    "ok",
+    "status",
+    "message",
+  ] },
+  { goType: "internal/admin.protocolProbeResult", tsType: "ProtocolProbeResult", fields: [
+    "results",
+  ] },
   { goType: "internal/admin.providerCreateRequest", tsType: "ProviderCreatePayload", fields: [
     "name",
     "protocol",
@@ -391,6 +400,10 @@ export const DTO_CONTRACTS: readonly DTOFieldContract[] = [
     "stream_first_token_timeout_ms",
     "failover_max_targets",
     "failover_failure_threshold",
+  ] },
+  { goType: "internal/admin.siteBrandingResponse", tsType: "SiteBranding", fields: [
+    "site_name",
+    "site_logo",
   ] },
   { goType: "internal/admin.statsOverviewResponse", tsType: "StatsOverview", fields: [
     "providers_total",

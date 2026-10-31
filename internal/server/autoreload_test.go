@@ -78,6 +78,14 @@ func TestAutoReload_TriggersOnSuccessfulWrite(t *testing.T) {
 	if reloads != 4 {
 		t.Fatalf("read-only probe endpoints must not trigger reload, got %d", reloads)
 	}
+
+	// 协议探测：路径既不以 /test 也不以 /discover 结尾，靠显式白名单豁免。
+	// 漏掉它的症状是「每点一次探测就白白重建一次运行时」，不会报错，
+	// 所以必须由测试钉住。
+	call(http.MethodPost, "/admin/api/providers/probe-protocols")
+	if reloads != 4 {
+		t.Fatalf("probe-protocols must not trigger reload, got %d", reloads)
+	}
 }
 
 // 审计回调在成功写操作上被调用，且只带字段名、不带请求体值。
