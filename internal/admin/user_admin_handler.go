@@ -267,7 +267,7 @@ func (h *UserHandler) CreateUser(w http.ResponseWriter, r *http.Request) {
 	}
 	var req createUserRequest
 	if err := decodeJSON(w, r, &req); err != nil {
-		if errors.Is(err, errUnsupportedMediaType) {
+		if decodeFailed(err) {
 			return
 		}
 		writeError(w, http.StatusBadRequest, "invalid JSON: "+err.Error())
@@ -388,7 +388,7 @@ func (h *UserHandler) UpdateUser(w http.ResponseWriter, r *http.Request, id stri
 
 	var req updateUserRequest
 	if err := decodeJSON(w, r, &req); err != nil {
-		if errors.Is(err, errUnsupportedMediaType) {
+		if decodeFailed(err) {
 			return
 		}
 		writeError(w, http.StatusBadRequest, "invalid JSON: "+err.Error())
@@ -542,7 +542,7 @@ func (h *UserHandler) ResetPassword(w http.ResponseWriter, r *http.Request, id s
 	}
 	var req resetPasswordRequest
 	if err := decodeJSON(w, r, &req); err != nil {
-		if errors.Is(err, errUnsupportedMediaType) {
+		if decodeFailed(err) {
 			return
 		}
 		writeError(w, http.StatusBadRequest, "invalid JSON: "+err.Error())
@@ -637,7 +637,7 @@ func (h *UserHandler) AdjustBalance(w http.ResponseWriter, r *http.Request, id s
 	}
 	var req adjustBalanceRequest
 	if err := decodeJSON(w, r, &req); err != nil {
-		if errors.Is(err, errUnsupportedMediaType) {
+		if decodeFailed(err) {
 			return
 		}
 		writeError(w, http.StatusBadRequest, "invalid JSON: "+err.Error())
@@ -859,7 +859,7 @@ func (h *UserHandler) ChangePassword(w http.ResponseWriter, r *http.Request) {
 	}
 	var req changePasswordRequest
 	if err := decodeJSON(w, r, &req); err != nil {
-		if errors.Is(err, errUnsupportedMediaType) {
+		if decodeFailed(err) {
 			return
 		}
 		writeError(w, http.StatusBadRequest, "invalid JSON: "+err.Error())

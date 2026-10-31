@@ -3,7 +3,6 @@ package admin
 import (
 	"crypto/sha256"
 	"encoding/hex"
-	"errors"
 	"net/http"
 	"strings"
 
@@ -187,7 +186,7 @@ func (h *KeyHandler) Create(w http.ResponseWriter, r *http.Request) {
 
 	var req keyRequest
 	if err := decodeJSON(w, r, &req); err != nil {
-		if errors.Is(err, errUnsupportedMediaType) {
+		if decodeFailed(err) {
 			return
 		}
 		writeError(w, http.StatusBadRequest, "invalid JSON: "+err.Error())
@@ -616,7 +615,7 @@ func (h *KeyHandler) Update(w http.ResponseWriter, r *http.Request, id string) {
 
 	var req keyRequest
 	if err := decodeJSON(w, r, &req); err != nil {
-		if errors.Is(err, errUnsupportedMediaType) {
+		if decodeFailed(err) {
 			return
 		}
 		writeError(w, http.StatusBadRequest, "invalid JSON: "+err.Error())

@@ -1,7 +1,6 @@
 package admin
 
 import (
-	"errors"
 	"fmt"
 	"net/http"
 
@@ -87,7 +86,7 @@ func (h *SettingsHandler) Get(w http.ResponseWriter, r *http.Request) {
 func (h *SettingsHandler) Update(w http.ResponseWriter, r *http.Request) {
 	var req settingsResponse
 	if err := decodeJSON(w, r, &req); err != nil {
-		if errors.Is(err, errUnsupportedMediaType) {
+		if decodeFailed(err) {
 			return
 		}
 		writeError(w, http.StatusBadRequest, "invalid JSON: "+err.Error())

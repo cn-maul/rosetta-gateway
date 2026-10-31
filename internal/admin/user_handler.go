@@ -1,7 +1,6 @@
 package admin
 
 import (
-	"errors"
 	"log/slog"
 	"net/http"
 	"strconv"
@@ -181,7 +180,7 @@ func (h *UserHandler) Login(w http.ResponseWriter, r *http.Request) {
 
 	var req loginRequest
 	if err := decodeJSON(w, r, &req); err != nil {
-		if errors.Is(err, errUnsupportedMediaType) {
+		if decodeFailed(err) {
 			return
 		}
 		writeError(w, http.StatusBadRequest, "invalid JSON: "+err.Error())
@@ -507,7 +506,7 @@ func (h *UserHandler) BootstrapSetup(w http.ResponseWriter, r *http.Request) {
 
 	var req bootstrapSetupRequest
 	if err := decodeJSON(w, r, &req); err != nil {
-		if errors.Is(err, errUnsupportedMediaType) {
+		if decodeFailed(err) {
 			return
 		}
 		writeError(w, http.StatusBadRequest, "invalid JSON: "+err.Error())

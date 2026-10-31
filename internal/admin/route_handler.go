@@ -84,7 +84,7 @@ func writeRouteWriteError(w http.ResponseWriter, action string, err error) {
 func (h *RouteHandler) Create(w http.ResponseWriter, r *http.Request) {
 	var req routeRequest
 	if err := decodeJSON(w, r, &req); err != nil {
-		if errors.Is(err, errUnsupportedMediaType) {
+		if decodeFailed(err) {
 			return
 		}
 		writeError(w, http.StatusBadRequest, "invalid JSON: "+err.Error())
@@ -157,7 +157,7 @@ func (h *RouteHandler) Update(w http.ResponseWriter, r *http.Request, id string)
 
 	var req routeRequest
 	if err := decodeJSON(w, r, &req); err != nil {
-		if errors.Is(err, errUnsupportedMediaType) {
+		if decodeFailed(err) {
 			return
 		}
 		writeError(w, http.StatusBadRequest, "invalid JSON: "+err.Error())

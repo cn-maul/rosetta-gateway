@@ -1,7 +1,6 @@
 package admin
 
 import (
-	"errors"
 	"net/http"
 	"strconv"
 
@@ -81,7 +80,7 @@ func (h *RouteTargetHandler) Replace(w http.ResponseWriter, r *http.Request, rou
 
 	var req replaceTargetsRequest
 	if err := decodeJSON(w, r, &req); err != nil {
-		if errors.Is(err, errUnsupportedMediaType) {
+		if decodeFailed(err) {
 			return
 		}
 		writeError(w, http.StatusBadRequest, "invalid JSON: "+err.Error())

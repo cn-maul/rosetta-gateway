@@ -2,7 +2,6 @@ package admin
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"log/slog"
 	"net/http"
@@ -55,7 +54,7 @@ func (h *ConfigTransferHandler) Export(w http.ResponseWriter, r *http.Request) {
 	// 让调用方拿到的永远是同一句「必须设置加密口令」而不是 JSON 解析错误。
 	if r.ContentLength != 0 {
 		if err := decodeJSON(w, r, &req); err != nil {
-			if errors.Is(err, errUnsupportedMediaType) {
+			if decodeFailed(err) {
 				return
 			}
 			writeError(w, http.StatusBadRequest, "invalid JSON: "+err.Error())
@@ -221,7 +220,7 @@ func (h *ConfigTransferHandler) Import(w http.ResponseWriter, r *http.Request) {
 	}
 	var req importRequest
 	if err := decodeJSON(w, r, &req); err != nil {
-		if errors.Is(err, errUnsupportedMediaType) {
+		if decodeFailed(err) {
 			return
 		}
 		writeError(w, http.StatusBadRequest, "invalid JSON: "+err.Error())

@@ -145,6 +145,18 @@ func decodeJSON(w http.ResponseWriter, r *http.Request, v any) error {
 var errUnsupportedMediaType = errors.New("unsupported media type")
 var errRequestTooLarge = errors.New("request body too large")
 
+// decodeFailed 报告 decodeJSON 的这个错误**已经写过响应**，调用方只需 return。
+//
+// 两个哨兵都必须走这里判断：decodeJSON 自己写 415/413，调用方写 400
+// 「invalid JSON: ...」。少判一个的症状是响应体里出现**两个 JSON 串** ——
+// 413 信封后面紧跟一个 400 信封，客户端 res.json() 直接抛 SyntaxError，
+// 服务端日志刷 superfluous response.WriteHeader（ResponseWriter 只认第一次
+// WriteHeader，第二次只打日志）。测试若只断言 rec.Code 则看不出来：Code
+// 取的正是第一次写的 413。
+func decodeFailed(err error) bool {
+	return errors.Is(err, errUnsupportedMediaType) || errors.Is(err, errRequestTooLarge)
+}
+
 // isJSONContentType 报告请求的 Content-Type 是否是 JSON。
 //
 // 只认 application/json 与 application/*+json（RFC 6839 的结构化后缀），

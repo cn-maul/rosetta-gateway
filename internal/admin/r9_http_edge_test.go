@@ -2,6 +2,7 @@ package admin
 
 import (
 	"bytes"
+	"encoding/json"
 	"io"
 	"log/slog"
 	"net/http"
@@ -13,6 +14,31 @@ import (
 	"github.com/cn-maul/rosetta-gateway/internal/store"
 )
 
+// assertSingleErrorEnvelope 断言响应体是**恰好一个** error 信封。
+//
+// 只断言 rec.Code 会漏掉「413 之后再追加一个 400」这个 bug：Code 取的是
+// 第一次写的状态码，看起来完全正确，但 body 里是两个 JSON 串，客户端
+// res.json() 抛 SyntaxError。
+func assertSingleErrorEnvelope(t *testing.T, rec *httptest.ResponseRecorder, wantStatus int) {
+	t.Helper()
+	if rec.Code != wantStatus {
+		t.Fatalf("status=%d body=%s, want %d", rec.Code, rec.Body.String(), wantStatus)
+	}
+	dec := json.NewDecoder(bytes.NewReader(rec.Body.Bytes()))
+	var envelope apiErrorResponse
+	if err := dec.Decode(&envelope); err != nil {
+		t.Fatalf("响应体不是合法 JSON 错误信封: %v body=%q", err, rec.Body.String())
+	}
+	if envelope.Error.Message == "" {
+		t.Fatalf("错误信封没有 message: body=%q", rec.Body.String())
+	}
+	var extra json.RawMessage
+	if err := dec.Decode(&extra); err != io.EOF {
+		t.Fatalf("响应体在第一个错误信封之后还有内容（err=%v），说明又写了一次响应: body=%q",
+			err, rec.Body.String())
+	}
+}
+
 func TestR9_AdminDecodeMapsBodyOverflowTo413(t *testing.T) {
 	st := newTestStore(t)
 	h := NewGroupHandler(st)
@@ -22,9 +48,21 @@ func TestR9_AdminDecodeMapsBodyOverflowTo413(t *testing.T) {
 	rec := httptest.NewRecorder()
 
 	h.Create(rec, asAdmin(req))
-	if rec.Code != http.StatusRequestEntityTooLarge {
-		t.Fatalf("oversized admin body status=%d body=%s, want 413", rec.Code, rec.Body.String())
-	}
+	assertSingleErrorEnvelope(t, rec, http.StatusRequestEntityTooLarge)
+}
+
+// 415 走的是同一条「helper 已写过响应」路径，所以也必须在调用方 return，
+// 否则 415 后面会跟一个 400（decodeJSON 的哨兵被当成普通解析错误）。
+func TestR9_AdminDecodeMapsWrongContentTypeTo415Only(t *testing.T) {
+	st := newTestStore(t)
+	h := NewGroupHandler(st)
+	req := httptest.NewRequest(http.MethodPost, "/admin/api/groups",
+		strings.NewReader(`{"name":"x"}`))
+	req.Header.Set("Content-Type", "text/plain")
+	rec := httptest.NewRecorder()
+
+	h.Create(rec, asAdmin(req))
+	assertSingleErrorEnvelope(t, rec, http.StatusUnsupportedMediaType)
 }
 
 func TestR9_AuditLimitRejectsMalformedValue(t *testing.T) {

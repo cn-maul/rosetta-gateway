@@ -177,7 +177,7 @@ func (h *ProviderHandler) List(w http.ResponseWriter, r *http.Request) {
 func (h *ProviderHandler) Create(w http.ResponseWriter, r *http.Request) {
 	var req providerCreateRequest
 	if err := decodeJSON(w, r, &req); err != nil {
-		if errors.Is(err, errUnsupportedMediaType) {
+		if decodeFailed(err) {
 			return
 		}
 		writeError(w, http.StatusBadRequest, "invalid JSON: "+err.Error())
@@ -295,7 +295,7 @@ func (h *ProviderHandler) Update(w http.ResponseWriter, r *http.Request, id stri
 
 	var req providerUpdateRequest
 	if err := decodeJSON(w, r, &req); err != nil {
-		if errors.Is(err, errUnsupportedMediaType) {
+		if decodeFailed(err) {
 			return
 		}
 		writeError(w, http.StatusBadRequest, "invalid JSON: "+err.Error())

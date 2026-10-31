@@ -71,7 +71,7 @@ type networkRequest struct {
 func (h *NetworkHandler) Create(w http.ResponseWriter, r *http.Request) {
 	var req networkRequest
 	if err := decodeJSON(w, r, &req); err != nil {
-		if errors.Is(err, errUnsupportedMediaType) {
+		if decodeFailed(err) {
 			return
 		}
 		writeError(w, http.StatusBadRequest, "invalid JSON: "+err.Error())
@@ -102,7 +102,7 @@ func (h *NetworkHandler) Create(w http.ResponseWriter, r *http.Request) {
 func (h *NetworkHandler) Update(w http.ResponseWriter, r *http.Request, id string) {
 	var req networkRequest
 	if err := decodeJSON(w, r, &req); err != nil {
-		if errors.Is(err, errUnsupportedMediaType) {
+		if decodeFailed(err) {
 			return
 		}
 		writeError(w, http.StatusBadRequest, "invalid JSON: "+err.Error())

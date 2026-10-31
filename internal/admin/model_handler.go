@@ -255,7 +255,7 @@ func (h *ModelHandler) Create(w http.ResponseWriter, r *http.Request, providerID
 
 	var req modelRequest
 	if err := decodeJSON(w, r, &req); err != nil {
-		if errors.Is(err, errUnsupportedMediaType) {
+		if decodeFailed(err) {
 			return
 		}
 		writeError(w, http.StatusBadRequest, "invalid JSON: "+err.Error())
@@ -333,7 +333,7 @@ func (h *ModelHandler) Update(w http.ResponseWriter, r *http.Request, id string)
 
 	var req modelRequest
 	if err := decodeJSON(w, r, &req); err != nil {
-		if errors.Is(err, errUnsupportedMediaType) {
+		if decodeFailed(err) {
 			return
 		}
 		writeError(w, http.StatusBadRequest, "invalid JSON: "+err.Error())
@@ -485,7 +485,7 @@ type batchPriceRequest struct {
 func (h *ModelHandler) BatchUpdatePrices(w http.ResponseWriter, r *http.Request) {
 	var req batchPriceRequest
 	if err := decodeJSON(w, r, &req); err != nil {
-		if errors.Is(err, errUnsupportedMediaType) {
+		if decodeFailed(err) {
 			return
 		}
 		writeError(w, http.StatusBadRequest, "invalid JSON: "+err.Error())
@@ -799,7 +799,7 @@ func (h *ModelHandler) ImportModels(w http.ResponseWriter, r *http.Request, prov
 		Models []modelImportItem `json:"models"`
 	}
 	if err := decodeJSON(w, r, &body); err != nil {
-		if errors.Is(err, errUnsupportedMediaType) {
+		if decodeFailed(err) {
 			return
 		}
 		writeError(w, http.StatusBadRequest, "invalid JSON: "+err.Error())

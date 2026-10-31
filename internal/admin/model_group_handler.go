@@ -79,7 +79,7 @@ type modelGroupRequest struct {
 func (h *ModelGroupHandler) Create(w http.ResponseWriter, r *http.Request) {
 	var req modelGroupRequest
 	if err := decodeJSON(w, r, &req); err != nil {
-		if errors.Is(err, errUnsupportedMediaType) {
+		if decodeFailed(err) {
 			return
 		}
 		writeError(w, http.StatusBadRequest, "invalid JSON: "+err.Error())
@@ -105,7 +105,7 @@ func (h *ModelGroupHandler) Create(w http.ResponseWriter, r *http.Request) {
 func (h *ModelGroupHandler) Update(w http.ResponseWriter, r *http.Request, id string) {
 	var req modelGroupRequest
 	if err := decodeJSON(w, r, &req); err != nil {
-		if errors.Is(err, errUnsupportedMediaType) {
+		if decodeFailed(err) {
 			return
 		}
 		writeError(w, http.StatusBadRequest, "invalid JSON: "+err.Error())
@@ -172,7 +172,7 @@ type assignGroupRequest struct {
 func (h *ModelGroupHandler) AssignModels(w http.ResponseWriter, r *http.Request, id string) {
 	var req assignGroupRequest
 	if err := decodeJSON(w, r, &req); err != nil {
-		if errors.Is(err, errUnsupportedMediaType) {
+		if decodeFailed(err) {
 			return
 		}
 		writeError(w, http.StatusBadRequest, "invalid JSON: "+err.Error())
@@ -244,7 +244,7 @@ func (h *ModelGroupHandler) AssignModels(w http.ResponseWriter, r *http.Request,
 func (h *ModelGroupHandler) UnassignModels(w http.ResponseWriter, r *http.Request) {
 	var req assignGroupRequest
 	if err := decodeJSON(w, r, &req); err != nil {
-		if errors.Is(err, errUnsupportedMediaType) {
+		if decodeFailed(err) {
 			return
 		}
 		writeError(w, http.StatusBadRequest, "invalid JSON: "+err.Error())

@@ -105,7 +105,7 @@ func (h *UserHandler) CheckPasswordSetupLink(w http.ResponseWriter, r *http.Requ
 	}
 	var req passwordSetupCheckRequest
 	if err := decodeJSON(w, r, &req); err != nil {
-		if errors.Is(err, errUnsupportedMediaType) {
+		if decodeFailed(err) {
 			return
 		}
 		writeError(w, http.StatusBadRequest, "invalid JSON: "+err.Error())
@@ -148,7 +148,7 @@ func (h *UserHandler) CompletePasswordSetup(w http.ResponseWriter, r *http.Reque
 
 	var req passwordSetupCompleteRequest
 	if err := decodeJSON(w, r, &req); err != nil {
-		if errors.Is(err, errUnsupportedMediaType) {
+		if decodeFailed(err) {
 			return
 		}
 		writeError(w, http.StatusBadRequest, "invalid JSON: "+err.Error())
