@@ -148,7 +148,10 @@ function fmtDur(ms: number): string {
 export function Settings() {
   const [searchParams, setSearchParams] = useSearchParams()
   const rawTab = searchParams.get('tab')
-  const tab: TabKey = TABS.some((t) => t.key === rawTab) ? (rawTab as TabKey) : 'model'
+  // 没带 ?tab= 时落在第一个页签（站点）。其它页（用量与费用、钱包、用户与权限）
+  // 的默认值也都是各自列表的第一项；这里原来写死 'model'，于是点「设置」永远先
+  // 看到模型默认值，用户在地址栏里也看不出「站点」这一页存在。
+  const tab: TabKey = TABS.some((t) => t.key === rawTab) ? (rawTab as TabKey) : TABS[0].key
   const tabSub = TABS.find((t) => t.key === tab)?.sub ?? ''
   const setTab = (key: string) => {
     const next = new URLSearchParams(searchParams)
@@ -567,13 +570,16 @@ export function Settings() {
       />
 
       <Tabs aria-label="设置分区" selectedKey={tab} onSelectionChange={(key) => setTab(String(key))}>
-        <Tabs.List>
-          {TABS.map((t) => (
-            <Tabs.Tab key={t.key} id={t.key}>
-              {t.label}
-            </Tabs.Tab>
-          ))}
-        </Tabs.List>
+        <Tabs.ListContainer>
+          <Tabs.List>
+            {TABS.map((t) => (
+              <Tabs.Tab key={t.key} id={t.key}>
+                <Tabs.Indicator />
+                {t.label}
+              </Tabs.Tab>
+            ))}
+          </Tabs.List>
+        </Tabs.ListContainer>
         <Tabs.Panel id={tab}>
           {/* ---------- 分类 0：站点标识 ----------
               这部分不参与 PUT /settings 的全量保存（字段在另一张表），

@@ -102,13 +102,16 @@ export function UsageStats() {
           selectedKey={tab}
           onSelectionChange={(key) => setTab(String(key))}
         >
-          <Tabs.List>
-            {tabs.map((t) => (
-              <Tabs.Tab key={t.key} id={t.key}>
-                {t.label}
-              </Tabs.Tab>
-            ))}
-          </Tabs.List>
+          <Tabs.ListContainer>
+            <Tabs.List>
+              {tabs.map((t) => (
+                <Tabs.Tab key={t.key} id={t.key}>
+                  <Tabs.Indicator />
+                  {t.label}
+                </Tabs.Tab>
+              ))}
+            </Tabs.List>
+          </Tabs.ListContainer>
           <Tabs.Panel id={tab}>
             {tab === 'groups' && admin ? <ModelGroups /> : null}
             {tab === 'providers' ? (

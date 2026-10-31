@@ -305,13 +305,16 @@ export function Wallet() {
               if (key !== null) setTab(String(key) as 'usage' | 'topup')
             }}
           >
-            <Tabs.List>
-              {tabs.map((t) => (
-                <Tabs.Tab key={t.key} id={t.key}>
-                  {t.label}
-                </Tabs.Tab>
-              ))}
-            </Tabs.List>
+            <Tabs.ListContainer>
+              <Tabs.List>
+                {tabs.map((t) => (
+                  <Tabs.Tab key={t.key} id={t.key}>
+                    <Tabs.Indicator />
+                    {t.label}
+                  </Tabs.Tab>
+                ))}
+              </Tabs.List>
+            </Tabs.ListContainer>
             <Tabs.Panel id={tab}>
               {tab === 'usage' ? (
                 admin ? (

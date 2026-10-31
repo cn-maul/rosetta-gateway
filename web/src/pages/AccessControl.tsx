@@ -59,13 +59,16 @@ export function AccessControl() {
             if (key !== null) setTab(String(key) as TabKey)
           }}
         >
-          <Tabs.List>
-            {tabs.map((t) => (
-              <Tabs.Tab key={t.key} id={t.key}>
-                {t.label}
-              </Tabs.Tab>
-            ))}
-          </Tabs.List>
+          <Tabs.ListContainer>
+            <Tabs.List>
+              {tabs.map((t) => (
+                <Tabs.Tab key={t.key} id={t.key}>
+                  <Tabs.Indicator />
+                  {t.label}
+                </Tabs.Tab>
+              ))}
+            </Tabs.List>
+          </Tabs.ListContainer>
           <Tabs.Panel id={tab}>
             {tab === 'keys' ? <Keys /> : <UsersGroups tab={tab === 'users' ? 'users' : 'groups'} />}
           </Tabs.Panel>
