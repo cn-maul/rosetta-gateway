@@ -333,8 +333,8 @@ func TestSchema_CanonicalObjectsAndColumns(t *testing.T) {
 		"idx_route_targets_route",
 		"idx_route_targets_unique",
 		"idx_rollup_day",
-		"idx_rollup_user",
-		"idx_rollup_key",
+		"idx_rollup_user_day",
+		"idx_rollup_key_day",
 	}
 	for _, name := range requiredIndexes {
 		var typ string

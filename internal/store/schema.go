@@ -138,6 +138,39 @@ func (s *Store) ensureCompatibleSchema(ctx context.Context) error {
 		ON usage_records(usage_state, charge_next_at, ts)`); err != nil {
 		return fmt.Errorf("ensure usage charge retry index: %w", err)
 	}
+	// 2026-11-01 修审计 #5：归档表改成 (user_id, day) / (access_key_id, day)
+	// 复合索引。
+	//
+	// 归档支的谓词是「day 裸列区间 AND user_id 等值」（见 usage_source.go 的
+	// 交集规则注释）。只有单列索引时 SQLite 只能用其中一个：带上 user_id 就
+	// 走 idx_rollup_user 定位该用户的全部历史归档行，day 区间降级成残余过滤
+	// —— 用户的历史越长，这条越接近全扫。实测计划（同一 DDL、内存库）：
+	//
+	//	day 区间 + user_id ：SEARCH usage_daily_rollups USING INDEX idx_rollup_user (user_id=?)
+	//	改成复合索引      ：SEARCH usage_daily_rollups USING INDEX idx_rollup_user_day (user_id=? AND day>? AND day<?)
+	//
+	// 旧单列索引必须删掉：CREATE INDEX IF NOT EXISTS 不替换同名旧索引，
+	// 而 (user_id, day) 的前缀已覆盖 (user_id) 的全部用途，留着只是让每次
+	// 归档写入多维护一棵 B 树。DROP/CREATE 都是幂等的。
+	for _, idx := range []struct{ drop, create string }{
+		{
+			`DROP INDEX IF EXISTS idx_rollup_user`,
+			`CREATE INDEX IF NOT EXISTS idx_rollup_user_day
+				ON usage_daily_rollups(user_id, day)`,
+		},
+		{
+			`DROP INDEX IF EXISTS idx_rollup_key`,
+			`CREATE INDEX IF NOT EXISTS idx_rollup_key_day
+				ON usage_daily_rollups(access_key_id, day)`,
+		},
+	} {
+		if _, err := s.db.ExecContext(ctx, idx.drop); err != nil {
+			return fmt.Errorf("drop legacy rollup index: %w", err)
+		}
+		if _, err := s.db.ExecContext(ctx, idx.create); err != nil {
+			return fmt.Errorf("ensure rollup composite index: %w", err)
+		}
+	}
 	// 旧库的 trg_update_usage_totals 不包含新列，DROP + CREATE 让新增列
 	// 从下一行明细开始进入终身累计。DROP/CREATE 都是幂等的，且触发器只
 	// 影响后续 INSERT。
@@ -571,8 +604,12 @@ var canonicalSchemaStatements = []string{
 	`CREATE UNIQUE INDEX idx_route_targets_unique
 		ON route_targets(route_id, provider_id, upstream_model_id)`,
 	`CREATE INDEX idx_rollup_day ON usage_daily_rollups(day)`,
-	`CREATE INDEX idx_rollup_user ON usage_daily_rollups(user_id)`,
-	`CREATE INDEX idx_rollup_key ON usage_daily_rollups(access_key_id)`,
+	// 归档支的过滤条件恒为「day 区间 + user_id/access_key_id 等值」
+	// （usage_source.go:208-225）。复合索引让等值列做前缀、day 直接吃区间；
+	// 单列 (user_id) 只能定位该用户的**全部历史归档行**，day 区间退化为
+	// 残余过滤。理由与实测计划见 ensureCompatibleSchema 里的同名注释。
+	`CREATE INDEX idx_rollup_user_day ON usage_daily_rollups(user_id, day)`,
+	`CREATE INDEX idx_rollup_key_day ON usage_daily_rollups(access_key_id, day)`,
 	`CREATE INDEX idx_audit_ts ON audit_log(ts)`,
 	`CREATE INDEX idx_balance_charges_user ON balance_charges(user_id, ts)`,
 	`CREATE INDEX idx_balance_pending_user ON balance_pending(user_id)`,
