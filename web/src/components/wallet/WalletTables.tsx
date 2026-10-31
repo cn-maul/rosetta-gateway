@@ -80,7 +80,7 @@ export function ByUserTable({
         )
       ) : (
         <>
-          <DataTable label="账户账单" loading={loading} hasData={true} empty={true}>
+          <DataTable label="账户账单" loading={loading} hasData={true}>
             <Table>
               <Table.ScrollContainer>
                 <Table.Content aria-label="账户账单">
@@ -174,7 +174,7 @@ export function ByDayTable({
         emptyBox(`近 ${days} 天没有消耗记录`)
       ) : (
         <>
-          <DataTable label="账户账单" loading={loading} hasData={true} empty={true}>
+          <DataTable label="账户账单" loading={loading} hasData={true}>
             <Table>
               <Table.ScrollContainer>
                 <Table.Content aria-label="账户账单">
@@ -245,7 +245,7 @@ export function TopupTable({
         emptyBox('暂无充值记录', admin ? '还没有任何充值操作。' : '还没有人为你的账户充值。')
       ) : (
         <>
-          <DataTable label="账户账单" loading={loading} hasData={true} empty={true}>
+          <DataTable label="账户账单" loading={loading} hasData={true}>
             <Table>
               <Table.ScrollContainer>
                 <Table.Content aria-label="账户账单">

@@ -34,7 +34,9 @@ export function UsersTable({ users, groups, loading, err, pending, onEdit, onPas
   const rowLabel = (id: string, fallback: string) => pending.get(id) ?? fallback
 
   return (
-    <DataTable label="用户与权限组" loading={loading} error={err} hasData={users.length > 0} empty={true} emptyText="还没有用户">
+    // empty 必须由数据算：写成常量 true 会让空态分支永远命中，表格本体
+    // 一次都不渲染（「用户列表里没人了」就是这么来的）。
+    <DataTable label="用户与权限组" loading={loading} error={err} hasData={users.length > 0} empty={users.length === 0} emptyText="还没有用户">
       <Table>
         <Table.ScrollContainer>
           <Table.Content aria-label="用户与权限组">
@@ -166,7 +168,7 @@ export function GroupsTable({ groups, loading, err, deleting, onModels, onEditGr
         loading={loading}
         error={err}
         hasData={groups.length > 0}
-        empty={true}
+        empty={groups.length === 0}
         emptyText="还没有分组 —— 当前所有密钥都能看到全部模型"
       >
         <Table>
