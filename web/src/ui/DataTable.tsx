@@ -1,5 +1,6 @@
 import type { ReactNode } from 'react'
-import { Alert, Button, EmptyState, Spinner } from '@heroui/react'
+import { Alert, Button, EmptyState } from '@heroui/react'
+import { SkeletonBlock } from './SkeletonBlock'
 
 /**
  * 列表页统一外壳（语义对齐旧 DataTable.vue）：工具条 + 加载态 + 错误态 +
@@ -22,6 +23,9 @@ interface DataTableProps {
   onRetry?: () => void
   toolbar?: ReactNode
   footer?: ReactNode
+  /** 骨架行规格（P6 占位先行）：loading 且无数据时渲染灰条骨架，模拟真实表格的行列节奏。 */
+  skeletonRows?: number
+  skeletonCols?: number
   children: ReactNode
 }
 
@@ -36,6 +40,8 @@ export function DataTable({
   onRetry,
   toolbar,
   footer,
+  skeletonRows = 6,
+  skeletonCols = 4,
   children,
 }: DataTableProps) {
   return (
@@ -59,8 +65,14 @@ export function DataTable({
       )}
 
       {loading && !hasData ? (
-        <div className="text-muted flex items-center justify-center gap-2 py-10" role="status">
-          <Spinner size="sm" /> 加载中…
+        <div className="divide-y divide-separator rounded-2xl border border-separator bg-background-secondary" role="status" aria-label={label + '加载中'}>
+          {Array.from({ length: skeletonRows }, (_, r) => (
+            <div key={r} className="flex items-center gap-4 px-4 py-3.5">
+              {Array.from({ length: skeletonCols }, (_, c) => (
+                <SkeletonBlock key={c} className={`h-3.5 ${c === 0 ? 'w-[22%]' : 'flex-1'}`} />
+              ))}
+            </div>
+          ))}
         </div>
       ) : empty && !error ? (
         <EmptyState>
