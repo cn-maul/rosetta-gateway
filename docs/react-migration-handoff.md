@@ -11,7 +11,8 @@ Vue→React 换血**已全部完成并合入本地 `main`**：13 个可渲染页
 `ui/` 基座与 `components/` 子组件拆分到位；首屏改造（U1）、七个大页面拆分（U2）、路由懒加载 +
 vendor 分包 + 偏好记忆（U3）全部落地，入口 chunk 从 1.10 MB 降到约 51 kB。
 `typecheck` / `npm test` **98 条** / `build` / `legacy-audit --gate` / Go 三项嵌入守护全绿。
-后端另有接口审计 13 条修复。**全部 70 个提交只在本地 `main`，未推送 `origin`**。
+后端另有接口审计 13 条修复。**全部提交都只在本地 `main`，未推送 `origin`**
+（准确条数用 `git rev-list --count origin/main..main` 取，别抄文档里的数字）。
 
 ## 2. 提交与标签
 
@@ -63,7 +64,7 @@ vendor 分包 + 偏好记忆（U3）全部落地，入口 chunk 从 1.10 MB 降�
 1. **浏览器手工走查**（唯一没做过的验证）：`cd web && npm run dev`（`/admin/api` 代理到
    `bin/config.json` 的网关端口，需先起 `bin/gateway.exe`）。重点看：路由懒加载首屏骨架、偏好刷新后
    是否保留、深链 `?tab=` / `?model=` / `?range=` / `?days=` / `?size=`、暗色切换、401 静默、登出
-2. **推送与发布**：`origin/main..main` 现有 **70 个提交**未推送。推送前跑一次
+2. **推送与发布**：`origin/main..main` 有 70 多个提交未推送。推送前跑一次
    `go test ./... -count=1`（含 `cmd/gateway` 的 e2e，约 80s）与二进制冒烟
 3. **XERJ 重建索引**：`%LOCALAPPDATA%\Programs\xerj\xerj-index.ps1 .`（本机 9200 端口当前未起；
    索引里还留着已删的 `web/src/views/*.vue`，重建后才会消失）
