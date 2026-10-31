@@ -1,120 +1,137 @@
-# 前端信息架构与性能整改方案
+# 前端信息架构与性能整改方案（v2）
 
-状态：待评审。分支基线 feat/react-rewrite @ 2ddd410（React 迁移已完成）。
-反馈来源：迁移交付后使用者复盘——「想看的信息第一时间看不见、信息组织方式有问题、部分页面加载信息太多拖慢速度」。
+状态：v2 待评审。v1 只覆盖四个最重页面；v2 应「所有页面都够快、没有大页面」的目标，
+补全全部页面加载清单、骨架屏/占位规范、图形化（进度条/圆环/迷你图）改造层。
+分支基线 feat/react-rewrite @ 05dddf1。反馈来源：迁移交付后使用者复盘。
 
 ## 0. 现状诊断（问题 → 证据）
 
 ### 0.1 想看的信息第一时间看不见
 
-- 登录后落在「网关总览」，统计范围**默认 14 天**，第一屏是 5 张配置卡片 + 区间 KPI——「今天正不正常、今天花了多少」这两个最高频的问题都要手动切范围才能回答。
-- 「异常」信息是被动的：最近失败请求要自己去 /history 筛 status；总览的待办面板只覆盖配置层面问题（凭据未就绪、费用待重算），不覆盖「刚才有请求失败了」。
-- 费用信息分散三处：总览 KPI 是区间汇总；按天/按模型在 /usage 的页签里；管理员看「谁花得多」要去 /wallet 的按用户表。
-- 普通用户同理：余额在 /wallet、消耗在 /usage、密钥在 /keys，三个页面各回答一半问题。
+- 登录后落在「网关总览」，统计范围**默认 14 天**——「今天正常吗、今天花了多少」都要手动切。
+- 「异常」被动：最近失败请求要自己去 /history 筛 status；总览待办只覆盖配置问题，不覆盖「刚才有请求失败」。
+- 费用信息分散：总览 KPI 是区间汇总；按天/按模型在 /usage 页签；管理员看「谁花得多」在 /wallet。
 
 ### 0.2 信息组织方式问题
 
-- 侧栏三组（运行 / 网关配置 / 管理）按**页面类型**分而不是按**使用频率**分：高频的「API 密钥」「账户与充值」在第三组末尾，低频的「代理」在第二组顶部。
-- 页面职责交叠：/users 与 /keys 是同一组件的两套标题；「模型与路由」「可用模型」「设置-价格页签」三处都在讲模型，入口心智成本高。
+- 侧栏三组按页面类型分而非使用频率：高频的「API 密钥」「账户与充值」在第三组末尾。
+- 模型相关入口三处（模型与路由 / 可用模型 / 设置-价格页签）。
 
-### 0.3 大页面慢（量化）
+### 0.3 大页面慢（全部页面挂载请求盘点，已逐文件核实）
 
-| 位置 | 现状 |
-| --- | --- |
-| 入口 chunk | 1057KB（P5 起 813→924→961→1057 一路膨胀），是所有页面的共同前置成本 |
-| /settings?tab=price | 进页签即全量拉 `api.providers()` + `api.allModels()`（所有上游的所有模型含价格字段），分组/筛选/分页全在客户端主线程 |
-| /providers/:id | 挂载即三连发：`api.provider(pid)` + `Promise.allSettled([credentials, models])`，凭据/模型在第二三屏却阻塞可交互时间 |
-| /keys | 挂载拉 keys；modelNames / users / groups 三个 ensure* 虽是惰性函数，但筛选下拉与表单一打开就触发，权限数据四份陪跑 |
-| /（总览） | 管理员视角 4 个请求（stats / byDay / statsOverview / providers），首屏数字被最慢的一个拖住 |
+| 路由 | 挂载请求 | 重量 | 对策（§号） |
+| --- | --- | --- | --- |
+| / 总览 | admin: stats + usageByDay + statsOverview + providers（4 并发）；user: stats + usageByDay | 重 | 首屏拆分，stats(1d) 先答，byDay 懒加载，网关区独立骨架（§3） |
+| /history 请求日志 | usageHistory(单页) + keys()（筛选项） | 轻 | 保留；补表格骨架行（§6） |
+| /usage 用量页签 | 每页签一个 usageBy{Provider,Model,Key}(limit 200) | 轻 | 保留 |
+| /usage?tab=groups | ModelGroups：modelGroups + allModels + providers **3 并发** | 重 | 拆：组表只要 modelGroups；allModels+providers 延到成员弹窗打开（§5） |
+| /models 可用模型 | modelNames + probeModels + probeTimeline(默认前 6) | 中 | 保留（时间线已按卡展开拉）；probeModels 卡片骨架化（§6） |
+| /wallet | admin: stats(0,now) + topups + usageByUser(100)；user: stats + usageByDay(90 天) + topups | 重 | stats 卡先渲染；topups/byUser/byDay 按区块懒加载 + 骨架（§5） |
+| /keys | keys；modelNames/users/groups 已惰性 | 中 | 惰性结果加模块级缓存，切页签不重拉（§5） |
+| /users 用户与权限 | users + groups + modelNames 并发 | 重 | modelNames 延到白名单弹窗打开（§5） |
+| /providers 上游列表 | providers() | 轻 | 保留；卡片骨架 |
+| /providers/:id | provider + credentials + models **3 并发** | 重 | 概览先渲染；凭据/模型按页签惰性（§5） |
+| /routes 路由 | routeCatalog；routeTargets 编辑时才拉 | 轻 | 保留 |
+| /networks 代理 | networks() | 轻 | 保留 |
+| /settings | settings；价格页签 providers + allModels 全量 | 重 | 价格页签拆弹窗数据源 + 按供应商懒分组（§5） |
+| /account | 无 | — | — |
+
+结论：轻页面（history/usage/providers/routes/networks）只缺骨架屏；「大页面」实为 **6 处**：
+总览、价格页签、上游详情、Wallet、UsersGroups、ModelGroups（groups 页签）——v1 漏了后两个。
 
 ## 1. 设计原则
 
 - **P1 登录即答案**：首屏 3 秒内回答「现在正常吗 + 今天花了多少」。
-- **P2 一屏一问，渐进披露**：每页第一屏只回答一个主问题；细节折叠、进详情抽屉或降到第二屏。
-- **P3 按需加载**：首屏可见的数据才在挂载时拉；折叠区、弹窗、第二屏的数据打开时才拉。
-- **P4 记住偏好**：范围、页签、筛选写入 localStorage（URL 参数仍优先），回访直接呈现上次视图。
-- **P5 角色分层**：管理员与普通用户的首屏、导航独立设计，不复用一个模板硬塞两种需求。
+- **P2 一屏一问，渐进披露**：第一屏只回答一个主问题；细节折叠、进抽屉、降第二屏。
+- **P3 按需加载**：首屏可见的数据才挂载拉；弹窗、折叠区、第二屏打开时才拉。
+- **P4 记住偏好**：范围/页签/筛选写 localStorage（URL 参数优先）。
+- **P5 角色分层**：管理员与普通用户首屏、导航独立设计。
+- **P6 占位先行**：页面骨架（布局 + Skeleton）立即渲染，数据到了再填；任何异步区域必须有「骨架 → 数据 → 错误」三态，禁止白屏等待。
+- **P7 图形优先**：能一张图说清的不用文字；比例用圆环/进度条，趋势用迷你折线，状态用色点+图标；零新增依赖（HeroUI 自带组件 + 手绘 SVG）。
 
 ## 2. 首屏仪表盘重排（改 Overview.tsx，路由不动）
 
 ### 2.1 管理员首屏（自上而下）
 
-1. **状态条**（一行四格，秒回「正常吗」）：上游就绪 X/M（异常红点直达 /providers?status=unready）· 公开路由 X 条 · 今日请求 N（成功率）· 今日花费 ¥。
-2. **今日关键数字卡 ×4**：请求数 / 成功率 / Token / 费用。**默认范围从 14d 改为 1d（今天 0 点起算）**，卡内副行给「近 7 天均值」对比；卡片可点击跳对应明细（费用卡 → /usage?tab=models）。范围选择器保留，选过就记住（P4）。
-3. **最近异常请求**（新增内嵌表）：`api.usageHistory(days=1, limit=8, filters={status:'error'})`，列 = 时间 / 模型 / 上游 / 错误码 / 耗时；行点击打开详情抽屉——把 UsageDetail 里的 RequestDetailDrawer **抽成共享组件**复用；底部「查看全部失败 → /history?status=error」。近 24 小时无失败时渲染成功态一行，不占视觉重量。
-4. **第二屏**（滚动可达，内容不减）：趋势图、待办面板、当前状态五卡——配置类信息从第一屏降级到这里。
+1. **状态条**（一行四格，图形化）：上游就绪 **ProgressCircle**（X/M，异常红圈直达 /providers?status=unready）· 公开路由数 · 今日请求 **成功率圆环**（≥90% 绿 / ≥70% 黄 / else 红）· 今日花费。
+2. **今日关键数字卡 ×4**：请求数 / 成功率 / Token / 费用。**默认范围 1d（今天 0 点起）**，卡内副行「近 7 天均值」对比 + 迷你趋势（sparkline）；点卡片跳明细。范围选择器保留并记忆（P4）。
+3. **最近异常请求**（内嵌表）：`usageHistory(days=1, limit=8, filters={status:'error'})`，行点击开详情抽屉（从 UsageDetail 抽共享组件）；底部「查看全部失败 → /history?status=error」；无失败渲染成功态一行。
+4. **第二屏**：趋势（保留现有条形图）、待办面板、当前状态五卡（配置信息降级到这里）。
 
 ### 2.2 普通用户首屏
 
-1. **余额大卡**：余额 + 待结算 + 配额进度条（Meter，≥80% 转警示色）。数据源就是已有的 stats（balance_* / quota_*），不等 byDay。
-2. **消耗小结两格**：今日 / 近 7 天（请求数 / Token / 费用）。
-3. **最近 10 条调用**：复用 §2.1 的内嵌表组件，不过滤 status，成功/失败徽章着色，行点击开抽屉。
-4. **快捷操作条**：新建密钥（直开弹窗）、复制密钥、查看可用模型。
+1. **余额大卡**：余额 + 待结算 + 配额 **ProgressBar**（≥80% 警示色）。不等 byDay。
+2. **消耗小结两格**：今日 / 近 7 天（请求数/Token/费用），配 sparkline。
+3. **最近 10 条调用**：复用 §2.1 内嵌表，成功/失败徽章着色，行点击开抽屉。
+4. **快捷操作条**：新建密钥、复制密钥、查看可用模型。
 
 ### 2.3 数据加载策略
 
-- 统计区与网关状态区（管理员）完全并行渲染，各自 skeleton，互不阻塞（现状两块已分开请求，但渲染等最慢的）。
-- byDay 趋势数据延到趋势区可见时才拉（懒触发即可，不必上 IntersectionObserver 库）。
-- 首屏骨架屏：KPI 卡用 Skeleton 占位，替代现有单点 Spinner。
+- 统计区与网关状态区并行渲染、各自 Skeleton，互不阻塞（现状请求已分开，渲染不再等最慢的）。
+- usageByDay 延到趋势区可见时才拉。
+- 首屏一律 Skeleton 占位（§6），不用单点 Spinner。
 
-## 3. 导航按频率重组（改 ui/nav.ts + Shell 分组渲染）
+## 3. 导航按频率重组（改 ui/nav.ts + Shell）
 
-管理员侧栏改为两组：
+管理员：**常用**＝网关总览 / · 请求日志 /history · 用量与费用 /usage · API 密钥 /keys · 账户与充值 /wallet；
+**管理配置**＝上游服务 /providers · 模型与路由 /routes · 用户与权限 /users · 代理 /networks · 系统设置 /settings。
+普通用户单组：我的总览 / · 我的调用 /history · 消耗与费用 /usage · API 密钥 /keys · 余额与账单 /wallet · 可用模型 /models。
+路由 URL 零变更。
 
-- **常用**：网关总览 / · 请求日志 /history · 用量与费用 /usage · API 密钥 /keys · 账户与充值 /wallet
-- **管理配置**：上游服务 /providers · 模型与路由 /routes · 用户与权限 /users · 代理 /networks · 系统设置 /settings
+## 4. 大页面拆分（全部 6 处）
 
-普通用户保持单组，顺序调整为：我的总览 / · 我的调用 /history · 消耗与费用 /usage · API 密钥 /keys · 余额与账单 /wallet · 可用模型 /models。
+1. **价格页签**（PriceSettings）：a) 弹窗数据源下沉——新增/编辑/批量弹窗打开才拉 `api.models(providerId)`；b) 列表按供应商懒分组——默认只拉 providers，选中才拉该组模型，去 allModels 全量；分页保留。（可选 U5 后端分页接口。）
+2. **上游详情**（ProviderDetail）：概览挂载即渲染；`Promise.allSettled([credentials, models])` 拆成独立 `loadCreds`/`loadModels`，进入对应页签才调，各自 loading/err。
+3. **Wallet**：stats 汇总卡挂载即渲染；topups / byUser / byDay 三个区块各自独立请求 + 懒加载（进视口或滚动触发），管理员 usageByUser(全历史聚合) 是最贵的一笔，放最后。
+4. **UsersGroups**：users+groups 保留并发；modelNames 移入白名单弹窗打开时。
+5. **ModelGroups**（/usage?tab=groups）：组表挂载只拉 modelGroups；allModels + providers 延到「成员」弹窗打开时（弹窗内本就要展示可选模型）。
+6. **Keys**：keys 挂载拉；modelNames/users/groups 惰性结果缓存到模块级，切 /keys ↔ /users 不重拉。
 
-变化点：密钥/充值升入第一组首位区域；「代理」降至管理配置末位；所有路由 URL 不变，无迁移成本。
+## 5. 占位与骨架系统（P6，全站适用）
 
-## 4. 大页面拆分与按需加载
+- 组件：HeroUI `Skeleton` 包一层项目封装 `<SkeletonBlock w h rounded?>`（统一圆角与 shimmer 节奏），放 `ui/SkeletonBlock.tsx`。
+- 表格：DataTable 增加 `skeleton` 呈现——loading&&!hasData 时渲染 N 行灰条（列数随表格），替代现单点 Spinner。
+- 卡片：KpiCard / 状态条 / Wallet 三区块 / 模型卡，未加载时渲染同尺寸骨架。
+- 规范：每个异步区域三态齐全（骨架 / 数据 / 错误重试）；骨架尺寸与真实内容一致，避免加载完成后跳动。
 
-### 4.1 设置-价格页签（最重，纯前端两步）
+## 6. 图形化改造层（P7，零新增依赖）
 
-- **a. 弹窗数据源下沉**：新增/编辑/批量调价弹窗打开时才拉对应供应商的 `api.models(providerId)`（单上游量小），列表页数据源不动。
-- **b. 列表按供应商懒分组**：默认只拉 providers，选中供应商才拉该组模型，去掉 allModels 全量；「跨供应商搜索」改为先选供应商再搜。客户端分页（10/页）保留。
-- （可选 U4，需后端：`GET /models?provider_id=&has_price=` 分页接口，届时全局搜索可恢复。）
+| 信息 | 现状 | 改为 |
+| --- | --- | --- |
+| 成功率 | 文字百分比 | HeroUI `ProgressCircle` 圆环（色阶随阈值），中心放百分比数字 |
+| 配额/余额 | 文字 | HeroUI `Meter` / `ProgressBar`（≥80% 警示色） |
+| 缓存命中率 | 文字 | `ProgressBar` 细条 + 百分比 |
+| 费用/请求趋势 | 现条形图（总览）保留 | KPI 卡内补手绘 SVG sparkline（≤60 行组件 `ui/Sparkline.tsx`，HeartbeatBar 同思路） |
+| 状态 | StatusChip 保留 | 配色点/图标辅助（lucide，size 14–18） |
+| 用量构成（输入/输出/缓存） | 文字 | 堆叠 `ProgressBar` 一条三段 |
 
-### 4.2 上游详情页
+手绘 SVG 只做 sparkline 与（可选）环形，复杂图表不引入图表库——保住入口体积目标。
 
-- 概览（provider 对象 + 余额查询）挂载即渲染；凭据、模型改为**页签内惰性**：`Promise.allSettled` 拆成独立的 `loadCreds` / `loadModels`，进入对应页签才调，各自 loading / err（err 现已分开，拆请求即可）。
-- 模型探测时间线维持「展开卡片才拉」。
+## 7. 入口体积与偏好记忆
 
-### 4.3 密钥 / 用户页的陪跑数据
+- vite `manualChunks` 拆 @heroui/react + react 全家桶 vendor chunk（首包预计降 300–400KB 且长缓存）；复核根入口导入的 tree-shaking。
+- `usePersistedState` hook（前缀 `rosetta_gw_`）：统计范围、/usage 页签与天数、/history 条数、价格页签供应商筛选。URL 优先，离开写回。
 
-- Keys.tsx：keys 主数据挂载即拉；modelNames / users / groups 保持惰性但结果缓存到模块级（切页签回来不重拉）。
-- UsersGroups.tsx：users + groups 保留挂载并发；modelNames 移入白名单弹窗打开时。
-
-### 4.4 入口体积
-
-- vite `manualChunks` 把 @heroui/react + react 全家桶拆成 vendor chunk：首包预计降 300–400KB，且 vendor 独立长缓存，业务迭代不再推高用户下载量。
-- 复核 HeroUI 从根入口 `@heroui/react` 导入的 tree-shaking 效果，必要时改为子路径导入。
-
-## 5. 偏好记忆（小改动大体验）
-
-- 新增 `usePersistedState` hook（key 前缀 `rosetta_gw_`）：统计范围、/usage 页签与天数、/history 每页条数、价格页签的供应商筛选。URL 参数存在时优先，离开时写回。
-
-## 6. 实施批次
+## 8. 实施批次
 
 | 批 | 内容 | 提交粒度 |
 | --- | --- | --- |
-| U1 | 首屏仪表盘（§2）+ 导航重组（§3）：Overview 重排、RecentFailures 内嵌表、RequestDetailDrawer 抽取、nav.ts/Shell | 2 个提交（首屏、导航各一） |
-| U2 | 大页面拆分（§4.1–4.3）：PriceSettings、ProviderDetail、Keys、UsersGroups | 每处独立提交（4 个） |
-| U3 | 入口体积 + 偏好记忆（§4.4 / §5） | 2 个提交 |
-| U4 | （可选，需后端）价格/模型分页接口、双区间 stats | 后端另行评审 |
+| U1 | 首屏仪表盘（§2）+ 导航（§3）+ 骨架系统基座（§5 的 SkeletonBlock/DataTable 骨架行）+ 图形基座（§6 的 Sparkline/圆环封装） | 2–3 个提交 |
+| U2 | 大页面拆分全部 6 处（§4），每处连带该页骨架与图形化 | 每处独立提交（6 个） |
+| U3 | 入口体积 + 偏好记忆（§7） | 2 个提交 |
+| U5 | （可选，需后端）价格/模型分页接口、双区间 stats | 后端另行评审 |
 
-每批沿用现有门禁：`npm run typecheck` + node --test 全量 + `npm run build` + `legacy-audit` + 仓库根 `go test ./internal/webui/... -count=1`。
+每批沿用门禁：`npm run typecheck` + node --test 全量 + `npm run build` + `legacy-audit` + 仓库根 `go test ./internal/webui/... -count=1`。
 
-## 7. 兼容与风险
+## 9. 兼容与风险
 
-- **路由零变更**：/ /usage /history /keys /users /providers/:id 全保留，书签与侧栏高亮逻辑不受影响。
-- **R10 断言**：本方案不触碰 ProviderDetail 的余额归属逻辑、Models 的时间线逻辑、ModelPicker 的 unionSelection——只拆请求时机不改归属判定，断言形态保持可匹配。
-- **业务文件纪律**：不改 DTO / api.ts 签名（U4 除外，届时另行评审）；语义注释随代码搬移保留。
-- **风险点**：vendor 拆分后注意 CSS 引入顺序（styles 走独立入口，理论不受影响）；keys 惰性数据在弱网下首次打开表单有一次可感知延迟，需配加载态兜底；价格页签改懒分组后「跨供应商全局搜索」能力收窄，需产品确认可接受（备选：模型数 <500 时保留全量 + 超过才降级）。
+- 路由零变更；R10 断言对象（ProviderDetail 余额归属 / Models 时间线 / ModelPicker unionSelection）只拆请求时机不改归属判定。
+- 业务文件（api.ts/types.ts 等）不改签名（U5 除外）。
+- 风险：价格页签全局搜索收窄为「先选供应商」（备选：模型 <500 保留全量）；Keys 惰性数据弱网首开表单有一次延迟（骨架兜底）；vendor 拆分后 CSS 顺序（styles 独立入口，理论不受影响）。
 
-## 8. 待拍板项
+## 10. 待拍板项
 
-1. 首屏默认统计范围改为「今天」（本文推荐）还是维持 14 天但首屏加今日行？
-2. 价格页签全局搜索收窄为「先选供应商」是否可接受（§4.1-b）？
-3. U4 后端分页接口是否立项（不做则 4.1-b 为终态）？
+1. 首屏默认统计范围改「今天」？
+2. 价格页签全局搜索收窄可接受？（或 <500 模型保留全量）
+3. U5 后端分页接口是否立项？
+4. 图形化程度：§6 全做，还是先做成功率圆环 + 配额条两处最高频的？
