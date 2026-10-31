@@ -32,6 +32,27 @@ body {
   --hb-empty: oklch(0.34 0.008 286);
 }
 
+/* 输入类控件（Input / Textarea / Select.Trigger / 各种 *-group）的可辨识度。
+   HeroUI 默认 `--field-background: var(--white)`、`--field-border: transparent`
+   且 `--field-border-width: 0px`：亮色下卡片是纯白（--surface），输入框也是纯白、
+   还没边框，只能靠 0 1px 的阴影分层 —— 一眼看过去输入框和背景是同一块。暗色下
+   同理（--field-background 与 --surface 都是 oklch(21.03% …)）。
+   这里只改令牌、不改组件：底色退到 --surface-secondary（与卡片差一档），边框
+   交给 --border —— 且必须把 --field-border-width 从默认的 0px 提到 1px，
+   否则 --field-border 设了颜色也没有宽度画出来。
+   --field-border-hover / --field-border-focus 由 HeroUI 从 --field-border 派生
+   （color-mix 88% / 74%），跟着一处改动即可生效。 */
+:root {
+  --field-background: var(--surface-secondary);
+  --field-border: var(--border);
+  --field-border-width: 1px;
+}
+[data-theme="dark"] {
+  --field-background: var(--surface-secondary);
+  --field-border: var(--border);
+  --field-border-width: 1px;
+}
+
 /* Magpie 等 SVG 图标是深色描边，暗色主题下反相才能看清。 */
 [data-theme="dark"] .icon-invert-dark {
   filter: invert(1);

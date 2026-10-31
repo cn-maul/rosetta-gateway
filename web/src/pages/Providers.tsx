@@ -481,21 +481,26 @@ function CreateProviderModal({
           <Label>显示名称</Label>
           <Input placeholder="DeepSeek（留空则用 Endpoint）" autoComplete="off" />
         </TextField>
-        <Select aria-label="类型" selectedKey={protocol} onSelectionChange={(key) => key !== null && setProtocol(String(key))}>
-          <SelectTrigger>
-            <SelectValue />
-            <SelectIndicator />
-          </SelectTrigger>
-          <SelectPopover>
-            <ListBox aria-label="协议类型">
-              {PROTOCOL_OPTIONS.map((o) => (
-                <ListBoxItem key={o.value} id={o.value}>
-                  {o.label}
-                </ListBoxItem>
-              ))}
-            </ListBox>
-          </SelectPopover>
-        </Select>
+        {/* Select 自带可见标签：只给 aria-label 时它没有 Label 占位，trigger 会
+            顶到格子顶部，和左边带 Label 的输入框错开一行。 */}
+        <div className="flex flex-col gap-1">
+          <Label>接口方式</Label>
+          <Select aria-label="接口方式" selectedKey={protocol} onSelectionChange={(key) => key !== null && setProtocol(String(key))}>
+            <SelectTrigger>
+              <SelectValue />
+              <SelectIndicator />
+            </SelectTrigger>
+            <SelectPopover>
+              <ListBox aria-label="协议类型">
+                {PROTOCOL_OPTIONS.map((o) => (
+                  <ListBoxItem key={o.value} id={o.value}>
+                    {o.label}
+                  </ListBoxItem>
+                ))}
+              </ListBox>
+            </SelectPopover>
+          </Select>
+        </div>
         <TextField aria-label="Endpoint" isRequired value={endpoint} onChange={setEndpoint} className="col-span-2">
           <Label>Endpoint *</Label>
           <Input placeholder="https://api.deepseek.com" className="font-mono" autoComplete="off" />
@@ -507,27 +512,29 @@ function CreateProviderModal({
             添加即启用；slug、超时与重试将自动使用默认值。余额查询可在创建后到详情页设置。
           </span>
         </TextField>
-        <Select
-          aria-label="代理"
-          className="col-span-2"
-          selectedKey={networkId}
-          onSelectionChange={(key) => key !== null && setNetworkId(String(key))}
-        >
-          <SelectTrigger>
-            <SelectValue />
-            <SelectIndicator />
-          </SelectTrigger>
-          <SelectPopover>
-            <ListBox aria-label="出站网络">
-              <ListBoxItem id={NETWORK_DIRECT_ID}>直连（默认，不经过代理）</ListBoxItem>
-              {networks.map((n) => (
-                <ListBoxItem key={n.id} id={n.id}>
-                  {n.name} — {n.proxy_url}
-                </ListBoxItem>
-              ))}
-            </ListBox>
-          </SelectPopover>
-        </Select>
+        <div className="col-span-2 flex flex-col gap-1">
+          <Label>代理</Label>
+          <Select
+            aria-label="代理"
+            selectedKey={networkId}
+            onSelectionChange={(key) => key !== null && setNetworkId(String(key))}
+          >
+            <SelectTrigger>
+              <SelectValue />
+              <SelectIndicator />
+            </SelectTrigger>
+            <SelectPopover>
+              <ListBox aria-label="出站网络">
+                <ListBoxItem id={NETWORK_DIRECT_ID}>直连（默认，不经过代理）</ListBoxItem>
+                {networks.map((n) => (
+                  <ListBoxItem key={n.id} id={n.id}>
+                    {n.name} — {n.proxy_url}
+                  </ListBoxItem>
+                ))}
+              </ListBox>
+            </SelectPopover>
+          </Select>
+        </div>
         <p className="col-span-2 text-[11px] leading-relaxed text-muted">
           默认<b>直连</b>，大多数上游不用改。要走代理就先去 <a className="text-link" href="/networks">代理</a>{' '}
           建一条（地址填一次到处可用），再回来从下拉里选——不用在这里手填 URL，写错不会报错只是连不上。

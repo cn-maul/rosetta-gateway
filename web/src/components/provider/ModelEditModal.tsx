@@ -253,6 +253,11 @@ export function ModelEditModal({
 /**
  * 探测 + 多选胶囊式添加弹窗（语义对齐旧 ProviderDetail.vue 的 mForm 非 editing 分支）。
  * 打开时状态清零，每次都从「获取模型列表」重新开始。
+ *
+ * 另有「手动添加模型」一档：有些上游不实现 /models（或凭据没开列表权限），
+ * 探测永远拿不到东西，但模型本身可用。这一档直接调同一个导入接口，只填
+ * model_id 也能落库（context_window / max_output_tokens 留 0 时后端回落到
+ * 模型默认值，见 internal/admin/model_handler.go 的 ImportModels）。
  */
 export function ModelDiscoverModal({
   providerId,
@@ -271,6 +276,13 @@ export function ModelDiscoverModal({
   const [filter, setFilter] = useState('')
   const [selected, setSelected] = useState<DiscoveredModel[]>([])
   const [importing, setImporting] = useState(false)
+  // 手动添加这一档：探测拿不到列表（上游没实现 /models，或凭据没开列表权限）时，
+  // 管理员仍然要能把模型名写进去。
+  const [manual, setManual] = useState(false)
+  const [mModelId, setMModelId] = useState('')
+  const [mDisplayName, setMDisplayName] = useState('')
+  const [mContextWindow, setMContextWindow] = useState('0')
+  const [mMaxOutput, setMMaxOutput] = useState('0')
 
   useEffect(() => {
     if (!open) return
@@ -278,6 +290,11 @@ export function ModelDiscoverModal({
     setSelected([])
     setDiscoverMsg('')
     setFilter('')
+    setManual(false)
+    setMModelId('')
+    setMDisplayName('')
+    setMContextWindow('0')
+    setMMaxOutput('0')
   }, [open])
 
   const filteredDiscovered = useMemo(() => {
@@ -352,6 +369,33 @@ export function ModelDiscoverModal({
     }
   }
 
+  /** 手动添加：只要 model_id，其余留 0 由后端回落到模型默认值。 */
+  const submitManual = async () => {
+    const id = mModelId.trim()
+    if (!id) {
+      toast.danger('上游模型名（model_id）为必填项')
+      return
+    }
+    setImporting(true)
+    try {
+      const r = await api.importModels(providerId, [
+        {
+          model_id: id,
+          display_name: mDisplayName.trim(),
+          context_window: Number(mContextWindow) || 0,
+          max_output_tokens: Number(mMaxOutput) || 0,
+        },
+      ])
+      toast.success(`已添加 ${r.imported} 个模型`)
+      onClose()
+      await onSaved()
+    } catch (e) {
+      if (!is401(e)) toast.danger('添加失败：' + (e as Error).message)
+    } finally {
+      setImporting(false)
+    }
+  }
+
   return (
     <AppModal
       open={open}
@@ -366,10 +410,10 @@ export function ModelDiscoverModal({
           </Button>
           <Button
             variant="primary"
-            isDisabled={!selected.length || importing}
-            onPress={() => void confirmImport()}
+            isDisabled={importing || (manual ? !mModelId.trim() : !selected.length)}
+            onPress={() => void (manual ? submitManual() : confirmImport())}
           >
-            {importing ? '添加中…' : `添加（${selected.length}）`}
+            {importing ? '添加中…' : manual ? '添加' : `添加（${selected.length}）`}
           </Button>
         </>
       }
@@ -379,76 +423,128 @@ export function ModelDiscoverModal({
           <Button
             variant="secondary"
             size="sm"
-            isDisabled={discovering}
+            isDisabled={discovering || manual}
             onPress={() => void runDiscover()}
           >
             {discovering ? '获取中…' : '获取模型列表'}
           </Button>
-          {discovered.length ? (
+          <Button
+            variant={manual ? 'secondary' : 'tertiary'}
+            size="sm"
+            isDisabled={importing}
+            onPress={() => setManual((v) => !v)}
+          >
+            {manual ? '返回获取列表' : '手动添加模型'}
+          </Button>
+          {!manual && discovered.length ? (
             <TextField aria-label="搜索模型" value={filter} onChange={setFilter} className="flex-1">
               <Input type="search" placeholder="搜索模型…" autoComplete="off" />
             </TextField>
           ) : null}
         </div>
-        {discoverMsg ? (
+        {discoverMsg && !manual ? (
           <p className="text-danger text-xs" role="alert">
             {discoverMsg}
           </p>
         ) : null}
 
-        {selected.length ? (
-          <div className="flex flex-wrap gap-2">
-            {selected.map((s) => (
-              <span
-                key={s.model_id}
-                className="bg-default-soft flex items-center gap-1 rounded-full py-0.5 pr-1 pl-2.5 text-xs"
-              >
-                <span className="font-mono">{s.model_id}</span>
-                <Button
-                  variant="ghost"
-                  isIconOnly
-                  size="sm"
-                  aria-label={`移除 ${s.model_id}`}
-                  className="h-5 min-w-5 rounded-full"
-                  onPress={() => removeSelected(s.model_id)}
-                >
-                  ×
-                </Button>
-              </span>
-            ))}
-          </div>
-        ) : null}
-
-        {discovered.length ? (
-          <div className="grid max-h-[320px] grid-cols-1 gap-1.5 overflow-y-auto sm:grid-cols-2">
-            {filteredDiscovered.map((d) => (
-              <Button
-                key={d.model_id}
-                variant={isSelected(d.model_id) ? 'secondary' : 'ghost'}
-                aria-label={isSelected(d.model_id) ? `取消选择 ${d.model_id}` : `选择 ${d.model_id}`}
-                className="h-auto w-full justify-start px-2 py-1.5 text-left"
-                onPress={() => toggleSelect(d)}
-              >
-                <span className="flex w-full min-w-0 items-center gap-2 text-xs">
-                  <span className="shrink-0">{isSelected(d.model_id) ? '✓' : '+'}</span>
-                  <span className="truncate font-mono">{d.model_id}</span>
-                  <span className="text-muted ml-auto shrink-0 text-[10px]">
-                    {d.effort_levels ? `思考 ${d.effort_levels}` : '思考 待配置'}
-                    {d.context_window || d.max_output_tokens
-                      ? ` · ${d.context_window ? d.context_window + ' ctx' : ''}${
-                          d.context_window && d.max_output_tokens ? ' / ' : ''
-                        }${d.max_output_tokens ? d.max_output_tokens + ' out' : ''}`
-                      : ''}
+        {manual ? (
+          <form
+            onSubmit={(e) => {
+              e.preventDefault()
+              void submitManual()
+            }}
+            className="flex flex-col gap-3"
+          >
+            <TextField
+              aria-label="上游模型名（model_id）"
+              isRequired
+              value={mModelId}
+              onChange={setMModelId}
+            >
+              <Label>上游模型名（model_id）*</Label>
+              <Input placeholder="deepseek-chat" className="font-mono" autoComplete="off" />
+            </TextField>
+            <TextField aria-label="显示名称" value={mDisplayName} onChange={setMDisplayName}>
+              <Label>显示名称</Label>
+              <Input placeholder="留空 = 用模型名" autoComplete="off" />
+            </TextField>
+            <div className="grid grid-cols-2 gap-3">
+              <TextField aria-label="上下文窗口" value={mContextWindow} onChange={setMContextWindow}>
+                <Label>上下文窗口</Label>
+                <Input type="number" min={0} step={1} placeholder="0 = 用默认值" />
+              </TextField>
+              <TextField aria-label="最大输出" value={mMaxOutput} onChange={setMMaxOutput}>
+                <Label>最大输出</Label>
+                <Input type="number" min={0} step={1} placeholder="0 = 用默认值" />
+              </TextField>
+            </div>
+            <span className="text-muted text-[11px]">
+              上游不实现 /models 或不给列表权限时用这一档。上下文窗口与最大输出填 0
+              会套用「模型默认值」；价格与思考挡位请在添加后到列表里逐个编辑。
+            </span>
+          </form>
+        ) : (
+          <>
+            {selected.length ? (
+              <div className="flex flex-wrap gap-2">
+                {selected.map((s) => (
+                  <span
+                    key={s.model_id}
+                    className="bg-default-soft flex items-center gap-1 rounded-full py-0.5 pr-1 pl-2.5 text-xs"
+                  >
+                    <span className="font-mono">{s.model_id}</span>
+                    <Button
+                      variant="ghost"
+                      isIconOnly
+                      size="sm"
+                      aria-label={`移除 ${s.model_id}`}
+                      className="h-5 min-w-5 rounded-full"
+                      onPress={() => removeSelected(s.model_id)}
+                    >
+                      ×
+                    </Button>
                   </span>
-                </span>
-              </Button>
-            ))}
-          </div>
-        ) : !discovering && !discoverMsg ? (
-          <p className="text-muted py-4 text-center text-xs">
-            点击「获取模型列表」拉取上游可用模型
-          </p>
-        ) : null}
+                ))}
+              </div>
+            ) : null}
+
+            {discovered.length ? (
+              /* 单列：模型名普遍偏长（带厂商前缀的如 deepseek/deepseek-chat 更长），
+                 两列会把名字截断还挤掉右侧的「思考 / ctx」提示。 */
+              <div className="grid max-h-[320px] grid-cols-1 gap-1.5 overflow-y-auto">
+                {filteredDiscovered.map((d) => (
+                  <Button
+                    key={d.model_id}
+                    variant={isSelected(d.model_id) ? 'secondary' : 'ghost'}
+                    aria-label={
+                      isSelected(d.model_id) ? `取消选择 ${d.model_id}` : `选择 ${d.model_id}`
+                    }
+                    className="h-auto w-full justify-start px-2 py-1.5 text-left"
+                    onPress={() => toggleSelect(d)}
+                  >
+                    <span className="flex w-full min-w-0 items-center gap-2 text-xs">
+                      <span className="shrink-0">{isSelected(d.model_id) ? '✓' : '+'}</span>
+                      <span className="truncate font-mono">{d.model_id}</span>
+                      <span className="text-muted ml-auto shrink-0 text-[10px]">
+                        {d.effort_levels ? `思考 ${d.effort_levels}` : '思考 待配置'}
+                        {d.context_window || d.max_output_tokens
+                          ? ` · ${d.context_window ? d.context_window + ' ctx' : ''}${
+                              d.context_window && d.max_output_tokens ? ' / ' : ''
+                            }${d.max_output_tokens ? d.max_output_tokens + ' out' : ''}`
+                          : ''}
+                      </span>
+                    </span>
+                  </Button>
+                ))}
+              </div>
+            ) : !discovering && !discoverMsg ? (
+              <p className="text-muted py-4 text-center text-xs">
+                点击「获取模型列表」拉取上游可用模型；上游不支持列表时用「手动添加模型」
+              </p>
+            ) : null}
+          </>
+        )}
       </div>
     </AppModal>
   )

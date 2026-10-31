@@ -154,25 +154,31 @@ export function ProviderEditModal({
           <Label>显示名称</Label>
           <Input placeholder="DeepSeek" autoComplete="off" />
         </TextField>
-        <Select
-          aria-label="类型"
-          selectedKey={protocol}
-          onSelectionChange={(key) => key !== null && setProtocol(String(key))}
-        >
-          <SelectTrigger>
-            <SelectValue />
-            <SelectIndicator />
-          </SelectTrigger>
-          <SelectPopover>
-            <ListBox aria-label="协议类型">
-              {PROTOCOL_OPTIONS.map((o) => (
-                <ListBoxItem key={o.value} id={o.value}>
-                  {o.label}
-                </ListBoxItem>
-              ))}
-            </ListBox>
-          </SelectPopover>
-        </Select>
+        {/* 这一格必须自带可见标签：左边是 TextField（Label 占一行），Select 若只给
+            aria-label，它的 trigger 就会顶到格子顶部、和右边的输入框错开一行。
+            gap-1 与 TextField 自己的 gap（--spacing）对齐。 */}
+        <div className="flex flex-col gap-1">
+          <Label>接口方式</Label>
+          <Select
+            aria-label="接口方式"
+            selectedKey={protocol}
+            onSelectionChange={(key) => key !== null && setProtocol(String(key))}
+          >
+            <SelectTrigger>
+              <SelectValue />
+              <SelectIndicator />
+            </SelectTrigger>
+            <SelectPopover>
+              <ListBox aria-label="协议类型">
+                {PROTOCOL_OPTIONS.map((o) => (
+                  <ListBoxItem key={o.value} id={o.value}>
+                    {o.label}
+                  </ListBoxItem>
+                ))}
+              </ListBox>
+            </SelectPopover>
+          </Select>
+        </div>
         <TextField
           aria-label="Endpoint"
           isRequired
@@ -191,27 +197,29 @@ export function ProviderEditModal({
           <Label>最大重试次数</Label>
           <Input type="number" min={0} max={10} step={1} />
         </TextField>
-        <Select
-          aria-label="代理"
-          className="col-span-2"
-          selectedKey={networkId}
-          onSelectionChange={(key) => key !== null && setNetworkId(String(key))}
-        >
-          <SelectTrigger>
-            <SelectValue />
-            <SelectIndicator />
-          </SelectTrigger>
-          <SelectPopover>
-            <ListBox aria-label="出站网络">
-              <ListBoxItem id={NETWORK_DIRECT_ID}>直连（不经过代理）</ListBoxItem>
-              {networks.map((n) => (
-                <ListBoxItem key={n.id} id={n.id}>
-                  {n.name} — {n.proxy_url}
-                </ListBoxItem>
-              ))}
-            </ListBox>
-          </SelectPopover>
-        </Select>
+        <div className="col-span-2 flex flex-col gap-1">
+          <Label>代理</Label>
+          <Select
+            aria-label="代理"
+            selectedKey={networkId}
+            onSelectionChange={(key) => key !== null && setNetworkId(String(key))}
+          >
+            <SelectTrigger>
+              <SelectValue />
+              <SelectIndicator />
+            </SelectTrigger>
+            <SelectPopover>
+              <ListBox aria-label="出站网络">
+                <ListBoxItem id={NETWORK_DIRECT_ID}>直连（不经过代理）</ListBoxItem>
+                {networks.map((n) => (
+                  <ListBoxItem key={n.id} id={n.id}>
+                    {n.name} — {n.proxy_url}
+                  </ListBoxItem>
+                ))}
+              </ListBox>
+            </SelectPopover>
+          </Select>
+        </div>
         <div className="col-span-2 flex flex-col gap-1">
           <Label>余额查询（可选）</Label>
           <TextArea
