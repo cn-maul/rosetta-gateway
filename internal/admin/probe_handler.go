@@ -140,8 +140,17 @@ func (h *ProbeHandler) allowedModelIDs(r *http.Request) (map[string]bool, bool) 
 		return nil, true
 	}
 	snap := snapshot.Get()
-	u := snap.UsersByID[me.ID]
-	if u == nil || u.AllowedModels.Unrestricted {
+	// fail-closed（2026-10-31 修，后端接口审计）：快照里查不到这个用户时
+	// **不能**当成「不受限」。这与本函数开头「空 ID 不当 admin」是同一条
+	// 教义 —— 拿不到身份信息就等于拿不到权限，方向必须收紧。
+	//
+	// 零值 ModelAllow 恰好是我们要的「不受限为假 + 白名单为空」，下面会
+	// 自然走到「空集」分支（不是全集），失败方向可见且可修。
+	var allow snapshot.ModelAllow
+	if u := snap.UsersByID[me.ID]; u != nil {
+		allow = u.AllowedModels
+	}
+	if allow.Unrestricted {
 		return nil, true
 	}
 	// 收窄：只放行「公开名在组白名单内」的那条路由的主目标模型。
@@ -149,9 +158,9 @@ func (h *ProbeHandler) allowedModelIDs(r *http.Request) (map[string]bool, bool) 
 	// 用 Routes.Resolve 而不是 ListRoutes 全表扫：Resolve 会跳过被禁用的
 	// provider/model（见 routing.go 的 synthCandidates），与数据面一致 ——
 	// 界面上摆出来一条实际不可用的模型，与不给它摆出来同样误导。
-	allowed := make(map[string]bool, len(u.AllowedModels.Models))
+	allowed := make(map[string]bool, len(allow.Models))
 	for _, name := range snap.Routes.ListPublicNames() {
-		if !u.AllowedModels.Allows(name) {
+		if !allow.Allows(name) {
 			continue
 		}
 		res, err := snap.Routes.Resolve(name)

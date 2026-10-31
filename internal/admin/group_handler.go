@@ -359,18 +359,25 @@ func (h *GroupHandler) ModelNames(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	u := snapshot.Get().UsersByID[me.ID]
-	if u == nil || u.AllowedModels.Unrestricted {
+	// fail-closed（2026-10-31 修，后端接口审计）：快照里查不到这个用户时
+	// **不能**当成「不受限」。与上面「空 ID 不当 admin」同一条教义 ——
+	// 拿不到身份信息就等于拿不到权限。零值 ModelAllow 是「不受限为假 +
+	// 白名单为空」，会自然走到下面的空交集分支（restricted=true + 空列表）。
+	var allow snapshot.ModelAllow
+	if u := snapshot.Get().UsersByID[me.ID]; u != nil {
+		allow = u.AllowedModels
+	}
+	if allow.Unrestricted {
 		writeJSON(w, http.StatusOK, map[string]any{"models": all, "restricted": false, "prices": prices, "meta": meta})
 		return
 	}
 	// 组白名单生效：只给他组内那部分。交集为空时返回空数组而不是全集 ——
 	// 「全都看不到」和「什么都能看到」是两回事，返回全集会静默放宽。
-	filtered := make([]string, 0, len(u.AllowedModels.Models))
-	filteredPrices := make([]modelPrice, 0, len(u.AllowedModels.Models))
-	filteredMeta := make([]modelMeta, 0, len(u.AllowedModels.Models))
+	filtered := make([]string, 0, len(allow.Models))
+	filteredPrices := make([]modelPrice, 0, len(allow.Models))
+	filteredMeta := make([]modelMeta, 0, len(allow.Models))
 	for i, m := range all {
-		if u.AllowedModels.Allows(m) {
+		if allow.Allows(m) {
 			filtered = append(filtered, m)
 			// prices 与 all 已按同一顺序排好，逐位取即可（见上面的构造）。
 			filteredPrices = append(filteredPrices, prices[i])
