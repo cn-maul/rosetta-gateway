@@ -215,9 +215,9 @@ export function Overview() {
       setTrendErr('')
       try {
         const { from, to } = timeRange.rangeBounds(rangeDays(requested))
-        const d = await api.usageByDay(from, to)
+        const page = await api.usageByDay(from, to)
         if (!trendGen.current.isCurrent(generation)) return
-        setByDay(d)
+        setByDay(page.records)
       } catch (e) {
         if (trendGen.current.isCurrent(generation) && !is401(e)) setTrendErr('趋势加载失败：' + (e as Error).message)
       } finally {

@@ -885,6 +885,31 @@ type usageGroupEntry struct {
 	Tps float64 `json:"tps"`
 }
 
+// usageGroupPage 是四个 by-* 端点的响应：当页行 + 分组总数。
+//
+// # 为什么四个 by-* 从裸数组改成对象（2026-10-31）
+//
+// 上一版把 by-key / by-model / by-provider 写成裸数组，理由写在
+// usage_by_user_handler.go 的注释里：「它们只用来画 Top 10，截断是既定语义」。
+// 那个理由在用量统计页改版之后就过期了：UsageStats 现在用 limit=200 拉全量
+// 列表，并在表头把行求和当成「当前范围汇总」展示 —— 一旦某天参与调用的
+// 上游/模型超过 200 个，界面会把「前 200 名的合计」印成全量合计，而且
+// 与同一页顶部那张全局汇总卡对不上账，却没有任何线索说明为什么。
+//
+// 与 by-user 同一个原则（也见 ExportCSV 的 X-Export-Truncated）：
+// **截断必须可见**。所以四个维度统一下发 total，前端才能说出
+// 「显示前 N / 共 M」并决定那个合计该怎么称呼。
+//
+// Total 的语义是「不受 limit 影响的分组数」：by-day 不带 limit（时间序列
+// 必须覆盖整个区间），它的 Total 恒等于当页行数；其余三个在结果**恰好等于
+// limit**（即可能被截断）时才多跑一条 COUNT，没被截断时 Total = 行数 ——
+// 正常情况下不为「我知道没截断」这一点付第二条查询的钱。
+// @ts-type UsageGroupPage
+type usageGroupPage struct {
+	Records []usageGroupEntry `json:"records"`
+	Total   int64             `json:"total"`
+}
+
 // groupBy 的分组列取自归一化来源。传的是**列名**而非表达式，四个调用点
 // （day / upstream_model / provider_id / access_key_id）都是表 A 与明细表
 // 双方都有的维度列 —— 剪枝后要能靠它把归档重新分桶。
@@ -944,15 +969,36 @@ func (h *UsageHandler) GroupByModel(w http.ResponseWriter, r *http.Request) {
 		` LEFT JOIN upstream_models um ON um.provider_id = u.provider_id AND um.model_id = u.upstream_model` +
 		` LEFT JOIN model_groups g ON g.id = um.group_id` +
 		` GROUP BY COALESCE(g.display_name, u.upstream_model)` +
-		` ORDER BY tokens DESC LIMIT ?`
+		` ORDER BY tokens DESC`
 
-	rows, err := h.store.Reader().QueryContext(r.Context(), query, args...)
+	// LIMIT 单独拼：同一条 query 去掉 LIMIT 就是一个统计分组总数的子查询，
+	// 两个数字因此来自**同一个** WHERE / JOIN / GROUP BY，不会因为哪一边
+	// 多加了条件而互相矛盾。
+	countArgs := args
+	args = append(args, limit)
+
+	rows, err := h.store.Reader().QueryContext(r.Context(), query+` LIMIT ?`, args...)
 	if err != nil {
 		writeServerError(w, "usage group by model", err)
 		return
 	}
-	defer rows.Close()
-	writeGroupEntries(w, rows, true)
+	entries, err := scanGroupEntries(rows, true)
+	rows.Close()
+	if err != nil {
+		writeServerError(w, "usage group by model", err)
+		return
+	}
+
+	// 只有「取满了 limit」才可能被截断，也才值得多跑一条 COUNT。
+	total := int64(len(entries))
+	if total == limit {
+		total, err = h.groupTotal(r.Context(), query, countArgs)
+		if err != nil {
+			writeServerError(w, "usage group by model total", err)
+			return
+		}
+	}
+	writeJSON(w, http.StatusOK, usageGroupPage{Records: entries, Total: total})
 }
 
 func (h *UsageHandler) GroupByProvider(w http.ResponseWriter, r *http.Request) {
@@ -1018,10 +1064,6 @@ func (h *UsageHandler) groupBy(w http.ResponseWriter, r *http.Request, column, n
 	if column == "day" {
 		order = "ORDER BY key ASC"
 	}
-	if limit > 0 {
-		args = append(args, limit)
-	}
-
 	withName := nameExpr != ""
 	query := `SELECT u.` + column + ` AS key, COALESCE(SUM(u.n), 0) AS count, ` +
 		store.UsageSumExpr("total_tokens", "u") + ` AS tokens, ` +
@@ -1053,7 +1095,13 @@ func (h *UsageHandler) groupBy(w http.ResponseWriter, r *http.Request, column, n
 	// 聚合别名在 ORDER BY 里可直接引用（SQLite 允许），GROUP BY 不行 ——
 	// 那里必须写原列名。
 	query += ` GROUP BY u.` + column + ` ` + order
+
+	// LIMIT 与 COUNT 用的是同一条 query 的两种拼法（见 usageGroupPage 注释）：
+	// baseQuery 不带 LIMIT，countArgs 不带 limit 参数，两条查询因此必然同源。
+	baseQuery := query
+	countArgs := args
 	if limit > 0 {
+		args = append(args, limit)
 		query += ` LIMIT ?`
 	}
 
@@ -1062,9 +1110,22 @@ func (h *UsageHandler) groupBy(w http.ResponseWriter, r *http.Request, column, n
 		writeServerError(w, "usage group by "+column, err)
 		return
 	}
-	defer rows.Close()
+	entries, err := scanGroupEntries(rows, withName)
+	rows.Close()
+	if err != nil {
+		writeServerError(w, "usage group by "+column, err)
+		return
+	}
 
-	writeGroupEntries(w, rows, withName)
+	total := int64(len(entries))
+	if limit > 0 && total == limit {
+		total, err = h.groupTotal(r.Context(), baseQuery, countArgs)
+		if err != nil {
+			writeServerError(w, "usage group by "+column+" total", err)
+			return
+		}
+	}
+	writeJSON(w, http.StatusOK, usageGroupPage{Records: entries, Total: total})
 }
 
 // Prune 手动触发用量归档（POST /admin/api/usage/prune?keep_days=N）。
@@ -1108,17 +1169,20 @@ func (h *UsageHandler) Prune(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, res)
 }
 
-// writeGroupEntries 把分组查询结果编码成 JSON。
+// scanGroupEntries 扫描分组查询结果。
 //
 // 初始化为空切片而非 nil：nil 切片会被编码成 JSON null，客户端拿到 null
 // 再 .map() 会直接 TypeError。空结果必须是 []。
-func writeGroupEntries(w http.ResponseWriter, rows *sql.Rows, withName bool) {
+//
+// 只扫描、不写响应：调用方还要决定 total（可能得多跑一条 COUNT），
+// 所以写 JSON 留在 handler 里，避免「响应已经写出去、又发现要补字段」。
+func scanGroupEntries(rows *sql.Rows, withName bool) ([]usageGroupEntry, error) {
 	entries := make([]usageGroupEntry, 0)
 	for rows.Next() {
 		var e usageGroupEntry
 		var key, name string
 		var err error
-		// 扫描顺序必须与 groupBy 里 SELECT 的列顺序**逐字对应**：
+		// 扫描顺序必须与 groupBy / GroupByModel 里 SELECT 的列顺序**逐字对应**：
 		// key, count, tokens, cost, ok, err, avg_ttfb_ms, n_ttfb, tps[, name]。
 		// 加列时漏改这里的表现是 Scan 报「期望 N 列、实际 M 列」—— 报错点
 		// 在 Scan，读代码的人会先查 Scan 本身，而不是想到「上面那条 SELECT
@@ -1131,16 +1195,24 @@ func writeGroupEntries(w http.ResponseWriter, rows *sql.Rows, withName bool) {
 				&e.Ok, &e.Err, &e.AvgTtfbMs, &e.NTtfb, &e.Tps)
 		}
 		if err != nil {
-			writeServerError(w, "usage group scan", err)
-			return
+			return nil, err
 		}
 		e.Key = key
 		e.Name = name
 		entries = append(entries, e)
 	}
 	if err := rows.Err(); err != nil {
-		writeServerError(w, "usage group rows", err)
-		return
+		return nil, err
 	}
-	writeJSON(w, http.StatusOK, entries)
+	return entries, nil
+}
+
+// groupTotal 统计某个分组查询的**分组数**（不受 limit 影响）。
+//
+// 传进来的 query 必须是调用方那条 SELECT 去掉 LIMIT 的版本：包成子查询后
+// COUNT(*) 数的是分组行（一行一个上游/模型/密钥），而不是底层明细行数。
+func (h *UsageHandler) groupTotal(ctx context.Context, query string, args []any) (int64, error) {
+	var total int64
+	err := h.store.Reader().QueryRowContext(ctx, "SELECT COUNT(*) FROM ("+query+")", args...).Scan(&total)
+	return total, err
 }

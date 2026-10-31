@@ -61,15 +61,32 @@ func TestUsageGroupByKey_NoDoubleWhere(t *testing.T) {
 			if rec.Code != http.StatusOK {
 				t.Fatalf("code=%d body=%s", rec.Code, rec.Body.String())
 			}
-			var entries []usageGroupEntry
-			if err := json.Unmarshal(rec.Body.Bytes(), &entries); err != nil {
-				t.Fatalf("unmarshal: %v body=%s", err, rec.Body.String())
-			}
+			entries := decodeGroupPage(t, rec)
 			if len(entries) != tc.want {
 				t.Fatalf("want %d groups, got %d: %+v", tc.want, len(entries), entries)
 			}
 		})
 	}
+}
+
+// decodeGroupPage 解析 by-* 端点的 {records, total} 响应。
+//
+// 四个 by-* 统一返回对象（见 usageGroupPage 注释）：total 是**不受 limit 影响**
+// 的分组数，前端靠它把「显示前 N / 共 M」说出来。测试里绝大多数断言只关心
+// 行，所以这里直接给 .Records，需要 total 的用例再用 decodeGroupPageRaw。
+func decodeGroupPage(t *testing.T, rec *httptest.ResponseRecorder) []usageGroupEntry {
+	t.Helper()
+	return decodeGroupPageRaw(t, rec).Records
+}
+
+// decodeGroupPageRaw 连 total 一起返回（截断可见性用例用）。
+func decodeGroupPageRaw(t *testing.T, rec *httptest.ResponseRecorder) usageGroupPage {
+	t.Helper()
+	var page usageGroupPage
+	if err := json.Unmarshal(rec.Body.Bytes(), &page); err != nil {
+		t.Fatalf("unmarshal group page: %v body=%s", err, rec.Body.String())
+	}
+	return page
 }
 
 // TestUsageGroupBy_AfterPrune 守住「剪枝后 by-* 端点仍然出数」。
@@ -205,10 +222,7 @@ func TestUsageGroupBy_QualityColumns(t *testing.T) {
 		if rec.Code != http.StatusOK {
 			t.Fatalf("%s code=%d body=%s", tc.dim, rec.Code, rec.Body.String())
 		}
-		var entries []usageGroupEntry
-		if err := json.Unmarshal(rec.Body.Bytes(), &entries); err != nil {
-			t.Fatalf("%s unmarshal: %v", tc.dim, err)
-		}
+		entries := decodeGroupPage(t, rec)
 		if len(entries) != 1 {
 			t.Fatalf("%s entries=%d, want 1: %+v", tc.dim, len(entries), entries)
 		}
@@ -261,10 +275,7 @@ func TestUsageGroupBy_QualityColumnsSurvivePrune(t *testing.T) {
 	if rec.Code != http.StatusOK {
 		t.Fatalf("before prune code=%d body=%s", rec.Code, rec.Body.String())
 	}
-	var before []usageGroupEntry
-	if err := json.Unmarshal(rec.Body.Bytes(), &before); err != nil || len(before) != 1 {
-		t.Fatalf("before prune: %v entries=%+v", err, before)
-	}
+	before := decodeGroupPage(t, rec)
 
 	if _, err := st.PruneOldUsage(ctx, store.DefaultRetentionDays); err != nil {
 		t.Fatalf("prune: %v", err)
@@ -276,10 +287,7 @@ func TestUsageGroupBy_QualityColumnsSurvivePrune(t *testing.T) {
 	if rec2.Code != http.StatusOK {
 		t.Fatalf("after prune code=%d body=%s", rec2.Code, rec2.Body.String())
 	}
-	var after []usageGroupEntry
-	if err := json.Unmarshal(rec2.Body.Bytes(), &after); err != nil || len(after) != 1 {
-		t.Fatalf("after prune: %v entries=%+v", err, after)
-	}
+	after := decodeGroupPage(t, rec2)
 
 	b, a := before[0], after[0]
 	if a.NTtfb != b.NTtfb || a.NTtfb != 1 {
@@ -327,10 +335,7 @@ func TestUsageGroupBy_ProviderDownsName(t *testing.T) {
 	if rec.Code != http.StatusOK {
 		t.Fatalf("code=%d body=%s", rec.Code, rec.Body.String())
 	}
-	var entries []usageGroupEntry
-	if err := json.Unmarshal(rec.Body.Bytes(), &entries); err != nil || len(entries) != 1 {
-		t.Fatalf("unmarshal: %v entries=%+v", err, entries)
-	}
+	entries := decodeGroupPage(t, rec)
 	if entries[0].Name != "OpenAI 官方" {
 		t.Errorf("by-provider name=%q, want %q（界面上要显示上游名，不是 provider_id）",
 			entries[0].Name, "OpenAI 官方")
@@ -345,10 +350,7 @@ func callGroup(t *testing.T, fn func(http.ResponseWriter, *http.Request), url st
 	if rec.Code != http.StatusOK {
 		t.Fatalf("%s code=%d body=%s", url, rec.Code, rec.Body.String())
 	}
-	var entries []usageGroupEntry
-	if err := json.Unmarshal(rec.Body.Bytes(), &entries); err != nil {
-		t.Fatalf("%s unmarshal: %v body=%s", url, err, rec.Body.String())
-	}
+	entries := decodeGroupPage(t, rec)
 	return len(entries)
 }
 
@@ -396,10 +398,7 @@ func TestUsageGroupBy_ScopeNarrowsArchive(t *testing.T) {
 	if rec.Code != http.StatusOK {
 		t.Fatalf("code=%d body=%s", rec.Code, rec.Body.String())
 	}
-	var entries []usageGroupEntry
-	if err := json.Unmarshal(rec.Body.Bytes(), &entries); err != nil {
-		t.Fatalf("unmarshal: %v body=%s", err, rec.Body.String())
-	}
+	entries := decodeGroupPage(t, rec)
 	if len(entries) != 1 {
 		t.Fatalf("u1 should see exactly 1 group, got %d: %+v", len(entries), entries)
 	}
@@ -572,5 +571,55 @@ func TestExportCSV_ReportsTruncation(t *testing.T) {
 	}
 	if got := rec2.Header().Get("X-Export-Total"); got != "1" {
 		t.Errorf("X-Export-Total=%q, want 1", got)
+	}
+}
+
+// TestUsageGroupBy_TotalReportsUntruncatedCount 钉住「截断必须可见」。
+//
+// by-key / by-model / by-provider 都吃 limit（默认 100、上限 1000），而用量
+// 统计页会把行求和印成「当前范围汇总」。分组数一旦超过 limit，那个合计就只是
+// 前 N 名的合计 —— 而界面上它和全量合计完全同形，只表现为「和顶部汇总卡对不上」。
+// 所以 total 必须是**不受 limit 影响**的分组数（口径与 by-user 一致）。
+func TestUsageGroupBy_TotalReportsUntruncatedCount(t *testing.T) {
+	st := newTestStore(t)
+	h := NewUsageHandler(st)
+	ctx := t.Context()
+	now := time.Now().UnixMilli()
+	for i, key := range []string{"k1", "k2", "k3"} {
+		if err := st.CreateUsageRecord(ctx, &store.UsageRecord{
+			ID:              fmt.Sprintf("t%d", i),
+			Ts:              now,
+			AccessKeyID:     key,
+			PublicModel:     "m",
+			ProviderID:      "p1",
+			UpstreamModel:   "x",
+			IngressProtocol: "chat",
+			InputTokens:     10,
+			OutputTokens:    5,
+			TotalTokens:     15,
+			Status:          "ok",
+			HTTPStatus:      200,
+		}); err != nil {
+			t.Fatalf("create usage: %v", err)
+		}
+	}
+
+	// 被截断：三个密钥，只要两行。
+	rec := httptest.NewRecorder()
+	h.GroupByKey(rec, asAdmin(httptest.NewRequest(http.MethodGet, "/admin/api/usage/by-key?from=0&limit=2", nil)))
+	page := decodeGroupPageRaw(t, rec)
+	if len(page.Records) != 2 {
+		t.Fatalf("limit=2 必须只返回 2 行，实际 %d", len(page.Records))
+	}
+	if page.Total != 3 {
+		t.Fatalf("total 必须是未截断的分组数 3，实际 %d（否则前端会把前两名合计当成全量）", page.Total)
+	}
+
+	// 没被截断：limit 足够大时 total 就等于行数（也说明没有白跑 COUNT）。
+	rec = httptest.NewRecorder()
+	h.GroupByKey(rec, asAdmin(httptest.NewRequest(http.MethodGet, "/admin/api/usage/by-key?from=0&limit=50", nil)))
+	page = decodeGroupPageRaw(t, rec)
+	if len(page.Records) != 3 || page.Total != 3 {
+		t.Fatalf("未截断时 records/total 都应是 3，实际 %d/%d", len(page.Records), page.Total)
 	}
 }

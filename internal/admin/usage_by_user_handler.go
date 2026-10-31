@@ -35,17 +35,18 @@ type usageUserEntry struct {
 
 // usageByUserResponse 是 by-user 的响应：当页行 + **有消费的用户总数**。
 //
-// # 为什么这一个 by-* 端点返回对象，而它的三个兄弟返回裸数组
+// # 为什么 by-* 一族都返回 { records, total } 而不是裸数组
 //
-// by-key / by-model / by-provider 由总览页调用，固定 limit=10 且只用来画
-// 「Top 10」条形图 —— 截断是它们的**既定语义**（标题就写着 Top 10），
-// 所以不需要总数。
-//
-// 而这张表是**按金额读账**的：管理员会把它当成「所有人各花了多少」。
+// 这张表是**按金额读账**的：管理员会把它当成「所有人各花了多少」。
 // 一旦用户数超过 limit，一张被截断的表与一张完整的表在界面上完全同形 ——
 // 把「前 100 名」读成「全部用户」会直接得出错误的结论（「合计怎么对不上
 // 上面那张汇总卡」）。所以必须把 total 下发，让前端能说出「前 N / 共 M」。
 // 与 ExportCSV 写 X-Export-Truncated 同一个原则：**截断必须可见**。
+//
+// 2026-10-31：另外三个 by-*（by-day / by-model / by-key / by-provider）也从
+// 裸数组改成了同一个形状 —— 它们原先「只画 Top 10，所以不需要总数」的理由
+// 在用量统计页改版后已经过期（那一页用 limit=200 拉列表并把行求和当合计）。
+// 见 usageGroupPage 的注释。
 // @ts-type UsageByUserPage
 type usageByUserResponse struct {
 	Records []usageUserEntry `json:"records"`

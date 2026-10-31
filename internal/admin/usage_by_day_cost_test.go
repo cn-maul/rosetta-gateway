@@ -84,11 +84,17 @@ func callByDay(t *testing.T, h *UsageHandler, as func(*http.Request) *http.Reque
 	if rec.Code != http.StatusOK {
 		t.Fatalf("code=%d body=%s", rec.Code, rec.Body.String())
 	}
-	var out []dayCostEntry
-	if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil {
+	var page struct {
+		Records []dayCostEntry `json:"records"`
+		Total   int64          `json:"total"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &page); err != nil {
 		t.Fatalf("unmarshal: %v body=%s", err, rec.Body.String())
 	}
-	return out
+	if page.Total != int64(len(page.Records)) {
+		t.Fatalf("by-day 不带 limit，total 必须等于行数：total=%d rows=%d", page.Total, len(page.Records))
+	}
+	return page.Records
 }
 
 // TestGroupByDay_CostIsSumOfThatDay 钉住「按天的费用 = 那天各条费用之和」。
@@ -248,10 +254,14 @@ func TestGroupByDay_DoesNotTruncateLongSeries(t *testing.T) {
 	if rec.Code != http.StatusOK {
 		t.Fatalf("code=%d body=%s", rec.Code, rec.Body.String())
 	}
-	var got []dayCostEntry
-	if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
+	var page struct {
+		Records []dayCostEntry `json:"records"`
+		Total   int64          `json:"total"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &page); err != nil {
 		t.Fatalf("unmarshal: %v body=%s", err, rec.Body.String())
 	}
+	got := page.Records
 	if len(got) != days {
 		t.Fatalf("请求 %d 天必须返回 %d 天，实际 %d（说明仍在套用 Top-N 截断）", days, days, len(got))
 	}

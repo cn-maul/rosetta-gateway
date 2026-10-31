@@ -859,6 +859,24 @@ export interface UsageGroupEntry {
 }
 
 /**
+ * 四个 by-* 端点（by-day / by-model / by-key / by-provider）的响应：
+ * 当页行 + 分组总数（2026-10-31 起统一成这个形状）。
+ *
+ * 为什么不是裸数组：by-key / by-model / by-provider 都吃 limit（默认 100、
+ * 上限 1000），而用量统计页会把行求和印成「当前范围汇总」。分组数一旦超过
+ * limit，那个合计只是前 N 名的合计 —— 界面上它与全量合计完全同形，只表现为
+ * 「和顶部那张汇总卡对不上」。所以后端下发 total（**不受 limit 影响**），
+ * 前端才能说出「显示前 N / 共 M」，并把那个合计改称「前 N 名合计」。
+ *
+ * by-day 不带 limit（时间序列必须覆盖整个区间），它的 total 恒等于行数。
+ */
+export interface UsageGroupPage {
+  records: UsageGroupEntry[]
+  /** 分组总数，不受 limit 影响。 */
+  total: number
+}
+
+/**
  * GET /admin/api/usage/by-user 的一行：**一个用户**的消费汇总。
  *
  * 存在的理由：钱包页要「消费汇总一表一行一个用户」。现有的 by-* 端点

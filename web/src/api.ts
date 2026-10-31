@@ -472,6 +472,7 @@ import type {
   Stats,
   StatsOverview,
   UsageGroupEntry,
+  UsageGroupPage,
   UsageByUserPage,
   UsageHistoryPage,
   HistoryFilters,
@@ -851,24 +852,28 @@ export const api = {
     download('POST', '/config-export/export', { passphrase }, 'rosetta-config.json.enc'),
   importConfig: (data: unknown, passphrase: string, dryRun: boolean) =>
     post<ConfigImportResult>('/config-export/import', { data, passphrase, dry_run: dryRun }),
-  usageByDay: (from: number, to: number) => get<UsageGroupEntry[]>(`/usage/by-day?from=${from}&to=${to}`),
+  // 四个 by-* 统一返回 { records, total }（2026-10-31）。total 是不受 limit
+  // 影响的分组数 —— 没有它，一张被 limit 截断的表和一张完整的表在界面上
+  // 完全同形，而用量统计页会把行求和当成「当前范围汇总」展示。
+  usageByDay: (from: number, to: number) =>
+    get<UsageGroupPage>(`/usage/by-day?from=${from}&to=${to}`),
   // limit 不再写死 10：总览页的「Top 10」只需要前几条，而用量统计页的
   // 上游 / 模型页要列出**全部**参与调用的上游与模型 —— 写死 10 的话，
   // 第 11 个之后的上游在统计页直接消失，而它在总览页也不出现，
   // 于是「这个上游到底有没有在用」这个问题没有任何页面能回答。
   usageByModel: (from = 0, to = Date.now(), limit = 200) =>
-    get<UsageGroupEntry[]>(`/usage/by-model?from=${from}&to=${to}&limit=${limit}`),
+    get<UsageGroupPage>(`/usage/by-model?from=${from}&to=${to}&limit=${limit}`),
   usageByKey: (from = 0, to = Date.now(), limit = 200) =>
-    get<UsageGroupEntry[]>(`/usage/by-key?from=${from}&to=${to}&limit=${limit}`),
+    get<UsageGroupPage>(`/usage/by-key?from=${from}&to=${to}&limit=${limit}`),
   usageByProvider: (from = 0, to = Date.now(), limit = 200) =>
-    get<UsageGroupEntry[]>(`/usage/by-provider?from=${from}&to=${to}&limit=${limit}`),
+    get<UsageGroupPage>(`/usage/by-provider?from=${from}&to=${to}&limit=${limit}`),
   /**
    * 按用户汇总消费（钱包页「消费汇总」一表一行一个用户）。
    *
    * from=0 是「全部历史」（显式传 0，后端用 queryRangeExplicit 区分
    * 「显式 0」与「没传」—— 后者才回落到近 7 天）。钱包页要的正是全部历史。
    *
-   * 返回 { records, total } 而**不是裸数组**（与上面四个 by-* 不同）：
+   * 返回 { records, total }（与上面四个 by-* 同一个形状，见 UsageGroupPage）：
    * total 是有消费的用户总数、不受 limit 影响，前端要靠它说出
    * 「显示前 N / 共 M 位用户」。没有它，一张被 limit 截断的表与一张完整的表
    * 在界面上完全同形 —— 而这张表是按金额读账的，把「前 N 名」读成全量

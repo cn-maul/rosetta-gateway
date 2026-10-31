@@ -45,10 +45,7 @@ func callByModel(t *testing.T, h *UsageHandler) []usageGroupEntry {
 	if rec.Code != http.StatusOK {
 		t.Fatalf("by-model code=%d body=%s", rec.Code, rec.Body.String())
 	}
-	var entries []usageGroupEntry
-	if err := json.Unmarshal(rec.Body.Bytes(), &entries); err != nil {
-		t.Fatalf("unmarshal: %v body=%s", err, rec.Body.String())
-	}
+	entries := decodeGroupPage(t, rec)
 	return entries
 }
 

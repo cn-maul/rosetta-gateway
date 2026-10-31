@@ -462,6 +462,10 @@ export const DTO_CONTRACTS: readonly DTOFieldContract[] = [
     "n_ttfb",
     "tps",
   ] },
+  { goType: "internal/admin.usageGroupPage", tsType: "UsageGroupPage", fields: [
+    "records",
+    "total",
+  ] },
   { goType: "internal/admin.usageHistoryEntry", tsType: "UsageHistoryEntry", fields: [
     "ts",
     "public_model",

@@ -93,7 +93,7 @@ export function Wallet() {
       if (d === null) {
         setByDay([])
       } else if (d.ok) {
-        setByDay(d.r)
+        setByDay(d.r.records)
       } else {
         setByDay([])
         setByDayErr(d.e instanceof Error ? '消耗记录加载失败：' + d.e.message : '消耗记录加载失败')
