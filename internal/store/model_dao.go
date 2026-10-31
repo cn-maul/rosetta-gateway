@@ -431,23 +431,37 @@ func compactTargetPositions(ctx context.Context, ex execer, routeID string) erro
 // 传 0 等于「批量清除价格」，与单条 PATCH 的既有约定保持一致 —— 否则
 // 批量写 0 会落成字面 0 元，与单条路径语义分裂。
 //
+// cacheCreation 传 nil 表示「批量改价不动缓存写入价」。
+//
+// 为什么这一档单独是指针：界面上已经不再暴露「缓存写入」价格（2026-10-31，
+// 由运维拍板），批量改价只改输入/命中/输出三档。若沿用「漏传=0」的整体替换
+// 语义，每次批量改价都会把别人手工配过的缓存写入价静默清空 —— 那是数据丢失，
+// 不是「整体替换」。nil = 保持原值，与单条 PATCH 的约定一致。
+//
 // 返回实际更新的行数。调用方（admin handler）用它核对「ids 里有多少真的
 // 存在」—— 传了 10 个 id 只更新 8 个，说明有 2 个 id 写错了，必须报错
 // 而不是静默跳过（沿用凭据「坏值必须让操作失败而不是部分生效」的立场）。
-func (s *Store) BatchUpdateModelPrices(ctx context.Context, ids []string, priceInput, priceCacheHit, priceCacheCreation, priceOutput float64) (int64, error) {
+func (s *Store) BatchUpdateModelPrices(ctx context.Context, ids []string, priceInput, priceCacheHit float64, cacheCreation *float64, priceOutput float64) (int64, error) {
 	if len(ids) == 0 {
 		return 0, nil
 	}
 	placeholders := strings.Repeat("?,", len(ids))
 	placeholders = placeholders[:len(placeholders)-1]
 	args := make([]any, 0, len(ids)+4)
-	args = append(args, nullIfZeroFloat(priceInput), nullIfZeroFloat(priceCacheHit),
-		nullIfZeroFloat(priceCacheCreation), nullIfZeroFloat(priceOutput))
+	args = append(args, nullIfZeroFloat(priceInput), nullIfZeroFloat(priceCacheHit))
+	// 缓存写入价单独拼 SET 片段：nil = 整段不出现（保持原值）；非 nil 时按传值
+	// 走 nullIfZeroFloat，所以显式传 0 仍然是「清除这一档」——两种意图都表达得出来。
+	setCreation := ""
+	if cacheCreation != nil {
+		setCreation = ", price_cache_creation = ?"
+		args = append(args, nullIfZeroFloat(*cacheCreation))
+	}
+	args = append(args, nullIfZeroFloat(priceOutput))
 	for _, id := range ids {
 		args = append(args, id)
 	}
 	res, err := s.db.ExecContext(ctx,
-		`UPDATE upstream_models SET price_input = ?, price_cache_hit = ?, price_cache_creation = ?, price_output = ? WHERE id IN (`+placeholders+`)`,
+		`UPDATE upstream_models SET price_input = ?, price_cache_hit = ?`+setCreation+`, price_output = ? WHERE id IN (`+placeholders+`)`,
 		args...)
 	if err != nil {
 		return 0, err
@@ -512,9 +526,12 @@ func (s *Store) UpsertUpstreamModel(ctx context.Context, m *UpstreamModel) error
 }
 
 func upsertUpstreamModel(ctx context.Context, ex execer, m *UpstreamModel) error {
+	// price_cache_creation 也要进 INSERT 列表（2026-10-31）：手动添加模型这条
+	// 路径允许直接带价格进来，漏了这一列会让「填了缓存写入价」静默丢失。
+	// ON CONFLICT 仍然完全不碰价格列（理由见函数注释），所以对已有模型无影响。
 	_, err := ex.ExecContext(ctx,
-		`INSERT INTO upstream_models (id, provider_id, model_id, display_name, context_window, max_output_tokens, supports_thinking, effort_levels, price_input, price_cache_hit, price_output)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		`INSERT INTO upstream_models (id, provider_id, model_id, display_name, context_window, max_output_tokens, supports_thinking, effort_levels, price_input, price_cache_hit, price_cache_creation, price_output)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		 ON CONFLICT(provider_id, model_id) DO UPDATE SET
 		   display_name = excluded.display_name,
 		   context_window = excluded.context_window,
@@ -524,7 +541,8 @@ func upsertUpstreamModel(ctx context.Context, ex execer, m *UpstreamModel) error
 		m.ID, m.ProviderID, m.ModelID, nullIfEmpty(m.DisplayName),
 		nullIfZeroInt(m.ContextWindow), nullIfZeroInt(m.MaxOutputTokens), m.SupportsThinking,
 		effortColumnValue(m),
-		nullIfZeroFloat(m.PriceInput), nullIfZeroFloat(m.PriceCacheHit), nullIfZeroFloat(m.PriceOutput))
+		nullIfZeroFloat(m.PriceInput), nullIfZeroFloat(m.PriceCacheHit),
+		nullIfZeroFloat(m.PriceCacheCreation), nullIfZeroFloat(m.PriceOutput))
 	return err
 }
 

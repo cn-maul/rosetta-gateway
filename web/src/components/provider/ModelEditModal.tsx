@@ -38,7 +38,6 @@ export function ModelEditModal({
   const [maxOutputTokens, setMaxOutputTokens] = useState('0')
   const [priceInput, setPriceInput] = useState('0')
   const [priceCacheHit, setPriceCacheHit] = useState('0')
-  const [priceCacheCreation, setPriceCacheCreation] = useState('0')
   const [priceOutput, setPriceOutput] = useState('0')
   const [effortCsv, setEffortCsv] = useState('')
   const [thinking, setThinkingState] = useState<Thinking>('unset')
@@ -51,7 +50,6 @@ export function ModelEditModal({
     setMaxOutputTokens(String(original.max_output_tokens ?? 0))
     setPriceInput(String(original.price_input ?? 0))
     setPriceCacheHit(String(original.price_cache_hit ?? 0))
-    setPriceCacheCreation(String(original.price_cache_creation ?? 0))
     setPriceOutput(String(original.price_output ?? 0))
     // unknown 档位附在后面：它们是网关不认、但可能是上游认得的厂商私有值，
     // 编辑时必须原样带回去，否则点一次保存就把它们悄悄抹掉了。
@@ -102,19 +100,21 @@ export function ModelEditModal({
       toast.danger('上游模型名（model_id）为必填项')
       return
     }
-    const prices = [priceInput, priceCacheHit, priceCacheCreation, priceOutput].map(Number)
+    const prices = [priceInput, priceCacheHit, priceOutput].map(Number)
     if (prices.some((v) => !Number.isFinite(v) || v < 0)) {
       toast.danger('单价必须是大于等于 0 的数字')
       return
     }
     setSaving(true)
     try {
-      if (
+      // 「原来配过价、现在三档全填 0」= 清除。判断里带上 price_cache_creation：
+      // 那一档界面不再暴露，但库里可能还有值，清除时得一并清掉（下面显式
+      // 传 0），否则会留下一个看不见的价在继续计费。
+      const clearing =
         [original.price_input, original.price_cache_hit, original.price_cache_creation, original.price_output].some(
           (v) => v > 0,
-        ) &&
-        prices.every((v) => v === 0)
-      ) {
+        ) && prices.every((v) => v === 0)
+      if (clearing) {
         const ok = await confirmBox({
           title: '清除该模型的全部价格？',
           body: '之后的调用将按 0 元计费，历史费用不变。',
@@ -128,8 +128,10 @@ export function ModelEditModal({
         max_output_tokens: Number(maxOutputTokens) || 0,
         price_input: prices[0],
         price_cache_hit: prices[1],
-        price_cache_creation: prices[2],
-        price_output: prices[3],
+        price_output: prices[2],
+        // 缓存写入价界面上不再暴露（2026-10-31）：不清除时**不发这个字段**，
+        // PATCH 的 nil 语义 = 保持原值；清除时显式发 0 把它一并清掉。
+        price_cache_creation: clearing ? 0 : undefined,
         // 空串 = 清除（回到未配置），与界面上「一个都不勾选」是同一个动作。
         effort_levels: effortCsv,
         // 三态映射：unset → null（后端解成「清除」）。不能省略字段 ——
@@ -195,10 +197,13 @@ export function ModelEditModal({
         </div>
         <fieldset className="min-w-0" disabled={saving}>
           <div className="text-muted text-[11px]">单价（元 / 1M tokens）</div>
+          {/* 三档而不是四档：缓存写入价（Anthropic cache_creation）2026-10-31
+              起不再在界面上暴露 —— 绝大多数上游不给这个数，留一格空着反而
+              让人以为自己漏填。未配置时计费侧按输入价算，需要特殊定价的
+              仍可由配置导入写入。 */}
           <div className="mt-2 grid grid-cols-3 gap-2">
             {PriceField('输入', priceInput, setPriceInput)}
             {PriceField('缓存命中', priceCacheHit, setPriceCacheHit)}
-            {PriceField('缓存写入', priceCacheCreation, setPriceCacheCreation)}
             {PriceField('输出', priceOutput, setPriceOutput)}
           </div>
           <div className="mt-4">
@@ -283,6 +288,11 @@ export function ModelDiscoverModal({
   const [mDisplayName, setMDisplayName] = useState('')
   const [mContextWindow, setMContextWindow] = useState('0')
   const [mMaxOutput, setMMaxOutput] = useState('0')
+  // 手动档也带单价：现场添加模型的人通常手里就有价目表，逼他「先建空模型、
+  // 再到列表里逐条补价」是白跑一趟。三档与编辑弹窗一致（无缓存写入）。
+  const [mPriceInput, setMPriceInput] = useState('0')
+  const [mPriceCacheHit, setMPriceCacheHit] = useState('0')
+  const [mPriceOutput, setMPriceOutput] = useState('0')
 
   useEffect(() => {
     if (!open) return
@@ -295,6 +305,9 @@ export function ModelDiscoverModal({
     setMDisplayName('')
     setMContextWindow('0')
     setMMaxOutput('0')
+    setMPriceInput('0')
+    setMPriceCacheHit('0')
+    setMPriceOutput('0')
   }, [open])
 
   const filteredDiscovered = useMemo(() => {
@@ -369,11 +382,16 @@ export function ModelDiscoverModal({
     }
   }
 
-  /** 手动添加：只要 model_id，其余留 0 由后端回落到模型默认值。 */
+  /** 手动添加：model_id 必填，其余留 0 由后端回落到模型默认值。 */
   const submitManual = async () => {
     const id = mModelId.trim()
     if (!id) {
       toast.danger('上游模型名（model_id）为必填项')
+      return
+    }
+    const prices = [mPriceInput, mPriceCacheHit, mPriceOutput].map(Number)
+    if (prices.some((v) => !Number.isFinite(v) || v < 0)) {
+      toast.danger('单价必须是大于等于 0 的数字')
       return
     }
     setImporting(true)
@@ -384,6 +402,11 @@ export function ModelDiscoverModal({
           display_name: mDisplayName.trim(),
           context_window: Number(mContextWindow) || 0,
           max_output_tokens: Number(mMaxOutput) || 0,
+          // 0 = 不配价（后端保持价格列为 NULL）。四项都填 0 与「留空」等价，
+          // 不会落成「确认免费」的 0 元条目。
+          price_input: prices[0],
+          price_cache_hit: prices[1],
+          price_output: prices[2],
         },
       ])
       toast.success(`已添加 ${r.imported} 个模型`)
@@ -479,9 +502,18 @@ export function ModelDiscoverModal({
                 <Input type="number" min={0} step={1} placeholder="0 = 用默认值" />
               </TextField>
             </div>
+            <fieldset className="min-w-0" disabled={importing}>
+              <div className="text-muted text-[11px]">单价（元 / 1M tokens）</div>
+              <div className="mt-2 grid grid-cols-3 gap-2">
+                {PriceField('输入', mPriceInput, setMPriceInput)}
+                {PriceField('缓存命中', mPriceCacheHit, setMPriceCacheHit)}
+                {PriceField('输出', mPriceOutput, setMPriceOutput)}
+              </div>
+            </fieldset>
             <span className="text-muted text-[11px]">
               上游不实现 /models 或不给列表权限时用这一档。上下文窗口与最大输出填 0
-              会套用「模型默认值」；价格与思考挡位请在添加后到列表里逐个编辑。
+              会套用「模型默认值」；单价留 0 = 不配价（之后可到列表里改），思考挡位请在
+              添加后到列表里逐个编辑。
             </span>
           </form>
         ) : (

@@ -417,18 +417,14 @@ export function Models() {
                     <div className="flex flex-col gap-[3px] text-[12.5px]">
                       <PriceRow label="输入" value={priceCell(priceOf(m)?.price_input)} unset={(priceOf(m)?.price_input ?? 0) <= 0} unsetClass={unsetClass} />
                       <PriceRow label="输出" value={priceCell(priceOf(m)?.price_output)} unset={(priceOf(m)?.price_output ?? 0) <= 0} unsetClass={unsetClass} />
-                      {/* 「其中:」前缀不能省：缓存命中/写入是**输入的一部分**
-                          （cached 与 creation 都 ⊆ input），不是额外成本。 */}
+                      {/* 「其中:」前缀不能省：缓存命中是**输入的一部分**
+                          （cached ⊆ input），不是额外成本。缓存写入价 2026-10-31
+                          起不再展示 —— 它未配置时按输入价计，单独列一行只会让
+                          人误以为「这里有笔没填的钱」。 */}
                       <PriceRow
                         label="其中:缓存命中"
                         value={cacheUnitPrice(priceOf(m)?.price_input ?? 0, priceOf(m)?.price_cache_hit ?? 0)}
                         unset={(priceOf(m)?.price_cache_hit ?? 0) <= 0 && (priceOf(m)?.price_input ?? 0) <= 0}
-                        unsetClass={unsetClass}
-                      />
-                      <PriceRow
-                        label="其中:缓存写入"
-                        value={cacheUnitPrice(priceOf(m)?.price_input ?? 0, priceOf(m)?.price_cache_creation ?? 0)}
-                        unset={(priceOf(m)?.price_cache_creation ?? 0) <= 0 && (priceOf(m)?.price_input ?? 0) <= 0}
                         unsetClass={unsetClass}
                       />
                     </div>

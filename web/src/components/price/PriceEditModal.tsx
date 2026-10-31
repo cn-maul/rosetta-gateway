@@ -133,7 +133,6 @@ export function PriceEditModal({
         </div>
         {PriceField('输入价格（元/1M）', form.price_input, (v) => onPatch({ price_input: v }), '缓存未命中的输入 token')}
         {PriceField('缓存命中价格（元/1M）', form.price_cache_hit, (v) => onPatch({ price_cache_hit: v }), '留空/填 0 时按输入价计')}
-        {PriceField('缓存写入价格（元/1M）', form.price_cache_creation, (v) => onPatch({ price_cache_creation: v }), 'Anthropic cache creation；留空/填 0 时按输入价计')}
         {PriceField('输出价格（元/1M）', form.price_output, (v) => onPatch({ price_output: v }))}
       </form>
     </AppModal>

@@ -188,6 +188,9 @@ export const DTO_CONTRACTS: readonly DTOFieldContract[] = [
     "max_output_tokens",
     "effort_levels",
     "supports_thinking",
+    "price_input",
+    "price_cache_hit",
+    "price_output",
   ] },
   { goType: "internal/admin.modelMeta", tsType: "ModelMeta", fields: [
     "name",

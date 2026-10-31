@@ -34,12 +34,14 @@ export interface PriceFormState {
   modelId: string
   price_input: string
   price_cache_hit: string
-  price_cache_creation: string
   price_output: string
   saving: boolean
 }
 
-export const emptyPrices = { price_input: '', price_cache_hit: '', price_cache_creation: '', price_output: '' }
+// 三档价格。缓存写入价（Anthropic cache_creation）2026-10-31 起不再出现在任何
+// 界面上：绝大多数上游不给这个数，多一格空位只会让人以为漏填。库里该列仍在，
+// 未配置时计费侧按输入价算（internal/store/pricing.go 的 EffectivePrices）。
+export const emptyPrices = { price_input: '', price_cache_hit: '', price_output: '' }
 
 export function PriceField(
   label: string,

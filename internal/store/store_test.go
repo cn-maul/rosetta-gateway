@@ -311,6 +311,34 @@ func TestUpsertUpstreamModel_KeepsPrices(t *testing.T) {
 	}
 }
 
+// 新增行（不是冲突更新）时必须把四档单价全部写进去。
+//
+// 2026-10-31：手动添加模型这条路径允许直接带价导入，而 upsert 的 INSERT
+// 列清单当时漏了 price_cache_creation —— 那条路径上填的缓存写入价会静默
+// 丢掉，接口回 200、界面看不出异常。
+func TestUpsertUpstreamModel_InsertWritesAllFourPrices(t *testing.T) {
+	ctx := context.Background()
+	st := testStore(t, t.TempDir()+"/gw.db")
+
+	if err := st.CreateProvider(ctx, &Provider{ID: "p1", Slug: "p1", Name: "P1", Endpoint: "http://x", Protocol: "chat", Enabled: true}); err != nil {
+		t.Fatalf("provider: %v", err)
+	}
+	if err := st.UpsertUpstreamModel(ctx, &UpstreamModel{
+		ID: "m1", ProviderID: "p1", ModelID: "chat",
+		PriceInput: 1, PriceCacheHit: 0.1, PriceCacheCreation: 1.25, PriceOutput: 2,
+	}); err != nil {
+		t.Fatalf("upsert insert: %v", err)
+	}
+
+	got, err := st.GetUpstreamModel(ctx, "m1")
+	if err != nil || got == nil {
+		t.Fatalf("get: %v %v", got, err)
+	}
+	if got.PriceInput != 1 || got.PriceCacheHit != 0.1 || got.PriceCacheCreation != 1.25 || got.PriceOutput != 2 {
+		t.Fatalf("upsert 插入漏写价格列: %+v", got)
+	}
+}
+
 // DSN 参数必须真实生效：驱动对 _journal_mode / _synchronous / _foreign_keys
 // 是解析式支持，写错参数名会被**静默忽略**（不报错）——journal_mode 退化成
 // delete 会失去读写并发，synchronous 退化成 FULL 会让每条用量 INSERT 都 fsync。

@@ -102,11 +102,11 @@ export function CredentialPanel({
       <div className="flex flex-wrap items-center justify-between gap-2">
         <h2 className="text-sm font-semibold">凭据（{creds.length}）</h2>
         <div className="flex items-center gap-2">
-          <Button variant="secondary" size="sm" onPress={onAdd}>
+          <Button variant="outline" size="sm" onPress={onAdd}>
             添加凭据
           </Button>
           <Button
-            variant="ghost"
+            variant="outline"
             size="sm"
             isDisabled={balanceBusy}
             aria-label="实时向该上游查询每把凭据的余额（不自动刷新）"
@@ -199,10 +199,10 @@ export function CredentialPanel({
                               <Switch.Thumb />
                             </Switch.Control>
                           </Switch>
-                          <Button variant="ghost" size="sm" onPress={() => onEdit(c)}>
+                          <Button variant="outline" size="sm" onPress={() => onEdit(c)}>
                             换钥
                           </Button>
-                          <Button variant="ghost" size="sm" onPress={() => onRemove(c)}>
+                          <Button variant="danger-soft" size="sm" onPress={() => onRemove(c)}>
                             删除
                           </Button>
                         </div>

@@ -19,7 +19,8 @@ import type { UpstreamModel } from '../types'
 
 /**
  * 一格里三个单价横排成「输入 | 输出 | 缓存命中」——
- * 顺序与编辑弹窗的字段顺序一致（输入、输出、缓存命中、缓存写入）。
+ * 顺序与编辑弹窗的字段顺序一致（输入、缓存命中、输出；缓存写入价 2026-10-31
+ * 起不再暴露，未配置时按输入价计费）。
  * 未配置用「—」而不是「未配置」：一格里挤三个词会撑爆列宽，
  * 完整口径在 title 与编辑弹窗里。
  */
@@ -117,7 +118,7 @@ export function UpstreamModelPanel({
     <section className="flex flex-col gap-3">
       <div className="flex flex-wrap items-center justify-between gap-2">
         <h2 className="text-sm font-semibold">上游模型（{models.length}）</h2>
-        <Button variant="secondary" size="sm" onPress={onAdd}>
+        <Button variant="outline" size="sm" onPress={onAdd}>
           添加模型
         </Button>
       </div>
@@ -185,7 +186,7 @@ export function UpstreamModelPanel({
                             provider 级测试不同，这个能证明「这个 model_id
                             现在真的能推理」（下架/无权限/名字写错都会红）。 */}
                         <Button
-                          variant="ghost"
+                          variant="outline"
                           size="sm"
                           isDisabled={testing.has(m.id)}
                           aria-label="真实调用一次（max_tokens=1）验证该模型可用"
@@ -193,7 +194,7 @@ export function UpstreamModelPanel({
                         >
                           {testing.has(m.id) ? '测试中…' : '测试'}
                         </Button>
-                        <Button variant="ghost" size="sm" onPress={() => onEdit(m)}>
+                        <Button variant="outline" size="sm" onPress={() => onEdit(m)}>
                           编辑
                         </Button>
                         {/* 链首置灰：后端对链首删除回 409，所以这里提前
@@ -201,7 +202,7 @@ export function UpstreamModelPanel({
                              隐藏：模型确实需要一个删除入口，只是这个模型现在
                              不能删 —— 藏起来会让人以为没有删除功能。 */}
                         <Button
-                          variant="ghost"
+                          variant="danger-soft"
                           size="sm"
                           isDisabled={m.is_route_head}
                           aria-label={

@@ -162,7 +162,6 @@ export function PriceSettings({ refreshSignal }: { refreshSignal: number }) {
       modelId: r.model.id,
       price_input: String(r.model.price_input),
       price_cache_hit: String(r.model.price_cache_hit),
-      price_cache_creation: String(r.model.price_cache_creation),
       price_output: String(r.model.price_output),
       saving: false,
     })
@@ -173,18 +172,19 @@ export function PriceSettings({ refreshSignal }: { refreshSignal: number }) {
       toast.danger('请选择要设置价格的模型')
       return
     }
+    // 三档，缓存写入价不出现（见 priceShared.emptyPrices 的注释）。PATCH 不带
+    // 这个字段 = 保持原值，所以改价不会顺手清掉库里已有的缓存写入价。
     const body = {
       price_input: Number(pForm.price_input) || 0,
       price_cache_hit: Number(pForm.price_cache_hit) || 0,
-      price_cache_creation: Number(pForm.price_cache_creation) || 0,
       price_output: Number(pForm.price_output) || 0,
     }
-    if (body.price_input < 0 || body.price_cache_hit < 0 || body.price_cache_creation < 0 || body.price_output < 0) {
+    if (body.price_input < 0 || body.price_cache_hit < 0 || body.price_output < 0) {
       toast.danger('单价不能为负数')
       return
     }
-    // 四项全 0 = 不生成条目（列表里不会出现该行），属于「什么都没填」而不是有效价格。
-    if (body.price_input === 0 && body.price_cache_hit === 0 && body.price_cache_creation === 0 && body.price_output === 0) {
+    // 三档全 0 = 不生成条目（列表里不会出现该行），属于「什么都没填」而不是有效价格。
+    if (body.price_input === 0 && body.price_cache_hit === 0 && body.price_output === 0) {
       toast.danger('至少填写一项单价')
       return
     }
@@ -202,6 +202,8 @@ export function PriceSettings({ refreshSignal }: { refreshSignal: number }) {
   }
 
   // 删除价格：行内按钮与编辑弹窗共用。确认后把四项单价清零（= 未配置）。
+  // 这里显式带上 price_cache_creation: 0 —— 「删除」是用户对整条价格记录的
+  // 明确动作，界面上看不见的第四档也得一起清掉，否则会留一个隐形价继续计费。
   //
   // 文案必须说清「只影响以后」：历史费用在落库时已按当时的价固化，删价不会
   // 把已经算好的金额抹掉。写成「该模型的用量按 0 元计」会让人以为历史费用
@@ -401,7 +403,6 @@ export function PriceSettings({ refreshSignal }: { refreshSignal: number }) {
                         <Table.Column>模型</Table.Column>
                         <Table.Column className="text-right">输入（元/1M）</Table.Column>
                         <Table.Column className="text-right">缓存命中（元/1M）</Table.Column>
-                        <Table.Column className="text-right">缓存写入（元/1M）</Table.Column>
                         <Table.Column className="text-right">输出（元/1M）</Table.Column>
                         <Table.Column className="w-[210px]">操作</Table.Column>
                       </Table.Header>
@@ -433,15 +434,6 @@ export function PriceSettings({ refreshSignal }: { refreshSignal: number }) {
                               }
                             >
                               {cacheUnitPrice(r.model.price_input, r.model.price_cache_hit)}
-                            </Table.Cell>
-                            <Table.Cell
-                              className={
-                                r.model.price_cache_creation <= 0 && r.model.price_input <= 0
-                                  ? 'text-right text-muted'
-                                  : 'text-right'
-                              }
-                            >
-                              {cacheUnitPrice(r.model.price_input, r.model.price_cache_creation)}
                             </Table.Cell>
                             <Table.Cell className={r.model.price_output <= 0 ? 'text-right text-muted' : 'text-right'}>
                               {priceCell(r.model.price_output)}

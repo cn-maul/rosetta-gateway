@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import { Button, Spinner, toast } from '@heroui/react'
-import { Link, useNavigate, useParams, useSearchParams } from 'react-router-dom'
+import { useNavigate, useParams, useSearchParams } from 'react-router-dom'
 import { api } from '../api'
 import { useNetworks } from '../useNetworks'
 import { RequestGeneration } from '../asyncState'
@@ -442,24 +442,26 @@ export function ProviderDetail() {
     <div className="flex flex-col gap-5">
       <PageHeader
         title={provider?.name ?? '上游详情'}
-        sub={
-          <Link to={backTo} className="text-link text-[12.5px] hover:underline">
-            ← 上游服务
-          </Link>
-        }
         actions={
-          <Button
-            variant="secondary"
-            isDisabled={loading}
-            onPress={() => {
-              void load()
-              // 三块都平铺在页面上，刷新就是三块一起刷（用户看得见的部分不该留旧值）。
-              if (subsLoadedRef.current.credentials) void loadCredentials(true)
-              if (subsLoadedRef.current.models) void loadModels(true)
-            }}
-          >
-            刷新
-          </Button>
+          <>
+            {/* 返回用按钮而不是链接：这一页的「返回」是页级动作，与右侧刷新、
+                编辑同级；做成蓝色下划线链接时，它读起来像正文里的跳转词。 */}
+            <Button variant="outline" size="sm" onPress={() => navigate(backTo)}>
+              ← 上游服务
+            </Button>
+            <Button
+              variant="outline"
+              isDisabled={loading}
+              onPress={() => {
+                void load()
+                // 三块都平铺在页面上，刷新就是三块一起刷（用户看得见的部分不该留旧值）。
+                if (subsLoadedRef.current.credentials) void loadCredentials(true)
+                if (subsLoadedRef.current.models) void loadModels(true)
+              }}
+            >
+              刷新
+            </Button>
+          </>
         }
       />
 
@@ -472,7 +474,7 @@ export function ProviderDetail() {
         <SectionCard>
           <div className="py-10 text-center">
             <p className="text-muted text-sm">该上游不存在（可能已被删除）</p>
-            <Button variant="tertiary" size="sm" className="mt-3" onPress={() => navigate(backTo)}>
+            <Button variant="outline" size="sm" className="mt-3" onPress={() => navigate(backTo)}>
               返回列表
             </Button>
           </div>

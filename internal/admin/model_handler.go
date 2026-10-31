@@ -461,27 +461,33 @@ func (h *ModelHandler) Delete(w http.ResponseWriter, r *http.Request, id string)
 // batchPriceRequest 是「批量设置价格」的输入。
 //
 // 刻意**不复用 modelRequest**：modelRequest 的 *float64 nil 语义是为单条
-// PATCH 设计的（nil = 保持原值），而批量改价是「整体替换」—— 三个价格
-// 必须同时显式给出，不存在「只改其中一档」的批量语义。用值类型 float64
+// PATCH 设计的（nil = 保持原值），而批量改价是「整体替换」—— 输入/命中/输出
+// 三档必须同时显式给出，不存在「只改其中一档」的批量语义。用值类型 float64
 // 让「漏传」在解码时就是 0，而不是被当成「不改」。
 //
 // 0 的含义与单条路径一致（nullIfZeroFloat：0 = 清除价格），所以「批量
 // 清除价格」就是传三个 0。前端把「设置」和「清除」做成两个独立按钮，
 // 避免用户以为填 0 是「设为免费」。
+//
+// PriceCacheCreation 是指针、且**不在整体替换的范围内**（2026-10-31）：
+// 界面上已不再暴露缓存写入价，若它跟着改成值类型，前端每次批量改价都会
+// 把它清成 0 —— 那是静默的数据丢失。nil = 保持原值（与单条 PATCH 同约定）。
 type batchPriceRequest struct {
 	ModelIDs           []string `json:"model_ids"`
 	PriceInput         float64  `json:"price_input"`
 	PriceCacheHit      float64  `json:"price_cache_hit"`
-	PriceCacheCreation float64  `json:"price_cache_creation"`
+	PriceCacheCreation *float64 `json:"price_cache_creation"`
 	PriceOutput        float64  `json:"price_output"`
 }
 
 // BatchUpdatePrices 把同一组价格批量写到多个模型。
 //
-// 语义是**整体替换**：三个价格同时覆盖。校验与单条路径同口径（非负），
-// 但多一条「id 必须全部存在」—— 传了 10 个 id 只更新 8 个，说明有 2 个
-// 写错了。静默跳过会让运维以为全改好了、实则漏了 2 个，那正是本功能要
-// 消灭的「配了但没生效」类故障。所以这里照实报错并列出缺失的 id。
+// 语义是**整体替换**：输入/命中/输出三档同时覆盖（缓存写入价是可选的
+// 第四档，不带就保持原值，见 batchPriceRequest 的注释）。校验与单条路径
+// 同口径（非负），但多一条「id 必须全部存在」—— 传了 10 个 id 只更新
+// 8 个，说明有 2 个写错了。静默跳过会让运维以为全改好了、实则漏了 2 个，
+// 那正是本功能要消灭的「配了但没生效」类故障。所以这里照实报错并列出
+// 缺失的 id。
 func (h *ModelHandler) BatchUpdatePrices(w http.ResponseWriter, r *http.Request) {
 	var req batchPriceRequest
 	if err := decodeJSON(w, r, &req); err != nil {
@@ -514,14 +520,17 @@ func (h *ModelHandler) BatchUpdatePrices(w http.ResponseWriter, r *http.Request)
 	}
 	for _, p := range []struct {
 		name string
-		val  float64
+		val  *float64
 	}{
-		{"price_input", req.PriceInput},
-		{"price_cache_hit", req.PriceCacheHit},
+		{"price_input", &req.PriceInput},
+		{"price_cache_hit", &req.PriceCacheHit},
 		{"price_cache_creation", req.PriceCacheCreation},
-		{"price_output", req.PriceOutput},
+		{"price_output", &req.PriceOutput},
 	} {
-		if p.val < 0 {
+		if p.val == nil {
+			continue
+		}
+		if *p.val < 0 {
 			writeError(w, http.StatusBadRequest, p.name+" cannot be negative")
 			return
 		}
@@ -555,14 +564,18 @@ func (h *ModelHandler) BatchUpdatePrices(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	writeJSON(w, http.StatusOK, map[string]any{
-		"updated": updated,
-		// 回显这次写进去的价格，让运维确认「我填的就是落库的」。
-		"price_input":          req.PriceInput,
-		"price_cache_hit":      req.PriceCacheHit,
-		"price_cache_creation": req.PriceCacheCreation,
-		"price_output":         req.PriceOutput,
-	})
+	resp := map[string]any{
+		"updated":         updated,
+		"price_input":     req.PriceInput,
+		"price_cache_hit": req.PriceCacheHit,
+		"price_output":    req.PriceOutput,
+	}
+	// 回显这次写进去的价格，让运维确认「我填的就是落库的」。缓存写入价只在
+	// 请求带了才回显 —— 没带就是「没动」，把原值报成「刚写入的」是撒谎。
+	if req.PriceCacheCreation != nil {
+		resp["price_cache_creation"] = *req.PriceCacheCreation
+	}
+	writeJSON(w, http.StatusOK, resp)
 }
 
 // modelTestResponse 是单模型可用性探测的响应体。
@@ -787,6 +800,33 @@ type modelImportItem struct {
 	// 两者都是「**有值才写**」语义，理由见 importThinking 的注释。
 	EffortLevels     string `json:"effort_levels"`
 	SupportsThinking *bool  `json:"supports_thinking"`
+
+	// 价格三档（2026-10-31）只在「手动添加模型」这一档用得上：探测导入时
+	// 上游 /models 从不报价格，而手工添加的管理员已经在表单里把价填好了，
+	// 没有理由再逼他「先导入、再去列表里逐条补价」。
+	//
+	// 三档都是「有值才写」：nil 与 0 都等于「不填」（0 与 NULL 同义＝未配置
+	// 价格，见 nullIfZeroFloat 的约定）。缓存写入价刻意不在这里 —— 界面上
+	// 已经不再暴露它，计费侧未配置时按输入价计，不需要人工填。
+	PriceInput    *float64 `json:"price_input"`
+	PriceCacheHit *float64 `json:"price_cache_hit"`
+	PriceOutput   *float64 `json:"price_output"`
+}
+
+// importPrices 把手工填的单价落进待导入的模型。
+//
+// 只写 >0 的三档：填 0 或留空都表示「这个模型不配价」，保持价格列为 NULL，
+// 而不是落成字面 0 元（0 元会被读成「确认免费」，与「未配置」是两件事）。
+func importPrices(m *store.UpstreamModel, it modelImportItem) {
+	if it.PriceInput != nil && *it.PriceInput > 0 {
+		m.PriceInput = *it.PriceInput
+	}
+	if it.PriceCacheHit != nil && *it.PriceCacheHit > 0 {
+		m.PriceCacheHit = *it.PriceCacheHit
+	}
+	if it.PriceOutput != nil && *it.PriceOutput > 0 {
+		m.PriceOutput = *it.PriceOutput
+	}
 }
 
 // ImportModels 批量 upsert 模型（按 provider_id+model_id 幂等），一次写入避免逐条 reload。
@@ -834,6 +874,7 @@ func (h *ModelHandler) ImportModels(w http.ResponseWriter, r *http.Request, prov
 			MaxOutputTokens: maxOut,
 		})
 		importThinking(models[len(models)-1], it)
+		importPrices(models[len(models)-1], it)
 	}
 
 	if err := h.store.ImportUpstreamModels(r.Context(), models); err != nil {
@@ -880,18 +921,21 @@ func toModelResponse(m store.UpstreamModel) modelResponse {
 		levels = []effort.Level{}
 	}
 	return modelResponse{
-		ID:               m.ID,
-		ProviderID:       m.ProviderID,
-		ModelID:          m.ModelID,
-		DisplayName:      m.DisplayName,
-		ContextWindow:    m.ContextWindow,
-		MaxOutputTokens:  m.MaxOutputTokens,
-		PriceInput:       m.PriceInput,
-		PriceCacheHit:    m.PriceCacheHit,
-		PriceOutput:      m.PriceOutput,
-		EffortLevels:     levels,
-		UnknownLevels:    m.UnknownLevels,
-		SupportsThinking: m.SupportsThinking,
-		GroupID:          m.GroupID,
+		ID:              m.ID,
+		ProviderID:      m.ProviderID,
+		ModelID:         m.ModelID,
+		DisplayName:     m.DisplayName,
+		ContextWindow:   m.ContextWindow,
+		MaxOutputTokens: m.MaxOutputTokens,
+		PriceInput:      m.PriceInput,
+		PriceCacheHit:   m.PriceCacheHit,
+		// PriceCacheCreation 之前声明了却没赋值，回给前端恒为 0：界面上一度
+		// 显示「缓存写入 0」而库里其实有价。2026-10-31 补上。
+		PriceCacheCreation: m.PriceCacheCreation,
+		PriceOutput:        m.PriceOutput,
+		EffortLevels:       levels,
+		UnknownLevels:      m.UnknownLevels,
+		SupportsThinking:   m.SupportsThinking,
+		GroupID:            m.GroupID,
 	}
 }

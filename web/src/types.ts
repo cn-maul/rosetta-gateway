@@ -125,6 +125,17 @@ export interface ModelImportItem {
   effort_levels?: string
   /** 见 DiscoveredModel.supports_thinking。 */
   supports_thinking?: boolean
+  /**
+   * 单价三档（元 / 1M tokens）。只有「手动添加模型」这一档会填：
+   * 探测导入时上游 /models 从不报价格。留空或填 0 = 不配价（库里落 NULL，
+   * 与「确认免费」的 0 元不是一回事）。
+   *
+   * 缓存写入价刻意不在导入接口里 —— 界面上已经不再暴露它，未配置时计费
+   * 侧按输入价算（internal/store/pricing.go 的 EffectivePrices）。
+   */
+  price_input?: number
+  price_cache_hit?: number
+  price_output?: number
 }
 
 // 全局设置（与 internal/admin/settings_handler.go 对应）。

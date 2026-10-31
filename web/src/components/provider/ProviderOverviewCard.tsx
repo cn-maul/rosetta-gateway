@@ -53,10 +53,12 @@ export function ProviderOverviewCard({
       title="概览"
       actions={
         <>
-          <Button variant="secondary" size="sm" onPress={onEdit}>
+          <Button variant="outline" size="sm" onPress={onEdit}>
             编辑
           </Button>
-          <Button variant="ghost" size="sm" onPress={onRemove}>
+          {/* 删除不给描边的中性样式：它和「编辑」并排，长一个样就得靠读字
+              分辨。danger-soft 用红底把破坏性动作单独标出来。 */}
+          <Button variant="danger-soft" size="sm" onPress={onRemove}>
             删除
           </Button>
           <Switch

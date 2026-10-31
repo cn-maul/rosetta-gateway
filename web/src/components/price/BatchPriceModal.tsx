@@ -41,7 +41,7 @@ export function BatchPriceModal({
   clearSelection: boolean
   initialSelected: Set<string>
 }) {
-  const [form, setForm] = useState({ price_input: '', price_cache_hit: '', price_cache_creation: '', price_output: '' })
+  const [form, setForm] = useState({ price_input: '', price_cache_hit: '', price_output: '' })
   const [provider, setProvider] = useState('')
   const [search, setSearch] = useState('')
   const [selected, setSelected] = useState<Set<string>>(new Set())
@@ -58,7 +58,6 @@ export function BatchPriceModal({
       setForm({
         price_input: String(seed.model.price_input),
         price_cache_hit: String(seed.model.price_cache_hit),
-        price_cache_creation: String(seed.model.price_cache_creation),
         price_output: String(seed.model.price_output),
       })
     }
@@ -125,18 +124,19 @@ export function BatchPriceModal({
       toast.danger('请先勾选要设置价格的模型')
       return
     }
+    // 只发三档：缓存写入价界面上不再暴露，后端对它是指针语义（不带 = 保持
+    // 原值），所以批量改价不会顺手清掉别人配过的缓存写入价。
     const body = {
       price_input: Number(form.price_input) || 0,
       price_cache_hit: Number(form.price_cache_hit) || 0,
-      price_cache_creation: Number(form.price_cache_creation) || 0,
       price_output: Number(form.price_output) || 0,
     }
-    if (body.price_input < 0 || body.price_cache_hit < 0 || body.price_cache_creation < 0 || body.price_output < 0) {
+    if (body.price_input < 0 || body.price_cache_hit < 0 || body.price_output < 0) {
       toast.danger('单价不能为负数')
       return
     }
-    // 四项全 0 = 清除价格。这里不拦（批量清除是合法动作），但确认文案要讲清。
-    const clearing = body.price_input === 0 && body.price_cache_hit === 0 && body.price_cache_creation === 0 && body.price_output === 0
+    // 三档全 0 = 清除价格。这里不拦（批量清除是合法动作），但确认文案要讲清。
+    const clearing = body.price_input === 0 && body.price_cache_hit === 0 && body.price_output === 0
     // 确认框里列出前几个模型名：跨供应商批量改价最容易勾错行，名字是唯一
     // 能让用户在点确认前核对「到底要改谁」的信息。
     const preview = targetsRows.slice(0, 3).map((r) => r.model.model_id).join('、')
@@ -225,13 +225,12 @@ export function BatchPriceModal({
               </div>
             ) : null}
           </div>
-          <span className="text-muted text-[11px]">含未配价的模型 —— 一次把同一批模型的价格配齐。四项全 0 = 清除价格。</span>
+          <span className="text-muted text-[11px]">含未配价的模型 —— 一次把同一批模型的价格配齐。三项全 0 = 清除价格。</span>
         </div>
         <div className="grid grid-cols-2 gap-4">
           {PriceField('输入价格（元/1M）', form.price_input, (v) => setForm((f) => ({ ...f, price_input: v })))}
           {PriceField('缓存命中价格（元/1M）', form.price_cache_hit, (v) => setForm((f) => ({ ...f, price_cache_hit: v })), '0 = 同输入价')}
-          {PriceField('缓存写入价格（元/1M）', form.price_cache_creation, (v) => setForm((f) => ({ ...f, price_cache_creation: v })), '0 = 同输入价')}
-          {PriceField('输出价格（元/1M）', form.price_output, (v) => setForm((f) => ({ ...f, price_output: v })), '四项全填 0 = 清除这些模型的价格（不是设为免费）')}
+          {PriceField('输出价格（元/1M）', form.price_output, (v) => setForm((f) => ({ ...f, price_output: v })), '三项全填 0 = 清除这些模型的价格（不是设为免费）')}
         </div>
       </form>
     </AppModal>
