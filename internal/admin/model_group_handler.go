@@ -1,6 +1,7 @@
 package admin
 
 import (
+	"context"
 	"errors"
 	"net/http"
 	"strings"
@@ -32,8 +33,8 @@ type modelGroupResponse struct {
 }
 
 // groupMemberCounts 一次查询拿全部组的成员数（List 的富化用）。
-func (h *ModelGroupHandler) groupMemberCounts() (map[string]int, error) {
-	rows, err := h.store.Reader().Query(
+func (h *ModelGroupHandler) groupMemberCounts(ctx context.Context) (map[string]int, error) {
+	rows, err := h.store.Reader().QueryContext(ctx,
 		`SELECT group_id, COUNT(*) FROM upstream_models WHERE group_id IS NOT NULL GROUP BY group_id`)
 	if err != nil {
 		return nil, err
@@ -57,7 +58,7 @@ func (h *ModelGroupHandler) List(w http.ResponseWriter, r *http.Request) {
 		writeServerError(w, "list model groups", err)
 		return
 	}
-	counts, err := h.groupMemberCounts()
+	counts, err := h.groupMemberCounts(r.Context())
 	if err != nil {
 		writeServerError(w, "count model group members", err)
 		return

@@ -1,6 +1,7 @@
 package admin
 
 import (
+	"context"
 	"database/sql"
 	"encoding/csv"
 	"fmt"
@@ -41,6 +42,13 @@ const (
 	defaultUsageLimit = 100
 	maxUsageLimit     = 1000
 )
+
+// exportTimeout 是 CSV 导出的总预算。
+//
+// 导出会流式扫 usage_records（最重的聚合之外唯一会把整段结果搬进响应的
+// 端点）。给它一个上限，客户端断开或超时后查询立刻停：读池只有 4 条连接，
+// 一个跑飞的全表扫描就够把管理面拖慢一个数量级。
+const exportTimeout = 60 * time.Second
 
 // clampLimit 解析并钳制 limit。
 //
@@ -312,7 +320,7 @@ func (h *UsageHandler) Query(w http.ResponseWriter, r *http.Request) {
 	// 两者共用 usageFilter 拆出的同一组条件。
 	where, args, filter := usageFilter(from, to, explicit, q, callerScope(r))
 
-	summary, err := h.summarize(filter)
+	summary, err := h.summarize(r.Context(), filter)
 	if err != nil {
 		writeServerError(w, "usage summary", err)
 		return
@@ -335,7 +343,7 @@ func (h *UsageHandler) Query(w http.ResponseWriter, r *http.Request) {
 		orderBy + ` LIMIT ?`
 	rowArgs := append(append([]any{}, args...), limit)
 
-	rows, err := h.store.Reader().Query(query, rowArgs...)
+	rows, err := h.store.Reader().QueryContext(r.Context(), query, rowArgs...)
 	if err != nil {
 		writeServerError(w, "usage query", err)
 		return
@@ -380,12 +388,12 @@ func (h *UsageHandler) Query(w http.ResponseWriter, r *http.Request) {
 // avg_latency_ms 用「延迟总和 / 请求数」而不是 AVG(延迟列)：归档行的
 // latency_sum_ms 是一组请求的累计值，直接平均等于把一天的耗时当成一次请求
 // 折进去。两支归一后 SUM(延迟)/SUM(请求数) 对明细也正好等于原口径的 AVG。
-func (h *UsageHandler) summarize(f store.UsageFilter) (usageSummary, error) {
+func (h *UsageHandler) summarize(ctx context.Context, f store.UsageFilter) (usageSummary, error) {
 	var s usageSummary
 	src, args := store.UsageSource(f)
 	// `* 1.0` 让这条比值走 REAL，扫整型会 ParseInt 失败（见 usageSummary 注释）。
 	var avgLatency sql.NullFloat64
-	err := h.store.Reader().QueryRow(
+	err := h.store.Reader().QueryRowContext(ctx,
 		`SELECT COALESCE(SUM(u.n), 0),
 		       `+store.UsageSumExpr("total_tokens", "u")+`,
 		       `+store.UsageSumExpr("input_tokens", "u")+`,
@@ -653,6 +661,18 @@ func clampOffset(raw string) int64 {
 // 完整的证据。现在上限命中时写 X-Export-Truncated: 1 与 X-Export-Total，
 // 让前端能在下载后明确提示「已截断」而不是让人对着一个假象做判断。
 func (h *UsageHandler) ExportCSV(w http.ResponseWriter, r *http.Request) {
+	// 导出是管理面唯一会「长时间占着读连接」的端点：它会流式扫全表。
+	// 用请求上下文派生一个总预算，客户端断开或超时后查询立刻停 —— 否则
+	// 浏览器关了、代理先超时了，SELECT 还在读池里跑（读池只有 4 条连接，
+	// 几次这样的残留就够把管理面拖慢）。
+	//
+	// 注意：**响应头一旦写出就无法回滚**。所以超时只保证「不再继续扫」，
+	// 中途超时仍会是一个被截断的 CSV —— 这一点无法避免，只能做到不留
+	// 后台查询。写出的行数与 X-Export-Total 对不上时，调用方自己就能看出
+	// 截断（这也是不把 total 塞进 body 而放响应头的原因）。
+	ctx, cancel := context.WithTimeout(r.Context(), exportTimeout)
+	defer cancel()
+
 	q := r.URL.Query()
 	// 与 History 同一个理由改用 queryRangeExplicit：显式 from=0 是「全部」，
 	// 不能被回落成默认 7 天，否则导出的文件与页面上「全部」看到的不一致，
@@ -667,13 +687,13 @@ func (h *UsageHandler) ExportCSV(w http.ResponseWriter, r *http.Request) {
 
 	// 总条数与 History 同源：多一次 COUNT 换来「导出的到底是不是全部」。
 	var total int64
-	if err := h.store.Reader().QueryRow(
+	if err := h.store.Reader().QueryRowContext(ctx,
 		`SELECT COUNT(*) FROM usage_records u`+where, args...).Scan(&total); err != nil {
 		writeServerError(w, "usage export count", err)
 		return
 	}
 
-	rows, err := h.store.Reader().Query(
+	rows, err := h.store.Reader().QueryContext(ctx,
 		`SELECT `+usageHistoryColumns+usageHistorySource+where+
 			` ORDER BY u.ts DESC, u.id DESC LIMIT ?`, append(args, limit)...)
 	if err != nil {
@@ -789,13 +809,13 @@ func (h *UsageHandler) History(w http.ResponseWriter, r *http.Request) {
 
 	// 总条数单独统计（计数不需要 JOIN access_keys，WHERE 只引用 u 列）。
 	var total int64
-	if err := h.store.Reader().QueryRow(
+	if err := h.store.Reader().QueryRowContext(r.Context(),
 		`SELECT COUNT(*) FROM usage_records u`+where, args...).Scan(&total); err != nil {
 		writeServerError(w, "usage history count", err)
 		return
 	}
 
-	rows, err := h.store.Reader().Query(
+	rows, err := h.store.Reader().QueryContext(r.Context(),
 		`SELECT `+usageHistoryColumns+usageHistorySource+where+
 			` ORDER BY u.ts DESC, u.id DESC LIMIT ? OFFSET ?`, append(args, limit, offset)...)
 	if err != nil {
@@ -926,7 +946,7 @@ func (h *UsageHandler) GroupByModel(w http.ResponseWriter, r *http.Request) {
 		` GROUP BY COALESCE(g.display_name, u.upstream_model)` +
 		` ORDER BY tokens DESC LIMIT ?`
 
-	rows, err := h.store.Reader().Query(query, args...)
+	rows, err := h.store.Reader().QueryContext(r.Context(), query, args...)
 	if err != nil {
 		writeServerError(w, "usage group by model", err)
 		return
@@ -1037,7 +1057,7 @@ func (h *UsageHandler) groupBy(w http.ResponseWriter, r *http.Request, column, n
 		query += ` LIMIT ?`
 	}
 
-	rows, err := h.store.Reader().Query(query, args...)
+	rows, err := h.store.Reader().QueryContext(r.Context(), query, args...)
 	if err != nil {
 		writeServerError(w, "usage group by "+column, err)
 		return
