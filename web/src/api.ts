@@ -513,8 +513,6 @@ export const api = {
   createProvider: (b: ProviderCreatePayload) => mutate(() => post<Provider>('/providers', b)),
   updateProvider: (id: string, b: ProviderUpdatePayload) => mutate(() => patch<Provider>(`/providers/${id}`, b)),
   deleteProvider: (id: string) => mutate(() => del(`/providers/${id}`)),
-  testProvider: (id: string, timeoutMs?: number) =>
-    post<{ status?: string; message?: string }>(`/providers/${id}/test`, undefined, timeoutMs),
   /**
    * 逐条查询该 provider 的凭据在上游侧的余额。
    *
@@ -554,8 +552,6 @@ export const api = {
   // 全部上游模型的扁平列表（跨 provider）。Routes/Settings 用它一次取全，
   // 避免「先取 providers 再逐 provider 取 models」的 1+N 请求。不含吞吐统计。
   allModels: () => get<UpstreamModel[]>('/upstream-models'),
-  createModel: (providerId: string, b: Partial<UpstreamModel>) =>
-    mutate(() => post<UpstreamModel>(`/providers/${providerId}/models`, b)),
   updateModel: (id: string, b: UpstreamModelUpdate) => mutate(() => patch<UpstreamModel>(`/models/${id}`, b)),
   deleteModel: (id: string) => mutate(() => del(`/models/${id}`)),
   // 批量设置价格：把同一组价格写到多个模型（整体替换，见后端 batchPriceRequest）。
@@ -567,7 +563,6 @@ export const api = {
   createModelGroup: (display_name: string) => mutate(() => post<ModelGroup>('/model-groups', { display_name })),
   updateModelGroup: (id: string, display_name: string) => mutate(() => patch<ModelGroup>(`/model-groups/${id}`, { display_name })),
   deleteModelGroup: (id: string) => mutate(() => del(`/model-groups/${id}`)),
-  groupMembers: (id: string) => get<UpstreamModel[]>(`/model-groups/${id}/members`),
   assignModelsToGroup: (groupId: string, modelIds: string[]) =>
     mutate(() => post<{ assigned: number }>(`/model-groups/${groupId}/assign`, { model_ids: modelIds })),
   unassignModelsFromGroup: (modelIds: string[]) =>
@@ -599,8 +594,7 @@ export const api = {
   testModel: (id: string, timeoutMs?: number) =>
     post<ModelTestResult>(`/models/${id}/test`, undefined, timeoutMs),
 
-  // routes
-  routes: () => get<Route[]>('/routes'),
+  // routes（列表用 routeCatalog：它带每组的目标与可用性，见后端口径）
   routeCatalog: () => get<RouteCatalog>('/route-catalog'),
   createRoute: (b: Partial<Route>) => mutate(() => post<Route>('/routes', b)),
   updateRoute: (id: string, b: Partial<Route>) => mutate(() => patch<Route>(`/routes/${id}`, b)),
