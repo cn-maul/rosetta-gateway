@@ -891,6 +891,17 @@ type UsageStats struct {
 	// 用输出 token 总和 / 成功请求耗时总和加权，避免单次快慢请求带偏。
 	TokensPerSec      float64
 	ThroughputSamples int64
+	// GenMs / GenSamples 是**首字之后**的生成耗时：成功请求的
+	// (latency - ttfb) 之和 / 样本数。TtfbMs + GenMs ≈ 平均总耗时。
+	//
+	// 为什么把两段拆开：TTFB 只回答「等多久开始吐字」，而用户体感的「慢」
+	// 往往在生成阶段（模型吐字慢、长输出的长尾）。合成一个「平均总耗时」，
+	// 这两种故障在界面上就分不出来，排查时得先猜是哪一段。
+	//
+	// 样本口径与 TtfbSamples 对齐（成功 + 测到过首字 + latency>ttfb）：
+	// 没有首字就没有「首字之后」可言，两者一起为 0 时界面显示「—」。
+	GenMs      float64
+	GenSamples int64
 }
 
 // GetUsageStats 返回累计统计。from/to 为毫秒时间戳，0 表示不设该边界
@@ -933,6 +944,8 @@ func (s *Store) GetUsageStats(ctx context.Context, from, to int64, scopeUserID s
 		        COALESCE(SUM(CASE WHEN u.out_ok > 0 AND u.lat_ok > 0 THEN u.out_ok ELSE 0 END) * 1000.0
 		                 / NULLIF(SUM(CASE WHEN u.out_ok > 0 AND u.lat_ok > 0 THEN u.lat_ok ELSE 0 END), 0), 0),
 		        COALESCE(SUM(u.n_ok_speed), 0),
+		        `+UsageRatioExpr("gen_ok_sum", "n_gen_ok", "u")+`,
+		        COALESCE(SUM(u.n_gen_ok), 0),
 		        CASE WHEN COALESCE(SUM(u.n_ok), 0) > 0
 		             THEN COALESCE(MAX(CASE WHEN u.n_ok > 0 THEN u.bucket_ts END), 0)
 		             ELSE 0 END,
@@ -941,6 +954,7 @@ func (s *Store) GetUsageStats(ctx context.Context, from, to int64, scopeUserID s
 		args...).
 		Scan(&stats.TotalRequests, &stats.TotalTokens, &stats.InputTokens, &stats.OutputTokens, &stats.CachedTokens, &stats.CachedCreationTokens, &stats.ErrorCount, &stats.CacheHitRate, &stats.Cost, &stats.CostPendingCount,
 			&stats.SuccessCount, &stats.CanceledCount, &stats.TtfbMs, &stats.TtfbSamples, &stats.TokensPerSec, &stats.ThroughputSamples,
+			&stats.GenMs, &stats.GenSamples,
 			&stats.LastSuccessAt, &stats.FirstRecordAt)
 	if err != nil {
 		return nil, err

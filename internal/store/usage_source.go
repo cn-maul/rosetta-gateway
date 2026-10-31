@@ -44,6 +44,13 @@ const (
 		-- 速度样本的实际条数。明细一行一个请求；归档支对应 ok_sample_count。
 		-- 与 out_ok/lat_ok 必须同口径，否则归档后「样本数」会退化成行数。
 		CASE WHEN status = '` + UsageStatusOK + `' AND output_tokens > 0 AND latency_ms > 0 THEN 1 ELSE 0 END AS n_ok_speed,
+		-- 「首字之后」的生成耗时：成功请求的 (latency - ttfb) 累计值与样本数。
+		-- 首字时间与生成时间是两个独立指标（等首字 vs 首字之后的吐字时长），
+		-- 分开下发才能回答「慢在等首字还是慢在生成」；两者相加≈总耗时。
+		-- 条件要求 ttfb>0（没测到首字就无所谓「首字之后」）且 latency>ttfb
+		-- （脏数据下 latency 可能小于 ttfb，减出负数会把均值带偏）。
+		CASE WHEN status = '` + UsageStatusOK + `' AND ttfb_ms > 0 AND latency_ms > ttfb_ms THEN latency_ms - ttfb_ms ELSE 0 END AS gen_ok_sum,
+		CASE WHEN status = '` + UsageStatusOK + `' AND ttfb_ms > 0 AND latency_ms > ttfb_ms THEN 1 ELSE 0 END AS n_gen_ok,
 		-- 待重算的条数（2026-10-21 修 M5）。「费用还是 0、等着被纠正」
 		-- 的记录数，归档后仍然可数 —— 剪枝不该让这个信号凭空消失。
 		CASE WHEN usage_state = '` + UsageStateCostPending + `' THEN 1 ELSE 0 END AS n_cost_pending,
@@ -71,6 +78,13 @@ const (
 		ok_latency_sum_ms AS lat_ok,
 		-- 成功请求数里「同时有正输出与正延迟」的条数，对应明细的 n_ok_speed。
 		ok_sample_count AS n_ok_speed,
+		-- 归档侧没有单独的「生成耗时」列：用成功延迟累计减首字累计还原
+		-- （两者都只累计成功请求，见上面的 ok_latency_sum_ms / ok_ttfb_sum_ms）。
+		-- 样本数沿用 ok_ttfb_count —— 只有测到过首字的成功请求才有「首字之后」
+		-- 的时长，与明细支 gen_ok_sum/n_gen_ok 的条件对齐。CASE 防脏数据
+		-- （ok_ttfb_sum_ms > ok_latency_sum_ms 时减出负数）。
+		CASE WHEN ok_latency_sum_ms > ok_ttfb_sum_ms THEN ok_latency_sum_ms - ok_ttfb_sum_ms ELSE 0 END AS gen_ok_sum,
+		ok_ttfb_count AS n_gen_ok,
 		-- 归档层的待重算条数（2026-10-21 修 M5）。
 		cost_pending_count AS n_cost_pending,
 		day, ` + dayStartMs + ` AS bucket_ts,

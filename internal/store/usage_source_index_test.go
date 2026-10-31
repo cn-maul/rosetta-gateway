@@ -136,6 +136,7 @@ func TestUsageSource_RollupDayRangeMatchesIntersectionRule(t *testing.T) {
 			lat, ttfbSum, nTTFB                      int64
 			ttfbOKSum, nTTFBOK                       int64
 			outOK, latOK, nOKSpeed                   int64
+			genOKSum, nGenOK                         int64
 			nCostPending                             int64
 			day                                      string
 			bucketTS                                 int64
@@ -143,8 +144,8 @@ func TestUsageSource_RollupDayRangeMatchesIntersectionRule(t *testing.T) {
 		)
 		if err := rows.Scan(&n, &nOK, &nErr, &in, &out, &cached, &cachedCreation, &reasoning, &total,
 			&cost, &lat, &ttfbSum, &nTTFB, &ttfbOKSum, &nTTFBOK, &outOK, &latOK,
-			&nOKSpeed, &nCostPending, &day, &bucketTS, &userID, &keyID, &pubModel,
-			&upModel, &provID); err != nil {
+			&nOKSpeed, &genOKSum, &nGenOK, &nCostPending, &day, &bucketTS,
+			&userID, &keyID, &pubModel, &upModel, &provID); err != nil {
 			t.Fatalf("scan: %v", err)
 		}
 		got[day] = true

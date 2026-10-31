@@ -740,6 +740,21 @@ export interface Stats {
   avg_ttfb_ms: number
   /** 参与首字平均的成功样本数；0 = 暂无样本。 */
   ttfb_samples: number
+  /**
+   * 所选区间内「首字之后」的平均生成耗时（毫秒）= 平均(latency − ttfb)。
+   *
+   * 与 avg_ttfb_ms 分开下发是刻意的：TTFB 回答「等多久开始吐字」，
+   * 生成耗时回答「开始吐字之后还要等多久」。两者相加 ≈ 平均总耗时，
+   * 但合成一个数字之后，「慢在等首字」和「慢在吐字」在界面上就分不出来，
+   * 而这两种情况该做的事完全不同（换路由 vs 换更快的模型/调小 max_tokens）。
+   *
+   * 只对 status='ok' 且测到过首字、且 latency>ttfb 的请求取平均；
+   * 必须与 gen_samples 一起读：gen_samples=0 时这个值恒为 0，
+   * 含义是「没有可用样本」而不是「生成瞬时完成」。
+   */
+  avg_gen_ms: number
+  /** 参与生成耗时平均的请求数；0 = 暂无样本。 */
+  gen_samples: number
   // 费用（元）：每条用量落库**当时**按模型单价算好并固化的金额求和
   // （usage_records.cost_total）。改价只影响此后的记录，不回溯历史。
   //
@@ -856,6 +871,33 @@ export interface UsageGroupEntry {
    * 拿它当分母会把平均速度压低，而那个请求根本没跑完。
    */
   tps: number
+  /**
+   * 缓存读取命中的输入 token 合计。
+   *
+   * 与 Stats.cached_tokens 同口径（**不过滤 status**）：前缀缓存衡量的是
+   * 「这次请求的输入有多少是命中的」，与这次请求最后成功与否无关 ——
+   * 失败请求同样消耗了（可能被缓存的）输入。趋势表要靠它判断
+   * 「今天的命中率相比上周掉了」。
+   */
+  cached_tokens: number
+  /**
+   * 缓存命中率（0~1）= cached_tokens / input_tokens。
+   *
+   * 分母是**输入**而不是总量：缓存只作用于输入侧，把输出 token 算进分母
+   * 只会让命中率随输出长度浮动。与 Stats.cache_hit_rate 逐字同口径，
+   * 所以「按天加权求和 == 区间合计」成立；input_tokens 为 0 时取 0。
+   */
+  cache_hit_rate: number
+  /**
+   * 「首字之后」的平均生成耗时（毫秒），与 Stats.avg_gen_ms 同口径：
+   * 只算 status='ok'、测到过首字、且 latency>ttfb 的请求。
+   *
+   * 与 avg_ttfb_ms 相加 ≈ 平均总耗时。n_gen=0 时恒为 0，含义是
+   * 「无样本」而不是「生成瞬时完成」。
+   */
+  avg_gen_ms: number
+  /** 参与生成耗时平均的请求数；0 = 暂无样本。 */
+  n_gen: number
 }
 
 /**

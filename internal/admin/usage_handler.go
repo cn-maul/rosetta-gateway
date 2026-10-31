@@ -896,6 +896,16 @@ type usageGroupEntry struct {
 	// 与 usage_dao.go 的 GetRecentThroughput 同口径：只算 status='ok' 且
 	// 两者都 > 0 的请求，否则一次 latency=0 的脏数据能把均值拉到 infinity。
 	Tps float64 `json:"tps"`
+	// CachedTokens / CacheHitRate 是缓存命中的输入 token 与命中率
+	// （cached_tokens / input_tokens，与 /stats 的 cache_hit_rate 同口径）。
+	// 总览的趋势表按天显示它，「今天命中率掉了」才有趋势可比。
+	CachedTokens int64   `json:"cached_tokens"`
+	CacheHitRate float64 `json:"cache_hit_rate"`
+	// AvgGenMs / NGen 是「首字之后」的平均生成耗时与样本数：
+	// avg_ttfb_ms + avg_gen_ms ≈ 平均总耗时。样本口径与 n_ttfb 一致，
+	// 为 0 时前端显示「—」而不是 0 秒。
+	AvgGenMs float64 `json:"avg_gen_ms"`
+	NGen     int64   `json:"n_gen"`
 }
 
 // usageGroupPage 是四个 by-* 端点的响应：当页行 + 分组总数。
@@ -977,6 +987,11 @@ func (h *UsageHandler) GroupByModel(w http.ResponseWriter, r *http.Request) {
 		store.UsageRatioExpr("ttfb_sum", "n_ttfb", "u") + ` AS avg_ttfb_ms, ` +
 		`COALESCE(SUM(u.n_ttfb), 0) AS n_ttfb, ` +
 		`COALESCE(SUM(u.out_ok) * 1000.0 / NULLIF(SUM(u.lat_ok), 0), 0) AS tps, ` +
+		// 缓存命中与生成耗时：与 groupBy 逐字同一组表达式（理由见那里的注释）。
+		`COALESCE(SUM(u.cached_tokens), 0) AS cached_tokens, ` +
+		`COALESCE(SUM(u.cached_tokens) * 1.0 / NULLIF(SUM(u.input_tokens), 0), 0) AS cache_hit_rate, ` +
+		store.UsageRatioExpr("gen_ok_sum", "n_gen_ok", "u") + ` AS avg_gen_ms, ` +
+		`COALESCE(SUM(u.n_gen_ok), 0) AS n_gen, ` +
 		`COALESCE(g.display_name, '') AS name` +
 		` FROM ` + src +
 		` LEFT JOIN upstream_models um ON um.provider_id = u.provider_id AND um.model_id = u.upstream_model` +
@@ -1092,7 +1107,18 @@ func (h *UsageHandler) groupBy(w http.ResponseWriter, r *http.Request, column, n
 	query += `, COALESCE(SUM(u.n_ok), 0) AS ok, COALESCE(SUM(u.n_err), 0) AS err, ` +
 		store.UsageRatioExpr("ttfb_sum", "n_ttfb", "u") + ` AS avg_ttfb_ms, ` +
 		`COALESCE(SUM(u.n_ttfb), 0) AS n_ttfb, ` +
-		`COALESCE(SUM(u.out_ok) * 1000.0 / NULLIF(SUM(u.lat_ok), 0), 0) AS tps`
+		`COALESCE(SUM(u.out_ok) * 1000.0 / NULLIF(SUM(u.lat_ok), 0), 0) AS tps, ` +
+		// 缓存命中率与「首字之后」的生成耗时：总览的趋势表按天要显示全七个
+		// 指标，而这几个此前只有 /stats 的区间合计有 —— 于是「今天命中率
+		// 掉了」只能靠一天一天改区间去比，等于没有趋势。
+		//
+		// 命中率的分母用 input_tokens（与 /stats 的 cache_hit_rate、store
+		// 的 CacheHitRate 逐字同口径）：缓存衡量的是输入侧，把输出 token
+		// 算进分母只会稀释指标。
+		`COALESCE(SUM(u.cached_tokens), 0) AS cached_tokens, ` +
+		`COALESCE(SUM(u.cached_tokens) * 1.0 / NULLIF(SUM(u.input_tokens), 0), 0) AS cache_hit_rate, ` +
+		store.UsageRatioExpr("gen_ok_sum", "n_gen_ok", "u") + ` AS avg_gen_ms, ` +
+		`COALESCE(SUM(u.n_gen_ok), 0) AS n_gen`
 	if withName {
 		// JOIN 放在归一化来源之外：密钥名是展示属性，不参与聚合，
 		// 放里面会因一条密钥对应多行来源而把计数复制多份。
@@ -1196,16 +1222,19 @@ func scanGroupEntries(rows *sql.Rows, withName bool) ([]usageGroupEntry, error) 
 		var key, name string
 		var err error
 		// 扫描顺序必须与 groupBy / GroupByModel 里 SELECT 的列顺序**逐字对应**：
-		// key, count, tokens, cost, ok, err, avg_ttfb_ms, n_ttfb, tps[, name]。
+		// key, count, tokens, cost, ok, err, avg_ttfb_ms, n_ttfb, tps,
+		// cached_tokens, cache_hit_rate, avg_gen_ms, n_gen[, name]。
 		// 加列时漏改这里的表现是 Scan 报「期望 N 列、实际 M 列」—— 报错点
 		// 在 Scan，读代码的人会先查 Scan 本身，而不是想到「上面那条 SELECT
 		// 加了一列」。name 恒在最后，因为它只由 withName 决定位置。
 		if withName {
 			err = rows.Scan(&key, &e.Count, &e.Tokens, &e.Cost,
-				&e.Ok, &e.Err, &e.AvgTtfbMs, &e.NTtfb, &e.Tps, &name)
+				&e.Ok, &e.Err, &e.AvgTtfbMs, &e.NTtfb, &e.Tps,
+				&e.CachedTokens, &e.CacheHitRate, &e.AvgGenMs, &e.NGen, &name)
 		} else {
 			err = rows.Scan(&key, &e.Count, &e.Tokens, &e.Cost,
-				&e.Ok, &e.Err, &e.AvgTtfbMs, &e.NTtfb, &e.Tps)
+				&e.Ok, &e.Err, &e.AvgTtfbMs, &e.NTtfb, &e.Tps,
+				&e.CachedTokens, &e.CacheHitRate, &e.AvgGenMs, &e.NGen)
 		}
 		if err != nil {
 			return nil, err

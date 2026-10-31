@@ -134,6 +134,16 @@ type statsResponse struct {
 	ThroughputSamples int64   `json:"throughput_samples"`
 	AvgTtfbMs         float64 `json:"avg_ttfb_ms"`
 	TtfbSamples       int64   `json:"ttfb_samples"`
+	// AvgGenMs / GenSamples 是**首字之后**的平均生成耗时与样本数：
+	// AvgTtfbMs + AvgGenMs ≈ 平均总耗时。
+	//
+	// 拆成两段而不是只给「平均总耗时」：TTFB 回答「等多久开始吐字」，
+	// 生成耗时回答「开始吐字之后还要等多久」。上游变慢时这两种原因的处理
+	// 完全不同（换路由 vs 调小 max_tokens / 换更快的模型），合成一个数字
+	// 就分不出来了。样本口径与 ttfb_samples 一致（成功 + 测到首字 +
+	// latency>ttfb），为 0 时前端显示「—」而不是「0 秒」。
+	AvgGenMs   float64 `json:"avg_gen_ms"`
+	GenSamples int64   `json:"gen_samples"`
 	// Cost 为费用（元）：每条用量记录落库**当时**按模型单价算好并固化的金额
 	// 求和（usage_records.cost_total），未配置价格的模型贡献 0。
 	//
@@ -262,6 +272,8 @@ func (h *StatsHandler) Get(w http.ResponseWriter, r *http.Request) { // from/to 
 		ThroughputSamples:    stats.ThroughputSamples,
 		AvgTtfbMs:            stats.TtfbMs,
 		TtfbSamples:          stats.TtfbSamples,
+		AvgGenMs:             stats.GenMs,
+		GenSamples:           stats.GenSamples,
 		Cost:                 stats.Cost,
 		CostPendingCount:     stats.CostPendingCount,
 		LastSuccessAt:        stats.LastSuccessAt,
