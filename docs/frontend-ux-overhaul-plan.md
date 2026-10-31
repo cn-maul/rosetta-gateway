@@ -1,6 +1,6 @@
 # 前端信息架构与性能整改方案（v2）
 
-状态：v2 待评审。v1 只覆盖四个最重页面；v2 应「所有页面都够快、没有大页面」的目标，
+状态：**已实施完毕**（2026-10-31，U1/U2/U3 全部落地，U5 不立项；执行结果见 §11）。v1 只覆盖四个最重页面；v2 应「所有页面都够快、没有大页面」的目标，
 补全全部页面加载清单、骨架屏/占位规范、图形化（进度条/圆环/迷你图）改造层。
 分支基线 feat/react-rewrite @ 05dddf1。反馈来源：迁移交付后使用者复盘。
 
@@ -135,3 +135,29 @@
 2. 价格页签全局搜索收窄可接受？（或 <500 模型保留全量）
 3. U5 后端分页接口是否立项？
 4. 图形化程度：§6 全做，还是先做成功率圆环 + 配额条两处最高频的？
+
+---
+
+## 11. 实际执行结果（2026-10-31）
+
+四个待拍板项当时的结论：**① 做**（首屏默认「今天」，KPI 副行给「近 7 天日均」对照）；
+**② 做，但带门控**（供应商 ≥500 才先选供应商，<500 保留全量，`PRICE_PROVIDER_GATE = 500`）；
+**③ 不立项**（U5 未做，价格/模型仍走现有接口）；**④ 全做**（圆环 + 进度条 + mini sparkline 都已落地）。
+
+| 批 | 状态 | 提交 | 实际结果 |
+| --- | --- | --- | --- |
+| U1 | ✅ | `142a6fe` | 首屏=状态条 + KPI（含圆环/迷你折线）+ 最近请求内嵌；第二屏=趋势/待办/配置五卡（`useInView` 滚动才拉 byDay）。新增基座 `SkeletonBlock` / `Sparkline` / `RateRing` / `useInView`，`DataTable` 加骨架行，`ui/nav.ts` 按频率重排两组 |
+| U2 | ✅ | `b9fb9f1` `9e93071` `ff1b460` `23a14e9` `30bedfc` `3c122a4` | 六处拆分全部完成：价格页签（弹窗下沉 + 供应商门控 + 批量列表渲染上限 300/次）、上游详情（4 弹窗独立 + 概览/凭据/模型页签化 + 首进页签才拉）、钱包（充值弹窗 + 三张表格独立 + 充值流水懒加载）、用户与分组（六弹窗两表格）、密钥（表格/弹窗/导入 hook）。ModelGroups 344 行经确认无需拆 |
+| U3 | ✅ | `8f8359a` `92734a4` | 路由懒加载（除 Networks 因导出 `networksLoader` 保持静态）+ vendor 分包：入口 **1,104.44 kB → 49.53 kB**（gzip 325.16 → 16.58），react 313.58 kB、heroui 490.16 kB、页面 2.1–55.5 kB。偏好记忆 `ui/usePersistedState.ts`（前缀 `rosetta.pref.`）：总览区间、`/usage` 与 `/history` 天数（分开记）、`/history` 每页条数、模型页天数与粒度 |
+| U5 | ⏭ 未做 | — | 待拍板项 ③ 结论为不立项 |
+
+门禁基线（U1–U3 每批每步都跑）：`npm run typecheck` 0 错 · `node --test` **51/51**（新增
+`persistedPrefs` 5 条）· `npm run build` ok · `legacy-audit` 裸原语 0（白名单 2）/旧类名 0 ·
+`go test ./internal/webui/... -count=1` ok。另做了一次二进制冒烟：`build.ps1` 出的
+`bin/gateway.exe` 在临时目录起服务后 `/admin/` 200、入口 chunk 与懒加载 chunk（Overview /
+react / heroui）全部 200 且字节数与构建输出一致 —— 证明 embed 里的产物与源码同批。
+
+两项偏离原计划，记录在此：**①** §7 说的 `manualChunks` 在 Vite 8（Rolldown）里已废弃，
+实际用 `build.rolldownOptions.output.codeSplitting.groups`；**②** 偏好前缀按实现改为
+`rosetta.pref.`（原文 `rosetta_gw_`），键按页面分域（`overview.range` / `history.days` /
+`usage.days` / `history.size` / `models.days` / `models.granularity`）。
