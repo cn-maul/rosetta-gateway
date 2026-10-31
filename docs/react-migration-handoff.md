@@ -1,90 +1,122 @@
 # 前端 React 重构 · 移交说明
 
-> 写给接手的新对话。总方案在 `docs/frontend-react-migration-plan.md`（607 行，含全部决策、
-> 组件映射表、阶段计划、风险登记册与 Plan B 执行细则 §12），本文只讲「现在在哪、怎么继续」。
+> 写给接手的新对话。两份长文档：`docs/frontend-react-migration-plan.md`（607 行，架构决策、
+> 组件映射表、阶段计划、Plan B 漂移控制 §12）与 `docs/frontend-ux-overhaul-plan.md`
+> （信息架构与性能整改：首屏口径、骨架规范、图形化改造层）。本文只讲「现在在哪、怎么继续」。
 
 ## 1. 现状一句话
 
-分支 `feat/react-rewrite` 上已完成 Vue→React 的一次性换血（P0/P1/P2）与 B1 第一张页面
-（Networks，作为模式模板），typecheck / 43 tests / build / Go 守护全绿；
-剩余工作是把 17 个页面按同一模式重建完（P4-B1 余量 → B2 → B3 → C 组件），然后 P5 收尾、合并。
+分支 `feat/react-rewrite` 上 Vue→React 换血**已全部完成**：12 个页面 + 登录/设密全部是真实实现
+（无占位件），`ui/` 基座与 `components/` 子组件拆分到位，首屏改造（U1）、七个大页面拆分（U2）、
+路由懒加载 + vendor 分包 + 偏好记忆（U3）全部落地；入口 chunk 从 1.10MB 降到 49KB。
+typecheck / 51 tests / build / legacy-audit / Go 三项嵌入守护全绿。剩下的是收尾与发布：
+浏览器手工走查、CI 接 `--gate`、文档收口、XERJ 重建索引、合并彩排（§12.5）。
 
 ## 2. 提交与标签
 
 | 提交 | 内容 |
 | --- | --- |
-| `pre-react-rewrite`（tag @ bbe9b08） | Vue 基线，旧实现全部可从这里 `git show pre-react-rewrite:web/src/<path>` 取阅 |
-| `4141251` docs | 重构方案 v2 + legacy-audit 脚本 + 基线数字 |
-| `992ac3d` P1 | 一次性换血：删光 .vue/styles.css/vue 依赖，React+Tailwind+HeroUI 骨架，api.ts store 化 |
-| `b5163f3` P2 | src/ui 组合件 + Shell + Login/PasswordSetup 真实页 + loader 守卫 |
-| `7d12cca` docs | P2 记录、组件 API 实测更正、P3 并入 P4 |
-| `c469bb9` B1-WIP | ui/DataTable + pages/Networks（模式模板） |
+| `pre-react-rewrite`（tag @ bbe9b08） | Vue 基线；旧实现取阅：`git show pre-react-rewrite:web/src/views/X.vue` |
+| `4141251` | 重构方案 v2 + legacy-audit 脚本 |
+| `992ac3d` `b5163f3` | P1 换血 / P2 基座与守卫 loader |
+| `c469bb9` `6a59aa5` | B1 Networks 模式模板 + 移交说明 |
+| `01d7ec2` … `1745cf6` | B1–B3 全页面重建（用量、总览、模型、上游、设置、密钥、用户、钱包…） |
+| `10f0d23` `fbd2d06` | P5 收尾（删占位件）+ 版本 1.7.2 → 2.0.0 |
+| `35323cd` `2ddd410` | R10 异步所有权断言回归 + failover 测试排空 |
+| `05dddf1` `bf86bf2` | 信息架构与性能整改方案（首屏 1d、骨架规范、图形化层） |
+| `142a6fe` | **U1 首屏仪表盘**：状态条 / KPI 图形化 / 最近请求内嵌 + 骨架与图形基座 |
+| `b9fb9f1` … `3c122a4` | **U2 六处大页面拆分**：价格页签、上游详情（页签化+懒加载）、钱包、用户与分组、密钥 |
+| `8f8359a` | **U3 路由懒加载与 vendor 分包**：入口 1.10MB → 49KB |
+| `92734a4` | **U3 偏好记忆**：区间 / 粒度 / 每页条数跨会话保留 |
 
 ## 3. 已完成 / 待办
 
-**已完成**（详细清单见方案 §7 各阶段「实际结果」）：
-- 依赖换血、theme.css、store.ts、main.tsx、router.tsx（18 条路由 handle 保留）
-- src/ui：AppModal、AppDrawer、ConfirmDialog+confirm.ts（Promise 契约）、PageHeader、
-  SectionCard、StatusChip、DataTable、theme.ts、nav.ts、Shell.tsx、AppRoot.tsx
-  （useDocumentTitle + 401 watcher）、Placeholder.tsx（未重建页的临时落点）
-- 守卫：loader 化（ensureSession/authedLoader/loginLoader/providersLoader），旧 reapplyGuard 已删
-- 真实页面：Login、PasswordSetup、Networks
-- 门禁：tests/noHandWrittenPrimitives.test.mjs（4 条）+ web/scripts/legacy-audit.mjs（报告/--gate）
+**已完成**
 
-**待办（按序）**：
-1. **B1 余量**（4 天估）：UsageStats+ModelGroups（Tabs+Table+Meter）→ Overview（含心跳条移植，
-   唯一自研组件，旧 602 行目标 ≤200）→ Models（SearchField+Card 网格+价格 Chip）→ UsageDetail（DataTable+AppDrawer+Disclosure）
-2. **B2**（7 天估）：Providers / Routes / ProviderDetail(拆 4 页签文件) / Settings(拆 Accordion 4 段)
-3. **B3**（5 天估）：Keys / UsersGroups / Wallet / AccessControl / AccountSettings
-4. **C 组件**（3 天估）：UsageByGroup、ModelPicker(→CheckboxGroup 抽屉)、CredentialPanel、UpstreamModelPanel、Upstream
-5. **P5 收尾**：删 Placeholder、CI 接 legacy-audit --gate、build.ps1/CI 注释/AGENTS.md/DESIGN.md 更新、
-   XERJ 索引重建（%LOCALAPPDATA%\Programs\xerj\xerj-index.ps1 .）、提交 internal/webui/dist
-6. **P6 发布**：版本 1.7.2→2.0.0（package.json+lockfile 根两处）、二进制冒烟、合并彩排（§12.5）
+- 基座：`theme.css`（唯一 CSS）、`store.ts`、`main.tsx`、`router.tsx`（18 条路由 handle 保留）、
+  loader 守卫（`ensureSession` / `authedLoader` / `loginLoader` / `providersLoader`）
+- `ui/`：AppModal、AppDrawer、ConfirmDialog + `confirm.ts`（Promise 契约）、PageHeader、SectionCard、
+  StatusChip、DataTable（含骨架行）、SkeletonBlock、Sparkline、RateRing、useInView、usePersistedState、
+  PageFallback、theme、nav、Shell、AppRoot、Login、PasswordSetup、FileImport
+- 页面（`pages/`）：Overview、UsageStats（含 UsageDetail 子页）、Models、Providers、Routes、
+  ProviderDetail、Settings、AccessControl、Wallet、AccountSettings、Networks（模板页）
+- 页面级子组件：`components/` 下 Keys、UsersGroups、Wallet 子页已有；`price/` `provider/` `wallet/`
+  `users/` `keys/` 五个文件夹是 U2 拆分产物（弹窗、表格、工具函数、导入 hook 各自成文件）
+- 门禁：`web/tests/` 10 个文件 51 条用例（含 noHandWrittenPrimitives、dtoContract、asyncOwnership、
+  routeTrace、heartbeatText、importLinks、apiContract、persistedPrefs）；`web/scripts/legacy-audit.mjs`
+  报告/`--gate` 两档；Go 侧 version / csp / lockfile 三项嵌入守护
 
-## 4. 每页重建的标准模式（照 Networks.tsx 抄）
+**待办（按序）**
 
-1. 读旧实现：`git show pre-react-rewrite:web/src/views/X.vue`（页面语义注释很有价值，**逐条带到新代码**）
-2. 读 loader：失败不 throw，返回 { data, error? }；变更后 `useRevalidator().revalidate()`
-3. 布局：PageHeader + SectionCard/DataTable + HeroUI 组件（映射表见方案 §4）
-4. 弹窗 AppModal / 抽屉 AppDrawer；危险操作 confirmBox({danger:true})
-5. 状态徽章 StatusChip；图标 lucide-react（Icon size=18 strokeWidth=1.75 aria-hidden）
-6. `api.ts` 的 401 一律静默（is401 判断），toast.success/danger 报结果
-7. 每页做完：typecheck + npm test + 该页手工走查；R10 异步所有权契约补回断言
-   （参考 git 历史里的 tests/asyncIntegration.test.mjs）
+1. **浏览器手工走查**（唯一没做过的验证）：`cd web && npm run dev`（`/admin/api` 代理到
+   `bin/config.json` 的网关端口，需先起 `bin/gateway.exe`）。重点看：路由懒加载首屏骨架、偏好在刷新后
+   是否保留、深链 `?tab=` / `?model=` / `?range=` / `?days=` / `?size=`、暗色切换、401 静默、登出
+2. **CI / build.ps1 接 `legacy-audit --gate`**（白名单 2 处需在脚本注释里写明为什么留）
+3. **文档收口**：本文件、方案 §7「实际结果」、`AGENTS.md`、`DESIGN.md`
+4. **XERJ 重建索引**：`%LOCALAPPDATA%\Programs\xerj\xerj-index.ps1 .`
+5. **合并彩排与发布**（§12.5）：rebase main → 全量 `go test ./...` → 二进制冒烟 → 合并
+
+## 4. 每页重建的标准模式
+
+1. 读旧实现：`git show pre-react-rewrite:web/src/views/X.vue` —— 页面语义注释很有价值，**逐条带进新代码**
+2. 数据：`api.ts` 直接调用 + `useState`；并发查询一律用 `RequestGeneration` 守卫（`asyncState.ts`），
+   401 一律静默（`is401(e)`），错误走 `toast.danger` + 页内 Alert
+3. 布局：PageHeader + SectionCard / DataTable + HeroUI 组件（映射表见方案 §4）；内容区外层边距由
+   Shell 提供（`max-w-app p-gutter`），页面不再自带 `.page` 容器
+4. 弹窗 AppModal / 抽屉 AppDrawer；危险操作 `confirmBox({ danger: true })`
+5. 状态徽章 StatusChip（`ok/err/warn/info/dim`）；图标 lucide-react（`size={18} strokeWidth={1.75} aria-hidden`）
+6. 加载态：首屏骨架用 SkeletonBlock / DataTable 的 `skeletonRows`，不要只放一个居中 Spinner
+7. 大页面拆分：单文件 ≤400 行；弹窗自包含（表单状态、校验、提交都在弹窗内，父级只传 `open` / `onSaved`）
+8. 页签化时把 `?tab=` 同步到 URL，**首次激活页签才拉数据**（参考 ProviderDetail 的 `subsLoadedRef`）
+9. 用户选择类偏好用 `usePersistedState`（URL 优先，偏好只做默认值）
+10. 每页做完跑第 7 节全部命令；源码形态断言（R10）要能匹配住（`tests/asyncIntegration.test.mjs`）
 
 ## 5. 硬性纪律（violate = 返工）
 
 - **守护测试不可红**：CSP（index.html 无内联脚本/事件、theme-init.js 同步外链）、
-  version_test（入口 chunk 必须含版本号字面量 → App/Shell 静态可达，页脚必须渲染 __APP_VERSION__）、
-  lockfile 根 version == package.json version（现 1.7.2）
-- **反手写门禁**：tsx 无裸 `<button>/<input>/<select>/<table>…`、无新 CSS 文件（仅 theme.css）、
-  无 .vue 回潮；每步跑 `npm test`（内含 noHandWrittenPrimitives）
-- **业务文件不动结构**：api.ts/types.ts/fmt.ts/… 只做框架相关最小改动（Plan B 漂移控制，§12.3）；
-  每周 rebase main 一次；`dtoContract` 是契约哨兵
-- **分支上不提交 internal/webui/dist**；web/dist 不入库（gitignore）
-- 单 tsx ≤ 400 行，超出拆子组件（Settings 拆 4 段、ProviderDetail 拆 4 页签）
+  `version_test`（`dist/index.html` 里的 `index-*.js` **入口 chunk 必须含 `2.0.0` 字面量** → 版本号
+  渲染在 Shell 页脚，Shell 永远在入口依赖链上，页面懒加载不影响）、
+  `lockfile_version_test`（`web/package-lock.json` 根 version == `web/package.json`，现 2.0.0）
+- **反手写门禁**：tsx 无裸 `<button>/<input>/<select>/<table>`、无新 CSS 文件（仅 `theme.css`）、无 `.vue` 回潮
+- **`internal/webui/dist` 必须随前端改动一起提交**：embed 与 `version_test` 读的都是它。
+  改完前端一定 `npm run build && npm run sync`，否则 Go 侧测试看着绿、其实测的是上一版产物。`web/dist` 不入库
+- **业务文件不动结构**：`api.ts` / `types.ts` / `fmt.ts` / `range.ts` / `routeTrace.ts` 等只做框架相关最小改动
+- **单 tsx ≤ 400 行**，超出拆子组件
+- **每个子步骤完成立刻提交**：本分支上有过一次教训 —— 未提交的落盘在会话换代时整片丢失，
+  `git status` 干净、HEAD 还停在上一笔，只能从精读笔记重做。批量攒到批次尾是坏习惯
 
 ## 6. 环境与工具坑（本机 Windows，踩过的）
 
-- shell 是 **cmd.exe**：参数里禁用 `<` `>` `|`（git --format、重定向都会炸）；
-  多行提交消息用 `git commit -F <msgfile>`
-- `go test` 需注入 env：USERPROFILE/HOME=C:\Users\louis，GOPATH=C:\Users\louis\go，
-  GOMODCACHE=C:\Users\louis\go\pkg\mod，GOCACHE=C:\Users\louis\AppData\Local\go-build
-- git 身份是 repo-local 的 cn-maul（原本无配置），可按需改
-- 工作区永久有未提交杂物，**永远不要 add**：cmd/gateway/failover_test.go（已修改）、home/、work-r7-store-api.txt
-- 构建有两条**已知无害警告**：theme-init.js "can't be bundled"（必须保留原样的外链脚本）；
-  chunk >500KB（P4 路由级 lazy 后回落）
-- run_code 内嵌模板字符串时内层引号用单引号；.mjs 里不能写 TS 注解
+- 本会话 shell 是 **bash**（旧记录里的 cmd.exe 限制已不适用）；多行提交信息仍用 `git commit -F <msgfile>`
+- `go test` 需注入 env：`USERPROFILE`/`HOME=C:\Users\louis`、`GOPATH=C:\Users\louis\go`、
+  `GOMODCACHE=C:\Users\louis\go\pkg\mod`、`GOCACHE=C:\Users\louis\AppData\Local\go-build`
+- git 身份是 repo-local 的 cn-maul；工作区偶有杂物（`home/`、`nul`、`work-r7-store-api.txt`），
+  `.gitignore` 已挡，**永远不要 `git add -A` 到仓库根**
+- 构建有一条**已知无害警告**：`theme-init.js can't be bundled without type="module"`（必须保留的同步外链脚本）。
+  500KB chunk 警告已随 U3 分包消失（heroui 490KB 仍在警戒线附近，但已是单一最大块）
+- **不要用 `npx tsc -b`**：会在 `web/` 生成 `vite.config.js` / `vite.config.d.ts` / `*.tsbuildinfo` 垃圾。
+  用 `npm run typecheck`（`tsc --noEmit`）
+- Vite 8 是 Rolldown 构建器：分包写在 `build.rolldownOptions.output.codeSplitting.groups`，
+  `output.manualChunks` 已废弃且与前者同时给会被忽略
 
 ## 7. 验证命令清单（每次提交前全跑）
 
-`cd web && npm run typecheck && npm test && npm run build && node scripts/legacy-audit.mjs`
-`go test ./internal/webui/...`（P5 前它是绿的，因为它测的是 embed 里的 Vue 旧产物）
-浏览器手工链路（登录→探测→守卫→登出→暗色切换）在 P2 后**尚未走查过**，建议下次先做：
-`cd web && npm run dev`（/admin/api 代理到 bin/config.json 的网关端口，需先起 gateway.exe）。
+```bash
+cd web && npm run typecheck && npm test && npm run build \
+  && node scripts/legacy-audit.mjs && npm run sync
+cd .. && go test ./internal/webui/... -count=1
+```
+
+当前基线：tsc 0 错 · tests 51/51 · build ok（入口 49.5 kB / react 313.6 kB / heroui 490.2 kB /
+页面 2.1–55.5 kB）· audit `.tsx` 58 文件、裸原语 0（白名单 2）、旧类名 0 · go webui ok
 
 ## 8. 组件 API 速记（详见方案附录 §11）
 
-Alert.status / Chip.color+variant+size / TextField 受控 value+onChange 放 TextField /
-Input 只吃原生属性 / Button 无 title / Drawer.Content 用 placement+className / Modal.Dialog 有 style /
-Checkbox 无 size / Menu.onAction+Dropdown.Item id。
+Alert.status / Chip.color+variant+size / TextField 受控 `value`+`onChange` 放 TextField、Input 只吃原生属性 /
+Button 无 `title`（包 `<span title>`）/ Drawer.Content 用 `placement`+`className` / Modal.Dialog 有 `style` /
+Checkbox 无 `size` / Menu.onAction+Dropdown.Item id。
+
+新增坑（U1–U3 实测）：`ProgressCircle` 的 `size` 只接受 `sm|md|lg`（传数字报 TS2322）·
+`ProgressBar.Fill` 必须自带 `style={{ width: '…%' }}`（编译 CSS 不消费 `--percentage`）·
+`Skeleton` 只有 `SkeletonRoot` · `Tooltip` 需 `<Tooltip delay={300}>` 根包住 Trigger/Content ·
+React 保留 prop `key` 不能当普通 prop 传递（`KeyEditModal` 因此把入参叫 `keyRow`）。
