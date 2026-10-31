@@ -245,9 +245,17 @@ func BuildApp(d Deps) *App {
 		{Pattern: "GET /anthropic/v1/models", Handler: catalog.List("anthropic"), Scope: routeRoot},
 		// 单模型详情：外部工具（Cherry Studio / LobeChat / 各类网关面板）按
 		// OpenRouter/LiteLLM 约定读 context_length / max_output_tokens。
-		{Pattern: "GET /v1/models/{model}", Handler: catalog.Get(""), Scope: routeRoot},
-		{Pattern: "GET /openai/v1/models/{model}", Handler: catalog.Get("openai"), Scope: routeRoot},
-		{Pattern: "GET /anthropic/v1/models/{model}", Handler: catalog.Get("anthropic"), Scope: routeRoot},
+		//
+		// 通配必须用 {model...} 而不是 {model}：列表端点在 ?include=upstream
+		// 时下发的 id 就是 "供应商slug/模型id"（catalog.List），而 public_name
+		// 本身也允许含 "/"（routing.go 明确支持「acme/gpt-4」这种按客户分名的
+		// 路由）。单段通配匹配不到含 "/" 的路径，ServeMux 于是落 404 ——
+		// 恰恰是「先列模型、再拉详情取 context_length」的那类客户端会踩到，
+		// 表现为「模型列出来了，但点进去说模型不存在」。{model...} 会把剩余
+		// 整段（含未转义的 "/" 与 %2F）都给到 PathValue("model")。
+		{Pattern: "GET /v1/models/{model...}", Handler: catalog.Get(""), Scope: routeRoot},
+		{Pattern: "GET /openai/v1/models/{model...}", Handler: catalog.Get("openai"), Scope: routeRoot},
+		{Pattern: "GET /anthropic/v1/models/{model...}", Handler: catalog.Get("anthropic"), Scope: routeRoot},
 		// 额度/费用查询（官方 usage/costs + 生态兼容 dashboard billing，见 billing.go）
 		{Pattern: "GET /dashboard/billing/subscription", Handler: billinghttp.Subscription(db), Scope: routeRoot},
 		{Pattern: "GET /v1/dashboard/billing/subscription", Handler: billinghttp.Subscription(db), Scope: routeRoot},
@@ -423,6 +431,15 @@ func BuildApp(d Deps) *App {
 		routeSpec{Pattern: "PATCH /admin/api/", Handler: adminAuto.ServeHTTP, Scope: routeAdminFallback},
 		routeSpec{Pattern: "DELETE /admin/api/", Handler: adminAuto.ServeHTTP, Scope: routeAdminFallback},
 		routeSpec{Pattern: "PUT /admin/api/", Handler: adminAuto.ServeHTTP, Scope: routeAdminFallback},
+	)
+
+	// 数据面兜底：未匹配的 /v1 路径也必须回 JSON，而不是 net/http 默认的
+	// text/plain 404（理由见 notfound.go）。三条子树模式覆盖三套别名入口，
+	// 具体端点比它更特异，不受影响。
+	routeSpecs = append(routeSpecs,
+		routeSpec{Pattern: "/v1/", Handler: v1NotFound(false), Scope: routeRoot},
+		routeSpec{Pattern: "/openai/v1/", Handler: v1NotFound(false), Scope: routeRoot},
+		routeSpec{Pattern: "/anthropic/v1/", Handler: v1NotFound(true), Scope: routeRoot},
 	)
 
 	// SPA 产物在 embed FS 的 dist/ 子目录下；剥掉 /admin 前缀后交给 FileServer。

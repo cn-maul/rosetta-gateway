@@ -26,10 +26,10 @@ func TestBuildApp_RegistersEveryCataloguedRoute(t *testing.T) {
 		usage: newUsageRecorder(db, discardLogger()),
 	})
 
-	// 109 是当前真实生产契约（含 5 条 /admin/api/ 方法兜底）。
-	// 端点增删必须显式更新这个数，不能靠测试里手抄第三份清单。
-	if len(app.Routes) != 109 {
-		t.Fatalf("生产路由契约应为 109 条，实际 %d 条", len(app.Routes))
+	// 112 是当前真实生产契约（含 5 条 /admin/api/ 方法兜底与 3 条 /v1
+	// 子树兜底）。端点增删必须显式更新这个数，不能靠测试里手抄第三份清单。
+	if len(app.Routes) != 112 {
+		t.Fatalf("生产路由契约应为 112 条，实际 %d 条", len(app.Routes))
 	}
 	seen := make(map[string]registeredRoute)
 	for _, r := range app.Routes {
@@ -45,6 +45,12 @@ func TestBuildApp_RegistersEveryCataloguedRoute(t *testing.T) {
 	required := []string{
 		"POST /v1/chat/completions", "POST /v1/messages", "POST /v1/responses",
 		"GET /v1/models", "GET /healthz", "GET /admin/",
+		// 模型详情必须是 {model...}（通配剩余整段）：列表端点会下发
+		// "供应商slug/模型id" 这种含 "/" 的 id，单段通配匹配不到。
+		"GET /v1/models/{model...}",
+		"GET /openai/v1/models/{model...}", "GET /anthropic/v1/models/{model...}",
+		// /v1 子树兜底：未匹配路径回 JSON 404，而不是 text/plain。
+		"/v1/", "/openai/v1/", "/anthropic/v1/",
 		"POST /admin/api/login", "GET /admin/api/session",
 		"GET /admin/api/providers", "POST /admin/api/providers",
 		"GET /admin/api/model-groups/{id}/members",
@@ -105,7 +111,21 @@ func TestBuildApp_HandlersMatchServeMuxPatterns(t *testing.T) {
 	for _, r := range sorted {
 		method, path, ok := strings.Cut(r.Pattern, " ")
 		if !ok {
-			t.Fatalf("pattern 缺少方法: %q", r.Pattern)
+			// 无方法的子树兜底（/v1/、/openai/v1/、/anthropic/v1/）：
+			// 它必须接住**所有**方法，所以不按方法逐个注册。
+			// 用一个肯定没人注册过的子路径验证它确实落到这条兜底上。
+			if !strings.HasSuffix(r.Pattern, "/") {
+				t.Fatalf("pattern 缺少方法: %q", r.Pattern)
+			}
+			req, err := http.NewRequest(http.MethodDelete,
+				r.Pattern+"definitely-not-a-registered-endpoint", nil)
+			if err != nil {
+				t.Fatalf("构造请求 %s: %v", r.Pattern, err)
+			}
+			if _, got := app.Mux.Handler(req); got != r.Pattern {
+				t.Errorf("%s 没能接住未注册子路径，实际落到 %q", r.Pattern, got)
+			}
+			continue
 		}
 		// 前缀兜底不是具体端点，mux.Handler 对其只返回自身 pattern；
 		// 它的作用由安全矩阵中的真实请求验证。
