@@ -4,6 +4,8 @@ import { api } from '../../api'
 import { AppModal } from '../../ui/AppModal'
 import { confirmBox } from '../../ui/confirm'
 import { PriceField } from '../price/priceShared'
+import { TokenField } from '../../ui/TokenField'
+import { parseTokenCount } from '../../tokenCount'
 import type { DiscoveredModel, UpstreamModel } from '../../types'
 
 const is401 = (e: unknown): boolean => (e as { status?: number }).status === 401
@@ -100,6 +102,18 @@ export function ModelEditModal({
       toast.danger('上游模型名（model_id）为必填项')
       return
     }
+    // 这两个数允许写 128K / 1M（厂商文档就是这么写的）。解析失败要当场报错，
+    // 不能落到 Number()||0 —— 那会把打错的后缀变成「未设置」，错误沉底。
+    const ctxTokens = parseTokenCount(contextWindow)
+    const outTokens = parseTokenCount(maxOutputTokens)
+    if (ctxTokens === null) {
+      toast.danger('上下文窗口无法识别，请填数字或 128K / 1M 这类写法')
+      return
+    }
+    if (outTokens === null) {
+      toast.danger('最大输出无法识别，请填数字或 128K / 1M 这类写法')
+      return
+    }
     const prices = [priceInput, priceCacheHit, priceOutput].map(Number)
     if (prices.some((v) => !Number.isFinite(v) || v < 0)) {
       toast.danger('单价必须是大于等于 0 的数字')
@@ -124,8 +138,8 @@ export function ModelEditModal({
       }
       await api.updateModel(original.id, {
         model_id: modelId.trim(),
-        context_window: Number(contextWindow) || 0,
-        max_output_tokens: Number(maxOutputTokens) || 0,
+        context_window: ctxTokens,
+        max_output_tokens: outTokens,
         price_input: prices[0],
         price_cache_hit: prices[1],
         price_output: prices[2],
@@ -178,22 +192,8 @@ export function ModelEditModal({
           <Input placeholder="deepseek-chat" className="font-mono" autoComplete="off" />
         </TextField>
         <div className="grid grid-cols-2 gap-4">
-          <TextField
-            aria-label="上下文窗口"
-            value={contextWindow}
-            onChange={setContextWindow}
-          >
-            <Label>上下文窗口</Label>
-            <Input type="number" min={0} step={1} placeholder="0 = 未设置" />
-          </TextField>
-          <TextField
-            aria-label="最大输出"
-            value={maxOutputTokens}
-            onChange={setMaxOutputTokens}
-          >
-            <Label>最大输出</Label>
-            <Input type="number" min={0} step={1} placeholder="0 = 未设置" />
-          </TextField>
+          <TokenField label="上下文窗口" value={contextWindow} onChange={setContextWindow} />
+          <TokenField label="最大输出" value={maxOutputTokens} onChange={setMaxOutputTokens} />
         </div>
         <fieldset className="min-w-0" disabled={saving}>
           <div className="text-muted text-[11px]">单价（元 / 1M tokens）</div>
@@ -389,6 +389,17 @@ export function ModelDiscoverModal({
       toast.danger('上游模型名（model_id）为必填项')
       return
     }
+    // 与编辑弹窗同一口径：128K / 1M 可识别，识别不了要当场说，不能静默变 0。
+    const ctxTokens = parseTokenCount(mContextWindow)
+    const outTokens = parseTokenCount(mMaxOutput)
+    if (ctxTokens === null) {
+      toast.danger('上下文窗口无法识别，请填数字或 128K / 1M 这类写法')
+      return
+    }
+    if (outTokens === null) {
+      toast.danger('最大输出无法识别，请填数字或 128K / 1M 这类写法')
+      return
+    }
     const prices = [mPriceInput, mPriceCacheHit, mPriceOutput].map(Number)
     if (prices.some((v) => !Number.isFinite(v) || v < 0)) {
       toast.danger('单价必须是大于等于 0 的数字')
@@ -400,8 +411,8 @@ export function ModelDiscoverModal({
         {
           model_id: id,
           display_name: mDisplayName.trim(),
-          context_window: Number(mContextWindow) || 0,
-          max_output_tokens: Number(mMaxOutput) || 0,
+          context_window: ctxTokens,
+          max_output_tokens: outTokens,
           // 0 = 不配价（后端保持价格列为 NULL）。四项都填 0 与「留空」等价，
           // 不会落成「确认免费」的 0 元条目。
           price_input: prices[0],
@@ -493,14 +504,18 @@ export function ModelDiscoverModal({
               <Input placeholder="留空 = 用模型名" autoComplete="off" />
             </TextField>
             <div className="grid grid-cols-2 gap-3">
-              <TextField aria-label="上下文窗口" value={mContextWindow} onChange={setMContextWindow}>
-                <Label>上下文窗口</Label>
-                <Input type="number" min={0} step={1} placeholder="0 = 用默认值" />
-              </TextField>
-              <TextField aria-label="最大输出" value={mMaxOutput} onChange={setMMaxOutput}>
-                <Label>最大输出</Label>
-                <Input type="number" min={0} step={1} placeholder="0 = 用默认值" />
-              </TextField>
+              <TokenField
+                label="上下文窗口"
+                value={mContextWindow}
+                onChange={setMContextWindow}
+                placeholder="0 = 用默认值"
+              />
+              <TokenField
+                label="最大输出"
+                value={mMaxOutput}
+                onChange={setMMaxOutput}
+                placeholder="0 = 用默认值"
+              />
             </div>
             <fieldset className="min-w-0" disabled={importing}>
               <div className="text-muted text-[11px]">单价（元 / 1M tokens）</div>

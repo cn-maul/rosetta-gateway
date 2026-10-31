@@ -22,6 +22,8 @@ import { fmtNum } from '../fmt'
 import { MODEL_DEFAULT_FALLBACKS, RUNTIME_DEFAULTS } from '../generated/defaults'
 import { PriceSettings } from '../components/PriceSettings'
 import { SiteBrandCard } from '../components/settings/SiteBrandCard'
+import { TokenField } from '../ui/TokenField'
+import { parseTokenCount } from '../tokenCount'
 import type { ConfigExportFile, ConfigImportResult, PruneResult } from '../types'
 
 /**
@@ -240,6 +242,15 @@ export function Settings() {
   // 不该在保存这一分类时把用户挡下来。
   const save = async (target: 'model' | 'runtime') => {
     const f = formRef.current
+    // 默认容量这两个数允许写 128K / 1M（厂商文档就是这么写的），解析口径见
+    // src/tokenCount.ts。解析放在这里而不是保存语句里，是为了让「model」分类
+    // 的校验和真正发出去的值共用同一次解析 —— 校验过的值与写下去的值必须同源。
+    const ctxTokens = parseTokenCount(f.default_context_window)
+    const outTokens = parseTokenCount(f.default_max_output_tokens)
+    // 两个分类共用一张表单与一个保存接口（PUT /settings 要求全量字段），
+    // 所以只校验**当前分类**的字段：另一个分类的值是载入时后端校验过的原值，
+    // 不该在保存这一分类时把用户挡下来。
+    //
     // 读取失败时 form 里是兜底常量，保存就是拿默认值覆盖生产配置 —— 直接拒绝。
     // 提示要指向「重新加载」，因为这是唯一能解开的状态。
     //
@@ -250,13 +261,15 @@ export function Settings() {
       return
     }
     if (target === 'model') {
-      const ctx = Number(f.default_context_window)
-      const out = Number(f.default_max_output_tokens)
-      if (!Number.isFinite(ctx) || ctx <= 0 || !Number.isFinite(out) || out <= 0) {
-        toast.danger('默认上下文与最大输出必须为正整数')
+      if (ctxTokens === null || outTokens === null) {
+        toast.danger('默认上下文与最大输出无法识别，请填数字或 128K / 1M 这类写法')
         return
       }
-      if (out > ctx) {
+      if (ctxTokens <= 0 || outTokens <= 0) {
+        toast.danger('默认上下文与最大输出必须为正数')
+        return
+      }
+      if (outTokens > ctxTokens) {
         toast.danger('最大输出通常不应超过上下文窗口')
         return
       }
@@ -290,8 +303,8 @@ export function Settings() {
     try {
       // saveSettings 走 mutate()：保存后自动 reload，转发路径即时用上新值（无需重启）。
       await api.saveSettings({
-        default_context_window: Number(f.default_context_window),
-        default_max_output_tokens: Number(f.default_max_output_tokens),
+        default_context_window: ctxTokens ?? 0,
+        default_max_output_tokens: outTokens ?? 0,
         upstream_timeout_ms: Number(f.upstream_timeout_ms),
         stream_idle_timeout_ms: Number(f.stream_idle_timeout_ms),
         stream_first_token_timeout_ms: Number(f.stream_first_token_timeout_ms),
@@ -587,24 +600,22 @@ export function Settings() {
                   description="上游没报这两个数时用它兜底。改这里不会影响已导入模型的既有值。"
                 >
                   <div className="flex flex-col gap-4">
-                    <TextField
-                      aria-label="默认上下文窗口（tokens）"
+                    <TokenField
+                      label="默认上下文窗口（tokens）"
                       value={form.default_context_window}
                       onChange={(v) => setForm((f) => ({ ...f, default_context_window: v }))}
-                    >
-                      <Label>默认上下文窗口（tokens）</Label>
-                      <Input type="number" min={1} step={1} />
-                      <span className="text-muted text-[11px]">添加模型时若上游未暴露 context_length，则用此值</span>
-                    </TextField>
-                    <TextField
-                      aria-label="默认最大输出（tokens）"
+                    />
+                    <span className="text-muted -mt-2 text-[11px]">
+                      添加模型时若上游未暴露 context_length，则用此值。可写 128K / 1M。
+                    </span>
+                    <TokenField
+                      label="默认最大输出（tokens）"
                       value={form.default_max_output_tokens}
                       onChange={(v) => setForm((f) => ({ ...f, default_max_output_tokens: v }))}
-                    >
-                      <Label>默认最大输出（tokens）</Label>
-                      <Input type="number" min={1} step={1} />
-                      <span className="text-muted text-[11px]">添加模型时若上游未暴露 max_completion_tokens，则用此值</span>
-                    </TextField>
+                    />
+                    <span className="text-muted -mt-2 text-[11px]">
+                      添加模型时若上游未暴露 max_completion_tokens，则用此值。可写 64K / 1M。
+                    </span>
                     <div className="flex justify-end">
                       <Button type="submit" variant="primary" isDisabled={saving}>
                         {saving ? '保存中…' : '保存设置'}
