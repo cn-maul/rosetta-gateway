@@ -1,11 +1,12 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
-import { Button, Spinner, toast } from '@heroui/react'
+import { Button, Spinner, Tabs, toast } from '@heroui/react'
 import { Link, useNavigate, useParams, useSearchParams } from 'react-router-dom'
 import { api } from '../api'
 import { useNetworks } from '../useNetworks'
 import { RequestGeneration } from '../asyncState'
 import { PageHeader } from '../ui/PageHeader'
 import { SectionCard } from '../ui/SectionCard'
+import { SkeletonBlock } from '../ui/SkeletonBlock'
 import { confirmBox } from '../ui/confirm'
 import { CredentialPanel } from '../components/CredentialPanel'
 import { UpstreamModelPanel } from '../components/UpstreamModelPanel'
@@ -51,6 +52,28 @@ export function ProviderDetail() {
   const navigate = useNavigate()
   const [searchParams, setSearchParams] = useSearchParams()
 
+  // 页签同步到 ?tab=：概览默认页；?model= 深链视为模型页签（等深链消费时
+  // 落成显式 tab=models，刷新后不再依赖 query 推断）。
+  const wantsModel = searchParams.get('model')
+  const rawTab = searchParams.get('tab')
+  const tab: 'overview' | 'credentials' | 'models' =
+    wantsModel
+      ? 'models'
+      : rawTab === 'credentials' || rawTab === 'models'
+        ? rawTab
+        : 'overview'
+  const setTab = (t: 'overview' | 'credentials' | 'models') => {
+    setSearchParams(
+      (prev) => {
+        const next = new URLSearchParams(prev)
+        if (t === 'overview') next.delete('tab')
+        else next.set('tab', t)
+        return next
+      },
+      { replace: true },
+    )
+  }
+
   const [provider, setProvider] = useState<Provider | null>(null)
   const [notFound, setNotFound] = useState(false)
   const [err, setErr] = useState('')
@@ -64,6 +87,12 @@ export function ProviderDetail() {
   // （一个要新增配置，一个要重试）。
   const [credsErr, setCredsErr] = useState('')
   const [modelsErr, setModelsErr] = useState('')
+  // 子资源懒加载：概览页签秒出，凭据/模型页签第一次进入才拉。
+  // loadedRef 记录「已拉过」（失败重试也算），失败态不会被 effect 反复重拉，
+  // 重试走页内按钮。
+  const [credsLoading, setCredsLoading] = useState(false)
+  const [modelsLoading, setModelsLoading] = useState(false)
+  const subsLoadedRef = useRef({ credentials: false, models: false })
 
   const [togglingProvider, setTogglingProvider] = useState(false)
   const [credToggling, setCredToggling] = useState<Set<string>>(new Set())
@@ -87,28 +116,51 @@ export function ProviderDetail() {
   const idRef = useRef(id)
   idRef.current = id
 
-  /** reloadSub 拉取该上游的凭据与模型。silent 时不弹 toast（后台刷新失败不该抢注意力）。 */
-  const reloadSub = async (silent = false) => {
+  /** loadCredentials/loadModels 各拉各的：两个子资源成败互不牵连（凭据接口挂了
+   *  不该把模型表也标成失败），懒加载时也能只点亮进入的那个页签。
+   *  silent 时不弹 toast（后台刷新失败不该抢注意力）。 */
+  const loadCredentials = async (silent = false) => {
     const pid = idRef.current
-    // 两个子资源各自成败互不牵连：凭据接口挂了不该把模型表也标成失败。
-    const [c, m] = await Promise.allSettled([api.credentials(pid), api.models(pid)])
-    if (pid !== idRef.current) return
-    if (c.status === 'fulfilled') {
-      setCreds(c.value)
+    subsLoadedRef.current.credentials = true
+    setCredsLoading(true)
+    try {
+      const result = await api.credentials(pid)
+      if (pid !== idRef.current) return
+      setCreds(result)
       setCredsErr('')
-    } else if (!is401(c.reason)) {
-      const msg = '凭据加载失败：' + (c.reason as Error).message
+    } catch (e) {
+      if (pid !== idRef.current || is401(e)) return
+      const msg = '凭据加载失败：' + (e as Error).message
       setCredsErr(msg)
       if (!silent) toast.danger(msg)
+    } finally {
+      if (pid === idRef.current) setCredsLoading(false)
     }
-    if (m.status === 'fulfilled') {
-      setModels(m.value)
+  }
+
+  const loadModels = async (silent = false) => {
+    const pid = idRef.current
+    subsLoadedRef.current.models = true
+    setModelsLoading(true)
+    try {
+      const result = await api.models(pid)
+      if (pid !== idRef.current) return
+      setModels(result)
       setModelsErr('')
-    } else if (!is401(m.reason)) {
-      const msg = '模型加载失败：' + (m.reason as Error).message
+    } catch (e) {
+      if (pid !== idRef.current || is401(e)) return
+      const msg = '模型加载失败：' + (e as Error).message
       setModelsErr(msg)
       if (!silent) toast.danger(msg)
+    } finally {
+      if (pid === idRef.current) setModelsLoading(false)
     }
+  }
+
+  /** 变更后的整表重载：凭据与模型都可能被一次写操作影响（model_count、
+   *  凭据掩码），两处一起刷。 */
+  const reloadSub = async (silent = false) => {
+    await Promise.all([loadCredentials(silent), loadModels(silent)])
   }
 
   const load = async () => {
@@ -116,7 +168,6 @@ export function ProviderDetail() {
     const seq = ++loadSeqRef.current
     setLoading(true)
     setErr('')
-    let found = true
     try {
       const result = await api.provider(pid)
       if (pid !== idRef.current || seq !== loadSeqRef.current) return
@@ -125,7 +176,6 @@ export function ProviderDetail() {
     } catch (e) {
       if (pid !== idRef.current || seq !== loadSeqRef.current) return
       if (is404(e)) {
-        found = false
         setProvider(null)
         setNotFound(true)
         return
@@ -133,7 +183,7 @@ export function ProviderDetail() {
       if (!is401(e)) setErr('加载上游失败：' + (e as Error).message)
     }
     if (pid !== idRef.current || seq !== loadSeqRef.current) return
-    if (found) await reloadSub()
+    // 子资源不再随主档等齐：页签懒加载各自拉，概览立即可见。
     if (seq === loadSeqRef.current) setLoading(false)
   }
 
@@ -149,6 +199,9 @@ export function ProviderDetail() {
     setBalance(undefined)
     setBalanceBusy(false)
     balanceRequests.current.invalidate()
+    subsLoadedRef.current = { credentials: false, models: false }
+    setCredsLoading(false)
+    setModelsLoading(false)
     setEditOpen(false)
     setCredModal({ open: false, editing: null })
     setModelModal({ open: false, editing: null })
@@ -168,6 +221,14 @@ export function ProviderDetail() {
         /* 保持 150s 保守值 */
       })
   }, [])
+
+  // 页签懒加载：第一次进入凭据/模型页签才拉对应子资源。
+  useEffect(() => {
+    if (!provider) return
+    if (tab === 'credentials' && !subsLoadedRef.current.credentials) void loadCredentials()
+    if (tab === 'models' && !subsLoadedRef.current.models) void loadModels()
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [tab, provider])
 
   // ---------- 概览动作 ----------
 
@@ -378,6 +439,7 @@ export function ProviderDetail() {
       (prev) => {
         const next = new URLSearchParams(prev)
         next.delete('model')
+        next.set('tab', 'models')
         return next
       },
       { replace: true },
@@ -399,7 +461,16 @@ export function ProviderDetail() {
           </Link>
         }
         actions={
-          <Button variant="secondary" isDisabled={loading} onPress={() => void load()}>
+          <Button
+            variant="secondary"
+            isDisabled={loading}
+            onPress={() => {
+              void load()
+              // 刷新只刷已经打开过的页签：没进过的页签保持「进入时再拉」。
+              if (subsLoadedRef.current.credentials) void loadCredentials(true)
+              if (subsLoadedRef.current.models) void loadModels(true)
+            }}
+          >
             刷新
           </Button>
         }
@@ -440,49 +511,77 @@ export function ProviderDetail() {
             </div>
           ) : null}
 
-          {/* 概览与凭据并排，模型表单独占满下一行：概览只有六行只读键值、
-               凭据表只有三列，都天然适合窄栏；并排后首屏能同时看到「这个上游
-               是谁」和「它现在用哪把 key」—— 排查「这个上游怎么不通」正是从
-               这两处一起看的。模型表有五列且可能是行数最多的块，本来就该占满。 */}
-          <div className="grid items-start gap-5 lg:grid-cols-2">
-            <ProviderOverviewCard
-              provider={provider}
-              networks={networks}
-              toggling={togglingProvider}
-              onEdit={() => setEditOpen(true)}
-              onRemove={() => void removeProvider()}
-              onToggle={() => void toggleProvider()}
-            />
-
-            {/* 余额刻意不单独成块：它本来就逐凭据显示（同一把 key 可能只剩一把
-                 有余额），汇总成一个数字反而要自己对应是哪把。 */}
-            <CredentialPanel
-              providerId={provider.id}
-              creds={creds}
-              balance={balance}
-              balanceBusy={balanceBusy}
-              toggling={credTogglingIds}
-              balanceSpecConfigured={balanceSpecConfigured}
-              error={credsErr}
-              onRetry={() => void reloadSub(true)}
-              onAdd={() => setCredModal({ open: true, editing: null })}
-              onQueryBalance={() => void queryBalance()}
-              onEdit={(c) => setCredModal({ open: true, editing: c })}
-              onRemove={(c) => void removeCred(c)}
-              onToggle={(c) => void toggleCred(c)}
-            />
-          </div>
-
-          <UpstreamModelPanel
-            models={models}
-            testing={testing}
-            error={modelsErr}
-            onRetry={() => void reloadSub(true)}
-            onAdd={() => setModelModal({ open: true, editing: null })}
-            onTest={(m) => void testModel(m)}
-            onEdit={(m) => setModelModal({ open: true, editing: m })}
-            onRemove={(m) => void removeModel(m)}
-          />
+          {/* 页签承载三块内容：概览秒出，凭据/模型第一次进入才拉（骨架占位）。
+               之前三块全部铺开时，找一个信息要在整页里扫；页签把「看状态」
+               「换 key」「管模型」三个不同频率的动作分开，一次只加载看的那块。
+               余额刻意跟凭据同页签：它本来就逐凭据显示（同一把 key 可能只剩
+               一把有余额），汇总成一个数字反而要自己对应是哪把。 */}
+          <Tabs
+            aria-label="上游详情"
+            selectedKey={tab}
+            onSelectionChange={(key) =>
+              setTab(key === 'credentials' || key === 'models' ? key : 'overview')
+            }
+          >
+            <Tabs.List>
+              <Tabs.Tab key="overview" id="overview">概览</Tabs.Tab>
+              <Tabs.Tab key="credentials" id="credentials">凭据</Tabs.Tab>
+              <Tabs.Tab key="models" id="models">模型</Tabs.Tab>
+            </Tabs.List>
+            <Tabs.Panel id={tab}>
+              {tab === 'overview' ? (
+                <ProviderOverviewCard
+                  provider={provider}
+                  networks={networks}
+                  toggling={togglingProvider}
+                  onEdit={() => setEditOpen(true)}
+                  onRemove={() => void removeProvider()}
+                  onToggle={() => void toggleProvider()}
+                />
+              ) : tab === 'credentials' ? (
+                credsLoading && !creds.length && !credsErr ? (
+                  <div className="flex flex-col gap-2" aria-hidden="true">
+                    {[0, 1, 2, 3, 4].map((i) => (
+                      <SkeletonBlock key={i} className="h-12 w-full" />
+                    ))}
+                  </div>
+                ) : (
+                  <CredentialPanel
+                    providerId={provider.id}
+                    creds={creds}
+                    balance={balance}
+                    balanceBusy={balanceBusy}
+                    toggling={credTogglingIds}
+                    balanceSpecConfigured={balanceSpecConfigured}
+                    error={credsErr}
+                    onRetry={() => void loadCredentials(true)}
+                    onAdd={() => setCredModal({ open: true, editing: null })}
+                    onQueryBalance={() => void queryBalance()}
+                    onEdit={(c) => setCredModal({ open: true, editing: c })}
+                    onRemove={(c) => void removeCred(c)}
+                    onToggle={(c) => void toggleCred(c)}
+                  />
+                )
+              ) : modelsLoading && !models.length && !modelsErr ? (
+                <div className="flex flex-col gap-2" aria-hidden="true">
+                  {[0, 1, 2, 3].map((i) => (
+                    <SkeletonBlock key={i} className="h-12 w-full" />
+                  ))}
+                </div>
+              ) : (
+                <UpstreamModelPanel
+                  models={models}
+                  testing={testing}
+                  error={modelsErr}
+                  onRetry={() => void loadModels(true)}
+                  onAdd={() => setModelModal({ open: true, editing: null })}
+                  onTest={(m) => void testModel(m)}
+                  onEdit={(m) => setModelModal({ open: true, editing: m })}
+                  onRemove={(m) => void removeModel(m)}
+                />
+              )}
+            </Tabs.Panel>
+          </Tabs>
         </>
       ) : null}
 
