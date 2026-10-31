@@ -3,6 +3,7 @@ package admin
 import (
 	"database/sql"
 	"encoding/csv"
+	"fmt"
 	"math"
 	"net/http"
 	"net/url"
@@ -90,7 +91,29 @@ func queryRangeExplicit(q url.Values, window time.Duration) (from, to int64, exp
 	if to == 0 {
 		to = time.Now().UnixMilli()
 	}
+	if err := validateRange(from, to); err != nil {
+		return 0, 0, false, err
+	}
 	return from, to, explicit, nil
+}
+
+// validateRange 拒绝反区间（from > to）。
+//
+// from > to 的查询在 SQL 里恒为空集，返回 200 只会让人以为「这个时段
+// 真的没有调用」—— 而实际是参数写反了。运维排查时会先去怀疑采集或剪枝，
+// 唯独不会怀疑自己把两个时间戳填反了。
+//
+// 校验必须放在**区间解析的公共入口**：/stats 早就单独校验过（它不走
+// queryRangeExplicit），而 6 个 usage 端点全走这里，此前只在 /stats 拦，
+// 于是同一个错误参数在 /stats 报 400、在 /usage 报 200 空表（CSV 更是
+// 只给一行表头）。
+//
+// from=0（显式「全部历史」）不参与比较：它不是时间点而是「不设下界」。
+func validateRange(from, to int64) error {
+	if from > 0 && to > 0 && from > to {
+		return fmt.Errorf("from must not be greater than to")
+	}
+	return nil
 }
 
 // groupFilter 是 by-* 端点用的条件构造：与 usageFilter 同源、同一套语义，

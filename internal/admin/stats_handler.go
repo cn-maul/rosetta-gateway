@@ -224,8 +224,8 @@ func (h *StatsHandler) Get(w http.ResponseWriter, r *http.Request) { // from/to 
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	if from > 0 && to > 0 && from > to {
-		writeError(w, http.StatusBadRequest, "from must not be greater than to")
+	if err := validateRange(from, to); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 
