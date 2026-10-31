@@ -1,6 +1,7 @@
 import { useLayoutEffect, useMemo, useRef, useState } from 'react'
 import type { ProbeTimelineBucket } from '../types'
 import { heartbeatBucketTexts, type HeartbeatBucket } from '../heartbeatText'
+import { buildBeats } from '../heartbeatBuckets'
 
 /**
  * 连通率条形图（语义对齐旧 HeartbeatBar.vue，2026-10-16 起替代 SVG 折线：
@@ -22,26 +23,6 @@ const BEAT_H = 30
 const PAD_MAX = 4
 const PAD_STRETCH = 10
 const PAD_MIN = 1
-
-/**
- * 把稀疏桶铺成等距 beat 序列：从 end=floor(now/step)*step 向前铺
- * total=hours/bucketMinutes 根；桶按 ts 对齐（后端 UTC 整点桶），缺失补
- * { rate:null, bucket:null }。「没有探测记录」与「成功率 0」必须分开。
- */
-function buildBeats(buckets: readonly ProbeTimelineBucket[], hours: number, bucketMinutes: number): HeartbeatBucket[] {
-  const step = bucketMinutes * 60000
-  const total = Math.max(1, Math.round((hours * 3600000) / step))
-  const end = Math.floor(Date.now() / step) * step
-  const byTs = new Map<number, ProbeTimelineBucket>()
-  for (const b of buckets) byTs.set(Math.floor(b.ts / step) * step, b)
-  const beats: HeartbeatBucket[] = []
-  for (let i = total - 1; i >= 0; i--) {
-    const ts = end - i * step
-    const bucket = byTs.get(ts) ?? null
-    beats.push({ ts, rate: bucket && bucket.count > 0 ? bucket.ok / bucket.count : null, bucket })
-  }
-  return beats
-}
 
 /**
  * 几何：关键不变式 beatCount × full ≤ boxWidth（full=boxWidth/beatCount）。
