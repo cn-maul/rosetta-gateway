@@ -1,16 +1,18 @@
 import { useMemo, useState } from 'react'
-import { Button, Disclosure, DisclosureBody, DisclosureContent, DisclosureHeading, DisclosureIndicator, DisclosureTrigger } from '@heroui/react'
-import { copyText, fmtMoney, fmtNum, fmtSec, fmtSpeed, fmtTimeMs, statusLabel } from '../fmt'
-import { protocolLabel } from '../protocols'
-import { parseRouteTrace } from '../routeTrace'
+import { Button } from '@heroui/react'
+import { copyText, fmtTimeMs, statusLabel } from '../fmt'
 import type { UsageHistoryEntry } from '../types'
 import { AppDrawer } from '../ui/AppDrawer'
 import { StatusChip } from '../ui/StatusChip'
 
 /**
- * 请求详情抽屉（语义对齐旧 DetailDrawer.vue / UsageDetail.vue 内嵌段）：
- * 请求事实、转发决策轨迹、错误详情三段。错误正文分「上游说明」与
- * 「完整原始响应」两块展示，原始 JSON 自动 pretty 化。
+ * 请求详情抽屉：**只承载「表格里看不到的东西」——失败原因**。
+ *
+ * 列表已经把时间、协议、上游、模型、密钥、Token、速度、耗时、费用、状态都印在
+ * 行里了，抽屉再抄一遍只是让人在两处对照同一批数字。排查失败要的是外面没有的
+ * 三样：上游那句原话、完整原始响应、以及这单到底停在哪个上游。
+ *
+ * 抽屉的宽度/定位见 ui/AppDrawer.tsx（宽度只能走 style，className 会被插槽丢弃）。
  */
 
 /** 状态徽章的语义色。ok 绿；error/timeout 红；截断/超限橙；取消灰。 */
@@ -27,18 +29,6 @@ export function statusTone(status: string): 'ok' | 'err' | 'warn' | 'dim' {
     default:
       return 'dim'
   }
-}
-
-function modeLabel(h: UsageHistoryEntry): string {
-  return h.stream ? '流式' : '非流式'
-}
-
-/** 首字超过 10s 红，5–10s 橙，5s 内绿；没有样本保持中性。 */
-function firstTokenTone(h: UsageHistoryEntry): string {
-  if (h.ttfb_ms <= 0) return 'text-muted'
-  if (h.ttfb_ms <= 5000) return 'text-success'
-  if (h.ttfb_ms <= 10000) return 'text-warning'
-  return 'text-danger'
 }
 
 /** 总耗时超过 30s 红，10–30s 橙，10s 内绿；没有样本保持中性。 */
@@ -101,17 +91,16 @@ function errorView(detail: string | undefined) {
   return { message, rawPretty }
 }
 
-function Fact({ label, children }: { label: string; children: React.ReactNode }) {
+function Scale({ label, children, tone }: { label: string; children: React.ReactNode; tone?: string }) {
   return (
-    <div className="grid grid-cols-[120px_minmax(0,1fr)] gap-4 border-b border-separator py-3">
-      <dt className="text-xs text-muted">{label}</dt>
-      <dd className="text-[13px] break-words">{children}</dd>
+    <div className="min-w-0 rounded-lg bg-background-tertiary px-3 py-2.5">
+      <span className="mb-1 block text-[10.5px] text-muted">{label}</span>
+      <strong className={'block break-all ' + (tone ?? '')}>{children}</strong>
     </div>
   )
 }
 
 function DetailContent({ entry }: { entry: UsageHistoryEntry }) {
-  const parsedTrace = useMemo(() => parseRouteTrace(entry.route_trace), [entry])
   const ev = useMemo(() => errorView(entry.error_detail), [entry])
   const [copyNotice, setCopyNotice] = useState('')
 
@@ -124,166 +113,58 @@ function DetailContent({ entry }: { entry: UsageHistoryEntry }) {
 
   return (
     <>
+      {/* 一行定位信息：哪一条请求、什么状态。表格里已经有的字段（模型、密钥、
+          Token、耗时…）不再重复；request_id 是这张表唯一没印的，留着方便对日志。 */}
       <div className="flex flex-wrap items-center justify-between gap-3 text-xs text-muted">
         <StatusChip tone={statusTone(entry.status)}>{statusLabel(entry.status)}</StatusChip>
-        <span>
-          {fmtTimeMs(entry.ts)} · {modeLabel(entry)} · {protocolLabel(entry.ingress_protocol)} →{' '}
-          {protocolLabel(entry.upstream_protocol)}
+        <span className="font-mono">
+          {fmtTimeMs(entry.ts)}
+          {entry.request_id ? ' · ' + entry.request_id : ''}
         </span>
       </div>
 
-      <dl className="mt-5">
-        <Fact label="请求 ID">
-          <span className="font-mono">{entry.request_id || '未记录'}</span>
-        </Fact>
-        <Fact label="请求 IP">
-          <span className="font-mono">{entry.request_ip || '未记录'}</span>
-        </Fact>
-        <Fact label="上游">
-          <span className="font-semibold">{upstreamName(entry)}</span>
-          {entry.provider_id ? <span className="mt-1.5 block font-mono text-[11px] text-muted">provider_id: {entry.provider_id}</span> : null}
-        </Fact>
-        <Fact label="上游协议 / 入站协议">
-          {protocolLabel(entry.upstream_protocol, '未记录')} / {protocolLabel(entry.ingress_protocol, '未记录')}
-          <span className="mt-1.5 block text-[11px] text-muted">上行是网关连接上游使用的协议；下行是客户端调用网关使用的协议。</span>
-        </Fact>
-        <Fact label="公开模型名">
-          <span className="font-mono">{entry.public_model || '—'}</span>
-        </Fact>
-        <Fact label="实际模型">
-          <span className="font-mono">{entry.upstream_model || '未记录'}</span>
-        </Fact>
-        <Fact label="调用密钥">{entry.key_name || entry.key_id || '未记录'}</Fact>
-        <Fact label="Token 用量">
-          新增输入 {fmtNum(newInputTokens(entry))} · 输出 {fmtNum(entry.output_tokens)} · 总计 {fmtNum(entry.total_tokens)}
-          <span className="mt-1.5 block text-[11px] text-muted">新增输入 = 输入总量 - 缓存命中 - 缓存写入</span>
-        </Fact>
-        <Fact label="缓存命中 / 写入 / 推理">
-          {fmtNum(entry.cached_tokens)} / {fmtNum(entry.cached_creation_tokens)} / {fmtNum(entry.reasoning_tokens)} Tokens
-        </Fact>
-        <Fact label="记录费用">
-          ¥{fmtMoney(entry.cost)}
-          <span className="mt-1.5 block text-[11px] text-muted">按调用当时单价固化；0 元不能单独说明是否配价</span>
-        </Fact>
-        <Fact label="首字 / 总耗时">
-          <span className="flex flex-wrap gap-4 tabular-nums">
-            <span className={firstTokenTone(entry)}>首字 {entry.ttfb_ms > 0 ? fmtSec(entry.ttfb_ms) + 's' : '—'}</span>
-            <span className={totalTimeTone(entry)}>总耗时 {entry.latency_ms > 0 ? fmtSec(entry.latency_ms) + 's' : '—'}</span>
-          </span>
-        </Fact>
-        <Fact label="输出速度">{entry.tps > 0 ? fmtSpeed(entry.tps) + ' tok/s' : '无可计算样本'}</Fact>
-        {entry.http_status > 0 ? (
-          <Fact label="HTTP 状态">{entry.http_status}</Fact>
-        ) : null}
-        {entry.error_code ? (
-          <Fact label="错误码">
-            <span className="font-mono">{entry.error_code}</span>
-          </Fact>
-        ) : null}
-      </dl>
+      <div className="mt-4 grid grid-cols-3 gap-2.5">
+        <Scale label="HTTP" tone={entry.http_status >= 400 || entry.http_status === 0 ? 'text-danger' : undefined}>
+          {entry.http_status || '—'}
+        </Scale>
+        <Scale label="错误码">
+          <code className="break-all font-mono">{entry.error_code || '未记录'}</code>
+        </Scale>
+        <Scale label="停在哪">{upstreamName(entry)}</Scale>
+      </div>
 
-      <section className="mt-6">
-        <div className="mb-3.5 flex flex-wrap items-center justify-between gap-3">
-          <h2 className="text-sm font-semibold">转发决策轨迹</h2>
-          {parsedTrace.length > 1 ? <span className="text-[11.5px] text-muted">共 {parsedTrace.length} 个决策</span> : null}
+      {entry.error_detail ? (
+        <div className="mt-3 flex justify-end">
+          <Button variant="ghost" size="sm" onPress={() => void copyError()}>
+            {copyNotice || '复制完整错误'}
+          </Button>
         </div>
-        {parsedTrace.length ? (
-          <>
-            <p className="rounded-lg bg-background-tertiary px-3.5 py-2 text-xs text-muted">
-              编号表示本次请求的决策顺序，包含跳过的目标。配置位置与实际调用次数可能不同。
-            </p>
-            <ol className="mt-3 space-y-2.5">
-              {parsedTrace.map((step, i) => (
-                <li key={i} className="flex gap-3 rounded-xl bg-background-tertiary px-3 py-3 text-xs">
-                  <span className="grid h-6 w-6 flex-none place-items-center rounded-full bg-background-secondary text-muted">
-                    {step.attempt ?? i + 1}
-                  </span>
-                  {step.parsed ? (
-                    <div className="min-w-0 flex-1">
-                      <div className="flex flex-wrap items-center gap-2.5 break-all">
-                        <strong>{step.provider}</strong>
-                        <StatusChip tone={step.outcome === 'ok' ? 'ok' : step.outcome === 'skip' ? 'dim' : 'err'}>
-                          {step.outcomeLabel}
-                        </StatusChip>
-                      </div>
-                      <div className="mt-1.5 break-all font-mono">{step.model}</div>
-                      {step.reasonLabel ? <div className="mt-2 leading-relaxed">{step.reasonLabel}</div> : null}
-                      {step.explanation ? <p className="mt-1.5 text-xs leading-relaxed text-muted">{step.explanation}</p> : null}
-                      <Disclosure className="mt-2 text-muted">
-                        <DisclosureHeading className="text-xs">
-                          <DisclosureTrigger className="text-xs">原始记录</DisclosureTrigger>
-                          <DisclosureIndicator />
-                        </DisclosureHeading>
-                        <DisclosureContent>
-                          <DisclosureBody>
-                            <code className="mt-1.5 block break-all whitespace-pre-wrap font-mono">{step.raw}</code>
-                          </DisclosureBody>
-                        </DisclosureContent>
-                      </Disclosure>
-                    </div>
-                  ) : (
-                    <div className="min-w-0 flex-1">
-                      <p className="text-xs leading-relaxed text-muted">记录格式无法解析，保留原文供排查。</p>
-                      <code className="mt-1.5 block break-all whitespace-pre-wrap font-mono">{step.raw}</code>
-                    </div>
-                  )}
-                </li>
-              ))}
-            </ol>
-          </>
-        ) : (
-          <p className="rounded-lg bg-background-tertiary px-3.5 py-2 text-xs text-muted">
-            此记录未提供转发轨迹，无法从中还原完整尝试过程。
-          </p>
-        )}
-      </section>
+      ) : null}
 
-      {entry.status !== 'ok' || entry.error_detail || entry.error_code ? (
-        <section className="mt-6">
-          <div className="mb-3.5 flex flex-wrap items-center justify-between gap-3">
-            <h2 className="text-sm font-semibold">错误详情</h2>
-            {entry.error_detail ? (
-              <Button variant="ghost" size="sm" onPress={() => void copyError()}>
-                {copyNotice || '复制完整错误'}
-              </Button>
-            ) : null}
-          </div>
-          <div className="grid grid-cols-3 gap-2.5">
-            <div className="min-w-0 rounded-lg bg-background-tertiary px-3 py-2.5">
-              <span className="mb-1 block text-[10.5px] text-muted">HTTP</span>
-              <strong className="break-all">{entry.http_status || '—'}</strong>
-            </div>
-            <div className="min-w-0 rounded-lg bg-background-tertiary px-3 py-2.5">
-              <span className="mb-1 block text-[10.5px] text-muted">错误码</span>
-              <code className="break-all font-mono">{entry.error_code || '未记录'}</code>
-            </div>
-            <div className="min-w-0 rounded-lg bg-background-tertiary px-3 py-2.5">
-              <span className="mb-1 block text-[10.5px] text-muted">终端</span>
-              <strong className="break-all">{parsedTrace.at(-1)?.provider || upstreamName(entry)}</strong>
-            </div>
-          </div>
-          {ev.message ? (
-            <div className="mt-3.5">
-              <h3 className="mb-2 text-xs font-semibold text-muted">上游返回的说明</h3>
-              <pre className="rounded-xl bg-danger-soft px-3.5 py-3.5 text-xs leading-relaxed whitespace-pre-wrap break-words text-danger-soft-foreground">
-                {ev.message}
-              </pre>
-            </div>
-          ) : null}
-          {ev.rawPretty ? (
-            <div className="mt-3.5">
-              <h3 className="mb-2 text-xs font-semibold text-muted">完整原始响应</h3>
-              <pre className="max-h-[52vh] overflow-auto rounded-xl bg-background-tertiary px-3.5 py-3.5 font-mono text-xs leading-relaxed whitespace-pre-wrap break-words">
-                {ev.rawPretty}
-              </pre>
-            </div>
-          ) : null}
-          {!ev.message && !ev.rawPretty ? (
-            <p className="mt-3 rounded-lg bg-background-tertiary px-3.5 py-2 text-xs text-muted">
-              没有可展示的上游正文：这类失败可能在连接阶段发生，或上游未返回错误体。上面的错误码与转发轨迹仍可用于定位。
-            </p>
-          ) : null}
-        </section>
+      {ev.message ? (
+        <div className="mt-1">
+          <h3 className="mb-2 text-xs font-semibold text-muted">上游返回的说明</h3>
+          <pre className="rounded-xl bg-danger-soft px-3.5 py-3.5 text-xs leading-relaxed whitespace-pre-wrap break-words text-danger-soft-foreground">
+            {ev.message}
+          </pre>
+        </div>
+      ) : null}
+      {ev.rawPretty ? (
+        <div className="mt-3.5">
+          <h3 className="mb-2 text-xs font-semibold text-muted">完整原始响应</h3>
+          <pre className="max-h-[52vh] overflow-auto rounded-xl bg-background-tertiary px-3.5 py-3.5 font-mono text-xs leading-relaxed whitespace-pre-wrap break-words">
+            {ev.rawPretty}
+          </pre>
+        </div>
+      ) : null}
+      {!ev.message && !ev.rawPretty ? (
+        <p className="mt-3 rounded-lg bg-background-tertiary px-3.5 py-2 text-xs leading-relaxed text-muted">
+          {entry.status === 'ok'
+            ? '这条请求成功了，没有错误详情。耗时、Token 与费用都印在列表那一行里。'
+            : entry.status === 'canceled'
+              ? '这条请求被调用方取消，上游没有返回错误正文。'
+              : '这条请求没有可展示的上游错误正文。失败可能发生在连接阶段（连不上、证书、DNS），或上游没回错误体；错误码与「停在哪」通常已足够定位。整条请求的耗时、Token 与费用在列表那一行里。'}
+        </p>
       ) : null}
     </>
   )
@@ -291,7 +172,7 @@ function DetailContent({ entry }: { entry: UsageHistoryEntry }) {
 
 export function UsageDetailDrawer({ entry, onClose }: { entry: UsageHistoryEntry | null; onClose: () => void }) {
   return (
-    <AppDrawer open={!!entry} onClose={onClose} title="请求详情">
+    <AppDrawer open={!!entry} onClose={onClose} title="错误详情">
       {entry ? <DetailContent entry={entry} /> : null}
     </AppDrawer>
   )

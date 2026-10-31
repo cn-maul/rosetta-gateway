@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
-import { Button, Spinner, Tabs, toast } from '@heroui/react'
+import { Button, Spinner, toast } from '@heroui/react'
 import { Link, useNavigate, useParams, useSearchParams } from 'react-router-dom'
 import { api } from '../api'
 import { useNetworks } from '../useNetworks'
@@ -52,27 +52,12 @@ export function ProviderDetail() {
   const navigate = useNavigate()
   const [searchParams, setSearchParams] = useSearchParams()
 
-  // 页签同步到 ?tab=：概览默认页；?model= 深链视为模型页签（等深链消费时
-  // 落成显式 tab=models，刷新后不再依赖 query 推断）。
-  const wantsModel = searchParams.get('model')
-  const rawTab = searchParams.get('tab')
-  const tab: 'overview' | 'credentials' | 'models' =
-    wantsModel
-      ? 'models'
-      : rawTab === 'credentials' || rawTab === 'models'
-        ? rawTab
-        : 'overview'
-  const setTab = (t: 'overview' | 'credentials' | 'models') => {
-    setSearchParams(
-      (prev) => {
-        const next = new URLSearchParams(prev)
-        if (t === 'overview') next.delete('tab')
-        else next.set('tab', t)
-        return next
-      },
-      { replace: true },
-    )
-  }
+  // 这一页不做页签：概览、凭据、模型三块平铺（旧版布局）。三块分别回答三个
+  // 不同问题 —— 它是谁 / 它拿哪把 key / 它有哪些模型 —— 排查「这个上游怎么不
+  // 通了」时正是要一起看，藏进页签只会多一次点击。
+  //
+  // ?model= 深链（从路由页跳来编辑某个模型）仍然支持：拉完模型后打开对应弹窗
+  // 并把这个参数从 URL 抹掉，避免刷新重复弹。
 
   const [provider, setProvider] = useState<Provider | null>(null)
   const [notFound, setNotFound] = useState(false)
@@ -183,7 +168,8 @@ export function ProviderDetail() {
       if (!is401(e)) setErr('加载上游失败：' + (e as Error).message)
     }
     if (pid !== idRef.current || seq !== loadSeqRef.current) return
-    // 子资源不再随主档等齐：页签懒加载各自拉，概览立即可见。
+    // 主档到手即可渲染概览；凭据与模型的拉取由下面的 provider effect 触发，
+    // 各自出骨架、各自报错（这里不直接调，否则刷新会拉两遍）。
     if (seq === loadSeqRef.current) setLoading(false)
   }
 
@@ -222,13 +208,13 @@ export function ProviderDetail() {
       })
   }, [])
 
-  // 页签懒加载：第一次进入凭据/模型页签才拉对应子资源。
+  // 主档到手后，凭据与模型两块同时开拉：成败互不牵连，各自出骨架/错误态。
   useEffect(() => {
     if (!provider) return
-    if (tab === 'credentials' && !subsLoadedRef.current.credentials) void loadCredentials()
-    if (tab === 'models' && !subsLoadedRef.current.models) void loadModels()
+    if (!subsLoadedRef.current.credentials) void loadCredentials()
+    if (!subsLoadedRef.current.models) void loadModels()
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [tab, provider])
+  }, [provider])
 
   // ---------- 概览动作 ----------
 
@@ -439,7 +425,8 @@ export function ProviderDetail() {
       (prev) => {
         const next = new URLSearchParams(prev)
         next.delete('model')
-        next.set('tab', 'models')
+        // 页签已取消：链接里若还带着旧的 ?tab=models 一并清掉，避免地址栏残留死参数。
+        next.delete('tab')
         return next
       },
       { replace: true },
@@ -466,7 +453,7 @@ export function ProviderDetail() {
             isDisabled={loading}
             onPress={() => {
               void load()
-              // 刷新只刷已经打开过的页签：没进过的页签保持「进入时再拉」。
+              // 三块都平铺在页面上，刷新就是三块一起刷（用户看得见的部分不该留旧值）。
               if (subsLoadedRef.current.credentials) void loadCredentials(true)
               if (subsLoadedRef.current.models) void loadModels(true)
             }}
@@ -511,77 +498,64 @@ export function ProviderDetail() {
             </div>
           ) : null}
 
-          {/* 页签承载三块内容：概览秒出，凭据/模型第一次进入才拉（骨架占位）。
-               之前三块全部铺开时，找一个信息要在整页里扫；页签把「看状态」
-               「换 key」「管模型」三个不同频率的动作分开，一次只加载看的那块。
-               余额刻意跟凭据同页签：它本来就逐凭据显示（同一把 key 可能只剩
-               一把有余额），汇总成一个数字反而要自己对应是哪把。 */}
-          <Tabs
-            aria-label="上游详情"
-            selectedKey={tab}
-            onSelectionChange={(key) =>
-              setTab(key === 'credentials' || key === 'models' ? key : 'overview')
-            }
-          >
-            <Tabs.List>
-              <Tabs.Tab key="overview" id="overview">概览</Tabs.Tab>
-              <Tabs.Tab key="credentials" id="credentials">凭据</Tabs.Tab>
-              <Tabs.Tab key="models" id="models">模型</Tabs.Tab>
-            </Tabs.List>
-            <Tabs.Panel id={tab}>
-              {tab === 'overview' ? (
-                <ProviderOverviewCard
-                  provider={provider}
-                  networks={networks}
-                  toggling={togglingProvider}
-                  onEdit={() => setEditOpen(true)}
-                  onRemove={() => void removeProvider()}
-                  onToggle={() => void toggleProvider()}
-                />
-              ) : tab === 'credentials' ? (
-                credsLoading && !creds.length && !credsErr ? (
-                  <div className="flex flex-col gap-2" aria-hidden="true">
-                    {[0, 1, 2, 3, 4].map((i) => (
-                      <SkeletonBlock key={i} className="h-12 w-full" />
-                    ))}
-                  </div>
-                ) : (
-                  <CredentialPanel
-                    providerId={provider.id}
-                    creds={creds}
-                    balance={balance}
-                    balanceBusy={balanceBusy}
-                    toggling={credTogglingIds}
-                    balanceSpecConfigured={balanceSpecConfigured}
-                    error={credsErr}
-                    onRetry={() => void loadCredentials(true)}
-                    onAdd={() => setCredModal({ open: true, editing: null })}
-                    onQueryBalance={() => void queryBalance()}
-                    onEdit={(c) => setCredModal({ open: true, editing: c })}
-                    onRemove={(c) => void removeCred(c)}
-                    onToggle={(c) => void toggleCred(c)}
-                  />
-                )
-              ) : modelsLoading && !models.length && !modelsErr ? (
-                <div className="flex flex-col gap-2" aria-hidden="true">
-                  {[0, 1, 2, 3].map((i) => (
-                    <SkeletonBlock key={i} className="h-12 w-full" />
-                  ))}
-                </div>
-              ) : (
-                <UpstreamModelPanel
-                  models={models}
-                  testing={testing}
-                  error={modelsErr}
-                  onRetry={() => void loadModels(true)}
-                  onAdd={() => setModelModal({ open: true, editing: null })}
-                  onTest={(m) => void testModel(m)}
-                  onEdit={(m) => setModelModal({ open: true, editing: m })}
-                  onRemove={(m) => void removeModel(m)}
-                />
-              )}
-            </Tabs.Panel>
-          </Tabs>
+          {/* 三块平铺：概览与凭据并排（各只六行键值 / 三列，天然适合窄栏，
+               并排后首屏能同时看到「这个上游是谁」和「它现在用哪把 key」），
+               模型表独占下一行（五列、可能几十行，占满才不用横向滚动）。
+               余额刻意不单独成块：它本来就逐凭据显示（同一把 key 可能只剩一把
+               有余额），汇总成一个数字反而要自己对应是哪把。 */}
+          <div className="grid items-start gap-5 lg:grid-cols-2">
+            <ProviderOverviewCard
+              provider={provider}
+              networks={networks}
+              toggling={togglingProvider}
+              onEdit={() => setEditOpen(true)}
+              onRemove={() => void removeProvider()}
+              onToggle={() => void toggleProvider()}
+            />
+
+            {credsLoading && !creds.length && !credsErr ? (
+              <div className="flex flex-col gap-2" aria-hidden="true">
+                {[0, 1, 2, 3, 4].map((i) => (
+                  <SkeletonBlock key={i} className="h-12 w-full" />
+                ))}
+              </div>
+            ) : (
+              <CredentialPanel
+                providerId={provider.id}
+                creds={creds}
+                balance={balance}
+                balanceBusy={balanceBusy}
+                toggling={credTogglingIds}
+                balanceSpecConfigured={balanceSpecConfigured}
+                error={credsErr}
+                onRetry={() => void loadCredentials(true)}
+                onAdd={() => setCredModal({ open: true, editing: null })}
+                onQueryBalance={() => void queryBalance()}
+                onEdit={(c) => setCredModal({ open: true, editing: c })}
+                onRemove={(c) => void removeCred(c)}
+                onToggle={(c) => void toggleCred(c)}
+              />
+            )}
+          </div>
+
+          {modelsLoading && !models.length && !modelsErr ? (
+            <div className="flex flex-col gap-2" aria-hidden="true">
+              {[0, 1, 2, 3].map((i) => (
+                <SkeletonBlock key={i} className="h-12 w-full" />
+              ))}
+            </div>
+          ) : (
+            <UpstreamModelPanel
+              models={models}
+              testing={testing}
+              error={modelsErr}
+              onRetry={() => void loadModels(true)}
+              onAdd={() => setModelModal({ open: true, editing: null })}
+              onTest={(m) => void testModel(m)}
+              onEdit={(m) => setModelModal({ open: true, editing: m })}
+              onRemove={(m) => void removeModel(m)}
+            />
+          )}
         </>
       ) : null}
 

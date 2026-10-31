@@ -453,10 +453,16 @@ export function UsageDetail({ days }: { days: number }) {
                       <span title={h.key_name || h.key_id || '—'}>{h.key_name || h.key_id || '—'}</span>
                     </Table.Cell>
                     <Table.Cell>
+                      {/* 箭头代替「新增输入 / 输出」两个词：这一列是表里最挤的一格，
+                          文字标签会把数字挤到换行。↑ 输入（未命中缓存的新增部分），
+                          ↓ 输出；完整口径在 title 里，读屏走 sr-only 文本。
+                          缓存命中单独一行，它是「输入里有多少是缓存命中」的注脚。 */}
                       <span title={tokenTitle(h)} className="flex flex-col">
                         <span className="tabular-nums">
-                          <span className="text-muted">新增输入</span> {fmtTokens(newInputTokens(h))} <span className="text-muted">|</span>{' '}
-                          <span className="text-muted">输出</span> {fmtTokens(h.output_tokens)}
+                          <span aria-hidden="true" className="text-muted">↑</span>
+                          <span className="sr-only">输入</span> {fmtTokens(newInputTokens(h))}{' '}
+                          <span aria-hidden="true" className="text-muted">↓</span>
+                          <span className="sr-only">输出</span> {fmtTokens(h.output_tokens)}
                         </span>
                         <span className="text-[11px] text-muted">缓存命中 {fmtTokens(h.cached_tokens)}</span>
                       </span>
@@ -475,17 +481,26 @@ export function UsageDetail({ days }: { days: number }) {
                     </Table.Cell>
                     <Table.Cell>¥{fmtMoney(h.cost)}</Table.Cell>
                     <Table.Cell>
-                      <Button
-                        variant="ghost"
-                        size="sm"
-                        aria-label={'查看' + statusLabel(h.status) + '请求详情'}
-                        onPress={() => setSelected(h)}
-                      >
-                        <span title={statusHint(h) + ' · 点击查看完整详情'} className="flex items-center gap-2">
+                      {/* 抽屉只讲失败原因，成功的行没什么可展开的：给个按钮点开
+                          只会得到一句「这条成功了」。所以只有非 ok 才是按钮。 */}
+                      {h.status === 'ok' ? (
+                        <span title={statusHint(h)} className="flex items-center gap-2">
                           <StatusChip tone={statusTone(h.status)}>{statusLabel(h.status)}</StatusChip>
                           {h.http_status > 0 ? <span className="text-[11px] text-muted">HTTP {h.http_status}</span> : null}
                         </span>
-                      </Button>
+                      ) : (
+                        <Button
+                          variant="ghost"
+                          size="sm"
+                          aria-label={'查看' + statusLabel(h.status) + '错误详情'}
+                          onPress={() => setSelected(h)}
+                        >
+                          <span title={statusHint(h) + ' · 点击查看错误详情'} className="flex items-center gap-2">
+                            <StatusChip tone={statusTone(h.status)}>{statusLabel(h.status)}</StatusChip>
+                            {h.http_status > 0 ? <span className="text-[11px] text-muted">HTTP {h.http_status}</span> : null}
+                          </span>
+                        </Button>
+                      )}
                     </Table.Cell>
                   </Table.Row>
                 ))}
