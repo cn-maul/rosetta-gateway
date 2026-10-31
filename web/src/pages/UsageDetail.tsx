@@ -22,6 +22,7 @@ import type { AccessKey, UsageHistoryEntry } from '../types'
 import { DataTable } from '../ui/DataTable'
 import { StatusChip } from '../ui/StatusChip'
 import { newInputTokens, statusTone, totalTimeTone, upstreamName, UsageDetailDrawer } from '../components/UsageDetailDrawer'
+import { oneOfInt, readPref, writePref } from '../ui/usePersistedState'
 
 /**
  * 请求日志（/history）。全部查询状态都在 URL 上：status/model/key/page/size。
@@ -121,7 +122,8 @@ export function UsageDetail({ days }: { days: number }) {
       model: queryText('model').trim(),
       keyId: queryText('key'),
       page: Math.max(1, Math.min(1000000, Math.floor(Number(queryText('page'))) || 1)),
-      size: SIZES.includes(size) ? size : 20,
+      // 每页条数没写在 URL 上时用上次的选择（URL 带 size 的分享链接照旧优先）。
+      size: SIZES.includes(size) ? size : readPref('history.size', 20, oneOfInt(SIZES)),
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [searchParams])
@@ -327,7 +329,10 @@ export function UsageDetail({ days }: { days: number }) {
             className="w-[110px]"
             selectedKey={String(request.size)}
             onSelectionChange={(key) => {
-              if (key !== null) pushQuery({ size: String(key), page: undefined })
+              if (key !== null) {
+                writePref('history.size', Number(key))
+                pushQuery({ size: String(key), page: undefined })
+              }
             }}
           >
             <SelectTrigger>

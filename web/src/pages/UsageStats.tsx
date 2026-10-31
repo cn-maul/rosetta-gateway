@@ -5,6 +5,7 @@ import { PageHeader } from '../ui/PageHeader'
 import { UsageByGroup } from '../components/UsageByGroup'
 import { ModelGroups } from '../components/ModelGroups'
 import { UsageDetail } from './UsageDetail'
+import { oneOfInt, readPref, writePref } from '../ui/usePersistedState'
 
 /**
  * 用量与费用页（语义对齐旧 UsageStats.vue）：一个页面挂「按上游 / 按模型 /
@@ -36,7 +37,13 @@ export function UsageStats() {
   const rawTab = searchParams.get('tab') ?? 'providers'
   const tab = tabs.some((t) => t.key === rawTab) ? rawTab : 'providers'
   const daysRaw = Number(searchParams.get('days'))
-  const days = DAY_OPTIONS.includes(daysRaw) ? daysRaw : logs ? 7 : 1
+  // 时间范围记在本地，且按页面分开记：请求日志是排障视角（默认近 7 天），
+  // 用量页是看账视角（默认今天），两者混用一份偏好会互相打扰。
+  const daysPrefKey = logs ? 'history.days' : 'usage.days'
+  const daysDefault = logs ? 7 : 1
+  const days = DAY_OPTIONS.includes(daysRaw)
+    ? daysRaw
+    : readPref(daysPrefKey, daysDefault, oneOfInt(DAY_OPTIONS))
 
   const scope = admin ? '全站' : '仅你自己'
   const title = logs ? (admin ? '请求日志' : '我的调用') : '用量与费用'
@@ -52,6 +59,7 @@ export function UsageStats() {
     setSearchParams(next)
   }
   const setDays = (value: number) => {
+    writePref(daysPrefKey, value)
     // 换时间范围必须清掉页码：旧页码在新窗口里很可能落在界外。
     const next = new URLSearchParams(searchParams)
     next.set('days', String(value))

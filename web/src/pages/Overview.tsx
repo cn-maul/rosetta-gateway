@@ -16,6 +16,7 @@ import { api, isAdmin } from '../api'
 import { RequestGeneration } from '../asyncState'
 import { fmtMoney, fmtNum, fmtPercent, fmtRemainder, fmtBalance, fmtSec, fmtSpeed, fmtTimeMs, fmtTokens } from '../fmt'
 import * as timeRange from '../range'
+import { oneOf, usePersistedState } from '../ui/usePersistedState'
 import type { Provider, Stats, StatsOverview, UsageGroupEntry } from '../types'
 import { PageHeader } from '../ui/PageHeader'
 import { SectionCard } from '../ui/SectionCard'
@@ -42,6 +43,7 @@ const RANGES = [
   { key: 'all', label: '全部', days: 0 },
 ]
 type RangeKey = string
+const RANGE_KEYS = RANGES.map((r) => r.key)
 const rangeDays = (key: string) => RANGES.find((r) => r.key === key)?.days ?? 1
 const rangeLabel = (key: string) => RANGES.find((r) => r.key === key)?.label ?? ''
 
@@ -143,8 +145,14 @@ export function Overview() {
   const [searchParams, setSearchParams] = useSearchParams()
   const admin = isAdmin()
 
-  const rawRange = searchParams.get('range') ?? '1d'
+  // 上次看的时间范围记在本地：下次进来还是同一档，不用每次重新点。
+  // URL 仍优先 —— 带 ?range= 的链接行为完全不变。
+  const [lastRange, setLastRange] = usePersistedState<RangeKey>('overview.range', '1d', oneOf(RANGE_KEYS))
+  const rawRange = searchParams.get('range') ?? lastRange
   const rangeKey: RangeKey = RANGES.some((r) => r.key === rawRange) ? rawRange : '1d'
+  useEffect(() => {
+    if (lastRange !== rangeKey) setLastRange(rangeKey)
+  }, [rangeKey, lastRange, setLastRange])
   const setRangeKey = (key: string) => {
     const next = new URLSearchParams(searchParams)
     next.set('range', key)

@@ -22,6 +22,7 @@ import { SectionCard } from '../ui/SectionCard'
 import { StatusChip } from '../ui/StatusChip'
 import { AppModal } from '../ui/AppModal'
 import { HeartbeatBar } from '../components/HeartbeatBar'
+import { oneOf, oneOfInt, usePersistedState } from '../ui/usePersistedState'
 
 /**
  * 可用模型（全体可见的只读清单）。每个模型一张卡片，卡内同时显示
@@ -114,8 +115,10 @@ export function Models() {
   /** 用户勾选要画曲线的公开模型名。空 = 一条都不画（界面给提示，不自动补）。 */
   const [drawn, setDrawn] = useState<string[]>([])
   const [bucketsByUpstream, setBucketsByUpstream] = useState<Record<string, ProbeTimelineBucket[]>>({})
-  const [days, setDays] = useState(7)
-  const [granularity, setGranularity] = useState<'hour' | 'day'>('hour')
+  // 观测窗口与分桶粒度记在本地：同一轮排查里反复进页面不该每次回到默认档。
+  // 都过校验 —— 旧版本写过的天数可能已经不在选项里了。
+  const [days, setDays] = usePersistedState<number>('models.days', 7, oneOfInt(DAY_OPTIONS.map((o) => Number(o.key))))
+  const [granularity, setGranularity] = usePersistedState<'hour' | 'day'>('models.granularity', 'hour', oneOf(['hour', 'day'] as const))
   const [timelineLoading, setTimelineLoading] = useState(false)
   const timelineSelectionKey = useRef('')
   const [configOpen, setConfigOpen] = useState(false)
