@@ -1090,6 +1090,15 @@ export interface UsageHistoryEntry {
   route_trace?: string
   /** 网关/上游链路请求标识；旧记录或未透传时为空串。 */
   request_id: string
+  /**
+   * 这次请求**实际下发**的思考档位（2026-10-31 新增）。
+   *
+   * 存的是网关夹取之后真正写到上游请求里的值，不是客户端请求的值 ——
+   * 上游只支持 low/high 而客户端要 xhigh 时，这里记 low。空串 = 没要求思考。
+   * anthropic 的预算式思考记 `budget:<n>`（n 是透传的 budget_tokens）。
+   * 旧记录没有这一列，同样为空串，列表里就不显示胶囊。
+   */
+  effort: string
 }
 
 // 调用历史的分页结果：当页明细 + 过滤后的总条数（用于计算总页数）

@@ -15,6 +15,7 @@ import {
   toast,
 } from '@heroui/react'
 import { api } from '../api'
+import { effortLabel, effortTitle, effortTone } from '../effortTone'
 import { fmtMoney, fmtNum, fmtSec, fmtSpeed, fmtTimeMs, fmtTokens, statusLabel } from '../fmt'
 import { protocolLabel } from '../protocols'
 import { parseRouteTrace } from '../routeTrace'
@@ -414,7 +415,14 @@ export function UsageDetail({ days }: { days: number }) {
                       <span className="font-mono">{fmtTimeMs(h.ts)}</span>
                     </Table.Cell>
                     <Table.Cell>
-                      <StatusChip tone={h.stream ? 'info' : 'dim'}>{h.stream ? '流式' : '非流式'}</StatusChip>
+                      <span className="flex flex-col items-start gap-1">
+                        <StatusChip tone={h.stream ? 'info' : 'dim'}>{h.stream ? '流式' : '非流式'}</StatusChip>
+                        {h.effort ? (
+                          <StatusChip tone={effortTone(h.effort)} title={effortTitle(h.effort)}>
+                            {effortLabel(h.effort)}
+                          </StatusChip>
+                        ) : null}
+                      </span>
                     </Table.Cell>
                     <Table.Cell>
                       <span title={`上游协议：${protocolLabel(h.upstream_protocol, '未记录')}；入站协议：${protocolLabel(h.ingress_protocol, '未记录')}`} className="flex flex-col gap-0.5 text-[11.5px]">

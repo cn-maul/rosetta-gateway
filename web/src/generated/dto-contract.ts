@@ -500,6 +500,7 @@ export const DTO_CONTRACTS: readonly DTOFieldContract[] = [
     "route_trace",
     "request_id",
     "request_ip",
+    "effort",
   ] },
   { goType: "internal/admin.usageHistoryResponse", tsType: "UsageHistoryPage", fields: [
     "records",

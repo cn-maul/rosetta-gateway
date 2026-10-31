@@ -354,7 +354,7 @@ func TestSchema_CanonicalObjectsAndColumns(t *testing.T) {
 		},
 		"usage_records": {
 			"user_id", "error_detail", "route_trace", "cost_total",
-			"provider_name", "upstream_protocol", "request_ip",
+			"provider_name", "upstream_protocol", "request_ip", "effort",
 			"charge_attempts", "charge_next_at", "charge_last_error",
 		},
 		"users": {"balance_cents", "balance_remainder", "group_id", "reserved_tokens"},

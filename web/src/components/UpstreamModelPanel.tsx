@@ -3,6 +3,7 @@ import { DataTable } from '../ui/DataTable'
 import { StatusChip, type StatusTone } from '../ui/StatusChip'
 import { fmtSpeed, fmtSec, fmtPercent } from '../fmt'
 import { unitPrice } from '../modelPrice'
+import { effortTone } from '../effortTone'
 import type { UpstreamModel } from '../types'
 
 /**
@@ -15,25 +16,6 @@ import type { UpstreamModel } from '../types'
  * 原来价格与挡位挤在模型名下面当副行，一列里塞四行字，扫不动；
  * 拆列之后同一行内横着比价、竖着比挡位。
  */
-
-/**
- * 挡位颜色＝**强度**色阶（弱→强：灰→蓝→绿→琥珀→红），与健康状态无关。
- * 之所以复用语义色，是因为 HeroUI 的 Chip 只有这几档色板；为避免误读，
- * 颜色不是唯一线索 —— 胶囊里始终写着挡位名。
- */
-const EFFORT_TONE: Record<string, StatusTone> = {
-  none: 'dim',
-  minimal: 'dim',
-  low: 'info',
-  medium: 'ok',
-  high: 'warn',
-  xhigh: 'err',
-  max: 'err',
-}
-
-function effortTone(level: string): StatusTone {
-  return EFFORT_TONE[level.trim().toLowerCase()] ?? 'dim'
-}
 
 /**
  * 一格里三个单价横排成「输入 | 输出 | 缓存命中」——

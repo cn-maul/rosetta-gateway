@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/cn-maul/rosetta"
+	"github.com/cn-maul/rosetta-gateway/internal/ingress"
 	"github.com/cn-maul/rosetta-gateway/internal/routing"
 	"github.com/cn-maul/rosetta-gateway/internal/upstream"
 )
@@ -46,6 +47,13 @@ type diagnosticsState struct {
 	ingressProtocol  string
 	upstreamProtocol string
 	stream           bool
+	// effort 是最后一个 attempt 实际下发给上游的思考档位（见
+	// ingress.EffortLabel）。失败收尾路径拿不到 attempt 内的 upstreamReq，
+	// 由 attempt 在造好请求后写进这里，落库时再读出来。
+	//
+	// 多个 attempt 时保留**最后一个**：归因也归给最后评估到的目标，两者口径
+	// 一致；空串表示整条链都没发出过带思考的请求。
+	effort string
 
 	bodyBytes    int64
 	messages     int
@@ -396,6 +404,15 @@ func (d *requestDiagnostics) setIngressRequest(ing *rosetta.ChatRequest, stream 
 	d.toolResults = snapshot.toolResults
 	d.inputChars = snapshot.inputChars
 	d.stream = stream
+	d.effort = ingress.EffortLabel(ing.Thinking)
+}
+
+// effortLabel 返回最后一个 attempt 实际下发的思考档位，供失败收尾路径落库。
+// 必须在 setIngressRequest 之后读（attempt 造完请求就调它）。
+func (d *requestDiagnostics) effortLabel() string {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return d.effort
 }
 
 func (d *requestDiagnostics) finish(status int, usageStatus, code, detail, raw, routeTrace string) {

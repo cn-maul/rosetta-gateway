@@ -127,6 +127,16 @@ func (s *Store) ensureCompatibleSchema(ctx context.Context) error {
 		{"usage_records", "charge_attempts", "INTEGER NOT NULL DEFAULT 0"},
 		{"usage_records", "charge_next_at", "INTEGER NOT NULL DEFAULT 0"},
 		{"usage_records", "charge_last_error", "TEXT"},
+		// 2026-10-31：调用历史要回答「这次请求实际用了几档思考强度」。
+		//
+		// 存的是**实际下发给上游**的档位（经过模型能力夹取之后），不是客户端
+		// 请求的原始值 —— 后者在从「请求 max、模型只支持 high」的夹取场景下
+		// 会让人误以为上游收到了 max。取值来源见 ingress.EffortLabel。
+		//
+		// 空串 = 本次没有思考（未请求、或模型明确不支持被剥掉、或旧记录）。
+		// 不参与任何聚合（usage_daily_rollups 不加此列）：它是逐条排障线索，
+		// 不是报表口径。
+		{"usage_records", "effort", "TEXT"},
 	} {
 		if err := s.ensureAdditiveColumn(ctx, col.table, col.column, col.decl); err != nil {
 			return err
@@ -499,6 +509,9 @@ var canonicalSchemaStatements = []string{
 		ttfb_ms           INTEGER NOT NULL DEFAULT 0,
 		request_id        TEXT,
 		request_ip        TEXT,
+		-- effort 是**实际下发**给上游的思考档位（夹取之后），空串 = 没思考。
+		-- 见 ensureCompatibleSchema 里的同名新增列说明。
+		effort            TEXT,
 		route_trace       TEXT,
 		cost_total        REAL NOT NULL DEFAULT 0,
 		-- Accounting retry state. These columns are additive and default to
