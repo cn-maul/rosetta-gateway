@@ -2,7 +2,7 @@ import { useEffect, useMemo, useRef, useState, useSyncExternalStore } from 'reac
 import { Button, ListBox, ListBoxItem, Select, SelectIndicator, SelectPopover, SelectTrigger, SelectValue, toast } from '@heroui/react'
 import { api, isAdmin, session } from '../api'
 import { confirmBox } from '../ui/confirm'
-import { fmtTokens, copyText } from '../fmt'
+import { copyText } from '../fmt'
 import { KeysTable } from './keys/KeysTable'
 import { KeyCreateModal, KeyEditModal } from './keys/KeyFormModals'
 import { PlainKeyModal, type PlainKeyBox } from './keys/PlainKeyModal'
@@ -39,7 +39,6 @@ export function Keys() {
 
   // 在途集合：同一行的开关在请求返回前不接受第二次点击。
   const [toggling, setToggling] = useState<Set<string>>(new Set())
-  const [recomputing, setRecomputing] = useState('')
 
   const { importingAction, ccImportingApp, importBusy, importKey } = useKeyImport({
     modelOptions,
@@ -234,22 +233,6 @@ export function Keys() {
     }
   }
 
-  // used_tokens 由数据库触发器单调累加、没有回退路径，一旦因 bug 偏高，
-  // 配额预检会让这把 key 永远 429（死 key）。这里是唯一的界面自愈入口。
-  const recomputeUsage = async (k: AccessKey) => {
-    setRecomputing(k.id)
-    try {
-      const r = await api.recomputeKeyUsage(k.id)
-      // 就地用返回的修正值刷新该行：其余行的状态（展开的弹窗等）不受打扰
-      setKeys((list) => list.map((it) => (it.id === k.id ? { ...it, used_tokens: r.used_tokens } : it)))
-      toast.success(`已重算「${k.name}」用量：${fmtTokens(r.used_tokens)} tokens`)
-    } catch (e) {
-      if ((e as { status?: number }).status !== 401) toast.danger('重算失败：' + (e as Error).message)
-    } finally {
-      setRecomputing('')
-    }
-  }
-
   const filterToolbar = isAdmin() ? (
     <div className="mb-3.5 flex flex-wrap items-center gap-2.5">
       <Select
@@ -324,12 +307,10 @@ export function Keys() {
         }
         toggling={toggling}
         copyingId={copyingId}
-        recomputing={recomputing}
         importBusy={importBusy}
         onCopy={(k) => void copyExistingKey(k)}
         onCcPicker={(k) => setCcPickerKey(k)}
         onMagpieImport={(k) => void importKey(k, 'magpie')}
-        onRecompute={(k) => void recomputeUsage(k)}
         onEdit={openEdit}
         onDelete={(k) => void removeKey(k)}
         onToggle={(k) => void toggleKey(k)}

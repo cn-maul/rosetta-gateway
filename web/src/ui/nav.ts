@@ -32,7 +32,7 @@ export const ADMIN_NAV: NavGroup[] = [
     label: '常用',
     items: [
       { to: '/', label: '网关总览', icon: LayoutDashboard },
-      { to: '/history', label: '请求日志', icon: FileText },
+      { to: '/history', label: '调用日志', icon: FileText },
       { to: '/usage', label: '用量与费用', icon: ChartColumn },
       { to: '/keys', label: 'API 密钥', icon: KeyRound },
       { to: '/wallet', label: '账户与充值', icon: Wallet },
@@ -41,11 +41,11 @@ export const ADMIN_NAV: NavGroup[] = [
   {
     label: '管理配置',
     items: [
-      { to: '/providers', label: '上游服务', icon: Server },
-      { to: '/routes', label: '模型与路由', icon: Route },
+      { to: '/providers', label: '供应商', icon: Server },
+      { to: '/routes', label: '路由', icon: Route },
       { to: '/users', label: '用户与权限', icon: Users },
       { to: '/networks', label: '代理', icon: Globe },
-      { to: '/settings', label: '系统设置', icon: Settings },
+      { to: '/settings', label: '设置', icon: Settings },
     ],
   },
 ]
@@ -55,7 +55,7 @@ export const USER_NAV: NavGroup[] = [
     label: '我的工作台',
     items: [
       { to: '/', label: '我的总览', icon: LayoutDashboard },
-      { to: '/history', label: '我的调用', icon: FileText },
+      { to: '/history', label: '调用日志', icon: FileText },
       { to: '/usage', label: '消耗与费用', icon: ChartColumn },
       { to: '/keys', label: 'API 密钥', icon: KeyRound },
       { to: '/wallet', label: '余额与账单', icon: Wallet },

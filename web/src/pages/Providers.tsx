@@ -23,6 +23,7 @@ import { PageHeader } from '../ui/PageHeader'
 import { DataTable } from '../ui/DataTable'
 import { AppModal } from '../ui/AppModal'
 import { StatusChip } from '../ui/StatusChip'
+import type { ProtocolProbeEntry } from '../types'
 import { confirmBox } from '../ui/confirm'
 import type { Provider } from '../types'
 
@@ -215,7 +216,7 @@ export function Providers() {
   return (
     <>
       <PageHeader
-        title="上游服务"
+        title="供应商"
         actions={
           <>
             <Button variant="secondary" isDisabled={loading} onPress={() => void load()}>
@@ -415,6 +416,10 @@ function CreateProviderModal({
   // 找不到对应 option，会显示成第一项却提交另一个值。
   const [networkId, setNetworkId] = useState(NETWORK_DIRECT_ID)
   const [formErr, setFormErr] = useState('')
+  // 协议探测：结论是「这台上游支持哪几种协议」，不是错误。probing 期间禁用按钮，
+  // 结果留在弹窗里直到用户改动 endpoint/key（改了结论就过期了）。
+  const [probing, setProbing] = useState(false)
+  const [probe, setProbe] = useState<ProtocolProbeEntry[] | null>(null)
 
   useEffect(() => {
     if (open) {
@@ -424,8 +429,33 @@ function CreateProviderModal({
       setApiKey('')
       setNetworkId(NETWORK_DIRECT_ID)
       setFormErr('')
+      setProbe(null)
+      setProbing(false)
     }
   }, [open])
+
+  const probeProtocols = async () => {
+    if (probing) return
+    if (!endpoint.trim()) {
+      setFormErr('先填 Endpoint 再探测')
+      return
+    }
+    setProbing(true)
+    setFormErr('')
+    setProbe(null)
+    try {
+      const r = await api.probeProtocols({
+        endpoint: endpoint.trim(),
+        api_key: apiKey.trim(),
+        network_id: networkId,
+      })
+      setProbe(r.results)
+    } catch (e) {
+      if (!is401(e)) setFormErr('探测失败：' + (e as Error).message)
+    } finally {
+      setProbing(false)
+    }
+  }
 
   const submit = async () => {
     if (saving) return
@@ -512,6 +542,45 @@ function CreateProviderModal({
             添加即启用；slug、超时与重试将自动使用默认值。余额查询可在创建后到详情页设置。
           </span>
         </TextField>
+        {/* 协议检测：填了 Endpoint（和 Key）之后可以先问一次，避免「建完发现
+            选错协议」再回头删。结论按协议排成三个胶囊，颜色只表示「这台机器上
+            有没有这个协议的入口」——黄/灰不代表这台上游不能用来配这个协议，
+            只代表路径不通。 */}
+        <div className="col-span-2 flex flex-col gap-1.5">
+          <div className="flex flex-wrap items-center gap-2">
+            <Button variant="outline" size="sm" isDisabled={probing || saving} onPress={() => void probeProtocols()}>
+              {probing ? '探测中…' : '协议检测'}
+            </Button>
+            <span className="text-muted text-[11px]">用上面的 Endpoint 与 API Key 试三种协议，不消耗额度</span>
+          </div>
+          {probe ? (
+            <div className="flex flex-wrap items-center gap-1.5" role="status">
+              {probe.map((r) => (
+                <span key={r.protocol} title={`${r.message}（HTTP ${r.status}）`}>
+                  <StatusChip tone={probeTone(r)}>
+                    {protocolLabel(r.protocol, r.protocol)}
+                    {r.ok ? ' 可用' : ' 未发现'}
+                  </StatusChip>
+                </span>
+              ))}
+              {probe.some((r) => r.ok) ? (
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  onPress={() => {
+                    // 选中第一个可用的协议：探测就是为了省掉这一步猜。
+                    const first = probe.find((r) => r.ok)
+                    if (first) setProtocol(first.protocol)
+                  }}
+                >
+                  用第一个可用的
+                </Button>
+              ) : (
+                <span className="text-muted text-[11px]">三种都没找到入口，检查 Endpoint 是否少了 /v1 或多了路径</span>
+              )}
+            </div>
+          ) : null}
+        </div>
         <div className="col-span-2 flex flex-col gap-1">
           <Label>代理</Label>
           <Select
@@ -547,4 +616,13 @@ function CreateProviderModal({
       </form>
     </AppModal>
   )
+}
+
+/**
+ * 探测结果的胶囊配色。ok → 绿；路径存在但鉴权没过（401/403）→ 黄：
+ * 「这台机器有这个协议，钥匙不对」和「没有这个协议」是两种处置。
+ */
+function probeTone(r: ProtocolProbeEntry): 'ok' | 'warn' | 'dim' {
+  if (r.ok && (r.status === 401 || r.status === 403)) return 'warn'
+  return r.ok ? 'ok' : 'dim'
 }

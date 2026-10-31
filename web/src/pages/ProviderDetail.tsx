@@ -447,7 +447,7 @@ export function ProviderDetail() {
             {/* 返回用按钮而不是链接：这一页的「返回」是页级动作，与右侧刷新、
                 编辑同级；做成蓝色下划线链接时，它读起来像正文里的跳转词。 */}
             <Button variant="outline" size="sm" onPress={() => navigate(backTo)}>
-              ← 上游服务
+              ← 供应商
             </Button>
             <Button
               variant="outline"

@@ -1260,3 +1260,29 @@ export interface RouteCatalog {
   models: UpstreamModel[]
   generated_at: number
 }
+
+// ---------- 站点品牌（2026-10-31） ----------
+//
+// 登录页要在**没有会话**时读到它，所以后端 GET /admin/api/site 是公开端点，
+// 字段只有这两项 —— 公开端点不能顺带把其它设置带出去。
+// 空串语义：未配置。前端把空站点名换成默认名（见 ui/branding.ts），
+// 空 LOGO 则退回首字母方块（见 ui/BrandMark.tsx）。
+export interface SiteBranding {
+  site_name: string
+  site_logo: string
+}
+
+// ---------- 上游协议探测（2026-10-31） ----------
+//
+// 「新建上游」时拿 endpoint + key 去问上游：三种协议里这台机器支持哪几种。
+// ok 的判据是**路径存在**（状态码不是 404/405），所以 401/403 也算存在，
+// 此时 message 会提示「路径存在但鉴权未通过」，避免被读成「协议可用」。
+export interface ProtocolProbeEntry {
+  protocol: string
+  ok: boolean
+  status: number
+  message: string
+}
+export interface ProtocolProbeResult {
+  results: ProtocolProbeEntry[]
+}

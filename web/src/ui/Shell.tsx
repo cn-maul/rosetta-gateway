@@ -4,6 +4,8 @@ import { Avatar, Button, Dropdown, Label, toast } from '@heroui/react'
 import { LogOut, Moon, PanelLeft, Sun, UserRound } from 'lucide-react'
 import { ApiFail, isAdmin, logout, session } from '../api'
 import { useTheme } from './theme'
+import { BrandMark } from './BrandMark'
+import { loadBranding, useBranding } from './branding'
 import { ADMIN_NAV, USER_NAV, type NavGroup } from './nav'
 import { PageFallback } from './PageFallback'
 
@@ -59,6 +61,13 @@ export function Shell() {
   const navigate = useNavigate()
   const location = useLocation()
   const { dark, toggle } = useTheme()
+  const branding = useBranding()
+
+  // 侧栏品牌与登录页共用同一份站点设置；已登录说明后端在跑，这里补一次
+  // 拉取（登录页那次可能因为点了「直接输地址」而没发生）。
+  useEffect(() => {
+    void loadBranding()
+  }, [])
 
   // ≤900px 视口强制图标栏（224px 会吃掉平板宽度），但用户自己的选择在
   // 回到宽屏后仍然生效 —— narrow 只影响显示，不写回存储。
@@ -112,12 +121,10 @@ export function Shell() {
         }
       >
         <div className="flex items-center gap-2.5 px-3 py-4">
-          <div className="bg-accent text-accent-foreground grid h-9 w-9 shrink-0 place-items-center rounded-[10px] font-bold">
-            RG
-          </div>
+          <BrandMark size={36} />
           {!railCollapsed && (
             <div className="min-w-0">
-              <div className="truncate text-sm font-semibold">Rosetta Gateway</div>
+              <div className="truncate text-sm font-semibold">{branding.name}</div>
               <div className="text-muted truncate text-xs">
                 {admin ? '管理控制台' : '个人工作台'}
               </div>

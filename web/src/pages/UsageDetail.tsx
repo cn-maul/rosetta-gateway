@@ -14,9 +14,9 @@ import {
   TextField,
   toast,
 } from '@heroui/react'
-import { api } from '../api'
+import { api, isAdmin } from '../api'
 import { effortLabel, effortTitle, effortTone } from '../effortTone'
-import { fmtMoney, fmtNum, fmtSec, fmtSpeed, fmtTimeMs, fmtTokens, statusLabel } from '../fmt'
+import { fmtMoney, fmtNum, fmtSec, fmtSpeed, fmtTimeFull, fmtTokens, statusLabel } from '../fmt'
 import { protocolLabel } from '../protocols'
 import { parseRouteTrace } from '../routeTrace'
 import type { AccessKey, UsageHistoryEntry } from '../types'
@@ -26,7 +26,7 @@ import { newInputTokens, statusTone, totalTimeTone, upstreamName, UsageDetailDra
 import { oneOfInt, readPref, writePref } from '../ui/usePersistedState'
 
 /**
- * 请求日志（/history）。全部查询状态都在 URL 上：status/model/key/page/size。
+ * 调用日志（/history）。全部查询状态都在 URL 上：status/model/key/page/size。
  * 输入框只保留草稿；实际请求、分页与 CSV 始终来自 URL 中已应用的条件。
  */
 
@@ -98,6 +98,9 @@ function PathFlow({ entry }: { entry: UsageHistoryEntry }) {
 }
 
 export function UsageDetail({ days }: { days: number }) {
+  // 普通用户看的是「我自己调了哪些路由」，后台怎么转发跟他的排障无关：
+  // 上游那一列整列不渲染，模型只显示路由名（public_model），不露背后实际模型。
+  const admin = isAdmin()
   const [searchParams, setSearchParams] = useSearchParams()
   const [rows, setRows] = useState<UsageHistoryEntry[]>([])
   const [total, setTotal] = useState(0)
@@ -176,7 +179,7 @@ export function UsageDetail({ days }: { days: number }) {
       setLoadedDays(days)
     } catch (e) {
       if (seq === reqSeq.current && (e as { status?: number }).status !== 401) {
-        setErr('请求日志加载失败：' + (e as Error).message)
+        setErr('调用日志加载失败：' + (e as Error).message)
       }
     } finally {
       if (seq === reqSeq.current) setLoading(false)
@@ -381,7 +384,7 @@ export function UsageDetail({ days }: { days: number }) {
   return (
     <div>
       <DataTable
-        label="请求日志"
+        label="调用日志"
         loading={loading}
         error={err ? errText : ''}
         hasData={rows.length > 0}
@@ -391,7 +394,7 @@ export function UsageDetail({ days }: { days: number }) {
         toolbar={toolbar}
         footer={footer}
       >
-        <Table aria-label="请求日志">
+        <Table aria-label="调用日志">
           <Table.ScrollContainer>
             <Table.Content className="min-w-[1490px] text-[13px]">
               <Table.Header>
@@ -399,7 +402,7 @@ export function UsageDetail({ days }: { days: number }) {
                 <Table.Column>模式</Table.Column>
                 <Table.Column>协议</Table.Column>
                 <Table.Column>请求 IP</Table.Column>
-                <Table.Column>上游</Table.Column>
+                {admin ? <Table.Column>上游</Table.Column> : null}
                 <Table.Column>模型</Table.Column>
                 <Table.Column>密钥</Table.Column>
                 <Table.Column>Token 用量</Table.Column>
@@ -412,7 +415,7 @@ export function UsageDetail({ days }: { days: number }) {
                 {rows.map((h, i) => (
                   <Table.Row key={h.ts + ':' + i}>
                     <Table.Cell>
-                      <span className="font-mono">{fmtTimeMs(h.ts)}</span>
+                      <span className="font-mono">{fmtTimeFull(h.ts)}</span>
                     </Table.Cell>
                     <Table.Cell>
                       <span className="flex flex-col items-start gap-1">
@@ -425,13 +428,17 @@ export function UsageDetail({ days }: { days: number }) {
                       </span>
                     </Table.Cell>
                     <Table.Cell>
-                      <span title={`上游协议：${protocolLabel(h.upstream_protocol, '未记录')}；入站协议：${protocolLabel(h.ingress_protocol, '未记录')}`} className="flex flex-col gap-0.5 text-[11.5px]">
-                        <span className="flex gap-1.5">
-                          <span className="text-muted">上游</span>
+                      {/* 「上游/下游」两个词占了大半格宽，而这一列真正要看的是两个协议名。
+                          ↑ 上行（网关发给上游）、↓ 下行（客户端进来的），读屏走 sr-only。 */}
+                      <span title={`上行协议：${protocolLabel(h.upstream_protocol, '未记录')}；下行协议：${protocolLabel(h.ingress_protocol, '未记录')}`} className="flex flex-col gap-0.5 text-[11.5px]">
+                        <span className="flex items-center gap-1.5">
+                          <span aria-hidden="true" className="text-muted">↑</span>
+                          <span className="sr-only">上行</span>
                           <span className="font-mono">{protocolLabel(h.upstream_protocol, '未记录')}</span>
                         </span>
-                        <span className="flex gap-1.5">
-                          <span className="text-muted">下游</span>
+                        <span className="flex items-center gap-1.5">
+                          <span aria-hidden="true" className="text-muted">↓</span>
+                          <span className="sr-only">下行</span>
                           <span className="font-mono">{protocolLabel(h.ingress_protocol, '未记录')}</span>
                         </span>
                       </span>
@@ -439,22 +446,26 @@ export function UsageDetail({ days }: { days: number }) {
                     <Table.Cell>
                       <span className="font-mono" title={h.request_ip || '未记录'}>{h.request_ip || '—'}</span>
                     </Table.Cell>
-                    <Table.Cell>
-                      {parseRouteTrace(h.route_trace).length ? (
-                        <PathFlow entry={h} />
-                      ) : (
-                        <span title={upstreamNameTitle(h)} className="flex flex-col">
-                          <span>{upstreamName(h)}</span>
-                          {!h.provider_name && h.provider_id ? <span className="text-[11px] text-muted">名称未固化</span> : null}
-                        </span>
-                      )}
-                    </Table.Cell>
+                    {admin ? (
+                      <Table.Cell>
+                        {parseRouteTrace(h.route_trace).length ? (
+                          <PathFlow entry={h} />
+                        ) : (
+                          <span title={upstreamNameTitle(h)} className="flex flex-col">
+                            <span>{upstreamName(h)}</span>
+                            {!h.provider_name && h.provider_id ? <span className="text-[11px] text-muted">名称未固化</span> : null}
+                          </span>
+                        )}
+                      </Table.Cell>
+                    ) : null}
                     <Table.Cell>
                       <span className="flex flex-col">
                         <span className="font-mono" title={h.public_model || '—'}>{h.public_model || '—'}</span>
-                        <span className="font-mono text-[11.5px] text-muted" title={h.upstream_model || '实际模型未记录'}>
-                          {h.upstream_model || '实际模型未记录'}
-                        </span>
+                        {admin ? (
+                          <span className="font-mono text-[11.5px] text-muted" title={h.upstream_model || '实际模型未记录'}>
+                            {h.upstream_model || '实际模型未记录'}
+                          </span>
+                        ) : null}
                       </span>
                     </Table.Cell>
                     <Table.Cell>

@@ -193,7 +193,17 @@ export function fmtBalanceWithRemainder(
   return rem ? `${base}（另有 ${rem} 待结算）` : base
 }
 
-// 毫秒时间戳 → 「MM-DD HH:MM:SS」（调用历史表格用）
+// 毫秒时间戳 → 「YYYY-MM-DD HH:MM:SS」。请求日志用它：排障时经常要跨天/跨年
+// 翻记录，只给 MM-DD 的话年份得靠上下文猜。充值流水那种「最近的记录」仍用
+// 下面的 fmtTimeMs —— 那里每一行都必然是同一年，省下的宽度留给金额。
+export function fmtTimeFull(tsMs: number): string {
+  if (!tsMs) return '—'
+  const d = new Date(tsMs)
+  const p = (x: number) => String(x).padStart(2, '0')
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`
+}
+
+// 毫秒时间戳 → 「MM-DD HH:MM:SS」（充值流水用）
 export function fmtTimeMs(tsMs: number): string {
   if (!tsMs) return '—'
   const d = new Date(tsMs)

@@ -10,7 +10,7 @@ import type { RouteHandle } from '../router'
 // 同一路由在管理员与普通用户眼里叫法不同。
 const ROLE_TITLES: [string, (admin: boolean) => string][] = [
   ['/', (admin) => (admin ? '网关总览' : '我的总览')],
-  ['/history', (admin) => (admin ? '请求日志' : '我的调用')],
+  ['/history', () => '调用日志'],
   ['/wallet', (admin) => (admin ? '账户与充值' : '余额与账单')],
 ]
 

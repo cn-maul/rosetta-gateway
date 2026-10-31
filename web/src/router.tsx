@@ -93,7 +93,7 @@ export const router = createHashRouter([
       {
         path: '/history',
         element: <UsageStats />,
-        handle: { title: '请求日志', wide: true },
+        handle: { title: '调用日志', wide: true },
         loader: authedLoader(false),
       },
       {
@@ -130,13 +130,13 @@ export const router = createHashRouter([
       {
         path: '/providers',
         element: <Providers />,
-        handle: { title: '上游服务', adminOnly: true },
+        handle: { title: '供应商', adminOnly: true },
         loader: providersLoader,
       },
       {
         path: '/routes',
         element: <Routes />,
-        handle: { title: '模型与路由', adminOnly: true },
+        handle: { title: '路由', adminOnly: true },
         loader: authedLoader(true),
       },
       { path: '/model-groups', element: <Navigate to="/usage?tab=groups" replace /> },
@@ -162,7 +162,7 @@ export const router = createHashRouter([
       {
         path: '/settings',
         element: <Settings />,
-        handle: { title: '系统设置', adminOnly: true },
+        handle: { title: '设置', adminOnly: true },
         loader: authedLoader(true),
       },
       { path: '*', element: <Navigate to="/" replace /> },

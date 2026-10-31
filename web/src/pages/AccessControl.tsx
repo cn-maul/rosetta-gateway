@@ -1,6 +1,5 @@
-import { useState } from 'react'
 import { useLocation, useNavigate } from 'react-router-dom'
-import { Tabs, Button } from '@heroui/react'
+import { Tabs } from '@heroui/react'
 import { isAdmin } from '../api'
 import { PageHeader } from '../ui/PageHeader'
 import { Keys } from '../components/Keys'
@@ -29,10 +28,6 @@ export function AccessControl() {
   const setTab = (key: TabKey) => {
     void navigate(key === 'keys' ? '/keys' : `/users?tab=${key}`)
   }
-  // 刷新用的重建计数。递增即让当前面板整体重挂载，各面板内部的加载逻辑
-  // 都在挂载时执行，不需要暴露刷新方法。
-  const [bump, setBump] = useState(0)
-
   const tabs: { key: TabKey; label: string }[] = isAdmin()
     ? [
         { key: 'users', label: '用户' },
@@ -53,15 +48,9 @@ export function AccessControl() {
 
   return (
     <div>
-      <PageHeader
-        title={heading}
-        sub={sub}
-        actions={
-          <Button variant="ghost" size="sm" onPress={() => setBump((b) => b + 1)}>
-            刷新
-          </Button>
-        }
-      />
+      {/* 页头不放刷新按钮：三个面板进入即拉数，写操作后各自重载自己的数据；
+          手动刷新只会让人怀疑「刚才那次保存是不是没生效」。要强制重取就切页签。 */}
+      <PageHeader title={heading} sub={sub} />
       {isAdmin() ? (
         <Tabs
           aria-label="用户 / 分组 / 访问密钥"
@@ -78,20 +67,11 @@ export function AccessControl() {
             ))}
           </Tabs.List>
           <Tabs.Panel id={tab}>
-            {/* key 同时包含页签与重建计数：切页签换组件，刷新换同组件的新实例。 */}
-            <div key={`${tab}:${bump}`}>
-              {tab === 'keys' ? (
-                <Keys />
-              ) : (
-                <UsersGroups tab={tab === 'users' ? 'users' : 'groups'} />
-              )}
-            </div>
+            {tab === 'keys' ? <Keys /> : <UsersGroups tab={tab === 'users' ? 'users' : 'groups'} />}
           </Tabs.Panel>
         </Tabs>
       ) : (
-        <div key={`keys:${bump}`}>
-          <Keys />
-        </div>
+        <Keys />
       )}
     </div>
   )

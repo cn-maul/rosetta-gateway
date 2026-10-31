@@ -46,7 +46,7 @@ export function UsageStats() {
     : readPref(daysPrefKey, daysDefault, oneOfInt(DAY_OPTIONS))
 
   const scope = admin ? '全站' : '仅你自己'
-  const title = logs ? (admin ? '请求日志' : '我的调用') : '用量与费用'
+  const title = logs ? '调用日志' : '用量与费用'
   const subtitle = logs
     ? `逐条查看调用结果、耗时与记录费用 · ${scope}`
     : tab === 'groups'

@@ -1,8 +1,12 @@
-import { useState, useSyncExternalStore, type FormEvent } from 'react'
+import { useEffect, useState, useSyncExternalStore, type FormEvent } from 'react'
 import { useLocation, useNavigate } from 'react-router-dom'
 import { Alert, Button, Card, Checkbox, Input, Label, TextField, toast } from '@heroui/react'
+import { Moon, Sun } from 'lucide-react'
 import { ApiFail, bootstrapSetup, loadSession, login, session } from '../api'
 import { checkPasswordStrength } from '../password'
+import { BrandMark } from './BrandMark'
+import { loadBranding, useBranding } from './branding'
+import { useTheme } from './theme'
 
 /**
  * 登录页。三种形态互斥，由 session 状态决定（语义对齐旧 Login.vue，不要合并）：
@@ -16,6 +20,14 @@ export function Login() {
   const me = useSyncExternalStore(session.subscribe, () => session.get().me)
   const navigate = useNavigate()
   const location = useLocation()
+  const branding = useBranding()
+  const { dark, toggle } = useTheme()
+
+  // 站点名与 LOGO 是公开端点，未登录也能读 —— 品牌区在拿到之前先用默认名，
+  // 不做骨架：一秒闪三次骨架比稳态慢一点更难受。
+  useEffect(() => {
+    void loadBranding()
+  }, [])
 
   const username = useState('')
   const password = useState('')
@@ -104,13 +116,23 @@ export function Login() {
   const type = showPwd[0] ? ('text' as const) : ('password' as const)
 
   return (
-    <main className="grid min-h-dvh place-items-center bg-background p-6 text-foreground">
+    <main className="relative grid min-h-dvh place-items-center bg-background p-6 text-foreground">
+      {/* 主题切换在登录页也要能按：暗色偏好存在 localStorage，先登录再切会闪一下。 */}
+      <div className="absolute top-4 right-4">
+        <Button
+          isIconOnly
+          size="sm"
+          variant="ghost"
+          aria-label={dark ? '切换到亮色模式' : '切换到暗色模式'}
+          onPress={toggle}
+        >
+          {dark ? <Sun size={16} aria-hidden /> : <Moon size={16} aria-hidden />}
+        </Button>
+      </div>
       <Card className="w-full max-w-[360px]">
         <Card.Content className="flex flex-col items-center gap-1 p-6 pt-7">
-          <div className="bg-accent text-accent-foreground grid h-10 w-10 place-items-center rounded-[10px] text-xl font-bold">
-            R
-          </div>
-          <h1 className="pt-3 text-[17px] font-semibold">rosetta-gateway</h1>
+          <BrandMark size={40} />
+          <h1 className="pt-3 text-[17px] font-semibold">{branding.name}</h1>
           <div className="text-muted pb-3 text-xs">网关管理后台</div>
 
           {mode === 'offline' && (

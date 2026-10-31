@@ -113,10 +113,10 @@ test('上游详情页的按钮都带描边', async () => {
   const detail = stripComments(await read('src/pages/ProviderDetail.tsx'))
   assert.ok(
     !/<Link\s+to=\{backTo\}/.test(detail),
-    '上游详情的「返回上游服务」必须是 Button，不能是 Link',
+    '上游详情的「返回供应商」必须是 Button，不能是 Link',
   )
   assert.ok(
-    detail.includes('← 上游服务'),
-    '返回按钮的文案丢了（← 上游服务）',
+    detail.includes('← 供应商'),
+    '返回按钮的文案丢了（← 供应商）',
   )
 })

@@ -24,7 +24,7 @@ import { createStore } from './store'
 import { rangeBounds } from './range'
 import type {
   ApiError, BootstrapStatus, Me, SessionStatus, LoginResult, ConfigImportResult,
-  PasswordSetupLink, PasswordSetupStatus,
+  PasswordSetupLink, PasswordSetupStatus, ProtocolProbeResult, SiteBranding,
 } from './types'
 
 const TOKEN_KEY = 'rosetta_gw_admin_token'
@@ -837,6 +837,18 @@ export const api = {
     get<Stats>(`/stats?from=${from}&to=${to}${includeLifetime ? '&include_lifetime=true' : ''}`),
   statsOverview: () => get<StatsOverview>('/stats/overview'),
   settings: () => get<Settings>('/settings'),
+  // 站点品牌（站点名 + LOGO）。GET 是**公开**端点（登录页要在没有会话时读），
+  // 所以它不能走 request() 之外的鉴权假设；PUT 需要管理员。
+  // 注意：前端读品牌走 ui/branding.ts 的裸 fetch（它比这个客户端早一步可用），
+  // 这里保留 api.site() 是为设置页保存后回读与类型对齐。
+  site: () => get<SiteBranding>('/site'),
+  saveSite: (b: SiteBranding) => mutate(() => put<{ status: string }>('/site', b)),
+
+  // 协议探测：拿 endpoint + key 去问「这台上游支持哪几种协议」。
+  // 探测结论不是错误 —— 三条结果都在 200 的 results 里，只有参数非法才 400。
+  // 超时给 25s：后端并发跑三条（单条 10s、总 15s），留一点余量。
+  probeProtocols: (b: { endpoint: string; api_key: string; network_id: string }) =>
+    post<ProtocolProbeResult>('/providers/probe-protocols', b, 25_000),
   // 设置里含运行时全局默认（超时 + 故障转移策略），这些值由快照驱动转发路径，
   // 所以必须走 mutate() 触发 reload 才能即时生效（模型容量默认也一并保存）。
   saveSettings: (b: Settings) => mutate(() => put<Settings>('/settings', b)),

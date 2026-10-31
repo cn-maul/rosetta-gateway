@@ -17,12 +17,10 @@ export function KeysTable({
   emptyAction,
   toggling,
   copyingId,
-  recomputing,
   importBusy,
   onCopy,
   onCcPicker,
   onMagpieImport,
-  onRecompute,
   onEdit,
   onDelete,
   onToggle,
@@ -36,13 +34,11 @@ export function KeysTable({
   emptyAction?: React.ReactNode
   toggling: Set<string>
   copyingId: string
-  recomputing: string
   /** 这一行是否有导入动作在途。 */
   importBusy: (k: AccessKey) => boolean
   onCopy: (k: AccessKey) => void
   onCcPicker: (k: AccessKey) => void
   onMagpieImport: (k: AccessKey) => void
-  onRecompute: (k: AccessKey) => void
   onEdit: (k: AccessKey) => void
   onDelete: (k: AccessKey) => void
   onToggle: (k: AccessKey) => void
@@ -179,19 +175,6 @@ export function KeysTable({
                           onPress={() => onMagpieImport(k)}
                         >
                           <img src={magpieIcon} alt="" width={17} height={17} className="icon-invert-dark object-contain" />
-                        </Button>
-                      </span>
-                      {/* 不按身份隐藏：端点在白名单内，普通用户有权自查。
-                          但要说清它修的是什么 —— 计数异常通常是历史归档或迁移
-                          留下的，对普通用户而言点它多半看不到变化。 */}
-                      <span title="按调用明细重算已用 tokens。通常无需操作：仅在配额计数与实际用量明显不符时使用（例如历史数据迁移后）">
-                        <Button
-                          variant="ghost"
-                          size="sm"
-                          isDisabled={recomputing === k.id}
-                          onPress={() => onRecompute(k)}
-                        >
-                          {recomputing === k.id ? '重算中…' : '重算用量'}
                         </Button>
                       </span>
                       <Button variant="ghost" size="sm" onPress={() => onEdit(k)}>

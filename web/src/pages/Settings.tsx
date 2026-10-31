@@ -21,6 +21,7 @@ import { FileImport } from '../ui/FileImport'
 import { fmtNum } from '../fmt'
 import { MODEL_DEFAULT_FALLBACKS, RUNTIME_DEFAULTS } from '../generated/defaults'
 import { PriceSettings } from '../components/PriceSettings'
+import { SiteBrandCard } from '../components/settings/SiteBrandCard'
 import type { ConfigExportFile, ConfigImportResult, PruneResult } from '../types'
 
 /**
@@ -32,9 +33,10 @@ import type { ConfigExportFile, ConfigImportResult, PruneResult } from '../types
  * 界面上的那一块，不是能力本身。
  */
 
-type TabKey = 'model' | 'runtime' | 'price' | 'transfer'
+type TabKey = 'site' | 'model' | 'runtime' | 'price' | 'transfer'
 
 const TABS: { key: TabKey; label: string; sub: string }[] = [
+  { key: 'site', label: '站点', sub: '站点名称与 LOGO：显示在登录页与侧栏左上角' },
   { key: 'model', label: '模型默认', sub: '全局默认值；模型容量探测不到时回落到这里' },
   { key: 'runtime', label: '运行时', sub: '各类超时与自动故障转移的全局默认，按「谁在保护什么」分块' },
   // 这里曾有一个「安全」页，放的是独立于 users 表的管理密码（另有一份凭据文件兜底）。
@@ -538,12 +540,16 @@ export function Settings() {
   return (
     <div>
       <PageHeader
-        title="系统设置"
+        title="设置"
         sub={tabSub}
         actions={
-          <Button variant="secondary" size="sm" isDisabled={loading && tab !== 'price'} onPress={refresh}>
-            刷新
-          </Button>
+          // 站点与价格两个页签各有自己的数据源，外层这个按钮只重取「设置」本体，
+          // 所以在那两个页签上不出现 —— 免得点了没反应。
+          tab === 'site' || tab === 'price' ? undefined : (
+            <Button variant="secondary" size="sm" isDisabled={loading} onPress={refresh}>
+              刷新
+            </Button>
+          )
         }
       />
 
@@ -556,6 +562,11 @@ export function Settings() {
           ))}
         </Tabs.List>
         <Tabs.Panel id={tab}>
+          {/* ---------- 分类 0：站点标识 ----------
+              这部分不参与 PUT /settings 的全量保存（字段在另一张表），
+              所以它自己读、自己写，也不受下方 loadedOnce 守卫影响。 */}
+          {tab === 'site' ? <SiteBrandCard /> : null}
+
           {/* ---------- 分类 1：模型默认 ---------- */}
           {tab === 'model' ? (
             loading ? (

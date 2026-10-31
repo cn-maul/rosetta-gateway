@@ -225,7 +225,7 @@ export function Routes() {
   return (
     <>
       <PageHeader
-        title="模型与路由"
+        title="路由"
         actions={
           <>
             <Button variant="secondary" isDisabled={loading} onPress={() => void load()}>
