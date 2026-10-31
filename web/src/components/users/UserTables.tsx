@@ -39,7 +39,7 @@ export function UsersTable({ users, groups, loading, err, pending, onEdit, onPas
         <Table.ScrollContainer>
           <Table.Content aria-label="用户与权限组">
             <Table.Header>
-              <Table.Column>用户名</Table.Column>
+              <Table.Column isRowHeader>用户名</Table.Column>
               <Table.Column>分组</Table.Column>
               <Table.Column className="text-right">密钥数量</Table.Column>
               <Table.Column className="text-right">总 token 用量</Table.Column>
@@ -173,7 +173,7 @@ export function GroupsTable({ groups, loading, err, deleting, onModels, onEditGr
           <Table.ScrollContainer>
             <Table.Content aria-label="用户分组">
               <Table.Header>
-                <Table.Column>分组</Table.Column>
+                <Table.Column isRowHeader>分组</Table.Column>
                 <Table.Column>说明</Table.Column>
                 <Table.Column>模型白名单</Table.Column>
                 <Table.Column className="text-right">操作</Table.Column>

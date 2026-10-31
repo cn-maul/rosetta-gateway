@@ -1,0 +1,1 @@
+function e(e){return Number.isFinite(e)&&e>0?`¥${e.toLocaleString(`zh-CN`,{maximumSignificantDigits:15})}`:`未配置`}function t(t,n){return n>0?e(n):t>0?`${e(t)}（沿用输入）`:`未配置`}export{e as n,t};

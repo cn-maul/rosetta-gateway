@@ -64,7 +64,7 @@ export function KeysTable({
         <Table.ScrollContainer>
           <Table.Content aria-label="调用密钥">
             <Table.Header>
-              <Table.Column>名称</Table.Column>
+              <Table.Column isRowHeader>名称</Table.Column>
               <Table.Column>归属用户</Table.Column>
               <Table.Column>限制</Table.Column>
               {/* 表头标出方向：这一列按 used_tokens 降序，箭头就是排的方向。 */}

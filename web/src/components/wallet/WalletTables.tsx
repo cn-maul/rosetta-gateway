@@ -85,7 +85,7 @@ export function ByUserTable({
               <Table.ScrollContainer>
                 <Table.Content aria-label="账户账单">
                   <Table.Header>
-                    <Table.Column>用户</Table.Column>
+                    <Table.Column isRowHeader>用户</Table.Column>
                     <Table.Column className="text-right">总消费</Table.Column>
                     <Table.Column className="text-right">调用次数</Table.Column>
                     <Table.Column className="text-right">Token</Table.Column>
@@ -179,7 +179,7 @@ export function ByDayTable({
               <Table.ScrollContainer>
                 <Table.Content aria-label="账户账单">
                   <Table.Header>
-                    <Table.Column>日期</Table.Column>
+                    <Table.Column isRowHeader>日期</Table.Column>
                     <Table.Column className="text-right">调用次数</Table.Column>
                     <Table.Column className="text-right">Tokens</Table.Column>
                     <Table.Column className="text-right">当日费用</Table.Column>
@@ -250,7 +250,7 @@ export function TopupTable({
               <Table.ScrollContainer>
                 <Table.Content aria-label="账户账单">
                   <Table.Header>
-                    <Table.Column>时间</Table.Column>
+                    <Table.Column isRowHeader>时间</Table.Column>
                     {admin ? <Table.Column>用户</Table.Column> : null}
                     <Table.Column className="text-right">金额</Table.Column>
                     <Table.Column className="text-right">调整后余额</Table.Column>

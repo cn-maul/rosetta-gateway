@@ -138,7 +138,7 @@ export function CredentialPanel({
           <Table.ScrollContainer>
             <Table.Content className="min-w-[560px]">
               <Table.Header>
-                <Table.Column>凭据</Table.Column>
+                <Table.Column isRowHeader>凭据</Table.Column>
                 <Table.Column>上游余额</Table.Column>
                 <Table.Column>操作</Table.Column>
               </Table.Header>

@@ -292,7 +292,7 @@ export function Providers() {
           <Table.ScrollContainer>
             <Table.Content className="min-w-[920px]">
               <Table.Header>
-                <Table.Column>上游 / Endpoint</Table.Column>
+                <Table.Column isRowHeader>上游 / Endpoint</Table.Column>
                 <Table.Column>类型</Table.Column>
                 <Table.Column>网络状态</Table.Column>
                 <Table.Column>配置状态</Table.Column>

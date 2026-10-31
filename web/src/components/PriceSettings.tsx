@@ -397,7 +397,7 @@ export function PriceSettings({ refreshSignal }: { refreshSignal: number }) {
                     <Table.Content aria-label="模型价格">
                       <Table.Header>
                         <Table.Column className="w-8" />
-                        <Table.Column>供应商</Table.Column>
+                        <Table.Column isRowHeader>供应商</Table.Column>
                         <Table.Column>模型</Table.Column>
                         <Table.Column className="text-right">输入（元/1M）</Table.Column>
                         <Table.Column className="text-right">缓存命中（元/1M）</Table.Column>

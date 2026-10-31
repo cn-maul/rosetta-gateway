@@ -243,7 +243,7 @@ export function UsageByGroup({
         <Table.ScrollContainer>
           <Table.Content aria-label={`用量分组统计，可横向滚动`}>
             <Table.Header>
-              <Table.Column>排名</Table.Column>
+              <Table.Column isRowHeader>排名</Table.Column>
               <Table.Column>{firstCol}</Table.Column>
               <Table.Column>请求量</Table.Column>
               <Table.Column>Tokens</Table.Column>

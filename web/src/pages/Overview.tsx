@@ -229,7 +229,7 @@ export function Overview() {
               <Table.ScrollContainer>
                 <Table.Content>
                   <Table.Header>
-                    <Table.Column>日期</Table.Column>
+                    <Table.Column isRowHeader>日期</Table.Column>
                     <Table.Column className="text-right">请求数</Table.Column>
                     <Table.Column className="text-right">Token</Table.Column>
                     <Table.Column className="text-right">成功率</Table.Column>

@@ -194,7 +194,7 @@ export function Networks() {
           <Table.ScrollContainer>
             <Table.Content aria-label="代理列表，可横向滚动">
               <Table.Header>
-                <Table.Column>名称</Table.Column>
+                <Table.Column isRowHeader>名称</Table.Column>
                 <Table.Column>代理地址</Table.Column>
                 <Table.Column>使用中的上游</Table.Column>
                 <Table.Column>联通状态</Table.Column>

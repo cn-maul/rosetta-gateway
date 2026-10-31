@@ -215,7 +215,7 @@ export function ModelGroups() {
           <Table.ScrollContainer>
             <Table.Content aria-label="模型分组列表">
               <Table.Header>
-                <Table.Column>组名（统计里显示这个名字）</Table.Column>
+                <Table.Column isRowHeader>组名（统计里显示这个名字）</Table.Column>
                 <Table.Column>成员数</Table.Column>
                 <Table.Column>操作</Table.Column>
               </Table.Header>

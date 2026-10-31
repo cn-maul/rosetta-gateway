@@ -303,7 +303,7 @@ export function Routes() {
           <Table.ScrollContainer>
             <Table.Content className="min-w-[880px]">
               <Table.Header>
-                <Table.Column>路由名</Table.Column>
+                <Table.Column isRowHeader>路由名</Table.Column>
                 <Table.Column>当前服务模型</Table.Column>
                 <Table.Column>上游数</Table.Column>
                 <Table.Column>操作</Table.Column>
@@ -715,7 +715,7 @@ function RouteEditor({
               <Table.ScrollContainer>
                 <Table.Content className="min-w-[760px]">
                   <Table.Header>
-                    <Table.Column>序号</Table.Column>
+                    <Table.Column isRowHeader>序号</Table.Column>
                     <Table.Column>上游服务</Table.Column>
                     <Table.Column>上游模型</Table.Column>
                     <Table.Column>启用</Table.Column>

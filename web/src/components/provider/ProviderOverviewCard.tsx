@@ -91,9 +91,6 @@ export function ProviderOverviewCard({
             <span className="text-muted">直连（不经过代理）</span>
           )}
         </KvRow>
-        <KvRow k="Slug">
-          <span className="text-muted font-mono">{provider.slug}</span>
-        </KvRow>
         <KvRow k="超时 / 重试">
           <span className="text-muted">
             {fmtTimeoutSec(provider.timeout_ms)} /{' '}

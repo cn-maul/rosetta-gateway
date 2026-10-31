@@ -47,3 +47,32 @@ test('每处 Table.ScrollContainer 都有配套的 Table 根组件', async () =>
   }
   assert.deepEqual(violations, [], '缺 Table 根的表格会丢失全部插槽样式：\n' + violations.join('\n'))
 })
+
+// react-aria-components（HeroUI Table 的底座）在客户端渲染时硬性要求：
+// 只要一张表渲染出至少一列，就必须有**且仅由** isRowHeader 标出的行首列。
+// 库源码：react-aria-components/dist/private/Table.mjs:145
+//   if (this.rowHeaderColumnKeys.size === 0 && this.columns.length > 0 && !isSSR)
+//     throw new Error('A table must have at least one Column with the isRowHeader prop set to true')
+// SSR 不触发这条断言，所以 `npm run build`、vite preview、单测全都看不见它 ——
+// 只有真浏览器点到那个页面才整页崩成 ErrorBoundary。
+//
+// 这里按「每张表的表头都要标一个行首列」来守：<Table.Header> 的数量
+// 必须被 isRowHeader 的数量覆盖。空的占位列（如批量选择框列）不能当行首。
+test('每张表都标了 isRowHeader 行首列', async () => {
+  const files = await walk(SRC)
+  const violations = []
+  for (const f of files) {
+    const src = await readFile(f, 'utf8')
+    const headers = count(src, /<Table\.Header[\s>]/g)
+    if (headers === 0) continue
+    const rowHeaders = count(src, /\bisRowHeader\b/g)
+    if (rowHeaders < headers) {
+      violations.push(`${rel(f)}: 表头 ${headers} 处，isRowHeader ${rowHeaders} 处`)
+    }
+  }
+  assert.deepEqual(
+    violations,
+    [],
+    '缺少 isRowHeader 的表在浏览器里会整页崩：\n' + violations.join('\n'),
+  )
+})
