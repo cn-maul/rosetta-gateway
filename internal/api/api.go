@@ -399,15 +399,17 @@ func BuildApp(d Deps) *App {
 		// 查谁）：普通用户只看到自己的，管理员也只看自己的那一份 —— 钱包页是
 		// 个人账本页，不存在「看全站充值」的用例。
 		//
-		// 路径 /admin/api/topups **不在** userAccessiblePrefixes 白名单里，所以
-		// AdminGateGuard 会要求管理员 —— 而普通用户需要看自己的充值记录。所以
-		// 必须把这个前缀加进白名单，作用域收窄由 handler 自己做
-		// （与 key_handler / usage_handler 的 callerScope 同一责任分配：
-		// 白名单只管「谁能进这个端点」，进来之后看谁由 handler 判）。
+		// 路径 /admin/api/topups **在**普通用户白名单里（internal/access 的
+		// 「精确路由」表，2026-10-10 起前缀匹配已废弃 —— 见 access.go 顶部注释），
+		// 否则 AdminGateGuard 会要求管理员，而普通用户需要看自己的充值记录。
+		// 白名单只管「谁能进这个端点」，进来之后看谁由 handler 判
+		// （与 key_handler / usage_handler 的 callerScope 同一责任分配）。
 		{Pattern: "GET /admin/api/topups", Handler: userHandler.ListTopups, Public: false},
 		{Pattern: "POST /admin/api/me/password", Handler: userHandler.ChangePassword, Public: false},
 		// 分组与模型白名单（多用户改造 P1）。全部 admin-only ——
-		// server.AdminGateGuard 是**前缀白名单**，/groups 不在其中即自动要求管理员。
+		// server.AdminGateGuard 按「精确路由」查普通用户白名单
+		// （internal/access 的 userAccessibleRoutes，2026-10-10 起前缀匹配已废弃），
+		// /groups 不在表里即自动 403，管理员在闸门处直接放行。
 		//
 		// 快照重建靠外层 AutoReload，这里不再显式调 reload（见 GroupHandler 注释）。
 		{Pattern: "GET /admin/api/groups", Handler: groupHandler.List, Public: false},

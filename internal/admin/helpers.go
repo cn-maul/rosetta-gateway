@@ -40,6 +40,22 @@ type apiErrorResponse struct {
 	Error apiErrorDetail `json:"error"`
 }
 
+// writeError 回一个 4xx 标准错误信封，type 恒为 "invalid_request_error"。
+//
+// # 为什么这里是 invalid_request_error，而网关层拒绝时是 auth_error
+//
+// 两套词汇刻意不同，回答的是「谁拒绝了你」：
+//   - 网关层（server.UserAuthMiddleware / access.AdminGateGuard，
+//     经 httpx.WriteAuthError）拒绝 → type = "auth_error"。它在 handler
+//     之前就把请求挡回去了：没身份、身份过期、或普通用户碰了管理端点。
+//   - handler 内部拒绝（本函数）→ type = "invalid_request_error"。请求已经
+//     通过身份闸门，拒绝理由是参数、作用域或状态（requireAdmin / callerScope
+//     也属于这一档：它们是「你以这个身份发的这条请求不允许」，不是「你不认识」）。
+//
+// 这不是历史遗留：internal/server/authz_matrix_test.go 把 auth_error 当成
+// 契约逐条断言（网关层与 handler 内两档分开测），internal/server/key_policy.go
+// 也硬编码 auth_error。统一成一种会让「403 到底是没登录还是没权限」在客户端
+// 无法区分，所以不动行为，只在此说明分工。
 func writeError(w http.ResponseWriter, status int, message string) {
 	writeJSON(w, status, apiErrorResponse{
 		Error: apiErrorDetail{

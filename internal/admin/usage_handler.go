@@ -238,6 +238,12 @@ const usageRecordColumns = `ts, public_model, provider_id, upstream_model, ingre
 // `ts, public_model, provider_id, ...` 原样留着、只追加一个 GROUP BY ——
 // SQLite 对此不报错，而是每个分组取「某一行」的值，结果不确定（换个查询计划就变）。
 // 这里所有非分组列一律给确定的中性值。
+//
+// 分组统计的是**明细表**（usage_records）：这是本端点的既有边界 ——
+// 记录列表本身就是明细（单次调用无法从日聚合还原），剪枝把老明细挪进归档
+// 之后，records 与 group_by 出来的分组行一起变少，而同一响应里的 summary
+// 走 store.UsageSource（明细+归档）不受影响。要看整个保留期之外的全区间
+// 维度汇总，用 /usage/by-*，不要用 group_by。
 func groupByClause(groupBy string) (selectCols, groupClause string, ok bool) {
 	const blank = `'' as public_model, '' as provider_id, '' as upstream_model, ` +
 		`'' as ingress_protocol, 0 as stream`
@@ -318,6 +324,13 @@ func (h *UsageHandler) Query(w http.ResponseWriter, r *http.Request) {
 
 	// 记录列表走明细（单次调用无法从日聚合还原），summary 走合并来源。
 	// 两者共用 usageFilter 拆出的同一组条件。
+	//
+	// ?group_by= 只作用于**记录列表**：它把明细行按维度合计，仍然是明细表的
+	// 聚合，剪枝之后同样查不到已归档日期（与不带 group_by 的 records 一致）。
+	// 也就是说：带 group_by 时 summary 覆盖整个区间、分组行只覆盖保留期内的
+	// 明细 —— 这不是错算，是「同一响应里两个来源各自的边界」。要全区间按维度
+	// 汇总请用 /admin/api/usage/by-day|by-key|by-model|by-provider（走
+	// store.UsageSource，明细与归档合并后再聚合）。
 	where, args, filter := usageFilter(from, to, explicit, q, callerScope(r))
 
 	summary, err := h.summarize(r.Context(), filter)
