@@ -151,6 +151,8 @@
 | U3 | ✅ | `8f8359a` `92734a4` | 路由懒加载（除 Networks 因导出 `networksLoader` 保持静态）+ vendor 分包：入口 **1,104.44 kB → 49.53 kB**（gzip 325.16 → 16.58），react 313.58 kB、heroui 490.16 kB、页面 2.1–55.5 kB。偏好记忆 `ui/usePersistedState.ts`（前缀 `rosetta.pref.`）：总览区间、`/usage` 与 `/history` 天数（分开记）、`/history` 每页条数、模型页天数与粒度 |
 | U5 | ⏭ 未做 | — | 待拍板项 ③ 结论为不立项 |
 
+**U1 首屏仪表盘已于 2026-10-31 按需求重写（`77dabd9`）**：用户明确「总览只看多少天内的七个指标 + 用量趋势表」，于是状态条 / 配置五卡 / 待办卡 / 最近请求 / 余额卡 / 柱状图全部从总览移除（各有专页）。保留的是区间选择 + 七指标（请求数 / Token / 成功率 / 缓存命中率 / TPS / 平均首字 / 首字之后的生成耗时）+ 按天趋势表（八列同口径）。为此后端先补了指标（`74e6006`）：`/stats` 加 `avg_gen_ms` + `gen_samples`（avg_ttfb + avg_gen ≈ 平均总耗时，刻意不合成一个数），`UsageSource` 两条来源支各加 `gen_ok_sum` / `n_gen_ok` 归一列，四个 by-* 每行补 `cached_tokens` / `cache_hit_rate` / `avg_gen_ms` / `n_gen`。上一版为此新增的 `Sparkline` / `RateRing` / `useInView` / `RecentRequests` 随本次重写一并删除（git 历史可查）。
+
 门禁基线（U1–U3 每批每步都跑）：`npm run typecheck` 0 错 · `node --test` **51/51**（新增
 `persistedPrefs` 5 条）· `npm run build` ok · `legacy-audit` 裸原语 0（白名单 2）/旧类名 0 ·
 `go test ./internal/webui/... -count=1` ok。另做了一次二进制冒烟：`build.ps1` 出的
