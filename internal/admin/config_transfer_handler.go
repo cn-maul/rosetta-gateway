@@ -185,7 +185,179 @@ func (h *ConfigTransferHandler) buildExport(ctx context.Context) (configExport, 
 			})
 		}
 	}
+
+	if err := h.exportIdentities(ctx, &out); err != nil {
+		return out, err
+	}
+	if err := h.exportRoutes(ctx, &out); err != nil {
+		return out, err
+	}
 	return out, nil
+}
+
+// exportIdentities 导出「人」这一层：用户分组、用户、访问密钥。
+//
+// 与供应商那段的差别在于**跨库对齐键**：用户靠用户名、分组靠组名、密钥靠
+// 归属用户名。都是管理员自己起的名字，也就是真正跨环境稳定的东西。
+func (h *ConfigTransferHandler) exportIdentities(ctx context.Context, out *configExport) error {
+	// 用户分组（groups）：带上模型白名单。空名单 = 不限制，原样保留 ——
+	// 导入侧必须区分「空 = 放行」与「空 = 全拒」，见 userGroupExport 的注释。
+	groups, err := h.store.ListGroups(ctx)
+	if err != nil {
+		return err
+	}
+	groupModels, err := h.store.ListGroupModels(ctx)
+	if err != nil {
+		return err
+	}
+	groupName := make(map[string]string, len(groups))
+	for _, g := range groups {
+		groupName[g.ID] = g.Name
+		out.UserGroups = append(out.UserGroups, userGroupExport{
+			Name:        g.Name,
+			Description: g.Description,
+			Models:      groupModels[g.ID],
+		})
+	}
+
+	users, err := h.store.ListUsers(ctx)
+	if err != nil {
+		return err
+	}
+	userName := make(map[string]string, len(users))
+	for i := range users {
+		u := &users[i]
+		userName[u.ID] = u.Username
+		// 不限额在库里是 NULL，导出成 JSON null：0 与 null 在余额语义下
+		// 是两种状态（0 = 真的没钱 → 402，null = 不限额 → 放行）。
+		var balance *int64
+		if !u.Unlimited {
+			cents := u.BalanceCents
+			balance = &cents
+		}
+		out.Users = append(out.Users, userExport{
+			Username:     u.Username,
+			DisplayName:  u.DisplayName,
+			PasswordHash: u.PasswordHash,
+			Role:         u.Role,
+			Status:       u.Status,
+			QuotaTokens:  u.QuotaTokens,
+			UsedTokens:   u.UsedTokens,
+			BalanceCents: balance,
+			Remark:       u.Remark,
+			GroupName:    groupName[u.GroupID],
+		})
+	}
+
+	keys, err := h.store.ListAccessKeys(ctx)
+	if err != nil {
+		return err
+	}
+	for i := range keys {
+		k := &keys[i]
+		// 老密钥（「可回读」上线前建的）只有哈希没有密文：明文谁都没有，
+		// 带不进新库。跳过并告警，让人知道要去换一把，而不是导出一把
+		// 到了新库必然 401 的空壳。
+		blob, found, err := h.store.AccessKeySecret(ctx, k.ID)
+		if err != nil {
+			return err
+		}
+		if !found || len(blob) == 0 {
+			slog.Warn("config export: access key has no readable secret, skipped",
+				"name", k.Name, "prefix", k.KeyPrefix)
+			continue
+		}
+		plain, err := decryptSecret(blob, h.masterKey)
+		if err != nil {
+			slog.Warn("config export: access key undecryptable, skipped",
+				"name", k.Name, "prefix", k.KeyPrefix, "error", err)
+			continue
+		}
+		enabled := k.Enabled
+		out.AccessKeys = append(out.AccessKeys, accessKeyExport{
+			Key: plain, Name: k.Name,
+			User:        userName[k.UserID],
+			Enabled:     &enabled,
+			QuotaTokens: k.QuotaTokens,
+			RPMLimit:    k.RPMLimit,
+			TPMLimit:    k.TPMLimit,
+			// nil 与非 nil 空在库里是两种语义（不限制 / 拒绝全部模型），
+			// omitempty 下两者都会消失，导入侧一律按「不限制」处理 ——
+			// 这是刻意的收敛：JSON 表达不出「拒绝全部」这个态，而带着
+			// 空数组导入反而会让一把本来能用的 key 全线 403。
+			AllowedModels: k.AllowedModels,
+			ExpiresAt:     k.ExpiresAt,
+			AllowedIPs:    k.AllowedIPs,
+			GroupName:     groupName[k.GroupID],
+		})
+	}
+	return nil
+}
+
+// exportRoutes 导出路由与它们的故障转移链。
+//
+// 链目标用 provider slug + model id 引用（跨库 id 无意义），导入时解析。
+func (h *ConfigTransferHandler) exportRoutes(ctx context.Context, out *configExport) error {
+	routes, err := h.store.ListRoutes(ctx)
+	if err != nil {
+		return err
+	}
+	if len(routes) == 0 {
+		return nil
+	}
+	providers, err := h.store.ListProviders(ctx)
+	if err != nil {
+		return err
+	}
+	providerSlug := make(map[string]string, len(providers))
+	for _, p := range providers {
+		providerSlug[p.ID] = p.Slug
+	}
+	models, err := h.store.ListAllUpstreamModels(ctx)
+	if err != nil {
+		return err
+	}
+	modelKey := make(map[string]modelRef, len(models))
+	for _, m := range models {
+		modelKey[m.ID] = modelRef{slug: providerSlug[m.ProviderID], modelID: m.ModelID}
+	}
+	targets, err := h.store.ListAllRouteTargets(ctx)
+	if err != nil {
+		return err
+	}
+	byRoute := make(map[string][]store.RouteTarget, len(routes))
+	for _, t := range targets {
+		byRoute[t.RouteID] = append(byRoute[t.RouteID], t)
+	}
+
+	for _, r := range routes {
+		re := routeExport{
+			PublicName:      r.PublicName,
+			Enabled:         r.Enabled,
+			FailoverEnabled: r.FailoverEnabled,
+		}
+		for _, t := range byRoute[r.ID] {
+			ref, ok := modelKey[t.UpstreamModelID]
+			if !ok || ref.slug == "" {
+				// 链上挂着一个已不存在的模型/provider（历史脏数据）：
+				// 带不出去就明说，别让导入方以为链是完整的。
+				slog.Warn("config export: route target refers to missing model, skipped",
+					"route", r.PublicName, "target", t.UpstreamModelID)
+				continue
+			}
+			re.Targets = append(re.Targets, routeTargetExport{
+				ProviderSlug: ref.slug, ModelID: ref.modelID, Enabled: t.Enabled,
+			})
+		}
+		out.Routes = append(out.Routes, re)
+	}
+	return nil
+}
+
+// modelRef 是「上游模型 id → (provider slug, model_id)」这一跳的中间值。
+type modelRef struct {
+	slug    string
+	modelID string
 }
 
 // importRequest 是导入请求。
@@ -209,8 +381,18 @@ type importResponse struct {
 	ModelsSkipped      int               `json:"models_skipped"`
 	CredentialsAdded   int               `json:"credentials_added"`
 	CredentialsSkipped int               `json:"credentials_skipped"`
-	Warnings           []string          `json:"warnings,omitempty"`
-	Notes              []string          `json:"notes,omitempty"`
+	// v4 新增：用户分组 / 用户 / 访问密钥 / 路由。分段计数而不是一个总数，
+	// 因为它们的冲突语义不同（分组与用户是「已存在就保留」、路由是
+	// 「已存在就跳过」），用户需要按段判断这次到底该不该回滚。
+	UserGroupsCreated int      `json:"user_groups_created"`
+	UsersCreated      int      `json:"users_created"`
+	UsersSkipped      int      `json:"users_skipped"`
+	AccessKeysCreated int      `json:"access_keys_created"`
+	AccessKeysSkipped int      `json:"access_keys_skipped"`
+	RoutesCreated     int      `json:"routes_created"`
+	RoutesSkipped     int      `json:"routes_skipped"`
+	Warnings          []string `json:"warnings,omitempty"`
+	Notes             []string `json:"notes,omitempty"`
 }
 
 // Import 导入供应商与模型。
@@ -398,6 +580,14 @@ func (h *ConfigTransferHandler) apply(ctx context.Context, in *configExport, dry
 		}
 		out := h.attach(ctx, in, bySlug, placeholder, true, resp, nil)
 		resp.ModelsCreated, resp.CredentialsAdded = out.models, out.creds
+		// 身份段与路由段在干跑里同样只数不写。路由要用 attach 产出的
+		// modelIDs 解析链目标，所以必须排在 attach 之后。
+		if err := h.applyIdentities(ctx, in, true, resp, nil); err != nil {
+			return nil, err
+		}
+		if err := h.applyRoutes(ctx, in, bySlug, placeholder, out.modelIDs, true, resp, nil); err != nil {
+			return nil, err
+		}
 		return resp, nil
 	}
 
@@ -437,7 +627,13 @@ func (h *ConfigTransferHandler) apply(ctx context.Context, in *configExport, dry
 		}
 		out := h.attach(ctx, in, bySlug, idOf, false, resp, tx)
 		resp.ModelsCreated, resp.CredentialsAdded = out.models, out.creds
-		return nil
+		// 身份段与路由段进同一笔事务：用户/密钥/路由任一条硬失败都让
+		// 整批回滚。分两笔提交会出现「供应商进来了、用户没进来」的半套
+		// 迁移，而重试又会给供应商加 -2 后缀。
+		if err := h.applyIdentities(ctx, in, false, resp, tx); err != nil {
+			return err
+		}
+		return h.applyRoutes(ctx, in, bySlug, idOf, out.modelIDs, false, resp, tx)
 	}); err != nil {
 		return nil, err
 	}
@@ -458,6 +654,10 @@ type pendingProvider struct {
 type attachOutcome struct {
 	models int
 	creds  int
+	// modelIDs 记录本次导入**新建**的模型：(providerID + "\x00" + modelID)
+	// → 新模型 id。路由段要用它把链目标解析回本库 id —— 这些模型在
+	// apply 开头那次 ListAllUpstreamModels 里还不存在。
+	modelIDs map[string]string
 }
 
 // attach 处理模型与凭据的挂靠。
@@ -475,7 +675,15 @@ func (h *ConfigTransferHandler) attach(
 	// tx 非 nil 时所有写入走这笔事务（真实导入路径）；干跑时为 nil，只数不写。
 	tx store.Tx,
 ) attachOutcome {
-	var out attachOutcome
+	out := attachOutcome{modelIDs: make(map[string]string)}
+
+	// 本库已有的模型 id 也要进 modelIDs：路由可能指向一个**本次没导入**
+	// 的既有模型（文件里只带了链、没带模型），那种情况同样要能解析。
+	if models, err := h.store.ListAllUpstreamModels(ctx); err == nil {
+		for _, m := range models {
+			out.modelIDs[m.ProviderID+"\x00"+m.ModelID] = m.ID
+		}
+	}
 
 	// 归组导入必须排在模型循环**之前**：模型靠 group_name 关联组，
 	// 组不存在就写不进 group_id。同名组复用现有组（导入是合并而不是
@@ -609,6 +817,10 @@ func (h *ConfigTransferHandler) attach(
 			m.EffortLevels, m.UnknownLevels = known, unknown
 		}
 		if dry {
+			// 干跑也要登记 modelIDs：路由段靠它解析链目标，而干跑的预览
+			// 必须与真实导入报同样的数字，否则「预览说会建 1 条路由、
+			// 真跑却建 0 条」这种偏差没人能解释。
+			out.modelIDs[pid+"\x00"+modelID] = "dry-run:" + pid + "/" + modelID
 			out.models++
 			continue
 		}
@@ -624,6 +836,7 @@ func (h *ConfigTransferHandler) attach(
 				fmt.Sprintf("模型 %s / %s 写入失败：%v", slug, modelID, merr))
 			continue
 		}
+		out.modelIDs[pid+"\x00"+modelID] = m.ID
 		out.models++
 	}
 

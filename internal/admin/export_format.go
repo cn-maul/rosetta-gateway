@@ -34,16 +34,26 @@ import (
 
 // exportFormatVersion 是当前导出体唯一接受的版本。
 //
-// 导出格式不做向后兼容：旧格式缺当前 schema 必需的结构（模型组、出站网络），
-// 部分字段缺失只会解成零值，结果是“导入成功但配置静默缩水”。发现非当前版本
-// 时必须明确拒绝，让用户重新导出，而不是尝试猜旧字段的语义。
-const exportFormatVersion = 3
-
-// configExport 是供应商 + 模型的导出体。
+// 导出格式不做向后兼容：旧格式缺当前 schema 必需的结构（模型组、出站网络、
+// 用户、访问密钥、路由），部分字段缺失只会解成零值，结果是“导入成功但配置
+// 静默缩水”。发现非当前版本时必须明确拒绝，让用户重新导出，而不是尝试猜
+// 旧字段的语义。
 //
-// 注意这里**不含** provider 的 id：id 是本库的内部主键，跨库无意义。
-// 导入时按slug 匹配现有provider —— slug 才是对外稳定标识（路由、
-// 日志、界面都引用它）。
+// 版本史：
+//
+//	1  只有供应商 + 模型
+//	2  加模型组、把逐 provider 的 proxy_url 收敛成 networks
+//	3  加密成为唯一形态（.json.enc，必带凭据）
+//	4  加用户（含余额与口令哈希）、访问密钥（含明文）、用户分组、路由与故障转移链
+const exportFormatVersion = 4
+
+// configExport 是整库配置的导出体。
+//
+// 注意这里**不含**任何本库内部主键（provider/model/route/user/key 的 id）：
+// id 跨库无意义，导入时一律现生成。跨库对齐全靠「人给的名字」——
+// provider 与模型组靠 slug、模型组靠显示名、网络靠网络名、用户靠用户名、
+// 路由靠公开名。这不是偷懒，而是因为那些名字本来就由管理员指定，
+// 是真正跨环境稳定的东西。
 // @ts-type ConfigExportFile
 type configExport struct {
 	Version    int   `json:"version"`
@@ -58,17 +68,133 @@ type configExport struct {
 	Cipher     string `json:"cipher,omitempty"`
 	Salt       string `json:"salt,omitempty"`
 	Iterations int    `json:"iterations,omitempty"`
-	// 加密体解开后的三组数据；外层包装里这些字段为空。
+	// 加密体解开后的数据；外层包装里这些字段为空。
 	Providers   []providerExport   `json:"providers,omitempty"`
 	Credentials []credentialExport `json:"credentials,omitempty"`
 	Models      []modelExport      `json:"models,omitempty"`
-	// ModelGroups 是模型归组。组内成员通过 modelExport.group_name
-	// 按显示名关联 —— 跨库靠名字对齐，与 provider 靠 slug 对齐同理。
+	// ModelGroups 是模型归组（统计里显示的名称）。组内成员通过
+	// modelExport.group_name 按显示名关联 —— 跨库靠名字对齐，与 provider
+	// 靠 slug 对齐同理。
 	ModelGroups []modelGroupExport `json:"model_groups,omitempty"`
 	// Networks 是出站网络清单。成员通过 providerExport.network_name
 	// 按**网络名**关联：跨库 id 无意义（与 provider 靠 slug、模型组靠显示名
 	// 同一理由），而名字本来就是管理员给它的。
 	Networks []networkExport `json:"networks,omitempty"`
+	// UserGroups 是**用户可见性分组**（groups 表），与上面的 ModelGroups
+	// （模型归组，只影响统计显示）是两件不同的事。名字里带 user_ 就是为了
+	// 让读文件的人不必去猜：分组成员通过 userExport.group_name 与
+	// accessKeyExport.group_name 按组名关联。
+	UserGroups []userGroupExport `json:"user_groups,omitempty"`
+	// Users 是账号清单（含口令哈希与余额）。
+	Users []userExport `json:"users,omitempty"`
+	// AccessKeys 是访问密钥（含明文 sk-gw-... 密钥）。
+	AccessKeys []accessKeyExport `json:"access_keys,omitempty"`
+	// Routes 是路由与它们的故障转移链。
+	Routes []routeExport `json:"routes,omitempty"`
+}
+
+// userGroupExport 是一个用户可见性分组及其模型白名单。
+//
+// 白名单为空 = 该组不限制模型（与库里语义一致，见 store.Group 的注释）。
+// 这条「空即不限制」必须原样保留：导入时把空名单当成「看不见任何模型」
+// 会让整组人突然失去全部权限。
+// @ts-type ConfigExportUserGroup
+type userGroupExport struct {
+	Name        string   `json:"name"`
+	Description string   `json:"description,omitempty"`
+	Models      []string `json:"models,omitempty"`
+}
+
+// userExport 是一个账号。
+//
+// # 为什么连口令哈希一起导
+//
+// 迁移的目标是「换个部署继续用」，而让所有用户重置口令会把一次搬家变成
+// 一次停服。password_hash 是自描述的 PBKDF2 串（算法与参数都写在串里），
+// 换台机器照样能校验。文件本身强制口令加密，所以它没有比数据库更裸。
+//
+// # 余额用指针
+//
+// NULL 与 0 在余额语义下是两种**不同**的状态：NULL = 不限额（放行），
+// 0 = 一分钱都没有（402）。用 *int64 让 JSON 能表达 null，避免把
+// 「不限额」导成「欠费」。见 store.User.BalanceCents 的注释。
+// @ts-type ConfigExportUser
+type userExport struct {
+	Username    string `json:"username"`
+	DisplayName string `json:"display_name,omitempty"`
+	// PasswordHash 空串 = 该账号还没设过密码（只能由管理员签发一次性设密链接）。
+	PasswordHash string `json:"password_hash,omitempty"`
+	Role         string `json:"role,omitempty"`
+	Status       string `json:"status,omitempty"`
+	// QuotaTokens 0 = 不限额（与余额相反，见 store.User 的注释）。
+	QuotaTokens int64 `json:"quota_tokens,omitempty"`
+	// UsedTokens 是运行时累计用量。导出它是因为配额判定看的是 used 而不是
+	// quota：不带上就等于把「已用 99% 配额」的账号在新库里重置成「一分没用」。
+	UsedTokens int64 `json:"used_tokens,omitempty"`
+	// BalanceCents：null = 不限额，数字 = 余额（单位分）。
+	BalanceCents *int64 `json:"balance_cents"`
+	Remark       string `json:"remark,omitempty"`
+	// GroupName 是该用户所属的用户分组（名字，不是 id）。
+	GroupName string `json:"group_name,omitempty"`
+}
+
+// accessKeyExport 是一把访问密钥。
+//
+// # 为什么带明文
+//
+// 密钥的哈希只能用来校验，不能用来重建 —— 迁移到新库时若只有哈希，
+// 这把 key 就永久失效了（调用方手里的字符串再也对不上任何记录）。
+// 所以导出明文，导入时重新算哈希与前缀。这与凭据导出带明文同源：
+// 文件已强制口令加密，拿到文件不等于拿到明文。
+//
+// 库里「可回读」上线之前创建的老密钥没有密文，那时导出侧会跳过并告警 ——
+// 那种 key 的明文谁都没有，只能让调用方换一把。
+// @ts-type ConfigExportAccessKey
+type accessKeyExport struct {
+	// Key 是完整明文 sk-gw-... 密钥。
+	Key  string `json:"key"`
+	Name string `json:"name"`
+	// User 是归属用户名。空 = 无归属 —— 而无归属的 key 在鉴权时一律 401，
+	// 所以导入侧会跳过并告警，而不是静默建出一把永远用不了的 key。
+	User          string   `json:"user,omitempty"`
+	Enabled       *bool    `json:"enabled"`
+	QuotaTokens   int64    `json:"quota_tokens,omitempty"`
+	RPMLimit      int      `json:"rpm_limit,omitempty"`
+	TPMLimit      int      `json:"tpm_limit,omitempty"`
+	AllowedModels []string `json:"allowed_models,omitempty"`
+	// ExpiresAt 0 = 永不过期（毫秒时间戳）。
+	ExpiresAt int64 `json:"expires_at,omitempty"`
+	// AllowedIPs 是原文（逗号分隔的 CIDR / 单 IP），空 = 不限制。
+	AllowedIPs string `json:"allowed_ips,omitempty"`
+	// GroupName 是 key 级分组覆盖，空 = 沿用归属用户的分组。
+	GroupName string `json:"group_name,omitempty"`
+}
+
+// routeExport 是一条路由及其故障转移链。
+//
+// # 为什么现在敢导路由了
+//
+// v3 时代刻意不导：公开名是**调用方看到的契约**，跨环境照抄会撞名。但撞名
+// 是可以检测的 —— 导入侧遇到已存在的公开名就跳过并告警（不像 provider slug
+// 那样加后缀改名，因为改名等于悄悄改掉客户端要调的名字）。能检测的风险
+// 不该以「永远无法搬路由」为代价。
+//
+// 链目标用 provider_slug + model_id 引用，导入时解析成本库的 id；任一个
+// 解析不到就整条路由跳过 —— 半条链比没有链更难排查。
+// @ts-type ConfigExportRoute
+type routeExport struct {
+	PublicName      string              `json:"public_name"`
+	Enabled         bool                `json:"enabled"`
+	FailoverEnabled bool                `json:"failover_enabled"`
+	Targets         []routeTargetExport `json:"targets,omitempty"`
+}
+
+// routeTargetExport 是链上的一个目标。
+// @ts-type ConfigExportRouteTarget
+type routeTargetExport struct {
+	ProviderSlug string `json:"provider_slug"`
+	ModelID      string `json:"model_id"`
+	Enabled      bool   `json:"enabled"`
 }
 
 // networkExport 是一条出站网络（代理配置）。只带名字与地址。
@@ -159,6 +285,10 @@ func sealExport(body configExport, passphrase string) (configExport, error) {
 		Models:      body.Models,
 		ModelGroups: body.ModelGroups,
 		Networks:    body.Networks,
+		UserGroups:  body.UserGroups,
+		Users:       body.Users,
+		AccessKeys:  body.AccessKeys,
+		Routes:      body.Routes,
 	}
 	raw, err := json.Marshal(inner)
 	if err != nil {

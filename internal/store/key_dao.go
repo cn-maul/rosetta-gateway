@@ -298,12 +298,24 @@ func (s *Store) ListAccessKeysByUser(ctx context.Context, userID string) ([]Acce
 }
 
 func (s *Store) CreateAccessKey(ctx context.Context, k *AccessKey) error {
+	return createAccessKey(ctx, s.db, k)
+}
+
+// CreateAccessKeyTx 在调用方的事务里插入访问密钥（配置导入用：密钥与它的
+// 归属用户必须在同一笔提交里 —— 用户建好而密钥没建，等于导进来的账号
+// 没有可用的凭证；反过来密钥没有归属用户则一律 401）。
+func (s *Store) CreateAccessKeyTx(ctx context.Context, tx Tx, k *AccessKey) error {
+	return createAccessKey(ctx, tx, k)
+}
+
+// createAccessKey 接受 execer，让同一份 SQL 既能在自动提交下跑也能进事务。
+func createAccessKey(ctx context.Context, ex execer, k *AccessKey) error {
 	now := time.Now().UnixMilli()
 	enabled := 0
 	if k.Enabled {
 		enabled = 1
 	}
-	_, err := s.db.ExecContext(ctx,
+	_, err := ex.ExecContext(ctx,
 		`INSERT INTO access_keys (id, key_hash, key_prefix, key_enc, name, enabled, quota_tokens, user_id, rpm_limit, tpm_limit, allowed_models_json, expires_at, allowed_ips, group_id, created_at)
 		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		k.ID, k.KeyHash, k.KeyPrefix, nullableBytes(k.KeyEnc), k.Name, enabled, k.QuotaTokens, nullIfEmpty(k.UserID),

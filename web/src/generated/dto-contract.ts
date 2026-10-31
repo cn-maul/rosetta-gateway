@@ -7,6 +7,19 @@ export interface DTOFieldContract {
 }
 
 export const DTO_CONTRACTS: readonly DTOFieldContract[] = [
+  { goType: "internal/admin.accessKeyExport", tsType: "ConfigExportAccessKey", fields: [
+    "key",
+    "name",
+    "user",
+    "enabled",
+    "quota_tokens",
+    "rpm_limit",
+    "tpm_limit",
+    "allowed_models",
+    "expires_at",
+    "allowed_ips",
+    "group_name",
+  ] },
   { goType: "internal/admin.apiErrorDetail", tsType: "ApiError", fields: [
     "message",
     "type",
@@ -40,6 +53,10 @@ export const DTO_CONTRACTS: readonly DTOFieldContract[] = [
     "models",
     "model_groups",
     "networks",
+    "user_groups",
+    "users",
+    "access_keys",
+    "routes",
   ] },
   { goType: "internal/admin.credentialExport", tsType: "ConfigExportCredential", fields: [
     "provider_slug",
@@ -83,6 +100,13 @@ export const DTO_CONTRACTS: readonly DTOFieldContract[] = [
     "models_skipped",
     "credentials_added",
     "credentials_skipped",
+    "user_groups_created",
+    "users_created",
+    "users_skipped",
+    "access_keys_created",
+    "access_keys_skipped",
+    "routes_created",
+    "routes_skipped",
     "warnings",
     "notes",
   ] },
@@ -363,6 +387,12 @@ export const DTO_CONTRACTS: readonly DTOFieldContract[] = [
     "models",
     "generated_at",
   ] },
+  { goType: "internal/admin.routeExport", tsType: "ConfigExportRoute", fields: [
+    "public_name",
+    "enabled",
+    "failover_enabled",
+    "targets",
+  ] },
   { goType: "internal/admin.routeResponse", tsType: "Route", fields: [
     "id",
     "public_name",
@@ -371,6 +401,11 @@ export const DTO_CONTRACTS: readonly DTOFieldContract[] = [
     "enabled",
     "created_at",
     "failover_enabled",
+  ] },
+  { goType: "internal/admin.routeTargetExport", tsType: "ConfigExportRouteTarget", fields: [
+    "provider_slug",
+    "model_id",
+    "enabled",
   ] },
   { goType: "internal/admin.routeTargetInput", tsType: "RouteTargetInput", fields: [
     "provider_id",
@@ -529,6 +564,23 @@ export const DTO_CONTRACTS: readonly DTOFieldContract[] = [
     "count",
     "tokens",
     "cost",
+  ] },
+  { goType: "internal/admin.userExport", tsType: "ConfigExportUser", fields: [
+    "username",
+    "display_name",
+    "password_hash",
+    "role",
+    "status",
+    "quota_tokens",
+    "used_tokens",
+    "balance_cents",
+    "remark",
+    "group_name",
+  ] },
+  { goType: "internal/admin.userGroupExport", tsType: "ConfigExportUserGroup", fields: [
+    "name",
+    "description",
+    "models",
   ] },
   { goType: "internal/admin.userResponse", tsType: "User", fields: [
     "id",

@@ -220,6 +220,17 @@ func (s *Store) FindUninitializedAdmin(ctx context.Context) (*User, error) {
 // Unlimited=true 落 NULL（不限额），否则落整数分。NULL 与 0 是两种业务
 // 状态：「不限额」与「余额为零」，不可合并。
 func (s *Store) CreateUser(ctx context.Context, u *User) error {
+	return createUser(ctx, s.db, u)
+}
+
+// CreateUserTx 在调用方的事务里插入用户（配置导入用：用户与他的访问密钥
+// 必须在同一笔提交里，否则「用户建好了、密钥没建」会留一个登不进去的空壳）。
+func (s *Store) CreateUserTx(ctx context.Context, tx Tx, u *User) error {
+	return createUser(ctx, tx, u)
+}
+
+// createUser 接受 execer，让同一份 SQL 既能在自动提交下跑也能进事务。
+func createUser(ctx context.Context, ex execer, u *User) error {
 	now := time.Now().UnixMilli()
 	u.Username = CanonicalUsername(u.Username)
 	if u.CreatedAt == 0 {
@@ -235,7 +246,7 @@ func (s *Store) CreateUser(ctx context.Context, u *User) error {
 	if u.AuthVersion == 0 {
 		u.AuthVersion = 1
 	}
-	_, err := s.db.ExecContext(ctx,
+	_, err := ex.ExecContext(ctx,
 		`INSERT INTO users (id, username, display_name, password_hash, role, status,
 		                    group_id, quota_tokens, used_tokens, auth_version, remark,
 		                    created_at, updated_at, last_login_at, balance_cents, balance_remainder)

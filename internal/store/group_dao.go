@@ -80,12 +80,24 @@ func (s *Store) GetGroup(ctx context.Context, id string) (*Group, error) {
 // CreateGroup 插入一个组。名称冲突由唯一约束报出，
 // 调用方用 IsUniqueViolation(err) 区分「重名」与「其他故障」。
 func (s *Store) CreateGroup(ctx context.Context, g *Group) error {
+	return createGroup(ctx, s.db, g)
+}
+
+// CreateGroupTx 在调用方的事务里插入分组（配置导入用：分组与它的模型白名单
+// 必须在同一笔提交里，否则会留下「组建好了、白名单没写」的空组 —— 而空
+// 白名单的语义是「不限制」，等于静默把权限放宽）。
+func (s *Store) CreateGroupTx(ctx context.Context, tx Tx, g *Group) error {
+	return createGroup(ctx, tx, g)
+}
+
+// createGroup 接受 execer，让同一份 SQL 既能在自动提交下跑也能进事务。
+func createGroup(ctx context.Context, ex execer, g *Group) error {
 	now := time.Now().UnixMilli()
 	if g.CreatedAt == 0 {
 		g.CreatedAt = now
 	}
 	g.UpdatedAt = now
-	_, err := s.db.ExecContext(ctx,
+	_, err := ex.ExecContext(ctx,
 		`INSERT INTO groups (id, name, description, created_at, updated_at) VALUES (?, ?, ?, ?, ?)`,
 		g.ID, g.Name, g.Description, g.CreatedAt, g.UpdatedAt)
 	return err
@@ -262,18 +274,35 @@ func (s *Store) ListGroupModelsByGroup(ctx context.Context, groupID string) ([]s
 // 传空切片 = 清空白名单 = 该组不限制模型（不是「什么都看不到」，
 // 语义见 Group 的注释）。
 func (s *Store) ReplaceGroupModels(ctx context.Context, groupID string, models []string) error {
-	normalized := NormalizeModelNames(models)
-
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
 	}
 	defer tx.Rollback()
 
+	if err := replaceGroupModels(ctx, tx, groupID, models); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+// ReplaceGroupModelsTx 在调用方的事务里整体替换白名单。
+//
+// 配置导入必须走这条：分组与白名单分两笔提交时，「组已建、白名单没写」
+// 会留一个空白名单的组 —— 而空白名单的语义是**不限制**，即静默放权。
+func (s *Store) ReplaceGroupModelsTx(ctx context.Context, tx Tx, groupID string, models []string) error {
+	return replaceGroupModels(ctx, tx, groupID, models)
+}
+
+// replaceGroupModels 接受 execer：先删后插必须在同一笔事务里，否则中间
+// 失败会留下一个白名单被清空的组（同样是把权限放宽）。
+func replaceGroupModels(ctx context.Context, ex execer, groupID string, models []string) error {
+	normalized := NormalizeModelNames(models)
+
 	// 显式校验组存在：models 为空时下面一句 INSERT 都不执行，
 	// 光靠外键兜不住「给一个不存在的组设空白名单」—— 那会静默成功。
 	var exists int
-	if err := tx.QueryRowContext(ctx,
+	if err := ex.QueryRowContext(ctx,
 		`SELECT COUNT(*) FROM groups WHERE id = ?`, groupID).Scan(&exists); err != nil {
 		return err
 	}
@@ -281,18 +310,18 @@ func (s *Store) ReplaceGroupModels(ctx context.Context, groupID string, models [
 		return ErrNotFound
 	}
 
-	if _, err := tx.ExecContext(ctx,
+	if _, err := ex.ExecContext(ctx,
 		`DELETE FROM user_group_models WHERE group_id = ?`, groupID); err != nil {
 		return err
 	}
 	for _, m := range normalized {
-		if _, err := tx.ExecContext(ctx,
+		if _, err := ex.ExecContext(ctx,
 			`INSERT INTO user_group_models (group_id, public_model) VALUES (?, ?)`,
 			groupID, m); err != nil {
 			return err
 		}
 	}
-	return tx.Commit()
+	return nil
 }
 
 // NormalizeModelNames 去空白、丢空串、去重、排序。

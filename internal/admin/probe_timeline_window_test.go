@@ -90,8 +90,10 @@ func TestProbeTimeline_DayGranularityWindowExcludesOlderDays(t *testing.T) {
 	y := time.Now().AddDate(0, 0, -1)
 	yesterdayLate := time.Date(y.Year(), y.Month(), y.Day(), 23, 30, 0, 0, time.Local)
 	seedProbeAt(t, st, "up/flash", yesterdayLate.UnixMilli(), true)
-	todayNoon := time.Date(time.Now().Year(), time.Now().Month(), time.Now().Day(), 12, 0, 0, 0, time.Local)
-	seedProbeAt(t, st, "up/flash", todayNoon.UnixMilli(), true)
+	// 「今天」的那条取当前时刻，而不是固定 12:00：上午跑测试时 12:00 还在未来，
+	// 窗口上界是 now，未来那条会被正确排除、用例自己就红了（本条曾在
+	// 2026-11-01 03:32 因为这一点假红过一次）。now 恒在本日且不晚于窗口上界。
+	seedProbeAt(t, st, "up/flash", time.Now().UnixMilli(), true)
 
 	h := NewProbeHandler(st, nil)
 	code, buckets := fetchTimeline(t, h, asAdmin(httptest.NewRequest(http.MethodGet,

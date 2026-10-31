@@ -720,11 +720,14 @@ export function Settings() {
               <SectionCard title="导出">
                 <div className="flex flex-col gap-4">
                   <p className="text-muted text-xs leading-relaxed">
-                    导出当前全部供应商、模型、它们的参数（超时、重试、协议、端点、价格）
-                    以及<b>上游 API Key</b>。文件用口令整体加密，产物是 <code>.json.enc</code> ——
-                    不设口令无法导出。
-                    <b>不含路由与下游访问密钥</b>：路由的公开名是给调用方看的契约，
-                    跨环境照抄容易撞名；下游密钥属于本库的身份体系，不随文件走。
+                    导出当前<b>全部配置</b>：供应商与凭据（含上游 API Key）、模型与模型组、
+                    代理网络、<b>用户与余额</b>、<b>用户分组</b>、<b>访问密钥</b>（含明文）、
+                    <b>路由与故障转移链</b>。文件用口令整体加密，产物是 <code>.json.enc</code>
+                    —— 不设口令无法导出。
+                  </p>
+                  <p className="text-warning text-xs leading-relaxed">
+                    这份文件等同于整个网关的钥匙：拿到它就能用全部上游额度、用全部下游密钥调用。
+                    口令请与你分开发的渠道传递，文件不要留在聊天记录或公共网盘里。
                   </p>
                   <TextField aria-label="加密口令（必填，至少 8 位）" value={exportPass} onChange={setExportPass}>
                     <Label>加密口令（必填，至少 8 位）</Label>
@@ -799,6 +802,9 @@ export function Settings() {
                       文件内容：{importParsed.providers?.length ?? 0} 个供应商、
                       {importParsed.models?.length ?? 0} 个模型、
                       {importParsed.credentials?.length ?? 0} 条凭据
+                      {importParsed.users?.length ? `、${importParsed.users.length} 个用户` : ''}
+                      {importParsed.access_keys?.length ? `、${importParsed.access_keys.length} 条访问密钥` : ''}
+                      {importParsed.routes?.length ? `、${importParsed.routes.length} 条路由` : ''}
                       {importParsed.version !== 1 ? (
                         <span className="text-warning">（文件版本 {importParsed.version}，可能来自更新的网关）</span>
                       ) : null}
@@ -826,6 +832,41 @@ export function Settings() {
                         {importPreview.models_skipped ? (
                           <li>
                             跳过已存在的模型 <b>{importPreview.models_skipped}</b>
+                          </li>
+                        ) : null}
+                        {importPreview.user_groups_created ? (
+                          <li>
+                            新增用户分组 <b>{importPreview.user_groups_created}</b>
+                          </li>
+                        ) : null}
+                        {importPreview.users_created ? (
+                          <li>
+                            新增用户 <b>{importPreview.users_created}</b>
+                          </li>
+                        ) : null}
+                        {importPreview.users_skipped ? (
+                          <li>
+                            跳过已存在的用户 <b>{importPreview.users_skipped}</b>
+                          </li>
+                        ) : null}
+                        {importPreview.access_keys_created ? (
+                          <li>
+                            新增访问密钥 <b>{importPreview.access_keys_created}</b>
+                          </li>
+                        ) : null}
+                        {importPreview.access_keys_skipped ? (
+                          <li>
+                            跳过已存在的访问密钥 <b>{importPreview.access_keys_skipped}</b>
+                          </li>
+                        ) : null}
+                        {importPreview.routes_created ? (
+                          <li>
+                            新增路由 <b>{importPreview.routes_created}</b>
+                          </li>
+                        ) : null}
+                        {importPreview.routes_skipped ? (
+                          <li>
+                            跳过已存在的路由 <b>{importPreview.routes_skipped}</b>
                           </li>
                         ) : null}
                       </ul>

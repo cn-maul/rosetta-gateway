@@ -1177,6 +1177,14 @@ export interface ConfigExportFile {
   models?: ConfigExportModel[]
   model_groups?: ConfigExportModelGroup[]
   networks?: ConfigExportNetwork[]
+  /** v4 新增：用户分组（白名单为空 = 不限制）。 */
+  user_groups?: ConfigExportUserGroup[]
+  /** v4 新增：用户，含口令哈希与余额。 */
+  users?: ConfigExportUser[]
+  /** v4 新增：访问密钥，含**明文**密钥。 */
+  access_keys?: ConfigExportAccessKey[]
+  /** v4 新增：路由与故障转移链。 */
+  routes?: ConfigExportRoute[]
 }
 
 export interface ConfigExportProvider {
@@ -1237,8 +1245,76 @@ export interface ConfigImportResult {
   models_skipped: number
   credentials_added: number
   credentials_skipped: number
+  /** v4 新增：下面四段各自计数，因为冲突语义不同（见后端 importResponse 注释）。 */
+  user_groups_created: number
+  users_created: number
+  users_skipped: number
+  access_keys_created: number
+  access_keys_skipped: number
+  routes_created: number
+  routes_skipped: number
   warnings?: string[]
   notes?: string[]
+}
+
+/**
+ * v4 导入导出：用户分组。白名单为空 = **不限制**（不是全拒），
+ * 所以导入侧只在文件确实带了成员时才写。
+ */
+export interface ConfigExportUserGroup {
+  name: string
+  description?: string
+  models?: string[]
+}
+
+/**
+ * v4 导入导出：用户。`balance_cents` 缺省 = **不限额**（库里落 NULL），
+ * 与 0（余额耗尽）是两种不同的状态，不能合并。
+ */
+export interface ConfigExportUser {
+  username: string
+  display_name?: string
+  /** PBKDF2 自描述串（算法与迭代数写在串里），跨机可直接校验。 */
+  password_hash?: string
+  role?: string
+  status?: string
+  quota_tokens?: number
+  used_tokens?: number
+  balance_cents?: number
+  remark?: string
+  group_name?: string
+}
+
+/**
+ * v4 导入导出：访问密钥。带**明文**是因为库里只存 sha256 与密文，
+ * 迁移后只有哈希等于把密钥永久作废。
+ */
+export interface ConfigExportAccessKey {
+  key: string
+  name: string
+  user?: string
+  enabled?: boolean
+  quota_tokens?: number
+  rpm_limit?: number
+  tpm_limit?: number
+  allowed_models?: string[]
+  expires_at?: number
+  allowed_ips?: string
+  group_name?: string
+}
+
+/** v4 导入导出：路由。公开名撞名时**跳过不改名**（那是调用方代码里的地址）。 */
+export interface ConfigExportRoute {
+  public_name: string
+  enabled: boolean
+  failover_enabled: boolean
+  targets?: ConfigExportRouteTarget[]
+}
+
+export interface ConfigExportRouteTarget {
+  provider_slug: string
+  model_id: string
+  enabled: boolean
 }
 
 // Admin route catalog: provider selection needs no endpoint or credentials.
