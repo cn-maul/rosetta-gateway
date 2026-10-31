@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"time"
 )
 
@@ -130,6 +131,83 @@ func (s *Store) SetModelGroup(ctx context.Context, modelID, groupID string) erro
 	res, err := s.db.ExecContext(ctx,
 		`UPDATE upstream_models SET group_id = ? WHERE id = ?`, nilGroup, modelID)
 	return checkAffected(res, err)
+}
+
+// AssignModelsToGroup 在**单个事务**里把一批模型指派到同一个组（空 groupID =
+// 移出组），返回实际更新的行数。
+//
+// # 为什么必须是事务
+//
+// 旧实现是 handler 里逐条 SetModelGroup，每条 UPDATE 独立自动提交。而
+// handler 的文档与注释都宣称「全部校验后才逐条写，任一 id 不存在则整笔拒绝」
+// —— 那只是**校验**阶段成立，写入阶段一旦中途失败（SQLITE_BUSY、另一个
+// 请求刚好删掉了某个模型、组被删掉触发 FK），前 N-1 条已经永久落库，接口
+// 却回 500。运维看到报错重试，此时模型已被指派了一半，重试会「成功」并把
+// 剩下的一半补上 —— 表面上一切正常，实际上是两次不同的写入拼出来的结果。
+//
+// 上限 500 个模型，单事务完全撑得住；同仓 ImportUpstreamModels 与配置导入
+// 都是这个形态。
+func (s *Store) AssignModelsToGroup(ctx context.Context, modelIDs []string, groupID string) (int, error) {
+	if len(modelIDs) == 0 {
+		return 0, nil
+	}
+	nilGroup := any(nil)
+	if groupID != "" {
+		nilGroup = groupID
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return 0, err
+	}
+	defer tx.Rollback()
+
+	assigned := 0
+	for _, mid := range modelIDs {
+		// 行数为 0 说明「校验通过之后模型被删了」——整笔回滚，不留半套。
+		if err := checkAffected(tx.ExecContext(ctx,
+			`UPDATE upstream_models SET group_id = ? WHERE id = ?`, nilGroup, mid)); err != nil {
+			return 0, err
+		}
+		assigned++
+	}
+	if err := tx.Commit(); err != nil {
+		return 0, err
+	}
+	return assigned, nil
+}
+
+// UnassignModelsFromGroup 在单个事务里把一批模型移出归组，返回实际更新的
+// 行数。**跳过**不存在的模型（移出组对「模型已被删」无害，不该整笔拒绝）。
+//
+// 仍然用事务：虽然移出是可重放的单调操作，但半途失败会留下「一部分移出了、
+// 一部分还在组里」的中间态，而接口回 500 —— 调用方要么看到错误、要么看到
+// 一个数字，两种都不该对应半个结果。
+func (s *Store) UnassignModelsFromGroup(ctx context.Context, modelIDs []string) (int, error) {
+	if len(modelIDs) == 0 {
+		return 0, nil
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return 0, err
+	}
+	defer tx.Rollback()
+
+	unassigned := 0
+	for _, mid := range modelIDs {
+		err := checkAffected(tx.ExecContext(ctx,
+			`UPDATE upstream_models SET group_id = NULL WHERE id = ?`, mid))
+		if errors.Is(err, ErrNotFound) {
+			continue
+		}
+		if err != nil {
+			return 0, err
+		}
+		unassigned++
+	}
+	if err := tx.Commit(); err != nil {
+		return 0, err
+	}
+	return unassigned, nil
 }
 
 // ListModelsInGroup 列出组内全部模型（管理页展示组成员用）。

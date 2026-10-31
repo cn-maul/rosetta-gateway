@@ -137,3 +137,86 @@ func TestModelGroup_GroupNamesByModel(t *testing.T) {
 		t.Fatalf("未归组模型不应出现在映射里: %v", names)
 	}
 }
+
+// TestAssignModelsToGroup_AtomicRollback 钉住批量指派的**整笔语义**。
+//
+// 旧实现是 handler 里逐条 SetModelGroup，每条 UPDATE 独立自动提交：
+// 第 N 条失败时前 N-1 条已永久落库，而接口回 500 —— 运维看到报错重试，
+// 第二次「成功」把剩下的补上，表面上一切正常，实际是两次不同写入拼出来的
+// 结果。这里用「第二个 id 不存在」制造写入中途失败，断言第一个模型**没有**
+// 被指派（整笔回滚），并且返回的是可判定的 ErrNotFound 而不是英文 FK 原文。
+func TestAssignModelsToGroup_AtomicRollback(t *testing.T) {
+	st := testStore(t, t.TempDir()+"/g.db")
+	ctx := context.Background()
+	seedProvider(t, st, "p1")
+	for _, id := range []string{"m1", "m2"} {
+		if err := st.CreateUpstreamModel(ctx, &UpstreamModel{
+			ID: id, ProviderID: "p1", ModelID: id,
+		}); err != nil {
+			t.Fatalf("model %s: %v", id, err)
+		}
+	}
+	seedGroup(t, st, "g1", "G1")
+
+	// 正常批量指派：两个都进去。
+	n, err := st.AssignModelsToGroup(ctx, []string{"m1", "m2"}, "g1")
+	if err != nil {
+		t.Fatalf("assign: %v", err)
+	}
+	if n != 2 {
+		t.Fatalf("assigned = %d, want 2", n)
+	}
+	for _, id := range []string{"m1", "m2"} {
+		m, _ := st.GetUpstreamModel(ctx, id)
+		if m.GroupID != "g1" {
+			t.Fatalf("%s group_id = %q, want g1", id, m.GroupID)
+		}
+	}
+
+	// 先全部移出，再制造「第二个 id 不存在」的中途失败。
+	if _, err := st.UnassignModelsFromGroup(ctx, []string{"m1", "m2"}); err != nil {
+		t.Fatalf("unassign: %v", err)
+	}
+	_, err = st.AssignModelsToGroup(ctx, []string{"m1", "ghost"}, "g1")
+	if !errors.Is(err, ErrNotFound) {
+		t.Fatalf("err = %v, want ErrNotFound（不能把 SQLite 英文原文漏给运维）", err)
+	}
+	// 关键断言：m1 必须仍是未归组 —— 否则就是「半套指派」。
+	m, _ := st.GetUpstreamModel(ctx, "m1")
+	if m.GroupID != "" {
+		t.Fatalf("中途失败后 m1 group_id = %q，整笔必须回滚", m.GroupID)
+	}
+}
+
+// TestUnassignModelsFromGroup_SkipsMissing 移出组对「模型已被删」无害，
+// 不该整笔拒绝；但存在的模型仍要在同一个事务里被移出。
+func TestUnassignModelsFromGroup_SkipsMissing(t *testing.T) {
+	st := testStore(t, t.TempDir()+"/g.db")
+	ctx := context.Background()
+	seedProvider(t, st, "p1")
+	for _, id := range []string{"m1", "m2"} {
+		if err := st.CreateUpstreamModel(ctx, &UpstreamModel{
+			ID: id, ProviderID: "p1", ModelID: id,
+		}); err != nil {
+			t.Fatalf("model %s: %v", id, err)
+		}
+	}
+	seedGroup(t, st, "g1", "G1")
+	if _, err := st.AssignModelsToGroup(ctx, []string{"m1", "m2"}, "g1"); err != nil {
+		t.Fatalf("assign: %v", err)
+	}
+
+	n, err := st.UnassignModelsFromGroup(ctx, []string{"m1", "ghost"})
+	if err != nil {
+		t.Fatalf("unassign: %v", err)
+	}
+	if n != 1 {
+		t.Fatalf("unassigned = %d, want 1（ghost 不存在，跳过）", n)
+	}
+	if m, _ := st.GetUpstreamModel(ctx, "m1"); m.GroupID != "" {
+		t.Fatalf("m1 仍在组 %q", m.GroupID)
+	}
+	if m, _ := st.GetUpstreamModel(ctx, "m2"); m.GroupID != "g1" {
+		t.Fatalf("m2 不在本次名单里，不该被动到：%q", m.GroupID)
+	}
+}

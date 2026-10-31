@@ -226,13 +226,19 @@ func (h *ModelGroupHandler) AssignModels(w http.ResponseWriter, r *http.Request,
 		return
 	}
 
-	assigned := 0
-	for _, mid := range ids {
-		if err := h.store.SetModelGroup(r.Context(), mid, id); err != nil {
-			writeServerError(w, "assign model group", err)
+	// 写入放在**一个事务**里（store.AssignModelsToGroup）。逐条自动提交时，
+	// 中途任何失败都会留下「前一半已指派」的库状态，而接口回 500 —— 运维
+	// 看到报错重试，第二次「成功」把剩下的一半补上，表面上风平浪静，实际是
+	// 两次不同写入拼出来的结果。上面的 missing 校验只覆盖「校验那一刻」，
+	// 挡不住校验与写入之间被删掉的模型，所以回滚后要明确让人重试。
+	assigned, aerr := h.store.AssignModelsToGroup(r.Context(), ids, id)
+	if aerr != nil {
+		if errors.Is(aerr, store.ErrNotFound) {
+			writeError(w, http.StatusConflict, "指派过程中模型已被删除，整笔未写入，请刷新后重试")
 			return
 		}
-		assigned++
+		writeServerError(w, "assign model group", aerr)
+		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"assigned": assigned, "group_id": id})
 }
@@ -268,16 +274,10 @@ func (h *ModelGroupHandler) UnassignModels(w http.ResponseWriter, r *http.Reques
 	// 所以不预先校验存在性：SetModelGroup 命中 0 行时跳过即可。
 	// 整笔拒绝的立场只适用于「部分写入」危险的场景（改价/指派），
 	// 这里没有那种风险。
-	unassigned := 0
-	for _, mid := range ids {
-		if err := h.store.SetModelGroup(r.Context(), mid, ""); err != nil {
-			if errors.Is(err, store.ErrNotFound) {
-				continue
-			}
-			writeServerError(w, "unassign model group", err)
-			return
-		}
-		unassigned++
+	unassigned, uerr := h.store.UnassignModelsFromGroup(r.Context(), ids)
+	if uerr != nil {
+		writeServerError(w, "unassign model group", uerr)
+		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"unassigned": unassigned})
 }
