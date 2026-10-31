@@ -57,9 +57,10 @@ func (h *GroupHandler) toGroupResponse(id, name, desc string, createdAt int64, m
 // —— 所以本文件刻意**不**再显式调 reload：那会变成一次请求重建两遍。
 //
 // 这条依赖不是「碰巧如此」：`access_keys.enabled` / `rpm_limit` 等列早就
-// 靠同一条路径生效。但它确实是一条**隐式**依赖，所以由端到端脚本
-// （`.workbuddy/verify_multiuser.sh`）以真实 HTTP 覆盖「改白名单 → 立刻生效」，
-// 避免将来有人把分组路由挪出 adminAuto 而无人发现。
+// 靠同一条路径生效。但它确实是一条**隐式**依赖，所以由端到端脚本以真实
+// HTTP 覆盖「改白名单 → 立刻生效」（`internal/server/autoreload_test.go` 与
+// `internal/snapshot/rebuild_test.go` 守着这条路径），避免将来有人把分组
+// 路由挪出 adminAuto 而无人发现。
 type GroupHandler struct {
 	store *store.Store
 }

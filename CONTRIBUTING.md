@@ -98,7 +98,7 @@ node sync-embed.mjs     # 把产物同步进 internal/webui/dist（go:embed 的�
 CI 的 `webui-sync` job 会拦这个（重新构建一遍，与入库产物比对），
 但本地就绪不等于 tag 就绪。
 
-### 行尾：Windows 上编辑 `.vue` 极易引入 CRLF
+### 行尾：Windows 上编辑 `web/src` 里的 `.tsx` / `.ts` 极易引入 CRLF
 
 CRLF 会让产物 hash 与 CI 上算出的不一致，触发 webui-sync 红灯。
 改完前端用 `git diff --check` 确认没有 CRLF。
@@ -109,20 +109,14 @@ CRLF 会让产物 hash 与 CI 上算出的不一致，触发 webui-sync 红灯�
 
 ### TypeScript 钉在 6.x，不要升到 7.x
 
-TypeScript 7 是 Go 原生重写版（tsgo），**不再暴露 `typescript/lib/tsc`
-这个子路径**，而 `vue-tsc` 恰恰依赖它：
+`npm run typecheck` 走的是 `tsc --noEmit`（Vite 只负责转译，不做类型检查）。
+TypeScript 7 是 Go 原生重写版（tsgo），行为与 6.x 有差异，本项目没有做过迁移验证，
+升级会让 `typecheck` 与 CI 的 webui-sync job 结果不可预期。
 
-```text
-Error [ERR_PACKAGE_PATH_NOT_EXPORTED]: Package subpath './lib/tsc'
-  is not defined by "exports" in .../typescript/package.json
-```
+因此 `package.json` 用 `~6.0.3` 钉住。要升 7.x 请单独起一次迁移，不要跟着 npm 顺手升上去。
 
-这不是警告，是**工具链直接起不来**，`npm run typecheck` 与 CI 的
-webui-sync job 都会红。tsgo 没有内置替代品 —— 它是编译器，不解析
-`.vue` 单文件组件，那部分是 vue-tsc（Volar）的职责。
-
-因此 `package.json` 用 `~6.0.3` 钉住。将来 vue-tsc 官方支持 tsgo 之后
-再单独评估，不要跟着 npm 顺手升上去。
+> 历史注记：Vue 时代这里写的是「`vue-tsc` 依赖 `typescript/lib/tsc` 子路径」，
+> 2026-10 前端重写为 React 后已无 `vue-tsc`，该理由作废；现在钉版本只是因为未验证。
 
 ### Node 至少 22.12（Vite 8 的 engines 下限）
 

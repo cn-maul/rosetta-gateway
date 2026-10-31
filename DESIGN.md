@@ -1595,11 +1595,13 @@ Docker 侧对齐，且避开浏览器的保留端口表（6666 是 IRC 段，浏
 
 ### 13.2 页面清单
 
-实际路由以 `web/src/router.ts` 为准（2026-10-22 核实）。共有 **13 个可渲染页面
-组件**：登录、普通用户设密、总览、请求日志/用量统计、可用模型、钱包、API 密钥/
-用户与权限、上游服务、上游详情、模型与路由、代理、账号设置、系统设置。
-其中 6 条路由带 `meta.adminOnly`：`/users`、`/providers`、`/providers/:id`、
+实际路由以 `web/src/router.tsx` 为准（2026-11-01 按 React 版核实）。共有 **13 个可渲染
+页面组件**：登录、普通用户设密、总览、调用日志/用量统计、可用模型、钱包、API 密钥/
+用户与权限、供应商、供应商详情、路由、代理、账号设置、设置。
+其中 6 条路由要求管理员：`/users`、`/providers`、`/providers/:id`、
 `/routes`、`/networks`、`/settings`，未登录或非 admin 看不到也进不去。
+另有 4 条兼容重定向：`/profile`→`/wallet`、`/model-groups`→`/usage?tab=groups`、
+`/health`→`/models`、`*`→`/`。
 
 管理员侧栏 10 项（运行 3 项 + 网关配置 4 项 + 管理 3 项）；普通用户侧栏 5 项
 （我的总览 / 可用模型 / API 密钥 / 我的调用 / 余额与账单）。`/profile` 是
@@ -1688,7 +1690,7 @@ Docker 侧对齐，且避开浏览器的保留端口表（6666 是 IRC 段，浏
   `GET /admin/api/audit`。
 
   **消费方式（2026-10 决策）**：界面上**没有**审计入口 —— 「设置」页的审计
-  日志页签已按要求移除，`web/src/views/` 下无审计页面。这是运维取证的正路，
+  日志页签已按要求移除，`web/src/` 下也没有审计页面。这是运维取证的正路，
   所以后端端点与 `api.ts` 的 `api.audit()` 都保留，运维直接调 API 取证。
   配套地，`audit_log.actor` 恒为 `"admin"` 的不精确**刻意不修**：当前唯一消费
   方式是运维取证，单管理员场景下它不妨碍回答真正关心的问题（时间、端点、
@@ -1747,6 +1749,13 @@ rosetta-gateway/
 │   ├── check-repo-hygiene.ps1      push 前本地守卫：索引里不许有 exe/db/密钥/数据，
 │   │                               外加 .gitignore 防线自检（只读，不改任何文件）
 │   └── authz_probe/                鉴权矩阵取证（dbdump 与 probe.ps1）
+├── docs/                           过程记录（文档地图见 docs/README.md）
+│   ├── react-migration-handoff.md  前端现行交接单：现状、纪律、环境坑、验证命令
+│   ├── frontend-react-migration-plan.md  Vue→React 迁移总方案
+│   ├── frontend-ux-overhaul-plan.md 信息架构与性能整改（已实施）
+│   ├── api-audit-2026-10-31.md     管理面接口审计（13 条已修 + 判定不做项）
+│   ├── audit-2026-10-22.md         2026-10-20 全量审计与 10-21/22 修复复核
+│   └── audit-history.md            四轮审计索引（含已清理报告的取回方式）
 ├── .github/
 │   └── workflows/
 │       ├── ci.yml                  go / webui-sync / -race / repo-hygiene 四道门禁

@@ -38,7 +38,8 @@
   链路尝试的 `attempts[]`，用于区分网关、上游、网络/代理与下游接入问题。
 - **上游模型探测**：定时对每个上游模型发最小真实推理，得出连通率曲线，
   画在「可用模型」页的模型卡上（探测不扣网关用户的钱，也不写熔断状态）。
-- **Web 管理界面**：Vue 3 + Vite，产物经 `go:embed` 进二进制，无外部静态资源。
+- **Web 管理界面**：React 19 + Vite + HeroUI（2026-10 从 Vue 3 重写），产物经
+  `go:embed` 进二进制，无外部静态资源。
 
 ## 快速开始
 
@@ -171,6 +172,10 @@ OpenAI 系客户端；额度查询端点（`/dashboard/billing/*`、`/v1/organiz
 | [MULTIUSER.md](MULTIUSER.md) | ⚠️ **历史归档**（冻结于 2026-10-07）：多用户 / 分组 / 权限模型的设计记录。保留是因为代码与 DESIGN.md 中有多处注释以它的章节号为锚点（`§5.1` / `§4.3` / `§4.8` 等） |
 | [DOCKER.md](DOCKER.md) | 容器化部署：镜像、挂载、日志、升级、健康检查 |
 | [CONTRIBUTING.md](CONTRIBUTING.md) | 开发环境与协作约定：本机 `-race` 的 CC 陷阱、纯 Go 交叉编译、代理与 SSH、`sync-embed`、TS 版本上界、代码风格 |
+| [docs/README.md](docs/README.md) | **文档地图**：哪份有效、哪份只是历史，以及历史报告从 git 历史取回的方式 |
+
+前端（`web/`，React 19 + HeroUI）另有一组过程文档，入口是
+[docs/react-migration-handoff.md](docs/react-migration-handoff.md)（现状、纪律、环境坑、验证命令）。
 
 仓库里还有两个本机脚本（不进文档表格，Windows 开发用）：`build.ps1`
 （纯编译，产物 `bin\gateway.exe`）与 `gateway.ps1`（编译 + 启动/停止，

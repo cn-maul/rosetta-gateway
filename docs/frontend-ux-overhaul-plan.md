@@ -153,13 +153,19 @@
 
 **U1 首屏仪表盘已于 2026-10-31 按需求重写（`77dabd9`）**：用户明确「总览只看多少天内的七个指标 + 用量趋势表」，于是状态条 / 配置五卡 / 待办卡 / 最近请求 / 余额卡 / 柱状图全部从总览移除（各有专页）。保留的是区间选择 + 七指标（请求数 / Token / 成功率 / 缓存命中率 / TPS / 平均首字 / 首字之后的生成耗时）+ 按天趋势表（八列同口径）。为此后端先补了指标（`74e6006`）：`/stats` 加 `avg_gen_ms` + `gen_samples`（avg_ttfb + avg_gen ≈ 平均总耗时，刻意不合成一个数），`UsageSource` 两条来源支各加 `gen_ok_sum` / `n_gen_ok` 归一列，四个 by-* 每行补 `cached_tokens` / `cache_hit_rate` / `avg_gen_ms` / `n_gen`。上一版为此新增的 `Sparkline` / `RateRing` / `useInView` / `RecentRequests` 随本次重写一并删除（git 历史可查）。
 
-门禁基线（U1–U3 每批每步都跑）：`npm run typecheck` 0 错 · `node --test` **51/51**（新增
-`persistedPrefs` 5 条）· `npm run build` ok · `legacy-audit` 裸原语 0（白名单 2）/旧类名 0 ·
-`go test ./internal/webui/... -count=1` ok。另做了一次二进制冒烟：`build.ps1` 出的
+门禁基线（U1–U3 每批每步都跑；括号里是 2026-11-01 的最新值）：`npm run typecheck` 0 错 ·
+`node --test` 51/51（现 **98/98**，新增了 tableRoot / tabsChrome / dataTableEmpty / tokenCount /
+tokenFields / drawerLayout / effortChip / priceAndButtons / uiRequests 等门禁）· `npm run build` ok
+（入口现约 50.6 kB）· `legacy-audit --gate` 裸原语 0（白名单 2）/旧类名 0 · 
+`go test ./internal/webui/... -count=1` ok。另做过二进制冒烟：`build.ps1` 出的
 `bin/gateway.exe` 在临时目录起服务后 `/admin/` 200、入口 chunk 与懒加载 chunk（Overview /
 react / heroui）全部 200 且字节数与构建输出一致 —— 证明 embed 里的产物与源码同批。
 
-两项偏离原计划，记录在此：**①** §7 说的 `manualChunks` 在 Vite 8（Rolldown）里已废弃，
+四项偏离原计划，记录在此：**①** §7 说的 `manualChunks` 在 Vite 8（Rolldown）里已废弃，
 实际用 `build.rolldownOptions.output.codeSplitting.groups`；**②** 偏好前缀按实现改为
 `rosetta.pref.`（原文 `rosetta_gw_`），键按页面分域（`overview.range` / `history.days` /
-`usage.days` / `history.size` / `models.days` / `models.granularity`）。
+`usage.days` / `history.size` / `models.days` / `models.granularity`）；**③** §6 的
+`ui/Sparkline.tsx` / `ui/RateRing.tsx` / `ui/useInView.ts` 随 U1 首屏重写（`77dabd9`）删除，
+总览不再有迷你折线与圆环，KPI 只留数字与副行；**④** 状态条 / 配置五卡 / 待办卡 / 最近请求 /
+余额卡从总览移除后**没有**在别处重建 —— 各自信息本来就有专页（供应商、路由、密钥、账户与充值），
+总览因此只剩「区间 + 七指标 + 按天趋势表」。

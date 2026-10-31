@@ -1,6 +1,8 @@
 # 前端重构方案 v2：Vue 3 → React 19 + Tailwind v4 + HeroUI v3
 
-> 状态：草案 v2（按「彻底重建」重写） · 范围：`web/` 全量前端 · 后端 Go 与 API 契约不动
+> 状态：**已实施完毕并合入本地 `main`**（2026-11-01；正文的迁移过程记录保留原样，只在这里加状态行）。
+> 现行状态与继续方式看 [`react-migration-handoff.md`](react-migration-handoff.md)，文档地图见 [`README.md`](README.md)
+> · 范围：`web/` 全量前端 · 后端 Go 与 API 契约不动
 >
 > v1 的核心假设是「保住现有观感」，已被否决。v2 的目标是**用 HeroUI 的体系重建这套后台**：
 > 视觉以 HeroUI 默认体系为准，原有像素级观感不作为约束；每一块界面都换成语义上最合适的 HeroUI 组件；
