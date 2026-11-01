@@ -87,7 +87,7 @@ export const router = createHashRouter([
       {
         index: true,
         element: <Overview />,
-        handle: { title: '网关总览' },
+        handle: { title: '总览' },
         loader: authedLoader(false),
       },
       {

@@ -10,7 +10,6 @@ import {
   SelectPopover,
   SelectTrigger,
   SelectValue,
-  Table,
 } from '@heroui/react'
 import { api } from '../api'
 import { RequestGeneration } from '../asyncState'
@@ -20,7 +19,7 @@ import { oneOf, usePersistedState } from '../ui/usePersistedState'
 import type { Stats, UsageGroupEntry } from '../types'
 import { PageHeader } from '../ui/PageHeader'
 import { SectionCard } from '../ui/SectionCard'
-import { DataTable } from '../ui/DataTable'
+import { BarChart } from '../ui/BarChart'
 import { SkeletonBlock } from '../ui/SkeletonBlock'
 
 /**
@@ -151,15 +150,11 @@ export function Overview() {
     void loadTrend(rangeKey)
   }
 
-  // 趋势表按时间**倒序**（最新的在最上面）：看板的第一需求是「今天怎么样」；
-  // 后端给的是升序（绘图时最早一天在左）。
-  const rows = byDay ? [...byDay].sort((a, b) => (a.key < b.key ? 1 : a.key > b.key ? -1 : 0)) : null
-
   return (
     <>
       <PageHeader
-        title="网关总览"
-        sub={`${rangeLabel(rangeKey)}的调用量与性能，逐日明细见下方趋势表`}
+        title="总览"
+        sub={`${rangeLabel(rangeKey)}的调用量与性能，逐日走势见下方图表`}
         actions={
           <>
             <Select
@@ -212,68 +207,153 @@ export function Overview() {
       <div className="mt-4">
         <SectionCard
           title="用量趋势"
-          description={`${rangeLabel(rangeKey)} · 按本地日聚合；成功率 = 成功 / (成功 + 失败)，取消不计入`}
+          description={`${rangeLabel(rangeKey)} · 按本地日聚合，每根柱子是一天（越靠右越近）；成功率 = 成功 / (成功 + 失败)，取消不计入`}
         >
-          <DataTable
-            label="按天用量趋势"
-            loading={trendLoading}
-            error={trendErr}
-            hasData={!!rows && rows.length > 0}
-            onRetry={() => void loadTrend(rangeKey)}
-            empty={!!rows && rows.length === 0}
-            emptyText="所选区间内没有调用记录"
-            skeletonRows={6}
-            skeletonCols={8}
-          >
-            <Table aria-label="按天用量趋势">
-              <Table.ScrollContainer>
-                <Table.Content>
-                  <Table.Header>
-                    <Table.Column isRowHeader>日期</Table.Column>
-                    <Table.Column className="text-right">请求数</Table.Column>
-                    <Table.Column className="text-right">Token</Table.Column>
-                    <Table.Column className="text-right">成功率</Table.Column>
-                    <Table.Column className="text-right">缓存命中</Table.Column>
-                    <Table.Column className="text-right">TPS</Table.Column>
-                    <Table.Column className="text-right">首字</Table.Column>
-                    <Table.Column className="text-right">生成耗时</Table.Column>
-                  </Table.Header>
-                  <Table.Body>
-                    {(rows ?? []).map((r) => {
-                      const denom = r.ok + r.err
-                      return (
-                        <Table.Row key={r.key}>
-                          <Table.Cell>
-                            <span className="font-mono text-[12.5px]">{r.key}</span>
-                          </Table.Cell>
-                          <Table.Cell className="text-right tabular-nums">{fmtNum(r.count)}</Table.Cell>
-                          <Table.Cell className="text-right tabular-nums">{fmtTokens(r.tokens)}</Table.Cell>
-                          <Table.Cell className="text-right tabular-nums">
-                            {denom > 0 ? `${fmtPercent(r.ok / denom)}%` : '—'}
-                          </Table.Cell>
-                          <Table.Cell className="text-right tabular-nums">
-                            {r.cache_hit_rate > 0 ? `${fmtPercent(r.cache_hit_rate)}%` : '—'}
-                          </Table.Cell>
-                          <Table.Cell className="text-right tabular-nums">
-                            {r.tps > 0 ? fmtSpeed(r.tps) : '—'}
-                          </Table.Cell>
-                          <Table.Cell className="text-right tabular-nums">
-                            {r.n_ttfb > 0 ? `${fmtSec(r.avg_ttfb_ms)}s` : '—'}
-                          </Table.Cell>
-                          <Table.Cell className="text-right tabular-nums">
-                            {r.n_gen > 0 ? `${fmtSec(r.avg_gen_ms)}s` : '—'}
-                          </Table.Cell>
-                        </Table.Row>
-                      )
-                    })}
-                  </Table.Body>
-                </Table.Content>
-              </Table.ScrollContainer>
-            </Table>
-          </DataTable>
+          <TrendCharts byDay={byDay} loading={trendLoading} error={trendErr} onRetry={() => void loadTrend(rangeKey)} />
         </SectionCard>
       </div>
     </>
+  )
+}
+
+/**
+ * 七张小柱状图，与上面七张指标卡一一对应。
+ *
+ * 2026-11-01 按用户要求把原来的八列表格换成图表：「看趋势」这个动作要的是
+ * 一眼看出哪天塌了，而不是逐行读数字。表格能做的「精确查某天」，调用日志
+ * 页按天筛选已经覆盖。
+ *
+ * 每张图下方给「最新一天」的数字：图形回答形状，数字回答当下。
+ */
+function TrendCharts({
+  byDay,
+  loading,
+  error,
+  onRetry,
+}: {
+  byDay: UsageGroupEntry[] | null
+  loading: boolean
+  error: string
+  onRetry: () => void
+}) {
+  if (loading && !byDay) {
+    return (
+      <div className="grid grid-cols-1 gap-4 md:grid-cols-2 xl:grid-cols-3" role="status" aria-label="趋势加载中">
+        {Array.from({ length: 6 }, (_, i) => (
+          <div key={i} className="flex flex-col gap-2">
+            <SkeletonBlock className="h-3 w-20" />
+            <SkeletonBlock className="h-16 w-full" />
+          </div>
+        ))}
+      </div>
+    )
+  }
+  if (error && !byDay) {
+    return (
+      <Alert status="danger">
+        <Alert.Content>
+          <Alert.Title>{error}</Alert.Title>
+        </Alert.Content>
+        <Button size="sm" variant="tertiary" isDisabled={loading} onPress={onRetry}>
+          重试
+        </Button>
+      </Alert>
+    )
+  }
+  if (byDay && byDay.length === 0) {
+    return <div className="text-muted py-8 text-center text-[12.5px]">所选区间内没有调用记录</div>
+  }
+
+  // 后端给的是升序（最早在左），图形要的正是这个顺序；`latest` 取最后一根。
+  const rows = byDay ?? []
+  const latest = rows.length > 0 ? rows[rows.length - 1] : null
+  const rate = (r: UsageGroupEntry) => {
+    const denom = r.ok + r.err
+    return denom > 0 ? r.ok / denom : 0
+  }
+
+  return (
+    <>
+      {error ? (
+        <div className="text-warning mb-3 text-[12.5px]" role="status">
+          {error} · 下面是上次成功的结果
+        </div>
+      ) : null}
+      <div className="grid grid-cols-1 gap-5 md:grid-cols-2 xl:grid-cols-3">
+        <TrendCard
+          title="请求数"
+          latest={latest ? fmtNum(latest.count) : '—'}
+          points={rows.map((r) => ({ key: r.key, value: r.count }))}
+          format={(v) => fmtNum(v)}
+        />
+        <TrendCard
+          title="Token 用量"
+          latest={latest ? fmtTokens(latest.tokens) : '—'}
+          points={rows.map((r) => ({ key: r.key, value: r.tokens }))}
+          format={(v) => fmtTokens(v)}
+          toneClass="bg-accent"
+        />
+        <TrendCard
+          title="成功率"
+          latest={latest && latest.ok + latest.err > 0 ? `${fmtPercent(rate(latest))}%` : '—'}
+          points={rows.map((r) => ({ key: r.key, value: rate(r) }))}
+          format={(v) => `${fmtPercent(v)}%`}
+          toneClass="bg-success"
+        />
+        <TrendCard
+          title="缓存命中率"
+          latest={latest && latest.cache_hit_rate > 0 ? `${fmtPercent(latest.cache_hit_rate)}%` : '—'}
+          points={rows.map((r) => ({ key: r.key, value: r.cache_hit_rate }))}
+          format={(v) => `${fmtPercent(v)}%`}
+          toneClass="bg-success"
+        />
+        <TrendCard
+          title="输出速度（tok/s）"
+          latest={latest && latest.tps > 0 ? fmtSpeed(latest.tps) : '—'}
+          points={rows.map((r) => ({ key: r.key, value: r.tps }))}
+          format={(v) => fmtSpeed(v)}
+        />
+        <TrendCard
+          title="平均首字延迟"
+          latest={latest && latest.n_ttfb > 0 ? `${fmtSec(latest.avg_ttfb_ms)}s` : '—'}
+          points={rows.map((r) => ({ key: r.key, value: r.n_ttfb > 0 ? r.avg_ttfb_ms : 0 }))}
+          format={(v) => `${fmtSec(v)}s`}
+          toneClass="bg-warning"
+        />
+        <TrendCard
+          title="生成耗时（首字之后）"
+          latest={latest && latest.n_gen > 0 ? `${fmtSec(latest.avg_gen_ms)}s` : '—'}
+          points={rows.map((r) => ({ key: r.key, value: r.n_gen > 0 ? r.avg_gen_ms : 0 }))}
+          format={(v) => `${fmtSec(v)}s`}
+          toneClass="bg-warning"
+        />
+      </div>
+    </>
+  )
+}
+
+/** 一张趋势卡：标题 + 最新值 + 柱状图。 */
+function TrendCard({
+  title,
+  latest,
+  points,
+  format,
+  toneClass,
+}: {
+  title: string
+  latest: string
+  points: { key: string; value: number }[]
+  format: (value: number) => string
+  toneClass?: string
+}) {
+  return (
+    <div>
+      <div className="mb-1.5 flex items-baseline justify-between gap-2">
+        <span className="text-[12.5px] font-medium">{title}</span>
+        <span className="font-mono text-[12.5px] tabular-nums">{latest}</span>
+      </div>
+      <BarChart label={title} points={points} format={format} toneClass={toneClass} />
+    </div>
   )
 }
 

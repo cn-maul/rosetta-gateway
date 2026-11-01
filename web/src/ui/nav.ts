@@ -31,7 +31,7 @@ export const ADMIN_NAV: NavGroup[] = [
   {
     label: '常用',
     items: [
-      { to: '/', label: '网关总览', icon: LayoutDashboard },
+      { to: '/', label: '总览', icon: LayoutDashboard },
       { to: '/history', label: '调用日志', icon: FileText },
       { to: '/usage', label: '用量与费用', icon: ChartColumn },
       { to: '/keys', label: 'API 密钥', icon: KeyRound },
