@@ -24,7 +24,31 @@ type ErrorDetail struct {
 	Param   string `json:"param,omitempty"`
 }
 
+// MapUpstreamError 把一次上游错误映射成「回给客户端的」状态码/错误码/文案，
+// 顺带把上游原文留在服务端日志里。
+//
+// 会写日志 —— 只应在真正要把错误回给客户端的路径上调用。若只是想知道错误
+// 该归到哪一类（探测、统计、分类），用 UpstreamErrorCode：它不产生任何
+// 日志记录（见 mapUpstreamError 的 logging 参数说明）。
 func MapUpstreamError(err error) (int, string, string) {
+	return mapUpstreamError(err, true)
+}
+
+// UpstreamErrorCode 只做归类，**不写日志**。
+//
+// 为什么必须分开：探测路径（internal/probe）每轮对每个模型调一次归类，
+// 而 MapUpstreamError 的 400/404/529 分支会顺带 slog.Warn 一条
+// "upstream returned an error"。那条日志既没有 model 也没有 provider 字段
+// （MapUpstreamError 看不到它们），运维无法据此判断是哪个模型坏了 ——
+// 而探测失败本来就已经落进 model_probes.error_detail。结果是「每 10 分钟
+// 每坏一个模型就刷一条无法定位的 WARN」。归类是纯计算，不该有日志副作用。
+func UpstreamErrorCode(err error) (int, string, string) {
+	return mapUpstreamError(err, false)
+}
+
+// mapUpstreamError 是两者的公共实现。logging=false 时一个日志都不写
+// （包括 logUpstreamMalformed），返回值完全相同。
+func mapUpstreamError(err error, logging bool) (int, string, string) {
 	if err == nil {
 		return http.StatusOK, "", ""
 	}
@@ -59,7 +83,9 @@ func MapUpstreamError(err error) (int, string, string) {
 	// 客户端 SDK 也能据此重试到别处。日志里记原始错误便于定位，但不回显给客户端
 	// （响应文案是固定串，不含上游原文）。
 	if errors.Is(err, rosetta.ErrUpstreamMalformed) {
-		logUpstreamMalformed(err)
+		if logging {
+			logUpstreamMalformed(err)
+		}
 		return http.StatusBadGateway, "upstream_error", "upstream provider returned an unreadable response"
 	}
 
@@ -77,7 +103,9 @@ func MapUpstreamError(err error) (int, string, string) {
 			// 官方 SDK 对它做指数退避重试。压成 502 会让客户端退化成
 			// 「未知错误」而不重试 —— 而过载恰恰是最该重试的场景。
 			// 503 同理（Service Unavailable，也是可重试的过载信号）。
-			logAPIError(apiErr)
+			if logging {
+				logAPIError(apiErr)
+			}
 			return apiErr.StatusCode, "upstream_error", "upstream provider overloaded"
 		case apiErr.StatusCode >= 500:
 			return http.StatusBadGateway, "upstream_error", "upstream provider error"
@@ -85,17 +113,23 @@ func MapUpstreamError(err error) (int, string, string) {
 			// 不回显上游原文：上游错误 message 里常带内部 URL、账号标识，
 			// 有时还有对方的 prompt片段。且这些文本对下游定位自己的问题无用
 			// —— 该做的是对照网关的路由配置。把原文放进日志而不是响应体。
-			logAPIError(apiErr)
+			if logging {
+				logAPIError(apiErr)
+			}
 			return http.StatusBadRequest, "invalid_request_error", "upstream rejected the request"
 		case apiErr.StatusCode == http.StatusNotFound, apiErr.StatusCode == http.StatusGone:
 			// 上游说「没有这个模型 / 没有这个端点」。这是目标级的配置问题，
 			// 不是网关内部故障 —— 旧实现落到 default 分支，把上游那句
 			// "not found" 原样塞进 502 upstream_error 里，客户端看不出该去查
 			// 自己的 model 名还是该去查网关的 provider 配置。
-			logAPIError(apiErr)
+			if logging {
+				logAPIError(apiErr)
+			}
 			return http.StatusNotFound, "model_not_found", "upstream provider does not serve this model"
 		default:
-			logAPIError(apiErr)
+			if logging {
+				logAPIError(apiErr)
+			}
 			return http.StatusBadGateway, "upstream_error", "upstream provider error"
 		}
 	}
@@ -110,9 +144,33 @@ func MapUpstreamError(err error) (int, string, string) {
 }
 
 // logAPIError 把上游错误原文留在服务端日志里（响应体只给分类后的固定文案）。
+//
+// 字段口径：只记「能把这条错误定位到某个上游/某个请求」的标识。
+// 不记 URL —— 它含上游 endpoint（可能带 key 的 query），与「端点不外泄」
+// 同一条红线；RequestID 是上游自己发的关联号（OpenAI 的 x-request-id 一类），
+// 拿它去找对方客服对账是唯一有效的手段，必须留。
 func logAPIError(e *rosetta.APIError) {
-	slog.Warn("upstream returned an error",
-		"status", e.StatusCode, "type", e.Type, "message", e.Message)
+	attrs := []any{
+		"status", e.StatusCode,
+		"type", e.Type,
+		"message", e.Message,
+	}
+	if e.Code != "" {
+		attrs = append(attrs, "code", e.Code)
+	}
+	if e.Param != "" {
+		attrs = append(attrs, "param", e.Param)
+	}
+	if e.RequestID != "" {
+		attrs = append(attrs, "upstream_request_id", e.RequestID)
+	}
+	if e.InBand {
+		// 上游用 200 分块里的 error 事件报错（Anthropic 的 overloaded_error
+		// 就常这么来）。这个=true 时 status 字段显示的仍是 200，不标出来
+		// 会让排查的人以为「200 为什么会有 WARN」。
+		attrs = append(attrs, "in_band", true)
+	}
+	slog.Warn("upstream returned an error", attrs...)
 }
 
 // logUpstreamMalformed 记录「上游响应解不开」的原始错误。

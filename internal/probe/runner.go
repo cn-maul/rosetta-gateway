@@ -11,6 +11,7 @@ import (
 	"context"
 	"log/slog"
 	"math/rand"
+	"strings"
 	"sync"
 	"time"
 
@@ -138,6 +139,8 @@ func (r *Runner) runOnce(ctx context.Context) {
 
 	sem := make(chan struct{}, concurrency)
 	var wg sync.WaitGroup
+	outcomes := make([]probeOutcome, 0, len(models))
+	var mu sync.Mutex
 	for _, m := range models {
 		m := m
 		wg.Add(1)
@@ -162,10 +165,33 @@ func (r *Runner) runOnce(ctx context.Context) {
 				timer.Stop()
 				return
 			}
-			r.probeOne(ctx, m, timeout)
+			out := r.probeOne(ctx, m, timeout)
+			if out.skipped {
+				return
+			}
+			mu.Lock()
+			outcomes = append(outcomes, out)
+			mu.Unlock()
 		}()
 	}
 	wg.Wait()
+
+	// 一轮一条汇总，而不是每个失败各一条 WARN。
+	//
+	// 旧实现在这里没有汇总：失败只由 outwire 的日志副作用带出来，而那条
+	// 日志既没有模型名也没有供应商（映射函数看不到它们），运维看到的是
+	// 「每 10 分钟刷一条不知道是谁坏了」的 WARN。汇总把「这一轮几个坏了、
+	// 分别是哪几个」一次说清；单个模型的成败明细降 DEBUG（要细节的人
+	// 自己开 log_level=debug），失败原因仍逐条落在 model_probes.error_detail
+	// 里供界面展示。
+	r.logRoundOutcome(ctx, outcomes)
+
+	// 代理测速跟着同一轮跑：它不打上游、不计费，一次 generate_204 的
+	// 代价远小于一次推理，所以不需要独立周期 —— 独立周期只会让两套
+	// 定时器在界面上显示的时间戳互相错开几分钟，看起来像「有的一直
+	// 没测」。放在模型探测之后，顺序也符合排障时的因果链（先看模型
+	// 通不通，再看代理通不通）。
+	r.probeNetworks(ctx, timeout)
 
 	// 代理测速跟着同一轮跑：它不打上游、不计费，一次 generate_204 的
 	// 代价远小于一次推理，所以不需要独立周期 —— 独立周期只会让两套
@@ -275,8 +301,21 @@ func (r *Runner) probeNetwork(ctx context.Context, n store.Network, timeout time
 // 都表现为「一小撮随机错开」。
 var intervalStagger = 2500 * time.Millisecond
 
-// probeOne 探测单个模型并落库。
-func (r *Runner) probeOne(ctx context.Context, m store.UpstreamModel, timeout time.Duration) {
+// probeOutcome 是一轮内单个模型的探测结论（只用于这一轮的汇总日志）。
+//
+// skipped 表示「这一条没得出结论」：上下文取消（进程在关）或落库失败。
+// 这两种都不该算进「N 个模型不健康」，否则关一次进程或者一次写库抖动
+// 就会在日志里伪装成一批上游故障。
+type probeOutcome struct {
+	ok      bool
+	model   string
+	errKind string
+	latency int64
+	skipped bool
+}
+
+// probeOne 探测单个模型并落库，返回本轮汇总需要的结论。
+func (r *Runner) probeOne(ctx context.Context, m store.UpstreamModel, timeout time.Duration) probeOutcome {
 	// 每个探测独立超时：一个挂死的上游不能卡住整轮。
 	pctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
@@ -298,11 +337,62 @@ func (r *Runner) probeOne(ctx context.Context, m store.UpstreamModel, timeout ti
 	// Cancellation is a lifecycle stop, not a probe result. Do not mutate
 	// probe history after the owner has begun shutdown.
 	if ctx.Err() != nil {
-		return
+		return probeOutcome{skipped: true}
 	}
 	if err := r.store.RecordProbe(ctx, rec); err != nil {
 		r.logger.Warn("probe: record failed", "model", m.ModelID, "error", err)
+		return probeOutcome{skipped: true}
 	}
+	out := probeOutcome{
+		ok:      res.OK,
+		model:   m.ModelID,
+		errKind: rec.ErrorKind,
+		latency: res.LatencyMs,
+	}
+	// 逐条结果只走 DEBUG：这是「细节」，要它的人会开 log_level=debug。
+	// INFO 级别留在一轮的汇总上（见 logRoundOutcome）。
+	r.logger.Debug("probe: model probed",
+		"model", m.ModelID, "provider_id", m.ProviderID,
+		"ok", res.OK, "latency_ms", res.LatencyMs, "error_kind", rec.ErrorKind)
+	return out
+}
+
+// logRoundOutcome 把一轮探测的结果合成一条日志。
+//
+// 级别口径：
+//   - 全部成功 → INFO（一行带样本数与最慢一条，用来确认探针还活着）；
+//   - 有失败 → WARN，并列出失败模型的 provider/model/error_kind。
+//
+// 旧实现没有这条汇总，失败靠 outwire 的日志副作用带出来，且不带模型名 ——
+// 一条无法定位的 WARN，每轮每个坏模型各一条。
+func (r *Runner) logRoundOutcome(ctx context.Context, outcomes []probeOutcome) {
+	if ctx.Err() != nil || len(outcomes) == 0 {
+		return
+	}
+	failed := make([]probeOutcome, 0)
+	var slowest int64
+	for _, o := range outcomes {
+		if !o.ok {
+			failed = append(failed, o)
+			continue
+		}
+		if o.latency > slowest {
+			slowest = o.latency
+		}
+	}
+	if len(failed) == 0 {
+		r.logger.Info("probe: round finished",
+			"models", len(outcomes), "failed", 0, "slowest_ms", slowest)
+		return
+	}
+	names := make([]string, 0, len(failed))
+	for _, o := range failed {
+		names = append(names, o.model)
+	}
+	r.logger.Warn("probe: round finished with failing models",
+		"models", len(outcomes), "failed", len(failed),
+		"failing_models", strings.Join(names, ", "),
+		"hint", "失败原因见 model_probes.error_detail（界面「模型探测」页可看原文）；若不期望该模型可用，可从上游模型列表删掉它")
 }
 
 // classifyError 把探测错误归到归一化的失败类别（时间轴/总览展示用）。
@@ -311,7 +401,11 @@ func classifyError(err error) string {
 		return ""
 	}
 	// 复用 outwire 的归类：它已经按状态码/哨兵分好了。
-	_, code, _ := outwire.MapUpstreamError(err)
+	//
+	// 用 UpstreamErrorCode 而不是 MapUpstreamError：后者对 400/404/529
+	// 会顺带 slog.Warn 一条不带模型名的 "upstream returned an error"，
+	// 而这里只是想知道「该归到哪一类」——归类是纯计算，不该有日志副作用。
+	_, code, _ := outwire.UpstreamErrorCode(err)
 	switch code {
 	case "upstream_timeout":
 		return "timeout"

@@ -16,9 +16,21 @@ import (
 )
 
 type Config struct {
-	Listen       string `json:"listen"`
-	DBPath       string `json:"db_path"`
-	LogLevel     string `json:"log_level"`
+	Listen   string `json:"listen"`
+	DBPath   string `json:"db_path"`
+	LogLevel string `json:"log_level"`
+	// LogFormat 是日志的呈现格式：auto / json / text。
+	//
+	// 为什么需要这一项：数据面每个请求写一条 60+ 字段的诊断日志（DESIGN §8.4），
+	// JSON 形态是给 `docker logs | jq`、日志聚合用的；但在终端里人工盯着看时，
+	// 一行上千字符的 JSON 反而读不出「谁错了、错在哪」。两种需求无法用一个格式
+	// 同时满足，所以把格式做成配置项，而不是替用户猜。
+	//
+	// auto（缺省）= stdout 是字符设备（交互终端）就用 text，否则用 json。
+	// 这条缺省刻意保住既有契约：容器里 stdout 是管道 → 仍然是 JSON，DOCKER.md
+	// 的 jq 示例、DESIGN §8.4 的「所有字段可按 JSON 检索聚合」都不失效；
+	// 而双击/前台运行时得到的是人能读的行。
+	LogFormat    string `json:"log_format"`
 	MasterKeyEnv string `json:"master_key_env"`
 	// PublicOrigin 是浏览器实际访问网关时看到的 scheme://host[:port]。
 	//
@@ -363,6 +375,11 @@ func (c *Config) setDefaults() {
 	if c.LogLevel == "" {
 		c.LogLevel = "info"
 	}
+	// 空串 = 未配置 → auto（按输出设备自动选）。这里写实值而不是留空，
+	// 让生成的 config.json 自带这一项，运维能看见有这么一个开关。
+	if c.LogFormat == "" {
+		c.LogFormat = "auto"
+	}
 	// 超时类兜底值的口径（2026-10-13 复核）：
 	// 这三项原是 120s / 60s / 30s，是按「短对话、响应很快」调的；对
 	// 非流式长回复与带思考的上游偏紧，于是**正常请求**被判成超时并触发
@@ -578,6 +595,14 @@ func (c *Config) validate() error {
 	case "debug", "info", "warn", "error":
 	default:
 		return fmt.Errorf("log_level: must be one of debug|info|warn|error, got %q", c.LogLevel)
+	}
+
+	// log_format 与 log_level 同理：非法值只会让 logger 悄悄退回 auto，
+	// 运维改了个拼错的 "test" 却以为生效了。
+	switch strings.ToLower(strings.TrimSpace(c.LogFormat)) {
+	case "auto", "json", "text":
+	default:
+		return fmt.Errorf("log_format: must be one of auto|json|text, got %q", c.LogFormat)
 	}
 
 	// timezone 在启动早期被 ApplyTimezone 消费，但校验仍放这里：

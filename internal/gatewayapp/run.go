@@ -44,10 +44,38 @@ type Options struct {
 func Run(opts Options) (retErr error) {
 	logLevel := new(slog.LevelVar)
 	logLevel.Set(slog.LevelInfo)
-	logger := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{
-		Level: logLevel,
-	}))
+	// 第一阶段：还没有 config，格式只能猜（auto 按输出设备）。
+	// 这一段必须独立可跑 —— 读配置失败时要能记 Error，而那时 log_format
+	// 还没解析出来（连配置路径都可能不存在）。
+	//
+	// 但**不能直接输出**：第二阶段会按 cfg.LogFormat 重建 handler，
+	// 先输出的那几行就是另一种格式，同一份日志里混两套格式既难读也难 grep。
+	// 所以先缓冲，等格式定了再一起重放（见 logsetup.go 的 bufferingHandler）。
+	buffered := newBufferingHandler(logLevel)
+	logger := slog.New(buffered)
 	slog.SetDefault(logger)
+	// 任何提前返回（配置读不出来、home 解析失败）都要把缓冲的记录补出来，
+	// 否则「启动失败」时日志里一个字都没有 —— 那正是最需要日志的时刻。
+	//
+	// 注意这里**不能**用 logger.Handler()：提前返回时 logger 仍指向缓冲器，
+	// 往它写只会把记录再塞回缓冲槽，然后就没有然后了。所以另存一个
+	// settled 标记，只有第二阶段重建过才用真 handler。
+	var settledHandler slog.Handler
+	flushLogs := func() {
+		recs := buffered.drain()
+		if len(recs) == 0 {
+			return
+		}
+		handler := settledHandler
+		if handler == nil {
+			// 没读到配置就退出了：按 auto 猜一个格式把日志吐出来，
+			// 有格式总比一个字的诊断信息都没有强。
+			handler = buildLogger(os.Stdout, logLevel,
+				resolveLogFormat("", stdoutIsCharDevice(os.Stdout))).Handler()
+		}
+		replayRecords(context.Background(), handler, recs)
+	}
+	defer flushLogs()
 
 	exePath, err := os.Executable()
 	if err != nil {
@@ -72,7 +100,21 @@ func Run(opts Options) (retErr error) {
 	}
 
 	logLevel.Set(slogLevel(cfg.LogLevel))
-	logger.Info("config loaded", "listen", cfg.Listen, "db_path", cfg.DBPath, "log_level", cfg.LogLevel)
+	// 第二阶段：config 到手后按 log_format 重建 logger（auto 仍看设备）。
+	// 为什么要重建而不是一开始就读配置：logger 必须在读配置之前可用，
+	// 否则「配置读不出来」这条错误无处可写。
+	//
+	// 重建前先把第一阶段缓冲的记录取出来，用新 handler 重放：这样整份日志
+	// 只有一种格式（含着色/字段风格），首行也不会因为「当时还没读配置」
+	// 而变成另一种样子。
+	pendingLogs := buffered.drain()
+	logFormat := resolveLogFormat(cfg.LogFormat, stdoutIsCharDevice(os.Stdout))
+	logger = buildLogger(os.Stdout, logLevel, logFormat)
+	settledHandler = logger.Handler()
+	slog.SetDefault(logger)
+	replayRecords(context.Background(), logger.Handler(), pendingLogs)
+	logger.Info("config loaded", "listen", cfg.Listen, "db_path", cfg.DBPath,
+		"log_level", cfg.LogLevel, "log_format", logFormat)
 
 	appliedTZ, err := config.ApplyTimezone(cfg.Timezone)
 	if err != nil {

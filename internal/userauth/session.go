@@ -81,8 +81,12 @@ func NewManager(secretPath string) (*Manager, error) {
 		if generated {
 			// 必须告知路径：悄悄生成一把新密钥 = 所有人手里的旧会话
 			// 在下一次重启后集体失效，而界面上看不出任何原因。
-			fmt.Fprintf(os.Stderr, "[session] generated a new session secret at %s; "+
-				"back it up with master.key — losing it invalidates all sessions\n", secretPath)
+			//
+			// 走 slog 而不是 fmt.Fprintf(os.Stderr)：这个包在 logger 装配之后才被
+			// 调用，直接用 stderr 会在 JSON 日志流里插进一行非 JSON 文本，
+			// `docker logs | jq` 与 log_format 都会漏掉它。
+			slog.Warn("generated a new session secret; losing it invalidates all sessions",
+				"path", secretPath, "next_step", "把它与 master.key 一起备份")
 		}
 	}
 	if raw == "" {

@@ -1025,9 +1025,10 @@ Rosetta 用 `ErrStreamTruncated` 区分「干净结束」与「连接被掐断�
 ### 8.4 请求诊断与性能归因
 
 每个数据面请求在终态写一条 `INFO` 日志，`event=gateway_request_diagnostic`。
-生产 logger 是 `slog.NewJSONHandler(os.Stdout)`，因此所有字段都可直接按 JSON
-检索与聚合；日志只保留**元数据、数量与耗时**，绝不记录 prompt、消息正文、
-生成正文或上游凭据。
+logger 写 stdout，格式由 `log_format` 决定：默认 `auto` —— stdout 是交互终端时
+用 `text`（人能直接读），否则用 JSON（容器/管道/重定向）；显式 `json` 时所有字段
+都可直接按 JSON 检索与聚合。日志只保留**元数据、数量与耗时**，绝不记录 prompt、
+消息正文、生成正文或上游凭据。
 
 **能把问题落到哪一段。** 日志里的耗时字段是互相独立的实测区间，不做
 「总耗时减各阶段」的残差推断：
@@ -1395,6 +1396,7 @@ AES-256-GCM 密文。无主密钥、密文损坏、主密钥不匹配或历史�
   "listen": "127.0.0.1:8666",
   "db_path": "./data/gateway.db",
   "log_level": "info",
+  "log_format": "auto",
   "master_key_env": "ROSETTA_GW_MASTER_KEY",
   "public_origin": "",
   "trusted_proxy_cidrs": [],

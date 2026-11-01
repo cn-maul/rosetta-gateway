@@ -2,6 +2,7 @@
   "listen": "0.0.0.0:8666",
   "db_path": "./data/gateway.db",
   "log_level": "info",
+  "log_format": "auto",
   "master_key_env": "ROSETTA_GW_MASTER_KEY",
   "public_origin": "",
   "trusted_proxy_cidrs": [],

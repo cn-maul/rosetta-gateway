@@ -234,8 +234,19 @@ services:
 
 **没有日志文件 —— 应用日志就是容器的标准输出。**
 
-网关用 `slog` 的 JSON handler 直接写 stdout（`internal/gatewayapp/run.go`），配置里的 `log_level`
-只调级别、不改去向。所以 `docker logs` 就是全部日志，`/data` 里不会出现任何 `.log`。
+网关用 `slog` 直接写 stdout（`internal/gatewayapp/run.go`），配置里的 `log_level`
+只调级别、`log_format` 只调格式，都不改去向。所以 `docker logs` 就是全部日志，`/data` 里不会出现任何 `.log`。
+
+`log_format` 有三档：
+
+| 值 | 行为 |
+| --- | --- |
+| `auto`（默认） | stdout 是交互终端时用 `text`，否则用 `json`。容器里 stdout 是管道 → **实际总是 JSON** |
+| `json` | 强制每行一个 JSON 对象 |
+| `text` | 强制 `time=… level=INFO msg=… key=value` 形式 |
+
+容器里默认走 JSON，所以下面这些按 JSON 处理的用法不受影响；若在 compose 里把
+`log_format` 显式设成 `text`，`jq` 那几行就不适用了。
 
 ```bash
 docker logs -f --tail 200 rosetta-gateway        # 实时跟随

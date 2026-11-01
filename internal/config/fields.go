@@ -40,6 +40,11 @@ var configFieldInventory = []configFieldSpec{
 		Frontend: frontendNone,
 	},
 	{
+		Path:     "log_format",
+		ReadBy:   []string{"internal/gatewayapp/run.go:Run"},
+		Frontend: frontendNone,
+	},
+	{
 		Path:     "master_key_env",
 		ReadBy:   []string{"internal/gatewayapp/run.go:Run"},
 		Frontend: frontendNone,
