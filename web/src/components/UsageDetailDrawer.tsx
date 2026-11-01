@@ -48,11 +48,27 @@ export function newInputTokens(h: UsageHistoryEntry): number {
 }
 
 /**
- * 实际接单的上游展示名。provider_name 是落库时固化的历史值；旧记录没有
- * 这个字段，回退到 provider_id 并明确标注，避免让人误以为那就是名字。
+ * 实际接单的上游展示名。
+ *
+ * provider_name 是落库时固化的历史值 —— 上游被删掉之后它仍然在，这正是
+ * 我们要的：调用历史回答「当时是谁接的」，而不是「今天这个 id 指着谁」。
+ * 所以顺序是：有名字就用名字，其次才是 id（旧记录没固化名字）。
+ *
+ * 上游已被删除时加「已删除 · 」前缀：不加前缀的话，一个已经不存在的上游
+ * 与一个活着的上游在列表里长得一模一样，排障时会白找一圈。
  */
 export function upstreamName(h: UsageHistoryEntry): string {
-  return h.provider_name || h.provider_id || '上游未记录'
+  const name = h.provider_name || h.provider_id || '上游未记录'
+  return h.provider_deleted ? `已删除 · ${name}` : name
+}
+
+/**
+ * 密钥的展示名。key_name 同样是落库时固化的（2026-11-01 新增列），
+ * 密钥删掉后仍显示当时的名字，而不是那串 sha256 id。
+ */
+export function keyName(h: UsageHistoryEntry): string {
+  const name = h.key_name || h.key_id || '—'
+  return h.key_deleted ? `已删除 · ${name}` : name
 }
 
 /** 错误详情分两段：上游那句 message 与完整 raw body。老记录可能只有一段

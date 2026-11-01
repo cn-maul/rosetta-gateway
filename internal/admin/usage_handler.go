@@ -453,8 +453,19 @@ type usageHistoryEntry struct {
 	UpstreamProtocol string `json:"upstream_protocol"`
 	KeyName          string `json:"key_name"`
 	KeyID            string `json:"key_id"`
-	InputTokens      int64  `json:"input_tokens"`
-	TotalTokens      int64  `json:"total_tokens"`
+	// KeyDeleted / ProviderDeleted 说明这一行指向的密钥 / 上游**已经不在库里**了。
+	//
+	// # 为什么这件事必须由后端回答
+	//
+	// 名字是落库时固化的（key_name / provider_name），所以「已删除」并不会
+	// 让名字消失 —— 但它也不足以判断对象还在不在：前端拿不到 access_keys 与
+	// providers 的当前状态，只能靠「名字为空」猜，而空名字既可能是旧记录
+	// 也可能是被删。两个 EXISTS 子查询把这件事问清楚，界面才能显示
+	// 「已删除 · 腾讯WorkBuddy」而不是把那串 id 当成名字。
+	KeyDeleted      bool  `json:"key_deleted"`
+	ProviderDeleted bool  `json:"provider_deleted"`
+	InputTokens     int64 `json:"input_tokens"`
+	TotalTokens     int64 `json:"total_tokens"`
 	// OutputTokens 是本次**生成**出来的 token 数（2026-10-11 新增）。
 	//
 	// 为什么必须单独下发、不能拿 TotalTokens 顶替：TotalTokens = 输入 + 输出，
@@ -560,14 +571,18 @@ const (
 	usageHistoryColumns = `u.ts, u.public_model, u.upstream_model,
 		COALESCE(u.provider_id, ''), COALESCE(u.provider_name, ''),
 		COALESCE(u.ingress_protocol, ''), COALESCE(u.upstream_protocol, ''),
-		COALESCE(a.name, ''), u.access_key_id,
+		COALESCE(NULLIF(u.key_name, ''), a.name, ''), u.access_key_id,
 		u.input_tokens, u.output_tokens, u.total_tokens,
 		u.cached_tokens, u.cached_creation_tokens, u.reasoning_tokens,
 		u.ttfb_ms, u.latency_ms, u.status, u.stream,
 		COALESCE(u.cost_total, 0), u.http_status,
 		COALESCE(u.error_code, ''), COALESCE(u.error_detail, ''),
 		COALESCE(u.route_trace, ''), COALESCE(u.request_id, ''),
-		COALESCE(u.request_ip, ''), COALESCE(u.effort, '')`
+		COALESCE(u.request_ip, ''), COALESCE(u.effort, ''),
+		CASE WHEN COALESCE(u.access_key_id, '') <> '' AND a.id IS NULL THEN 1 ELSE 0 END,
+		CASE WHEN COALESCE(u.provider_id, '') <> ''
+		          AND NOT EXISTS (SELECT 1 FROM providers p WHERE p.id = u.provider_id)
+		     THEN 1 ELSE 0 END`
 	usageHistorySource = ` FROM usage_records u
 		LEFT JOIN access_keys a ON a.id = u.access_key_id`
 )
@@ -584,6 +599,7 @@ func scanUsageHistoryEntry(scanner usageHistoryScanner, e *usageHistoryEntry) er
 		&e.CachedTokens, &e.CachedCreationTokens, &e.ReasoningTokens, &e.TTFBMs, &e.LatencyMs,
 		&e.Status, &e.Stream, &e.Cost, &e.HTTPStatus, &e.ErrorCode, &e.ErrorDetail,
 		&e.RouteTrace, &e.RequestID, &e.RequestIP, &e.Effort,
+		&e.KeyDeleted, &e.ProviderDeleted,
 	)
 }
 
@@ -741,7 +757,8 @@ func (h *UsageHandler) ExportCSV(w http.ResponseWriter, r *http.Request) {
 		"output_tokens", "tps", "route_trace", "provider_id", "ingress_protocol",
 		"input_tokens", "cached_tokens", "reasoning_tokens", "request_id",
 		"http_status", "error_code", "error_detail", "cached_creation_tokens",
-		"provider_name", "upstream_protocol", "request_ip", "effort"})
+		"provider_name", "upstream_protocol", "request_ip", "effort",
+		"key_deleted", "provider_deleted"})
 	for rows.Next() {
 		var e usageHistoryEntry
 		if err := scanUsageHistoryEntry(rows, &e); err != nil {
@@ -777,6 +794,7 @@ func (h *UsageHandler) ExportCSV(w http.ResponseWriter, r *http.Request) {
 			strconv.FormatInt(e.CachedCreationTokens, 10),
 			csvCell(e.ProviderName), csvCell(e.UpstreamProtocol),
 			csvCell(e.RequestIP), csvCell(e.Effort),
+			strconv.FormatBool(e.KeyDeleted), strconv.FormatBool(e.ProviderDeleted),
 		})
 	}
 	cw.Flush()

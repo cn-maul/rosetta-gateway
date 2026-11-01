@@ -111,9 +111,12 @@ func TestUsage_ExportCSV_IncludesEffortColumn(t *testing.T) {
 	if effortIdx < 0 {
 		t.Fatalf("CSV 表头没有 effort 列：%v", header)
 	}
-	if effortIdx != len(header)-1 {
-		t.Errorf("effort 列下标 = %d，期望追加在末尾（%d）——新列必须追加，否则既有脚本按下标取值会错位",
-			effortIdx, len(header)-1)
+	// effort 曾是最后一列；2026-11-01 之后又追加了 key_deleted /
+	// provider_deleted。规则没变 —— **新列一律追加在末尾**，所以这里断言
+	// effort 之后只剩下后来新增的那两列，而不是死认「effort 就是最后一列」。
+	if len(header)-effortIdx-1 != 2 || header[effortIdx+1] != "key_deleted" || header[effortIdx+2] != "provider_deleted" {
+		t.Errorf("effort 之后应只跟着后来追加的 key_deleted/provider_deleted，实际 header 尾部 %v（effort 下标 %d）",
+			header[max(0, effortIdx):], effortIdx)
 	}
 	seen := map[string]bool{}
 	for _, row := range rows[1:] {

@@ -22,7 +22,7 @@ import { parseRouteTrace } from '../routeTrace'
 import type { AccessKey, UsageHistoryEntry } from '../types'
 import { DataTable } from '../ui/DataTable'
 import { StatusChip } from '../ui/StatusChip'
-import { newInputTokens, statusTone, totalTimeTone, upstreamName, UsageDetailDrawer } from '../components/UsageDetailDrawer'
+import { keyName, newInputTokens, statusTone, totalTimeTone, upstreamName, UsageDetailDrawer } from '../components/UsageDetailDrawer'
 import { oneOfInt, readPref, writePref } from '../ui/usePersistedState'
 
 /**
@@ -47,8 +47,12 @@ function timingTitle(h: UsageHistoryEntry): string {
 }
 
 function upstreamNameTitle(h: UsageHistoryEntry): string {
-  if (h.provider_name) return h.provider_id ? `${h.provider_name}（provider_id: ${h.provider_id}）` : h.provider_name
-  if (h.provider_id) return `旧记录未固化上游名称，provider_id: ${h.provider_id}`
+  // 已删除的上游：名字是当时固化的，仍然显示，但在 title 里说明它已经不在了，
+  // 免得有人照着这个名字去「上游服务」页找。
+  const gone = h.provider_deleted ? '（该上游已被删除）' : ''
+  const idPart = h.provider_id ? `（provider_id: ${h.provider_id}）` : ''
+  if (h.provider_name) return h.provider_name + idPart + gone
+  if (h.provider_id) return `旧记录未固化上游名称，provider_id: ${h.provider_id}` + gone
   return '这条记录没有归因到具体上游'
 }
 
@@ -453,7 +457,11 @@ export function UsageDetail({ days }: { days: number }) {
                         ) : (
                           <span title={upstreamNameTitle(h)} className="flex flex-col">
                             <span>{upstreamName(h)}</span>
-                            {!h.provider_name && h.provider_id ? <span className="text-[11px] text-muted">名称未固化</span> : null}
+                            {!h.provider_name && h.provider_id ? (
+                              <span className="text-[11px] text-muted">名称未固化</span>
+                            ) : h.provider_deleted ? (
+                              <span className="text-[11px] text-warning">上游已删除</span>
+                            ) : null}
                           </span>
                         )}
                       </Table.Cell>
@@ -469,7 +477,9 @@ export function UsageDetail({ days }: { days: number }) {
                       </span>
                     </Table.Cell>
                     <Table.Cell>
-                      <span title={h.key_name || h.key_id || '—'}>{h.key_name || h.key_id || '—'}</span>
+                      {/* 名字是落库时固化的：密钥删掉之后仍显示当时的名字，
+                          加「已删除 · 」前缀；只有升级前的旧记录才回退到 id。 */}
+                      <span title={keyName(h)}>{keyName(h)}</span>
                     </Table.Cell>
                     <Table.Cell>
                       {/* 箭头代替「新增输入 / 输出」两个词：这一列是表里最挤的一格，

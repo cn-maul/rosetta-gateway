@@ -29,7 +29,13 @@ type UsageRecord struct {
 	// 显示新名字、在删除后显示一片空白 —— 调用历史要回答「当时是谁接的」，
 	// 而不是「今天这条配置叫什么」。空串 = 旧记录（升级前未固化）或确实
 	// 没有目标，UI 回退到 provider_id 并显式标注未固化。
-	ProviderName    string
+	ProviderName string
+	// KeyName 是落库当时的访问密钥名，与 ProviderName 一样是**历史事实**。
+	//
+	// 为什么不靠 JOIN access_keys 取：密钥被删之后 JOIN 只剩空串，几百行
+	// 历史记录会变回一串 sha256 id —— 而「当时用的是哪把 key」正是排障时
+	// 最想知道的。空串 = 升级前的旧记录，UI 回退到 key_id。
+	KeyName         string
 	UpstreamModel   string
 	IngressProtocol string
 	// UpstreamProtocol 是本次目标的上游线路协议（chat / response /
@@ -189,8 +195,8 @@ func (s *Store) CreateUsageRecordWithCost(ctx context.Context, r *UsageRecord) (
 		usageState = usageStateCostPending
 	}
 	_, err := s.db.ExecContext(ctx,
-		`INSERT INTO usage_records (id, ts, access_key_id, user_id, public_model, provider_id, provider_name, upstream_model, ingress_protocol, upstream_protocol, stream, input_tokens, output_tokens, total_tokens, reasoning_tokens, cached_tokens, cached_creation_tokens, usage_state, status, http_status, error_code, error_detail, latency_ms, ttfb_ms, request_id, request_ip, effort, route_trace, cost_total) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		r.ID, ts, r.AccessKeyID, nullIfEmpty(r.UserID), r.PublicModel, r.ProviderID, nullIfEmpty(r.ProviderName), r.UpstreamModel, r.IngressProtocol, nullIfEmpty(r.UpstreamProtocol), stream, r.InputTokens, r.OutputTokens, r.TotalTokens, r.ReasoningTokens, r.CachedTokens, r.CachedCreationTokens, usageState, r.Status, r.HTTPStatus, nullIfEmpty(r.ErrorCode), nullIfEmpty(r.ErrorDetail), r.LatencyMs, r.TTFBMs, nullIfEmpty(r.RequestID), nullIfEmpty(r.RequestIP), nullIfEmpty(r.Effort), nullIfEmpty(r.RouteTrace), cost)
+		`INSERT INTO usage_records (id, ts, access_key_id, user_id, public_model, provider_id, provider_name, upstream_model, ingress_protocol, upstream_protocol, stream, input_tokens, output_tokens, total_tokens, reasoning_tokens, cached_tokens, cached_creation_tokens, usage_state, status, http_status, error_code, error_detail, latency_ms, ttfb_ms, request_id, request_ip, effort, key_name, route_trace, cost_total) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		r.ID, ts, r.AccessKeyID, nullIfEmpty(r.UserID), r.PublicModel, r.ProviderID, nullIfEmpty(r.ProviderName), r.UpstreamModel, r.IngressProtocol, nullIfEmpty(r.UpstreamProtocol), stream, r.InputTokens, r.OutputTokens, r.TotalTokens, r.ReasoningTokens, r.CachedTokens, r.CachedCreationTokens, usageState, r.Status, r.HTTPStatus, nullIfEmpty(r.ErrorCode), nullIfEmpty(r.ErrorDetail), r.LatencyMs, r.TTFBMs, nullIfEmpty(r.RequestID), nullIfEmpty(r.RequestIP), nullIfEmpty(r.Effort), nullIfEmpty(r.KeyName), nullIfEmpty(r.RouteTrace), cost)
 	if err != nil {
 		// 落库失败：费用随记录一起作废。返回 0 而不是 cost —— 调用方若误用
 		// 这个值去扣费，扣的金额必须与「库里真实存在的记录」对应，
@@ -258,14 +264,14 @@ func (s *Store) CreateUsageRecordsBatched(ctx context.Context, recs []*UsageReco
 		(id, ts, access_key_id, user_id, public_model, provider_id, provider_name,
 		 upstream_model, ingress_protocol, upstream_protocol, stream, input_tokens, output_tokens, total_tokens,
 		 reasoning_tokens, cached_tokens, cached_creation_tokens, usage_state, status, http_status,
-		 error_code, error_detail, latency_ms, ttfb_ms, request_id, request_ip, effort,
+		 error_code, error_detail, latency_ms, ttfb_ms, request_id, request_ip, effort, key_name,
 		 route_trace, cost_total) VALUES `)
 
 	for i, r := range recs {
 		if i > 0 {
 			sb.WriteByte(',')
 		}
-		sb.WriteString("(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)")
+		sb.WriteString("(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)")
 		args = append(args, usageInsertArgs(r, costs[i], costPending[i])...)
 	}
 
@@ -280,7 +286,7 @@ func (s *Store) CreateUsageRecordsBatched(ctx context.Context, recs []*UsageReco
 }
 
 // usageInsertColumns 是 usage_records 写入路径的列数（仅用于容量预估）。
-const usageInsertColumns = 29
+const usageInsertColumns = 30
 
 // batchComputeCosts 逐条算固化费用，并顺带完成 token 负值归一与 ts 兜底。
 //
@@ -344,7 +350,7 @@ func usageInsertArgs(r *UsageRecord, cost float64, costPending bool) []any {
 		r.ReasoningTokens, r.CachedTokens, r.CachedCreationTokens, usageState, r.Status,
 		r.HTTPStatus, nullIfEmpty(r.ErrorCode), nullIfEmpty(r.ErrorDetail),
 		r.LatencyMs, r.TTFBMs, nullIfEmpty(r.RequestID), nullIfEmpty(r.RequestIP),
-		nullIfEmpty(r.Effort), nullIfEmpty(r.RouteTrace), cost,
+		nullIfEmpty(r.Effort), nullIfEmpty(r.KeyName), nullIfEmpty(r.RouteTrace), cost,
 	}
 }
 

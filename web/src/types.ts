@@ -1039,8 +1039,18 @@ export interface UsageHistoryEntry {
    * 页面显示为未记录，不能用当前部署配置反推。
    */
   request_ip: string
-  key_name: string // 调用密钥名称（密钥删除后为空）
+  key_name: string // 调用密钥名称；落库时固化，密钥删除后仍是原来的名字
   key_id: string // 调用密钥 id（回退显示用）
+  /**
+   * key_deleted / provider_deleted 表示这一行的密钥 / 上游**已经不在库里**。
+   *
+   * 名字是落库时固化的历史事实（key_name / provider_name），所以删掉对象
+   * 不会让名字消失；但「还在不在」这件事前端判断不了 —— 空名字既可能是
+   * 旧记录也可能是被删。由后端两个 EXISTS 子查询给出，界面据此显示
+   * 「已删除 · 原名」，而不是把一串 sha256 id 当成名字。
+   */
+  key_deleted: boolean
+  provider_deleted: boolean
   /**
    * 输入侧 token 总量（请求上下文、工具定义等），包含缓存命中与缓存写入。
    * 页面上的“新增输入”按 input_tokens - cached_tokens - cached_creation_tokens

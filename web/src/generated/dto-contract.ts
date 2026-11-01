@@ -536,6 +536,8 @@ export const DTO_CONTRACTS: readonly DTOFieldContract[] = [
     "upstream_protocol",
     "key_name",
     "key_id",
+    "key_deleted",
+    "provider_deleted",
     "input_tokens",
     "total_tokens",
     "output_tokens",

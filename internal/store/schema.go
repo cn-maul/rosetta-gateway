@@ -137,6 +137,15 @@ func (s *Store) ensureCompatibleSchema(ctx context.Context) error {
 		// 不参与任何聚合（usage_daily_rollups 不加此列）：它是逐条排障线索，
 		// 不是报表口径。
 		{"usage_records", "effort", "TEXT"},
+		// 2026-11-01：调用历史要能显示「已被删除的密钥当时叫什么」。
+		//
+		// 现状是 key 名靠 LEFT JOIN access_keys 取，密钥一删名字就没了，
+		// 历史上那几百行只剩一串 sha256 十六进制 id。跟 provider_name 一样
+		// 固化成本很低（一次写入多一列），而不固化就永久丢信息 —— 删掉的
+		// 密钥不可能再被查回来补名字。
+		//
+		// 空串 = 升级前的旧记录，界面回退到 key_id。
+		{"usage_records", "key_name", "TEXT"},
 	} {
 		if err := s.ensureAdditiveColumn(ctx, col.table, col.column, col.decl); err != nil {
 			return err
@@ -512,6 +521,9 @@ var canonicalSchemaStatements = []string{
 		-- effort 是**实际下发**给上游的思考档位（夹取之后），空串 = 没思考。
 		-- 见 ensureCompatibleSchema 里的同名新增列说明。
 		effort            TEXT,
+		-- key_name 是落库当时的访问密钥名（历史事实）。密钥删掉后仍要能
+		-- 显示「当时用的是哪把」，见 ensureCompatibleSchema 的同名列说明。
+		key_name          TEXT,
 		route_trace       TEXT,
 		cost_total        REAL NOT NULL DEFAULT 0,
 		-- Accounting retry state. These columns are additive and default to

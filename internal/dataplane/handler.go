@@ -879,6 +879,7 @@ func (h *Handler) Handle(codec ingress.Codec) http.HandlerFunc {
 		h.usage.Record(&store.UsageRecord{
 			ID:               newID(),
 			AccessKeyID:      keyID,
+			KeyName:          authCtx.Name,
 			UserID:           authCtx.UserID,
 			RequestID:        httpx.RequestIDFromContext(r.Context()),
 			RequestIP:        requestIP,
@@ -1453,6 +1454,7 @@ func (h *Handler) attemptStream(w http.ResponseWriter, r *http.Request, client *
 	h.usage.RecordWithCallback(&store.UsageRecord{
 		ID:                   newID(),
 		AccessKeyID:          authCtx.KeyID,
+		KeyName:              authCtx.Name,
 		UserID:               authCtx.UserID,
 		RequestID:            httpx.RequestIDFromContext(r.Context()),
 		RequestIP:            httpx.ClientIPOf(r),
@@ -1598,6 +1600,7 @@ func (h *Handler) attemptNonStream(w http.ResponseWriter, r *http.Request, clien
 	h.usage.RecordWithCallback(&store.UsageRecord{
 		ID:                   newID(),
 		AccessKeyID:          authCtx.KeyID,
+		KeyName:              authCtx.Name,
 		UserID:               authCtx.UserID,
 		RequestID:            httpx.RequestIDFromContext(r.Context()),
 		RequestIP:            httpx.ClientIPOf(r),
@@ -1672,6 +1675,7 @@ func (h *Handler) finishNonStreamEncodeFailure(
 	h.usage.Record(&store.UsageRecord{
 		ID:               newID(),
 		AccessKeyID:      authCtx.KeyID,
+		KeyName:          authCtx.Name,
 		UserID:           authCtx.UserID,
 		RequestID:        httpx.RequestIDFromContext(r.Context()),
 		RequestIP:        httpx.ClientIPOf(r),
@@ -1738,6 +1742,7 @@ func (h *Handler) finishNonStreamWriteFailure(
 	h.usage.RecordWithCallback(&store.UsageRecord{
 		ID:                   newID(),
 		AccessKeyID:          authCtx.KeyID,
+		KeyName:              authCtx.Name,
 		UserID:               authCtx.UserID,
 		RequestID:            httpx.RequestIDFromContext(r.Context()),
 		RequestIP:            httpx.ClientIPOf(r),
