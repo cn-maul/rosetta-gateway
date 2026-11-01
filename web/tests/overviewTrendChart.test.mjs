@@ -108,3 +108,20 @@ test('不足一整桶的尾桶打标记，不按整桶高度归一', () => {
   assert.ok(lastBucket.labFull.endsWith('*'), '尾桶是部分桶，标签应带 * 标记')
   assert.ok(lastBucket.tip.includes('部分桶'), '尾桶提示要点明只有几天')
 })
+
+test('七张指标卡与趋势区都不带副行小字', async () => {
+  const page = await read('pages/Overview.tsx')
+
+  // 需求原话：这些字去掉 ——「293 / 298 有结论的请求」「11.06M 输入 · 219.7K 输出」
+  // 「293 个成功样本」「首字 + 生成 ≈ 11.7s · 274 个样本」以及趋势标题下面的
+  // 「按日聚合 · 每根柱子一个时间桶……」。
+  //
+  // 不只是「换个说法」：卡片上每多一行小字，「七张卡一眼扫过」就退化成一列行文，
+  // 而副行想说明的「样本够不够」在主值为 0 样本时已经显「—」了。所以这里钉住
+  // 的是结构 —— Metric 不再有 hint 这个入口，也没有这些文案残留在页面里。
+  for (const frag of ['有结论的请求', '输入 token', '个成功样本', '首字 + 生成', '个样本的输出速度', '每根柱子一个时间桶']) {
+    assert.ok(!page.includes(frag), `页面里还留着「${frag}」`)
+  }
+  assert.ok(!page.includes('hint={'), 'Metric 卡仍在传 hint 副行')
+  assert.match(page, /function Metric\(\{ label, value, tone \}/, 'Metric 的 props 应只剩 label/value/tone')
+})

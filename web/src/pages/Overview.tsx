@@ -21,7 +21,7 @@ import { PageHeader } from '../ui/PageHeader'
 import { SectionCard } from '../ui/SectionCard'
 import { BarChart } from '../ui/BarChart'
 import { SkeletonBlock } from '../ui/SkeletonBlock'
-import { buildUsageSeries, granularityLabel } from '../usageSeries'
+import { buildUsageSeries } from '../usageSeries'
 
 /**
  * 网关总览：**只看七个指标**（都按「所选区间」口径）外加一张按天的趋势表。
@@ -208,10 +208,7 @@ export function Overview() {
       <Metrics stats={stats} loading={statsLoading} />
 
       <div className="mt-4">
-        <SectionCard
-          title={`${rangeLabel(rangeKey)}用量`}
-          description={`${granularityLabel(rangeDays(rangeKey))} · 每根柱子一个时间桶（越靠右越近），悬停查看当天详情`}
-        >
+        <SectionCard title={`${rangeLabel(rangeKey)}用量`}>
           <UsageTrend
             byDay={byDay}
             days={rangeDays(rangeKey)}
@@ -312,11 +309,10 @@ function Metrics({ stats, loading }: { stats: Stats | null; loading: boolean }) 
         {Array.from({ length: 7 }, (_, i) => (
           <div
             key={i}
-            className="flex min-h-[104px] flex-col gap-2 rounded-2xl border border-separator bg-background-secondary p-4"
+            className="flex min-h-[86px] flex-col gap-2 rounded-2xl border border-separator bg-background-secondary p-4"
           >
             <SkeletonBlock className="h-3 w-16" />
             <SkeletonBlock className="h-8 w-24" />
-            <SkeletonBlock className="h-3 w-24" />
           </div>
         ))}
       </div>
@@ -326,82 +322,40 @@ function Metrics({ stats, loading }: { stats: Stats | null; loading: boolean }) 
 
   const denom = stats.success_count + stats.error_count
   const rate = successRate(stats)
-  const totalMs = stats.avg_ttfb_ms + stats.avg_gen_ms
 
+  // 只有数字，不带副行小字。七张卡各挂一行说明，整屏就退化成一列行文，
+  // 「一眼扫过七个数字」这件事反而变慢；那行字想说的「样本够不够」，
+  // 在主值为 0 样本时已经显「—」讲清楚了。
   return (
     <div className="grid grid-cols-2 gap-3 md:grid-cols-3 lg:grid-cols-4">
-      <Metric
-        label="请求数"
-        value={fmtNum(stats.total_requests)}
-        hint={`${fmtNum(stats.success_count)} 成功 · ${fmtNum(stats.error_count)} 失败${
-          stats.canceled_count > 0 ? ` · ${fmtNum(stats.canceled_count)} 取消` : ''
-        }`}
-      />
-      <Metric
-        label="Token 用量"
-        value={fmtTokens(stats.total_tokens)}
-        hint={`${fmtTokens(stats.input_tokens)} 输入 · ${fmtTokens(stats.output_tokens)} 输出`}
-      />
+      <Metric label="请求数" value={fmtNum(stats.total_requests)} />
+      <Metric label="Token 用量" value={fmtTokens(stats.total_tokens)} />
       <Metric
         label="成功率"
         value={denom > 0 ? `${fmtPercent(rate)}%` : '—'}
-        hint={denom > 0 ? `${fmtNum(stats.success_count)} / ${fmtNum(denom)} 有结论的请求` : '所选区间没有有结论的请求'}
         tone={denom > 0 && rate < 0.95 ? 'warn' : undefined}
       />
       <Metric
         label="缓存命中率"
         value={stats.input_tokens > 0 ? `${fmtPercent(stats.cache_hit_rate)}%` : '—'}
-        hint={
-          stats.input_tokens > 0
-            ? `${fmtTokens(stats.cached_tokens)} / ${fmtTokens(stats.input_tokens)} 输入 token`
-            : '所选区间没有输入 token'
-        }
       />
       <Metric
         label="TPS"
         value={stats.throughput_samples > 0 ? fmtSpeed(stats.avg_tokens_per_sec) : '—'}
-        hint={
-          stats.throughput_samples > 0
-            ? `${fmtNum(stats.throughput_samples)} 个成功样本的输出速度`
-            : '没有可用的速度样本'
-        }
       />
-      <Metric
-        label="平均首字延迟"
-        value={stats.ttfb_samples > 0 ? `${fmtSec(stats.avg_ttfb_ms)}s` : '—'}
-        hint={stats.ttfb_samples > 0 ? `${fmtNum(stats.ttfb_samples)} 个成功样本` : '没有测到首字的请求'}
-      />
-      <Metric
-        label="生成耗时（首字之后）"
-        value={stats.gen_samples > 0 ? `${fmtSec(stats.avg_gen_ms)}s` : '—'}
-        hint={
-          stats.gen_samples > 0
-            ? `首字 + 生成 ≈ ${fmtSec(totalMs)}s · ${fmtNum(stats.gen_samples)} 个样本`
-            : '没有可用样本'
-        }
-      />
+      <Metric label="平均首字延迟" value={stats.ttfb_samples > 0 ? `${fmtSec(stats.avg_ttfb_ms)}s` : '—'} />
+      <Metric label="生成耗时（首字之后）" value={stats.gen_samples > 0 ? `${fmtSec(stats.avg_gen_ms)}s` : '—'} />
     </div>
   )
 }
 
-function Metric({
-  label,
-  value,
-  hint,
-  tone,
-}: {
-  label: string
-  value: string
-  hint: string
-  tone?: 'warn'
-}) {
+function Metric({ label, value, tone }: { label: string; value: string; tone?: 'warn' }) {
   return (
-    <div className="flex min-h-[104px] flex-col justify-between rounded-2xl border border-separator bg-background-secondary p-4">
+    <div className="flex min-h-[86px] flex-col justify-between rounded-2xl border border-separator bg-background-secondary p-4">
       <div className="text-muted text-[12px]">{label}</div>
       <div className={`text-[26px] leading-tight font-semibold tabular-nums ${tone === 'warn' ? 'text-warning' : ''}`}>
         {value}
       </div>
-      <div className="text-muted text-[11.5px]">{hint}</div>
     </div>
   )
 }
