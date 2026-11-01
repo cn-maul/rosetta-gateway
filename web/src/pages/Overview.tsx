@@ -21,6 +21,7 @@ import { PageHeader } from '../ui/PageHeader'
 import { SectionCard } from '../ui/SectionCard'
 import { BarChart } from '../ui/BarChart'
 import { SkeletonBlock } from '../ui/SkeletonBlock'
+import { buildUsageSeries, granularityLabel } from '../usageSeries'
 
 /**
  * 网关总览：**只看七个指标**（都按「所选区间」口径）外加一张按天的趋势表。
@@ -110,7 +111,9 @@ export function Overview() {
     setStatsErr('')
     try {
       const { from, to } = bounds(requested)
-      const s = await api.stats(from, to, false)
+      // 「全部」档要终身累计：明细剪枝之后 byDay 只剩最近 N 天，图的起点得靠
+      // lifetime.first_record_at，否则更早的历史整段从图上消失。
+      const s = await api.stats(from, to, requested === 'all')
       if (!statsGen.current.isCurrent(generation)) return
       setStats(s)
     } catch (e) {
@@ -206,10 +209,17 @@ export function Overview() {
 
       <div className="mt-4">
         <SectionCard
-          title="用量趋势"
-          description={`${rangeLabel(rangeKey)} · 按本地日聚合，每根柱子是一天（越靠右越近）；成功率 = 成功 / (成功 + 失败)，取消不计入`}
+          title={`${rangeLabel(rangeKey)}用量`}
+          description={`${granularityLabel(rangeDays(rangeKey))} · 每根柱子一个时间桶（越靠右越近），悬停查看当天详情`}
         >
-          <TrendCharts byDay={byDay} loading={trendLoading} error={trendErr} onRetry={() => void loadTrend(rangeKey)} />
+          <UsageTrend
+            byDay={byDay}
+            days={rangeDays(rangeKey)}
+            firstRecordAt={stats?.lifetime?.first_record_at ?? 0}
+            loading={trendLoading}
+            error={trendErr}
+            onRetry={() => void loadTrend(rangeKey)}
+          />
         </SectionCard>
       </div>
     </>
@@ -217,34 +227,37 @@ export function Overview() {
 }
 
 /**
- * 七张小柱状图，与上面七张指标卡一一对应。
+ * 用量趋势：**一张**柱状图，柱高是当天的 token 用量。
  *
- * 2026-11-01 按用户要求把原来的八列表格换成图表：「看趋势」这个动作要的是
- * 一眼看出哪天塌了，而不是逐行读数字。表格能做的「精确查某天」，调用日志
- * 页按天筛选已经覆盖。
+ * 2026-11-01 按用户要求把原来的八列表格换成图表；随后又按「v1.5.3 那样只有
+ * 一张图」的要求，把上一版做的七张小图合成一张。理由：总览要回答的是
+ * 「这段时间的用量走势」，字段一多就要七张图并排，看的人反而要来回扫；
+ * 单张图上「哪天塌了 / 哪天暴涨」一眼可见，其余指标的走势由上面的七张
+ * 指标卡给数字，调用日志页按天筛选给精确读数。
  *
- * 每张图下方给「最新一天」的数字：图形回答形状，数字回答当下。
+ * 柱高用 token 而不是请求数：同一根柱子的悬停提示里两个都给了，而柱高只能
+ * 表达一个量 —— token 才是「用了多少资源」，请求数一句话可以多打十个短请求。
  */
-function TrendCharts({
+function UsageTrend({
   byDay,
+  days,
+  firstRecordAt,
   loading,
   error,
   onRetry,
 }: {
   byDay: UsageGroupEntry[] | null
+  days: number
+  firstRecordAt: number
   loading: boolean
   error: string
   onRetry: () => void
 }) {
   if (loading && !byDay) {
     return (
-      <div className="grid grid-cols-1 gap-4 md:grid-cols-2 xl:grid-cols-3" role="status" aria-label="趋势加载中">
-        {Array.from({ length: 6 }, (_, i) => (
-          <div key={i} className="flex flex-col gap-2">
-            <SkeletonBlock className="h-3 w-20" />
-            <SkeletonBlock className="h-16 w-full" />
-          </div>
-        ))}
+      <div className="flex flex-col gap-2" role="status" aria-label="趋势加载中">
+        <SkeletonBlock className="h-[150px] w-full" />
+        <SkeletonBlock className="h-3 w-full" />
       </div>
     )
   }
@@ -260,17 +273,11 @@ function TrendCharts({
       </Alert>
     )
   }
-  if (byDay && byDay.length === 0) {
-    return <div className="text-muted py-8 text-center text-[12.5px]">所选区间内没有调用记录</div>
-  }
 
-  // 后端给的是升序（最早在左），图形要的正是这个顺序；`latest` 取最后一根。
   const rows = byDay ?? []
-  const latest = rows.length > 0 ? rows[rows.length - 1] : null
-  const rate = (r: UsageGroupEntry) => {
-    const denom = r.ok + r.err
-    return denom > 0 ? r.ok / denom : 0
-  }
+  const buckets = buildUsageSeries({ byDay: rows, days, firstRecordAt })
+  // 最新一根柱子对应的「当天」数字：图形回答形状，数字回答现在。
+  const latestRow = rows.length > 0 ? rows[rows.length - 1] : null
 
   return (
     <>
@@ -279,81 +286,21 @@ function TrendCharts({
           {error} · 下面是上次成功的结果
         </div>
       ) : null}
-      <div className="grid grid-cols-1 gap-5 md:grid-cols-2 xl:grid-cols-3">
-        <TrendCard
-          title="请求数"
-          latest={latest ? fmtNum(latest.count) : '—'}
-          points={rows.map((r) => ({ key: r.key, value: r.count }))}
-          format={(v) => fmtNum(v)}
-        />
-        <TrendCard
-          title="Token 用量"
-          latest={latest ? fmtTokens(latest.tokens) : '—'}
-          points={rows.map((r) => ({ key: r.key, value: r.tokens }))}
-          format={(v) => fmtTokens(v)}
-          toneClass="bg-accent"
-        />
-        <TrendCard
-          title="成功率"
-          latest={latest && latest.ok + latest.err > 0 ? `${fmtPercent(rate(latest))}%` : '—'}
-          points={rows.map((r) => ({ key: r.key, value: rate(r) }))}
-          format={(v) => `${fmtPercent(v)}%`}
-          toneClass="bg-success"
-        />
-        <TrendCard
-          title="缓存命中率"
-          latest={latest && latest.cache_hit_rate > 0 ? `${fmtPercent(latest.cache_hit_rate)}%` : '—'}
-          points={rows.map((r) => ({ key: r.key, value: r.cache_hit_rate }))}
-          format={(v) => `${fmtPercent(v)}%`}
-          toneClass="bg-success"
-        />
-        <TrendCard
-          title="输出速度（tok/s）"
-          latest={latest && latest.tps > 0 ? fmtSpeed(latest.tps) : '—'}
-          points={rows.map((r) => ({ key: r.key, value: r.tps }))}
-          format={(v) => fmtSpeed(v)}
-        />
-        <TrendCard
-          title="平均首字延迟"
-          latest={latest && latest.n_ttfb > 0 ? `${fmtSec(latest.avg_ttfb_ms)}s` : '—'}
-          points={rows.map((r) => ({ key: r.key, value: r.n_ttfb > 0 ? r.avg_ttfb_ms : 0 }))}
-          format={(v) => `${fmtSec(v)}s`}
-          toneClass="bg-warning"
-        />
-        <TrendCard
-          title="生成耗时（首字之后）"
-          latest={latest && latest.n_gen > 0 ? `${fmtSec(latest.avg_gen_ms)}s` : '—'}
-          points={rows.map((r) => ({ key: r.key, value: r.n_gen > 0 ? r.avg_gen_ms : 0 }))}
-          format={(v) => `${fmtSec(v)}s`}
-          toneClass="bg-warning"
-        />
-      </div>
+      <BarChart label="用量趋势" buckets={buckets} formatTokens={fmtTokens} formatCount={fmtNum} />
+      {latestRow ? (
+        <div className="text-muted mt-3 flex flex-wrap items-center gap-x-4 gap-y-1 text-[11.5px]">
+          <span className="font-mono">{latestRow.key}</span>
+          <span>{fmtNum(latestRow.count)} 次调用</span>
+          <span>{fmtTokens(latestRow.tokens)} tokens</span>
+          <span>
+            成功率{' '}
+            {latestRow.ok + latestRow.err > 0
+              ? `${fmtPercent(latestRow.ok / (latestRow.ok + latestRow.err))}%`
+              : '—'}
+          </span>
+        </div>
+      ) : null}
     </>
-  )
-}
-
-/** 一张趋势卡：标题 + 最新值 + 柱状图。 */
-function TrendCard({
-  title,
-  latest,
-  points,
-  format,
-  toneClass,
-}: {
-  title: string
-  latest: string
-  points: { key: string; value: number }[]
-  format: (value: number) => string
-  toneClass?: string
-}) {
-  return (
-    <div>
-      <div className="mb-1.5 flex items-baseline justify-between gap-2">
-        <span className="text-[12.5px] font-medium">{title}</span>
-        <span className="font-mono text-[12.5px] tabular-nums">{latest}</span>
-      </div>
-      <BarChart label={title} points={points} format={format} toneClass={toneClass} />
-    </div>
   )
 }
 
