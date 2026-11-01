@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"math"
 	"strings"
 	"time"
 )
@@ -247,6 +248,118 @@ func (s *Store) ProbeTimeline(ctx context.Context, modelIDs []string, from, to, 
 		out = append(out, b)
 	}
 	return out, rows.Err()
+}
+
+// ProbeLatency 是一个 upstream 在窗口内的往返延迟摘要。
+type ProbeLatency struct {
+	ProviderID string
+	// Samples 是窗口内**成功**探测的样本数（失败没有往返耗时可言，
+	// 把它们算进平均值只会让一个连不上的上游看起来很快）。
+	Samples int64
+	// AvgMs / P95Ms / MaxMs 都是成功样本上的毫秒数。
+	AvgMs int64
+	P95Ms int64
+	MaxMs int64
+	// LastTs 是窗口内最近一次成功探测的时间（毫秒）。
+	LastTs int64
+}
+
+// ProbeLatencyByProvider 返回每个 upstream 在窗口内的往返延迟。
+//
+// 与 ProbeHealthSummary 的分工：那个按**模型**汇总健康态（窗口成功率、
+// 连续失败），这个按**供应商**汇总延迟 —— 供应商列表一列只有一个格子，
+// 而一个供应商下往往挂着好几个模型，逐模型显示既占宽度也不是那个位置
+// 想回答的问题（用户问的是「网关到这个供应商的网络有多快」）。
+//
+// 只统计 ok=1 的样本：失败那条的 latency_ms 是超时等待时间或 0，
+// 混进平均值后「连不上」会显示成「很快」。失败率另有健康态那一列可看。
+//
+// 窗口由调用方传毫秒；按 (provider_id, ts) 索引聚合，不需要扫全表。
+func (s *Store) ProbeLatencyByProvider(ctx context.Context, windowMs int64) (map[string]ProbeLatency, error) {
+	cutoff := time.Now().UnixMilli() - windowMs
+	rows, err := s.read.QueryContext(ctx,
+		`SELECT provider_id,
+		        COUNT(*) AS samples,
+		        COALESCE(AVG(latency_ms), 0) AS avg_ms,
+		        COALESCE(MAX(latency_ms), 0) AS max_ms,
+		        MAX(ts) AS last_ts
+		   FROM model_probes
+		  WHERE ts >= ? AND ok = 1 AND latency_ms > 0 AND provider_id <> ''
+		  GROUP BY provider_id`,
+		cutoff)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	out := make(map[string]ProbeLatency)
+	for rows.Next() {
+		var (
+			l    ProbeLatency
+			avg  sql.NullFloat64
+			last sql.NullInt64
+		)
+		if err := rows.Scan(&l.ProviderID, &l.Samples, &avg, &l.MaxMs, &last); err != nil {
+			return nil, err
+		}
+		if avg.Valid {
+			l.AvgMs = int64(math.Round(avg.Float64))
+		}
+		if last.Valid {
+			l.LastTs = last.Int64
+		}
+		out[l.ProviderID] = l
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	// P95 用窗口内的样本单独算：SQLite 没有 percentile 函数，窗口期
+	// （默认 10 分钟 × 10 = 100 分钟）内单供应商的样本量在几十条量级，
+	// 一条 ORDER BY 查询的代价可以忽略，而「平均被一两次慢请求拉平」
+	// 恰好是延迟这一列最不该犯的错。
+	for id, l := range out {
+		p95, perr := s.probeP95Latency(ctx, cutoff, id)
+		if perr != nil {
+			return nil, perr
+		}
+		l.P95Ms = p95
+		out[id] = l
+	}
+	return out, nil
+}
+
+// probeP95Latency 取某供应商窗口内成功探测延迟的第 95 百分位。
+//
+// 用 OFFSET 直接取那条样本而不是把全部延迟读进内存排序：样本量再大
+// 也只是 SQLite 内部走一遍索引，Go 侧不用为一个数字分配一个切片。
+func (s *Store) probeP95Latency(ctx context.Context, cutoff int64, providerID string) (int64, error) {
+	var n int64
+	if err := s.read.QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM model_probes
+		  WHERE ts >= ? AND ok = 1 AND latency_ms > 0 AND provider_id = ?`,
+		cutoff, providerID).Scan(&n); err != nil {
+		return 0, err
+	}
+	if n == 0 {
+		return 0, nil
+	}
+	// ceil(0.95*n) 的名次（1-based）→ OFFSET 名次-1。
+	rank := (95*n + 99) / 100
+	if rank < 1 {
+		rank = 1
+	}
+	if rank > n {
+		rank = n
+	}
+	var v int64
+	if err := s.read.QueryRowContext(ctx,
+		`SELECT latency_ms FROM model_probes
+		  WHERE ts >= ? AND ok = 1 AND latency_ms > 0 AND provider_id = ?
+		  ORDER BY latency_ms ASC LIMIT 1 OFFSET ?`,
+		cutoff, providerID, rank-1).Scan(&v); err != nil {
+		return 0, err
+	}
+	return v, nil
 }
 
 // PruneOldProbes 删除超期探测记录，返回删除行数。

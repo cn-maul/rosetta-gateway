@@ -52,9 +52,51 @@ function readyLabel(p: Provider): string {
   return p.ready === true ? '凭据就绪' : p.ready === false ? '未就绪' : '状态未知'
 }
 
-function readyTone(p: Provider): 'ok' | 'err' | 'dim' {
-  if (!p.enabled) return 'dim'
-  return p.ready === true ? 'ok' : p.ready === false ? 'err' : 'dim'
+/**
+ * 延迟胶囊的分档阈值（毫秒）。
+ *
+ * 300 / 1000 是「体感分界」而不是某家的 SLO：直连主流上游的首字通常在
+ * 一两百毫秒量级，超过 300ms 已经能感觉到慢；超过 1 秒说明这条路有问题
+ * （跨境、代理绕路或上游自己在排队），即使还能用也会拖垮整体体验。
+ * 分档只影响颜色，具体数值始终印在胶囊里 —— 颜色不是唯一线索。
+ */
+const LATENCY_OK_MS = 300
+const LATENCY_WARN_MS = 1000
+
+/** 有成功探测样本才算「测到了」；0 表示窗口内没有可用样本，界面显示「—」。 */
+function hasLatency(p: Provider): boolean {
+  return (p.latency_samples ?? 0) > 0
+}
+
+function latencyText(p: Provider): string {
+  if (!hasLatency(p)) return '—'
+  const ms = p.latency_ms ?? 0
+  // 小于 1 秒用整数毫秒，够精确且好比较；上到秒级再换单位，否则会印出
+  // 「1234 ms」这种读起来费劲的数。
+  return ms < 1000 ? `${Math.round(ms)} ms` : `${(ms / 1000).toFixed(2)} s`
+}
+
+function latencyTone(p: Provider): 'ok' | 'warn' | 'err' | 'dim' {
+  if (!hasLatency(p)) return 'dim'
+  const ms = p.latency_ms ?? 0
+  return ms <= LATENCY_OK_MS ? 'ok' : ms <= LATENCY_WARN_MS ? 'warn' : 'err'
+}
+
+/**
+ * 延迟胶囊的悬停说明：把被这一列挤掉的「配置状态」信息放在这里。
+ *
+ * 用户要的是「一列只回答一个问题」，但 ready=false 是故障信号而不是配置
+ * 状态 —— 它同时还会在下方显示一行红字原因，不会被藏进 tooltip。
+ */
+function latencyTitle(p: Provider): string {
+  const parts: string[] = []
+  parts.push(hasLatency(p) ? `平均往返 ${latencyText(p)}` : '窗口内没有成功的探测记录')
+  if (hasLatency(p)) {
+    parts.push(`P95 ${Math.round(p.latency_p95_ms ?? 0)} ms`, `${p.latency_samples} 个样本`)
+  }
+  parts.push(readyLabel(p))
+  if (p.ready === false && p.ready_reason) parts.push(p.ready_reason)
+  return parts.join(' · ')
 }
 
 function isDirectProvider(p: Provider): boolean {
@@ -296,7 +338,7 @@ export function Providers() {
                 <Table.Column isRowHeader>上游 / Endpoint</Table.Column>
                 <Table.Column>类型</Table.Column>
                 <Table.Column>网络状态</Table.Column>
-                <Table.Column>配置状态</Table.Column>
+                <Table.Column>延迟</Table.Column>
                 <Table.Column>模型 / 凭据</Table.Column>
                 <Table.Column>操作</Table.Column>
                 <Table.Column>启用</Table.Column>
@@ -328,8 +370,12 @@ export function Providers() {
                       )}
                     </Table.Cell>
                     <Table.Cell>
-                      <span title={p.ready === false ? p.ready_reason || '未建立可用凭据池，请检查凭据' : p.ready === true ? undefined : '暂未取得运行时状态'}>
-                        <StatusChip tone={readyTone(p)}>{readyLabel(p)}</StatusChip>
+                      {/* 这一格回答「网关到这个供应商的网络有多快」。
+                          配置状态搬进 title，但 ready=false（凭据没建起来）是
+                          故障而不是配置细节 —— 它在胶囊下方单独留一行红字，
+                          不能只藏在 tooltip 里。 */}
+                      <span title={latencyTitle(p)}>
+                        <StatusChip tone={latencyTone(p)}>{latencyText(p)}</StatusChip>
                       </span>
                       {p.ready === false ? (
                         <span className="text-muted mt-0.5 block max-w-[220px] truncate text-xs">

@@ -346,6 +346,9 @@ export const DTO_CONTRACTS: readonly DTOFieldContract[] = [
     "ready_reason",
     "model_count",
     "cred_count",
+    "latency_ms",
+    "latency_p95_ms",
+    "latency_samples",
   ] },
   { goType: "internal/admin.providerUpdateRequest", tsType: "ProviderUpdatePayload", fields: [
     "name",

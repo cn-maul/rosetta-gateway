@@ -54,6 +54,19 @@ export interface Provider {
    */
   model_count?: number
   cred_count?: number
+  /**
+   * latency_ms / latency_p95_ms / latency_samples 是**探针测得的**网关到该
+   * 上游的往返耗时（窗口 = probes.window_size × interval_sec，与健康判定
+   * 同一口径；单位毫秒）。
+   *
+   * latency_samples = 0 表示窗口内没有成功的探测记录（从未探测、探测全
+   * 失败、或探针功能关闭）—— 界面显示「—」而不是「0 ms」，否则「一条都
+   * 没测到」会被读成「快到测不出来」。失败样本不计入平均：连不上的那条
+   * latency 是超时等待时间，混进去会让故障上游看起来很健康。
+   */
+  latency_ms?: number
+  latency_p95_ms?: number
+  latency_samples?: number
 }
 
 // 新增上游只需这三项 + 可选 api_key；slug、启用、超时、重试由后端决定。

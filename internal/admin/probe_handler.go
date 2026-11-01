@@ -37,11 +37,18 @@ func NewProbeHandler(st *store.Store, cfg *config.Config) *ProbeHandler {
 // window_size 是 10 —— 管理面展示与探测器判定的窗口从一开始就不同。
 // cfg 为 nil（仅测试构造）时保留旧默认，避免把测试辅助函数全部改签名。
 func (h *ProbeHandler) probeWindowMs() int64 {
-	if h.cfg == nil {
+	return probeWindowMs(h.cfg)
+}
+
+// probeWindowMs 是上一条的包级实现，供不在 ProbeHandler 上的调用方复用
+// （供应商列表的延迟列要用**同一个**窗口 —— 两处各写一份，改配置后
+// 健康态与延迟就会按不同时间范围统计，而界面上它们挨着显示）。
+func probeWindowMs(cfg *config.Config) int64 {
+	if cfg == nil {
 		return int64(time.Hour / time.Millisecond)
 	}
-	interval := h.cfg.Probes.IntervalSec
-	window := h.cfg.Probes.WindowSize
+	interval := cfg.Probes.IntervalSec
+	window := cfg.Probes.WindowSize
 	if interval <= 0 {
 		interval = 600
 	}
