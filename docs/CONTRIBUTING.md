@@ -103,9 +103,9 @@ CI 的 `webui-sync` job 会拦这个（重新构建一遍，与入库产物比�
 CRLF 会让产物 hash 与 CI 上算出的不一致，触发 webui-sync 红灯。
 改完前端用 `git diff --check` 确认没有 CRLF。
 
-> 例外：`DOCKER.md` 是仓库里**唯一**以 CRLF 入库的 Markdown（历史原因）。
-> 对它执行 `git diff --check` 会报「每行末尾有 CR」，**这条可以接受** ——
-> 转 LF 会产生数百行纯换行符噪声。曾尝试加 `.gitattributes` 修正，已撤销。
+> `DOCKER.md` 曾是仓库里唯一以 CRLF 入库的 Markdown（历史原因）。
+> 2026-11-01 文档整理时已统一到 `docs/DOCKER.md` 并转成 LF；现在所有
+> Markdown 都应通过 `git diff --check`。
 
 ### TypeScript 钉在 6.x，不要升到 7.x
 

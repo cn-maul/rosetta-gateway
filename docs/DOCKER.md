@@ -2,11 +2,11 @@
 
 镜像：`ghcr.io/cn-maul/rosetta-gateway`
 
-**镜像版本号 = 软件版本号**，两者都取自 `web/package.json` 的 `version`（当前 **1.6.8**）。
-发布 `v1.6.8` tag 会得到 `:1.6.8` 与 `:latest` 两个标签；CI 会校验 tag 与
+**镜像版本号 = 软件版本号**，两者都取自 `web/package.json` 的 `version`（当前 **2.0.0**）。
+发布 `v2.0.0` tag 会得到 `:2.0.0` 与 `:latest` 两个标签；CI 会校验 tag 与
 `package.json` 一致，不一致直接构建失败（防止打出名不副实的镜像）。
 
-> 下文示例中的 `:1.6.8` 是**编写时的当前版本**。实际部署请先 `docker pull ghcr.io/cn-maul/rosetta-gateway:1.6.8`
+> 下文示例中的 `:2.0.0` 是**编写时的当前版本**。实际部署请先 `docker pull ghcr.io/cn-maul/rosetta-gateway:2.0.0`
 > 确认该 tag 存在，或直接用 `:latest`。
 
 架构：`linux/amd64`（`docker.yml` 的 buildx 只构建这一种；需要 arm64 再说）。
@@ -22,7 +22,7 @@ docker run -d \
   -p 127.0.0.1:8666:8666 \
   -v rosetta-gateway-data:/data \
   --restart unless-stopped \
-  ghcr.io/cn-maul/rosetta-gateway:1.6.8
+  ghcr.io/cn-maul/rosetta-gateway:2.0.0
 ```
 
 然后打开 `http://127.0.0.1:8666/admin/` —— 首次进入会显示「首次设置密码」表单，
@@ -176,7 +176,7 @@ Chrome / Edge / Brave / Opera 一律硬拦；Firefox 也拦，只是报错文案
 ```yaml
 services:
   rosetta-gateway:
-    image: ghcr.io/cn-maul/rosetta-gateway:1.6.8
+    image: ghcr.io/cn-maul/rosetta-gateway:2.0.0
     container_name: rosetta-gateway
     restart: unless-stopped
     # 正常关停的名义预算是 26s（剪枝 5s + 费用重算 2s + 对账 2s +
@@ -367,19 +367,14 @@ docker run --rm -v rosetta-gateway-data:/data -v "$PWD:/backup" alpine sh -c '
 docker compose pull && docker compose up -d
 ```
 
-**v1.6.6 → v1.6.7 可以直接原地升级。** 这一版只给 `usage_records` 增加
-`provider_name` 与 `upstream_protocol` 两个可空列，启动时会做纯新增迁移，
-不改写或删除已有数据。旧调用记录没有这两个字段，界面会回退显示 `provider_id`
-并标注「名称未固化」；升级后新产生的记录才会固化当时的实际上游名与上下游协议。
+**v1.7.2 → v2.0.0 可以直接原地升级。** 这一版把管理界面从 Vue 重写为
+React，并新增站点品牌、协议探测、导入导出 v4、请求诊断字段和网络测速记录。
+SQLite 启动时会原地补齐新表与新列，已有配置、用户、密钥、路由、余额和
+历史用量都会保留。升级前仍应按上面的步骤完整备份 `/data`。
 
-**v1.6.7 → v1.6.8 可以直接原地升级。** 这一版只调整请求日志展示：合并重复的
-上游列、在故障转移时直接展示 `A → B` 路径，并把 Token 明细中的“输入”改为
-“新增输入”（输入总量扣除缓存命中与缓存写入）。数据库结构与配置格式不变。
-
-**v1.6.8 → v1.7.1 可以直接原地升级。** 这一版会为用量明细纯新增
-`provider_name`、`upstream_protocol` 与记账重试状态列，并新增
-`quota_reservation_leases`；已有配置、余额、密钥和历史用量都会保留。
-升级前请按上面的步骤完整备份 `/data`。
+> 导入导出文件**不跨版本兼容**：1.7.2 的 v3 导出不能导入 2.0.0，2.0.0 的
+> v4 导出也不能导入 1.7.2。跨版本迁移请备份并替换整个 `/data`，不要把
+> 导出文件当作数据库备份。
 
 ## 以非 root 运行（2026-10-07 起）
 

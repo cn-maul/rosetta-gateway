@@ -27,7 +27,7 @@ type Config struct {
 	// 同时满足，所以把格式做成配置项，而不是替用户猜。
 	//
 	// auto（缺省）= stdout 是字符设备（交互终端）就用 text，否则用 json。
-	// 这条缺省刻意保住既有契约：容器里 stdout 是管道 → 仍然是 JSON，DOCKER.md
+	// 这条缺省刻意保住既有契约：容器里 stdout 是管道 → 仍然是 JSON，docs/DOCKER.md
 	// 的 jq 示例、DESIGN §8.4 的「所有字段可按 JSON 检索聚合」都不失效；
 	// 而双击/前台运行时得到的是人能读的行。
 	LogFormat    string `json:"log_format"`
@@ -366,7 +366,7 @@ func (c *Config) setDefaults() {
 		// 此时绑 0.0.0.0 等于把「抢先完成首次设置密码」的权利交给局域网里第一个访问者。
 		// 要对外服务就显式改成 0.0.0.0:<port>（启动日志会打印实际监听地址）。
 		// 端口用 8666：与 Docker 侧对齐，且避开浏览器保留端口表（6666 是 IRC 段，
-		// 浏览器会直接 ERR_UNSAFE_PORT，见 ports.go 黑名单与 DOCKER.md）。
+		// 浏览器会直接 ERR_UNSAFE_PORT，见 ports.go 黑名单与 docs/DOCKER.md）。
 		c.Listen = "127.0.0.1:8666"
 	}
 	if c.DBPath == "" {

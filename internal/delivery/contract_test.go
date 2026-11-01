@@ -139,11 +139,11 @@ func TestR12M1803LauncherOnlyStopsVerifiedProcesses(t *testing.T) {
 }
 
 func TestR12M1804ComposePersistsWholeStateDirectory(t *testing.T) {
-	docker := readRepoFile(t, "DOCKER.md")
+	docker := readRepoFile(t, "docs/DOCKER.md")
 	compose := composeBlock(t, docker)
-	requireContains(t, "DOCKER.md compose example", compose,
+	requireContains(t, "docs/DOCKER.md compose example", compose,
 		"- ./rosetta:/data")
-	requireNotContains(t, "DOCKER.md compose example", compose,
+	requireNotContains(t, "docs/DOCKER.md compose example", compose,
 		"./rosetta/master.key:/data/master.key",
 		"./rosetta/session_secret:/data/session_secret")
 }
@@ -153,7 +153,7 @@ func composeBlock(t *testing.T, docker string) string {
 	const start = "## docker compose"
 	i := strings.Index(docker, start)
 	if i < 0 {
-		t.Fatal("DOCKER.md is missing the docker compose section")
+		t.Fatal("docs/DOCKER.md is missing the docker compose section")
 	}
 	rest := docker[i+len(start):]
 	if j := strings.Index(rest, "\n## "); j >= 0 {
@@ -200,16 +200,16 @@ func requireShortGuard(t *testing.T, file, source, testName string) {
 }
 
 func TestR12M2004DesignPointsAtLocalRaceSetup(t *testing.T) {
-	design := readRepoFile(t, "DESIGN.md")
-	requireContains(t, "DESIGN.md", design,
+	design := readRepoFile(t, "docs/DESIGN.md")
+	requireContains(t, "docs/DESIGN.md", design,
 		"CONTRIBUTING.md")
-	requireNotContains(t, "DESIGN.md", design,
+	requireNotContains(t, "docs/DESIGN.md", design,
 		"`-race` 本机不可用 | Windows 开发机无 gcc")
 }
 
 func TestR12M2001BudgetContractStillPassesR12(t *testing.T) {
-	docker := readRepoFile(t, "DOCKER.md")
-	requireContains(t, "DOCKER.md", docker,
+	docker := readRepoFile(t, "docs/DOCKER.md")
+	requireContains(t, "docs/DOCKER.md", docker,
 		"正常关停的名义预算是 26s",
 		"上界为 30s",
 		"stop_grace_period: 31s")

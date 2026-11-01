@@ -25,8 +25,8 @@ import {
  * 的 price 页签）。价格挂在「供应商的模型」上 —— 同一个 model_id 在不同
  * 供应商下的实际结算价可能不同。
  *
- * U2 拆分（docs/frontend-ux-overhaul-plan.md §U2-price）：弹窗在 price/ 子目录；
- * 供应商 ≥ PRICE_PROVIDER_GATE 时先选供应商再看列表（首屏只渲染一家的条目）。
+ * 弹窗在 price/ 子目录；供应商数量达到门限时先选供应商再看列表
+ * （首屏只渲染一家的条目）。
  */
 export function PriceSettings({ refreshSignal }: { refreshSignal: number }) {
   const [providers, setProviders] = useState<Provider[]>([])

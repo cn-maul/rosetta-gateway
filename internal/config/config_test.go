@@ -88,12 +88,12 @@ func TestR2_DeploymentDocsMatchEffectiveContracts(t *testing.T) {
 		return string(data)
 	}
 
-	docker := read("DOCKER.md")
+	docker := read("docs/DOCKER.md")
 	if !strings.Contains(docker, "非空的 `config.json.timezone` 最高") {
-		t.Fatal("DOCKER.md must document config timezone as the final override")
+		t.Fatal("docs/DOCKER.md must document config timezone as the final override")
 	}
 	if !strings.Contains(docker, "`usage_retention_days` 到期后") {
-		t.Fatal("DOCKER.md must describe retention as configurable, not fixed at 30 days")
+		t.Fatal("docs/DOCKER.md must describe retention as configurable, not fixed at 30 days")
 	}
 
 	readme := read("README.md")
@@ -102,9 +102,9 @@ func TestR2_DeploymentDocsMatchEffectiveContracts(t *testing.T) {
 		t.Fatal("README.md must describe 30 days as a configurable default")
 	}
 
-	design := read("DESIGN.md")
+	design := read("docs/DESIGN.md")
 	if !strings.Contains(design, "写 `0` 或 `-1` 都显式关闭剪枝") {
-		t.Fatal("DESIGN.md must document 0 and -1 as disabling audit pruning")
+		t.Fatal("docs/DESIGN.md must document 0 and -1 as disabling audit pruning")
 	}
 }
 

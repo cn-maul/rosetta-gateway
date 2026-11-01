@@ -44,6 +44,42 @@ func seedProbeNetwork(t *testing.T, st *store.Store, id string) {
 	}
 }
 
+func seedProbeModel(t *testing.T, st *store.Store) {
+	t.Helper()
+	ctx := context.Background()
+	now := time.Now().UnixMilli()
+	if _, err := st.DB().ExecContext(ctx,
+		`INSERT INTO providers (id, slug, name, protocol, endpoint, enabled, created_at, updated_at)
+		 VALUES (?, ?, ?, ?, ?, 1, ?, ?)`,
+		"p1", "p1", "p1", "chat", "http://127.0.0.1:1/v1", now, now); err != nil {
+		t.Fatalf("insert provider: %v", err)
+	}
+	if err := st.CreateUpstreamModel(ctx, &store.UpstreamModel{
+		ID: "m1", ProviderID: "p1", ModelID: "model",
+	}); err != nil {
+		t.Fatalf("create model: %v", err)
+	}
+}
+
+func TestRunOnce_ProbesEachNetworkExactlyOnce(t *testing.T) {
+	r, st := newProbeRunner(t)
+	seedProbeModel(t, st)
+	seedProbeNetwork(t, st, "n1")
+	r.stagger = time.Nanosecond
+
+	var calls int32
+	r.proxyProbe = func(_ context.Context, _ string) (int64, error) {
+		atomic.AddInt32(&calls, 1)
+		return 5, nil
+	}
+
+	r.runOnce(context.Background())
+
+	if got := atomic.LoadInt32(&calls); got != 1 {
+		t.Fatalf("一轮应只测一次代理，实际调用 %d 次", got)
+	}
+}
+
 func TestProbeNetworks_RecordsSuccessAndLatency(t *testing.T) {
 	r, st := newProbeRunner(t)
 	ctx := context.Background()

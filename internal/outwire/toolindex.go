@@ -17,8 +17,8 @@ package outwire
 // `ch.Index` 写进 `Event.ToolIndex`），于是网关出站层拿到的 ToolIndex
 // **是上游那一套编号**。
 //
-// 后果（2026-10-20 的全量审计用真实上游复现过；原始取证报告已从工作树清理，
-// 需要时从 git 历史里取 `docs/audit-2026-10-20/A3-outwire.md`）：
+// 后果（2026-10-20 的全量审计用真实上游复现过；现行规则见
+// `docs/DESIGN.md` §7）：
 // Anthropic 上游 → OpenAI Chat 下游时，第一个工具调用下发的是
 // `index: 1`（因为 Anthropic 的文本块占了 0）。OpenAI 客户端的常规合并
 // 逻辑是「按 index 归并 tool_call」，于是它的 tool_call 数组第 0 位

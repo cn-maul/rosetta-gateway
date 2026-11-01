@@ -193,13 +193,6 @@ func (r *Runner) runOnce(ctx context.Context) {
 	// 通不通，再看代理通不通）。
 	r.probeNetworks(ctx, timeout)
 
-	// 代理测速跟着同一轮跑：它不打上游、不计费，一次 generate_204 的
-	// 代价远小于一次推理，所以不需要独立周期 —— 独立周期只会让两套
-	// 定时器在界面上显示的时间戳互相错开几分钟，看起来像「有的一直
-	// 没测」。放在模型探测之后，顺序也符合排障时的因果链（先看模型
-	// 通不通，再看代理通不通）。
-	r.probeNetworks(ctx, timeout)
-
 	// 顺带剪枝超期探测记录（保留期独立配置）。
 	if ctx.Err() == nil && r.cfg.Probes.RetentionDays > 0 {
 		if n, err := r.store.PruneOldProbes(ctx, r.cfg.Probes.RetentionDays); err != nil {

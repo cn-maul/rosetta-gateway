@@ -8,9 +8,9 @@ import (
 )
 
 func TestR1_DeploymentShutdownBudgetMatchesLifecycleConstant(t *testing.T) {
-	raw, err := os.ReadFile("../../DOCKER.md")
+	raw, err := os.ReadFile("../../docs/DOCKER.md")
 	if err != nil {
-		t.Fatalf("read DOCKER.md: %v", err)
+		t.Fatalf("read docs/DOCKER.md: %v", err)
 	}
 	doc := string(raw)
 	budget := DefaultShutdownBudget()
@@ -21,7 +21,7 @@ func TestR1_DeploymentShutdownBudgetMatchesLifecycleConstant(t *testing.T) {
 	}
 	for _, want := range checks {
 		if !strings.Contains(doc, want) {
-			t.Fatalf("DOCKER.md does not contain %q", want)
+			t.Fatalf("docs/DOCKER.md does not contain %q", want)
 		}
 	}
 }

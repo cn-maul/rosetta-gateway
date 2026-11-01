@@ -11,7 +11,7 @@ import (
 
 // log_format 的判定表。
 //
-// 重点在 auto 的两支：容器里 stdout 是管道 → 必须是 json（DOCKER.md 的
+// 重点在 auto 的两支：容器里 stdout 是管道 → 必须是 json（docs/DOCKER.md 的
 // jq 用法、DESIGN §8.4 的「按 JSON 检索聚合」都建立在这条上）；
 // 终端里 → text，人能直接读。
 func TestResolveLogFormat(t *testing.T) {

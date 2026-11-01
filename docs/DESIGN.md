@@ -7,9 +7,9 @@
 | module path | `github.com/cn-maul/rosetta-gateway` |
 | 运行时依赖 | `github.com/cn-maul/rosetta` v1.2.1（上游 SDK）、`modernc.org/sqlite`（纯 Go SQLite）、`github.com/golang-jwt/jwt/v5`（管理会话） |
 | 工具链 | **Go 1.27.3 起**（`go.mod` 的 `go` 指令是唯一来源，CI 用 `go-version-file` 读取；1.27.3 之前的版本带已知安全漏洞，不得使用，本地也勿用更早的 1.27.x）。镜像构建固定 `golang:1.27.3-alpine3.24` 的 digest，并设 `GOTOOLCHAIN=local`，版本不足时构建直接失败，不会静默下载其他工具链 |
-| 版本 | 与 `web/package.json` 同源（当前 1.6.8），镜像与二进制共用 |
+| 版本 | 与 `web/package.json` 同源（当前 2.0.0），镜像与二进制共用 |
 | 状态 | **已实现**（P0–P3 全部落地，多用户、用量归档、配置导入导出均已上线） |
-| 更新 | 2026-10-24 |
+| 更新 | 2026-11-01 |
 
 ---
 
@@ -1482,7 +1482,7 @@ AES-256-GCM 密文。无主密钥、密文损坏、主密钥不匹配或历史�
 modernc SQLite 的 `'localtime'` 在 Linux 上走 C 的 `tzset`（只认 `TZ`），
 Windows 上才跟 `time.Local`，**只设一个会跨平台失效**（第一版修复就是这么
 在 CI 上翻车的）。空串 = 沿用进程现有时区。它决定总览日趋势、钱包页按天消耗、
-用量归档的日界三处，配错的症状是「过了 0 点按天数据不切日」，详见 DOCKER.md。
+用量归档的日界三处，配错的症状是「过了 0 点按天数据不切日」，详见 [DOCKER.md](DOCKER.md)。
 
 **`probes`（2026-10-14 新增，连通率探测）**：定时对上游模型发最小真实推理
 （`max_tokens=1`、不走 usage_recorder，**不扣网关用户的钱**，但上游侧照常计费
@@ -1490,7 +1490,10 @@ Windows 上才跟 `time.Local`，**只设一个会跨平台失效**（第一版�
 **默认开**（只有显式 `enabled:false` 才关闭；对象存在但缺省 `enabled`
 时仍按 true 处理）——
 用户明确要这个功能。其余默认值：间隔 600s、超时 30s、并发 4、连续 3 次失败判 down、
-窗口 10 次、成功率阈值 0.8、探测记录保留 30 天。
+窗口 10 次、成功率阈值 0.8、探测记录保留 30 天。每轮同一调度还对各出站网络做一次
+`generate_204` 连通性测速，写 `network_probes`，同样不碰冷却/熔断。
+**每轮每个模型恰好一次、每个网络恰好一次**；停用整个功能要写
+`"probes":{"enabled":false}`，而不是依赖对象缺省。
 两个必须说清的边界：探测**绝不写 pool 的冷却/熔断**（隔离红线，见
 `internal/probe/runner.go` 与 `store.go` 的建表注释）—— 否则「探测不通」会
 被放大成「上游整体不可用」；它也不是 `/admin/api/usage` 的一部分，与配额
@@ -1526,7 +1529,7 @@ web 设置页的 `RUNTIME_DEFAULTS`（`web/src/generated/defaults.ts`）——
 
 **关于 `listen`**：默认（含程序自动生成的配置）是 `127.0.0.1:8666` —— 端口与
 Docker 侧对齐，且避开浏览器的保留端口表（6666 是 IRC 段，浏览器会直接
-`ERR_UNSAFE_PORT`，黑名单见 `internal/config/ports.go`，完整讨论见 DOCKER.md）。
+`ERR_UNSAFE_PORT`，黑名单见 `internal/config/ports.go`，完整讨论见 [DOCKER.md](DOCKER.md)）。
 网关对外提供 `/v1` 是常态，但**首次启动时第一个管理员的密码还没设**，
 此时绑 `0.0.0.0` 等于把「抢先完成首次设置密码」的权利交给局域网里第一个访问 `/admin/` 的人。
 要对外服务就显式改成 `0.0.0.0:<port>` —— 启动日志会打印实际监听地址，
@@ -1552,7 +1555,7 @@ Docker 侧对齐，且避开浏览器的保留端口表（6666 是 IRC 段，浏
 
 `go:embed` 打包静态资源（`internal/webui/dist`），`web/` 下是 **React 19 + Vite + TS + HeroUI** 工程，`fetch` 调 `/admin/api/*`。
 
-> 历史沿革：早期是单个 `index.html` 内联全部逻辑，理由写的是「内网管理页不超过 8 个，引入框架收益不成比例」，并预设了升级边界「一旦出现多页 + 复杂表单联动 + 图表就换框架」。边界随后真的被触发了（六页 + 表单弹窗 + 图表），于是按当初的约定引入框架（Vue 3）；2026-10 前端整体重写为 React 19 + HeroUI（页签/表格/表单弹窗组件化，路由 react-router，数据获取走 loader/useRevalidator，迁移记录见 docs/react-migration-handoff.md 与 docs/frontend-react-migration-plan.md）。构建链：`cd web && npm run build && npm run sync`（`sync` 把产物同步进 `internal/webui/dist` 供 embed），`gateway.ps1` 已编排。
+> 历史沿革：早期是单个 `index.html` 内联全部逻辑，理由写的是「内网管理页不超过 8 个，引入框架收益不成比例」，并预设了升级边界「一旦出现多页 + 复杂表单联动 + 图表就换框架」。边界随后真的被触发了（六页 + 表单弹窗 + 图表），于是按当初的约定引入框架（Vue 3）；2026-10 前端整体重写为 React 19 + HeroUI（页签/表格/表单弹窗组件化，路由 react-router，数据获取走 loader/useRevalidator）。构建链：`cd web && npm run build && npm run sync`（`sync` 把产物同步进 `internal/webui/dist` 供 embed），`gateway.ps1` 已编排。
 >
 > **CI 会校验产物同步**（`.github/workflows/ci.yml`，2026-10-02 起）：push/PR 时重新
 > `npm build + sync` 一遍，与入库的 `internal/webui/dist` 做 `git diff --exit-code`，
@@ -1735,10 +1738,7 @@ Docker 侧对齐，且避开浏览器的保留端口表（6666 是 IRC 段，浏
 ```
 rosetta-gateway/
 ├── README.md                       项目门面：简介、快速开始、文档索引
-├── DESIGN.md                       本文件
-├── MULTIUSER.md                    多用户 / 分组 / 权限模型（§6.3 的展开；历史归档）
-├── DOCKER.md                       容器化部署
-├── CONTRIBUTING.md                 开发环境与协作约定（本机 -race 的 CC、sync-embed、TS 上界）
+├── AGENTS.md                       代理工具与本地代码索引说明
 ├── config.example.json             配置样例（config.json 本身不入库）
 ├── Dockerfile                      两段式（golang:1.27.3-alpine 构建 → alpine 运行），CGO_ENABLED=0
 ├── build.ps1                       纯编译脚本：前端构建 + go build → bin\gateway.exe
@@ -1751,13 +1751,11 @@ rosetta-gateway/
 │   ├── check-repo-hygiene.ps1      push 前本地守卫：索引里不许有 exe/db/密钥/数据，
 │   │                               外加 .gitignore 防线自检（只读，不改任何文件）
 │   └── authz_probe/                鉴权矩阵取证（dbdump 与 probe.ps1）
-├── docs/                           过程记录（文档地图见 docs/README.md）
-│   ├── react-migration-handoff.md  前端现行交接单：现状、纪律、环境坑、验证命令
-│   ├── frontend-react-migration-plan.md  Vue→React 迁移总方案
-│   ├── frontend-ux-overhaul-plan.md 信息架构与性能整改（已实施）
-│   ├── api-audit-2026-10-31.md     管理面接口审计（13 条已修 + 判定不做项）
-│   ├── audit-2026-10-22.md         2026-10-20 全量审计与 10-21/22 修复复核
-│   └── audit-history.md            四轮审计索引（含已清理报告的取回方式）
+├── docs/                           项目文档（文档地图见 docs/README.md）
+│   ├── DESIGN.md                   本文件：架构、数据模型与契约
+│   ├── DOCKER.md                   容器化部署：镜像、挂载、日志、升级
+│   ├── CONTRIBUTING.md             开发环境与协作约定
+│   └── MULTIUSER.md                多用户 / 分组 / 权限模型（历史归档）
 ├── .github/
 │   └── workflows/
 │       ├── ci.yml                  go / webui-sync / -race / repo-hygiene 四道门禁
@@ -1913,7 +1911,7 @@ rosetta-gateway/
 
 | 取舍 | 说明 | 影响与兜底 |
 |---|---|---|
-| 全链路无 TLS | 定位是局域网网关，设计上不做传输加密 | 对外暴露由部署层解决（反向代理终结 TLS，见 DOCKER.md） |
+| 全链路无 TLS | 定位是局域网网关，设计上不做传输加密 | 对外暴露由部署层解决（反向代理终结 TLS，见 [DOCKER.md](DOCKER.md)） |
 | 删库 = 失明 | 身份、配额、路由、key 全部绑在同一个 SQLite 文件上（§12.1） | 不可重建的身份状态只有 `master.key` 与 `session_secret` 两把密钥，独立于库存放；删库后重新走首次初始化 |
 | `audit.actor` 恒为 "admin" | `WriteAuditor` 回调未透传会话身份，普通用户对自己资源的写操作也落 "admin" 记录 | **刻意不修**（2026-10 决策）：审计无 UI 入口，唯一消费方式是运维直接调 API 取证，单管理员场景下不影响取证。修法需改 `WriteAuditor` 签名并波及全部调用点 |
 | 配额预占 est 是预估值 | 预占含 `max_tokens` 全额，请求收尾按真实 usage 退预占；上游不回 usage 时退预占、漏账以 `usage_state="missing"` 显形（§11.1/§11.2） | 在途瞬间不精确，终态正确；漏账可从界面察觉 |

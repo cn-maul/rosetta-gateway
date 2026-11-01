@@ -61,7 +61,7 @@ docker run -d \
 表单只要求设置管理员密码，不需要任何额外令牌。完成引导的端点在设密前是免鉴权的，
 因此部署后应**立即**打开 `/admin/` 完成设置；局域网内能访问该端口的人在该窗口内
 都可以抢先初始化。窗口只开一次，设完即永久关闭。容器部署的目录布局、挂载方式与
-升级流程见 [DOCKER.md](DOCKER.md)。
+升级流程见 [docs/DOCKER.md](docs/DOCKER.md)。
 
 普通用户同样不由系统开放注册。管理员在「用户与权限」中新建普通用户时把初始密码
 留空，界面会生成一条一次性设密链接；把链接发给本人后，对方打开
@@ -111,7 +111,7 @@ go build -o gateway ./cmd/gateway
 ```
 
 配置文件不是必需的（有零配置默认值）；需要引导上游时参考
-[config.example.json](config.example.json) 与 [DESIGN.md](DESIGN.md) §12。
+[config.example.json](config.example.json) 与 [docs/DESIGN.md](docs/DESIGN.md) §12。
 所有相对路径锚在状态目录（默认可执行文件同目录，`ROSETTA_GW_HOME` 可重定向）：
 
 ```
@@ -163,20 +163,17 @@ OpenAI 系客户端；额度查询端点（`/dashboard/billing/*`、`/v1/organiz
   全链路生效。
 - **上游凭据**：AES-256-GCM 加密落库，主密钥独立于数据库存放——
   **`master.key` 丢失 = 上游凭据全部作废，请把状态目录当关键资产持久化**。
-- **传输**：网关自身不做 TLS，对外暴露请前置反向代理（见 [DESIGN.md](DESIGN.md) 附录 C）。
+- **传输**：网关自身不做 TLS，对外暴露请前置反向代理（见 [docs/DESIGN.md](docs/DESIGN.md) 附录 C）。
 
 ## 文档
 
 | 文档 | 内容 |
 |---|---|
-| [DESIGN.md](DESIGN.md) | 设计文档：架构、数据模型、路由、配额、故障转移、协议转换、配置 |
-| [MULTIUSER.md](MULTIUSER.md) | ⚠️ **历史归档**（冻结于 2026-10-07）：多用户 / 分组 / 权限模型的设计记录。保留是因为代码与 DESIGN.md 中有多处注释以它的章节号为锚点（`§5.1` / `§4.3` / `§4.8` 等） |
-| [DOCKER.md](DOCKER.md) | 容器化部署：镜像、挂载、日志、升级、健康检查 |
-| [CONTRIBUTING.md](CONTRIBUTING.md) | 开发环境与协作约定：本机 `-race` 的 CC 陷阱、纯 Go 交叉编译、代理与 SSH、`sync-embed`、TS 版本上界、代码风格 |
-| [docs/README.md](docs/README.md) | **文档地图**：哪份有效、哪份只是历史，以及历史报告从 git 历史取回的方式 |
-
-前端（`web/`，React 19 + HeroUI）另有一组过程文档，入口是
-[docs/react-migration-handoff.md](docs/react-migration-handoff.md)（现状、纪律、环境坑、验证命令）。
+| [docs/README.md](docs/README.md) | **文档地图**：所有文档的用途与更新时机 |
+| [docs/DESIGN.md](docs/DESIGN.md) | 设计文档：架构、数据模型、路由、配额、故障转移、协议转换、配置 |
+| [docs/DOCKER.md](docs/DOCKER.md) | 容器化部署：镜像、挂载、日志、升级、健康检查 |
+| [docs/CONTRIBUTING.md](docs/CONTRIBUTING.md) | 开发环境与协作约定：本机 `-race` 的 CC 陷阱、纯 Go 交叉编译、代理与 SSH、`sync-embed`、TS 版本上界、代码风格 |
+| [docs/MULTIUSER.md](docs/MULTIUSER.md) | ⚠️ **历史归档**（冻结于 2026-10-07）：多用户 / 分组 / 权限模型的设计记录。保留是因为代码与设计文档中有多处注释以它的章节号为锚点（`§5.1` / `§4.3` / `§4.8` 等） |
 
 仓库里还有两个本机脚本（不进文档表格，Windows 开发用）：`build.ps1`
 （纯编译，产物 `bin\gateway.exe`）与 `gateway.ps1`（编译 + 启动/停止，
@@ -200,5 +197,5 @@ Windows 上一键做同样的事：`.\build.ps1`（`-NoWeb` 跳过前端、`-Typ
 `-Stop` 停止。产物是 `bin\gateway.exe`，配置自动落在它同级的 `bin\config.json`。
 
 提交前请跑全量测试；改动转发热路径（配额/限速/故障转移/落库）时，先读
-[DESIGN.md](DESIGN.md) 对应小节的决策留痕——那里的多数「为什么」都对应一次真实踩坑。
-本机特有的环境坑（`-race` 需要显式 CC 等）见 [CONTRIBUTING.md](CONTRIBUTING.md)。
+[docs/DESIGN.md](docs/DESIGN.md) 对应小节的决策留痕——那里的多数「为什么」都对应一次真实踩坑。
+本机特有的环境坑（`-race` 需要显式 CC 等）见 [docs/CONTRIBUTING.md](docs/CONTRIBUTING.md)。
