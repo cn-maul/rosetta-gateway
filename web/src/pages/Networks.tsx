@@ -2,12 +2,13 @@ import { useCallback, useState } from 'react'
 import { useLoaderData, useRevalidator, type LoaderFunctionArgs } from 'react-router-dom'
 import { Button, Table, TextField, Input, Label, toast } from '@heroui/react'
 import { api } from '../api'
+import { fmtTimeMs } from '../fmt'
 import { confirmBox } from '../ui/confirm'
 import { AppModal } from '../ui/AppModal'
 import { DataTable } from '../ui/DataTable'
 import { PageHeader } from '../ui/PageHeader'
 import { StatusChip, type StatusTone } from '../ui/StatusChip'
-import type { Network, NetworkTestResult } from '../types'
+import type { Network } from '../types'
 
 /**
  * 出站网络（管理员）：跨上游共用的代理地址清单（语义对齐旧 Networks.vue）。
@@ -33,17 +34,53 @@ function is401(e: unknown): boolean {
   return (e as { status?: number }).status === 401
 }
 
-// 连通性结果只保留在当前页面会话：它描述的是「刚才那次测试」，不是配置本身。
-interface TestState {
-  pending: boolean
-  result: NetworkTestResult | null
+// 2026-11-01：连通性不再靠「测试」按钮，改由探针后台定期测速（与供应商
+// 延迟列同一个窗口、同一张表的口径）。界面因此只读后端给的摘要，页面自己
+// 不再持有任何「刚才那次测试」的临时状态 —— 那样关掉页面就丢失，而代理坏
+// 掉通常恰恰发生在没人盯着这个页面的时候。
+const LATENCY_OK_MS = 300
+const LATENCY_WARN_MS = 1000
+
+/** 有成功样本才算「测到了」；0 表示窗口内没有可用样本，界面显示「—」。 */
+function hasLatency(n: Network): boolean {
+  return (n.latency_samples ?? 0) > 0
 }
 
-function testVisual(state: TestState | undefined): { tone: StatusTone; label: string; title?: string } {
-  if (!state) return { tone: 'dim', label: '未测试' }
-  if (state.pending) return { tone: 'warn', label: '测试中…' }
-  if (state.result?.status === 'ok') return { tone: 'ok', label: `正常 · ${state.result.latency_ms}ms` }
-  return { tone: 'err', label: '失败', title: state.result?.message }
+function latencyText(n: Network): string {
+  if (!hasLatency(n)) return '—'
+  const ms = n.latency_ms ?? 0
+  return ms < 1000 ? `${Math.round(ms)} ms` : `${(ms / 1000).toFixed(2)} s`
+}
+
+function latencyTone(n: Network): StatusTone {
+  // 没有成功样本时不能一律 dim：最近一次就失败的代理必须显红，否则「测不
+  // 通」和「没测过」在列表上是同一个灰点。
+  if (!hasLatency(n)) return n.last_probe_at && n.last_probe_ok === false ? 'err' : 'dim'
+  const ms = n.latency_ms ?? 0
+  return ms <= LATENCY_OK_MS ? 'ok' : ms <= LATENCY_WARN_MS ? 'warn' : 'err'
+}
+
+function latencyTitle(n: Network): string {
+  const parts: string[] = []
+  if (hasLatency(n)) {
+    parts.push(`平均往返 ${latencyText(n)}`)
+    parts.push(`P95 ${Math.round(n.latency_p95_ms ?? 0)} ms`, `${n.latency_samples} 个样本`)
+  } else if (!n.last_probe_at) {
+    parts.push('还没有探测记录（探针按 probes.interval_sec 定时测速）')
+  } else {
+    parts.push('窗口内没有成功的探测记录')
+  }
+  if (n.last_probe_at) {
+    parts.push(`最近一次 ${n.last_probe_ok ? '成功' : '失败'} · ${fmtTimeMs(n.last_probe_at)}`)
+  }
+  if (n.last_probe_error) parts.push(n.last_probe_error)
+  return parts.join(' · ')
+}
+
+/** 失败原因单独露出一行：只藏在 tooltip 里等于看不见。 */
+function probeErrorLine(n: Network): string {
+  if (n.last_probe_at && n.last_probe_ok === false && n.last_probe_error) return n.last_probe_error
+  return ''
 }
 
 export function Networks() {
@@ -52,15 +89,6 @@ export function Networks() {
 
   // 刷新/变更后的重读：交给 revalidator 重跑 loader；错误信息也随 loader 返回。
   const reload = useCallback(() => void revalidator.revalidate(), [revalidator])
-
-  const [testStates, setTestStates] = useState<Record<string, TestState>>({})
-  const setTest = (id: string, state: TestState | undefined) =>
-    setTestStates((prev) => {
-      const next = { ...prev }
-      if (state === undefined) delete next[id]
-      else next[id] = state
-      return next
-    })
 
   // ---------- 建 / 改 ----------
   const [formOpen, setFormOpen] = useState(false)
@@ -104,7 +132,6 @@ export function Networks() {
     try {
       if (editing) {
         await api.updateNetwork(editing, { name: trimmedName, proxy_url: proxyURL })
-        setTest(editing, undefined)
         toast.success('代理已更新')
       } else {
         await api.createNetwork({ name: trimmedName, proxy_url: proxyURL })
@@ -133,32 +160,10 @@ export function Networks() {
     if (!ok) return
     try {
       await api.deleteNetwork(n.id)
-      setTest(n.id, undefined)
       toast.success('代理已删除')
       reload()
     } catch (e) {
       if (!is401(e)) toast.danger('删除失败：' + (e as Error).message)
-    }
-  }
-
-  async function testProxy(n: Network) {
-    const state = testStates[n.id]
-    if (state?.pending) return
-    setTest(n.id, { pending: true, result: null })
-    try {
-      const result = await api.testNetwork(n.id)
-      setTest(n.id, { pending: false, result })
-      if (result.status !== 'ok') toast.danger('测试失败：' + result.message)
-    } catch (e) {
-      if (is401(e)) {
-        setTest(n.id, undefined)
-        return
-      }
-      setTest(n.id, {
-        pending: false,
-        result: { status: 'error', message: '管理接口调用失败：' + (e as Error).message, latency_ms: 0 },
-      })
-      toast.danger('测试失败：' + (e as Error).message)
     }
   }
 
@@ -197,13 +202,12 @@ export function Networks() {
                 <Table.Column isRowHeader>名称</Table.Column>
                 <Table.Column>代理地址</Table.Column>
                 <Table.Column>使用中的上游</Table.Column>
-                <Table.Column>联通状态</Table.Column>
+                <Table.Column>延迟</Table.Column>
                 <Table.Column>操作</Table.Column>
               </Table.Header>
               <Table.Body>
                 {rows.map((n) => {
-                  const v = testVisual(testStates[n.id])
-                  const testing = testStates[n.id]?.pending === true
+                  const probeError = probeErrorLine(n)
                   return (
                     <Table.Row key={n.id}>
                       <Table.Cell>{n.name}</Table.Cell>
@@ -212,15 +216,17 @@ export function Networks() {
                       </Table.Cell>
                       <Table.Cell className="text-right">{n.provider_count}</Table.Cell>
                       <Table.Cell>
-                        <StatusChip tone={v.tone} title={v.title}>
-                          {v.label}
-                        </StatusChip>
+                        <span title={latencyTitle(n)}>
+                          <StatusChip tone={latencyTone(n)}>{latencyText(n)}</StatusChip>
+                        </span>
+                        {probeError ? (
+                          <span className="text-danger mt-0.5 block max-w-[220px] truncate text-xs" title={probeError}>
+                            {probeError}
+                          </span>
+                        ) : null}
                       </Table.Cell>
                       <Table.Cell>
                         <div className="flex justify-end gap-1">
-                          <Button size="sm" variant="ghost" isDisabled={testing} onPress={() => void testProxy(n)}>
-                            {testing ? '测试中…' : '测试'}
-                          </Button>
                           <Button size="sm" variant="ghost" onPress={() => openEdit(n)}>
                             编辑
                           </Button>

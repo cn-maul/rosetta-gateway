@@ -101,7 +101,7 @@ func TestNetworkPatch_OnlyOneFieldKeepsOther(t *testing.T) {
 	if err := st.CreateNetwork(context.Background(), n); err != nil {
 		t.Fatalf("create network: %v", err)
 	}
-	h := NewNetworkHandler(st)
+	h := NewNetworkHandler(st, nil)
 
 	rec := httptest.NewRecorder()
 	h.Update(rec, asAdmin(jsonRequest(http.MethodPatch, "/admin/api/networks/n1",
@@ -149,7 +149,7 @@ func TestNetworkPatch_NoFieldsRejected(t *testing.T) {
 		&store.Network{ID: "n1", Name: "机房", ProxyURL: "socks5://127.0.0.1:1080"}); err != nil {
 		t.Fatalf("create network: %v", err)
 	}
-	h := NewNetworkHandler(st)
+	h := NewNetworkHandler(st, nil)
 
 	rec := httptest.NewRecorder()
 	h.Update(rec, asAdmin(jsonRequest(http.MethodPatch, "/admin/api/networks/n1",

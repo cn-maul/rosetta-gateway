@@ -151,6 +151,23 @@ func (s *Store) ensureCompatibleSchema(ctx context.Context) error {
 			return err
 		}
 	}
+	// 2026-11-01：代理也改成定时测速（不再靠「测试」按钮），需要自己的
+	// 探测表。纯新增表，旧库原地补建即可，不必抬 currentSchemaVersion —
+	// 与上面加列的判据相同：可幂等创建、不破坏既有数据。
+	if _, err := s.db.ExecContext(ctx, `CREATE TABLE IF NOT EXISTS network_probes (
+		id         INTEGER PRIMARY KEY AUTOINCREMENT,
+		network_id TEXT NOT NULL,
+		ts         INTEGER NOT NULL,
+		ok         INTEGER NOT NULL,
+		latency_ms INTEGER NOT NULL DEFAULT 0,
+		error      TEXT
+	)`); err != nil {
+		return fmt.Errorf("ensure network probe table: %w", err)
+	}
+	if _, err := s.db.ExecContext(ctx, `CREATE INDEX IF NOT EXISTS idx_netprobes_net_ts
+		ON network_probes(network_id, ts)`); err != nil {
+		return fmt.Errorf("ensure network probe index: %w", err)
+	}
 	// This index depends on charge_next_at, so it must be created after the
 	// additive-column pass above. v1.6.8 has neither the column nor the index.
 	if _, err := s.db.ExecContext(ctx, `CREATE INDEX IF NOT EXISTS idx_usage_charge_retry
@@ -615,6 +632,24 @@ var canonicalSchemaStatements = []string{
 		error_kind   TEXT,
 		error_detail TEXT
 	)`,
+	// network_probes 记「经这条代理能不能出去」，与 model_probes 同构但
+	// **故意分开一张表**：
+	//
+	//   - 粒度不同：model_probes 是一次真实推理（按模型、会向上游计费），
+	//     network_probes 是一次 generate_204 探测（按代理、不打上游）；
+	//   - 生命周期不同：删模型要级联删 model_probes（纯派生），而删代理
+	//     时遗留的历史探测记录对排障仍有价值，不该跟着消失；
+	//   - 把两者塞进一张表要么多一列区分（`kind`），要么让所有既有查询都
+	//     加 `WHERE kind='model'` —— 前者会让索引区分度变差，后者是给每
+	//     一个历史调用点埋一颗雷。
+	`CREATE TABLE network_probes (
+		id         INTEGER PRIMARY KEY AUTOINCREMENT,
+		network_id TEXT NOT NULL,
+		ts         INTEGER NOT NULL,
+		ok         INTEGER NOT NULL,
+		latency_ms INTEGER NOT NULL DEFAULT 0,
+		error      TEXT
+	)`,
 
 	`CREATE INDEX idx_usage_ts ON usage_records(ts)`,
 	`CREATE INDEX idx_usage_key_ts ON usage_records(access_key_id, ts)`,
@@ -641,6 +676,7 @@ var canonicalSchemaStatements = []string{
 	`CREATE INDEX idx_balance_topups_user ON balance_topups(user_id, ts)`,
 	`CREATE INDEX idx_probes_model_ts ON model_probes(model_id, ts)`,
 	`CREATE INDEX idx_probes_provider_ts ON model_probes(provider_id, ts)`,
+	`CREATE INDEX idx_netprobes_net_ts ON network_probes(network_id, ts)`,
 
 	`INSERT INTO usage_totals (id) VALUES (1)`,
 

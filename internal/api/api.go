@@ -168,7 +168,7 @@ func BuildApp(d Deps) *App {
 	providerHandler := admin.NewProviderHandler(db, masterKey, cfg)
 	// 出站网络（代理地址的共享清单）。provider 的下拉从它取值，
 	// 管理入口与 provider 同级 —— 见 admin/network_handler.go 的注释。
-	networkHandler := admin.NewNetworkHandler(db)
+	networkHandler := admin.NewNetworkHandler(db, cfg)
 	credentialHandler := admin.NewCredentialHandler(db, masterKey)
 	modelHandler := admin.NewModelHandler(db, masterKey, cfg)
 	modelGroupHandler := admin.NewModelGroupHandler(db)

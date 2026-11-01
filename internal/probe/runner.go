@@ -70,10 +70,22 @@ type Runner struct {
 	masterKey []byte
 	logger    *slog.Logger
 	stagger   time.Duration
+	// proxyProbe 是代理测速的注入点，默认 upstream.TestProxyConnectivity。
+	//
+	// 为什么要留这个口子：那条探测打的是固定的外部 HTTPS 目标
+	// （https://www.gstatic.com/generate_204），单元测试既不能依赖外网，
+	// 也没法用一个本地假代理顶上 —— 客户端对 https 目标会先发 CONNECT，
+	// 假代理要么不会隧道要么通不过 TLS 校验。测试里换成假函数，验的是
+	// 「调度、落库、取消纪律」，不是 generate_204 本身（后者在
+	// upstream 包有自己的用例）。
+	proxyProbe func(ctx context.Context, proxyURL string) (int64, error)
 }
 
 func NewRunner(st *store.Store, cfg *config.Config, masterKey []byte, logger *slog.Logger) *Runner {
-	return &Runner{store: st, cfg: cfg, masterKey: masterKey, logger: logger, stagger: intervalStagger}
+	return &Runner{
+		store: st, cfg: cfg, masterKey: masterKey, logger: logger,
+		stagger: intervalStagger, proxyProbe: upstream.TestProxyConnectivity,
+	}
 }
 
 // Run 阻塞执行探测循环，直到 ctx 取消。
@@ -155,6 +167,13 @@ func (r *Runner) runOnce(ctx context.Context) {
 	}
 	wg.Wait()
 
+	// 代理测速跟着同一轮跑：它不打上游、不计费，一次 generate_204 的
+	// 代价远小于一次推理，所以不需要独立周期 —— 独立周期只会让两套
+	// 定时器在界面上显示的时间戳互相错开几分钟，看起来像「有的一直
+	// 没测」。放在模型探测之后，顺序也符合排障时的因果链（先看模型
+	// 通不通，再看代理通不通）。
+	r.probeNetworks(ctx, timeout)
+
 	// 顺带剪枝超期探测记录（保留期独立配置）。
 	if ctx.Err() == nil && r.cfg.Probes.RetentionDays > 0 {
 		if n, err := r.store.PruneOldProbes(ctx, r.cfg.Probes.RetentionDays); err != nil {
@@ -162,11 +181,98 @@ func (r *Runner) runOnce(ctx context.Context) {
 		} else if n > 0 {
 			r.logger.Debug("probe: pruned old records", "count", n)
 		}
+		if n, err := r.store.PruneOldNetworkProbes(ctx, r.cfg.Probes.RetentionDays); err != nil {
+			r.logger.Warn("probe: prune network probes failed", "error", err)
+		} else if n > 0 {
+			r.logger.Debug("probe: pruned old network records", "count", n)
+		}
 	}
 }
 
-// intervalStagger 是探测抖动上限（毫秒）。取间隔的 1/4，避免整轮探测
-// 被同一个偏移量推成「所有模型同时打」。
+// probeNetworks 对所有出站网络各做一次连通性测速。
+//
+// 为什么不再靠「测试」按钮：手动测试测的是「我刚才点那一下」，而代理挂掉
+// 通常发生在没人点按钮的时候 —— 那时列表上还挂着上次成功留下的绿色。
+// 改成定时测速后，界面上的数字与供应商延迟同一口径（窗口内的成功样本），
+// 「代理坏了」这件事不需要人主动去问。
+//
+// 失败绝不写 poool 的熔断状态，也不改 provider 配置：与 model_probes 同一
+// 条隔离红线，探测只是观测。
+func (r *Runner) probeNetworks(ctx context.Context, timeout time.Duration) {
+	networks, err := r.store.ListNetworks(ctx)
+	if err != nil {
+		r.logger.Warn("probe: list networks failed", "error", err)
+		return
+	}
+	if len(networks) == 0 {
+		return
+	}
+
+	concurrency := r.cfg.Probes.Concurrency
+	if concurrency <= 0 {
+		concurrency = 4
+	}
+
+	sem := make(chan struct{}, concurrency)
+	var wg sync.WaitGroup
+	for _, n := range networks {
+		n := n
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			select {
+			case sem <- struct{}{}:
+			case <-ctx.Done():
+				return
+			}
+			defer func() { <-sem }()
+			r.probeNetwork(ctx, n, timeout)
+		}()
+	}
+	wg.Wait()
+}
+
+// probeNetwork 测一条代理并落库。
+func (r *Runner) probeNetwork(ctx context.Context, n store.Network, timeout time.Duration) {
+	// 与模型探测同一套超时上限：代理探测自己内部还压了 10 秒硬上限
+	// （见 upstream.TestProxyConnectivity），这里的 timeout 只是外层兜底，
+	// 防止某条代理把整轮拖到下一个周期。
+	pctx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+
+	probe := r.proxyProbe
+	if probe == nil {
+		probe = upstream.TestProxyConnectivity
+	}
+	latencyMs, err := probe(pctx, n.ProxyURL)
+
+	// Cancellation is a lifecycle stop, not a probe result — 与 probeOne 一致。
+	if ctx.Err() != nil {
+		return
+	}
+	rec := store.NetworkProbe{
+		NetworkID: n.ID,
+		Ts:        time.Now().UnixMilli(),
+		OK:        err == nil,
+		LatencyMs: latencyMs,
+	}
+	if err != nil {
+		// 错误正文已由 upstream 侧脱敏（代理 URL 里可能带账号密码，
+		// TestProxyConnectivity 的错误文案不含完整 URL）。
+		rec.Error = err.Error()
+	}
+	if err := r.store.RecordNetworkProbe(ctx, rec); err != nil {
+		r.logger.Warn("probe: record network probe failed", "network", n.Name, "error", err)
+	}
+}
+
+// intervalStagger 是探测抖动的**上限**（毫秒），不是「间隔的 1/4」。
+//
+// 目的只有一个：别让整轮探测在同一个瞬间打出去（同一秒对内网代理或
+// 上游打十几个并发，会撞限速也会让延迟数字互相污染）。取固定 2.5 秒
+// 而不是按间隔比例算：间隔调小到 60 秒时，1/4 只有 15 秒，抖动窗口
+// 比探测本身还长，反而把一轮拖到下一轮；固定值在 60 秒与 1 小时间隔
+// 都表现为「一小撮随机错开」。
 var intervalStagger = 2500 * time.Millisecond
 
 // probeOne 探测单个模型并落库。

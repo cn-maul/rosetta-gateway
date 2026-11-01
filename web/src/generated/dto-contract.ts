@@ -283,6 +283,12 @@ export const DTO_CONTRACTS: readonly DTOFieldContract[] = [
     "proxy_url",
     "provider_count",
     "created_at",
+    "latency_ms",
+    "latency_p95_ms",
+    "latency_samples",
+    "last_probe_ok",
+    "last_probe_error",
+    "last_probe_at",
   ] },
   { goType: "internal/admin.networkTestResponse", tsType: "NetworkTestResult", fields: [
     "status",

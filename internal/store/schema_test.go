@@ -335,6 +335,7 @@ func TestSchema_CanonicalObjectsAndColumns(t *testing.T) {
 		"idx_rollup_day",
 		"idx_rollup_user_day",
 		"idx_rollup_key_day",
+		"idx_netprobes_net_ts",
 	}
 	for _, name := range requiredIndexes {
 		var typ string

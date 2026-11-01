@@ -269,6 +269,24 @@ export interface Network {
   /** 引用该网络的上游数（派生值）。删网络前用它提示影响面。 */
   provider_count: number
   created_at?: number
+
+  /**
+   * 以下是**探针测得**的连通性摘要（2026-11-01 起代理由后台定时测速，
+   * 不再有「测试」按钮）。窗口与供应商延迟同一口径：
+   * probes.window_size × interval_sec。
+   *
+   * latency_samples = 0 表示窗口内没有成功样本 → 界面显示「—」，不能
+   * 显示 0ms（「一次都没通」与「快到 0」是两件事）。此时
+   * last_probe_ok / last_probe_error 仍然有用：它们回答「没测过」还是
+   * 「一直在失败」。
+   */
+  latency_ms?: number
+  latency_p95_ms?: number
+  latency_samples?: number
+  last_probe_ok?: boolean
+  last_probe_error?: string
+  /** 最近一次探测时间（毫秒）；0 或缺失 = 从未探测。 */
+  last_probe_at?: number
 }
 
 /**
