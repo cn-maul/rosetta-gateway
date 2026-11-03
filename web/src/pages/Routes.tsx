@@ -355,9 +355,11 @@ export function Routes() {
                           aria-label={`${r.failover_enabled ? '关闭' : '开启'} ${r.public_name} 的故障转移`}
                           onChange={() => void toggleFailover(r)}
                         >
-                          <Switch.Control>
-                            <Switch.Thumb />
-                          </Switch.Control>
+                          <Switch.Content>
+                            <Switch.Control>
+                              <Switch.Thumb />
+                            </Switch.Control>
+                          </Switch.Content>
                         </Switch>
                       </Table.Cell>
                       <Table.Cell>
@@ -367,9 +369,11 @@ export function Routes() {
                           aria-label={`${r.enabled ? '停用' : '启用'} ${r.public_name}`}
                           onChange={() => void toggleRoute(r)}
                         >
-                          <Switch.Control>
-                            <Switch.Thumb />
-                          </Switch.Control>
+                          <Switch.Content>
+                            <Switch.Control>
+                              <Switch.Thumb />
+                            </Switch.Control>
+                          </Switch.Content>
                         </Switch>
                       </Table.Cell>
                     </Table.Row>
@@ -705,12 +709,12 @@ function RouteEditor({
             <Input placeholder="gpt-4o" className="font-mono" autoComplete="off" disabled={chainBlocked} />
           </TextField>
           <Switch isSelected={failoverEnabled} isDisabled={chainBlocked} aria-label="自动故障转移" onChange={setFailoverEnabled}>
-            <div className="flex items-center gap-2">
+            <Switch.Content className="flex items-center gap-2">
               <Switch.Control>
                 <Switch.Thumb />
               </Switch.Control>
               <span className="text-sm">自动故障转移</span>
-            </div>
+            </Switch.Content>
           </Switch>
         </div>
 
@@ -812,9 +816,11 @@ function RouteEditor({
                               aria-label={`${t.enabled ? '停用' : '启用'}第 ${i + 1} 个目标`}
                               onChange={(v) => patchTarget(i, { enabled: v })}
                             >
-                              <Switch.Control>
-                                <Switch.Thumb />
-                              </Switch.Control>
+                              <Switch.Content>
+                                <Switch.Control>
+                                  <Switch.Thumb />
+                                </Switch.Control>
+                              </Switch.Content>
                             </Switch>
                           </Table.Cell>
                           <Table.Cell>

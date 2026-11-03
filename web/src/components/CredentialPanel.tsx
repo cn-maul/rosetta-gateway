@@ -195,9 +195,11 @@ export function CredentialPanel({
                             }
                             onChange={() => onToggle(c)}
                           >
-                            <Switch.Control>
-                              <Switch.Thumb />
-                            </Switch.Control>
+                            <Switch.Content>
+                              <Switch.Control>
+                                <Switch.Thumb />
+                              </Switch.Control>
+                            </Switch.Content>
                           </Switch>
                           <Button variant="outline" size="sm" onPress={() => onEdit(c)}>
                             换钥

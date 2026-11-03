@@ -410,9 +410,11 @@ export function Providers() {
                         aria-label={`启用 ${p.name}`}
                         onChange={() => void toggleProvider(p)}
                       >
-                        <Switch.Control>
-                          <Switch.Thumb />
-                        </Switch.Control>
+                        <Switch.Content>
+                          <Switch.Control>
+                            <Switch.Thumb />
+                          </Switch.Control>
+                        </Switch.Content>
                       </Switch>
                     </Table.Cell>
                   </Table.Row>

@@ -67,9 +67,11 @@ export function ProviderOverviewCard({
             aria-label={`${provider.enabled ? '停用' : '启用'} ${provider.name || provider.slug}`}
             onChange={onToggle}
           >
-            <Switch.Control>
-              <Switch.Thumb />
-            </Switch.Control>
+            <Switch.Content>
+              <Switch.Control>
+                <Switch.Thumb />
+              </Switch.Control>
+            </Switch.Content>
           </Switch>
         </>
       }

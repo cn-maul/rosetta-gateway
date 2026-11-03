@@ -188,7 +188,13 @@ export function KeysTable({
                         isDisabled={toggling.has(k.id)}
                         aria-label={(k.enabled ? '停用 ' : '启用 ') + (k.name || k.key_prefix)}
                         onChange={() => onToggle(k)}
-                      />
+                      >
+                        <Switch.Content>
+                          <Switch.Control>
+                            <Switch.Thumb />
+                          </Switch.Control>
+                        </Switch.Content>
+                      </Switch>
                     </div>
                   </Table.Cell>
                 </Table.Row>

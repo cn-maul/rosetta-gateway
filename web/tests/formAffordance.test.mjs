@@ -128,3 +128,23 @@ test('每个 Checkbox 都渲染了可点击的 Content/Control', async () => {
     'Checkbox 缺少 Content/Control，会渲染成空 div、点不动：\n' + violations.join('\n'),
   )
 })
+
+// HeroUI 3 的 Switch 同样是复合组件：`Switch` 只渲染外层 div；真正可点击的
+// <label> 与其内隐藏的 <input> 来自 Switch.Content。只放 Control/Thumb 时
+// 界面看着完全正常（轨道和滑块都在），但整块开关点不动。
+test('每个 Switch 都渲染了可点击的 Content', async () => {
+  const files = (await listTsx('src'))
+  const violations = []
+  for (const rel of files) {
+    const src = await read(rel)
+    for (const m of src.matchAll(/<Switch(?![.\w])[\s\S]*?<\/Switch>/g)) {
+      if (!m[0].includes('<Switch.Content')) violations.push(rel + ': ' + m[0].slice(0, 80))
+    }
+    for (const m of src.matchAll(/<Switch(?![.\w])[^>]*\/>/g)) violations.push(rel + ': ' + m[0].slice(0, 80))
+  }
+  assert.deepEqual(
+    violations,
+    [],
+    'Switch 缺少 Content，会渲染成没有 input 的装饰性 div、点不动：\n' + violations.join('\n'),
+  )
+})
