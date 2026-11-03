@@ -148,3 +148,61 @@ test('每个 Switch 都渲染了可点击的 Content', async () => {
     'Switch 缺少 Content，会渲染成没有 input 的装饰性 div、点不动：\n' + violations.join('\n'),
   )
 })
+
+test('探测列表的思考挡位按强度上色，并与模型表共用同一份色阶', async () => {
+  const src = await read('src/components/provider/ModelEditModal.tsx')
+  assert.ok(
+    src.includes("import { effortTone } from '../../effortTone'"),
+    '探测列表必须从 effortTone 取色阶，不能自带一份映射',
+  )
+  assert.ok(
+    !/const EFFORT_TONE/.test(src),
+    'ModelEditModal 里不该再有一份 EFFORT_TONE —— 与模型表各写一份必然漂移',
+  )
+  // 胶囊必须逐档渲染：整串「low,medium,high」糊在纯文本里就丢了配色。
+  assert.match(src, /splitLevels\(d\.effort_levels\)\.map\(/, '挡位要拆开后逐枚渲染')
+  assert.match(src, /tone=\{effortTone\(lvl\)\}/, '每枚胶囊的配色必须走 effortTone')
+  // 上游没报挡位时不能伪造颜色。
+  assert.match(src, /思考 待配置/, '上游没报挡位时应显示「待配置」而不是冒充某一档')
+})
+
+test('勾选思考挡位会把「未配置」的思考开关升到「支持」', async () => {
+  const src = await read('src/components/provider/ModelEditModal.tsx')
+  const at = src.indexOf('const toggleEffortLevel')
+  assert.ok(at > 0, '找不到 toggleEffortLevel')
+  const body = src.slice(at, src.indexOf('\n  }', at))
+  assert.match(
+    body,
+    /if \(next && thinking === 'unset'\) setThinkingState\('yes'\)/,
+    '手动勾了挡位就该把开关从「未配置」切到「支持」，否则出现「配了 high 却显示未配置」',
+  )
+  // 只从 unset 升到 yes，不得篡改管理员显式选择的「不支持」。
+  assert.ok(
+    !/thinking === 'no'[\s\S]{0,40}setThinkingState\('yes'\)/.test(body),
+    '「不支持」不应被勾选挡位改写 —— 那样会覆盖管理员的明确声明',
+  )
+})
+
+test('上游模型表有「上下文 / 最大输出」列', async () => {
+  const src = await read('src/components/UpstreamModelPanel.tsx')
+  assert.ok(src.includes('<Table.Column>上下文 / 最大输出</Table.Column>'), '缺少容量列')
+  assert.ok(src.includes('capacityCell(m)'), '容量列必须渲染上下文与最大输出')
+  assert.ok(
+    src.includes("import { fmtSpeed, fmtSec, fmtPercent, fmtTokens } from '../fmt'"),
+    '容量列要用 fmtTokens 缩写（131072 → 131.1K），不能直接堆原始数字',
+  )
+})
+
+test('密钥页 Endpoint 显示 base URL，不带具体协议路径', async () => {
+  const src = await read('src/components/keys/EndpointBar.tsx')
+  // 只看代码行：注释里会把旧路径当作反例写出来，那不是违规。
+  const code = src
+    .split('\n')
+    .filter((l) => !/^\s*(\*|\/\/|\/\*)/.test(l))
+    .join('\n')
+  assert.ok(
+    !/\/v1\/chat\/completions|\/v1\/messages|\/v1\/responses/.test(code),
+    'Endpoint 应显示 <origin>/v1，完整请求路径交给客户端自己拼',
+  )
+  assert.match(code, /path: '\/v1'/, '三种协议的 base URL 都是 /v1')
+})

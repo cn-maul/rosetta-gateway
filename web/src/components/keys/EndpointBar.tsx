@@ -16,16 +16,19 @@ import { copyText } from '../../fmt'
 /**
  * 密钥页顶部的调用地址：默认 OpenAI Chat，可切到 Responses / Anthropic。
  *
- * 显示的是**完整请求路径**而不是 base URL：三种协议的 base URL 里有两种
- * 同为 /v1，只显示 base 时切换协议界面毫无变化，看起来像没生效。完整
- * 路径与 DESIGN §7 的入口表逐字对应，复制后也能直接用于 curl / 调试。
+ * 显示的是 **base URL**（`<origin>/v1`），而不是 `/v1/chat/completions`
+ * 这类完整请求路径：用户复制它是去填客户端里的「API Base / Endpoint」字段，
+ * 各家客户端自己会拼后面的路径；贴完整路径反而要被手工截断。
+ *
+ * 三种协议的 base URL 有两处同为 `/v1`，只显示 base 时切换协议界面毫无变化
+ * —— 于是协议名留在左侧下拉里作为唯一区分信号，右侧地址保持干净。
  */
 type ApiFormat = 'openai_chat' | 'openai_responses' | 'anthropic'
 
 const API_FORMATS: { key: ApiFormat; label: string; path: string }[] = [
-  { key: 'openai_chat', label: 'OpenAI Chat', path: '/v1/chat/completions' },
-  { key: 'openai_responses', label: 'OpenAI Responses', path: '/v1/responses' },
-  { key: 'anthropic', label: 'Anthropic', path: '/v1/messages' },
+  { key: 'openai_chat', label: 'OpenAI Chat', path: '/v1' },
+  { key: 'openai_responses', label: 'OpenAI Responses', path: '/v1' },
+  { key: 'anthropic', label: 'Anthropic', path: '/v1' },
 ]
 
 export function EndpointBar({ action }: { action?: React.ReactNode }) {

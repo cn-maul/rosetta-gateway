@@ -5,10 +5,21 @@ import { AppModal } from '../../ui/AppModal'
 import { confirmBox } from '../../ui/confirm'
 import { PriceField } from '../price/priceShared'
 import { TokenField } from '../../ui/TokenField'
+import { StatusChip } from '../../ui/StatusChip'
+import { effortTone } from '../../effortTone'
+import { fmtTokens } from '../../fmt'
 import { parseTokenCount } from '../../tokenCount'
 import type { DiscoveredModel, UpstreamModel } from '../../types'
 
 const is401 = (e: unknown): boolean => (e as { status?: number }).status === 401
+
+/** 上游自报的挡位是逗号分隔原文，逐枚上色前先拆开去空。 */
+function splitLevels(csv: string): string[] {
+  return csv
+    .split(',')
+    .map((x) => x.trim())
+    .filter(Boolean)
+}
 
 type Thinking = 'unset' | 'yes' | 'no'
 
@@ -85,7 +96,14 @@ export function ModelEditModal({
       return idx < 0 ? knownEffortLevels.length : idx
     }
     parts.sort((a, b) => rank(a) - rank(b))
-    setEffortCsv(parts.join(','))
+    const next = parts.join(',')
+    setEffortCsv(next)
+    // 勾了挡位就等于声明「这个模型能思考」：上游没报思考能力（未配置）
+    // 时开关停在「未配置」，管理员还得再手动切一次「支持」，否则出现
+    // 「配了 high 但显示未配置」——保存后档位照常下发，界面自相矛盾。
+    // 只从 unset 升到 yes，不改管理员显式选的「不支持」（那种情况下
+    // 档位区本来就不显示，走不到这里做勾选）。
+    if (next && thinking === 'unset') setThinkingState('yes')
   }
 
   // 明确「不支持思考」时清空挡位；反过来不成立（「支持」不必配挡位）。
@@ -435,7 +453,7 @@ export function ModelDiscoverModal({
       open={open}
       onClose={onClose}
       title="添加上游模型"
-      maxWidth="560px"
+      maxWidth="720px"
       dismissable={false}
       footer={
         <>
@@ -573,12 +591,29 @@ export function ModelDiscoverModal({
                     <span className="flex w-full min-w-0 items-center gap-2 text-xs">
                       <span className="shrink-0">{isSelected(d.model_id) ? '✓' : '+'}</span>
                       <span className="truncate font-mono">{d.model_id}</span>
-                      <span className="text-muted ml-auto shrink-0 text-[10px]">
-                        {d.effort_levels ? `思考 ${d.effort_levels}` : '思考 待配置'}
+                      {/* 思考挡位按强度上色，与上游模型表 / 请求日志共用
+                          同一份 effortTone 色阶 —— 三处同一个 high 必须同一个
+                          颜色，否则读的人会以为是不同的东西。
+                          上游没报挡位时保持中性灰「待配置」，不冒充任何强度。 */}
+                      <span className="ml-auto flex shrink-0 items-center gap-1">
+                        {d.effort_levels ? (
+                          <>
+                            <span className="text-muted text-[10px]">思考</span>
+                            {splitLevels(d.effort_levels).map((lvl) => (
+                              <StatusChip key={lvl} tone={effortTone(lvl)} size="sm">
+                                {lvl}
+                              </StatusChip>
+                            ))}
+                          </>
+                        ) : (
+                          <span className="text-muted text-[10px]">思考 待配置</span>
+                        )}
+                      </span>
+                      <span className="text-muted shrink-0 text-[10px]">
                         {d.context_window || d.max_output_tokens
-                          ? ` · ${d.context_window ? d.context_window + ' ctx' : ''}${
+                          ? `${d.context_window ? fmtTokens(d.context_window) + ' ctx' : ''}${
                               d.context_window && d.max_output_tokens ? ' / ' : ''
-                            }${d.max_output_tokens ? d.max_output_tokens + ' out' : ''}`
+                            }${d.max_output_tokens ? fmtTokens(d.max_output_tokens) + ' out' : ''}`
                           : ''}
                       </span>
                     </span>

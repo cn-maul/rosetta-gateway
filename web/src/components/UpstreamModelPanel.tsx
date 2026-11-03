@@ -1,7 +1,7 @@
 import { Button, Table } from '@heroui/react'
 import { DataTable } from '../ui/DataTable'
 import { StatusChip, type StatusTone } from '../ui/StatusChip'
-import { fmtSpeed, fmtSec, fmtPercent } from '../fmt'
+import { fmtSpeed, fmtSec, fmtPercent, fmtTokens } from '../fmt'
 import { unitPrice } from '../modelPrice'
 import { effortTone } from '../effortTone'
 import type { UpstreamModel } from '../types'
@@ -55,8 +55,36 @@ function priceCell(m: UpstreamModel) {
  * supports_thinking 是三态（未配置/支持/不支持），三态都要能看出来 ——
  * 把「未配置」显示成「不支持」会让所有未配置的模型凭空失去思考能力。
  */
-function thinkingCell(m: UpstreamModel) {
-  const supported =
+/**
+ * 「上下文 / 最大输出」两格横排，单位按 128K / 1M 缩写。
+ *
+ * 0 表示未设置（落库时由「模型默认值」兜底，见 Settings 页），显示「—」
+ * 而不是「0」：0 token 的上下文窗口没有意义，写出来会被误读成「这个模型
+ * 用不了」。完整精确值放在 title 里 —— 缩写会丢掉 131072 这种细节，而
+ * 排查「客户端报超长」时需要的正是精确数。
+ */
+function capacityCell(m: UpstreamModel) {
+  const ctx = m.context_window > 0 ? fmtTokens(m.context_window) : '—'
+  const out = m.max_output_tokens > 0 ? fmtTokens(m.max_output_tokens) : '—'
+  const hint = [
+    m.context_window > 0 ? `上下文 ${m.context_window.toLocaleString('en-US')} tokens` : '上下文：未设置（用默认值）',
+    m.max_output_tokens > 0
+      ? `最大输出 ${m.max_output_tokens.toLocaleString('en-US')} tokens`
+      : '最大输出：未设置（用默认值）',
+  ].join(' · ')
+  return (
+    <span
+      className="flex items-center gap-1.5 text-xs whitespace-nowrap tabular-nums"
+      title={hint}
+    >
+      <span className={m.context_window > 0 ? undefined : 'text-muted'}>{ctx}</span>
+      <span className="text-muted/60">/</span>
+      <span className={m.max_output_tokens > 0 ? undefined : 'text-muted'}>{out}</span>
+    </span>
+  )
+}
+
+function thinkingCell(m: UpstreamModel) {  const supported =
     m.supports_thinking === undefined
       ? { text: '未配置', tone: 'dim' as StatusTone, hint: '未配置：网关不干预，客户端维持既有行为' }
       : m.supports_thinking
@@ -132,11 +160,12 @@ export function UpstreamModelPanel({
       >
         <Table aria-label="上游模型">
           <Table.ScrollContainer>
-            <Table.Content className="min-w-[980px]">
+            <Table.Content className="min-w-[1120px]">
               {/* 整表左对齐（用户要求）：数字列也左对齐，与其余运维表一致。
                   表头里把价位顺序写进列名，省得每次都要对着数字猜哪格是哪个。 */}
               <Table.Header>
                 <Table.Column isRowHeader>模型</Table.Column>
+                <Table.Column>上下文 / 最大输出</Table.Column>
                 <Table.Column>价格（元/1M） 输入 | 输出 | 缓存命中</Table.Column>
                 <Table.Column>思考（是否支持 / 挡位）</Table.Column>
                 <Table.Column>速度(tok/s)</Table.Column>
@@ -159,6 +188,7 @@ export function UpstreamModelPanel({
                         ) : null}
                       </div>
                     </Table.Cell>
+                    <Table.Cell>{capacityCell(m)}</Table.Cell>
                     <Table.Cell>{priceCell(m)}</Table.Cell>
                     <Table.Cell>{thinkingCell(m)}</Table.Cell>
                     <Table.Cell className="text-xs tabular-nums">
