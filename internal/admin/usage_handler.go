@@ -679,6 +679,7 @@ type usageHistoryResponse struct {
 //   - 管理员：scope 为空，user_id 生效 = 按人筛选；
 //   - 普通用户：scope 是自己，即使用 query 传了别人的 user_id，
 //     两个条件同时成立才算命中，结果只会是空集 —— 不能靠参数越权。
+//
 // 把 userID 塞进 scopeUserID 是不行的：那等于让 query 参数决定权限。
 func usageHistoryFilters(from, to int64, status, model, keyID, userID, scopeUserID string) (string, []any) {
 	conds := []string{"u.ts >= ?", "u.ts <= ?"}
@@ -1009,7 +1010,8 @@ func (h *UsageHandler) GroupByKey(w http.ResponseWriter, r *http.Request) {
 // 分组键取 `COALESCE(g.display_name, u.upstream_model)`：
 //   - 归了组的行 → 按组名合并（这正是需求）；
 //   - 没归组的行 → 逐字保持旧行为（键 = upstream_model），历史统计不受影响；
-//   - 模型行被删（LEFT JOIN 落空）→ 同样落回 upstream_model，用量不丢。
+//   - 归属表里没有这个 (provider_id, upstream_model) → 同样落回
+//     upstream_model，用量不丢。
 //
 // 组是**展示层派生**而不是落库维度：改一次组名，所有历史统计立刻跟着变,
 // 不需要回填几百万行明细（这正是把 group_id 固化进事实表做不到、
@@ -1051,8 +1053,12 @@ func (h *UsageHandler) GroupByModel(w http.ResponseWriter, r *http.Request) {
 		`COALESCE(SUM(u.n_gen_ok), 0) AS n_gen, ` +
 		`COALESCE(g.display_name, '') AS name` +
 		` FROM ` + src +
-		` LEFT JOIN upstream_models um ON um.provider_id = u.provider_id AND um.model_id = u.upstream_model` +
-		` LEFT JOIN model_groups g ON g.id = um.group_id` +
+		// 归属必须直接读 model_group_members，不能 JOIN upstream_models 再取
+		// group_id：删掉一个上游后模型行被级联删除，那一侧的归属随之消失，
+		// 历史用量就会静默裂成单独一行。归属表按 (provider_id, model_id)
+		// 定位，正是 usage 两侧都带的不可变坐标。
+		` LEFT JOIN model_group_members mgm ON mgm.provider_id = u.provider_id AND mgm.model_id = u.upstream_model` +
+		` LEFT JOIN model_groups g ON g.id = mgm.group_id` +
 		` GROUP BY COALESCE(g.display_name, u.upstream_model)` +
 		` ORDER BY tokens DESC`
 

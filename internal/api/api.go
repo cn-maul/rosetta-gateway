@@ -329,6 +329,17 @@ func BuildApp(d Deps) *App {
 		{Pattern: "PATCH /admin/api/model-groups/{id}", Handler: func(w http.ResponseWriter, r *http.Request) { modelGroupHandler.Update(w, r, r.PathValue("id")) }, Public: false},
 		{Pattern: "DELETE /admin/api/model-groups/{id}", Handler: func(w http.ResponseWriter, r *http.Request) { modelGroupHandler.Delete(w, r, r.PathValue("id")) }, Public: false},
 		{Pattern: "GET /admin/api/model-groups/{id}/members", Handler: func(w http.ResponseWriter, r *http.Request) { modelGroupHandler.GroupMembers(w, r, r.PathValue("id")) }, Public: false},
+		// 历史成员：组内已经没有当前 upstream_models 行、但归属表仍保留的
+		// (provider_id, model_id)。删上游后统计仍按组合并，管理页也必须
+		// 能看见并管理这些成员，否则成员数对不上、历史行无处可归。
+		{Pattern: "GET /admin/api/model-groups/{id}/history-members", Handler: func(w http.ResponseWriter, r *http.Request) {
+			modelGroupHandler.HistoryMembers(w, r, r.PathValue("id"))
+		}, Public: false},
+		{Pattern: "GET /admin/api/model-groups/orphan-history-members", Handler: modelGroupHandler.OrphanHistoryMembers, Public: false},
+		{Pattern: "POST /admin/api/model-groups/{id}/assign-history", Handler: func(w http.ResponseWriter, r *http.Request) {
+			modelGroupHandler.AssignHistoryMembers(w, r, r.PathValue("id"))
+		}, Public: false},
+		{Pattern: "POST /admin/api/model-groups/unassign-history", Handler: modelGroupHandler.UnassignHistoryMembers, Public: false},
 		// 指派/取消指派：路径里的 {id} 是**组** id（对某个组的操作）；
 		// 移出组不属于任何组，所以单独一个 unassign 端点而不是带空 group_id 的指派。
 		{Pattern: "POST /admin/api/model-groups/{id}/assign", Handler: func(w http.ResponseWriter, r *http.Request) { modelGroupHandler.AssignModels(w, r, r.PathValue("id")) }, Public: false},

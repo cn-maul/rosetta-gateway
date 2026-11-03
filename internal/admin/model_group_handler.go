@@ -35,7 +35,7 @@ type modelGroupResponse struct {
 // groupMemberCounts 一次查询拿全部组的成员数（List 的富化用）。
 func (h *ModelGroupHandler) groupMemberCounts(ctx context.Context) (map[string]int, error) {
 	rows, err := h.store.Reader().QueryContext(ctx,
-		`SELECT group_id, COUNT(*) FROM upstream_models WHERE group_id IS NOT NULL GROUP BY group_id`)
+		`SELECT group_id, COUNT(*) FROM model_group_members GROUP BY group_id`)
 	if err != nil {
 		return nil, err
 	}
@@ -295,4 +295,153 @@ func (h *ModelGroupHandler) GroupMembers(w http.ResponseWriter, r *http.Request,
 		result = append(result, toModelResponse(m))
 	}
 	writeJSON(w, http.StatusOK, result)
+}
+
+// ModelGroupHistoryMember 是组内「当前模型行已不存在、但历史用量仍在」的成员。
+//
+// 删掉上游时 upstream_models 行会被级联删除，归属表按 (provider_id, model_id)
+// 保留下来，统计才能继续合并。管理页必须能看见它，否则组列表里的成员数会
+// 和「当前成员」对不上，而多出来的那个又无处可查。
+// @ts-type ModelGroupHistoryMember
+type modelGroupHistoryMemberResponse struct {
+	ProviderID   string `json:"provider_id"`
+	ModelID      string `json:"model_id"`
+	ProviderName string `json:"provider_name"`
+	Count        int64  `json:"count"`
+	Tokens       int64  `json:"tokens"`
+}
+
+type groupMemberRefRequest struct {
+	ProviderID string `json:"provider_id"`
+	ModelID    string `json:"model_id"`
+}
+
+type historyMembersRequest struct {
+	Members []groupMemberRefRequest `json:"members"`
+}
+
+func toHistoryMemberResponse(m store.ModelGroupHistoryMember) modelGroupHistoryMemberResponse {
+	return modelGroupHistoryMemberResponse{
+		ProviderID: m.ProviderID, ModelID: m.ModelID,
+		ProviderName: m.ProviderName, Count: m.Count, Tokens: m.Tokens,
+	}
+}
+
+// HistoryMembers 列出组内已经没有当前模型行的历史成员。
+func (h *ModelGroupHandler) HistoryMembers(w http.ResponseWriter, r *http.Request, id string) {
+	members, err := h.store.ListGroupHistoryMembers(r.Context(), id)
+	if err != nil {
+		writeServerError(w, "list model group history members", err)
+		return
+	}
+	result := make([]modelGroupHistoryMemberResponse, 0, len(members))
+	for _, m := range members {
+		result = append(result, toHistoryMemberResponse(m))
+	}
+	writeJSON(w, http.StatusOK, result)
+}
+
+// OrphanHistoryMembers 列出「有历史用量、当前没有模型行、也没归组」的定位符。
+//
+// 这是「删上游后归组丢失」的补救入口：这些对仍然精确指向历史行，但没有
+// 对应的 upstream_models.id 可选。没有它，用户只能看着统计里多一行却
+// 无法把它并进组。
+func (h *ModelGroupHandler) OrphanHistoryMembers(w http.ResponseWriter, r *http.Request) {
+	members, err := h.store.ListUngroupedHistoryMembers(r.Context())
+	if err != nil {
+		writeServerError(w, "list orphan history members", err)
+		return
+	}
+	result := make([]modelGroupHistoryMemberResponse, 0, len(members))
+	for _, m := range members {
+		result = append(result, toHistoryMemberResponse(m))
+	}
+	writeJSON(w, http.StatusOK, result)
+}
+
+// cleanupHistoryMembers 去重并拒绝空定位符。
+func cleanupHistoryMembers(raw []groupMemberRefRequest) []groupMemberRefRequest {
+	seen := make(map[string]bool, len(raw))
+	out := make([]groupMemberRefRequest, 0, len(raw))
+	for _, m := range raw {
+		providerID := strings.TrimSpace(m.ProviderID)
+		modelID := strings.TrimSpace(m.ModelID)
+		if providerID == "" || modelID == "" {
+			continue
+		}
+		key := providerID + "\x00" + modelID
+		if seen[key] {
+			continue
+		}
+		seen[key] = true
+		out = append(out, groupMemberRefRequest{ProviderID: providerID, ModelID: modelID})
+	}
+	return out
+}
+
+func storeGroupMemberRefs(raw []groupMemberRefRequest) []store.GroupMemberRef {
+	out := make([]store.GroupMemberRef, 0, len(raw))
+	for _, m := range raw {
+		out = append(out, store.GroupMemberRef{ProviderID: m.ProviderID, ModelID: m.ModelID})
+	}
+	return out
+}
+
+// AssignHistoryMembers 按历史定位符把成员挂进组（当前模型行不必存在）。
+func (h *ModelGroupHandler) AssignHistoryMembers(w http.ResponseWriter, r *http.Request, id string) {
+	var req historyMembersRequest
+	if err := decodeJSON(w, r, &req); err != nil {
+		if decodeFailed(err) {
+			return
+		}
+		writeError(w, http.StatusBadRequest, "invalid JSON: "+err.Error())
+		return
+	}
+	members := cleanupHistoryMembers(req.Members)
+	if len(members) == 0 {
+		writeError(w, http.StatusBadRequest, "members 不能为空")
+		return
+	}
+	if len(members) > 500 {
+		writeError(w, http.StatusBadRequest, "一次最多指派 500 个模型")
+		return
+	}
+	g, err := h.store.GetModelGroup(r.Context(), id)
+	if err != nil {
+		writeServerError(w, "get model group", err)
+		return
+	}
+	if g == nil {
+		writeError(w, http.StatusNotFound, "模型组不存在")
+		return
+	}
+	assigned, err := h.store.AssignHistoryMembersToGroup(r.Context(), id, storeGroupMemberRefs(members))
+	if err != nil {
+		writeServerError(w, "assign history model group", err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"assigned": assigned, "group_id": id})
+}
+
+// UnassignHistoryMembers 按历史定位符移出组；不要求当前模型行存在。
+func (h *ModelGroupHandler) UnassignHistoryMembers(w http.ResponseWriter, r *http.Request) {
+	var req historyMembersRequest
+	if err := decodeJSON(w, r, &req); err != nil {
+		if decodeFailed(err) {
+			return
+		}
+		writeError(w, http.StatusBadRequest, "invalid JSON: "+err.Error())
+		return
+	}
+	members := cleanupHistoryMembers(req.Members)
+	if len(members) == 0 {
+		writeError(w, http.StatusBadRequest, "members 不能为空")
+		return
+	}
+	unassigned, err := h.store.UnassignHistoryMembersFromGroup(r.Context(), storeGroupMemberRefs(members))
+	if err != nil {
+		writeServerError(w, "unassign history model group", err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"unassigned": unassigned})
 }

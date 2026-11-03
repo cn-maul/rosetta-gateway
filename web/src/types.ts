@@ -253,6 +253,21 @@ export interface ModelGroup {
 }
 
 /**
+ * 组内「当前模型行已不存在、但历史用量仍在」的成员。
+ *
+ * 删掉上游后 upstream_models 行会被级联删除，而归组归属按
+ * (provider_id, model_id) 留在独立表里，统计才能继续按组合并。
+ * provider_name 优先取当前上游名，上游已删时回退到用量里固化的旧名字。
+ */
+export interface ModelGroupHistoryMember {
+  provider_id: string
+  model_id: string
+  provider_name: string
+  count: number
+  tokens: number
+}
+
+/**
  * 一条出站网络（可复用的代理配置）。
  *
  * 代理地址天然是多个上游共用的，所以它是一份**清单**而不是每个上游各填

@@ -188,6 +188,13 @@ export const DTO_CONTRACTS: readonly DTOFieldContract[] = [
   { goType: "internal/admin.modelGroupExport", tsType: "ConfigExportModelGroup", fields: [
     "display_name",
   ] },
+  { goType: "internal/admin.modelGroupHistoryMemberResponse", tsType: "ModelGroupHistoryMember", fields: [
+    "provider_id",
+    "model_id",
+    "provider_name",
+    "count",
+    "tokens",
+  ] },
   { goType: "internal/admin.modelGroupResponse", tsType: "ModelGroup", fields: [
     "id",
     "display_name",

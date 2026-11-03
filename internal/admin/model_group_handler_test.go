@@ -148,6 +148,37 @@ func TestGroupByModel_DeletedModelStillCounts(t *testing.T) {
 	}
 }
 
+// TestGroupByModel_DeletedProviderKeepsGroup 是 2026-11-03 的真实故障回归：
+// 两个上游归进一组后删掉其中一个 provider，剩下那部分历史用量仍必须和
+// 另一个上游合并成组名一行，而不是重新裂成裸 model_id。
+func TestGroupByModel_DeletedProviderKeepsGroup(t *testing.T) {
+	st := newTestStore(t)
+	h := NewUsageHandler(st)
+	ctx := t.Context()
+
+	if err := st.CreateModelGroup(ctx, &store.ModelGroup{ID: "g1", DisplayName: "DeepSeek-V4.1-Flash"}); err != nil {
+		t.Fatalf("create group: %v", err)
+	}
+	if _, err := st.AssignModelsToGroup(ctx, []string{"m1", "m2"}, "g1"); err != nil {
+		t.Fatalf("assign: %v", err)
+	}
+	seedUsage(t, st, "u-a", "p1", "alpha-chat", 100)
+	seedUsage(t, st, "u-b", "p2", "beta-chat", 200)
+
+	// 删掉第二个上游：它的模型行会随 provider 级联删除，归属必须保留。
+	if err := st.DeleteProvider(ctx, "p2"); err != nil {
+		t.Fatalf("delete provider: %v", err)
+	}
+
+	entries := callByModel(t, h)
+	if len(entries) != 1 {
+		t.Fatalf("删上游后仍应按组合并成 1 行，实际 %d 行: %+v", len(entries), entries)
+	}
+	if e := entries[0]; e.Key != "DeepSeek-V4.1-Flash" || e.Tokens != 300 || e.Count != 2 {
+		t.Fatalf("合并结果不对: %+v", e)
+	}
+}
+
 // TestModelGroupHandler_AssignAndList 走真实 HTTP：建组→指派→成员→改名→删除。
 func TestModelGroupHandler_AssignAndList(t *testing.T) {
 	st := newTestStore(t)

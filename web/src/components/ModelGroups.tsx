@@ -4,7 +4,7 @@ import { api } from '../api'
 import { confirmBox } from '../ui/confirm'
 import { AppModal } from '../ui/AppModal'
 import { DataTable } from '../ui/DataTable'
-import type { ModelGroup, Provider, UpstreamModel } from '../types'
+import type { ModelGroup, ModelGroupHistoryMember, Provider, UpstreamModel } from '../types'
 
 /**
  * 模型归组（管理员）：把不同上游的「同一个模型」标成一组，用量统计按组名合并
@@ -45,6 +45,27 @@ export function ModelGroups() {
       return []
     } finally {
       setLoading(false)
+    }
+  }, [])
+
+  // ---------- 已删除上游留下的历史成员 ----------
+  // 归属表按 (provider_id, model_id) 存，删上游不会带走它；这些成员
+  // 不在 allModels 里，只能通过专用端点列出与重新指派。
+  const [historyMembers, setHistoryMembers] = useState<ModelGroupHistoryMember[]>([])
+  const [orphanMembers, setOrphanMembers] = useState<ModelGroupHistoryMember[]>([])
+
+  const loadHistory = useCallback(async (groupId: string) => {
+    try {
+      const [inside, orphans] = await Promise.all([
+        api.modelGroupHistoryMembers(groupId),
+        api.orphanHistoryMembers(),
+      ])
+      setHistoryMembers(inside)
+      setOrphanMembers(orphans)
+    } catch (e) {
+      if (!is401(e)) toast.danger('加载历史成员失败：' + (e as Error).message)
+      setHistoryMembers([])
+      setOrphanMembers([])
     }
   }, [])
 
@@ -134,7 +155,25 @@ export function ModelGroups() {
   function openMembers(g: ModelGroup) {
     setGroup(g)
     setAddIds(new Set())
+    setAddHistoryKeys(new Set())
+    setHistoryMembers([])
+    setOrphanMembers([])
     setMembersOpen(true)
+    void loadHistory(g.id)
+  }
+
+  /** 历史成员按 `provider_id\x00model_id` 作为 key（没有 upstream_models.id）。 */
+  const [addHistoryKeys, setAddHistoryKeys] = useState<Set<string>>(new Set())
+  const historyKey = (m: { provider_id: string; model_id: string }) => `${m.provider_id}\x00${m.model_id}`
+
+  function toggleHistory(m: ModelGroupHistoryMember) {
+    const key = historyKey(m)
+    setAddHistoryKeys((prev) => {
+      const next = new Set(prev)
+      if (next.has(key)) next.delete(key)
+      else next.add(key)
+      return next
+    })
   }
 
   // 当前组成员：group_id === 本组的模型。
@@ -155,13 +194,17 @@ export function ModelGroups() {
   async function applyMembers() {
     if (!group) return
     const ids = [...addIds]
-    if (ids.length === 0) {
+    const history = orphanMembers
+      .filter((m) => addHistoryKeys.has(historyKey(m)))
+      .map((m) => ({ provider_id: m.provider_id, model_id: m.model_id }))
+    if (ids.length === 0 && history.length === 0) {
       setMembersOpen(false)
       return
     }
     try {
-      await api.assignModelsToGroup(group.id, ids)
-      toast.success(`已把 ${ids.length} 个模型并入「${group.display_name}」`)
+      if (ids.length > 0) await api.assignModelsToGroup(group.id, ids)
+      if (history.length > 0) await api.assignHistoryMembersToGroup(group.id, history)
+      toast.success(`已把 ${ids.length + history.length} 个模型并入「${group.display_name}」`)
       setMembersOpen(false)
       await load()
     } catch (e) {
@@ -183,10 +226,31 @@ export function ModelGroups() {
     }
   }
 
+  async function removeHistoryMember(mm: ModelGroupHistoryMember) {
+    if (!group) return
+    try {
+      await api.unassignHistoryMembersFromGroup([
+        { provider_id: mm.provider_id, model_id: mm.model_id },
+      ])
+      toast.success(`已把「${mm.model_id}」移出组`)
+      await load()
+      await loadHistory(group.id)
+    } catch (e) {
+      if (!is401(e)) toast.danger('移出失败：' + (e as Error).message)
+    }
+  }
+
   // 候选/成员行的可读标签「供应商 / 模型名」；provider 刚删或接口部分失败时
   // 回退也截短 id —— 退回完整 32 位哈希就是用户看到的那串乱码。
   function labelFor(mm: UpstreamModel): string {
     const name = providerName[mm.provider_id] ?? mm.provider_id.slice(0, 8)
+    return `${name} / ${mm.model_id}`
+  }
+
+  /** 历史成员的标签：上游已删时 providerName 不在 providers 里，用后端
+   *  从用量固化值回退出的名字，仍取不到才截短 id。 */
+  function historyLabelFor(mm: ModelGroupHistoryMember): string {
+    const name = mm.provider_name || providerName[mm.provider_id] || mm.provider_id.slice(0, 8)
     return `${name} / ${mm.model_id}`
   }
 
@@ -296,15 +360,21 @@ export function ModelGroups() {
             <Button variant="tertiary" onPress={() => setMembersOpen(false)}>
               关闭
             </Button>
-            <Button variant="primary" isDisabled={addIds.size === 0} onPress={() => void applyMembers()}>
-              应用（加 {addIds.size} 个）
+            <Button
+              variant="primary"
+              isDisabled={addIds.size === 0 && addHistoryKeys.size === 0}
+              onPress={() => void applyMembers()}
+            >
+              应用（加 {addIds.size + addHistoryKeys.size} 个）
             </Button>
           </>
         }
       >
         <div className="flex flex-col gap-4">
           <section>
-            <h3 className="mb-1.5 text-sm font-semibold">当前成员（{currentMembers.length}）</h3>
+            <h3 className="mb-1.5 text-sm font-semibold">
+              当前成员（{currentMembers.length}）
+            </h3>
             {currentMembers.length === 0 ? (
               <p className="text-muted text-xs">组里还没有模型</p>
             ) : (
@@ -318,6 +388,30 @@ export function ModelGroups() {
               ))
             )}
           </section>
+
+          {historyMembers.length > 0 ? (
+            <section>
+              <h3 className="mb-1.5 text-sm font-semibold">
+                历史成员（{historyMembers.length}）
+              </h3>
+              <p className="text-muted mb-1.5 text-[11.5px]">
+                这些上游模型已不在当前配置里，但历史用量仍按本组合并统计。
+              </p>
+              {historyMembers.map((mm) => (
+                <div key={historyKey(mm)} className="flex items-center justify-between gap-2 py-0.5">
+                  <span className="truncate font-mono text-sm">
+                    {historyLabelFor(mm)}
+                    <span className="text-muted ml-2 text-[11.5px]">
+                      {mm.count} 次 · {mm.tokens} tokens
+                    </span>
+                  </span>
+                  <Button size="sm" variant="ghost" onPress={() => void removeHistoryMember(mm)}>
+                    移出
+                  </Button>
+                </div>
+              ))}
+            </section>
+          ) : null}
 
           <section>
             <h3 className="mb-1.5 text-sm font-semibold">添加到本组（勾选后点「应用」）</h3>
@@ -341,6 +435,32 @@ export function ModelGroups() {
               ))
             )}
           </section>
+
+          {orphanMembers.length > 0 ? (
+            <section>
+              <h3 className="mb-1.5 text-sm font-semibold">
+                未归组的历史模型（{orphanMembers.length}）
+              </h3>
+              <p className="text-muted mb-1.5 text-[11.5px]">
+                这些上游已删除，但历史用量还在。勾选后点「应用」把它们并进本组。
+              </p>
+              {orphanMembers.map((mm) => (
+                <Checkbox
+                  key={historyKey(mm)}
+                  isSelected={addHistoryKeys.has(historyKey(mm))}
+                  onChange={() => toggleHistory(mm)}
+                  className="w-full"
+                >
+                  <Checkbox.Content className="w-full gap-2 py-0.5">
+                    <Checkbox.Control>
+                      <Checkbox.Indicator />
+                    </Checkbox.Control>
+                    <span className="truncate font-mono text-sm">{historyLabelFor(mm)}</span>
+                  </Checkbox.Content>
+                </Checkbox>
+              ))}
+            </section>
+          ) : null}
         </div>
       </AppModal>
     </>

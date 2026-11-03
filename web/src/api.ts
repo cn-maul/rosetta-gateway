@@ -485,6 +485,7 @@ import type {
   Group,
   ModelPrice,
   ModelMeta,
+  ModelGroupHistoryMember,
 } from './types'
 
 /**
@@ -573,6 +574,23 @@ export const api = {
     mutate(() => post<{ assigned: number }>(`/model-groups/${groupId}/assign`, { model_ids: modelIds })),
   unassignModelsFromGroup: (modelIds: string[]) =>
     mutate(() => post<{ unassigned: number }>('/model-groups/unassign', { model_ids: modelIds })),
+  /**
+   * 组内已经没有当前模型行、但历史用量仍在的成员。
+   *
+   * 删上游后统计继续按组名合并，靠的就是保留下来的归属行；成员弹窗必须
+   * 能看见这部分，否则「成员数」与实际可见成员对不上。
+   */
+  modelGroupHistoryMembers: (groupId: string) =>
+    get<ModelGroupHistoryMember[]>(`/model-groups/${groupId}/history-members`),
+  /**
+   * 有历史用量、没有当前模型行、也没归组的 (provider_id, model_id)。
+   * 这是「删上游导致归组丢失」的补救入口。
+   */
+  orphanHistoryMembers: () => get<ModelGroupHistoryMember[]>('/model-groups/orphan-history-members'),
+  assignHistoryMembersToGroup: (groupId: string, members: { provider_id: string; model_id: string }[]) =>
+    mutate(() => post<{ assigned: number }>(`/model-groups/${groupId}/assign-history`, { members })),
+  unassignHistoryMembersFromGroup: (members: { provider_id: string; model_id: string }[]) =>
+    mutate(() => post<{ unassigned: number }>('/model-groups/unassign-history', { members })),
 
   // 上游模型健康探测（读 model_probes 表；探测循环在后台跑）
   probeModels: () => get<ProbeHealth[]>('/probes/models'),

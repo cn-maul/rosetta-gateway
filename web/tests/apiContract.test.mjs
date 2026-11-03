@@ -354,9 +354,9 @@ test('模型白名单按组写入用 PUT 到 models 子路径', async () => {
 })
 
 test('生产路由快照完整且免鉴权端点集合固定', () => {
-  // 115 = 109 + /v1 三条子树兜底（2026-10-31 的 JSON 404）+ 站点 GET/PUT + 协议探测
-  assert.equal(API_ROUTES.length, 115, '路由增删必须同步承认契约变化')
-  assert.equal(new Set(API_ROUTES.map((r) => r.pattern)).size, 115, '路由 pattern 不得重复')
+  // 119 = 115 + 模型组历史成员的四个端点（删上游后仍能看见并重新归组）
+  assert.equal(API_ROUTES.length, 119, '路由增删必须同步承认契约变化')
+  assert.equal(new Set(API_ROUTES.map((r) => r.pattern)).size, 119, '路由 pattern 不得重复')
 
   const publicRoutes = API_ROUTES
     .filter((r) => r.public)

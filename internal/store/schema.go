@@ -168,6 +168,41 @@ func (s *Store) ensureCompatibleSchema(ctx context.Context) error {
 		ON network_probes(network_id, ts)`); err != nil {
 		return fmt.Errorf("ensure network probe index: %w", err)
 	}
+	// 2026-11-03：模型归组改成**独立于 upstream_models 的归属表**。
+	//
+	// 旧实现把归属落在 upstream_models.group_id 上，而那一行有
+	// `REFERENCES providers(id) ON DELETE CASCADE` —— 删掉一个上游时，
+	// 它的模型行被级联删除，组员关系跟着一起消失。历史用量仍然按
+	// (provider_id, upstream_model) 记着（那是固化事实），于是 by-model
+	// 查询 JOIN 不到组，静默退回按裸 model_id 分组：界面看起来像
+	// 「归组根本没生效」，而组里其实只剩另外几个上游。
+	//
+	// 用独立表的理由与 provider_name / key_name 固化同理：归属是
+	// **统计口径上的历史事实**，不该被一次配置删除抹掉。
+	if _, err := s.db.ExecContext(ctx, `CREATE TABLE IF NOT EXISTS model_group_members (
+		group_id    TEXT NOT NULL REFERENCES model_groups(id) ON DELETE CASCADE,
+		provider_id TEXT NOT NULL,
+		model_id    TEXT NOT NULL,
+		PRIMARY KEY (provider_id, model_id)
+	)`); err != nil {
+		return fmt.Errorf("ensure model group membership table: %w", err)
+	}
+	// 回填：把现有 upstream_models.group_id 搬到新表。按 (provider_id,
+	// model_id) 而非上游模型行 id —— 前者是 usage_records 里的不可变定位符，
+	// 后者会在模型被删后失去意义。ON CONFLICT 让重复启动幂等。
+	if _, err := s.db.ExecContext(ctx, `INSERT INTO model_group_members (group_id, provider_id, model_id)
+		SELECT um.group_id, um.provider_id, um.model_id
+		  FROM upstream_models um
+		 WHERE um.group_id IS NOT NULL
+		ON CONFLICT(provider_id, model_id) DO UPDATE SET group_id = excluded.group_id`); err != nil {
+		return fmt.Errorf("backfill model group membership: %w", err)
+	}
+	// 旧实现已经因为删上游丢掉的那部分归属，靠 status-quo 回填不回来
+	// （模型行没了）。这里按历史 public_model 与现存组成员的重合做一次
+	// 保守修补，必须有持久标记 —— 详见函数注释。
+	if err := s.repairOrphanGroupMembershipsOnce(ctx); err != nil {
+		return fmt.Errorf("repair orphan model group memberships: %w", err)
+	}
 	// This index depends on charge_next_at, so it must be created after the
 	// additive-column pass above. v1.6.8 has neither the column nor the index.
 	if _, err := s.db.ExecContext(ctx, `CREATE INDEX IF NOT EXISTS idx_usage_charge_retry
@@ -489,6 +524,12 @@ var canonicalSchemaStatements = []string{
 		group_id     TEXT NOT NULL REFERENCES groups(id) ON DELETE CASCADE,
 		public_model TEXT NOT NULL,
 		PRIMARY KEY (group_id, public_model)
+	)`,
+	`CREATE TABLE model_group_members (
+		group_id    TEXT NOT NULL REFERENCES model_groups(id) ON DELETE CASCADE,
+		provider_id TEXT NOT NULL,
+		model_id    TEXT NOT NULL,
+		PRIMARY KEY (provider_id, model_id)
 	)`,
 	`CREATE TABLE routes (
 		id                TEXT PRIMARY KEY,

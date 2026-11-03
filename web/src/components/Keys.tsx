@@ -7,6 +7,7 @@ import { KeysTable } from './keys/KeysTable'
 import { KeyCreateModal, KeyEditModal } from './keys/KeyFormModals'
 import { PlainKeyModal, type PlainKeyBox } from './keys/PlainKeyModal'
 import { CcPickerModal } from './keys/CcPickerModal'
+import { EndpointBar } from './keys/EndpointBar'
 import { useKeyImport } from './keys/useKeyImport'
 import { ALL_USERS_FILTER, ORPHAN_FILTER } from './keys/keyUtils'
 import type { AccessKey, Group, User } from '../types'
@@ -282,16 +283,18 @@ export function Keys() {
 
   return (
     <div>
-      {/* 自助发 key 只对普通用户开放。管理员不再铸造数据面凭据
-         （后端 denyAdminKeyCreate 对管理员一律 403）；隐藏而非禁用：
-         一个点下去必然失败的按钮没有存在价值。 */}
-      {!isAdmin() ? (
-        <div className="mb-3.5 flex justify-end">
-          <Button variant="primary" size="sm" onPress={openCreate}>
-            新建密钥
-          </Button>
-        </div>
-      ) : null}
+      <EndpointBar
+        action={
+          // 自助发 key 只对普通用户开放。管理员不再铸造数据面凭据
+          // （后端 denyAdminKeyCreate 对管理员一律 403）；隐藏而非禁用：
+          // 一个点下去必然失败的按钮没有存在价值。
+          !isAdmin() ? (
+            <Button variant="primary" size="sm" onPress={openCreate}>
+              新建密钥
+            </Button>
+          ) : undefined
+        }
+      />
       <KeysTable
         visibleKeys={visibleKeys}
         loading={loading}
