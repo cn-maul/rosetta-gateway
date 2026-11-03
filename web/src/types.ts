@@ -1060,6 +1060,17 @@ export interface UsageHistoryEntry {
   key_name: string // 调用密钥名称；落库时固化，密钥删除后仍是原来的名字
   key_id: string // 调用密钥 id（回退显示用）
   /**
+   * 这条调用归属哪个用户（usage_records.user_id，落库时固化）。
+   *
+   * 密钥名**没有唯一约束**：两个用户各建一把都叫「主力」是合法的，
+   * 此时只靠 key_name 无法区分。归属用户是唯一的区分维度。
+   *
+   * user_name 是**当前**用户名（users.username，可改）；用户已删除时为空，
+   * 页面回退显示 user_id，而不是留白（留白会被读成「无归属」）。
+   */
+  user_id: string
+  user_name: string
+  /**
    * key_deleted / provider_deleted 表示这一行的密钥 / 上游**已经不在库里**。
    *
    * 名字是落库时固化的历史事实（key_name / provider_name），所以删掉对象
@@ -1168,6 +1179,8 @@ export interface HistoryFilters {
   status?: string
   model?: string
   keyId?: string
+  /** 归属用户 id（管理员按人筛）。普通用户即使传别人的 id 也只会得到空集。 */
+  userId?: string
 }
 
 /**

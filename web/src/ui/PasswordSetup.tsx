@@ -109,7 +109,12 @@ export function PasswordSetup() {
               <div className="mt-3.5 flex items-baseline justify-between gap-3">
                 <Label>新密码</Label>
                 <Checkbox isSelected={showPassword} onChange={setShowPassword}>
-                  显示密码
+                  <Checkbox.Content className="gap-2">
+                    <Checkbox.Control>
+                      <Checkbox.Indicator />
+                    </Checkbox.Control>
+                    <span>显示密码</span>
+                  </Checkbox.Content>
                 </Checkbox>
               </div>
               <TextField

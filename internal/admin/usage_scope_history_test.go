@@ -74,6 +74,8 @@ type historyPage struct {
 	Records []struct {
 		PublicModel string `json:"public_model"`
 		TotalTokens int64  `json:"total_tokens"`
+		UserID      string `json:"user_id"`
+		UserName    string `json:"user_name"`
 	} `json:"records"`
 }
 
@@ -127,6 +129,36 @@ func TestUsageHistory_ScopedToCaller(t *testing.T) {
 				p.Total, len(p.Records))
 		}
 	})
+
+	// 2026-11-03：管理员可按归属用户筛选。
+	//
+	// 密钥名**没有唯一约束**，两个用户各建一把同名 key 是合法的，所以
+	// 「按人看」不能靠密钥名，必须是 user_id。
+	t.Run("管理员按用户筛选", func(t *testing.T) {
+		p := hit(asAdmin, "/admin/api/usage/history?from=0&user_id=u2")
+		if p.Total != 1 || len(p.Records) != 1 || p.Records[0].PublicModel != "m-b" {
+			t.Fatalf("按 u2 筛选应只得到 m-b 一条，实际 total=%d records=%+v", p.Total, p.Records)
+		}
+	})
+
+	// user_id 是**查询条件**，不是权限：普通用户传别人的 id 仍是空集。
+	// 若实现把 user_id 当成 callerScope 的替代品，这里就会泄露。
+	t.Run("普通用户传别人的 user_id 仍是空集", func(t *testing.T) {
+		p := hit(func(r *http.Request) *http.Request { return asUser(r, "u1") },
+			"/admin/api/usage/history?from=0&user_id=u2")
+		if p.Total != 0 || len(p.Records) != 0 {
+			t.Fatalf("u1 指定 u2 的 user_id 应得空集，实际 total=%d records=%d —— 可被参数绕过",
+				p.Total, len(p.Records))
+		}
+	})
+
+	// 历史行要带归属用户，界面才能在同名密钥之间区分。
+	t.Run("历史行带归属用户", func(t *testing.T) {
+		p := hit(asAdmin, "/admin/api/usage/history?from=0&user_id=u1")
+		if len(p.Records) != 1 || p.Records[0].UserName != "alice" || p.Records[0].UserID != "u1" {
+			t.Fatalf("应按 u1 返回 alice/u1，实际 %+v", p.Records)
+		}
+	})
 }
 
 // TestExportCSV_ScopedToCaller 钉住 CSV 导出同样收窄。
@@ -162,6 +194,12 @@ func TestExportCSV_ScopedToCaller(t *testing.T) {
 		"/admin/api/usage/history.csv?from=0")
 	if len(user) != 2 { // 表头 + 1 条
 		t.Fatalf("u1 应只导出 2 行（表头+1 条），实际 %d —— CSV 泄露", len(user))
+	}
+
+	// 导出也要跟列表同一套用户筛选：只收窄列表、导出忽略 user_id
+	// 会让「导出这份筛选结果」变成「导出全站」。
+	if n := len(run(asAdmin, "/admin/api/usage/history.csv?from=0&user_id=u2")); n != 2 {
+		t.Fatalf("按 u2 导出应只有表头+1 条，实际 %d 行", n)
 	}
 	// 逐字节确认另一条记录没混进来（按行数断言不够：万一实现是「少一条但多一条
 	// 别人的」，行数照样对得上）。m-b 是 u2 的公开模型名。

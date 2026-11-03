@@ -490,11 +490,20 @@ export function Models() {
       <AppModal open={configOpen} onClose={() => setConfigOpen(false)} title="配置显示曲线的模型" maxWidth="620px" dismissable={false}>
         <div className="flex max-h-[60vh] flex-col gap-0.5 overflow-y-auto">
           {sorted.map((m) => (
-            <label key={m} className="flex cursor-pointer items-center gap-2 rounded-md px-1 py-[5px] hover:bg-default-soft">
-              <Checkbox isSelected={drawn.includes(m)} onChange={() => setDrawn((prev) => (prev.includes(m) ? prev.filter((x) => x !== m) : [...prev, m]))} aria-label={`画 ${m} 的连通率曲线`} />
-              <span className="min-w-0 flex-1 truncate font-mono text-[12.5px]">{m}</span>
-              <StatusChip tone={healthTone(healthOf(m)?.health ?? 'unknown')}>{healthLabel(healthOf(m)?.health ?? 'unknown')}</StatusChip>
-            </label>
+            <Checkbox
+              key={m}
+              isSelected={drawn.includes(m)}
+              onChange={() => setDrawn((prev) => (prev.includes(m) ? prev.filter((x) => x !== m) : [...prev, m]))}
+              className="w-full"
+            >
+              <Checkbox.Content className="hover:bg-default-soft w-full gap-2 rounded-md px-1 py-[5px]">
+                <Checkbox.Control>
+                  <Checkbox.Indicator />
+                </Checkbox.Control>
+                <span className="min-w-0 flex-1 truncate font-mono text-[12.5px]">{m}</span>
+                <StatusChip tone={healthTone(healthOf(m)?.health ?? 'unknown')}>{healthLabel(healthOf(m)?.health ?? 'unknown')}</StatusChip>
+              </Checkbox.Content>
+            </Checkbox>
           ))}
         </div>
         <p className="mt-2 text-[11.5px] leading-relaxed text-muted">

@@ -175,7 +175,12 @@ export function Login() {
               <div className="flex items-baseline justify-between gap-2">
                 <Label>新密码</Label>
                 <Checkbox isSelected={showPwd[0]} onChange={showPwd[1]}>
-                  显示密码
+                  <Checkbox.Content className="gap-2">
+                    <Checkbox.Control>
+                      <Checkbox.Indicator />
+                    </Checkbox.Control>
+                    <span>显示密码</span>
+                  </Checkbox.Content>
                 </Checkbox>
               </div>
               <TextField

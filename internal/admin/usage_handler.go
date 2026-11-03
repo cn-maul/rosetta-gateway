@@ -453,6 +453,19 @@ type usageHistoryEntry struct {
 	UpstreamProtocol string `json:"upstream_protocol"`
 	KeyName          string `json:"key_name"`
 	KeyID            string `json:"key_id"`
+	// UserID / UserName 是这条调用的归属用户（usage_records.user_id 冗余固化）。
+	//
+	// # 为什么调用历史要带用户
+	//
+	// 密钥名**没有唯一约束**（access_keys.name 只是 TEXT NOT NULL），
+	// 两个用户各建一把都叫「主力」是完全合法的。此时只显示 key_name 的
+	// 历史表里，两条记录看起来一模一样，管理员无法判断这条到底是谁调的。
+	// 归属用户是密钥之外唯一能区分它们的维度。
+	//
+	// UserName 是**当前**用户名（users.username，可改）；用户已被删除时为空，
+	// 前端回退显示 UserID —— 与 key_deleted 一样，留白会被误读成「无归属」。
+	UserID   string `json:"user_id"`
+	UserName string `json:"user_name"`
 	// KeyDeleted / ProviderDeleted 说明这一行指向的密钥 / 上游**已经不在库里**了。
 	//
 	// # 为什么这件事必须由后端回答
@@ -582,9 +595,11 @@ const (
 		CASE WHEN COALESCE(u.access_key_id, '') <> '' AND a.id IS NULL THEN 1 ELSE 0 END,
 		CASE WHEN COALESCE(u.provider_id, '') <> ''
 		          AND NOT EXISTS (SELECT 1 FROM providers p WHERE p.id = u.provider_id)
-		     THEN 1 ELSE 0 END`
+		     THEN 1 ELSE 0 END,
+		COALESCE(u.user_id, ''), COALESCE(ur.username, '')`
 	usageHistorySource = ` FROM usage_records u
-		LEFT JOIN access_keys a ON a.id = u.access_key_id`
+		LEFT JOIN access_keys a ON a.id = u.access_key_id
+		LEFT JOIN users ur ON ur.id = u.user_id`
 )
 
 type usageHistoryScanner interface {
@@ -600,6 +615,7 @@ func scanUsageHistoryEntry(scanner usageHistoryScanner, e *usageHistoryEntry) er
 		&e.Status, &e.Stream, &e.Cost, &e.HTTPStatus, &e.ErrorCode, &e.ErrorDetail,
 		&e.RouteTrace, &e.RequestID, &e.RequestIP, &e.Effort,
 		&e.KeyDeleted, &e.ProviderDeleted,
+		&e.UserID, &e.UserName,
 	)
 }
 
@@ -645,7 +661,8 @@ type usageHistoryResponse struct {
 }
 
 // usageHistoryFilters 组装 History/CSV 共用的过滤子句：时间范围之外支持
-// status（精确）、public_model（精确）、access_key_id（精确）。
+// status（精确）、public_model（精确）、access_key_id（精确）、
+// user_id（精确，管理员用）。
 // 列名是字面量、值全参数化，无注入面。返回 WHERE 子句与配套参数。
 // usageHistoryFilters 构造历史/CSV 查询的 WHERE。
 //
@@ -653,12 +670,26 @@ type usageHistoryResponse struct {
 // 普通用户能通过 /admin/api/usage/history 或 history.csv 看到
 // 全公司的调用明细（这比看到自己的用量严重得多：明细里有模型名与时间戳，
 // 足以推断出同事在做什么项目）。
-func usageHistoryFilters(from, to int64, status, model, keyID, scopeUserID string) (string, []any) {
+//
+// # userID 与 scopeUserID 为什么是两个参数
+//
+// scopeUserID 是**权限**：由服务端按会话身份决定，非空即强制收窄。
+// userID 是**用户主动选的筛选条件**（管理员在「调用历史」里按人看）。
+// 两者都写成 AND，顺序上权限在前：
+//   - 管理员：scope 为空，user_id 生效 = 按人筛选；
+//   - 普通用户：scope 是自己，即使用 query 传了别人的 user_id，
+//     两个条件同时成立才算命中，结果只会是空集 —— 不能靠参数越权。
+// 把 userID 塞进 scopeUserID 是不行的：那等于让 query 参数决定权限。
+func usageHistoryFilters(from, to int64, status, model, keyID, userID, scopeUserID string) (string, []any) {
 	conds := []string{"u.ts >= ?", "u.ts <= ?"}
 	args := []any{from, to}
 	if scopeUserID != "" {
 		conds = append(conds, "u.user_id = ?")
 		args = append(args, scopeUserID)
+	}
+	if userID != "" {
+		conds = append(conds, "u.user_id = ?")
+		args = append(args, userID)
 	}
 	if status != "" {
 		conds = append(conds, "u.status = ?")
@@ -719,7 +750,7 @@ func (h *UsageHandler) ExportCSV(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	limit := clampLimit(q.Get("limit"), maxUsageLimit, maxUsageLimit)
-	where, args := usageHistoryFilters(from, to, q.Get("status"), q.Get("model"), q.Get("key_id"), callerScope(r))
+	where, args := usageHistoryFilters(from, to, q.Get("status"), q.Get("model"), q.Get("key_id"), q.Get("user_id"), callerScope(r))
 
 	// 总条数与 History 同源：多一次 COUNT 换来「导出的到底是不是全部」。
 	var total int64
@@ -758,7 +789,7 @@ func (h *UsageHandler) ExportCSV(w http.ResponseWriter, r *http.Request) {
 		"input_tokens", "cached_tokens", "reasoning_tokens", "request_id",
 		"http_status", "error_code", "error_detail", "cached_creation_tokens",
 		"provider_name", "upstream_protocol", "request_ip", "effort",
-		"key_deleted", "provider_deleted"})
+		"key_deleted", "provider_deleted", "user_name", "user_id"})
 	for rows.Next() {
 		var e usageHistoryEntry
 		if err := scanUsageHistoryEntry(rows, &e); err != nil {
@@ -795,6 +826,7 @@ func (h *UsageHandler) ExportCSV(w http.ResponseWriter, r *http.Request) {
 			csvCell(e.ProviderName), csvCell(e.UpstreamProtocol),
 			csvCell(e.RequestIP), csvCell(e.Effort),
 			strconv.FormatBool(e.KeyDeleted), strconv.FormatBool(e.ProviderDeleted),
+			csvCell(e.UserName), csvCell(e.UserID),
 		})
 	}
 	cw.Flush()
@@ -843,7 +875,7 @@ func (h *UsageHandler) History(w http.ResponseWriter, r *http.Request) {
 	}
 	limit := clampLimit(q.Get("limit"), 200, maxUsageLimit)
 	offset := clampOffset(q.Get("offset"))
-	where, args := usageHistoryFilters(from, to, q.Get("status"), q.Get("model"), q.Get("key_id"), callerScope(r))
+	where, args := usageHistoryFilters(from, to, q.Get("status"), q.Get("model"), q.Get("key_id"), q.Get("user_id"), callerScope(r))
 
 	// 总条数单独统计（计数不需要 JOIN access_keys，WHERE 只引用 u 列）。
 	var total int64

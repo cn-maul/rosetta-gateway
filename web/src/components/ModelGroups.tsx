@@ -327,12 +327,16 @@ export function ModelGroups() {
               availableModels.map((mm) => (
                 <Checkbox
                   key={mm.id}
-                  aria-label={labelFor(mm)}
                   isSelected={addIds.has(mm.id)}
                   onChange={() => toggleAdd(mm.id)}
-                  className="w-full py-0.5"
+                  className="w-full"
                 >
-                  <span className="truncate font-mono text-sm">{labelFor(mm)}</span>
+                  <Checkbox.Content className="w-full gap-2 py-0.5">
+                    <Checkbox.Control>
+                      <Checkbox.Indicator />
+                    </Checkbox.Control>
+                    <span className="truncate font-mono text-sm">{labelFor(mm)}</span>
+                  </Checkbox.Content>
                 </Checkbox>
               ))
             )}

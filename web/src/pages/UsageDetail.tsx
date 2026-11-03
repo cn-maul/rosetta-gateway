@@ -19,14 +19,14 @@ import { effortLabel, effortTitle, effortTone } from '../effortTone'
 import { fmtMoney, fmtNum, fmtSec, fmtSpeed, fmtTimeFull, fmtTokens, statusLabel } from '../fmt'
 import { protocolLabel } from '../protocols'
 import { parseRouteTrace } from '../routeTrace'
-import type { AccessKey, UsageHistoryEntry } from '../types'
+import type { AccessKey, User, UsageHistoryEntry } from '../types'
 import { DataTable } from '../ui/DataTable'
 import { StatusChip } from '../ui/StatusChip'
 import { keyName, newInputTokens, statusTone, totalTimeTone, upstreamName, UsageDetailDrawer } from '../components/UsageDetailDrawer'
 import { oneOfInt, readPref, writePref } from '../ui/usePersistedState'
 
 /**
- * 调用日志（/history）。全部查询状态都在 URL 上：status/model/key/page/size。
+ * 调用日志（/history）。全部查询状态都在 URL 上：status/model/key/user/page/size。
  * 输入框只保留草稿；实际请求、分页与 CSV 始终来自 URL 中已应用的条件。
  */
 
@@ -112,6 +112,10 @@ export function UsageDetail({ days }: { days: number }) {
   const [err, setErr] = useState('')
   const [keys, setKeys] = useState<AccessKey[]>([])
   const [keyError, setKeyError] = useState('')
+  // 归属用户筛选只给管理员：普通用户的结果集本来就只有自己，
+  // 多一个恒等于「我自己」的下拉没有信息量。
+  const [users, setUsers] = useState<User[]>([])
+  const [userError, setUserError] = useState('')
   const [selected, setSelected] = useState<UsageHistoryEntry | null>(null)
   const [exporting, setExporting] = useState(false)
   const [exportNotice, setExportNotice] = useState('')
@@ -120,6 +124,7 @@ export function UsageDetail({ days }: { days: number }) {
   const [fStatus, setFStatus] = useState('')
   const [fModel, setFModel] = useState('')
   const [fKey, setFKey] = useState('')
+  const [fUser, setFUser] = useState('')
 
   const queryText = (key: string) => searchParams.get(key) ?? ''
   const request = useMemo(() => {
@@ -129,6 +134,7 @@ export function UsageDetail({ days }: { days: number }) {
       status: STATUSES.some((s) => s.value === status) ? status : '',
       model: queryText('model').trim(),
       keyId: queryText('key'),
+      userId: queryText('user'),
       page: Math.max(1, Math.min(1000000, Math.floor(Number(queryText('page'))) || 1)),
       // 每页条数没写在 URL 上时用上次的选择（URL 带 size 的分享链接照旧优先）。
       size: SIZES.includes(size) ? size : readPref('history.size', 20, oneOfInt(SIZES)),
@@ -144,7 +150,8 @@ export function UsageDetail({ days }: { days: number }) {
     setFStatus(request.status)
     setFModel(request.model)
     setFKey(request.keyId)
-  }, [request.status, request.model, request.keyId])
+    setFUser(request.userId)
+  }, [request.status, request.model, request.keyId, request.userId])
 
   const pushQuery = useCallback(
     (patch: Record<string, string | undefined>) => {
@@ -158,10 +165,11 @@ export function UsageDetail({ days }: { days: number }) {
     [searchParams, setSearchParams],
   )
 
-  const filters = (status: string, model: string, keyId: string) => ({
+  const filters = (status: string, model: string, keyId: string, userId: string) => ({
     status: status || undefined,
     model: model || undefined,
     keyId: keyId || undefined,
+    userId: userId || undefined,
   })
 
   const load = useCallback(async () => {
@@ -170,7 +178,12 @@ export function UsageDetail({ days }: { days: number }) {
     setLoading(true)
     setErr('')
     try {
-      const result = await api.usageHistory(days, r.size, (r.page - 1) * r.size, filters(r.status, r.model, r.keyId))
+      const result = await api.usageHistory(
+        days,
+        r.size,
+        (r.page - 1) * r.size,
+        filters(r.status, r.model, r.keyId, r.userId),
+      )
       if (seq !== reqSeq.current) return
       const last = Math.max(1, Math.ceil(result.total / r.size))
       if (r.page > last) {
@@ -198,18 +211,29 @@ export function UsageDetail({ days }: { days: number }) {
   }, [load])
 
   const applyFilters = useCallback(
-    (override?: { status?: string; model?: string; key?: string }) => {
+    (override?: { status?: string; model?: string; key?: string; user?: string }) => {
       const status = override?.status ?? fStatus
       const model = (override?.model ?? fModel).trim()
       const key = override?.key ?? fKey
-      const changed = status !== request.status || model !== request.model || key !== request.keyId
+      const user = override?.user ?? fUser
+      const changed =
+        status !== request.status ||
+        model !== request.model ||
+        key !== request.keyId ||
+        user !== request.userId
       if (!changed) {
         void load()
         return
       }
-      pushQuery({ status: status || undefined, model: model || undefined, key: key || undefined, page: undefined })
+      pushQuery({
+        status: status || undefined,
+        model: model || undefined,
+        key: key || undefined,
+        user: user || undefined,
+        page: undefined,
+      })
     },
-    [fStatus, fModel, fKey, request, load, pushQuery],
+    [fStatus, fModel, fKey, fUser, request, load, pushQuery],
   )
 
   const onModelBlur = () => {
@@ -220,7 +244,8 @@ export function UsageDetail({ days }: { days: number }) {
     setFStatus('')
     setFModel('')
     setFKey('')
-    applyFilters({ status: '', model: '', key: '' })
+    setFUser('')
+    applyFilters({ status: '', model: '', key: '', user: '' })
   }
 
   const go = (page: number) => {
@@ -241,12 +266,26 @@ export function UsageDetail({ days }: { days: number }) {
     void loadKeys()
   }, [loadKeys])
 
+  const loadUsers = useCallback(async () => {
+    if (!admin) return
+    setUserError('')
+    try {
+      setUsers(await api.users())
+    } catch {
+      setUserError('用户筛选暂不可用')
+    }
+  }, [admin])
+
+  useEffect(() => {
+    void loadUsers()
+  }, [loadUsers])
+
   const exportCSV = async () => {
     setExporting(true)
     try {
       // 草稿还没应用时先写回 URL（分页会随之清掉），CSV 始终按草稿条件导。
       applyFilters()
-      const result = await api.exportUsageCSV(days, filters(fStatus, fModel.trim(), fKey))
+      const result = await api.exportUsageCSV(days, filters(fStatus, fModel.trim(), fKey, fUser))
       if (result.truncated) {
         setExportNotice(
           (result.total === undefined ? '' : '共 ' + fmtNum(result.total) + ' 条，') +
@@ -264,6 +303,28 @@ export function UsageDetail({ days }: { days: number }) {
   }
 
   const errText = err + (rows.length ? '（近 ' + loadedDays + ' 天，第 ' + loadedPage + ' 页）' : '')
+
+  /** 密钥下拉的展示名。密钥名没有唯一约束，两个用户都建一把「主力」时
+   *  只写名字会得到两个完全相同的选项 —— 选中哪一个都是猜。归属用户是
+   *  唯一可靠的区分维度，因此在列表里名字唯一的正常情况不额外加噪声，
+   *  重名时才补上归属。 */
+  const duplicateKeyNames = useMemo(() => {
+    const seen = new Set<string>()
+    const dup = new Set<string>()
+    for (const k of keys) {
+      const name = k.name || k.key_prefix
+      if (seen.has(name)) dup.add(name)
+      seen.add(name)
+    }
+    return dup
+  }, [keys])
+
+  /** 按用户筛选后，密钥下拉只列这个人的密钥 —— 否则「选了张三，
+   *  下拉里却还有李四的 key」会让下一步筛出空集，而界面不会解释原因。 */
+  const keyOptions = useMemo(
+    () => (fUser ? keys.filter((k) => k.user_id === fUser) : keys),
+    [keys, fUser],
+  )
 
   const toolbar = (
     <>
@@ -304,7 +365,7 @@ export function UsageDetail({ days }: { days: number }) {
         </TextField>
         <Select
           aria-label="调用密钥"
-          className="w-[170px]"
+          className="w-[220px]"
           isDisabled={!!keyError}
           selectedKey={fKey}
           onSelectionChange={(key) => {
@@ -320,12 +381,49 @@ export function UsageDetail({ days }: { days: number }) {
           <SelectPopover>
             <ListBox aria-label="调用密钥">
               <ListBoxItem id="" className="text-muted">全部密钥</ListBoxItem>
-              {keys.map((k) => (
-                <ListBoxItem key={k.id} id={k.id}>{k.name || k.key_prefix}</ListBoxItem>
+              {keyOptions.map((k) => (
+                <ListBoxItem key={k.id} id={k.id}>
+                  {k.name || k.key_prefix}
+                  {duplicateKeyNames.has(k.name || k.key_prefix)
+                    ? `（${k.username || k.user_id || '无归属'}）`
+                    : ''}
+                </ListBoxItem>
               ))}
             </ListBox>
           </SelectPopover>
         </Select>
+        {admin ? (
+          <Select
+            aria-label="归属用户"
+            className="w-[170px]"
+            isDisabled={!!userError}
+            selectedKey={fUser}
+            onSelectionChange={(key) => {
+              const v = key === null ? '' : String(key)
+              setFUser(v)
+              // 换人时清掉密钥条件：上一把 key 属于别人，留着两个条件
+              // 同时生效只会得到空集，而空集看起来像「这个人没有调用」。
+              setFKey('')
+              applyFilters({ user: v, key: '' })
+            }}
+          >
+            <SelectTrigger>
+              <SelectValue />
+              <SelectIndicator />
+            </SelectTrigger>
+            <SelectPopover>
+              <ListBox aria-label="归属用户">
+                <ListBoxItem id="" className="text-muted">全部用户</ListBoxItem>
+                {users.map((u) => (
+                  <ListBoxItem key={u.id} id={u.id}>
+                    {u.username}
+                    {u.role === 'admin' ? '（管理员）' : ''}
+                  </ListBoxItem>
+                ))}
+              </ListBox>
+            </SelectPopover>
+          </Select>
+        ) : null}
         <Button variant="secondary" size="sm" onPress={() => applyFilters()}>应用</Button>
         <Button variant="ghost" size="sm" onPress={resetFilters}>重置</Button>
       </div>
@@ -365,6 +463,12 @@ export function UsageDetail({ days }: { days: number }) {
         <p className="mb-4 flex items-center gap-2 rounded-lg bg-warning-soft px-3.5 py-2 text-xs text-warning-foreground" role="status">
           {keyError}
           <Button variant="tertiary" size="sm" onPress={() => void loadKeys()}>重试</Button>
+        </p>
+      ) : null}
+      {userError ? (
+        <p className="mb-4 flex items-center gap-2 rounded-lg bg-warning-soft px-3.5 py-2 text-xs text-warning-foreground" role="status">
+          {userError}
+          <Button variant="tertiary" size="sm" onPress={() => void loadUsers()}>重试</Button>
         </p>
       ) : null}
       {exportNotice ? (
@@ -408,6 +512,7 @@ export function UsageDetail({ days }: { days: number }) {
                 <Table.Column>请求 IP</Table.Column>
                 {admin ? <Table.Column>上游</Table.Column> : null}
                 <Table.Column>模型</Table.Column>
+                {admin ? <Table.Column>用户</Table.Column> : null}
                 <Table.Column>密钥</Table.Column>
                 <Table.Column>Token 用量</Table.Column>
                 <Table.Column>速度</Table.Column>
@@ -431,6 +536,15 @@ export function UsageDetail({ days }: { days: number }) {
                         ) : null}
                       </span>
                     </Table.Cell>
+                    {admin ? (
+                      <Table.Cell>
+                        {/* 用户名来自 users 当前值（可改）；用户已删除时回退到 id，
+                            留白会被读成「无归属」，那是另一件事。 */}
+                        <span title={h.user_id || '这条记录没有归属用户'}>
+                          {h.user_name || h.user_id || '无归属'}
+                        </span>
+                      </Table.Cell>
+                    ) : null}
                     <Table.Cell>
                       {/* 「上游/下游」两个词占了大半格宽，而这一列真正要看的是两个协议名。
                           ↑ 上行（网关发给上游）、↓ 下行（客户端进来的），读屏走 sr-only。 */}
@@ -479,7 +593,9 @@ export function UsageDetail({ days }: { days: number }) {
                     <Table.Cell>
                       {/* 名字是落库时固化的：密钥删掉之后仍显示当时的名字，
                           加「已删除 · 」前缀；只有升级前的旧记录才回退到 id。 */}
-                      <span title={keyName(h)}>{keyName(h)}</span>
+                      <span title={keyName(h) + (h.user_name || h.user_id ? `（归属 ${h.user_name || h.user_id}）` : '')}>
+                        {keyName(h)}
+                      </span>
                     </Table.Cell>
                     <Table.Cell>
                       {/* 箭头代替「新增输入 / 输出」两个词：这一列是表里最挤的一格，

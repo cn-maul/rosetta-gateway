@@ -206,13 +206,25 @@ export function BatchPriceModal({
             </div>
             <div className="max-h-[240px] overflow-y-auto py-1">
               {visibleTargets.map((r) => (
-                <label key={r.model.id} className="hover:bg-hover flex cursor-pointer items-center gap-2 px-2.5 py-1">
-                  <Checkbox aria-label={`选择 ${r.model.model_id}`} isSelected={selected.has(r.model.id)} onChange={() => toggleSelected(r.model.id)} />
-                  <span className="truncate font-mono text-[13px]">{r.model.model_id}</span>
-                  <span className="text-muted ml-auto shrink-0 text-[11px]">{r.providerName}</span>
-                  {/* 已配价的标出来：批量覆盖它们是有意还是误勾，一眼可辨 */}
-                  {isPriced(r.model) ? <StatusChip tone="dim">已配价</StatusChip> : null}
-                </label>
+                // 整行就是 Checkbox 的 label：Content 会渲染 <label>，
+                // 外面再套一层 <label> 是嵌套 label（HTML 不允许），
+                // 而且真正可点的只有内层那个。
+                <Checkbox
+                  key={r.model.id}
+                  isSelected={selected.has(r.model.id)}
+                  onChange={() => toggleSelected(r.model.id)}
+                  className="w-full"
+                >
+                  <Checkbox.Content className="hover:bg-hover w-full gap-2 px-2.5 py-1">
+                    <Checkbox.Control>
+                      <Checkbox.Indicator />
+                    </Checkbox.Control>
+                    <span className="truncate font-mono text-[13px]">{r.model.model_id}</span>
+                    <span className="text-muted ml-auto shrink-0 text-[11px]">{r.providerName}</span>
+                    {/* 已配价的标出来：批量覆盖它们是有意还是误勾，一眼可辨 */}
+                    {isPriced(r.model) ? <StatusChip tone="dim">已配价</StatusChip> : null}
+                  </Checkbox.Content>
+                </Checkbox>
               ))}
               {targets.length === 0 ? <div className="text-muted px-2.5 py-2 text-xs">没有匹配的模型</div> : null}
             </div>

@@ -414,7 +414,13 @@ export function PriceSettings({ refreshSignal }: { refreshSignal: number }) {
                                 aria-label={`选择 ${r.model.model_id}`}
                                 isSelected={priceSelected.has(r.model.id)}
                                 onChange={() => togglePriceSelected(r.model.id)}
-                              />
+                              >
+                                <Checkbox.Content>
+                                  <Checkbox.Control>
+                                    <Checkbox.Indicator />
+                                  </Checkbox.Control>
+                                </Checkbox.Content>
+                              </Checkbox>
                             </Table.Cell>
                             <Table.Cell>{r.providerName}</Table.Cell>
                             <Table.Cell>

@@ -18,12 +18,30 @@
 
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { readFile } from 'node:fs/promises'
-import { dirname, join } from 'node:path'
+import { readdir, readFile } from 'node:fs/promises'
+import { dirname, join, relative, sep } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
 const WEB = join(dirname(fileURLToPath(import.meta.url)), '..')
 const read = (rel) => readFile(join(WEB, rel), 'utf8')
+
+/** 递归列出 src 下的 tsx，返回相对 WEB 的路径（统一用 /）。 */
+async function listTsx(dir) {
+  const out = []
+  async function walk(abs) {
+    for (const e of await readdir(abs, { withFileTypes: true })) {
+      const full = join(abs, e.name)
+      if (e.isDirectory()) {
+        if (e.name === 'node_modules' || e.name === 'dist') continue
+        await walk(full)
+      } else if (e.name.endsWith('.tsx')) {
+        out.push(relative(WEB, full).split(sep).join('/'))
+      }
+    }
+  }
+  await walk(join(WEB, dir))
+  return out
+}
 
 test('输入控件的底色与边框在 theme.css 里被显式覆盖', async () => {
   const css = await read('src/theme.css')
@@ -85,5 +103,28 @@ test('探测不到列表时能手动添加模型', async () => {
     src.slice(src.indexOf('const submitManual')),
     /api\.importModels\(/,
     '手动添加必须复用 api.importModels',
+  )
+})
+
+// HeroUI 3 的 Checkbox 是复合组件：`Checkbox` 本身只渲染一个空 div，
+// 真正的 <input> 来自 Checkbox.Content → Checkbox.Control。
+// 只传文本子节点时编译能过、界面上也有字，但既看不见方框也点不动 ——
+// 「模型白名单只能全选/清空」正是这样发生的。类型系统管不到，只能源码门禁。
+test('每个 Checkbox 都渲染了可点击的 Content/Control', async () => {
+  const files = (await listTsx('src'))
+  const violations = []
+  for (const rel of files) {
+    const src = await read(rel)
+    // (?![.\w]) 排除 <Checkbox.Content> / <Checkbox.Control> 这类子组件。
+    for (const m of src.matchAll(/<Checkbox(?![.\w])[\s\S]*?<\/Checkbox>/g)) {
+      if (!m[0].includes('<Checkbox.Content')) violations.push(rel + ': ' + m[0].slice(0, 80))
+    }
+    // 自闭合的 Checkbox 同样没有 input（例如表格里的裸勾选框）。
+    for (const m of src.matchAll(/<Checkbox(?![.\w])[^>]*\/>/g)) violations.push(rel + ': ' + m[0].slice(0, 80))
+  }
+  assert.deepEqual(
+    violations,
+    [],
+    'Checkbox 缺少 Content/Control，会渲染成空 div、点不动：\n' + violations.join('\n'),
   )
 })

@@ -503,6 +503,7 @@ function usageHistoryQuery(days: number, filters?: HistoryFilters): string {
   if (filters?.status) q.set('status', filters.status)
   if (filters?.model) q.set('model', filters.model)
   if (filters?.keyId) q.set('key_id', filters.keyId)
+  if (filters?.userId) q.set('user_id', filters.userId)
   return q.toString()
 }
 

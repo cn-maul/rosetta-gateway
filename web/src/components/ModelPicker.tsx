@@ -96,9 +96,17 @@ export function ModelPicker({ value, onChange, options, restricted = false }: Mo
                 key={m}
                 isSelected={picked.has(m)}
                 onChange={() => toggle(m)}
-                className="hover:bg-default-soft rounded px-1.5 py-1"
+                className="w-full"
               >
-                <span className="font-mono text-[13px]">{m}</span>
+                {/* HeroUI 3 的 Checkbox 是复合组件：不渲染 Content/Control/Indicator
+                    就只剩一个空 div —— 既看不见方框，也没有 input，整行点不动。
+                    只有「全选 / 清空」这类按钮还生效，于是表现为「只能全选或清空」。 */}
+                <Checkbox.Content className="hover:bg-default-soft w-full gap-2 rounded px-1.5 py-1">
+                  <Checkbox.Control>
+                    <Checkbox.Indicator />
+                  </Checkbox.Control>
+                  <span className="font-mono text-[13px]">{m}</span>
+                </Checkbox.Content>
               </Checkbox>
             ))}
             {visible.length === 0 ? <div className="text-muted px-1 py-2.5 text-xs">没有匹配「{query}」的模型。</div> : null}
