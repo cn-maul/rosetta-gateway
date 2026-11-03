@@ -1467,6 +1467,112 @@ func TestPerfLongStreamMemoryBounded(t *testing.T) {
 // 辅助
 // ---------------------------------------------------------------------------
 
+// fakeStreamRoleOnlyFirst 模拟「首个 chunk 只带 role」的上游。
+//
+// 这是 OpenAI 系上游的常态（DeepSeek / vLLM / 多数中转都先发一个
+// delta.role 的空拍），但它恰好是网关最容易丢时间的地方：chat 下游 sink
+// 在 EventMessageStart 时不写任何字节，于是 WriteHeader 之后没有数据、
+// 响应头也发不出去，客户端要等到第二个事件才看到 200。
+//
+// 与 fakeStreamMany 的区别只有一个：首片不带 content。
+func fakeStreamRoleOnlyFirst(contentEvents int, gap time.Duration) *httptest.Server {
+	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		fl, _ := w.(http.Flusher)
+		emit := func(delta string) {
+			fmt.Fprintf(w, "data: {\"id\":\"c1\",\"object\":\"chat.completion.chunk\",\"created\":0,"+
+				"\"model\":\"good-model\",\"choices\":[{\"index\":0,\"delta\":%s,\"finish_reason\":null}]}\n\n", delta)
+			if fl != nil {
+				fl.Flush()
+			}
+		}
+		// 首片：只有 role，没有任何正文。
+		emit(`{"role":"assistant"}`)
+		for i := 0; i < contentEvents; i++ {
+			if gap > 0 {
+				select {
+				case <-time.After(gap):
+				case <-r.Context().Done():
+					return
+				}
+			}
+			emit(`{"content":"x"}`)
+		}
+		fmt.Fprint(w, "data: {\"id\":\"c1\",\"object\":\"chat.completion.chunk\",\"created\":0,"+
+			"\"model\":\"good-model\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n")
+		fmt.Fprint(w, "data: [DONE]\n\n")
+		if fl != nil {
+			fl.Flush()
+		}
+	}))
+}
+
+// TestStreamHeadersNotHeldByRoleOnlyFirstChunk 守住「响应头不被首个空拍压住」。
+//
+// # 这条测试防的是什么回归
+//
+// Go 的 WriteHeader 只记账，字节要等第一次 Write 才出。chat 下游 sink 在
+// EventMessageStart（上游首个只带 role 的 chunk）时不写任何字节，所以修复前
+// 客户端要等到**第二个上游事件**才看到 200 和流起点 —— 首字整整晚一个事件
+// 间隔（实测上游 200ms/事件时，响应头从 224ms 变成 414ms；10/50/200ms 的
+// 事件间隔分别带来 +12.8/+67.4/+198.5ms，随间隔线性增长）。
+//
+// 判据用「响应头到达时刻」而不是 TTFT，因为两者在零延迟上游下无法区分：
+// 这里上游两个事件之间停 300ms，若头被压住，头到达时刻会 ≥300ms。
+func TestStreamHeadersNotHeldByRoleOnlyFirstChunk(t *testing.T) {
+	const gap = 300 * time.Millisecond
+
+	up := fakeStreamRoleOnlyFirst(2, gap)
+	defer up.Close()
+
+	h, _ := buildHarness(t, []struct {
+		slug, url string
+		fail      bool
+	}{{"good", up.URL, false}}, false)
+	gw := startGateway(t, h)
+	client := perfClient()
+	defer client.CloseIdleConnections()
+
+	// 预热：把连接、快照、客户端构建都走一遍，避免把冷启动算进判据。
+	for i := 0; i < 5; i++ {
+		if _, _, code, err := doStream(client, gw.URL, streamBody); err != nil || code != 200 {
+			t.Fatalf("预热失败: code=%d err=%v", code, err)
+		}
+	}
+
+	// 只测「响应头到达时刻」：不读 body，拿到 *http.Response 立刻停表。
+	headAt := make([]time.Duration, 0, 10)
+	for i := 0; i < 10; i++ {
+		req, err := http.NewRequest(http.MethodPost, gw.URL+"/v1/chat/completions", strings.NewReader(streamBody))
+		if err != nil {
+			t.Fatal(err)
+		}
+		req.Header.Set("Authorization", "Bearer "+testAccessKey)
+		req.Header.Set("Content-Type", "application/json")
+		start := time.Now()
+		resp, err := client.Do(req)
+		if err != nil {
+			t.Fatalf("请求失败: %v", err)
+		}
+		d := time.Since(start)
+		resp.Body.Close()
+		headAt = append(headAt, d)
+	}
+
+	sort.Slice(headAt, func(i, j int) bool { return headAt[i] < headAt[j] })
+	p50 := percentile(headAt, 50)
+	t.Logf("A9 role-only 首片: 响应头 P50=%v P95=%v（上游第二个事件在 %v 之后）",
+		p50.Round(time.Millisecond), percentile(headAt, 95).Round(time.Millisecond), gap)
+
+	// 阈值取 gap 的一半：头正常应在一个事件间隔之前就到；被压住时必然 ≥gap。
+	// 留一半余量是为了容忍机器抖动，但仍能明确区分两种行为。
+	if p50 > gap/2 {
+		t.Fatalf("响应头 P50=%v 超过了 %v —— 头被首个空拍压住，客户端要等第二个上游事件",
+			p50, gap/2)
+	}
+}
+
 // newPerfEnv 组一套「网关 HTTP 服务器 + 客户端」。
 //
 // 与直接调 handler 的区别见 startGateway 的注释（Flusher / 真实连接）。

@@ -1121,6 +1121,32 @@ func (h *Handler) attemptStream(w http.ResponseWriter, r *http.Request, client *
 	w.Header().Set("X-Accel-Buffering", "no")
 	w.WriteHeader(http.StatusOK)
 
+	// 提交后立刻把响应头刷出去，不等第一个正文分片。
+	//
+	// # 不刷会怎样
+	//
+	// Go 的 WriteHeader 只是记账，真正的字节要等第一次 Write 才发出。而
+	// OpenAI chat 的下游 sink 在 EventMessageStart 时**一个字节都不写**
+	// （它只调 SetResponseID）—— 上游的首个 chunk 通常只带 delta.role。
+	// 于是客户端要等到**第二个上游事件**（正文）才看到 200 和流起点，
+	// 首字被推迟整整一个事件间隔：实测上游每 200ms 一事件时，客户端收到
+	// 响应头的时间从 224ms 变成 414ms，且该差值随事件间隔线性增长
+	// （10/50/200ms → +12.8/+67.4/+198.5ms）。
+	//
+	// # 为什么在这里刷而不是提前发 role 分片
+	//
+	// SSEWriter.SetResponseID 只在首个分片写出前才允许改 id（上游
+	// message_start 带回真实响应 id 时要覆盖兜底 id）。先发 role 分片会把
+	// roleSent 置位，真实 id 就再也写不进去了。只刷头不写分片则两者都保住：
+	// 客户端立刻拿到 200 与 SSE 头，分片仍按原有顺序与 id 语义产出。
+	//
+	// Anthropic 与 Responses 两条 sink 在 MessageStart 时就已写出
+	// message_start / response.created，本来就没有这个问题；这次 flush 对
+	// 它们只是把已有的头更早送出，无副作用。
+	if f, ok := w.(http.Flusher); ok {
+		f.Flush()
+	}
+
 	// 流式编码器由 codec 构造：OpenAI 走 SSEWriter，Anthropic 走块状态机。
 	sink := codec.NewSink(w, publicModel, ing)
 	// 单次写截止时间（2026-10-17）：下游挂死不读时让 Write 自己返回超时，
