@@ -1,0 +1,1 @@
+var e=e=>e.user_name?e.user_name:e.key||`无归属`,t=e=>e.key?e.user_name?e.role===`admin`?{text:`管理员·历史`,tone:`info`}:null:{text:`已删除`,tone:`dim`}:{text:`无归属`,tone:`dim`};function n(t){return Array.from(e(t))[0]??`?`}export{e as n,t as r,n as t};

@@ -11,6 +11,8 @@ const read = (rel) => readFileSync(join(web, rel), 'utf8')
 
 test('设置页的导入导出：四段新计数都有回显', () => {
   const src = read('src/pages/Settings.tsx')
+  const previewFn = src.match(/function importPreviewRows[\s\S]*?\n\}/)?.[0] ?? ''
+  assert.ok(previewFn, '缺少 importPreviewRows')
   for (const field of [
     'user_groups_created',
     'users_created',
@@ -20,17 +22,20 @@ test('设置页的导入导出：四段新计数都有回显', () => {
     'routes_created',
     'routes_skipped',
   ]) {
-    // 要断「守卫表达式」而不只是「出现过」：只把值写进 <b> 而丢了条件，
+    // 要断「计数源都在面板里」，并确认零值被过滤：只把值塞进数组而不过滤，
     // 结果仍会出现一条「跳过已存在的路由 0」，比不显示更误导。
-    assert.ok(
-      src.includes(`{importPreview.${field} ? (`),
-      `设置页缺 ${field} 的条件渲染 —— 后端导进来了，界面却是哑的`,
-    )
+    assert.ok(previewFn.includes(`p.${field}`), `预演结果缺 ${field} —— 后端导进来了，界面却是哑的`)
   }
+  assert.ok(
+    previewFn.includes('.filter((row) => row.value > 0)'),
+    '预演结果没有过滤零值，会显示一串「新增 0」',
+  )
   // 文件内容摘要也要能报出用户/密钥/路由的条数
-  assert.ok(src.includes('importParsed.users?.length'), '未解密的文件摘要里没有用户条数')
-  assert.ok(src.includes('importParsed.access_keys?.length'), '未解密的文件摘要里没有访问密钥条数')
-  assert.ok(src.includes('importParsed.routes?.length'), '未解密的文件摘要里没有路由条数')
+  const fileFn = src.match(/function importedFileRows[\s\S]*?\n\}/)?.[0] ?? ''
+  assert.ok(fileFn, '缺少 importedFileRows')
+  assert.ok(fileFn.includes('f.users?.length'), '未解密的文件摘要里没有用户条数')
+  assert.ok(fileFn.includes('f.access_keys?.length'), '未解密的文件摘要里没有访问密钥条数')
+  assert.ok(fileFn.includes('f.routes?.length'), '未解密的文件摘要里没有路由条数')
 })
 
 test('导入导出类型与后端 v4 契约一致', () => {

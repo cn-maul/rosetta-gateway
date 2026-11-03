@@ -3,6 +3,7 @@ import { Tabs, ToggleButton, ToggleButtonGroup } from '@heroui/react'
 import { api, isAdmin } from '../api'
 import { PageHeader } from '../ui/PageHeader'
 import { UsageByGroup } from '../components/UsageByGroup'
+import { UsageByUser } from '../components/UsageByUser'
 import { ModelGroups } from '../components/ModelGroups'
 import { UsageDetail } from './UsageDetail'
 import { oneOfInt, readPref, writePref } from '../ui/usePersistedState'
@@ -30,6 +31,7 @@ export function UsageStats() {
   const tabs = [
     { key: 'providers', label: '按上游' },
     { key: 'models', label: '按模型' },
+    ...(admin ? [{ key: 'users', label: '按用户' }] : []),
     { key: 'keys', label: '按密钥' },
     ...(admin ? [{ key: 'groups', label: '统计归并' }] : []),
   ]
@@ -51,7 +53,9 @@ export function UsageStats() {
     ? `逐条查看调用结果、耗时与记录费用 · ${scope}`
     : tab === 'groups'
       ? `将跨上游的同名模型合并统计；不改变路由、转发或权限 · ${scope}`
-      : ''
+      : tab === 'users'
+        ? `按用户汇总消费与用量；含已删除用户的历史记录 · ${scope}`
+        : ''
 
   const setTab = (key: string) => {
     const next = new URLSearchParams(searchParams)
@@ -120,6 +124,7 @@ export function UsageStats() {
             {tab === 'models' ? (
               <UsageByGroup key="models" firstCol="模型" kind="model" fetch={fetchModels} days={days} />
             ) : null}
+            {tab === 'users' && admin ? <UsageByUser days={days} /> : null}
             {tab === 'keys' ? (
               <UsageByGroup key="keys" firstCol="密钥" kind="key" fetch={fetchKeys} days={days} />
             ) : null}

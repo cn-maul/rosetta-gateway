@@ -3,15 +3,31 @@ import { useSearchParams } from 'react-router-dom'
 import {
   Alert,
   Button,
+  Description,
   Disclosure,
   Input,
   Label,
+  Separator,
   Spinner,
+  Surface,
   Tabs,
   TextField,
   TextArea,
   toast,
 } from '@heroui/react'
+import {
+  Activity,
+  Archive,
+  Boxes,
+  Calculator,
+  Download,
+  GitBranch,
+  RotateCcw,
+  Save,
+  ShieldAlert,
+  Timer,
+  Upload,
+} from 'lucide-react'
 import { api } from '../api'
 import { confirmBox } from '../ui/confirm'
 import { PageHeader } from '../ui/PageHeader'
@@ -39,8 +55,8 @@ type TabKey = 'site' | 'model' | 'runtime' | 'price' | 'transfer'
 
 const TABS: { key: TabKey; label: string; sub: string }[] = [
   { key: 'site', label: '站点', sub: '站点名称与 LOGO：显示在登录页与侧栏左上角' },
-  { key: 'model', label: '模型默认', sub: '全局默认值；模型容量探测不到时回落到这里' },
-  { key: 'runtime', label: '运行时', sub: '各类超时与自动故障转移的全局默认，按「谁在保护什么」分块' },
+  { key: 'model', label: '模型默认', sub: '上游未回报容量时的兜底值' },
+  { key: 'runtime', label: '运行时', sub: '超时、流式看门狗与故障转移' },
   // 这里曾有一个「安全」页，放的是独立于 users 表的管理密码（另有一份凭据文件兜底）。
   // 统一认证后管理密码就是 users 表里某个用户的密码，已由「我的账号」（自助改）
   // 与「用户管理」（管理员重置）各自承担，所以整块删除 —— 不要在这里加回跳转提示之类的残件。
@@ -50,9 +66,38 @@ const TABS: { key: TabKey; label: string; sub: string }[] = [
   {
     key: 'transfer',
     label: '导入导出',
-    sub: '导出供应商与模型配置，或从文件导入。只影响供应商与模型，不含路由与密钥',
+    sub: '完整配置的加密导出与导入',
   },
 ]
+
+/** 预演结果只列非零项：零值堆在面板里只会让真正发生的变化更难找。 */
+function importPreviewRows(p: ConfigImportResult): { label: string; value: number }[] {
+  return [
+    { label: '新增供应商', value: p.providers_created },
+    { label: '新增模型', value: p.models_created },
+    { label: '跳过模型', value: p.models_skipped },
+    { label: '新增凭据', value: p.credentials_added },
+    { label: '新增用户分组', value: p.user_groups_created },
+    { label: '新增用户', value: p.users_created },
+    { label: '跳过用户', value: p.users_skipped },
+    { label: '新增访问密钥', value: p.access_keys_created },
+    { label: '跳过访问密钥', value: p.access_keys_skipped },
+    { label: '新增路由', value: p.routes_created },
+    { label: '跳过路由', value: p.routes_skipped },
+  ].filter((row) => row.value > 0)
+}
+
+/** 文件清单同样只列有内容的分段，省掉一串「0 个」。 */
+function importedFileRows(f: ConfigExportFile): { label: string; value: number }[] {
+  return [
+    { label: '供应商', value: f.providers?.length ?? 0 },
+    { label: '模型', value: f.models?.length ?? 0 },
+    { label: '凭据', value: f.credentials?.length ?? 0 },
+    { label: '用户', value: f.users?.length ?? 0 },
+    { label: '访问密钥', value: f.access_keys?.length ?? 0 },
+    { label: '路由', value: f.routes?.length ?? 0 },
+  ].filter((row) => row.value > 0)
+}
 
 // 运行时推荐默认值由 Go 侧生成（go generate ./internal/config）。
 // 原始定义在 internal/config/config.go；这里不再手抄一份数字。
@@ -201,6 +246,7 @@ export function Settings() {
   const [importPass, setImportPass] = useState('')
   const [importPreview, setImportPreview] = useState<ConfigImportResult | null>(null)
   const [importError, setImportError] = useState('')
+  const [dragOver, setDragOver] = useState(false)
 
   // 价格页签是独立组件、自己拉数据；外层「刷新」按钮通过计数器触发它的重拉。
   const [priceRefresh, setPriceRefresh] = useState(0)
@@ -439,21 +485,16 @@ export function Settings() {
     if (ok) await runImport(false)
   }
 
-  // recNote 给出该字段的推荐值，并在当前值已偏离时点明。
-  //
-  // 「当前已自定义」是有用的信息：这几个数一旦偏离推荐值，多半是当初为了
-  // 某个具体故障调过的。界面上看不出偏离，运维很容易在别的故障里顺手改回去。
-  const recNote = (k: RuntimeKey): string => {
+  // recText 只负责把推荐值说成人话；是否偏离由 fieldIsCustom 单独判断，
+  // 界面用胶囊表达，不再把「当前已自定义」拼进同一行文字。
+  const recText = (k: RuntimeKey): string => {
     const rec = RUNTIME_DEFAULTS[k]
-    const unit =
-      k === 'failover_max_targets'
-        ? ' 个目标'
-        : k === 'failover_failure_threshold'
-          ? ' 次连续失败'
-          : `（${fmtDur(rec)}）`
-    const s = `推荐 ${fmtNum(rec)}${unit}`
-    return Number(form[k]) === rec ? s : `${s} · 当前已自定义`
+    if (k === 'failover_max_targets') return `${fmtNum(rec)} 个目标`
+    if (k === 'failover_failure_threshold') return `${fmtNum(rec)} 次连续失败`
+    return fmtDur(rec)
   }
+
+  const fieldIsCustom = (k: RuntimeKey): boolean => Number(form[k]) !== RUNTIME_DEFAULTS[k]
 
   // groupAtDefaults：整类都等于推荐值时，「恢复推荐默认」按钮禁用。
   // 一个永远可点但什么都不会变的按钮，比没有更让人怀疑它是不是坏了。
@@ -468,6 +509,18 @@ export function Settings() {
       for (const k of keys) next[k] = String(RUNTIME_DEFAULTS[k])
       return next
     })
+  }
+
+  const modelAtDefaults = (): boolean =>
+    Number(form.default_context_window) === MODEL_DEFAULT_FALLBACKS.default_context_window &&
+    Number(form.default_max_output_tokens) === MODEL_DEFAULT_FALLBACKS.default_max_output_tokens
+
+  const resetModelDefaults = () => {
+    setForm((f) => ({
+      ...f,
+      default_context_window: String(MODEL_DEFAULT_FALLBACKS.default_context_window),
+      default_max_output_tokens: String(MODEL_DEFAULT_FALLBACKS.default_max_output_tokens),
+    }))
   }
 
   // derivedTotalBudgetText 把「整请求总预算」换算成可读文本，供设置页展示。
@@ -519,11 +572,23 @@ export function Settings() {
   // 运行时按「谁在保护什么」分块。这几类的**失效后果不同**：改错超时是
   // 「请求变慢/被切走」，改错故障转移是「一直重试坏目标」。块与块之间的
   // 分隔必须能一眼看出这是两类东西。
-  const runtimeGroup = (groupKey: 'nonstream' | 'streaming' | 'failover', title: string, desc: string) => {
+  const runtimeGroup = (
+    groupKey: 'nonstream' | 'streaming' | 'failover',
+    title: string,
+    desc: string,
+    icon: React.ReactNode,
+  ) => {
     const keys = RUNTIME_GROUPS[groupKey]
     return (
       <SectionCard
-        title={title}
+        title={
+          <span className="flex items-center gap-2.5">
+            <span className="bg-accent-soft text-accent flex h-8 w-8 shrink-0 items-center justify-center rounded-lg">
+              {icon}
+            </span>
+            {title}
+          </span>
+        }
         description={desc}
         actions={
           <Button
@@ -532,19 +597,30 @@ export function Settings() {
             isDisabled={groupAtDefaults(keys)}
             onPress={() => resetRuntimeGroup(keys)}
           >
-            恢复推荐默认
+            <RotateCcw className="h-3.5 w-3.5" />
+            恢复推荐
           </Button>
         }
       >
-        <div className="flex flex-col gap-4">
+        <div className={keys.length > 1 ? 'grid gap-4 sm:grid-cols-2' : 'flex flex-col gap-4'}>
           {keys.map((k) => {
             const meta = RUNTIME_FIELD_META[k]
+            const custom = fieldIsCustom(k)
             return (
               <TextField key={k} aria-label={meta.label} value={form[k]} onChange={(v) => setForm((f) => ({ ...f, [k]: v }))}>
-                <Label>{meta.label}</Label>
+                <div className="flex items-center justify-between gap-2">
+                  <Label>{meta.label}</Label>
+                  {custom ? (
+                    <StatusChip tone="warn" size="sm">
+                      已自定义
+                    </StatusChip>
+                  ) : null}
+                </div>
                 <Input type="number" min={meta.min} max={meta.max} step={1} />
-                <span className="text-muted text-[11px] leading-relaxed">{meta.tip}</span>
-                <span className="text-muted text-[11px] tabular-nums">{recNote(k)}</span>
+                <Description className="text-[11px] leading-relaxed">
+                  <span className="text-muted">推荐 {recText(k)}</span>
+                  <span className="mt-1 block">{meta.tip}</span>
+                </Description>
               </TextField>
             )
           })}
@@ -593,40 +669,62 @@ export function Settings() {
             ) : err ? (
               loadFailedBlock
             ) : (
-              // 只有两个字段，所以给它一张卡而不是一排。
               <form
                 onSubmit={(e) => {
                   e.preventDefault()
                   void save('model')
                 }}
-                className="max-w-[680px]"
+                className="max-w-[880px]"
               >
                 <SectionCard
-                  title="模型默认值"
-                  description="上游没报这两个数时用它兜底。改这里不会影响已导入模型的既有值。"
+                  title={
+                    <span className="flex items-center gap-2.5">
+                      <span className="bg-accent-soft text-accent flex h-8 w-8 shrink-0 items-center justify-center rounded-lg">
+                        <Boxes size={16} />
+                      </span>
+                      模型默认值
+                    </span>
+                  }
+                  description="上游没有回报容量时用它兜底；不影响已导入模型的既有值。"
+                  actions={
+                    <Button variant="ghost" size="sm" isDisabled={modelAtDefaults()} onPress={resetModelDefaults}>
+                      <RotateCcw className="h-3.5 w-3.5" />
+                      恢复推荐
+                    </Button>
+                  }
                 >
-                  <div className="flex flex-col gap-4">
-                    <TokenField
-                      label="默认上下文窗口（tokens）"
-                      value={form.default_context_window}
-                      onChange={(v) => setForm((f) => ({ ...f, default_context_window: v }))}
-                    />
-                    <span className="text-muted -mt-2 text-[11px]">
-                      添加模型时若上游未暴露 context_length，则用此值。可写 128K / 1M。
-                    </span>
-                    <TokenField
-                      label="默认最大输出（tokens）"
-                      value={form.default_max_output_tokens}
-                      onChange={(v) => setForm((f) => ({ ...f, default_max_output_tokens: v }))}
-                    />
-                    <span className="text-muted -mt-2 text-[11px]">
-                      添加模型时若上游未暴露 max_completion_tokens，则用此值。可写 64K / 1M。
-                    </span>
-                    <div className="flex justify-end">
-                      <Button type="submit" variant="primary" isDisabled={saving}>
-                        {saving ? '保存中…' : '保存设置'}
-                      </Button>
+                  <div className="grid gap-4 sm:grid-cols-2">
+                    <div>
+                      <TokenField
+                        label="默认上下文窗口（tokens）"
+                        value={form.default_context_window}
+                        onChange={(v) => setForm((f) => ({ ...f, default_context_window: v }))}
+                      />
+                      <Description className="text-muted mt-1.5 block text-[11px] leading-relaxed">
+                        上游未暴露 context_length 时使用；可写 128K / 1M。
+                      </Description>
                     </div>
+                    <div>
+                      <TokenField
+                        label="默认最大输出（tokens）"
+                        value={form.default_max_output_tokens}
+                        onChange={(v) => setForm((f) => ({ ...f, default_max_output_tokens: v }))}
+                      />
+                      <Description className="text-muted mt-1.5 block text-[11px] leading-relaxed">
+                        上游未暴露 max_completion_tokens 时使用；可写 64K / 1M。
+                      </Description>
+                    </div>
+                  </div>
+
+                  <div className="border-separator mt-4 flex flex-wrap items-center justify-between gap-3 border-t pt-3.5">
+                    <span className="text-muted text-[11px] tabular-nums">
+                      推荐 {fmtNum(MODEL_DEFAULT_FALLBACKS.default_context_window)} /{' '}
+                      {fmtNum(MODEL_DEFAULT_FALLBACKS.default_max_output_tokens)} tokens
+                    </span>
+                    <Button type="submit" variant="primary" isDisabled={saving}>
+                      <Save className="h-4 w-4" />
+                      {saving ? '保存中…' : '保存设置'}
+                    </Button>
                   </div>
                 </SectionCard>
               </form>
@@ -635,80 +733,117 @@ export function Settings() {
 
           {/* ---------- 分类 2：运行时（超时 + 故障转移） ---------- */}
           {tab === 'runtime' ? (
-            <div className="max-w-[680px]">
-              {loading ? (
-                loadingBlock
-              ) : err ? (
-                loadFailedBlock
-              ) : (
+            loading ? (
+              loadingBlock
+            ) : err ? (
+              loadFailedBlock
+            ) : (
+              <div className="flex max-w-[980px] flex-col gap-4">
                 <form
                   onSubmit={(e) => {
                     e.preventDefault()
                     void save('runtime')
                   }}
-                  className="flex flex-col gap-3.5"
+                  className="grid items-stretch gap-4 xl:grid-cols-2"
                 >
-                  {runtimeGroup('nonstream', '非流式请求超时', '不流式调用（stream=false）时，一次请求最多等多久。超时按可转移错误处理。')}
-                  {runtimeGroup('streaming', '流式看门狗', '流式调用时盯住「迟迟不出字」与「出到一半卡死」，两个是不同的时间点。')}
-                  {runtimeGroup('failover', '自动故障转移', '一个目标不行时，最多换几个、什么情况下先摘掉它。')}
+                  {runtimeGroup(
+                    'nonstream',
+                    '非流式请求超时',
+                    '不流式调用（stream=false）时，一次请求最多等多久；超时按可转移错误处理。',
+                    <Timer size={16} />,
+                  )}
+                  {runtimeGroup(
+                    'streaming',
+                    '流式看门狗',
+                    '盯住「迟迟不出字」与「出到一半卡死」两个时间点。',
+                    <Activity size={16} />,
+                  )}
+                  {runtimeGroup(
+                    'failover',
+                    '自动故障转移',
+                    '一个目标不行时，最多换几个、什么情况下先摘掉它。',
+                    <GitBranch size={16} />,
+                  )}
 
-                  {/* 分类 4：派生值（只读） */}
+                  {/* 派生值（只读）：把长公式收进 Disclosure，主视觉只留数字。 */}
                   <SectionCard
                     title={
-                      <span className="flex items-center gap-2">
-                        整请求总预算 <StatusChip tone="dim">自动推导 · 不可配</StatusChip>
+                      <span className="flex items-center gap-2.5">
+                        <span className="bg-success-soft text-success flex h-8 w-8 shrink-0 items-center justify-center rounded-lg">
+                          <Calculator size={16} />
+                        </span>
+                        整请求总预算
                       </span>
                     }
-                    description="一次请求跨所有故障转移尝试的总时长上限，由上面三类值推导，不是独立旋钮。"
+                    description="由超时与故障转移参数推导，不是独立旋钮。"
+                    actions={<StatusChip tone="dim">自动推导</StatusChip>}
                   >
-                    <div className="flex flex-col gap-1.5">
-                      <span className="text-muted text-[12.5px] font-semibold">当前生效</span>
-                      <span className="text-xl font-semibold tabular-nums">{derivedTotalBudgetText}</span>
-                      <span className="text-muted mt-1 text-[11px] leading-relaxed">
-                        公式：（max(非流式整体超时, 首字超时 + 等响应头 60 秒) + 5 秒）×（最多尝试目标数 + 1），
-                        再夹在 30 秒 ~ 30 分钟之间。
-                        没有它，一串半死的上游可以把一个客户端挂住数分钟，期间持续占用连接、配额预占和故障转移名额。
-                        <b>注意</b>：上面那些超时都是<b>单次尝试</b>的预算，不是整请求的。
-                      </span>
+                    <div className="flex flex-col gap-3">
+                      <div className="flex items-baseline gap-2">
+                        <span className="text-[32px] leading-none font-semibold tabular-nums">
+                          {derivedTotalBudgetText}
+                        </span>
+                        <span className="text-muted text-xs">上限</span>
+                      </div>
+                      <Disclosure>
+                        <Disclosure.Heading>
+                          <Disclosure.Trigger>计算方式</Disclosure.Trigger>
+                        </Disclosure.Heading>
+                        <Disclosure.Content>
+                          <Disclosure.Body>
+                            <p className="text-muted text-[11px] leading-relaxed">
+                              （max(非流式整体超时, 首字超时 + 等响应头 60 秒) + 5 秒）×（最多尝试目标数 + 1），
+                              再夹在 30 秒 ~ 30 分钟之间。所有超时都是<b>单次尝试</b>的预算，不是整请求的。
+                            </p>
+                          </Disclosure.Body>
+                        </Disclosure.Content>
+                      </Disclosure>
                     </div>
                   </SectionCard>
 
-                  <div className="flex justify-end">
+                  <div className="flex justify-end xl:col-span-2">
                     <Button type="submit" variant="primary" isDisabled={saving}>
+                      <Save className="h-4 w-4" />
                       {saving ? '保存中…' : '保存设置'}
                     </Button>
                   </div>
                 </form>
-              )}
 
-              {/* 用量归档维护：与上面的表单无关（不保存任何设置项，是立即执行的动作），
-                   单独成块放在运行时页签下，而不是让运维去 curl /usage/prune。 */}
-              {!loading && !err ? (
-                <div className="mt-4.5 border-t border-separator pt-3.5">
-                  <h3 className="text-sm font-semibold">用量归档</h3>
-                  <p className="text-muted my-2 text-[11px] leading-relaxed">
-                    调用明细默认保留 30 天，更早的记录由每日定时任务聚合进「按天累计」后删除
-                    （累计永久保留）。这里可以手动立即执行一次剪枝，结果实时回显。
-                  </p>
-                  <Button variant="secondary" size="sm" isDisabled={pruning} onPress={() => void runPrune()}>
-                    {pruning ? '剪枝中…' : '立即归档剪枝'}
-                  </Button>
+                {/* 用量归档维护：与上面的表单无关，是立即执行的动作，单独成块。 */}
+                <SectionCard
+                  title={
+                    <span className="flex items-center gap-2.5">
+                      <span className="bg-default-soft text-muted flex h-8 w-8 shrink-0 items-center justify-center rounded-lg">
+                        <Archive size={16} />
+                      </span>
+                      用量归档
+                    </span>
+                  }
+                  description="调用明细保留 30 天，更早的记录聚合进「按天累计」后删除；累计永久保留。"
+                  actions={
+                    <Button variant="secondary" size="sm" isDisabled={pruning} onPress={() => void runPrune()}>
+                      {pruning ? '剪枝中…' : '立即归档剪枝'}
+                    </Button>
+                  }
+                >
                   {pruneResult ? (
-                    <div className="text-muted mt-2.5 text-[12.5px]">
+                    <Surface variant="secondary" className="text-muted rounded-lg px-3.5 py-3 text-[12.5px]">
                       {pruneResult.skipped ? (
                         <>本次跳过：{pruneResult.reason || '无待归档的数据'}</>
                       ) : (
                         <>
-                          已删除明细 <b>{fmtNum(pruneResult.deleted_rows)}</b> 行，写入按天累计{' '}
-                          <b>{fmtNum(pruneResult.rollup_rows)}</b> 组；归档水位 {pruneResult.pruned_through_day}
-                          （保留窗口自 {pruneResult.cutoff_day} 起）
+                          已删除明细 <b className="text-foreground">{fmtNum(pruneResult.deleted_rows)}</b> 行，
+                          写入按天累计 <b className="text-foreground">{fmtNum(pruneResult.rollup_rows)}</b> 组；
+                          归档水位 {pruneResult.pruned_through_day}（保留窗口自 {pruneResult.cutoff_day} 起）。
                         </>
                       )}
-                    </div>
-                  ) : null}
-                </div>
-              ) : null}
-            </div>
+                    </Surface>
+                  ) : (
+                    <p className="text-muted text-[11px]">手动执行一次；定时任务照常运行。</p>
+                  )}
+                </SectionCard>
+              </div>
+            )
           ) : null}
 
           {/* ---------- 分类 3：模型价格（独立组件，自己拉数据） ---------- */}
@@ -716,73 +851,102 @@ export function Settings() {
 
           {/* ---------- 分类 4：导入 / 导出 ---------- */}
           {tab === 'transfer' ? (
-            <div className="grid gap-4 lg:grid-cols-2">
-              <SectionCard title="导出">
-                <div className="flex flex-col gap-4">
-                  <p className="text-muted text-xs leading-relaxed">
-                    导出当前<b>全部配置</b>：供应商与凭据（含上游 API Key）、模型与模型组、
-                    代理网络、<b>用户与余额</b>、<b>用户分组</b>、<b>访问密钥</b>（含明文）、
-                    <b>路由与故障转移链</b>。文件用口令整体加密，产物是 <code>.json.enc</code>
-                    —— 不设口令无法导出。
-                  </p>
-                  <p className="text-warning text-xs leading-relaxed">
-                    这份文件等同于整个网关的钥匙：拿到它就能用全部上游额度、用全部下游密钥调用。
-                    口令请与你分开发的渠道传递，文件不要留在聊天记录或公共网盘里。
-                  </p>
-                  <TextField aria-label="加密口令（必填，至少 8 位）" value={exportPass} onChange={setExportPass}>
-                    <Label>加密口令（必填，至少 8 位）</Label>
-                    <Input type="password" autoComplete="new-password" placeholder="导入这份文件时要用同一个口令" />
-                    <span className="text-muted text-[11px] leading-relaxed">
-                      文件里包含全部上游 API Key，口令是唯一的保护 —— 请用区别于登录密码的独立口令，
-                      并把口令与文件分开传递。
+            <div className="grid items-start gap-4 lg:grid-cols-2">
+              <SectionCard
+                title={
+                  <span className="flex items-center gap-2.5">
+                    <span className="bg-warning-soft text-warning-soft-foreground flex h-8 w-8 shrink-0 items-center justify-center rounded-lg">
+                      <Download size={16} />
                     </span>
+                    导出
+                  </span>
+                }
+                actions={<StatusChip tone="warn">含全部凭据</StatusChip>}
+              >
+                <div className="flex flex-col gap-4">
+                  <TextField aria-label="加密口令（必填，至少 8 位）" value={exportPass} onChange={setExportPass}>
+                    <Label>加密口令</Label>
+                    <Input type="password" autoComplete="new-password" placeholder="至少 8 位，导入时需使用同一口令" />
                   </TextField>
-                  <div>
-                    <Button
-                      variant="primary"
-                      isDisabled={transferBusy || exportPass.trim().length < 8}
-                      onPress={() => void doExport()}
-                    >
-                      {transferBusy ? '处理中…' : '导出为加密文件'}
-                    </Button>
+                  <div className="text-warning-soft-foreground flex items-start gap-1.5 text-[11px] leading-relaxed">
+                    <ShieldAlert className="mt-px h-3.5 w-3.5 shrink-0" />
+                    <span>文件含全部上游密钥，请离线保存，口令与文件分开传递。</span>
                   </div>
+                  <Button
+                    variant="primary"
+                    className="w-full"
+                    isDisabled={transferBusy || exportPass.trim().length < 8}
+                    onPress={() => void doExport()}
+                  >
+                    <Download className="h-4 w-4" />
+                    {transferBusy ? '处理中…' : '导出为加密文件'}
+                  </Button>
                 </div>
               </SectionCard>
 
-              <SectionCard title="导入">
+              <SectionCard
+                title={
+                  <span className="flex items-center gap-2.5">
+                    <span className="bg-accent-soft text-accent flex h-8 w-8 shrink-0 items-center justify-center rounded-lg">
+                      <Upload size={16} />
+                    </span>
+                    导入
+                  </span>
+                }
+              >
                 <div className="flex flex-col gap-4">
-                  <p className="text-muted text-xs leading-relaxed">
-                    选择一份此前导出的文件。先「预演」看清会发生什么，确认后才真正写入。
-                  </p>
-                  <div className="flex items-center gap-2">
+                  <Surface
+                    variant="secondary"
+                    onDragOver={(e) => {
+                      e.preventDefault()
+                      if (!transferBusy) setDragOver(true)
+                    }}
+                    onDragLeave={() => setDragOver(false)}
+                    onDrop={(e) => {
+                      e.preventDefault()
+                      setDragOver(false)
+                      const f = e.dataTransfer.files?.[0]
+                      if (f && !transferBusy) void onPickFile(f)
+                    }}
+                    className={`flex flex-col items-center gap-2.5 rounded-xl border border-dashed px-4 py-6 text-center transition-colors ${
+                      dragOver ? 'border-accent bg-accent-soft' : 'border-separator'
+                    }`}
+                  >
+                    <div className="bg-accent-soft text-accent flex h-10 w-10 items-center justify-center rounded-full">
+                      <Upload size={18} />
+                    </div>
+                    <div className="min-w-0">
+                      <div className="truncate text-sm font-medium">
+                        {importFile ? importFile.name : '拖入或选择导出文件'}
+                      </div>
+                      <div className="text-muted mt-0.5 text-[11px]">
+                        {importFile ? '文件已载入' : '支持 .json / .json.enc'}
+                      </div>
+                    </div>
                     <FileImport
                       accept=".json,.json.enc,.enc,application/json"
-                      label="选择导出文件…"
+                      label={importFile ? '更换文件' : '选择文件'}
                       disabled={transferBusy}
                       onPick={(f) => void onPickFile(f)}
                     />
-                    {importFile ? <span className="text-muted text-[11px]">已选择：{importFile.name}</span> : null}
-                  </div>
+                  </Surface>
 
                   {importParsed?.encrypted ? (
-                    <TextField
-                      aria-label="文件口令"
-                      value={importPass}
-                      onChange={(v) => {
-                        setImportPass(v)
-                        setImportPreview(null)
-                      }}
-                    >
-                      <Label>文件口令 *</Label>
-                      <Input type="password" autoComplete="off" placeholder="导出时设置的那个" />
-                      <span className="text-muted text-[11px]">该文件已加密，必须输入导出时用的口令</span>
-                    </TextField>
-                  ) : null}
-                  {importParsed?.encrypted ? (
-                    <div>
+                    <div className="flex flex-col gap-2">
+                      <TextField
+                        aria-label="文件口令"
+                        value={importPass}
+                        onChange={(v) => {
+                          setImportPass(v)
+                          setImportPreview(null)
+                        }}
+                      >
+                        <Label>文件口令</Label>
+                        <Input type="password" autoComplete="off" placeholder="导出时设置的口令" />
+                      </TextField>
                       <Button
                         variant="secondary"
-                        size="sm"
+                        className="w-full"
                         isDisabled={!importPass.trim() || transferBusy}
                         onPress={() => void runImport(true)}
                       >
@@ -792,89 +956,54 @@ export function Settings() {
                   ) : null}
 
                   {importError ? (
-                    <div className="text-danger text-xs" role="alert">
-                      {importError}
-                    </div>
+                    <Alert status="danger">
+                      <Alert.Indicator />
+                      <Alert.Content>
+                        <Alert.Title>{importError}</Alert.Title>
+                      </Alert.Content>
+                    </Alert>
                   ) : null}
 
                   {importParsed && !importParsed.encrypted ? (
-                    <div className="text-muted text-xs">
-                      文件内容：{importParsed.providers?.length ?? 0} 个供应商、
-                      {importParsed.models?.length ?? 0} 个模型、
-                      {importParsed.credentials?.length ?? 0} 条凭据
-                      {importParsed.users?.length ? `、${importParsed.users.length} 个用户` : ''}
-                      {importParsed.access_keys?.length ? `、${importParsed.access_keys.length} 条访问密钥` : ''}
-                      {importParsed.routes?.length ? `、${importParsed.routes.length} 条路由` : ''}
+                    <div className="flex flex-wrap items-center gap-1.5">
+                      {importedFileRows(importParsed).map((row) => (
+                        <StatusChip key={row.label} tone="dim">
+                          {row.label} {row.value}
+                        </StatusChip>
+                      ))}
                       {importParsed.version !== 1 ? (
-                        <span className="text-warning">（文件版本 {importParsed.version}，可能来自更新的网关）</span>
+                        <StatusChip tone="warn" title="文件可能来自更新的网关">
+                          版本 {importParsed.version}
+                        </StatusChip>
                       ) : null}
                     </div>
                   ) : null}
 
-                  {/* 预演结果：逐项说明，而不是只给一个总数 */}
+                  {/* 预演结果：逐项计数，面板里只留真正会变化的项 */}
                   {importPreview ? (
-                    <div className="flex flex-col gap-2">
-                      <h4 className="text-sm font-semibold">
-                        {importPreview.dry_run ? '预演结果（尚未写入）' : '导入结果'}
-                      </h4>
-                      <ul className="text-muted list-disc space-y-0.5 pl-5 text-xs">
-                        <li>
-                          新增供应商 <b>{importPreview.providers_created}</b>
-                        </li>
-                        <li>
-                          新增模型 <b>{importPreview.models_created}</b>
-                        </li>
-                        {importPreview.credentials_added ? (
-                          <li>
-                            新增凭据 <b>{importPreview.credentials_added}</b>
-                          </li>
-                        ) : null}
-                        {importPreview.models_skipped ? (
-                          <li>
-                            跳过已存在的模型 <b>{importPreview.models_skipped}</b>
-                          </li>
-                        ) : null}
-                        {importPreview.user_groups_created ? (
-                          <li>
-                            新增用户分组 <b>{importPreview.user_groups_created}</b>
-                          </li>
-                        ) : null}
-                        {importPreview.users_created ? (
-                          <li>
-                            新增用户 <b>{importPreview.users_created}</b>
-                          </li>
-                        ) : null}
-                        {importPreview.users_skipped ? (
-                          <li>
-                            跳过已存在的用户 <b>{importPreview.users_skipped}</b>
-                          </li>
-                        ) : null}
-                        {importPreview.access_keys_created ? (
-                          <li>
-                            新增访问密钥 <b>{importPreview.access_keys_created}</b>
-                          </li>
-                        ) : null}
-                        {importPreview.access_keys_skipped ? (
-                          <li>
-                            跳过已存在的访问密钥 <b>{importPreview.access_keys_skipped}</b>
-                          </li>
-                        ) : null}
-                        {importPreview.routes_created ? (
-                          <li>
-                            新增路由 <b>{importPreview.routes_created}</b>
-                          </li>
-                        ) : null}
-                        {importPreview.routes_skipped ? (
-                          <li>
-                            跳过已存在的路由 <b>{importPreview.routes_skipped}</b>
-                          </li>
-                        ) : null}
-                      </ul>
+                    <div className="flex flex-col gap-3">
+                      <div className="flex items-center gap-2">
+                        <h4 className="text-sm font-semibold">
+                          {importPreview.dry_run ? '预演结果' : '导入结果'}
+                        </h4>
+                        {importPreview.dry_run ? <StatusChip tone="info">尚未写入</StatusChip> : null}
+                      </div>
+
+                      {importPreviewRows(importPreview).length ? (
+                        <Surface variant="secondary" className="grid grid-cols-2 gap-x-4 gap-y-2 rounded-xl px-3.5 py-3">
+                          {importPreviewRows(importPreview).map((row) => (
+                            <div key={row.label} className="flex items-baseline justify-between gap-2">
+                              <span className="text-muted text-xs">{row.label}</span>
+                              <span className="text-sm font-semibold tabular-nums">{row.value}</span>
+                            </div>
+                          ))}
+                        </Surface>
+                      ) : null}
 
                       {Object.keys(importPreview.providers_renamed ?? {}).length ? (
-                        <div className="text-muted text-xs">
-                          重命名（原有数据不受影响）：
-                          <ul className="list-disc space-y-0.5 pl-5">
+                        <div className="rounded-lg border border-warning/30 bg-warning-soft px-3 py-2 text-xs text-warning-soft-foreground">
+                          <div className="font-medium">重名供应商将自动改名，原数据不受影响</div>
+                          <ul className="mt-1 list-disc space-y-0.5 pl-4">
                             {Object.entries(importPreview.providers_renamed ?? {}).map(([from, to]) => (
                               <li key={from}>
                                 <code>{from}</code> → <code>{to}</code>
@@ -918,18 +1047,21 @@ export function Settings() {
                         </Disclosure>
                       ) : null}
 
+                      <Separator />
+
                       {importPreview.dry_run ? (
-                        <div>
-                          <Button variant="primary" isDisabled={transferBusy} onPress={() => void confirmImport()}>
-                            确认导入
-                          </Button>
-                        </div>
+                        <Button
+                          variant="primary"
+                          className="w-full"
+                          isDisabled={transferBusy}
+                          onPress={() => void confirmImport()}
+                        >
+                          确认导入
+                        </Button>
                       ) : (
-                        <div>
-                          <Button variant="secondary" onPress={resetImport}>
-                            再导一个
-                          </Button>
-                        </div>
+                        <Button variant="secondary" className="w-full" onPress={resetImport}>
+                          再导一个
+                        </Button>
                       )}
                     </div>
                   ) : null}

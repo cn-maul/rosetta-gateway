@@ -4,6 +4,7 @@ import { DataTable } from '../../ui/DataTable'
 import { StatusChip } from '../../ui/StatusChip'
 import { fmtNum, fmtTokens, fmtMoney, fmtTimeMs } from '../../fmt'
 import type { TopupRecord, UsageByUserEntry, UsageGroupEntry } from '../../types'
+import { userRowName, userRowTag } from '../../userDisplay'
 
 const softError = (text: string) => (
   <p className="bg-warning-soft text-warning-soft mb-3.5 rounded-md px-2.5 py-2 text-[12.5px]" role="alert">
@@ -20,18 +21,6 @@ const emptyBox = (title: string, detail?: string) => (
     ) : null}
   </div>
 )
-
-/** 一行的展示名：用户已删除（key 非空而 user_name 空）回退显示 user_id；
- * 无归属（key 为空）显示「无归属」。两者数据形状相同但含义不同。 */
-const rowName = (r: UsageByUserEntry) => (r.user_name ? r.user_name : r.key || '无归属')
-
-/** 行标记：已删除 / 管理员历史用量 / 无归属。都显式标注，不靠名字空缺意会。 */
-const rowTag = (r: UsageByUserEntry): { text: string; tone: 'dim' | 'info' } | null => {
-  if (!r.key) return { text: '无归属', tone: 'dim' }
-  if (!r.user_name) return { text: '已删除', tone: 'dim' }
-  if (r.role === 'admin') return { text: '管理员·历史', tone: 'info' }
-  return null
-}
 
 function GotoHistoryLink() {
   const navigate = useNavigate()
@@ -92,11 +81,11 @@ export function ByUserTable({
                   </Table.Header>
                   <Table.Body>
                     {byUser.map((r) => {
-                      const tag = rowTag(r)
+                      const tag = userRowTag(r)
                       return (
                         <Table.Row key={r.key || '__orphan__'}>
                           <Table.Cell>
-                            <span className={!r.user_name ? 'font-mono' : ''}>{rowName(r)}</span>
+                            <span className={!r.user_name ? 'font-mono' : ''}>{userRowName(r)}</span>
                             {tag ? (
                               <span className="ml-1.5">
                                 <StatusChip tone={tag.tone}>{tag.text}</StatusChip>
