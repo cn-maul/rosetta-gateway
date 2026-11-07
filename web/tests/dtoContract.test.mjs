@@ -2,7 +2,21 @@ import test from 'node:test'
 import assert from 'node:assert/strict'
 import { readFileSync } from 'node:fs'
 import { fileURLToPath } from 'node:url'
-import ts from 'typescript'
+// 编译器**取自 TS 6 兼容包**，不是项目主依赖 typescript（v7）。
+//
+// TypeScript 7（Go 原生版）到 7.0 为止**不导出编译器 API**：主入口只剩 version，
+// 只有 `typescript/unstable/*` 这套明确标注不稳定的入口。而本文件要做的是读
+// `src/types.ts` 的 AST 来核对字段（`createSourceFile` / `isInterfaceDeclaration`
+// / `isPropertySignature`），属于典型的 API 消费者。
+//
+// 所以按微软给出的过渡方案：`tsc` 用 7（typecheck 快 4 倍），这里 import
+// `@typescript/typescript6`（`npm:typescript@6.0.2` 的别名）拿 6.0 的 API。
+// **7.1 恢复稳定 API 后应把这一行改回 `from 'typescript'` 并删掉兼容包**。
+//
+// 另一个坑：兼容包自带名为 `tsc` 的 bin，会覆盖 node_modules/.bin/tsc。
+// 因此 package.json 的 typecheck 脚本写的是显式路径
+// `node ./node_modules/typescript/bin/tsc`，否则会静默跑回 6.0。
+import ts from '@typescript/typescript6'
 import { DTO_CONTRACTS } from '../src/generated/dto-contract.ts'
 
 const typesPath = fileURLToPath(new URL('../src/types.ts', import.meta.url))

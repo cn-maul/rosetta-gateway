@@ -1,23 +1,24 @@
 {
   "name": "rosetta-gateway-admin",
   "private": true,
-  "version": "2.0.1",
+  "version": "2.1.0",
   "type": "module",
   "scripts": {
     "dev": "vite",
     "build": "vite build",
-    "typecheck": "tsc --noEmit",
+    "typecheck": "node ./node_modules/typescript/bin/tsc --noEmit",
     "test": "node --experimental-strip-types --no-deprecation --import ./tests/tsResolve.mjs --test tests/*.test.mjs",
     "sync": "node sync-embed.mjs"
   },
   "devDependencies": {
-    "@tailwindcss/vite": "^4.3.3",
+    "@tailwindcss/vite": "^4.3.5",
     "@types/react": "^19.3.0",
     "@types/react-dom": "^19.3.0",
-    "@vitejs/plugin-react": "^6.1.2",
-    "tailwindcss": "^4.3.3",
-    "typescript": "~6.0.3",
-    "vite": "^8.3.4"
+    "@typescript/typescript6": "npm:typescript@^6.0.2",
+    "@vitejs/plugin-react": "^6.2.1",
+    "tailwindcss": "^4.3.5",
+    "typescript": "^7.0.2",
+    "vite": "^8.3.6"
   },
   "dependencies": {
     "@heroui/react": "3.2.7",
@@ -25,7 +26,7 @@
     "@internationalized/date": "^3.12.4",
     "@react-aria/ssr": "^3.10.1",
     "@react-aria/utils": "^3.34.1",
-    "lucide-react": "^1.65.0",
+    "lucide-react": "^1.70.0",
     "react": "^19.3.1",
     "react-aria": "^3.53.1",
     "react-aria-components": "^1.22.1",
