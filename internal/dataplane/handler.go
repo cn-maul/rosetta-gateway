@@ -999,16 +999,14 @@ func (h *Handler) attemptStream(w http.ResponseWriter, r *http.Request, client *
 	attempt.StartedAtMs = attemptStart.Sub(start).Milliseconds()
 	buildStart := time.Now()
 
-	// 每个 attempt 现造一份请求，并把公共别名换成该目标的上游 model_id、
-	// 挂上该上游协议的私有透传字段。必须在 attempt 内部做（而不是在调用点
-	// 造好传进来）：链上各目标的协议不同，Extra 形状也不同，复用同一实例
-	// 会把 A 目标的字段泄漏给 B 目标。
+	// 每个 attempt 现造一份请求，并把公共别名换成该目标的上游 model_id。
+	// 必须在 attempt 内部做（而不是在调用点造好传进来）：链上各目标可能
+	// 对接不同协议的端点，复用同一实例会把上一个目标的改动带过去。
 	upstreamReq := ing.BuildRosetta()
 	upstreamReq.Model = cand.UpstreamModel.ModelID
-	ing.ApplyUpstreamExtras(upstreamReq, upstreamProtocol)
 	ing.ApplyThinkingCapability(upstreamReq, cand.UpstreamModel, upstreamProtocol)
-	// 剥掉目标协议回放不了的思考块（chat 全剥 / anthropic 剥无签名的），
-	// 否则 harness 回传 thinking 后的第二轮必然 400。详见 replay_gate.go。
+	// 剥掉目标协议回放不了的思考块（chat 剥签名的与无文本的、anthropic 剥无签名的），
+	// 否则 harness 回传 thinking 后的第二轮必然 400。详见 replay.go。
 	h.applyReplayGate(upstreamReq, upstreamProtocol)
 	attempt.RequestBuildMs = time.Since(buildStart).Milliseconds()
 	diag.setIngressRequest(upstreamReq, true)
@@ -1574,13 +1572,12 @@ func (h *Handler) attemptNonStream(w http.ResponseWriter, r *http.Request, clien
 	attempt.Protocol = upstreamProtocol
 	attempt.StartedAtMs = attemptStart.Sub(start).Milliseconds()
 	buildStart := time.Now()
-	// 同attemptStream：别名 → 上游 model_id 的映射与协议私有字段的透传
-	// 必须在本次 attempt 内完成，不能由调用方造好传入。
+	// 同 attemptStream：别名 → 上游 model_id 的映射必须在本次 attempt 内
+	// 完成，不能由调用方造好传入。
 	upstreamReq := ing.BuildRosetta()
 	upstreamReq.Model = cand.UpstreamModel.ModelID
-	ing.ApplyUpstreamExtras(upstreamReq, upstreamProtocol)
 	ing.ApplyThinkingCapability(upstreamReq, cand.UpstreamModel, upstreamProtocol)
-	// 与 attemptStream 同一刀，理由见 replay_gate.go。
+	// 与 attemptStream 同一刀，理由见 replay.go。
 	h.applyReplayGate(upstreamReq, upstreamProtocol)
 	attempt.RequestBuildMs = time.Since(buildStart).Milliseconds()
 	diag.setIngressRequest(upstreamReq, false)

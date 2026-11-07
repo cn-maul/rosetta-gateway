@@ -22,21 +22,22 @@ import (
 //     工具结果；reasoning item 连同 id / encrypted_content / summary 搬进
 //     rosetta 的 thinking 块，供 Responses 上游跨轮原样回放。
 //
-//     chat 上游（2026-10-23 补齐）：DeepSeek 系既要求 `reasoning_content`
-//     原样回传，也要求同一轮的正文与 tool_calls 落在同一条 assistant 消息上。
-//     所有 Responses→chat 请求统一由 responsesChatMessages
-//     重新编码 chat messages（合并 turn，并把 summary 回填成
-//     `reasoning_content`）。详见 responses_chat_replay.go。
+//     **一轮 assistant = 一条 Message 多 Block**（2026-11-07 修）。Responses 把
+//     一轮拆成 reasoning / message / function_call 多个 output item，入站时按原
+//     顺序合并成同一条 `RoleAssistant`，遇到 user / 工具结果才断开。这样 chat
+//     上游（DeepSeek 系要求 reasoning_content、正文与 tool_calls 同轮）、
+//     anthropic、responses 三个出站协议同时正确 —— 修复前是「一个 item 一条
+//     Message」，再靠出站层重写一遍编码器把 turn 合回去，只补了 chat 一个协议。
 //
 //     anthropic 上游仍是已知缺口：thinking 块必须带 Anthropic 签发的
-//     signature，Responses 的 reasoning item 无法伪造，因此继续剥除。
+//     signature，Responses 的 reasoning item 无法伪造，由 applyReplayGate 剥除。
 //   - instructions 映射为 System；developer/system 角色 item 映射为 RoleSystem。
 //   - reasoning.effort 映射为 rosetta 的 ThinkingConfig（SDK 负责跨协议翻译）。
 //   - 不支持的 item 类型（item_reference / web_search 等内建工具）**显式 400**，
 //     不静默丢弃 —— 静默丢弃正是本网关反复修过的「无声吞内容」。
 //   - tools 里的 namespace（Codex 的工具打包形态）在 ToRosetta 展平成平级
 //     function，见 flattenNamespaceTools。
-//   - previous_response_id / store：Responses 目标经 Extra 原样透传；
+//   - previous_response_id / store：落到类型化字段，SDK 对 response 目标原样编码；
 //     chat / anthropic 目标没有对应概念，继续要求客户端自带全量历史。
 //   - text.format 映射到 chat 上游的 response_format（json_object 直映、
 //     json_schema 翻译外壳）；responses 上游经 Extra 原样回传；anthropic 上游
@@ -68,11 +69,10 @@ type ResponsesRequest struct {
 	// flattenedToolChoice 是 ToRosetta 展平 namespace 后**重写过的**
 	// tool_choice（指向 namespace 内工具的会被换成展平后的名字）。
 	//
-	// 为什么存在请求结构体上而不是现算：tool_choice 的翻译发生在
-	// ApplyUpstreamExtras（按目标协议），那是逐 attempt 调用、且此时已
-	// 拿不到 tools 的原始形态。展平映射表只在 ToRosetta 里有意义，而
-	// ToRosetta 同样是逐 attempt 调用的工厂 —— 两者在同一个 attempt 里
-	// 先后执行，所以把结果记在结构体上传下去是唯一不重复计算的走法。
+	// 为什么存在请求结构体上而不是现算：ToRosetta 是逐 attempt 调用的工厂，
+	// 展平映射表只在那一刻有输入（原始 tools 形态）。把结果记在结构体上，
+	// 同一次 attempt 内的后续步骤（诊断、run 记录）读到的就是这一次的展平
+	// 结果，不会重复计算，也不会跨 attempt 串味。
 	//
 	// nil = 未重写过，沿用 ToolChoice 原值。
 	flattenedToolChoice json.RawMessage `json:"-"`
@@ -696,10 +696,14 @@ func (a *ResponsesRequest) rewriteNamespaceToolChoice(nsName string, flat []rose
 // ToRosetta 组装统一请求。input 是字符串时整体作为一条 user 消息。
 func (a *ResponsesRequest) ToRosetta() *rosetta.ChatRequest {
 	req := &rosetta.ChatRequest{
-		Model:       a.Model,
-		Temperature: a.Temperature,
-		TopP:        a.TopP,
-		System:      a.Instructions,
+		Model:              a.Model,
+		Temperature:        a.Temperature,
+		TopP:               a.TopP,
+		System:             a.Instructions,
+		ParallelToolCalls:  a.ParallelToolCalls,
+		PromptCacheKey:     a.PromptCacheKey,
+		Store:              a.Store,
+		PreviousResponseID: a.PreviousResponseID,
 	}
 	if a.MaxOutputTokens != nil {
 		req.MaxOutputTokens = *a.MaxOutputTokens
@@ -710,6 +714,12 @@ func (a *ResponsesRequest) ToRosetta() *rosetta.ChatRequest {
 		// 否则上游会去找一个不存在的工具名（或干脆拒绝）。
 		a.flattenedToolChoice = a.rewriteToolChoice(a.Tools, req.Tools)
 	}
+	if tc := responsesToolChoiceToRosetta(a.effectiveToolChoice()); tc != nil {
+		req.ToolChoice = tc
+	}
+	if rf := responsesTextFormatToRosetta(a.Text); rf != nil {
+		req.ResponseFormat = rf
+	}
 	// minimal / xhigh / max 是 OpenAI 为 gpt-5 系列新增的档位（比 low 更省、
 	// 比 high 更强），直连上游时合法。旧实现只认 low/medium/high，这些档位
 	// 落空 → req.Thinking 保持 nil → 客户端以为自己开了推理模式，实际静默
@@ -718,6 +728,15 @@ func (a *ResponsesRequest) ToRosetta() *rosetta.ChatRequest {
 		if lvl, ok := effort.ToThinkingLevel(effort.Parse(a.Reasoning.Effort)); ok {
 			req.Thinking = &rosetta.ThinkingConfig{Effort: rosetta.Effort(lvl)}
 		}
+	}
+	// include（reasoning.encrypted_content 等）挂在 Thinking 上；没有 reasoning
+	// 时 include 里的加密思考字段无意义，丢弃。
+	if len(a.Include) > 0 && req.Thinking != nil {
+		req.Thinking.Include = a.Include
+	}
+	// text.verbosity 落到 Verbosity（SDK 对 responses 目标编码 text.verbosity）。
+	if v, _ := a.textPassthroughKeys()["verbosity"].(string); v != "" {
+		req.Verbosity = v
 	}
 
 	// 字符串形态：整段就是一条 user 消息。
@@ -732,43 +751,77 @@ func (a *ResponsesRequest) ToRosetta() *rosetta.ChatRequest {
 		// 非法 input 在 decode 侧就该报（这里补一道：ToRosetta 可被逐 attempt 调用）。
 		return req
 	}
+
+	// assistant 侧的 item 必须合成**一条** Message（多 Block），不是每条一个。
+	//
+	// Responses 把一轮 assistant 拆成多个 output item —— reasoning、message、
+	// function_call 各一条。rosetta 的语义是「一个 Message = 一轮」，所以这里
+	// 按原顺序把它们的 Block 攒进同一条 RoleAssistant，遇到非 assistant 的
+	// item 才 flush。
+	//
+	// 这不是优化，是正确性。拆成多条 Message 时，任何出站编码器都会忠实输出
+	// 成多条连续 assistant —— SDK 是哑适配器，不该替调用方猜「这几条是不是
+	// 同一轮」。而 DeepSeek 系 chat 上游要求 reasoning_content、正文与
+	// tool_calls 落在同一条 assistant 消息上，否则 400「工具调用记录对不上」。
+	//
+	// 修复前这里是「一个 item 一条 Message」，再靠出站层
+	// responses_chat_replay.go 合并回来。那等于在编码器外面重写一遍编码器
+	// （user 多模态、工具结果、文件都要重编），而且只补了 chat 一个协议；
+	// 入站改对之后，chat / responses / anthropic 三个出站协议同时正确。
+	var pending *rosetta.Message
+	flush := func() {
+		if pending != nil && len(pending.Blocks) > 0 {
+			req.Messages = append(req.Messages, *pending)
+		}
+		pending = nil
+	}
+	addAssistant := func(blocks ...rosetta.Block) {
+		if len(blocks) == 0 {
+			return
+		}
+		if pending == nil {
+			pending = &rosetta.Message{Role: rosetta.RoleAssistant}
+		}
+		pending.Blocks = append(pending.Blocks, blocks...)
+	}
+
 	for _, item := range items {
 		switch item.Type {
 		case "", "message":
-			req.Messages = append(req.Messages, convertResponsesMessage(item)...)
+			msgs := convertResponsesMessage(item)
+			// 只有 assistant 的 message item 属于当前这一轮；user / system
+			// 是轮次边界，先 flush 再原样追加。
+			if len(msgs) == 1 && msgs[0].Role == rosetta.RoleAssistant {
+				addAssistant(msgs[0].Blocks...)
+				continue
+			}
+			flush()
+			req.Messages = append(req.Messages, msgs...)
 		case "function_call":
 			args := item.Arguments
 			if strings.TrimSpace(args) == "" {
 				args = "{}"
 			}
-			req.Messages = append(req.Messages, rosetta.Message{
-				Role:   rosetta.RoleAssistant,
-				Blocks: []rosetta.Block{rosetta.ToolCall(item.CallID, item.Name, args)},
-			})
+			addAssistant(rosetta.ToolCall(item.CallID, item.Name, args))
 		case "local_shell_call":
 			// Codex 让模型直接发起 shell 调用。与 function_call 的区别只在
 			// 入参形态：local_shell_call 用 {"type":"exec","command":["…"]}
-			// 的 action 对象，而不是 {"command":[…]}。展平成与降级后的
+			// 的 action 对象，而不是 {"command":[…] }。展平成与降级后的
 			// local_shell 工具（localShellToolParameters）完全一致的参数形状，
 			// 模型下一轮看到自己的工具 schema 与历史调用就能对上。
-			req.Messages = append(req.Messages, rosetta.Message{
-				Role:   rosetta.RoleAssistant,
-				Blocks: []rosetta.Block{rosetta.ToolCall(item.CallID, localShellToolName, responsesLocalShellArgs(item.Action))},
-			})
+			addAssistant(rosetta.ToolCall(item.CallID, localShellToolName, responsesLocalShellArgs(item.Action)))
 		case "custom_tool_call":
 			// custom 工具降级成「接受一个 input 字符串参数的 function」，
 			// 所以回放历史时要把裸文本包成同一个外壳，否则上一轮模型看到
 			// 的是 freeform 文本、这一轮工具 schema 却要一个对象。
-			req.Messages = append(req.Messages, rosetta.Message{
-				Role: rosetta.RoleAssistant,
-				Blocks: []rosetta.Block{rosetta.ToolCall(item.CallID, item.Name,
-					responsesCustomToolArgs(item.Input))},
-			})
+			addAssistant(rosetta.ToolCall(item.CallID, item.Name,
+				responsesCustomToolArgs(item.Input)))
 		case "local_shell_call_output", "custom_tool_call_output":
 			// 与 function_call_output 同一条路径：客户端执行完工具，把结果
 			// 喂回来。三者的区别只在 output 的内部形态（local_shell 是
 			// {"stdout":…} 对象、custom 是裸文本），而 responsesItemToolOutput
 			// 对字符串与分块数组都处理，结构对象交给 JSON 兜底。
+			flush()
 			text, media := responsesItemToolOutput(item)
 			if text != "" || len(media) == 0 {
 				req.Messages = append(req.Messages, rosetta.ToolResult(item.CallID, "", text))
@@ -795,6 +848,7 @@ func (a *ResponsesRequest) ToRosetta() *rosetta.ChatRequest {
 			// 所以拆成紧随其后的一条 user 消息，并在文本里留一行说明它被搬去了哪。
 			// 这与 cc-switch 的 TOOL_RESULT_MEDIA_MOVED_MARKER 同一思路：
 			// 不丢内容，也不假装它还在原来的位置。
+			flush()
 			text, media := responsesItemToolOutput(item)
 			if text != "" || len(media) == 0 {
 				req.Messages = append(req.Messages, rosetta.ToolResult(item.CallID, "", text))
@@ -835,10 +889,7 @@ func (a *ResponsesRequest) ToRosetta() *rosetta.ChatRequest {
 			// Block.ReasoningID 写出 "id"），漏了它等于带着载荷却没有地址。
 			blk := rosetta.SealedThinking(summary, item.EncryptedContent, string(rosetta.ProtoOpenAIResponses))
 			blk.ReasoningID = item.ID
-			req.Messages = append(req.Messages, rosetta.Message{
-				Role:   rosetta.RoleAssistant,
-				Blocks: []rosetta.Block{blk},
-			})
+			addAssistant(blk)
 		default:
 			// 兜底分支。正常路径下走不到这里 —— decode 阶段的
 			// validateResponsesInputItems 已经用带位置与原因的错误拦掉了
@@ -846,12 +897,14 @@ func (a *ResponsesRequest) ToRosetta() *rosetta.ChatRequest {
 			// 不能假设 input 一定经过过 validate（测试与内部调用可能直接构造）。
 			//
 			// 仍然不静默吞：留一个可识别的空块让 rosetta validate 拒绝。
+			flush()
 			req.Messages = append(req.Messages, rosetta.Message{
 				Role:   rosetta.RoleUser,
 				Blocks: []rosetta.Block{{Type: rosetta.BlockType("responses_item:" + item.Type)}},
 			})
 		}
 	}
+	flush()
 	return req
 }
 
@@ -1134,123 +1187,91 @@ func responsesItemReasoningText(item responsesItem) string {
 	return sb.String()
 }
 
-// ApplyUpstreamExtras 按上游协议挂 Responses 私有字段。
-//
-// anthropic 分支（2026-10-07 P1-8）：此前对 anthropic 整个跳过、把 tool_choice
-// 静默丢掉 —— 故障转移前后同一请求行为不一致。现在能等价翻译的 tool_choice
-// 必须翻译；text.format 在 Anthropic 无对应物，属硬约束，由网关层
-// requiresStructuredOutput 拒绝，不会带着丢失的约束放行。
-func (a *ResponsesRequest) ApplyUpstreamExtras(req *rosetta.ChatRequest, protocol string) {
-	switch protocol {
-	case "anthropic":
-		// tool_choice 等价翻译：auto→{"type":"auto"}、required→{"type":"any"}、
-		// 命名函数→{"type":"tool"}；"none" 在 Anthropic 无对应物（无法表达
-		// 「工具照常声明但本轮禁止调用」），丢弃 —— 见 responsesToolChoiceAnthropic。
-		if tc := responsesToolChoiceAnthropic(a.effectiveToolChoice()); tc != nil {
-			mergeExtra(req, map[string]any{"tool_choice": tc})
-		}
-		// text.format 在 Anthropic 无对应物。json_object / json_schema 是硬约束，
-		// 不允许「200 但约束丢失」—— 这类请求在 handleIngress 就被
-		// requiresStructuredOutput 挡在 anthropic 候选之外，到不了这里。
-		// parallel_tool_calls 亦无开关对应物，丢弃不改变正确性。
-		return
-
-	case "", "chat", "auto":
-		// "auto" 与 ""/"chat" 同组：auto 下SDK 自动探测，落点几乎总是
-		// OpenAI 方言，漏掉它等于让最常用的协议配置静默丢字段。
-		extra := map[string]any{}
-		if v := responsesToolChoiceOpenAI(a.effectiveToolChoice()); v != nil {
-			extra["tool_choice"] = v
-		}
-		if f := a.textFormatMap(); f != nil {
-			if rf := textFormatToResponseFormat(f); rf != nil {
-				extra["response_format"] = rf
-			}
-		}
-		if a.ParallelToolCalls != nil {
-			extra["parallel_tool_calls"] = *a.ParallelToolCalls
-		}
-		if a.PromptCacheKey != "" {
-			extra["prompt_cache_key"] = a.PromptCacheKey
-		}
-		// Responses→chat 的 turn 合并：SDK 编码器逐条输出 assistant，
-		// 会把 Responses 的 message + function_call 拆成两条连续 assistant
-		// 消息，DeepSeek 系上游因此报「工具调用记录对不上」。所有请求都
-		// 整份接管 messages；可读思考顺便回填 `reasoning_content`。
-		if msgs, ok := responsesChatMessages(req); ok {
-			extra["messages"] = msgs
-		}
-		if len(extra) > 0 {
-			mergeExtra(req, extra)
-		}
-	case "response":
-		extra := map[string]any{}
-		if tc := a.effectiveToolChoice(); len(tc) > 0 {
-			extra["tool_choice"] = json.RawMessage(tc)
-		}
-		// text 是 {"format": {...}} 的外壳，所以这里要**拆开**再放回 format。
-		//
-		// 修复前是把整个 a.Text 当成 format 的值，出站变成
-		//   "text":{"format":{"format":{"type":"json_schema",…}}}
-		// 上游看到的 format 对象里没有 type、schema 埋在重复的 format 键下，
-		// 于是结构化输出**静默不生效**，而客户端以为它生效了
-		// （实测抓到的出站 body 就是双层）。同函数上面的 chat 分支
-		// 用 textFormatMap() 正确拆包 —— 两个分支的处理方式本就该一致。
-		if f := a.textFormatMap(); f != nil {
-			extra["text"] = map[string]any{"format": f}
-		}
-		// text 里除 format 之外的键（verbosity 等）不能跟着丢，原样带上。
-		if rest := a.textPassthroughKeys(); len(rest) > 0 {
-			textObj, _ := extra["text"].(map[string]any)
-			if textObj == nil {
-				textObj = map[string]any{}
-				extra["text"] = textObj
-			}
-			for k, v := range rest {
-				if _, taken := textObj[k]; !taken {
-					textObj[k] = v
-				}
-			}
-		}
-		if a.ParallelToolCalls != nil {
-			extra["parallel_tool_calls"] = *a.ParallelToolCalls
-		}
-		// previous_response_id / store 交给 response 上游承接。
-		//
-		// 修复前这两个字段解析完就被丢弃：客户端拿它续会话，收到的却是
-		// 「只含本次 input」的 200，模型完全不知道前文。SDK 没把
-		// previous_response_id 列入 response 的保留键，走 Extra 合法。
-		// 非 response 上游没有对应概念（chat/anthropic 都是无状态），
-		// 继续按原样丢弃 —— 那条路径客户端本就该自带全量历史。
-		if a.PreviousResponseID != "" {
-			extra["previous_response_id"] = a.PreviousResponseID
-		}
-		if a.Store != nil {
-			extra["store"] = *a.Store
-		}
-		if a.PromptCacheKey != "" {
-			extra["prompt_cache_key"] = a.PromptCacheKey
-		}
-		if len(a.Include) > 0 {
-			extra["include"] = a.Include
-		}
-		if len(extra) > 0 {
-			mergeExtra(req, extra)
-		}
-	}
-}
+// 本入口不再需要 ApplyUpstreamExtras。tool_choice / text.format /
+// parallel_tool_calls / prompt_cache_key / store / previous_response_id /
+// include / verbosity 全部在 ToRosetta 落到 rosetta.ChatRequest 的类型化字段；
+// 曾经唯一需要出站接管的「一轮拆成多条 assistant」已在入站 ToRosetta 合并成
+// 一条 Message 修掉，出站交给 SDK 编码器即可（2026-11-07）。
 
 // effectiveToolChoice 返回本次 attempt 该用的 tool_choice 原值。
 //
-// ToRosetta 是逐 attempt 调用的工厂，展平与 tool_choice 重写都在里面发生；
-// ApplyUpstreamExtras 在同一个 attempt 里紧随其后执行，所以它读到的
-// flattenedToolChoice 一定对应**本 attempt 的那份**展平结果，不存在跨
-// attempt 串味（BuildRosetta 不复用同一个实例，见 ingress.Request 的注释）。
+// ToRosetta 是逐 attempt 调用的工厂，展平与 tool_choice 重写都在它内部发生，
+// 所以同一 attempt 里读到的 flattenedToolChoice 一定对应这一份展平结果，
+// 不存在跨 attempt 串味（BuildRosetta 不复用同一个实例，见 ingress.Request
+// 的注释）。
 func (a *ResponsesRequest) effectiveToolChoice() json.RawMessage {
 	if len(a.flattenedToolChoice) > 0 {
 		return a.flattenedToolChoice
 	}
 	return a.ToolChoice
+}
+
+// responsesToolChoiceToRosetta 把 Responses 的 tool_choice（string 或
+// {"type":"function","name"}，namespace 已在 ToRosetta 展平）翻译成 rosetta
+// 的统一 ToolChoice。不认识的形状返回 nil（丢弃）。
+func responsesToolChoiceToRosetta(raw json.RawMessage) *rosetta.ToolChoice {
+	if len(raw) == 0 {
+		return nil
+	}
+	var s string
+	if json.Unmarshal(raw, &s) == nil {
+		switch s {
+		case "auto":
+			return &rosetta.ToolChoice{Mode: rosetta.ToolChoiceAuto}
+		case "none":
+			return &rosetta.ToolChoice{Mode: rosetta.ToolChoiceNone}
+		case "required":
+			return &rosetta.ToolChoice{Mode: rosetta.ToolChoiceRequired}
+		}
+		return nil
+	}
+	var obj struct {
+		Type string `json:"type"`
+		Name string `json:"name"`
+	}
+	if json.Unmarshal(raw, &obj) != nil {
+		return nil
+	}
+	switch obj.Type {
+	case "auto":
+		return &rosetta.ToolChoice{Mode: rosetta.ToolChoiceAuto}
+	case "none":
+		return &rosetta.ToolChoice{Mode: rosetta.ToolChoiceNone}
+	case "required":
+		return &rosetta.ToolChoice{Mode: rosetta.ToolChoiceRequired}
+	case "function":
+		if obj.Name == "" {
+			return nil
+		}
+		return &rosetta.ToolChoice{Mode: rosetta.ToolChoiceTool, Name: obj.Name}
+	}
+	return nil
+}
+
+// responsesTextFormatToRosetta 把 Responses 的 text.format（{"format":{...}}，
+// 平铺的 type/name/schema/strict）翻译成 rosetta 的统一 ResponseFormat。
+// SDK 按目标协议映射（Responses 的 text.format、chat 的 response_format、
+// Anthropic 的 output_config）。description 未建模，翻译中丢弃。
+func responsesTextFormatToRosetta(raw json.RawMessage) *rosetta.ResponseFormat {
+	if len(raw) == 0 {
+		return nil
+	}
+	var outer struct {
+		Format json.RawMessage `json:"format"`
+	}
+	if json.Unmarshal(raw, &outer) != nil || len(outer.Format) == 0 {
+		return nil
+	}
+	var f struct {
+		Type   string          `json:"type"`
+		Name   string          `json:"name"`
+		Schema json.RawMessage `json:"schema"`
+		Strict *bool           `json:"strict"`
+	}
+	if json.Unmarshal(outer.Format, &f) != nil || f.Type == "" {
+		return nil
+	}
+	return &rosetta.ResponseFormat{Type: f.Type, Name: f.Name, Schema: f.Schema, Strict: f.Strict}
 }
 
 func (a *ResponsesRequest) textFormatMap() map[string]any {

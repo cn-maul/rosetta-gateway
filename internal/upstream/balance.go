@@ -13,6 +13,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/cn-maul/rosetta"
 	"github.com/cn-maul/rosetta-gateway/internal/store"
 )
 
@@ -451,7 +452,7 @@ func doBalanceGET(ctx context.Context, p *store.Provider, url, apiKey string, an
 	}
 	if anthropic {
 		req.Header.Set("x-api-key", apiKey)
-		req.Header.Set("anthropic-version", "2023-06-01")
+		req.Header.Set("anthropic-version", rosetta.AnthropicVersion)
 	} else {
 		req.Header.Set("Authorization", "Bearer "+apiKey)
 	}

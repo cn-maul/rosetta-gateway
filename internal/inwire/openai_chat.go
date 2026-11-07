@@ -227,12 +227,18 @@ func (r *OpenAIChatRequest) ToRosetta() *rosetta.ChatRequest {
 	}
 
 	req := &rosetta.ChatRequest{
-		Model:           r.Model,
-		Messages:        msgs,
-		MaxOutputTokens: maxTokens(r),
-		Temperature:     r.Temperature,
-		TopP:            r.TopP,
-		StopSequences:   r.Stop,
+		Model:             r.Model,
+		Messages:          msgs,
+		MaxOutputTokens:   maxTokens(r),
+		Temperature:       r.Temperature,
+		TopP:              r.TopP,
+		StopSequences:     r.Stop,
+		Seed:              r.Seed,
+		User:              r.User,
+		PresencePenalty:   r.PresencePenalty,
+		FrequencyPenalty:  r.FrequencyPenalty,
+		ParallelToolCalls: r.ParallelToolCalls,
+		PromptCacheKey:    r.PromptCacheKey,
 	}
 
 	// reasoning_effort → Thinking.Effort。rosetta 只认 low/medium/high
@@ -261,148 +267,101 @@ func (r *OpenAIChatRequest) ToRosetta() *rosetta.ChatRequest {
 		}
 		req.Tools = tools
 	}
+	if tc := chatToolChoiceToRosetta(r.ToolChoice); tc != nil {
+		req.ToolChoice = tc
+	}
+	if rf := chatResponseFormatToRosetta(r.ResponseFormat); rf != nil {
+		req.ResponseFormat = rf
+	}
 
 	return req
 }
 
-// ApplyProtocolPrivateExtra 把 OpenAI-Chat 私有请求字段按**目标上游协议**处理：
-// 能等价翻译的必须翻译，不能翻译的按「软偏好丢弃 / 硬约束由网关层拒绝」分别处置。
-// 此前的实现是「目标为 anthropic / response 就整个 return」，把
-// response_format、tool_choice 等全部静默丢掉 —— 故障转移到不同协议的目标后，
-// 同一请求的行为悄然改变，路由不再语义透明（2026-10-07 P1-8）。
-//
-// 各目标的处置矩阵：
-//   - chat / "" / auto：OpenAI 方言原样直传（含未知协议值 —— 池构建期
-//     已拒绝拼写错误的协议名，这里保持旧的宽容行为不做二次拦截）。
-//   - response：response_format → text.format（等价约束，反向复用
-//     textFormatToResponseFormat 的翻译）、tool_choice 摊平成 Responses 形状、
-//     parallel_tool_calls 直传。penalty / seed / user 无对应物：三者是**软偏好**
-//     （采样倾向、缓存归并、租户标注），丢弃不改变请求的正确性，注释留痕即可。
-//   - anthropic：tool_choice 翻译（auto→{"type":"auto"}、required→{"type":"any"}、
-//     命名函数→{"type":"tool"}；"none" 无对应物，见 chatToolChoiceAnthropic）。
-//     response_format 是**硬约束**，Anthropic 无对应物 —— 它不允许静默降级，
-//     由 ingress.Request.RequiresStructuredOutput 在网关层把「只余 anthropic
-//     候选」的这类请求整体 400（见 handleIngress），到不了本函数。penalty /
-//     seed / user / parallel_tool_calls 同为软偏好或无效开关，丢弃不破坏正确性。
-//
-// n is deliberately absent. rosetta models a single assistant turn -- the
-// unary decoder reads Choices[0] and the streaming decoder skips every
-// index != 0 -- so n > 1 would bill the caller for candidates the gateway
-// then discards. Dropping it is the safer outcome.
-func (r *OpenAIChatRequest) ApplyProtocolPrivateExtra(req *rosetta.ChatRequest, protocol string) {
-	switch protocol {
-	case "response":
-		// —— 能等价翻译的必须翻译 ——
-		extra := map[string]any{}
-		// response_format → Responses 的 text.format。json_object 直映、
-		// json_schema 摊平外壳，与 textFormatToResponseFormat 互为镜像；
-		// "text"/缺省是两协议共同的默认值，无需显式表达。
-		if len(r.ResponseFormat) > 0 {
-			if tf := responseFormatToTextFormat(r.ResponseFormat); tf != nil {
-				extra["text"] = map[string]any{"format": tf}
-			}
+// chatToolChoiceToRosetta 把 chat 的 tool_choice（any：string 或命名函数
+// map 两种形态）翻译成 rosetta 的统一 ToolChoice。不认识的形状返回 nil
+// （丢弃，与旧实现的处置一致——绝不把 OpenAI 形状原样塞给别的协议）。
+func chatToolChoiceToRosetta(v any) *rosetta.ToolChoice {
+	switch t := v.(type) {
+	case string:
+		switch t {
+		case "auto":
+			return &rosetta.ToolChoice{Mode: rosetta.ToolChoiceAuto}
+		case "none":
+			return &rosetta.ToolChoice{Mode: rosetta.ToolChoiceNone}
+		case "required":
+			return &rosetta.ToolChoice{Mode: rosetta.ToolChoiceRequired}
 		}
-		// 字符串三档（auto/none/required）两协议同名；命名函数从 chat 的
-		// 嵌套 {"type":"function","function":{"name"}} 摊平成 Responses 的
-		// {"type":"function","name"}。
-		if r.ToolChoice != nil {
-			if tc := chatToolChoiceResponses(r.ToolChoice); tc != nil {
-				extra["tool_choice"] = tc
-			}
+		return nil
+	case map[string]any:
+		if t["type"] != "function" {
+			return nil
 		}
-		if r.ParallelToolCalls != nil {
-			extra["parallel_tool_calls"] = *r.ParallelToolCalls
+		fn, ok := t["function"].(map[string]any)
+		if !ok {
+			return nil
 		}
-		if r.PromptCacheKey != "" {
-			extra["prompt_cache_key"] = r.PromptCacheKey
+		name, _ := fn["name"].(string)
+		if name == "" {
+			return nil
 		}
-		// presence_penalty / frequency_penalty / seed / user：Responses API 无对应物。
-		// 它们是软偏好或标注类字段，丢弃不改变请求的正确性 —— 与结构化输出这类
-		// 硬约束不同（后者在网关层被拒绝，绝不静默降级）。
-		if len(extra) > 0 {
-			mergeExtra(req, extra)
-		}
-		return
-
-	case "anthropic":
-		// tool_choice 有等价翻译（映射表见 chatToolChoiceAnthropic）。
-		if r.ToolChoice != nil {
-			if tc := chatToolChoiceAnthropic(r.ToolChoice); tc != nil {
-				mergeExtra(req, map[string]any{"tool_choice": tc})
-			}
-		}
-		// response_format 在 Anthropic 无对应物。json_object / json_schema 是
-		// **硬约束**：静默丢弃会让客户端拿到「200 但约束失效」的响应，且故障
-		// 转移前后行为不一致 —— 这类请求不会走到这里（RequiresStructuredOutput
-		// 已在 handleIngress 把 anthropic 候选过滤掉，全被滤空则 400）。
-		// penalty / seed / user 是软偏好，parallel_tool_calls 是 Anthropic
-		// 没有开关表达的控制位 —— 丢弃均不改变请求的正确性。
-		return
+		return &rosetta.ToolChoice{Mode: rosetta.ToolChoiceTool, Name: name}
 	}
-
-	// "" / "chat" / "auto"（及未知值）：OpenAI 方言直传。
-	extra := map[string]any{}
-	if r.ToolChoice != nil {
-		extra["tool_choice"] = r.ToolChoice
-	}
-	if r.PresencePenalty != nil {
-		extra["presence_penalty"] = *r.PresencePenalty
-	}
-	if r.FrequencyPenalty != nil {
-		extra["frequency_penalty"] = *r.FrequencyPenalty
-	}
-	// response_format 保留客户端原始 JSON（{"type":"json_object"} 或含 json_schema
-	// 的对象）：这里用 json.RawMessage 直传、不做结构往返，schema 里我们没建模的
-	// 字段（strict、schema 名等）才不会被解码环节吃掉。显式 null 也照原样透传。
-	if len(r.ResponseFormat) > 0 {
-		extra["response_format"] = r.ResponseFormat
-	}
-	if r.Seed != nil {
-		extra["seed"] = *r.Seed
-	}
-	if r.User != "" {
-		extra["user"] = r.User
-	}
-	if r.ParallelToolCalls != nil {
-		extra["parallel_tool_calls"] = *r.ParallelToolCalls
-	}
-	if r.PromptCacheKey != "" {
-		extra["prompt_cache_key"] = r.PromptCacheKey
-	}
-	// The SDK's Chat encoder intentionally drops BlockThinking because it
-	// historically treated all thinking as Anthropic-only. DeepSeek's Chat
-	// protocol does replay a plain reasoning_content field, so when the
-	// original request contains it we provide the complete messages array
-	// ourselves. buildClient enables WithExtraOverrides for this one reserved
-	// field; all requests without replayed reasoning keep the SDK encoder.
-	if r.hasReplayableChatReasoning() {
-		extra["messages"] = r.chatMessagesWithReasoning()
-	}
-	// reasoning_effort 故意**不**进 Extra，尽管它是 OpenAI 的字段。
-	//
-	// 进 Extra 的代价已经变了：internal/upstream 的 buildClient 现在开了
-	// WithExtraOverrides(true)，所以直传不再会撞 openaiChatReservedPayloadKeys 报 400 —— 但
-	// 它现在会**覆盖** SDK 自己按 Thinking 算出的 reasoning_effort，等于把
-	// "effort 归一化 + 与 temperature/top_p 的互斥处理"（provider_openai_chat
-	// 的 emitReasoning 分支）整套绕过去。那条分支不是可有可无的装饰：
-	// 推理模型收到 temperature 会被部分上游 400 拒绝。
-	//
-	// 不直传的代价：Thinking.Effort 只归一到 low/medium/high，minimal→low、
-	// xhigh→high。语义方向正确（都是"少想一点"/"多想想"），只是粒度变粗。
-	// 这个取舍与本函数对未知 effort 值的既有处理一致（静默退回默认而非 400）：
-	// 客户端可能按更新的模型能力在发请求，让整个请求不可用才是更糟的失败。
-	if len(extra) == 0 {
-		return
-	}
-
-	if req.Extra == nil {
-		req.Extra = extra
-		return
-	}
-	for k, v := range extra {
-		req.Extra[k] = v
-	}
+	return nil
 }
+
+// chatResponseFormatToRosetta 把 chat 的 response_format（json.RawMessage）
+// 翻译成 rosetta 的统一 ResponseFormat。SDK 按目标协议映射（chat 的
+// response_format、Responses 的 text.format、Anthropic 的 output_config）。
+// 未建模的字段（如 json_schema 的 description）在翻译中丢弃 —— 这是从
+// RawMessage 直传迁到类型化字段的代价，换取的是不再依赖 WithExtraOverrides。
+func chatResponseFormatToRosetta(raw json.RawMessage) *rosetta.ResponseFormat {
+	if len(raw) == 0 {
+		return nil
+	}
+	var f struct {
+		Type       string          `json:"type"`
+		JSONSchema json.RawMessage `json:"json_schema"`
+	}
+	if json.Unmarshal(raw, &f) != nil {
+		return nil
+	}
+	switch f.Type {
+	case "text":
+		return &rosetta.ResponseFormat{Type: "text"}
+	case "json_object":
+		return &rosetta.ResponseFormat{Type: "json_object"}
+	case "json_schema":
+		rf := &rosetta.ResponseFormat{Type: "json_schema"}
+		if len(f.JSONSchema) > 0 {
+			var js struct {
+				Name   string          `json:"name"`
+				Schema json.RawMessage `json:"schema"`
+				Strict *bool           `json:"strict"`
+			}
+			if json.Unmarshal(f.JSONSchema, &js) == nil {
+				rf.Name = js.Name
+				rf.Schema = js.Schema
+				rf.Strict = js.Strict
+			}
+		}
+		return rf
+	}
+	return nil
+}
+
+// 本入口不再需要 ApplyUpstreamExtras。
+//
+// tool_choice / response_format / seed / user / presence_penalty /
+// frequency_penalty / parallel_tool_calls / prompt_cache_key / top_k 全部在
+// ToRosetta 落到 rosetta.ChatRequest 的类型化字段，由 SDK 按目标协议翻译
+// （v1.3.0 起这些同时是 SDK 保留键，塞 Extra 会撞 openaiChatReservedPayloadKeys）。
+//
+// 曾经独占的 reasoning_content 回放也交还给 SDK 了：v1.3.0 的 chat 编码器
+// 把 BlockThinking 编码成同一条 assistant 消息的 reasoning_content（P1-1a），
+// 因此这里不再整份接管 messages，也不再依赖 WithExtraOverrides。
+//
+// n 依然刻意不支持：rosetta 只建模单条 assistant 轮次，n > 1 会让调用方
+// 为网关随后丢弃的候选付费。
 
 func maxTokens(r *OpenAIChatRequest) int {
 	if r.MaxCompletionTokens != nil {
@@ -538,24 +497,6 @@ func convertMessage(m OpenAIMessage) rosetta.Message {
 		// 角色未知时按 user 处理（rosetta 的 validate 随后会拒绝非法角色）。
 		return userMessage(m.Content)
 	}
-}
-
-func (r *OpenAIChatRequest) hasReplayableChatReasoning() bool {
-	for _, m := range r.Messages {
-		if m.Role == "assistant" && strings.TrimSpace(m.ReasoningContent) != "" {
-			return true
-		}
-	}
-	return false
-}
-
-// chatMessagesWithReasoning preserves the client's Chat wire messages,
-// including reasoning_content. It is used only when replay is required;
-// all other requests continue through the SDK's normal encoder.
-func (r *OpenAIChatRequest) chatMessagesWithReasoning() []OpenAIMessage {
-	msgs := make([]OpenAIMessage, len(r.Messages))
-	copy(msgs, r.Messages)
-	return msgs
 }
 
 // assistantText 取 assistant 消息的正文，refusal 作为 content 为空时的兜底。

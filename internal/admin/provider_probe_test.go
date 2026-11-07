@@ -8,6 +8,7 @@ import (
 	"sync"
 	"testing"
 
+	"github.com/cn-maul/rosetta"
 	"github.com/cn-maul/rosetta-gateway/internal/config"
 	"github.com/cn-maul/rosetta-gateway/internal/protocol"
 	"github.com/cn-maul/rosetta-gateway/internal/store"
@@ -175,8 +176,8 @@ func TestProbeProtocolsJudgesEachPathIndependently(t *testing.T) {
 	if got := messages.Header.Get("Authorization"); got != "" {
 		t.Fatalf("anthropic 不该同时带 Authorization，实际 %q", got)
 	}
-	if got := messages.Header.Get("anthropic-version"); got != anthropicVersionHeader {
-		t.Fatalf("anthropic 应带 anthropic-version=%s，实际 %q", anthropicVersionHeader, got)
+	if got := messages.Header.Get("anthropic-version"); got != rosetta.AnthropicVersion {
+		t.Fatalf("anthropic 应带 anthropic-version=%s，实际 %q", rosetta.AnthropicVersion, got)
 	}
 
 	// 响应体里绝不能出现 api_key。

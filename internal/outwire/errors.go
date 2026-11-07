@@ -88,6 +88,16 @@ func mapUpstreamError(err error, logging bool) (int, string, string) {
 		}
 		return http.StatusBadGateway, "upstream_error", "upstream provider returned an unreadable response"
 	}
+	if errors.Is(err, rosetta.ErrResponseTooLarge) {
+		// 上游返回了超过网关读上限的响应体。与 ErrUpstreamMalformed 同属
+		// 「接受请求但返回不可用体」的目标级故障，归 502 并纳入故障转移，
+		// 只是错误形状不同（超限 vs 解不开）。
+		if logging {
+			slog.Warn("upstream response exceeded the read limit",
+				"error", err, "hint", "upstream returned a body larger than the gateway reads")
+		}
+		return http.StatusBadGateway, "upstream_error", "upstream provider returned an oversized response"
+	}
 
 	var apiErr *rosetta.APIError
 	if errors.As(err, &apiErr) {
@@ -404,6 +414,11 @@ func FailoverEligible(err error) bool {
 	// 所以「流式解不开」走的是流哨兵（ErrStreamTruncated/Overflow）那条路，
 	// 那条路按设计也不可转移。两者不冲突。
 	if errors.Is(err, rosetta.ErrUpstreamMalformed) {
+		return true
+	}
+	if errors.Is(err, rosetta.ErrResponseTooLarge) {
+		// 与 ErrUpstreamMalformed 同一理由：上游「接受请求却返回不可用体」
+		// （这里是体超限），属于目标级故障，链正是为吸收它存在的。
 		return true
 	}
 	var transportErr *rosetta.TransportError

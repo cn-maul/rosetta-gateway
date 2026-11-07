@@ -10,6 +10,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/cn-maul/rosetta"
 	wireproto "github.com/cn-maul/rosetta-gateway/internal/protocol"
 	"github.com/cn-maul/rosetta-gateway/internal/upstream"
 )
@@ -201,14 +202,14 @@ func probeOneProtocol(ctx context.Context, client *http.Client, endpoint, apiKey
 			// 缺它时上游回 400 —— 那也会被算成「路径存在」，但错误原因会
 			// 被掩盖成「格式不对」而不是「缺 header」。
 			req.Header.Set("x-api-key", apiKey)
-			req.Header.Set("anthropic-version", anthropicVersionHeader)
+			req.Header.Set("anthropic-version", rosetta.AnthropicVersion)
 		} else {
 			req.Header.Set("Authorization", "Bearer "+apiKey)
 		}
 	} else if protocol == wireproto.Anthropic {
 		// 没给 key 也带上版本头：这样 401「缺 key」与 400「缺版本头」
 		// 不会混在一起，管理员看到的原因才是真的原因。
-		req.Header.Set("anthropic-version", anthropicVersionHeader)
+		req.Header.Set("anthropic-version", rosetta.AnthropicVersion)
 	}
 
 	resp, err := client.Do(req)
@@ -266,13 +267,6 @@ func (h *ProviderHandler) resolveProbeProxy(ctx context.Context, networkID strin
 	}
 	return n.ProxyURL, nil
 }
-
-// anthropicVersionHeader 与 internal/upstream 里的常量同值。
-//
-// 不导出那个常量：它是数据面 SDK 的参数，这里只是探测时握手用；
-// 两边都指向同一份协议约定（Anthropic 的 anthropic-version），
-// 升级时一起改。
-const anthropicVersionHeader = "2023-06-01"
 
 // validateProbeEndpoint 校验探测用的 endpoint。
 //

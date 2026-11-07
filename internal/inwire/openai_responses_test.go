@@ -1,7 +1,6 @@
 package inwire
 
 import (
-	"encoding/json"
 	"errors"
 	"net/http"
 	"net/http/httptest"
@@ -132,115 +131,101 @@ func TestDecodeResponses_Full(t *testing.T) {
 		t.Fatalf("tools: %+v", req.Tools)
 	}
 
-	// user → assistant(text) → assistant(tool_call) → tool → user(text+image)
+	// user → assistant(text + tool_call，**同一条**) → tool → user(text+image)
 	//
-	// {"type":"reasoning"} 项不计入消息数：它不带 role 也不带 content，
-	// 按 F17 规则（user 侧只采信 input_text）产不出任何消息，在 dispatch
+	// {"type":"reasoning"} 项不计入任何消息：它不带 role 也不带 content，
+	// 按 F17 规则（user 侧只采信 input_text）产不出任何块，在 dispatch
 	// 里就是空操作 —— 这与修复前一致。
-	if len(req.Messages) != 5 {
-		t.Fatalf("message count = %d, want 5: %+v", len(req.Messages), req.Messages)
+	//
+	// assistant 的 message item 与 function_call item 合进**一条** Message
+	// 的两个 Block：Responses 把一轮拆成多个 output item，而 rosetta 的语义
+	// 是「一个 Message = 一轮」。拆成两条会导致出站编码器输出两条连续
+	// assistant，DeepSeek 系上游不认（2026-11-07 修）。
+	if len(req.Messages) != 4 {
+		t.Fatalf("message count = %d, want 4: %+v", len(req.Messages), req.Messages)
 	}
-	if req.Messages[1].Role != rosetta.RoleAssistant || req.Messages[1].Blocks[0].Text != "我调个工具" {
-		t.Fatalf("assistant text: %+v", req.Messages[1])
+	asst := req.Messages[1]
+	if asst.Role != rosetta.RoleAssistant || len(asst.Blocks) != 2 {
+		t.Fatalf("assistant turn should hold text+tool_call, got %+v", asst)
 	}
-	tc := req.Messages[2]
-	if tc.Role != rosetta.RoleAssistant || tc.Blocks[0].Type != rosetta.BlockToolCall || tc.Blocks[0].ToolCallID != "c1" {
-		t.Fatalf("function_call item: %+v", tc)
+	if asst.Blocks[0].Type != rosetta.BlockText || asst.Blocks[0].Text != "我调个工具" {
+		t.Fatalf("assistant text block: %+v", asst.Blocks[0])
 	}
-	tr := req.Messages[3]
+	if asst.Blocks[1].Type != rosetta.BlockToolCall || asst.Blocks[1].ToolCallID != "c1" {
+		t.Fatalf("function_call block: %+v", asst.Blocks[1])
+	}
+	tr := req.Messages[2]
 	if tr.Role != rosetta.RoleTool || tr.Blocks[0].Content != "晴" {
 		t.Fatalf("function_call_output item: %+v", tr)
 	}
-	last := req.Messages[4]
+	last := req.Messages[3]
 	if last.Role != rosetta.RoleUser || len(last.Blocks) != 2 ||
 		last.Blocks[0].Text != "看这张图" || last.Blocks[1].ImageURL != "https://x/y.png" {
 		t.Fatalf("final user message: %+v", last)
 	}
 }
 
-// tool_choice 翻译：chat 上游 function→嵌套形状，responses 上游原样。
+// tool_choice 翻译到统一 ToolChoice；跨协议翻译（chat 的嵌套形状、
+// anthropic 的 tool 形状）由 SDK 负责。
 func TestDecodeResponses_ToolChoice(t *testing.T) {
 	got := decodeResponses(t, `{"model":"m","input":"hi",
 		"tool_choice":{"type":"function","name":"weather"}}`)
 	req := got.ToRosetta()
-	got.ApplyUpstreamExtras(req, "chat")
-	if tc, ok := req.Extra["tool_choice"].(map[string]any); !ok || tc["type"] != "function" {
-		t.Fatalf("chat tool_choice: %+v", req.Extra)
+	if req.ToolChoice == nil || req.ToolChoice.Mode != rosetta.ToolChoiceTool || req.ToolChoice.Name != "weather" {
+		t.Fatalf("ToolChoice = %+v，期望 tool/weather", req.ToolChoice)
 	}
-	req2 := got.ToRosetta()
-	got.ApplyUpstreamExtras(req2, "response")
-	if _, ok := req2.Extra["tool_choice"].(json.RawMessage); !ok {
-		t.Fatalf("responses tool_choice passthrough: %+v", req2.Extra)
-	}
-	// anthropic 上游拿翻译后的形状（P1-8：不再整个跳过、静默丢 tool_choice）。
-	req3 := got.ToRosetta()
-	got.ApplyUpstreamExtras(req3, "anthropic")
-	if tc, ok := req3.Extra["tool_choice"].(map[string]any); !ok || tc["type"] != "tool" || tc["name"] != "weather" {
-		t.Fatalf("anthropic tool_choice translation: %+v", req3.Extra)
-	}
-	// text.format 不跟随：anthropic 上游没有对应物（结构化输出这类硬约束由
-	// 网关层 requiresStructuredOutput 拦截，不放行后丢失）。
+
+	// text.format 落到 ResponseFormat；anthropic 上游拿不到 text.format 由
+	// 网关层 requiresStructuredOutput 拦截，不在本层放行后丢失。
 	got2 := decodeResponses(t, `{"model":"m","input":"hi",
 		"text":{"format":{"type":"json_object"}}}`)
-	req4 := got2.ToRosetta()
-	got2.ApplyUpstreamExtras(req4, "anthropic")
-	if len(req4.Extra) != 0 {
-		t.Fatalf("anthropic upstream must not receive text.format, got %+v", req4.Extra)
+	req2 := got2.ToRosetta()
+	if req2.ResponseFormat == nil || req2.ResponseFormat.Type != "json_object" {
+		t.Fatalf("ResponseFormat = %+v，期望 json_object", req2.ResponseFormat)
 	}
 }
 
-// text.format → chat 的 response_format 翻译。
+// text.format → 统一 ResponseFormat。
 func TestDecodeResponses_TextFormat(t *testing.T) {
 	got := decodeResponses(t, `{"model":"m","input":"hi",
 		"text":{"format":{"type":"json_schema","name":"out","schema":{"type":"object"}}}}`)
 	req := got.ToRosetta()
-	got.ApplyUpstreamExtras(req, "chat")
-	rf, ok := req.Extra["response_format"].(map[string]any)
-	if !ok || rf["type"] != "json_schema" {
-		t.Fatalf("response_format: %+v", req.Extra)
+	if req.ResponseFormat == nil || req.ResponseFormat.Type != "json_schema" || req.ResponseFormat.Name != "out" {
+		t.Fatalf("ResponseFormat = %+v，期望 json_schema/out", req.ResponseFormat)
 	}
-	inner := rf["json_schema"].(map[string]any)
-	if inner["name"] != "out" {
-		t.Fatalf("json_schema inner: %+v", inner)
-	}
-
-	// responses 上游拿原始 text 外壳。
-	req2 := got.ToRosetta()
-	got.ApplyUpstreamExtras(req2, "response")
-	if _, ok := req2.Extra["text"].(map[string]any); !ok {
-		t.Fatalf("responses text passthrough: %+v", req2.Extra)
+	if string(req.ResponseFormat.Schema) != `{"type":"object"}` {
+		t.Fatalf("ResponseFormat.Schema = %s", req.ResponseFormat.Schema)
 	}
 }
 
-// responses → anthropic：tool_choice 等价翻译矩阵（P1-8 补齐的方向）。
-func TestResponses_AnthropicToolChoiceMatrix(t *testing.T) {
+// responses 的 tool_choice 各种形态（string / 对象）都翻译成统一 ToolChoice。
+func TestResponses_ToolChoiceModes(t *testing.T) {
 	cases := []struct {
 		name       string
 		toolChoice string
-		wantJSON   string // "" = 应被丢弃
+		want       rosetta.ToolChoice
+		drop       bool
 	}{
-		{"auto→auto", `"auto"`, `{"type":"auto"}`},
-		{"required→any", `"required"`, `{"type":"any"}`},
-		{"object auto→auto", `{"type":"auto"}`, `{"type":"auto"}`},
-		{"object required→any", `{"type":"required"}`, `{"type":"any"}`},
-		{"function→tool", `{"type":"function","name":"weather"}`, `{"name":"weather","type":"tool"}`},
-		// "none" 在 Anthropic 无对应物：丢弃。
-		{"none dropped", `"none"`, ""},
+		{"auto", `"auto"`, rosetta.ToolChoice{Mode: rosetta.ToolChoiceAuto}, false},
+		{"required", `"required"`, rosetta.ToolChoice{Mode: rosetta.ToolChoiceRequired}, false},
+		{"object auto", `{"type":"auto"}`, rosetta.ToolChoice{Mode: rosetta.ToolChoiceAuto}, false},
+		{"object required", `{"type":"required"}`, rosetta.ToolChoice{Mode: rosetta.ToolChoiceRequired}, false},
+		{"function", `{"type":"function","name":"weather"}`, rosetta.ToolChoice{Mode: rosetta.ToolChoiceTool, Name: "weather"}, false},
+		{"none", `"none"`, rosetta.ToolChoice{Mode: rosetta.ToolChoiceNone}, false},
+		{"unknown string dropped", `"bogus"`, rosetta.ToolChoice{}, true},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
 			got := decodeResponses(t, `{"model":"m","input":"hi","tool_choice":`+c.toolChoice+`}`)
 			req := got.ToRosetta()
-			got.ApplyUpstreamExtras(req, "anthropic")
-			if c.wantJSON == "" {
-				if _, exists := req.Extra["tool_choice"]; exists {
-					t.Fatalf("tool_choice 应被丢弃，实际 %v", req.Extra["tool_choice"])
+			if c.drop {
+				if req.ToolChoice != nil {
+					t.Fatalf("tool_choice 应被丢弃，实际 %+v", req.ToolChoice)
 				}
 				return
 			}
-			raw, _ := json.Marshal(req.Extra["tool_choice"])
-			if string(raw) != c.wantJSON {
-				t.Fatalf("tool_choice = %s, want %s", raw, c.wantJSON)
+			if req.ToolChoice == nil || *req.ToolChoice != c.want {
+				t.Fatalf("ToolChoice = %+v，期望 %+v", req.ToolChoice, c.want)
 			}
 		})
 	}
@@ -462,76 +447,50 @@ func TestResponses_TextFormatNotDoubleWrapped(t *testing.T) {
 	a := decodeResponses(t, `{"model":"m","input":"hi",
 		"text":{"format":{"type":"json_schema","name":"t","strict":true,
 			"schema":{"type":"object","properties":{"a":{"type":"string"}}}}}}`)
-
 	req := a.ToRosetta()
-	a.ApplyUpstreamExtras(req, "response")
-
-	textObj, ok := req.Extra["text"].(map[string]any)
-	if !ok {
-		t.Fatalf("extra[text] 应是 map，实际 %T（%v）", req.Extra["text"], req.Extra["text"])
+	if req.ResponseFormat == nil || req.ResponseFormat.Type != "json_schema" || req.ResponseFormat.Name != "t" {
+		t.Fatalf("ResponseFormat = %+v，期望 json_schema/t", req.ResponseFormat)
 	}
-	format, ok := textObj["format"].(map[string]any)
-	if !ok {
-		t.Fatalf("text.format 应是 map，实际 %T —— 说明整包被当成 format 的值塞进去了",
-			textObj["format"])
+	if req.ResponseFormat.Strict == nil || !*req.ResponseFormat.Strict {
+		t.Fatalf("ResponseFormat.Strict 丢了")
 	}
-	if format["type"] != "json_schema" {
-		t.Fatalf("text.format.type = %v，期望 json_schema", format["type"])
-	}
-	if _, doubled := format["format"]; doubled {
-		t.Fatalf("text.format 里不该再出现一层 format（双层包裹）")
-	}
-	if _, hasName := format["name"]; !hasName {
-		t.Fatalf("text.format 丢了 schema 名：%v", format)
+	if string(req.ResponseFormat.Schema) != `{"type":"object","properties":{"a":{"type":"string"}}}` {
+		t.Fatalf("ResponseFormat.Schema = %s", req.ResponseFormat.Schema)
 	}
 }
 
-// text 里除 format 之外的键不能因为修 format 而被一起弄丢。
+// text.verbosity 落到 Verbosity，不被修 format 时弄丢。
 func TestResponses_TextOtherKeysPassThrough(t *testing.T) {
 	a := decodeResponses(t, `{"model":"m","input":"hi",
 		"text":{"format":{"type":"json_object"},"verbosity":"low"}}`)
-
 	req := a.ToRosetta()
-	a.ApplyUpstreamExtras(req, "response")
-
-	textObj, ok := req.Extra["text"].(map[string]any)
-	if !ok {
-		t.Fatalf("extra[text] 应是 map，实际 %T", req.Extra["text"])
+	if req.Verbosity != "low" {
+		t.Fatalf("Verbosity = %q，期望 low", req.Verbosity)
 	}
-	if textObj["verbosity"] != "low" {
-		t.Fatalf("text.verbosity 被丢了：%v", textObj)
-	}
-	if _, ok := textObj["format"]; !ok {
-		t.Fatalf("text.format 丢了：%v", textObj)
+	if req.ResponseFormat == nil || req.ResponseFormat.Type != "json_object" {
+		t.Fatalf("ResponseFormat 丢了：%+v", req.ResponseFormat)
 	}
 }
 
-// previous_response_id / store 解析后必须送到 response 上游，
-// 否则客户端以为会话续上了，实际模型只看到本次 input。
+// previous_response_id / store 落到类型化字段。
 func TestResponses_PreviousResponseIDForwarded(t *testing.T) {
 	a := decodeResponses(t, `{"model":"m","input":"hi",
 		"previous_response_id":"resp_abc123","store":false}`)
-
 	req := a.ToRosetta()
-	a.ApplyUpstreamExtras(req, "response")
-
-	if req.Extra["previous_response_id"] != "resp_abc123" {
-		t.Fatalf("previous_response_id 未透传：%v", req.Extra["previous_response_id"])
+	if req.PreviousResponseID != "resp_abc123" {
+		t.Fatalf("previous_response_id 未落到类型化字段：%q", req.PreviousResponseID)
 	}
-	if req.Extra["store"] != false {
-		t.Fatalf("显式 store:false 未透传：%v", req.Extra["store"])
+	if req.Store == nil || *req.Store != false {
+		t.Fatalf("显式 store:false 未落到类型化字段：%v", req.Store)
 	}
 }
 
 func TestResponses_PromptCacheKeyForwarded(t *testing.T) {
 	a := decodeResponses(t, `{"model":"m","input":"hi",
 		"prompt_cache_key":"conversation-42"}`)
-
 	req := a.ToRosetta()
-	a.ApplyUpstreamExtras(req, "response")
-
-	if got := req.Extra["prompt_cache_key"]; got != "conversation-42" {
-		t.Fatalf("prompt_cache_key 未透传：%v", got)
+	if req.PromptCacheKey != "conversation-42" {
+		t.Fatalf("prompt_cache_key 未落到类型化字段：%q", req.PromptCacheKey)
 	}
 }
 
@@ -668,20 +627,8 @@ func TestDecodeResponses_NamespaceToolChoiceHonored(t *testing.T) {
 	if req.Tools[0].Name != "shell__ls" {
 		t.Fatalf("展平后的工具名 = %q, want shell__ls", req.Tools[0].Name)
 	}
-	// tool_choice 挂在 req.Extra 上（ApplyUpstreamExtras 的事），
-	// 断言的是**重写后的值**而不是原始载荷。
-	got.ApplyUpstreamExtras(req, "response")
-	choice := req.Extra["tool_choice"]
-	raw, ok := choice.(json.RawMessage)
-	if !ok {
-		t.Fatalf("tool_choice = %#v, want json.RawMessage", choice)
-	}
-	var m map[string]any
-	if err := json.Unmarshal(raw, &m); err != nil {
-		t.Fatalf("tool_choice 不是 JSON 对象: %v", err)
-	}
-	if m["type"] != "function" || m["name"] != "shell__ls" {
-		t.Fatalf("tool_choice = %#v —— namespace 约束没被兑现，"+
-			"原样发给上游会指向不存在的工具", m)
+	// tool_choice 落到统一 ToolChoice，且指向展平后的工具名。
+	if req.ToolChoice == nil || req.ToolChoice.Mode != rosetta.ToolChoiceTool || req.ToolChoice.Name != "shell__ls" {
+		t.Fatalf("ToolChoice = %+v —— namespace 约束没被兑现，原样发给上游会指向不存在的工具", req.ToolChoice)
 	}
 }

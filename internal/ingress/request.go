@@ -15,9 +15,7 @@ import (
 //
 // BuildRosetta is a factory called once per attempt rather than a prepared
 // request: targets in a failover chain can use different upstream protocols,
-// and ApplyUpstreamExtras attaches protocol-private fields to req.Extra.
-// Reusing one instance across attempts would leak target A's Extra into target
-// B's request.
+// so each attempt needs its own instance with its own upstream model id.
 type Request struct {
 	BuildRosetta func() *rosetta.ChatRequest
 	Stream       bool
@@ -34,8 +32,6 @@ type Request struct {
 	// (chat response_format or responses text.format set to json_object /
 	// json_schema). Such requests must not be sent to Anthropic upstreams.
 	RequiresStructuredOutput bool
-
-	ApplyUpstreamExtras func(req *rosetta.ChatRequest, upstreamProtocol string)
 
 	// RawEffort is the client's original effort level before normalization.
 	// An empty string means it was not specified.

@@ -9,6 +9,7 @@ import (
 	"errors"
 	"log/slog"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/cn-maul/rosetta-gateway/internal/store"
@@ -24,6 +25,11 @@ type Config struct {
 	Logger          *slog.Logger
 	BatchInsert     BatchInsertFunc
 	IsBalanceExempt func(userID string) bool
+
+	// EnqueueWait 覆盖「队列满时等空位」的时间窗，0 = usageEnqueueWait。
+	// 仅测试设置：生产用默认值，测试要在一个可控的短窗口里验证
+	// 「等不到才同步写」这条分支。
+	EnqueueWait time.Duration
 }
 
 // New starts the usage recorder workers.
@@ -36,6 +42,10 @@ func New(cfg Config) *Recorder {
 	if isExempt == nil {
 		isExempt = func(string) bool { return false }
 	}
+	wait := cfg.EnqueueWait
+	if wait <= 0 {
+		wait = usageEnqueueWait
+	}
 	u := &Recorder{
 		db:              cfg.DB,
 		logger:          logger,
@@ -43,6 +53,8 @@ func New(cfg Config) *Recorder {
 		stop:            make(chan struct{}),
 		batchInsert:     cfg.BatchInsert,
 		isBalanceExempt: isExempt,
+		enqueueWait:     wait,
+		space:           make(chan struct{}, 1),
 		done:            make(chan struct{}),
 	}
 	for i := 0; i < usageWorkers; i++ {
@@ -65,7 +77,8 @@ func New(cfg Config) *Recorder {
 // 用固定数量的 worker + 有界队列取代「每条记录一个 goroutine」：
 //   - 高并发下不再无限堆积 goroutine（配合 SetMaxOpenConns(1)，无界 goroutine
 //     只会全部阻塞在 DB 锁上排队，白白吃内存）；
-//   - 队列满时 record 退化为同步写，提供背压而不是静默丢记录。
+//   - 队列满时**先限时等空位**（背压），等不到才同步写兜底 —— 不是一满就同步写，
+//     那会让请求线程抢走 worker 的写连接，形成「worker 饿死 → 队列更满」的正反馈。
 type Recorder struct {
 	db     *store.Store
 	logger *slog.Logger
@@ -97,11 +110,29 @@ type Recorder struct {
 	mu     sync.Mutex
 	closed bool
 
+	// enqueueWait 是队列满时等空位的上限，见 usageEnqueueWait / Config.EnqueueWait。
+	enqueueWait time.Duration
+
+	// space 是「队列刚空出一格」的信号（容量 1，非阻塞发送）。
+	//
+	// 为什么不用「持锁阻塞发送」：worker 落库成功后会调 clearFlushFailed，
+	// 它也要 mu。生产者若持锁等满整个等待窗口，worker 就被挡在锁上、
+	// 永远排不空队列 —— 等待必然超时、必然走同步写，等于没修。
+	// 改成「短暂持锁尝试 + 等信号」，锁从不跨越等待。
+	space chan struct{}
+
+	// syncFallbacks 累计「整段等待窗口都没等到空位、只能同步写」的次数。
+	//
+	// 恒为 0 = 从未走到兜底；持续增长 = worker 停摆（DB 长时间不可写）。
+	// 之所以要计数而不是只打日志：这条分支一旦常态出现，吞吐会掉一个量级，
+	// 而它在指标上只表现为「QPS 变低」，没有计数器就无从归因。
+	syncFallbacks atomic.Int64
+
 	// flushFailed 记录「上一次整批落库失败」，供 worker 决定要不要回灌
 	//（2026-10-12 修 P1-1）。
 	//
 	// 为什么需要这个标志：flush 失败后要把整批保留下来重试，而不能
-	// 非阻塞地插回有界队列（usageQueueSize=1024）—— 队列满时插回会静默
+	// 非阻塞地插回有界队列（usageQueueSize，当前 8192）—— 队列满时插回会静默
 	// 丢弃，那正是本次要修的缺陷本身。所以这批留在 worker 手里，
 	// flushFailed 就是「手上还攥着一批待重试」的标记，让关停流程能识别出来。
 	flushFailed bool
@@ -154,8 +185,26 @@ func (j persistJob) finish() {
 }
 
 const (
-	// usageQueueSize 是有界队列容量。超过该值即触发同步写背压。
-	usageQueueSize = 1024
+	// usageQueueSize 是有界队列容量。满了以后先按 usageEnqueueWait 限时等待，
+	// 等不到空位才退化为同步写。
+	//
+	// 2026-11 从 1024 提到 8192：实测（并发扩展压测，n=1500/档）
+	//   1024  → 200 并发 QPS 3,514，P99 303ms
+	//   8192  → 200 并发 QPS 13,227，P99 53ms
+	//   32768 → 与 8192 持平（噪声内），再大没有收益。
+	// 机理见 RecordWithCallback 的慢路径注释：容量本身不是瓶颈，队列一满
+	// 就退化成「请求线程抢唯一写连接」才是。容量只是把这件事的概率压低。
+	//
+	// 内存代价：一条 persistJob 约几百字节，8192 条约 3~5MB。
+	usageQueueSize = 8192
+
+	// usageEnqueueWait 是队列满时请求线程**等空位**的上限（背压窗口）。
+	//
+	// 取值依据：批量 50 行约 2ms 落一批，8192 条最坏约 300ms 排空；
+	// 1s 足够覆盖「瞬时突发 + 一次 checkpoint 抖动」，又不会让客户端
+	// 为了等记账而挂太久。超过它说明 worker 真的停摆了（DB 长时间不可写），
+	// 那时只能同步写兜底 —— 记账不能丢，但会在日志里留痕。
+	usageEnqueueWait = time.Second
 	// usageWorkers 是并发落库的 worker 数。SQLite 单写锁下并发写没有收益，
 	// 1 个 worker 足够，队列本身负责吸收突发。
 	usageWorkers = 1
@@ -258,7 +307,7 @@ func (u *Recorder) worker() {
 
 	// stillPending 是**上一轮落库失败、留待重试**的记录（2026-10-12 修 P1-1）。
 	//
-	// 为什么留在 worker 手里而不是插回队列：队列是有界的（usageQueueSize=1024）
+	// 为什么留在 worker 手里而不是插回队列：队列是有界的（usageQueueSize，当前 8192）
 	// 且此刻可能已满，非阻塞插回会在 `default` 分支静默丢弃 —— 那正是本次
 	// 要修的缺陷本身。留在手上则保证「不丢」，代价是这批重试期间不再取新记录，
 	// 让入队端自然背压（record 里的 select 会走 default 同步写）。
@@ -306,6 +355,8 @@ func (u *Recorder) worker() {
 			return
 		}
 		batch = append(batch, job)
+		// 刚取走一条 = 队列空出一格，唤醒一个正在等空位的生产者。
+		u.signalSpace()
 
 		// 尽力多攒：把**当前已就绪**的记录挪进这批。
 		//
@@ -321,6 +372,7 @@ func (u *Recorder) worker() {
 					break drain
 				}
 				batch = append(batch, next)
+				u.signalSpace()
 			default:
 				break drain
 			}
@@ -798,6 +850,25 @@ func (u *Recorder) Record(rec *store.UsageRecord) {
 // usage 行要么已经可见（used 已含本次用量），要么已经彻底放弃（释放
 // 比永久冻结安全）。done 由本方法包一次 sync.Once，降级重试重复命中
 // 同一条记录也不会重复释放。
+// RecordWithCallback 把一条记录交给异步落库，落库尝试结束后调用 done。
+//
+// # 队列满时为什么是「等」而不是「立刻同步写」
+//
+// 旧实现在队列满时立刻在**请求线程**上做单行事务。那一步要独占写池唯一连接
+// 约 283µs，而批量 worker 也在等同一条连接 —— 请求线程一多，worker 抢不到
+// 连接，它手上那批就发不出去，队列永远排不空，于是更多请求走同步写。
+// 这是正反馈：实测 200 并发下吞吐从 13k 掉到 3.5k，而且**掉下去就回不来**
+// （同一档并发下先跑到高速率，队列一满就锁死在低速）。
+//
+// 现在满队列先等 usageEnqueueWait 的空位：请求线程停在「等队列」上，
+// 写连接始终留给 worker，吞吐上限不变，代价只是延迟。只有整段窗口都
+// 等不到空位（说明 worker 真停摆了）才同步写兜底 —— 记账不能丢。
+//
+// # 锁的作用域
+//
+// mu 既保护 closed，也保护「发送」：向已关闭的 channel 发送会 panic。
+// 等待期间持锁是刻意的 —— CloseQueue 也要拿这把锁，所以这个窗口里
+// channel 不可能被关闭。代价是关停最多多等一个 enqueueWait，可接受。
 func (u *Recorder) RecordWithCallback(rec *store.UsageRecord, done func()) {
 	if done != nil {
 		var once sync.Once
@@ -806,35 +877,98 @@ func (u *Recorder) RecordWithCallback(rec *store.UsageRecord, done func()) {
 	}
 	job := persistJob{rec: rec, done: done}
 
-	// Admission and close share mu. Queue-full synchronous backpressure is
-	// attempted only while admission was observed open; shutdown never starts
-	// a new DB write behind the join barrier.
 	u.mu.Lock()
-	if !u.closed {
+	if u.closed {
+		u.mu.Unlock()
+		u.logger.Error("usage record rejected after recorder shutdown",
+			"request_id", rec.RequestID, "key_id", rec.AccessKeyID,
+			"user_id", rec.UserID)
+		job.finish()
+		return
+	}
+	// 快路径：队列有空位就交给 worker，绝大多数请求走这里。
+	select {
+	case u.queue <- job:
+		u.mu.Unlock()
+		return
+	default:
+	}
+	// 慢路径开始前必须先放锁：下面每一圈自己要重新加锁，
+	// 这里不放就是同一 goroutine 的二次 Lock —— 自死锁（被测试抓到过）。
+	u.mu.Unlock()
+	// 慢路径：队列满。限时等空位 —— 这是背压，把写连接留给批量 worker。
+	//
+	// 每一圈只**短暂**持锁：worker 落库后要调 clearFlushFailed，它也要这把锁；
+	// 持锁等满整个窗口会把 worker 挡在锁上、队列永远排不空（这条正是被
+	// recorder_queue_test.go 抓出来的）。等待本身发生在锁之外，靠 worker
+	// 取走记录时发的 space 信号唤醒。
+	timer := time.NewTimer(u.enqueueWait)
+	defer timer.Stop()
+	for {
+		u.mu.Lock()
+		if u.closed {
+			u.mu.Unlock()
+			u.logger.Error("usage record rejected after recorder shutdown",
+				"request_id", rec.RequestID, "key_id", rec.AccessKeyID,
+				"user_id", rec.UserID)
+			job.finish()
+			return
+		}
 		select {
 		case u.queue <- job:
 			u.mu.Unlock()
 			return
 		default:
-			u.mu.Unlock()
-			cost, err := u.db.CreateUsageRecordWithCost(context.Background(), rec)
-			if err != nil {
-				u.logger.Error("failed to record usage (sync fallback)",
-					"error", err, "key_id", rec.AccessKeyID)
-			} else {
-				u.charge(rec, cost)
-			}
-			job.finish()
+		}
+		u.mu.Unlock()
+
+		select {
+		case <-u.space:
+			// 有空位了（信号可能被别的生产者先抢走，那就再等下一格）。
+		case <-timer.C:
+			u.syncFallback(rec, job)
 			return
 		}
 	}
-	u.mu.Unlock()
+}
 
-	u.logger.Error("usage record rejected after recorder shutdown",
-		"request_id", rec.RequestID, "key_id", rec.AccessKeyID,
-		"user_id", rec.UserID)
+// signalSpace 唤醒最多一个正在等空位的生产者。非阻塞发送：没人等时
+// 信号直接丢弃，cap=1 保证它不会堆积成「假的空位」。
+func (u *Recorder) signalSpace() {
+	select {
+	case u.space <- struct{}{}:
+	default:
+	}
+}
+
+// syncFallback 是最后兜底：整个等待窗口内队列都没有空位，说明 worker
+// 已停摆（DB 长时间不可写、或批量一直失败在重试）。此时仍不能丢记录 ——
+// 少一条就是账不平、配额少算。同步写保证数据落库，同时留痕并计数：
+// 这条分支常态化意味着吞吐已经退化一个量级，必须能被看见。
+func (u *Recorder) syncFallback(rec *store.UsageRecord, job persistJob) {
+	n := u.syncFallbacks.Add(1)
+	// 只在前几次和之后每 100 次打一条：DB 卡住时这条分支会被高频命中，
+	// 每条一打会把日志变成噪声源，反而看不到别的线索。
+	if n == 1 || n%100 == 0 {
+		u.logger.Warn("usage queue stayed full for the whole enqueue window, falling back to synchronous write",
+			"fallbacks", n, "queue_size", cap(u.queue), "enqueue_wait", u.enqueueWait,
+			"key_id", rec.AccessKeyID)
+	}
+	cost, err := u.db.CreateUsageRecordWithCost(context.Background(), rec)
+	if err != nil {
+		u.logger.Error("failed to record usage (sync fallback)",
+			"error", err, "key_id", rec.AccessKeyID)
+	} else {
+		u.charge(rec, cost)
+	}
 	job.finish()
 }
+
+// SyncFallbacks 返回「等满整个窗口仍无空位、退化为同步写」的累计次数。
+//
+// 健康进程恒为 0。持续增长说明批量落库跟不上了（DB 卡住、磁盘满、
+// 或批次一直失败在重试），应结合 usage 队列水位一起看。
+func (u *Recorder) SyncFallbacks() int64 { return u.syncFallbacks.Load() }
 
 // markFlushFailed / clearFlushFailed / HasPendingUsage 记录「是否还攥着
 // 一批没落库成功的记录」（2026-10-12 修 P1-1）。

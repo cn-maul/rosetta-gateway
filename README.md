@@ -140,6 +140,12 @@ curl http://<主机>:8666/v1/chat/completions \
 OpenAI 系客户端；额度查询端点（`/dashboard/billing/*`、`/v1/organization/*`）
 与 one-api 系工具兼容。
 
+路由到 **Anthropic 上游**时，`temperature` / `top_p` / `top_k` / `stop_sequences` /
+`service_tier` 不会下发：Anthropic 新版 API（`anthropic-version: 2026-10-21`）
+已移除这些字段，继续发送会直接 400。客户端可以照常发送，网关**接受并忽略**，
+其余字段照常透传；路由到 OpenAI 系上游时这些参数不受影响。详见
+[docs/DESIGN.md](docs/DESIGN.md) §7.5。
+
 接入 OpenCode Go 作为上游时，网关会把下游的会话标识转发给 `opencode.ai` 及其
 子域，并把 `User-Agent` 设为 `rosetta-gateway`。网关按以下顺序识别会话：
 `x-opencode-session`、`x-deepseek-harness-session-id`、`x-session-affinity`、

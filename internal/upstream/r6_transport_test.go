@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/cn-maul/rosetta"
 	"github.com/cn-maul/rosetta-gateway/internal/store"
 )
 
@@ -169,8 +170,8 @@ func TestR6_AnthropicDiscoveryUsesResolvedProtocolAuth(t *testing.T) {
 			if last.apiKey != "sk-secret" || last.authorization != "" {
 				t.Fatalf("discovery auth = x-api-key %q / Authorization %q; want x-api-key only", last.apiKey, last.authorization)
 			}
-			if last.version != "2023-06-01" {
-				t.Fatalf("anthropic-version = %q, want 2023-06-01", last.version)
+			if last.version != rosetta.AnthropicVersion {
+				t.Fatalf("anthropic-version = %q, want %s", last.version, rosetta.AnthropicVersion)
 			}
 		})
 	}

@@ -60,7 +60,6 @@ func (openaiChatCodec) Decode(r *http.Request, maxBytes int64) (*Request, error)
 		CacheKey:                 req.PromptCacheKey,
 		WantsStreamUsage:         wantsStreamUsage(req),
 		RequiresStructuredOutput: req.RequiresStructuredOutput(),
-		ApplyUpstreamExtras:      req.ApplyProtocolPrivateExtra,
 		RawEffort:                req.RawEffort,
 	}, nil
 }
@@ -93,7 +92,6 @@ func (anthropicMessagesCodec) Decode(r *http.Request, maxBytes int64) (*Request,
 		Model:                    req.Model,
 		WantsStreamUsage:         false, // Anthropic message_delta always carries usage
 		RequiresStructuredOutput: false, // Anthropic ingress has no structured-output concept
-		ApplyUpstreamExtras:      req.ApplyUpstreamExtras,
 		RawEffort:                req.RawEffort,
 		AnthropicBudget:          req.ThinkingBudget(),
 	}, nil
@@ -128,7 +126,6 @@ func (openaiResponsesCodec) Decode(r *http.Request, maxBytes int64) (*Request, e
 		CacheKey:                 req.PromptCacheKey,
 		WantsStreamUsage:         false, // response.completed always carries usage
 		RequiresStructuredOutput: req.RequiresStructuredOutput(),
-		ApplyUpstreamExtras:      req.ApplyUpstreamExtras,
 		RawEffort:                req.RawEffort,
 		DowngradedTools:          req.DowngradedTools(),
 	}, nil

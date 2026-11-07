@@ -5,9 +5,9 @@
 | 项目名 | **rosetta-gateway** |
 | 项目性质 | 独立项目，不在 Rosetta 上改造（2026-09-15 定，理由见 §2.1） |
 | module path | `github.com/cn-maul/rosetta-gateway` |
-| 运行时依赖 | `github.com/cn-maul/rosetta` v1.2.1（上游 SDK）、`modernc.org/sqlite`（纯 Go SQLite）、`github.com/golang-jwt/jwt/v5`（管理会话） |
+| 运行时依赖 | `github.com/cn-maul/rosetta` v1.3.1（上游 SDK）、`modernc.org/sqlite` v1.61.1（纯 Go SQLite，内置 SQLite 3.54.1；无 cgo，`CGO_ENABLED=0` 可构建）、`github.com/golang-jwt/jwt/v5`（管理会话） |
 | 工具链 | **Go 1.27.3 起**（`go.mod` 的 `go` 指令是唯一来源，CI 用 `go-version-file` 读取；1.27.3 之前的版本带已知安全漏洞，不得使用，本地也勿用更早的 1.27.x）。镜像构建固定 `golang:1.27.3-alpine3.24` 的 digest，并设 `GOTOOLCHAIN=local`，版本不足时构建直接失败，不会静默下载其他工具链 |
-| 版本 | 与 `web/package.json` 同源（当前 2.0.0），镜像与二进制共用 |
+| 版本 | 与 `web/package.json` 同源（当前 2.1.0），镜像与二进制共用 |
 | 状态 | **已实现**（P0–P3 全部落地，多用户、用量归档、配置导入导出均已上线） |
 | 更新 | 2026-11-01 |
 
@@ -813,9 +813,20 @@ OpenAI 系协议不单独上报 cache creation，该列恒为 0。
 **已实现（2026-10-02 起分批落地）**：三套入口全部完成——OpenAI Chat（P0）、
 Anthropic Messages（2026-10-02）、OpenAI Responses（2026-10-04）。转发骨架
 （鉴权/配额/路由/故障转移/看门狗/落库）通过 `ingressCodec` 接口复用，
-各协议只实现「解码请求 + 渲染错误/响应/SSE」。跨协议的私有字段翻译
-（tool_choice 三方互译、response_format ↔ text.format 等）与硬约束过滤
-（结构化输出请求不打 anthropic 上游）见 §10 与 `internal/inwire`。
+各协议只实现「解码请求 + 渲染错误/响应/SSE」。
+
+**2026-11-07 起上游侧翻译全部交还 SDK**：升级 Rosetta v1.3.0 后，跨协议私有
+字段的翻译（`tool_choice` 三方互译、`response_format` ↔ `text.format`、采样
+参数、`prompt_cache_key`、`top_k`、`store` / `previous_response_id` 等）由 SDK
+按目标协议完成。网关只把下游 JSON 解析进 `rosetta.ChatRequest` 的**类型化
+字段**，不再维护互译表，也**不再往 `Extra` 写任何保留键** —— `WithExtraOverrides`
+与 `WithExtraOverrideKeys` 都不装，SDK 的碰撞检查保持默认开启（越界写入会被当场
+拒成 400，而不是静默覆盖 payload）。
+
+唯一的例外曾经是 Responses→chat 的 turn 合并：它一度靠 `Extra["messages"]`
+接管整份 messages。2026-11-07 已改为**入站修**——一轮 assistant 在 `ToRosetta`
+里就合成一条 `Message` 多 Block（见 §7.5），出站不再需要任何接管。
+
 
 ### 7.1 sealed reasoning 的跨协议边界
 
@@ -833,7 +844,7 @@ Rosetta 用一对字段表达它：`Sealed` 装载荷，`SealedBy` 记下是哪�
 | 方向 | 处理 |
 |---|---|
 | Responses 入站 | `reasoning` item 搬成 `SealedThinking(summary, sealed, "response")`。**空 item 跳过**：无 `encrypted_content` 且 summary 为空时硬造 block 会被 validate 拒掉，把本来能跑的请求变成 400 |
-| Responses 入站 → chat 上游 | **所有** Responses→chat 请求都由 `responsesChatMessages` 重新编码 chat `messages`：把 Responses 拆开的 reasoning / message / function_call item 合并成同一条 assistant 消息，有 summary 时回填 `reasoning_content`。合并与 reasoning 无关，因为 SDK 逐 item 编码会拆成多条连续 assistant，DeepSeek 系会判定工具调用记录不配对（2026-10-23）。遇到不认识的块形状回退 SDK（宁可维持旧行为，不静默改写）；anthropic 上游仍剥除 —— thinking 块必须带 Anthropic 签发的 signature，reasoning item 无法伪造 |
+| Responses 入站 → 任意上游 | `ToRosetta` 把一轮的多个 output item（reasoning / message / function_call）按原顺序合并成**一条** `RoleAssistant` 多 Block，遇到 user / 工具结果才断开。这是 rosetta 的语义（一个 Message = 一轮），也是 chat 上游能续接的前提：SDK 的 chat 编码器随后把 thinking 写成 `reasoning_content`，与正文、`tool_calls` 落在同一条消息上。2026-11-07 之前是「一个 item 一条 Message」，再靠出站层 `responses_chat_replay.go` 合并回来——那等于在编码器外面重写一遍编码器，且只补了 chat 一个协议 |
 | Responses 上游回放 | 同一协议族的 reasoning block 按 `summary` / `id` / `encrypted_content` 三者各自存在即回放；**只有摘要和 id、没有密封载荷也必须回放**，兼容上游只返回可读思考但强制下一轮带回该 item。空的 `encrypted_content` 不写出 |
 | Responses 出站（流式） | `EventThinkingDelta` 发 `output_item.added` → `reasoning_summary_text.delta` → `output_item.done`（带 `encrypted_content`）。`SealedBy` 非本族的整条丢弃 |
 | Responses 出站（非流式） | `BlockThinking` 输出 reasoning item，同样过 `SealedBy` 门闩 |
@@ -845,7 +856,8 @@ Rosetta 用一对字段表达它：`Sealed` 装载荷，`SealedBy` 记下是哪�
 才能跨网关存活。
 
 **仍然不做**：会话状态托管。`previous_response_id` / `store` 由上游承接
-（`inwire` 经 `Extra` 透传），网关不存、不续、不校验 item 归属。
+（`inwire` 落到 `ChatRequest.PreviousResponseID` / `ChatRequest.Store`，SDK 对
+response 目标原样编码），网关不存、不续、不校验 item 归属。
 
 ### 7.2 工具输出与用户附件的媒体块
 
@@ -923,7 +935,7 @@ CC Switch 透传，网关 400；Magpie 静默丢弃（200 但 output 无 `web_se
 
 | 目标协议 | SDK 行为 | 撞上的约束 |
 |---|---|---|
-| `chat` | thinking / redacted-thinking 一律跳过 | 该 assistant turn 恰好只有这些块时，跳完变成一条什么都没有的 assistant，SDK 报 `assistant turn has only thinking/redacted-thinking blocks, which the OpenAI chat protocol cannot replay`（400） |
+| `chat` | v1.3.0 起 thinking 编码成同一条 assistant 消息的 `reasoning_content`（可回放）；redacted-thinking 无文本仍跳过 | 该 assistant turn 没有正文也没有 tool_call、只剩这些块时，SDK 报 `assistant turn has only thinking/redacted-thinking blocks, which the OpenAI chat protocol cannot replay`（400） |
 | `anthropic` | 无签名的 thinking 被跳过 | turn 因此空了同样报 `assistant turn has only unsigned thinking blocks, which anthropic cannot replay` |
 | `response` | 由 `SealedBy` 门闩自管 | 不需要这一刀 |
 
@@ -934,18 +946,83 @@ CC Switch 透传，网关 400；Magpie 静默丢弃（200 但 output 无 `web_se
 
 | 目标协议 | thinking | redacted_thinking |
 |---|---|---|
-| `chat` / `""` / `auto` | 剥（带不带签名都剥） | 剥 |
+| `chat` / `""` / `auto` | 保留**无签名且有可读文本**的（v1.3.0 起编码成 `reasoning_content`）；签名的（别的协议族签发）与无文本的剥 | 剥 |
 | `anthropic` | 剥无签名的，保留有签名的 | 保留 |
 | `response` | 不动 | 不动 |
 
+chat 这一行的改动是 v1.3.0 带来的：以前 chat 完全不能回放思考，一刀全剥是对的；
+现在 SDK 会把 `BlockThinking` 写成 `reasoning_content`，再全剥就等于把刚接上的
+能力又掐掉。剥的范围收窄到「chat 编不出来」的两类：**带签名的**（签名是别的
+协议族签发的，chat 没有对应语义，强塞可能被上游拒）与**没有可读文本的**
+（封了但没摘要，写不出 `reasoning_content`）。
+
 剥空之后的 assistant turn 整条删掉 —— 留着零块消息 SDK 照样会以「只有思考块
-无法回放」报 400。删掉是安全的：turn 空了意味着它既没有正文也没有 tool_call，
-对模型本来就是一条空消息；工具调用链不受影响（tool_call 在同一 turn 里会保留）。
+无法回放」报 400。chat 还多一条更严的：**只有思考、没有正文也没有 tool_call
+的轮同样整条丢**，因为 SDK 的 chat 编码器对「有 thinking 但没有 content 和
+tool_calls」的轮会直接报 G6。删掉是安全的：这些轮本来就不带任何对话信息；
+工具调用链不受影响（tool_call 在同一 turn 里会保留）。
 
 **症状与验证**：deepseek harness 经 `/v1/messages` → `chat`，第一轮正常，
 第二轮必然 400（客户端回传了上一轮的 thinking）。修复后四种回放形态（带签名
 thinking / 无签名 thinking / redacted_thinking / thinking+text+tool_use 混合）
 全部 200，且模型仍知道前文问了什么 —— 剥掉不损失对话语义。
+
+### 7.5 Rosetta v1.3.0 之后的边界（2026-11-07）
+
+升级到 v1.3.0 时，网关删掉了「替 SDK 做协议翻译」的那批代码（净减约 800 行）。
+记下为什么删、删完靠什么，避免下次又长回来：
+
+| 能力 | v1.2.1 时网关怎么做 | v1.3.0 之后 |
+|---|---|---|
+| `tool_choice` 三方互译 | `inwire` 里 4 个互译函数 + `Extra` 直传 | `ChatRequest.ToolChoice`，SDK 按目标协议编码 |
+| 结构化输出 `response_format` ↔ `text.format` | 手搓双向翻译 + `Extra` | `ChatRequest.ResponseFormat`（`Type`/`Name`/`Schema`/`Strict`） |
+| `seed` / `user` / `presence_penalty` / `frequency_penalty` / `parallel_tool_calls` / `prompt_cache_key` | 塞 `Extra` | 类型化字段 |
+| Anthropic `top_k` | `Extra["top_k"]` | `ChatRequest.TopK` |
+| chat 的 `reasoning_content` 回放 | 整份接管 `messages`（依赖 `WithExtraOverrides`） | SDK 编码器把 `BlockThinking` 写成同一条 assistant 消息的 `reasoning_content` |
+| 模型发现（`/models` 解析 + 路径回退） | `DiscoverUpstreamModels` 手搓 HTTP + `rawModelEntry`/`flexBool` | `Client.ListModels`（内置能力解析 + 404/410 回退） |
+| `anthropic-version` | 三处硬编码 `2023-06-01` | `rosetta.AnthropicVersion`（`2026-10-21`） |
+| Responses 的「一轮拆多条 assistant」 | 出站接管 `messages`（`responses_chat_replay.go`，重写一遍编码器） | **入站合并**：`ToRosetta` 把一轮的 item 合成一条 `Message` 多 Block |
+
+`buildClient` **不装任何 Extra 覆盖开关**（既非 `WithExtraOverrides`，也非
+`WithExtraOverrideKeys`）：网关现在一个保留键都不往 `Extra` 写。SDK 的碰撞检查
+保持默认开启 —— 任何一处误写 `Extra["stream"]` 都会被当场拒成
+`ErrInvalidRequest`（→ 400），而不是静默覆盖 SDK 的编码结果。回归防线是
+`internal/upstream/extra_override_test.go`。
+
+v1.3.1 的 `WithExtraOverrideKeys` 曾经是这条路上的一站（只放行 `messages`），
+2026-11-07 入站修好之后连这一个键也不需要了。
+
+#### 为什么「一轮」必须在入站合并（而不是让出站编码器猜）
+
+SDK 的语义是「一个 Message = 一轮」。Responses 把一轮拆成 reasoning / message /
+function_call 多个 output item，入站如果把每个 item 都变成一条 `Message`，
+就是把这个前提弄错了：任何出站编码器都会忠实输出成多条连续 assistant。
+
+修复方向有两个，只有一个是治本的：
+
+- **出站合并**（已删除的做法）：网关在编码器外面再写一遍编码，把相邻 assistant
+  合回去。代价是重写 user 多模态、工具结果、文件编码，且**只补 chat 一个协议**；
+  Responses / Anthropic 的编码器各有各的规则，硬加还会引入新的不一致。更根本
+  的问题是它在做隐式改写 —— SDK 是哑适配器，「相邻两条 assistant 是不是同一轮」
+  它无从判断（真·多轮连续 assistant 是合法形态）。
+- **入站合并**（现在的做法）：`ToRosetta` 一处改对，三个出站协议同时正确；
+  Responses→Responses 出站时 SDK 仍按 Block 顺序把 item 拆回去（有测试守着）。
+
+#### Anthropic 上游不再接收五个采样参数（行为变更）
+
+Anthropic 新版 API（`anthropic-version: 2026-10-21`）移除了 `temperature` /
+`top_p` / `top_k` / `stop_sequences` / `service_tier`，继续发送会直接 400。
+因此 Rosetta 对 **anthropic 目标**不再编码这五个字段，网关也不做补偿。
+
+- **影响面**：只有路由到 Anthropic 上游的请求。下游仍可发送这些参数，网关
+  **接受并忽略**，不报错；OpenAI 系目标完全不受影响。
+- **为什么接受**：直连新版 Anthropic 的客户端本就会拿到同样结果。与上游保持
+  一致，比「网关帮客户端保留一个上游已删除的字段」更可预测。
+- **可观测性**：SDK 在 debug 级别记一行 `anthropic: dropping fields removed in
+  API 2026-10-21`；网关不额外打日志（避免逐请求刷屏）。排查具体请求时把日志
+  级别调到 debug。
+- **不做补偿**：没有把 `temperature` 折算成 `top_p` 之类的等价映射 —— 采样语义
+  不可互换，折算等于替客户端编造它没提的要求。
 
 ---
 
@@ -1090,6 +1167,7 @@ round-trip 次数、连接是否复用、各阶段耗时、`failure_stage`、
 | 上游 402（余额不足） | 502 | `upstream_quota_exhausted` | 同上，且触发凭证冷却 |
 | 上游 429 | 429 | `rate_limit_exceeded` | 先尝试换凭证 / 换 provider，全部失败才返回 |
 | 上游 5xx | 502 | `upstream_error` | |
+| 上游 200 但响应体不可读 / 超限 | 502 | `upstream_error` | `ErrUpstreamMalformed` / `ErrResponseTooLarge`（后者 v1.3.0 新增，非流式体超过 SDK 读上限）。同属「接受请求却返回不可用体」的目标级故障，纳入故障转移；两者都不把上游体回显给客户端 |
 | 上游超时 / 连接失败 | 504 / 502 | `upstream_timeout` | 出站侧 |
 | 网关总预算到期 | 504 | `gateway_timeout` | 网关侧不是上游故障：不冷却凭据、不累计目标熔断、不再转移 |
 | 上游 400（请求非法） | 400 | 透传上游 code | 这类是调用方的问题，原样透传并保留 message |
@@ -1265,6 +1343,34 @@ UPDATE access_keys SET used_tokens = used_tokens + NEW.total_tokens WHERE id = N
 落库本身走 `recordUsage`（goroutine 异步），故扣减在响应返回后就近实时生效。
 写放大：每条请求一次 INSERT（触发器顺带两次 UPDATE：key 级 used_tokens 与
 终身累计表 `usage_totals`），WAL 下无压力。
+
+#### 11.3.1 落库队列与背压（2026-11 修）
+
+**症状**：并发扩展压测（n=1500/档，零延迟假上游）里，网关在 10 并发就到顶，
+200 并发反而只有 10 并发的一半，P99 从 5ms 涨到 300ms。两版代码完全一致地复现，
+说明是既有缺陷而非回归。
+
+**根因是正反馈，不是「SQLite 慢」**：队列（原 1024）一满，`RecordWithCallback`
+就在**请求线程**上做单行事务。那一步要独占写池唯一连接约 283µs，而批量 worker
+也在等同一条连接 —— 请求线程一多，worker 抢不到连接就发不出批，队列永远排不空，
+于是更多请求走同步写。一旦触发就回不来。
+
+CPU profile 佐证：高并发时 `database/sql.withLock` 占 31%、`CreateUsageRecordWithCost`
+占 17%，而 12 核只用 4 核 —— 是等锁，不是算力。
+
+**改法**（`internal/usage/recorder.go`）：
+
+| 项 | 值 | 理由 |
+|---|---|---|
+| `usageQueueSize` | 1024 → **8192** | 实测 200 并发 3.5k → 13.2k QPS；32768 无额外收益；内存约 3~5MB |
+| 满队列行为 | 立即同步写 → **限时等空位（1s）** | 请求线程停在「等队列」，写连接留给 worker；等不到才同步写 |
+| 等待实现 | 短暂持锁尝试 + `space` 信号 | **不能持锁等**：worker 落库后要 `clearFlushFailed` 拿同一把锁，持锁等待会把 worker 挡死（测试抓到过自死锁 + 这一条） |
+| 可观测性 | `Recorder.SyncFallbacks()` | 兜底常态化 = 吞吐已退化一个量级，指标上只表现为「QPS 变低」，没计数器无法归因 |
+
+**实测**（同机、交替重复）：200 并发 QPS 3,514 → 9,987~13,741，P99 303ms → 47~77ms。
+
+回归防线：`internal/usage/recorder_queue_test.go`（满队列必须等而不是立刻写；
+等满窗口才允许兜底且必须计数）。
 
 ### 11.4 限速（已实现，2026-10-04）
 
@@ -1869,7 +1975,7 @@ rosetta-gateway/
 | R15 | **Codex 的 namespace 工具形态被网关拒绝** | Codex 经 `/v1/responses` 接入整体 400，不是功能缺失而是整条路径不可用 | **已解决（2026-10-18，v1.6.4）**：`flattenNamespaceTools` 把 namespace 展平成平级 function（`父名__原名`），`tool_choice` 同步改名。展平让工具表变长但被上游前缀缓存完全吸收（实测 4531 token 里 4530 命中）。客户端侧无开关（`tool_namespace` 被 Codex 忽略）。见 §7.3 |
 | R16 | **Responses 流式 reasoning item 被逐增量切碎** | 客户端看到一串逐段变长、前缀重复的思考块；携带 sealed 载荷的那一片单独成 item，其余片对模型无意义且在历史里多出垃圾 item | **已解决（2026-10-18，v1.6.4）**：reasoning item 生命周期改为跨增量（首片 added、中间片 delta、末片或 `Finish` 才 done），`reasonItemID` 在 added/delta/done 里复用，`thinkText` 在开新 item 时 Reset。见 §7.4 与 §8.1 |
 | R17 | **客户端按模型目录声明的托管工具（`web_search`）被网关拒绝** | 走 Responses 接入时整体 400；客户端若不关该能力则无法使用任何走 Responses 的模型 | **有意接受（2026-10-18）**：托管搜索由 OpenAI 服务端执行，任何第三方上游都承接不了，网关无法代理。拒绝而非静默丢弃 —— 静默丢弃的症状是模型在多轮后说「我没有联网能力」，用户要过几轮才会怀疑是代理吞了工具。处置在客户端侧：模型目录（`supports_search_tool: false`）关掉该能力。注意 Magpie 会静默丢弃（200 但无 `web_search_call`），CC Switch 透传到网关导致 400。见 §7.3 |
-| R18 | **`/v1/responses` 的 reasoning / 工具 turn 回放到 chat 上游时被拆散** | DeepSeek thinking 模式多轮（尤其带工具调用）第二轮 400：`The reasoning_content in the thinking mode must be passed back`，或工具调用记录不配对 | **已解决（2026-10-24，v1.6.7）**：SDK 的 chat 编码器既丢弃 thinking 块，又把 Responses 的 message / function_call 逐 item 输出成多条连续 assistant。网关现在对所有 Responses→chat 请求统一接管 `messages`（`internal/inwire/responses_chat_replay.go`），把同一轮合并成一条 assistant，并把可读 summary 回填为 `reasoning_content`；不认识的形状回退 SDK。anthropic 上游仍剥除（无法伪造签名）。见 §7.1 |
+| R18 | **`/v1/responses` 的 reasoning / 工具 turn 回放到 chat 上游时被拆散** | DeepSeek thinking 模式多轮（尤其带工具调用）第二轮 400：`The reasoning_content in the thinking mode must be passed back`，或工具调用记录不配对 | **已解决（2026-10-24，v1.6.7；2026-11-07 改为治本）**：根因是入站把 Responses 的 reasoning / message / function_call 每个 output item 都变成一条 `Message`，出站编码器于是逐条输出成多条连续 assistant。初始修复在出站接管 `messages`（`responses_chat_replay.go`）；v1.3.0 之后改为在 `ToRosetta` 把一轮合并成一条 `Message` 多 Block，出站接管整层删除 —— chat / anthropic / responses 三个协议同时正确。anthropic 上游的 thinking 仍按签名剥除。见 §7.1 / §7.5 |
 
 ---
 

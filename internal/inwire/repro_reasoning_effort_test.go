@@ -53,17 +53,17 @@ func gwClient(t *testing.T, endpoint string) *rosetta.Client {
 	return c
 }
 
-// decodeToRosetta 跑完「入站 decode → ToRosetta → ApplyProtocolPrivateExtra」，
-// 与真实请求路径一致。
+// decodeToRosetta 跑完「入站 decode → ToRosetta」，与真实请求路径一致。
+// chat 入口自 v1.3.0 迁移后不再有 ApplyUpstreamExtras 这一步（私有字段
+// 全部落到类型化字段），protocol 参数保留只为标注用例意图。
 func decodeToRosetta(t *testing.T, body, protocol string) *rosetta.ChatRequest {
 	t.Helper()
+	_ = protocol
 	req, err := DecodeOpenAIChatRequest(newReq(t, body), defaultMaxBodyBytes)
 	if err != nil {
 		t.Fatalf("入站 decode 应成功: %v", err)
 	}
-	ros := req.ToRosetta()
-	req.ApplyProtocolPrivateExtra(ros, protocol)
-	return ros
+	return req.ToRosetta()
 }
 
 // TestRegression_ReasoningEffortNoLonger400 是核心回归用例：
@@ -148,15 +148,22 @@ func TestRegression_OtherExtrasStillForwarded(t *testing.T) {
 	if _, err := gwClient(t, srv.URL).Chat(context.Background(), ros); err != nil {
 		t.Fatalf("请求不应失败: %v", err)
 	}
+	// seed / user / parallel_tool_calls 在 reasoning 请求下也应直通。
 	for k, want := range map[string]any{
 		"seed":                float64(42),
 		"user":                "u1",
 		"parallel_tool_calls": true,
-		"presence_penalty":    0.1,
-		"frequency_penalty":   0.2,
 	} {
 		if got[k] != want {
 			t.Fatalf("上游 %s=%v，期望 %v", k, got[k], want)
+		}
+	}
+	// presence_penalty / frequency_penalty 是推理模型拒绝的参数：迁到类型化字段后
+	// 由 SDK 决定（reasoning 请求下丢弃，见 provider_openai_chat 的 reasoning 分支）。
+	// 旧行为是塞 Extra 硬直通，部分推理上游会 400。
+	for _, k := range []string{"presence_penalty", "frequency_penalty"} {
+		if _, exists := got[k]; exists {
+			t.Fatalf("reasoning 请求下 %s 应被丢弃，实际 %v", k, got[k])
 		}
 	}
 }

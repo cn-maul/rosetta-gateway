@@ -240,6 +240,7 @@ func (a *AnthropicMessagesRequest) ToRosetta() *rosetta.ChatRequest {
 		MaxOutputTokens: a.MaxTokens,
 		Temperature:     a.Temperature,
 		TopP:            a.TopP,
+		TopK:            a.TopK,
 		StopSequences:   a.StopSequences,
 	}
 
@@ -284,11 +285,37 @@ func (a *AnthropicMessagesRequest) ToRosetta() *rosetta.ChatRequest {
 	if a.Thinking != nil && a.Thinking.Type == "enabled" {
 		req.Thinking = &rosetta.ThinkingConfig{BudgetTokens: a.Thinking.BudgetTokens}
 	}
+	if tc := anthropicToolChoiceToRosetta(a.ToolChoice); tc != nil {
+		req.ToolChoice = tc
+	}
 
 	for _, m := range a.Messages {
 		req.Messages = append(req.Messages, convertAnthropicMessage(m)...)
 	}
 	return req
+}
+
+// anthropicToolChoiceToRosetta 把 Anthropic 的 tool_choice（auto/any/tool/none）
+// 翻译成 rosetta 的统一 ToolChoice。any 对应 required（Anthropic 的「必须调
+// 一个工具」），SDK 会再把 required 映射回 {"type":"any"}。
+func anthropicToolChoiceToRosetta(t *AnthropicToolChoice) *rosetta.ToolChoice {
+	if t == nil {
+		return nil
+	}
+	switch t.Type {
+	case "auto":
+		return &rosetta.ToolChoice{Mode: rosetta.ToolChoiceAuto}
+	case "any":
+		return &rosetta.ToolChoice{Mode: rosetta.ToolChoiceRequired}
+	case "none":
+		return &rosetta.ToolChoice{Mode: rosetta.ToolChoiceNone}
+	case "tool":
+		if t.Name == "" {
+			return nil
+		}
+		return &rosetta.ToolChoice{Mode: rosetta.ToolChoiceTool, Name: t.Name}
+	}
+	return nil
 }
 
 // ThinkingBudget 返回客户端请求的**原始 token 预算**（thinking.budget_tokens），
@@ -313,61 +340,10 @@ func (a *AnthropicMessagesRequest) ThinkingBudget() int {
 	return a.Thinking.BudgetTokens
 }
 
-// ApplyUpstreamExtras 把 Anthropic 入口的协议私有字段挂到 req.Extra。
-// 门的开口方向与 OpenAI 入口相反：anthropic 上游拿原样字段，chat /
-// response 拿翻译后的 tool_choice，top_k 谁都拿不到（只有 Anthropic
-// 有这个旋钮）。
-//
-// response 分支（2026-10-07 P1-8）：此前对 responses 整个跳过、把
-// tool_choice 静默丢掉 —— 故障转移前后同一请求行为不一致。现在做等价翻译
-// （映射见 AnthropicToolChoice.responsesValue）；top_k 在 Responses 无对应物，
-// 丢弃不改变正确性。
-func (a *AnthropicMessagesRequest) ApplyUpstreamExtras(req *rosetta.ChatRequest, protocol string) {
-	switch protocol {
-	case "anthropic":
-		extra := map[string]any{}
-		if a.TopK != nil {
-			extra["top_k"] = *a.TopK
-		}
-		if a.ToolChoice != nil {
-			// Anthropic 形状原样重建（字段是已知集合，比保留原始字节更可预测；
-			// 两个键都不在 rosetta 的 anthropic 保留键集合里，不会撞车）。
-			extra["tool_choice"] = a.ToolChoice.anthropicValue()
-		}
-		if len(extra) > 0 {
-			mergeExtra(req, extra)
-		}
-	case "", "chat", "auto":
-		// "auto" 必须与 ""/"chat" 同组：upstream.buildClient 对 auto
-		// 不加 WithProtocol，让 SDK 自动探测，实际落到的几乎总是 OpenAI 方言。
-		// 把 auto 漏在这里会让「协议自动探测」这条最常用的配置静默丢掉 tool_choice。
-		if a.ToolChoice == nil {
-			return
-		}
-		if v := a.ToolChoice.openAIValue(); v != nil {
-			mergeExtra(req, map[string]any{"tool_choice": v})
-		}
-	case "response":
-		if a.ToolChoice == nil {
-			return
-		}
-		if v := a.ToolChoice.responsesValue(); v != nil {
-			mergeExtra(req, map[string]any{"tool_choice": v})
-		}
-		// top_k 在 Responses API 无对应物：它是采样多样性旋钮（软偏好），
-		// 丢弃只改变采样倾向、不改变请求的正确性 —— 与结构化输出这类硬约束
-		// 的处置（网关层拒绝）不同。
-	}
-}
-
-// anthropicValue 把 ToolChoice 表达为 Anthropic wire 形状（{"type","name"?}）。
-func (t *AnthropicToolChoice) anthropicValue() map[string]any {
-	m := map[string]any{"type": t.Type}
-	if t.Name != "" {
-		m["name"] = t.Name
-	}
-	return m
-}
+// 本入口不再需要 ApplyUpstreamExtras：tool_choice / top_k 已在 ToRosetta
+// 落到类型化字段（req.ToolChoice / req.TopK），由 SDK 按目标协议翻译
+// （v1.3.0 起这些同时是 SDK 保留键，塞 Extra 会撞键）。网关不再为
+// anthropic 入口维护一套自己的 tool_choice 互译表 —— 那是 SDK 的活。
 
 func (t *AnthropicCacheControl) toRosetta() *rosetta.CacheControl {
 	return &rosetta.CacheControl{Type: t.Type, TTL: t.TTL}
@@ -378,57 +354,6 @@ func (b *anthropicBlock) cacheControl() *rosetta.CacheControl {
 		return nil
 	}
 	return b.CacheControl.toRosetta()
-}
-
-// openAIValue 把 Anthropic 的 tool_choice 翻译成 OpenAI chat 的形状。
-// 不认识的类型返回 nil（上层跳过）—— decode 已把类型收敛到白名单，这是防御。
-func (t *AnthropicToolChoice) openAIValue() any {
-	switch t.Type {
-	case "auto":
-		return "auto"
-	case "any":
-		return "required"
-	case "none":
-		return "none"
-	case "tool":
-		return map[string]any{
-			"type":     "function",
-			"function": map[string]any{"name": t.Name},
-		}
-	}
-	return nil
-}
-
-// responsesValue 把 Anthropic 的 tool_choice 翻译成 Responses 的形状：
-// auto→"auto"、any→"required"、tool→{"type":"function","name"}。
-// "none" 返回 nil（丢弃）—— Responses 只表达「模型自主决定不调工具」，
-// 与 Anthropic 的 none（禁止调用已声明工具）语义并不完全对齐，且 OpenAI
-// 官方已将其归入 deprecated；翻译过去只会造成两协议行为漂移的错觉。
-// 不认识的类型返回 nil（上层跳过）—— decode 已把类型收敛到白名单，这是防御。
-func (t *AnthropicToolChoice) responsesValue() any {
-	switch t.Type {
-	case "auto":
-		return "auto"
-	case "any":
-		return "required"
-	case "tool":
-		if t.Name == "" {
-			return nil
-		}
-		return map[string]any{"type": "function", "name": t.Name}
-	}
-	return nil
-}
-
-// mergeExtra 把 extra 并进 req.Extra（不覆盖已有键 —— Extra 由多个来源共用）。
-func mergeExtra(req *rosetta.ChatRequest, extra map[string]any) {
-	if req.Extra == nil {
-		req.Extra = extra
-		return
-	}
-	for k, v := range extra {
-		req.Extra[k] = v
-	}
 }
 
 // convertAnthropicMessage 把一条 Anthropic 消息转成 0..2 条 rosetta 消息：

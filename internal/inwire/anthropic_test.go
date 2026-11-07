@@ -1,7 +1,6 @@
 package inwire
 
 import (
-	"encoding/json"
 	"errors"
 	"net/http"
 	"net/http/httptest"
@@ -113,42 +112,32 @@ func TestDecodeAnthropicMessages_MaxTokensRequired(t *testing.T) {
 	}
 }
 
-// tool_choice 类型校验与按上游协议的翻译/透传。
+// tool_choice 翻译到统一 ToolChoice；top_k 落到 req.TopK，不再塞 Extra。
 func TestDecodeAnthropicMessages_ToolChoice(t *testing.T) {
 	good := decodeAnthropic(t, `{"model":"m","max_tokens":8,
 		"tool_choice":{"type":"tool","name":"weather"},
 		"messages":[{"role":"user","content":"hi"}]}`)
 	req := good.ToRosetta()
-	good.ApplyUpstreamExtras(req, "chat")
-	if tc, ok := req.Extra["tool_choice"].(map[string]any); !ok || tc["type"] != "function" {
-		t.Fatalf("openai tool_choice translation: %+v", req.Extra)
+	if req.ToolChoice == nil || req.ToolChoice.Mode != rosetta.ToolChoiceTool || req.ToolChoice.Name != "weather" {
+		t.Fatalf("ToolChoice = %+v，期望 tool/weather", req.ToolChoice)
 	}
 
 	anyChoice := decodeAnthropic(t, `{"model":"m","max_tokens":8,
 		"tool_choice":{"type":"any"},"messages":[{"role":"user","content":"hi"}]}`)
 	req2 := anyChoice.ToRosetta()
-	anyChoice.ApplyUpstreamExtras(req2, "")
-	if req2.Extra["tool_choice"] != "required" {
-		t.Fatalf("any→required: %+v", req2.Extra)
+	if req2.ToolChoice == nil || req2.ToolChoice.Mode != rosetta.ToolChoiceRequired {
+		t.Fatalf("any→required: %+v", req2.ToolChoice)
 	}
-	// anthropic 上游拿原形状。
-	anyChoice.ApplyUpstreamExtras(req2, "anthropic")
-	if tc, ok := req2.Extra["tool_choice"].(map[string]any); !ok || tc["type"] != "any" {
-		t.Fatalf("anthropic tool_choice passthrough: %+v", req2.Extra)
-	}
-	// responses 上游拿翻译后的形状（P1-8：不再整个跳过、静默丢 tool_choice）。
-	req3 := anyChoice.ToRosetta()
-	anyChoice.ApplyUpstreamExtras(req3, "response")
-	if req3.Extra["tool_choice"] != "required" {
-		t.Fatalf("responses tool_choice translation (any→required): %+v", req3.Extra)
-	}
-	// top_k 不跟随：responses 上游没有对应物，丢弃。
+
+	// top_k 落到 req.TopK，不再塞 Extra。
 	req4 := decodeAnthropic(t, `{"model":"m","max_tokens":8,"top_k":40,
 		"messages":[{"role":"user","content":"hi"}]}`)
 	req4Ros := req4.ToRosetta()
-	req4.ApplyUpstreamExtras(req4Ros, "response")
+	if req4Ros.TopK == nil || *req4Ros.TopK != 40 {
+		t.Fatalf("top_k 未落到类型化字段：%v", req4Ros.TopK)
+	}
 	if len(req4Ros.Extra) != 0 {
-		t.Fatalf("responses upstream must not receive top_k, got %+v", req4Ros.Extra)
+		t.Fatalf("top_k 不该进 Extra：%+v", req4Ros.Extra)
 	}
 
 	bad := httptest.NewRequest(http.MethodPost, "/v1/messages",
@@ -158,34 +147,25 @@ func TestDecodeAnthropicMessages_ToolChoice(t *testing.T) {
 	}
 }
 
-// anthropic → response：tool_choice 等价翻译矩阵（P1-8 补齐的方向）。
+// anthropic → 统一 ToolChoice：any→required、tool→tool+name、none 保留。
 func TestAnthropic_ResponsesToolChoiceMatrix(t *testing.T) {
 	cases := []struct {
 		name       string
 		toolChoice string
-		wantJSON   string // "" = 应被丢弃
+		want       rosetta.ToolChoice
 	}{
-		{"auto→auto", `{"type":"auto"}`, `"auto"`},
-		{"any→required", `{"type":"any"}`, `"required"`},
-		{"tool→function", `{"type":"tool","name":"weather"}`, `{"name":"weather","type":"function"}`},
-		// "none" 在 Responses 无对齐语义：丢弃。
-		{"none dropped", `{"type":"none"}`, ""},
+		{"auto→auto", `{"type":"auto"}`, rosetta.ToolChoice{Mode: rosetta.ToolChoiceAuto}},
+		{"any→required", `{"type":"any"}`, rosetta.ToolChoice{Mode: rosetta.ToolChoiceRequired}},
+		{"tool→tool", `{"type":"tool","name":"weather"}`, rosetta.ToolChoice{Mode: rosetta.ToolChoiceTool, Name: "weather"}},
+		{"none", `{"type":"none"}`, rosetta.ToolChoice{Mode: rosetta.ToolChoiceNone}},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
 			got := decodeAnthropic(t, `{"model":"m","max_tokens":8,
 				"tool_choice":`+c.toolChoice+`,"messages":[{"role":"user","content":"hi"}]}`)
 			req := got.ToRosetta()
-			got.ApplyUpstreamExtras(req, "response")
-			if c.wantJSON == "" {
-				if _, exists := req.Extra["tool_choice"]; exists {
-					t.Fatalf("tool_choice 应被丢弃，实际 %v", req.Extra["tool_choice"])
-				}
-				return
-			}
-			raw, _ := json.Marshal(req.Extra["tool_choice"])
-			if string(raw) != c.wantJSON {
-				t.Fatalf("tool_choice = %s, want %s", raw, c.wantJSON)
+			if req.ToolChoice == nil || *req.ToolChoice != c.want {
+				t.Fatalf("ToolChoice = %+v，期望 %+v", req.ToolChoice, c.want)
 			}
 		})
 	}

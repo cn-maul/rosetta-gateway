@@ -2,11 +2,9 @@ package upstream
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"hash/fnv"
-	"io"
 	"log/slog"
 	"math/rand/v2"
 	"net"
@@ -24,8 +22,6 @@ import (
 	wireproto "github.com/cn-maul/rosetta-gateway/internal/protocol"
 	"github.com/cn-maul/rosetta-gateway/internal/store"
 )
-
-const anthropicVersion = "2023-06-01"
 
 type CredentialEntry struct {
 	ID            string
@@ -1134,205 +1130,15 @@ type ModelCandidate struct {
 	SupportsThinking *bool
 }
 
-// rawModelEntry 宽松匹配各家 /models 的字段名；缺字段解析为 0，多余字段忽略。
-type rawModelEntry struct {
-	ID                  string `json:"id"`
-	Name                string `json:"name"`
-	DisplayName         string `json:"display_name"`
-	ContextLength       int    `json:"context_length"`
-	ContextWindow       int    `json:"context_window"`
-	MaxInputTokens      int    `json:"max_input_tokens"`
-	MaxCompletionTokens int    `json:"max_completion_tokens"`
-	MaxOutputTokens     int    `json:"max_output_tokens"`
-	TopProvider         struct {
-		ContextLength       int `json:"context_length"`
-		MaxCompletionTokens int `json:"max_completion_tokens"`
-	} `json:"top_provider"`
-
-	// 思考能力。**多个字段名都收**，因为各家写法不统一且没有约定：
-	//   - reasoning_supported_efforts：实测某国产上游用这个（值形如
-	//     ["low","medium","high","xhigh","max"]）
-	//   - supported_reasoning：OpenRouter 约定
-	//   - supported_efforts / effort_levels：另一些网关的写法
-	// 都收下是为了「上游报了就能用」，而不是猜哪个才是标准 ——
-	// 猜错的后果是配置永远为空，而空 = 网关不干预 = 静默。
-	ReasoningSupportedEfforts []string `json:"reasoning_supported_efforts"`
-	SupportedReasoning        []string `json:"supported_reasoning"`
-	SupportedEfforts          []string `json:"supported_efforts"`
-	EffortLevelsRaw           []string `json:"effort_levels"`
-
-	// supports_reasoning / supports_thinking：同样是多写法，且**必须用
-	// *bool** —— 缺席（nil）与显式 false 是两件事：前者是「不知道，交给
-	// 上游」，后者是「明确不支持，剥掉思考」。
-	SupportsReasoning *bool `json:"supports_reasoning"`
-	SupportsThinking  *bool `json:"supports_thinking"`
-	// Reasoning 是最麻烦的一个字段名：它在不同上游是**两种不兼容的形状**。
-	//
-	// 实测 OpenRouter（2026-10-15，462 个模型）给的是**对象**：
-	//
-	//	"reasoning": {"mandatory":true,"supported_efforts":["high","medium","low"],
-	//	               "default_effort":"medium"}
-	//	"reasoning": {"mandatory":false,"default_enabled":true}
-	//
-	// 而某些上游给的是裸布尔。原先这里声明成 *bool，OpenRouter 的对象形态
-	// 直接触发 `json: cannot unmarshal object into Go struct field
-	// .data.2.reasoning of type bool` —— **整个模型列表解析失败**，
-	// 「获取模型」整个功能不可用（不是某一个模型出错，是全部）。
-	//
-	// 两种形状的解读见 flexBool 的注释。
-	Reasoning flexBool `json:"reasoning"`
-}
-
-// flexBool 收「可能是布尔、也可能是对象」的思考能力字段。
-//
-// # 为什么需要它
-//
-// `reasoning` 这个字段名在不同上游是**两种不兼容的形状**。实测 OpenRouter
-// （2026-10-15，462 个模型全量统计）给的是**对象**，0 个模型给裸布尔：
-//
-//	"reasoning": {"mandatory":true,"supported_efforts":["high","medium","low"],
-//	               "default_effort":"medium"}
-//	"reasoning": {"mandatory":false,"default_enabled":true}
-//
-// 声明成 *bool 时，OpenRouter 的对象形态会触发
-// `json: cannot unmarshal object into Go struct field .data.N.reasoning of
-// type bool` —— 而这是**整个列表**解析失败，不是一个模型出错：
-// 「获取模型」功能对 OpenRouter 完全不可用。
-//
-// # 两种形状各自怎么解读
-//
-// 对象形态（OpenRouter）的 `mandatory` 语义**不是**「支持思考」而是
-// 「思考是强制的」—— 强制蕴含支持，于是 Mandatory=true → 支持；
-// 但 Mandatory=false 不等于不支持，它只说明「思考可选」，而 OpenRouter
-// 在这条分支上通常还给了 default_enabled 或 supported_efforts。
-// 所以判定顺序是：有 supported_efforts → 支持（上游明确列了档位）；
-// 否则取 mandatory。这个顺序不能反 —— 反了会把「思考可选」的模型
-// 误判成「不支持」，进而被网关剥掉思考。
-type flexBool struct {
-	set   bool
-	value bool
-	// isObj 区分「布尔形态」与「对象形态」。
-	//
-	// **必须有这个标志**：boolPtr 的判定要读 obj.Mandatory，而布尔形态下
-	// obj 是零值（Mandatory=false）。若不区分，布尔 `true` 会被读成
-	// obj.Mandatory=false —— 于是「上游明说支持」被翻转成「不支持」，
-	// 网关会开始剥掉这个模型的思考。那是比原 bug 更糟的结果：原 bug
-	// 是整个功能不可用，这个是**静默地做错事**。
-	isObj bool
-	// obj 收对象形态里的其余字段。effort 集合必须收：OpenRouter 把它
-	// 放在 reasoning 对象**内部**而非顶层平铺，不收的话接 OpenRouter 时
-	// effort_levels 全空 —— 而空 = 网关不干预 = 静默，客户端发的思考档位
-	// 裸奔，正是这个字段存在的意义要防的事。
-	obj struct {
-		Mandatory        bool     `json:"mandatory"`
-		DefaultEnabled   bool     `json:"default_enabled"`
-		SupportedEfforts []string `json:"supported_efforts"`
-		DefaultEffort    string   `json:"default_effort"`
-	}
-}
-
-// UnmarshalJSON 接受布尔、对象、以及 null 三种形态。
-//
-// 遇到**不认识的形状**（字符串、数字、数组）返回 error 而不是静默忽略：
-// 静默忽略的后果是「上游报了但我们没读到」，而空 = 网关不干预 = 静默 ——
-// 那正是最该避免的结果。宁可让整次发现失败并报出形态，
-// 也不要给管理员一个「配置成功但其实没填上」的假象。
-func (f *flexBool) UnmarshalJSON(b []byte) error {
-	trimmed := strings.TrimSpace(string(b))
-	if trimmed == "null" {
-		return nil
-	}
-	// 第一字节定形态，避免先 unmarshal 到 any 再断言类型。
-	switch trimmed[0] {
-	case 't', 'f':
-		var v bool
-		if err := json.Unmarshal(b, &v); err != nil {
-			return err
-		}
-		f.set, f.value, f.isObj = true, v, false
-		return nil
-	case '{':
-		if err := json.Unmarshal(b, &f.obj); err != nil {
-			return err
-		}
-		f.set, f.isObj = true, true
-		return nil
-	default:
-		return fmt.Errorf("reasoning: 不认识的形状 %q（期望布尔或对象）", trimmed)
-	}
-}
-
-// boolPtr 返回三态结果：nil = 上游没报（不知道，交给上游）。
-func (f *flexBool) boolPtr() *bool {
-	if !f.set {
-		return nil
-	}
-	if !f.isObj {
-		v := f.value
-		return &v
-	}
-	if len(f.obj.SupportedEfforts) > 0 {
-		// 明确列了档位 = 明确支持。mandatory 在这里不参与判定。
-		t := true
-		return &t
-	}
-	v := f.obj.Mandatory
-	return &v
-}
-
-// effortLevels 取对象形态里的 supported_efforts（布尔形态恒为 nil）。
-func (f *flexBool) effortLevels() []string {
-	return f.obj.SupportedEfforts
-}
-
-// effortLevelsFor 从各家字段名里取出第一个非空的挡位集合。
-//
-// 只取第一个**非空**的：某些上游会同时给多个（有的空、有的有值），
-// 取第一个非空比取第一个字段更稳 —— 后者可能正好落在那个空数组上。
-func (e *rawModelEntry) effortLevelsFor() []string {
-	for _, cand := range [][]string{
-		e.ReasoningSupportedEfforts,
-		e.SupportedReasoning,
-		e.SupportedEfforts,
-		e.EffortLevelsRaw,
-		// OpenRouter 把 supported_efforts 放在 reasoning 对象**内部**，
-		// 不是顶层平铺。放最后：顶层那些字段一旦有值就更权威（同一家
-		// 不会同时给两套矛盾值），这里只在它们都缺席时兜底。
-		e.Reasoning.effortLevels(),
-	} {
-		if len(cand) > 0 {
-			return cand
-		}
-	}
-	return nil
-}
-
-// supportsThinkingFor 同理取第一个**非 nil** 的布尔。
-//
-// 这里刻意不能用 `if e.SupportsThinking != nil` 优先，因为一个上游可能
-// 同时给 supports_reasoning=true 与 supports_thinking=false（自相矛盾的
-// 情况下不能猜），所以顺序固定为 reasoning → thinking → reasoning 别名。
-func (e *rawModelEntry) supportsThinkingFor() *bool {
-	if e.SupportsReasoning != nil {
-		return e.SupportsReasoning
-	}
-	if e.SupportsThinking != nil {
-		return e.SupportsThinking
-	}
-	return e.Reasoning.boolPtr()
-}
-
-// DiscoverUpstreamModels 直接向 provider 拉一次原始 /models，
-// 解析出各家扩展的上下文/最大输出容量（rosetta 的 ListModels 不填这些）。
-// OpenAI 兼容端点用 Authorization: Bearer；anthropic 用 x-api-key + anthropic-version。
+// DiscoverUpstreamModels 通过 rosetta 的 ListModels 拉取上游模型目录。
+// 能力字段（上下文窗口/最大输出/思考挡位/思考三态）由 SDK 内置解析填好，
+// 路径回退（/v1/models → /models，仅 404/410 触发）也由 SDK 承担。
+// 网关只做「SDK ModelInfo → 本网关 ModelCandidate」的字段搬运。
 func DiscoverUpstreamModels(ctx context.Context, st *store.Store, providerID string, masterKey []byte, cfg *config.Config) ([]ModelCandidate, error) {
 	p, apiKey, err := resolveCredential(ctx, st, providerID, masterKey)
 	if err != nil {
 		return nil, err
 	}
-
-	base := strings.TrimRight(p.Endpoint, "/")
-	urls := modelListURLs(base)
 
 	// 与数据面使用同一个 provider 出站网络，同时禁止重定向：一个 302
 	// 就能把带 API key 的探测扩大到任意主机，包括云元数据地址。
@@ -1340,185 +1146,23 @@ func DiscoverUpstreamModels(ctx context.Context, st *store.Store, providerID str
 	if err != nil {
 		return nil, err
 	}
-	protocol, err := resolveDiscoveryProtocol(ctx, p, apiKey, client)
+
+	rc, err := discoveryClient(ctx, p, apiKey, client)
 	if err != nil {
 		return nil, err
 	}
-	var lastErr error
-	// triedErrs 按候选顺序留痕：全部候选都失败时，管理员需要知道网关
-	// **试过哪些路径**，否则「endpoint 填错了」与「上游不提供模型列表」
-	// 在界面上是同一句话，只能靠猜。
-	triedErrs := make([]string, 0, len(urls))
-	for _, u := range urls {
-		cands, err := fetchModels(ctx, client, u, protocol, apiKey)
-		if err != nil {
-			lastErr = err
-			triedErrs = append(triedErrs, fmt.Sprintf("%s → %v", u, err))
+
+	infos, err := rc.ListModels(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("模型列表探测失败：%w", err)
+	}
+
+	result := make([]ModelCandidate, 0, len(infos))
+	for _, mi := range infos {
+		if mi.ID == "" {
 			continue
 		}
-		return cands, nil
-	}
-	if lastErr == nil {
-		lastErr = fmt.Errorf("无法获取模型列表")
-	}
-	// errors.Join 需要 []error：每个候选的「路径 → 原因」各占一条，
-	// lastErr 再单列（它已经是最后一条路径的 error，重复会让文案变啰嗦）。
-	parts := make([]error, 0, len(triedErrs)+1)
-	for _, e := range triedErrs {
-		parts = append(parts, errors.New(e))
-	}
-	parts = append(parts, lastErr)
-	return nil, fmt.Errorf("模型列表探测失败（已尝试 %d 个路径）：%w", len(urls), errors.Join(parts...))
-}
-
-// resolveDiscoveryProtocol resolves the same configured protocol value that
-// buildClient resolves for the data plane. Discovery must not independently
-// guess an auth scheme from the raw store value.
-func resolveDiscoveryProtocol(ctx context.Context, p *store.Provider, apiKey string, client *http.Client) (string, error) {
-	configured := wireproto.Normalize(p.Protocol)
-	if configured != "" && configured != wireproto.Auto {
-		if !wireproto.Valid(configured) {
-			return "", fmt.Errorf("provider %s: 未知的 protocol %q（合法值：%s）",
-				p.Slug, configured, wireproto.AllowedValues)
-		}
-		return configured, nil
-	}
-
-	opts := []rosetta.Option{
-		rosetta.WithEndpoint(p.Endpoint),
-		rosetta.WithAPIKey(apiKey),
-		rosetta.WithHTTPClient(client),
-		rosetta.WithTimeout(15 * time.Second),
-	}
-	rosettaClient, err := rosetta.DetectClient(ctx, opts...)
-	if err != nil {
-		return "", err
-	}
-	return wireproto.Normalize(gatewayProtocolName(rosettaClient.Protocol())), nil
-}
-
-// modelListURLs 给出模型列表端点的候选路径，按「最可能命中」排序。
-//
-// # 为什么要多个候选
-//
-// 管理员填的 endpoint 形态并不统一：有人填到域根（https://api.x.com），
-// 有人填到已经带版本的那一层（https://api.x.com/v1）。前者要的模型端点是
-// /v1/models，后者要的是 /v1/models 之下**不能**再加一次 /v1。
-//
-// 修复前非 anthropic 协议只试 /models 一个路径，于是「endpoint 填域根 +
-// OpenAI 兼容」这个最常见的组合（DeepSeek、Moonshot、OpenRouter、vLLM、
-// 各类中转都如此）必然 404 —— 而真实错误会被报成「上游返回 HTTP 404」，
-// 指向管理员去检查 API Key，而 key 其实完全正常。
-//
-// 候选表只含三种形态，都来自实际部署：
-//   - base 已以 /vN 结尾 → base/models（不重复加版本）
-//   - base 以 /v1 结尾 → base/models
-//   - 域根 → 先试 base/v1/models（OpenAI 系的事实标准），再退回 base/models
-//
-// 三家上游（OpenAI 系、Anthropic、vLLM）的模型列表都在 /v1/models，
-// 所以**不按协议分候选**：候选只取决于 base 的形状。保留 protocol 参数是为了
-// 将来出现协议专属路径时有地方落，当前形态下它不参与判定。
-func modelListURLs(base string) []string {
-	if hasVersionSuffix(base) {
-		return []string{base + "/models"}
-	}
-	return []string{base + "/v1/models", base + "/models"}
-}
-
-// hasVersionSuffix 判断 base 是否已经以 /vN（N 为数字）结尾。
-//
-// 只认结尾一段：路径中间出现的 /v1（如 /proxy/v1）不算，那仍是可以再拼
-// 一层版本的中转路径。用 path 而非字符串后缀匹配是为了避免
-// "https://host/v1beta" 这类被判成已带版本。
-func hasVersionSuffix(base string) bool {
-	u, err := url.Parse(base)
-	if err != nil {
-		return false
-	}
-	last := u.Path
-	if i := strings.LastIndex(last, "/"); i >= 0 {
-		last = last[i+1:]
-	}
-	if len(last) < 2 || last[0] != 'v' {
-		return false
-	}
-	for _, c := range last[1:] {
-		if c < '0' || c > '9' {
-			return false
-		}
-	}
-	return true
-}
-
-func fetchModels(ctx context.Context, client *http.Client, url, protocol, apiKey string) ([]ModelCandidate, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
-	if err != nil {
-		return nil, err
-	}
-	if protocol == "anthropic" {
-		req.Header.Set("x-api-key", apiKey)
-		req.Header.Set("anthropic-version", anthropicVersion)
-	} else {
-		req.Header.Set("Authorization", "Bearer "+apiKey)
-	}
-
-	resp, err := client.Do(req)
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		// 响应体片段**只进日志，不进 error**。
-		//
-		// 旧实现把上游响应体前 512 字节塞进 error，而这个 error 经
-		// model_handler / provider_handler 原样回显给调用方。管理员把某
-		// provider 的 endpoint 指到内网服务（127.0.0.1、169.254.169.254、
-		// 任何未暴露端口）后调 discover，就拿到了内网的**可读**响应 ——
-		// 这把盲打变成了读取原语。真实上游的错误页里也常带内部主机名、
-		// 路径、框架版本。
-		//
-		// 单租户下「管理员能配任意 endpoint」本身不算越权（内网自建
-		// LLM 服务是常见用法，禁掉内网地址会打断它），所以这里只切断
-		// 「响应体回显」这一条，它才是把盲打变成读取的那一步。
-		body, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
-		slog.Warn("upstream models discovery returned non-200",
-			"url", url, "status", resp.StatusCode, "body_preview", strings.TrimSpace(string(body)))
-		return nil, fmt.Errorf("上游返回 HTTP %d（响应体已记入网关日志）", resp.StatusCode)
-	}
-
-	var payload struct {
-		Data   []rawModelEntry `json:"data"`
-		Models []rawModelEntry `json:"models"`
-	}
-	if err := json.NewDecoder(resp.Body).Decode(&payload); err != nil {
-		return nil, fmt.Errorf("解析模型列表失败：%w", err)
-	}
-
-	entries := payload.Data
-	if len(entries) == 0 {
-		entries = payload.Models
-	}
-
-	result := make([]ModelCandidate, 0, len(entries))
-	for _, e := range entries {
-		if e.ID == "" {
-			continue
-		}
-		name := e.DisplayName
-		if name == "" {
-			name = e.Name
-		}
-		result = append(result, ModelCandidate{
-			ID:              e.ID,
-			DisplayName:     name,
-			ContextWindow:   firstPositive(e.ContextLength, e.ContextWindow, e.MaxInputTokens, e.TopProvider.ContextLength),
-			MaxOutputTokens: firstPositive(e.MaxCompletionTokens, e.MaxOutputTokens, e.TopProvider.MaxCompletionTokens),
-			// 思考能力：原样带给 admin 层，由那边做「上游报了才填」的判定。
-			// 这里**不做**任何档位清洗 —— 网关的 effort 包是 admin 层的事，
-			// 在这一层归一会丢掉 UnknownLevels 机制（厂商私有值需要原样保留）。
-			EffortLevels:     e.effortLevelsFor(),
-			SupportsThinking: e.supportsThinkingFor(),
-		})
+		result = append(result, modelCandidateFromModelInfo(mi))
 	}
 	if len(result) == 0 {
 		return nil, fmt.Errorf("上游未返回任何模型")
@@ -1526,13 +1170,62 @@ func fetchModels(ctx context.Context, client *http.Client, url, protocol, apiKey
 	return result, nil
 }
 
-func firstPositive(vals ...int) int {
-	for _, v := range vals {
-		if v > 0 {
-			return v
-		}
+// discoveryClient 建一个只用于模型发现的 rosetta client。协议解析与数据面
+// buildClient 同一份约定：配置值优先，auto 用 DetectClient 探测。
+func discoveryClient(ctx context.Context, p *store.Provider, apiKey string, client *http.Client) (*rosetta.Client, error) {
+	opts := []rosetta.Option{
+		rosetta.WithEndpoint(p.Endpoint),
+		rosetta.WithAPIKey(apiKey),
+		rosetta.WithHTTPClient(client),
+		rosetta.WithTimeout(15 * time.Second),
 	}
-	return 0
+	configured := wireproto.Normalize(p.Protocol)
+	if configured != "" && configured != wireproto.Auto {
+		if !wireproto.Valid(configured) {
+			return nil, fmt.Errorf("provider %s: 未知的 protocol %q（合法值：%s）",
+				p.Slug, configured, wireproto.AllowedValues)
+		}
+		opts = append(opts, rosetta.WithProtocol(discoveryProtocol(configured)))
+		return rosetta.NewClient(opts...)
+	}
+	detected, err := rosetta.DetectClient(ctx, opts...)
+	if err != nil {
+		return nil, err
+	}
+	opts = append(opts, rosetta.WithProtocol(detected.Protocol()))
+	return rosetta.NewClient(opts...)
+}
+
+// discoveryProtocol 把网关内部协议名映射为 rosetta 协议。
+func discoveryProtocol(name string) rosetta.Protocol {
+	switch name {
+	case wireproto.Chat:
+		return rosetta.ProtoOpenAIChat
+	case wireproto.Response:
+		return rosetta.ProtoOpenAIResponses
+	case wireproto.Anthropic:
+		return rosetta.ProtoAnthropic
+	default:
+		return rosetta.ProtoOpenAIChat
+	}
+}
+
+// modelCandidateFromModelInfo 把 SDK 的 ModelInfo 转成网关的 ModelCandidate。
+// 三态映射：ThinkingReported=false 表示「上游没报」，映射为 nil；否则按
+// SupportsThinking 给指针。
+func modelCandidateFromModelInfo(mi rosetta.ModelInfo) ModelCandidate {
+	c := ModelCandidate{
+		ID:              mi.ID,
+		DisplayName:     mi.DisplayName,
+		ContextWindow:   mi.ContextWindow,
+		MaxOutputTokens: mi.MaxOutputTokens,
+		EffortLevels:    mi.EffortLevels,
+	}
+	if mi.ThinkingReported {
+		v := mi.SupportsThinking
+		c.SupportsThinking = &v
+	}
+	return c
 }
 
 // upstreamHTTPClient 是所有 rosetta 客户端共享的 HTTP 客户端（共用一个连接池）。
@@ -1695,11 +1388,18 @@ func buildClient(ctx context.Context, prov *ProviderEntry, apiKey string, cfg *c
 		// 且 Idempotency-Key 对 DeepSeek/vLLM/各类中转普遍无效。
 		// 网关自己的重试策略：故障转移链（route_targets），不是同一个上游反复打。
 		rosetta.WithQuirks(rosetta.Quirks{NoIdempotencyKey: true}),
-		// Chat thinking replay needs to replace the SDK's messages array with
-		// the original wire messages, including reasoning_content. It is only
-		// emitted when that field actually exists; all other reserved keys are
-		// still constructed by the SDK and never placed in Extra.
-		rosetta.WithExtraOverrides(true),
+		// 不装任何 Extra 覆盖开关（既非 WithExtraOverrides，也非
+		// WithExtraOverrideKeys）：网关现在**不往 Extra 里写任何保留键**。
+		//
+		// 曾经要覆盖的 messages（Responses→chat 的 turn 合并）已在入站
+		// ToRosetta 修掉：一轮 assistant 直接合成一条 Message 多 Block，
+		// 出站编码器不再需要被改写。其余字段（tool_choice / response_format /
+		// seed / user / penalties / prompt_cache_key / parallel_tool_calls /
+		// store / previous_response_id …）本来就已迁到类型化字段。
+		//
+		// 保持默认（碰撞即 ErrInvalidRequest）是一道免费的护栏：未来谁再
+		// 往 Extra 塞保留键，会在网关进程内被当场拒掉，而不是静默覆盖
+		// SDK 算好的 payload。回归防线见 extra_override_test.go。
 	}
 	// WithTimeout also bounds DetectClient's /models probe. Install it before
 	// auto-detection so a hanging endpoint cannot hold pool construction for
