@@ -108,6 +108,12 @@ func normalizeAlias(s string) Level {
 		// 曾经这里是 `return XHigh`（把 max 当 xhigh 的别名）。现在 Max 是
 		// 独立档，见 KnownLevels 上面的说明。
 		return Max
+	case "ultra":
+		// DeepSeek 官方 thinking-mode 文档的档位映射表把 ultra 列为最上层，
+		// 并明确 ultra → max。归到 Max 即可：发出去的 max 正是 DeepSeek 对
+		// ultra 的实际执行档。不归的话 Parse 返回 Unset，ToRosetta 会把整个
+		// Thinking 丢掉 —— 客户端选了最强档，上游却完全不开思考。
+		return Max
 	default:
 		return Unset
 	}

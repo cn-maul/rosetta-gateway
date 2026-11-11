@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/cn-maul/rosetta-gateway/internal/config"
+	"github.com/cn-maul/rosetta-gateway/internal/dialect"
 	"github.com/cn-maul/rosetta-gateway/internal/effort"
 	wireproto "github.com/cn-maul/rosetta-gateway/internal/protocol"
 	"github.com/cn-maul/rosetta-gateway/internal/store"
@@ -155,7 +156,11 @@ func (h *ConfigTransferHandler) buildExport(ctx context.Context) (configExport, 
 				// 挡位也要导出：它是手工按模型文档配出来的运维知识，
 				// 一次「换台机器重新部署」就配一遍是纯粹的重复劳动。
 				// 形态与库里那列一致（CSV），未知档位附在后面不被丢。
-				EffortLevels:       effort.FormatLevels(m.EffortLevels, m.UnknownLevels),
+				EffortLevels: effort.FormatLevels(m.EffortLevels, m.UnknownLevels),
+				// 方言同理：它是每条模型各自的字段拼写，丢了就只能靠
+				// 模型名推断，而中转站改过名的模型推断不出来。
+				ThinkingDialect:    string(m.ThinkingDialect),
+				CanDisableThinking: m.CanDisableThinking,
 				PriceInput:         m.PriceInput,
 				PriceCacheHit:      m.PriceCacheHit,
 				PriceCacheCreation: m.PriceCacheCreation,
@@ -816,6 +821,21 @@ func (h *ConfigTransferHandler) attach(
 			}
 			m.EffortLevels, m.UnknownLevels = known, unknown
 		}
+		// 方言：空串 = 自动（合法）；写错的照实跳过并告警，不静默当自动 ——
+		// 那会让一份写坏的配置文件看起来「导入成功」，实际思考开关全错。
+		if me.ThinkingDialect != "" {
+			d, ok := dialect.Parse(me.ThinkingDialect)
+			if !ok {
+				resp.ModelsSkipped++
+				resp.Warnings = append(resp.Warnings,
+					fmt.Sprintf("模型 %s / %s 的 thinking_dialect 取值不认识（%q），已跳过",
+						slug, modelID, me.ThinkingDialect))
+				continue
+			}
+			m.ThinkingDialect = d
+		}
+		// 能否关闭思考：指针直传，nil = 按厂商文档表（合法的默认值）。
+		m.CanDisableThinking = me.CanDisableThinking
 		if dry {
 			// 干跑也要登记 modelIDs：路由段靠它解析链目标，而干跑的预览
 			// 必须与真实导入报同样的数字，否则「预览说会建 1 条路由、

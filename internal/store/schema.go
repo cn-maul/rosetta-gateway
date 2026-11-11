@@ -146,6 +146,24 @@ func (s *Store) ensureCompatibleSchema(ctx context.Context) error {
 		//
 		// 空串 = 升级前的旧记录，界面回退到 key_id。
 		{"usage_records", "key_name", "TEXT"},
+		// 2026-11-09：思考方言按模型配置。
+		//
+		// 同一个中转站常常同时卖 GPT、DeepSeek、GLM、Qwen，而四家表达
+		// 「开关思考」的字段互不兼容（详见 internal/dialect）。把方言
+		// 挂在上游模型上而不是 provider 上，是唯一能让「一个 base URL
+		// 下多个厂商的模型各说各话」的放法。
+		//
+		// NULL / 空串 = 自动（按模型名推断），与 dialect.Auto 同义。
+		{"upstream_models", "thinking_dialect", "TEXT"},
+		// 2026-11-10：能否关闭思考，改为可实测纠正的三态。
+		//
+		// 厂商文档说 GLM-5.3 / Kimi K3 / MiniMax-M3.1-Flash 不能关，那张表
+		// 描述的是**直连厂商端点**。中转站会做归一化，实测 opencode.ai 的
+		// glm-5.3、kimi-k3.1-pro 都接受 thinking:{type:"disabled"} —— 按文档
+		// 表降级成「最低档」会让用户点了关闭、上游照旧思考并计费。
+		//
+		// NULL = 按文档表（默认，存量数据行为不变），1/0 = 以实测为准。
+		{"upstream_models", "can_disable_thinking", "INTEGER"},
 	} {
 		if err := s.ensureAdditiveColumn(ctx, col.table, col.column, col.decl); err != nil {
 			return err

@@ -35,6 +35,23 @@ type OpenAIChatRequest struct {
 	// 无日志、无报错，而 rosetta 与上游 OpenAI 侧都完整支持它。
 	// 这是最常用的入站协议，丢它的代价最大（用户以为在用推理模式，实际没有）。
 	ReasoningEffort *string `json:"reasoning_effort,omitempty"`
+	// Thinking 是 DeepSeek / Kimi / Qwen 等 OpenAI 兼容上游的显式思考开关，
+	// 形状 {"type":"enabled"|"disabled"}（部分上游还带 budget_tokens）。
+	//
+	// 它不是 OpenAI 官方字段，但在这类 Chat 方言里被广泛使用。此前结构体
+	// 没有声明它，encoding/json 静默丢弃 —— 客户端显式关思考，网关回 200，
+	// 上游照常思考，链路上没有任何信号。
+	//
+	// 保留原始字节而不是再定义一套结构：这个对象各家的扩展字段并不一致，
+	// 而目标上游同为 Chat 方言时最正确的做法是原样转发。
+	Thinking json.RawMessage `json:"thinking,omitempty"`
+	// ThinkingOff 记录「客户端显式要求不思考」。它单独存在是因为 rosetta
+	// 的 Thinking 只能表达「请求思考」：nil 是「不发」，上游会按默认开。
+	// 显式关闭必须由数据面按目标协议写到 wire 上。
+	ThinkingOff bool `json:"-"`
+
+	// Suffix 是 model 尾巴上的一次性覆盖（@thinking:off 等）。
+	Suffix ModelSuffix `json:"-"`
 	// PromptCacheKey is an explicit cache-affinity hint. It is separate from
 	// conversation headers: clients may keep the same conversation while
 	// intentionally changing the reusable prefix (and vice versa).
@@ -60,11 +77,35 @@ type OpenAIChatRequest struct {
 	// 后者正是要消灭的失败模式。留着字段、在 decode 侧明确拒绝，
 	// 客户端拿到的是一个可据以改代码的 400（带原因），而不是一个
 	// 看起来成功、实际少给了候选的 200。
-	N                 *int            `json:"n,omitempty"`
-	ResponseFormat    json.RawMessage `json:"response_format,omitempty"`
-	Seed              *int            `json:"seed,omitempty"`
-	User              string          `json:"user,omitempty"`
-	ParallelToolCalls *bool           `json:"parallel_tool_calls,omitempty"`
+	N              *int            `json:"n,omitempty"`
+	ResponseFormat json.RawMessage `json:"response_format,omitempty"`
+	Seed           *int            `json:"seed,omitempty"`
+	User           string          `json:"user,omitempty"`
+	// UserID 是 DeepSeek 的官方写法（`user_id`）。OpenAI 标准是 `user`，
+	// 两边含义相同（业务侧用户标识，用于滥用监测与缓存隔离），但名字不同。
+	//
+	// DeepSeek 超集同时接受 `user`，所以这里不必二选一：哪个来了用哪个，
+	// 两个都来以 `user_id` 为准（它是该厂商文档里的正式字段）。
+	UserID            string `json:"user_id,omitempty"`
+	ParallelToolCalls *bool  `json:"parallel_tool_calls,omitempty"`
+}
+
+// chatThinking 是 Chat 方言 thinking 对象里网关需要理解的部分。
+type chatThinking struct {
+	Type         string `json:"type"`
+	BudgetTokens int    `json:"budget_tokens,omitempty"`
+}
+
+// parseChatThinking 解析 thinking 对象；形状不对时 ok=false。
+func (r *OpenAIChatRequest) parseChatThinking() (chatThinking, bool) {
+	if len(r.Thinking) == 0 {
+		return chatThinking{}, false
+	}
+	var t chatThinking
+	if err := json.Unmarshal(r.Thinking, &t); err != nil {
+		return chatThinking{}, false
+	}
+	return t, true
 }
 
 // FlexibleStringList 接受 JSON 的 string、array、null 三种形态，统一成
@@ -213,8 +254,68 @@ func DecodeOpenAIChatRequest(r *http.Request, maxBytes int64) (*OpenAIChatReques
 		}
 	}
 
+	// thinking 是已知的高风险字段：不校验就转发，非法值会被上游或更晚的
+	// 链路吞掉，客户端只能看到 200。这里与 n 同一口径 —— 显式 400 让问题
+	// 在开发阶段暴露。
+	if t, ok := req.parseChatThinking(); ok {
+		switch t.Type {
+		case "enabled":
+			if t.BudgetTokens < 0 {
+				return nil, fmt.Errorf("thinking.budget_tokens: must be >= 0")
+			}
+		case "disabled":
+			req.ThinkingOff = true
+		default:
+			return nil, fmt.Errorf("thinking.type: must be enabled|disabled, got %q", t.Type)
+		}
+	} else if len(req.Thinking) > 0 {
+		return nil, fmt.Errorf("thinking: must be a JSON object with a type field")
+	}
+
 	if req.ReasoningEffort != nil {
 		req.RawEffort = strings.TrimSpace(*req.ReasoningEffort)
+	}
+	// reasoning_effort:none 与 thinking.disabled 是同一意图：必须真正关掉，
+	// 不能因为 rosetta 没有「关闭」值就静默退回上游默认。
+	if req.ReasoningEffort != nil && effort.Parse(req.RawEffort) == effort.None {
+		req.ThinkingOff = true
+	}
+
+	// model 后缀最后应用：它优先于请求体字段，且必须在校验之后，
+	// 否则后缀写出的 thinking 对象还没走过上面的类型校验。
+	baseModel, sfx, err := ParseModelSuffix(req.Model)
+	if err != nil {
+		return nil, err
+	}
+	req.Model = baseModel
+	req.Suffix = sfx
+	if sfx.Set {
+		switch {
+		case sfx.ThinkingOff:
+			req.Thinking = nil
+			req.ThinkingOff = true
+			req.RawEffort = "none"
+			req.ReasoningEffort = &req.RawEffort
+		case sfx.ThinkingOn:
+			req.ThinkingOff = false
+			req.Thinking = nil
+			// Chat 协议没有统一的预算字段：预算按区间折成档位，
+			// 与 rosetta 的 effortFromBudget 同一口径。
+			if sfx.Level != effort.Unset && sfx.Level != effort.None {
+				req.RawEffort = string(sfx.Level)
+				req.ReasoningEffort = &req.RawEffort
+			} else if req.RawEffort == "" || effort.Parse(req.RawEffort) == effort.None {
+				// 只写 @thinking:on / @thinking:adaptive：Chat 协议没有
+				// 「开」这个布尔位，唯一能打开思考的就是给一个档位。
+				// medium 与 rosetta 在「请求思考但未指定档位」时的兜底一致。
+				req.RawEffort = "medium"
+				req.ReasoningEffort = &req.RawEffort
+			}
+			if sfx.Budget > 0 {
+				req.Thinking = json.RawMessage(fmt.Sprintf(
+					`{"type":"enabled","budget_tokens":%d}`, sfx.Budget))
+			}
+		}
 	}
 	return &req, nil
 }
@@ -226,6 +327,10 @@ func (r *OpenAIChatRequest) ToRosetta() *rosetta.ChatRequest {
 		msgs = append(msgs, msg)
 	}
 
+	user := r.User
+	if r.UserID != "" {
+		user = r.UserID
+	}
 	req := &rosetta.ChatRequest{
 		Model:             r.Model,
 		Messages:          msgs,
@@ -234,7 +339,7 @@ func (r *OpenAIChatRequest) ToRosetta() *rosetta.ChatRequest {
 		TopP:              r.TopP,
 		StopSequences:     r.Stop,
 		Seed:              r.Seed,
-		User:              r.User,
+		User:              user,
 		PresencePenalty:   r.PresencePenalty,
 		FrequencyPenalty:  r.FrequencyPenalty,
 		ParallelToolCalls: r.ParallelToolCalls,
@@ -250,9 +355,27 @@ func (r *OpenAIChatRequest) ToRosetta() *rosetta.ChatRequest {
 	// 此前这里是本包自己的一张 switch，它漏掉了 max / very_high / min /
 	// mid / default 等写法 —— 漏掉的那些落进 default 分支返回 Unset，
 	// 于是「客户端要最高档思考」变成「完全不思考」，且日志无痕。
+	// 强度与开关分两步：客户端常把两者一起发（DeepSeek 文档的示例就是
+	// thinking:{type:"enabled"} + reasoning_effort:"high"），先按 effort
+	// 定强度，再由开关覆盖成「关」。
 	if r.ReasoningEffort != nil {
 		if lvl, ok := effort.ToThinkingLevel(effort.Parse(*r.ReasoningEffort)); ok {
 			req.Thinking = &rosetta.ThinkingConfig{Effort: rosetta.Effort(lvl)}
+		}
+	}
+	if t, ok := r.parseChatThinking(); ok {
+		switch t.Type {
+		case "disabled":
+			// rosetta 的 Thinking 只有「请求思考」一种语义，nil 等于「不发」
+			// （上游按默认，DeepSeek 系默认就是开思考），恰好与请求相反。
+			// 显式关闭由数据面按目标协议写到 wire 上（见
+			// ingress.Request.ApplyProtocolThinking）。
+			req.Thinking = nil
+		case "enabled":
+			// 显式开启：没有 reasoning_effort 时按预算（或 SDK 默认强度）。
+			if req.Thinking == nil && t.BudgetTokens > 0 {
+				req.Thinking = &rosetta.ThinkingConfig{BudgetTokens: t.BudgetTokens}
+			}
 		}
 	}
 
@@ -352,9 +475,12 @@ func chatResponseFormatToRosetta(raw json.RawMessage) *rosetta.ResponseFormat {
 // 本入口不再需要 ApplyUpstreamExtras。
 //
 // tool_choice / response_format / seed / user / presence_penalty /
-// frequency_penalty / parallel_tool_calls / prompt_cache_key / top_k 全部在
-// ToRosetta 落到 rosetta.ChatRequest 的类型化字段，由 SDK 按目标协议翻译
-// （v1.3.0 起这些同时是 SDK 保留键，塞 Extra 会撞 openaiChatReservedPayloadKeys）。
+// frequency_penalty / parallel_tool_calls / prompt_cache_key 全部在 ToRosetta
+// 落到 rosetta.ChatRequest 的类型化字段，由 SDK 按目标协议翻译（v1.3.0 起
+// 这些同时是 SDK 保留键，塞 Extra 会撞 openaiChatReservedPayloadKeys）。
+//
+// top_k 刻意不支持：它不是 OpenAI 官方 Chat 参数（只有 vLLM 一类自建
+// 服务认），而入站结构体也没有这个字段。见 DESIGN §5.2.1 的「已知丢弃」。
 //
 // 曾经独占的 reasoning_content 回放也交还给 SDK 了：v1.3.0 的 chat 编码器
 // 把 BlockThinking 编码成同一条 assistant 消息的 reasoning_content（P1-1a），
@@ -521,13 +647,17 @@ func assistantText(m OpenAIMessage) string {
 
 // openAIContentPart 是 OpenAI「内容块数组」里的一块。
 //
-// image_url.detail 不在 rosetta 的通用模型里，仍由 encoding/json 忽略；
+// image_url.detail 落在 rosetta.Block.ImageDetail 上：它决定上游把图片
+// 缩到 512×512（low）还是保留原图（high / original / auto），直接影响
+// 识别精度与 token 成本，丢了等于替客户端选了一个它没选的档。
+//
 // 输入媒体本身（input_audio / file）必须保留，不能再静默丢掉。
 type openAIContentPart struct {
 	Type     string `json:"type"`
 	Text     string `json:"text"`
 	ImageURL *struct {
-		URL string `json:"url"`
+		URL    string `json:"url"`
+		Detail string `json:"detail"`
 	} `json:"image_url"`
 	InputAudio *struct {
 		Data   string `json:"data"`
@@ -583,6 +713,7 @@ func extractUserContent(raw json.RawMessage) userContent {
 		if single.Type == "image_url" && single.ImageURL != nil && single.ImageURL.URL != "" {
 			return userContent{Blocks: []rosetta.Block{{
 				Type: rosetta.BlockImage, ImageURL: single.ImageURL.URL,
+				ImageDetail: normalizeImageDetail(single.ImageURL.Detail),
 			}}}
 		}
 		if single.Text != "" {
@@ -601,6 +732,7 @@ func extractUserContent(raw json.RawMessage) userContent {
 			if p.ImageURL != nil && p.ImageURL.URL != "" {
 				out.Blocks = append(out.Blocks, rosetta.Block{
 					Type: rosetta.BlockImage, ImageURL: p.ImageURL.URL,
+					ImageDetail: normalizeImageDetail(p.ImageURL.Detail),
 				})
 			} else {
 				out.Dropped = append(out.Dropped, p.Type)
@@ -633,6 +765,7 @@ func chatContentBlock(p openAIContentPart) userContent {
 		if p.ImageURL != nil && p.ImageURL.URL != "" {
 			return userContent{Blocks: []rosetta.Block{{
 				Type: rosetta.BlockImage, ImageURL: p.ImageURL.URL,
+				ImageDetail: normalizeImageDetail(p.ImageURL.Detail),
 			}}}
 		}
 	case "input_audio":
@@ -679,6 +812,26 @@ func stripDataURLPrefix(data string) string {
 		return data[idx+1:]
 	}
 	return data
+}
+
+// normalizeImageDetail 把厂商扩展的 detail 收敛到 rosetta 认识的三个值。
+//
+// DeepSeek 多了一个 `original`（保留原图，不缩放到 512）。rosetta 的校验
+// 只认 auto/low/high，原样透传会把一个合法请求打成 400。`original` 与
+// `high` 的语义一致（doc：high、original 与 auto 都保留原图），所以映射
+// 到 high 而不丢弃 —— 丢弃会让上游按默认档处理，改变客户端的成本选择。
+//
+// 未知取值同样收敛成空串（交给上游默认），而不是让它 400：
+// detail 是锦上添花的提示位，不该成为整条请求的失败点。
+func normalizeImageDetail(detail string) string {
+	switch strings.ToLower(strings.TrimSpace(detail)) {
+	case "auto", "low", "high":
+		return strings.ToLower(strings.TrimSpace(detail))
+	case "original":
+		return "high"
+	default:
+		return ""
+	}
 }
 
 // extractText 只要文本，丢弃图像。用于 system / assistant / tool —— 这三个角色的

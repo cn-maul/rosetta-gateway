@@ -404,6 +404,160 @@ resolve(model):
 
 `GET /v1/models` 默认**只返回轨道一的虚拟名**。轨道二的形式不列出（可能非常长，且上游模型数会随 provider 增长）。可用 `?include=upstream` 展开。
 
+### 5.2.1 model 后缀：一次性覆盖（2026-11-10）
+
+`model` 字符串尾部可以跟一组 `@` 覆盖，只作用于**这一次请求**，不写库、
+不影响其他并发请求：
+
+| 后缀 | 含义 |
+|---|---|
+| `@thinking:on` / `@thinking:off` | 开 / 关思考 |
+| `@thinking:adaptive` | 让模型自选预算（Anthropic 系） |
+| `@thinking:<正整数>` | 指定 token 预算；跨协议时按 4096 / 16384 折成 low/medium/high |
+| `@effort:low\|medium\|high\|xhigh\|max`（含 `minimal`、`none`） | 指定档位，按目标方言翻译 |
+| `@dialect:openai\|anthropic\|deepseek\|glm\|qwen\|minimax\|kimi\|passthrough\|auto` | 临时改这次用的思考方言 |
+
+例子（把同一路由临时当成别家的写法发出去）：
+
+```json
+{"model": "deepseek-chat@thinking:off", "messages": [...]}
+{"model": "glm-5.3@effort:max", "messages": [...]}
+{"model": "my-route@dialect:qwen", "messages": [...]}
+```
+
+**优先级**：后缀 > 请求体字段 > 库里这个模型的方言配置 > 按模型名推断 > 原样透传。
+后缀与请求体冲突时按后缀执行，并在日志（`model suffix override`）里留痕。
+
+**解析规则**：只剥**尾部连续**的这三种键；其它 `@`（例如仓库里的
+`model@sha256:...`、`model@2024-08`）属于模型名本身，原样保留。取值非法
+直接 400，不做静默忽略 —— 否则调用方会以为覆盖生效了，实际发出去的是另一种字段。
+
+**为什么只做后缀、不做别的覆盖入口**：方言配置是「这个上游平时怎么说话」的
+默认值，而后缀解决的是「某一次想试试它到底认哪个」。后者需要即时、可见、
+不污染配置，正好是请求级参数该干的事。
+
+**能否关闭思考：文档表 + 实测纠正**（2026-11-10）
+
+`internal/dialect` 里有一张按厂商文档写死的表，说明 GLM-5.3、Kimi K3 系列、
+MiniMax-M3.1-Flash **不能关闭思考**（传 `disabled` 直接 400）。这张表描述的是
+**直连厂商端点**的行为。
+
+中转站会做归一化：同一批模型挂在同一个 base URL 下，由中转自己把请求翻译成
+各家协议。实测 `opencode.ai` 的 `glm-5.3`、`kimi-k3.1-pro` 都接受
+`thinking:{type:"disabled"}`。按文档表降级为「最低档」的后果是：用户点了关闭、
+上游照旧思考并计费，而且没有任何报错。
+
+因此上游模型多了一列 `can_disable_thinking`（三态）：
+
+| 取值 | 含义 |
+|---|---|
+| NULL（默认） | 按厂商文档表判断，存量行为不变 |
+| `true` | 实测能关 —— 关闭时下发该方言真正的关闭字段 |
+| `false` | 实测不能关 —— 即使文档说能关也退回最低档 |
+
+管理界面「编辑上游模型 → 能否关闭思考」可改，导出文件带 `can_disable_thinking`，
+换机器重建不会丢。判断顺序是**实测纠正 > 文档表**；纠正成能关之后，`none`
+不再被改写成 `low`（GLM-5.3 / MiniMax 本身没有 `none` 这一档，此时关闭只走
+`thinking.type`，强度字段整个不下发）。
+
+**方言未知时也不能盲发关闭**（2026-11-10，智谱官方实测）：
+
+`passthrough` 的承诺是「不发明厂商字段、保证不把请求打挂」。此前它在
+「方言认不出 + 客户端要关思考」时会补一个 `reasoning_effort:"none"`，理由是
+那是 OpenAI 兼容端点共有的写法。智谱官方实测证伪了这条：`glm-5.3` /
+`glm-5.3-flash` 收到 `none` 直接返回
+`1210 该模型始终思考，不支持关闭思考；请使用 low、high 或 max`。
+
+现在 fallback 会先查厂商文档表（`dialect.CannotDisableByDocs`）：命中
+GLM-5.3 / MiniMax-M3.1-Flash / Kimi K3 这类「始终思考」的模型时，
+**三个协议入口都不发任何关闭字段**，只记一条 Info 日志。代价是这次关闭
+不生效；收益是请求仍然成功，而不是变成一次 400。
+
+**关思考不等于抹掉 include**（2026-11-10）：
+
+`include`（`reasoning.encrypted_content` 等）在 SDK 里挂在 Thinking 配置上，
+所以「把 Thinking 换成 `effort:"none"`」这种直观写法会顺带把客户端的 include
+抹掉。Codex 一类客户端正是靠它换回可离线续接的加密思考。网关现在关思考时
+只替换强度、保留 include：关的是**这一轮**的思考，不是「以后别再返回思考包裹」。
+
+**DeepSeek 的两处字段名差异**（2026-11-10，真上游实测）：
+
+- `user` → `user_id`：DeepSeek 文档的正式字段是 `user_id`（OpenAI 标准仍是
+  `user`）。Chat 入口两个都收，`user_id` 优先；转发给上游时统一落到
+  `rosetta.ChatRequest.User`，由 SDK 按目标协议发。实测 tiantoken、
+  opencode.ai 两家上游对两种写法都回 200。
+- `image_url.detail`：之前被 `encoding/json` 静默丢掉。现在会透传到
+  `Block.ImageDetail`，并收敛厂商扩展值：DeepSeek 多出的 `original`
+  与 `high` 同义（文档：high/original/auto 都保留原图），映射成 `high`；
+  未知取值收敛成空串交给上游默认，不让一个提示位把请求打成 400。
+  真上游验证：发 `detail:"low"` 的单像素 PNG，模型正确答出颜色。
+
+**Responses 入口补齐两处**（2026-11-10）：
+
+- **关不掉 ≠ 硬发 none**：GLM-5.3 / MiniMax-M3.1-Flash / Kimi K3 收到
+  `reasoning.effort:"none"` 是 400。Responses 入口现在与 chat / anthropic
+  同一口径：判定关不掉就退到该模型的最低档，并记 WARN。
+  客户端直接发 `reasoning.effort:"none"` 也算「关」，两条路径一并拦。
+- **档位按方言翻译**：GLM-5.3 只认 low/high/max，收到 `medium` 直接 400。
+  chat 入口一直有翻译，Responses 入口此前漏了 —— 同一条 effort 在 chat 上
+  能跑、在 responses 上被拒。现在两条入口共用 `dialect.WireEffort`。
+
+### 5.2.2 按官方文档复核方言表（2026-11-11）
+
+上面几节里有一部分结论来自「真上游实测」。实测能证明某条路径通，但证明不了
+字段表本身对不对；本轮回到**厂商官方文档**逐条核对，修正了四处偏差。
+
+出处：DeepSeek `api-docs.deepseek.com/guides/thinking_mode`；智谱
+`docs.bigmodel.cn/cn/guide/capabilities/thinking.md`；Kimi
+`platform.kimi.com/docs/guide/use-thinking-models` 与 `/docs/api/chat`；
+Qwen `help.aliyun.com/zh/model-studio/deep-thinking`；MiniMax
+`platform.minimaxi.com/docs/api-reference/text-chat-openai`。
+
+| 问题 | 官方口径 | 修正 |
+|---|---|---|
+| Responses 入口的 `reasoning.effort:"none"` 只记进 `RawEffort`，没记成「关闭」 | none 是各家的关闭写法（DeepSeek 明确 `none` disables thinking） | 新增 `ResponsesRequest.ThinkingOff()`：跨协议到 chat / anthropic 目标时也走关闭分支 |
+| Kimi K3 系列被塞了 `thinking` 对象 | API 参考用 `oneOf` 区分：K3 的 schema 只有 `reasoning_effort`，`thinking` 属于 K2.x | K3 丢弃 `thinking`，只发强度；K2.x 反过来不发 `reasoning_effort` |
+| MiniMax 开启态可能发出 `thinking.type:"enabled"` | `thinking.type` 的 enum 只有 `adaptive` / `disabled`，`adaptive` 是 M3.1-Flash 唯一接受的取值 | 开启态统一写 `adaptive`，客户端带来的 `enabled` 也收敛成它 |
+| `reasoning_effort:"ultra"` 被当非法值 | DeepSeek 映射表列出 `ultra`，并写明 `ultra → max` | `ultra` 归到 `Max`：发出去的就是上游实际执行的档位 |
+
+未改的两处，理由记在这里，避免下次又被「看起来像漏洞」重新改回去：
+
+- **Qwen 同时接受 `reasoning_effort` 与 `enable_thinking`**：官方
+  「深度思考」页仍以 `enable_thinking` 为主，Responses 页则写明
+  `reasoning.effort` 优先、`enable_thinking` 后续不再支持。两个都发不会
+  报错，且能让新老模型都生效，因此保留。
+- **Anthropic 兼容端点用 `output_config.effort`**：这条只有 DeepSeek 的
+  `/anthropic` 页给了明确依据 —— `budget_tokens` 被忽略、`output_config`
+  只支持 `effort`。其它厂商的 Anthropic 兼容层文档没有同等说明，代码里仍
+  按 `output_config.effort` 发，属于**待补证**的现状，不是已核实的结论。
+
+**Anthropic 入口的 metadata.user_id**（2026-11-10）：
+
+之前整个 `metadata` 被忽略。DeepSeek 的 Anthropic 兼容端点明确支持
+`metadata.user_id`（用于内容安全与 KVCache 隔离），现在落到
+`ChatRequest.User`。真上游验证：带该字段的 `/v1/messages` 请求回 200。
+
+**已知丢弃：Anthropic 侧的 `top_k`**（2026-11-10）
+
+`top_k` 是采样截断参数：每一步只从概率最高的 K 个候选 token 里挑，用来压掉
+长尾的低概率输出。它与 `temperature`（随机程度）、`top_p`（累计概率截断）
+是同一类旋钮，通常只需要调其中一个。
+
+网关**不转发**它，且这是有意为之：
+
+- Anthropic 在 API 2026-10-21 版本移除了 `top_k`，收到即为 400；SDK 因此
+  不再编码该字段（见 SDK 的 `dropRemovedFields`）。
+- DeepSeek 文档明确写 `top_k` 忽略。
+- 思考模式下该参数意义本就很小：思考阶段的输出分布很尖，多数厂商直接忽略。
+
+要强行下发只能绕过 SDK 手写 Anthropic 请求体，等于放弃 SDK 的版本适配，
+风险大于收益。
+
+**注意**：三个入口**都**不转发 `top_k`（Chat / Responses 的入站结构体也没有
+这个字段——它不是 OpenAI 官方 Chat 参数，只有 vLLM 一类自建服务认）。
+所以这不是 Anthropic 独有的取舍，而是网关整体不支持该旋钮。
+依赖 `top_k` 的调用方需要改用 `temperature` 或 `top_p`。
+
 ### 5.3 模型容量元数据（2026-10-04）
 
 外部工具（Cherry Studio / LobeChat / 各类网关面板）需要按模型读取上下文与输出上限，
@@ -983,11 +1137,13 @@ thinking / 无签名 thinking / redacted_thinking / thinking+text+tool_use 混�
 | `anthropic-version` | 三处硬编码 `2023-06-01` | `rosetta.AnthropicVersion`（`2026-10-21`） |
 | Responses 的「一轮拆多条 assistant」 | 出站接管 `messages`（`responses_chat_replay.go`，重写一遍编码器） | **入站合并**：`ToRosetta` 把一轮的 item 合成一条 `Message` 多 Block |
 
-`buildClient` **不装任何 Extra 覆盖开关**（既非 `WithExtraOverrides`，也非
-`WithExtraOverrideKeys`）：网关现在一个保留键都不往 `Extra` 写。SDK 的碰撞检查
-保持默认开启 —— 任何一处误写 `Extra["stream"]` 都会被当场拒成
-`ErrInvalidRequest`（→ 400），而不是静默覆盖 SDK 的编码结果。回归防线是
-`internal/upstream/extra_override_test.go`。
+`buildClient` 只放行**两个**保留键：`WithExtraOverrideKeys("thinking", "output_config")`。
+这是 2026-11-10 起为思考方言开的窄口子 —— 显式关闭思考必须把字段写进上游
+payload，而 SDK 把这两个键视为保留键；不放开就撞 `ErrInvalidRequest`。
+除此之外仍然一个保留键都不写，碰撞检查保持默认开启 —— 误写
+`Extra["stream"]`、`Extra["messages"]` 之类照样当场拒成 400，而不是静默覆盖
+SDK 的编码结果。回归防线是 `internal/upstream/extra_override_test.go`
+（它断言这两个键之外的一切都仍被拒）。
 
 v1.3.1 的 `WithExtraOverrideKeys` 曾经是这条路上的一站（只放行 `messages`），
 2026-11-07 入站修好之后连这一个键也不需要了。

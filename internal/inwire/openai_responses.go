@@ -98,7 +98,22 @@ type ResponsesRequest struct {
 	// 归一到三档**之前**的那一档。空串 = 请求没提 effort。
 	RawEffort string `json:"-"`
 
+	// Suffix 是 model 尾巴上的一次性覆盖（@thinking:off 等）。
+	Suffix ModelSuffix `json:"-"`
+
 	// metadata / service_tier / safety_identifier 等未建模字段由 encoding/json 忽略。
+}
+
+// ThinkingOff reports whether the client explicitly asked for no thinking.
+//
+// Responses has no `thinking` object: the off switch is `reasoning.effort:"none"`
+// (OpenAI documents it, and DeepSeek/GLM/MiniMax/Qwen all accept it). The
+// effort value alone is kept in RawEffort because the data plane needs the
+// un-clamped level, but "none" must also be visible as an intent: a chat or
+// anthropic upstream needs a different field spelling, and `none` is not a
+// valid value for several of them (GLM-5.3 answers 400).
+func (a *ResponsesRequest) ThinkingOff() bool {
+	return effort.Parse(a.RawEffort) == effort.None
 }
 
 type ResponsesTool struct {
@@ -150,6 +165,10 @@ type responsesContentPart struct {
 	Type     string `json:"type"`
 	Text     string `json:"text"`
 	ImageURL string `json:"image_url"`
+	// Detail 是图片解析档（low / high / auto；DeepSeek 另有 original）。
+	// 与 chat 入口同一个语义：它决定上游缩不缩图、按什么成本计费，
+	// 丢了等于替客户端选了一个它没选的档。收敛规则见 normalizeImageDetail。
+	Detail string `json:"detail"`
 	// input_file / input_audio 的载荷。三者的 url 形态各异：
 	//   file_url  / audio_url  —— 远端引用（http(s)）
 	//   file_data / audio_data —— 内联 base64（可带 data: 前缀）
@@ -316,6 +335,36 @@ func DecodeResponsesRequest(r *http.Request, maxBytes int64) (*ResponsesRequest,
 	}
 	if req.Reasoning != nil {
 		req.RawEffort = strings.TrimSpace(req.Reasoning.Effort)
+	}
+
+	// model 后缀最后应用：优先于 reasoning.effort。
+	baseModel, sfx, err := ParseModelSuffix(req.Model)
+	if err != nil {
+		return nil, err
+	}
+	req.Model = baseModel
+	req.Suffix = sfx
+	if sfx.Set {
+		if sfx.ThinkingOff {
+			req.RawEffort = "none"
+		} else if sfx.ThinkingOn {
+			effortValue := string(sfx.Level)
+			if effortValue == "" {
+				// 只写 @thinking:on：Responses 没有「开」这个布尔位，
+				// 唯一能表达的是给一个档位。medium 与 rosetta 在
+				// 「请求思考但未指定档位」时的兜底一致。
+				effortValue = "medium"
+			}
+			req.RawEffort = effortValue
+		}
+		// 无论开还是关，都覆盖请求体里的 reasoning.effort：
+		// ToRosetta 读的是这个字段，只改 RawEffort 会让后缀被它盖回去。
+		if req.Reasoning == nil {
+			req.Reasoning = &struct {
+				Effort string `json:"effort,omitempty"`
+			}{}
+		}
+		req.Reasoning.Effort = req.RawEffort
 	}
 	if req.MaxOutputTokens != nil && *req.MaxOutputTokens <= 0 {
 		return nil, fmt.Errorf("max_output_tokens: must be a positive integer")
@@ -725,7 +774,13 @@ func (a *ResponsesRequest) ToRosetta() *rosetta.ChatRequest {
 	// 落空 → req.Thinking 保持 nil → 客户端以为自己开了推理模式，实际静默
 	// 不思考。归一口径由 internal/effort 单一提供（2026-10-21 修 P0-12）。
 	if a.Reasoning != nil && a.Reasoning.Effort != "" {
-		if lvl, ok := effort.ToThinkingLevel(effort.Parse(a.Reasoning.Effort)); ok {
+		if level := effort.Parse(a.Reasoning.Effort); level == effort.None {
+			// DeepSeek documents {"reasoning":{"effort":"none"}} as the
+			// Responses-side off-switch. Leaving Thinking nil would send no
+			// reasoning object at all, and the upstream then thinks by
+			// default — the opposite of the request.
+			req.Thinking = &rosetta.ThinkingConfig{EffortRaw: "none"}
+		} else if lvl, ok := effort.ToThinkingLevel(level); ok {
 			req.Thinking = &rosetta.ThinkingConfig{Effort: rosetta.Effort(lvl)}
 		}
 	}
@@ -955,7 +1010,10 @@ func userMessageFromContent(content json.RawMessage) []rosetta.Message {
 			blocks = append(blocks, rosetta.Block{Type: rosetta.BlockText, Text: p.Text})
 		case "input_image":
 			if p.ImageURL != "" {
-				blocks = append(blocks, rosetta.Block{Type: rosetta.BlockImage, ImageURL: p.ImageURL})
+				blocks = append(blocks, rosetta.Block{
+					Type: rosetta.BlockImage, ImageURL: p.ImageURL,
+					ImageDetail: normalizeImageDetail(p.Detail),
+				})
 			}
 		// file / audio 与 image 同属「用户发来的附件」。原先只认 image，
 		// 于是「让模型读这份 PDF」在 user 侧同样被静默丢弃 —— 与
@@ -1066,7 +1124,10 @@ func responsesItemToolOutput(item responsesItem) (string, []rosetta.Block) {
 			text.WriteString(p.Text)
 		case "input_image":
 			if p.ImageURL != "" {
-				media = append(media, rosetta.Block{Type: rosetta.BlockImage, ImageURL: p.ImageURL})
+				media = append(media, rosetta.Block{
+					Type: rosetta.BlockImage, ImageURL: p.ImageURL,
+					ImageDetail: normalizeImageDetail(p.Detail),
+				})
 			}
 		case "input_file":
 			if b, ok := responsesFileBlock(p); ok {

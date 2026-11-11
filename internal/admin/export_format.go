@@ -247,7 +247,15 @@ type modelExport struct {
 	MaxOutputTokens  int    `json:"max_output_tokens,omitempty"`
 	SupportsThinking *bool  `json:"supports_thinking,omitempty"`
 	// EffortLevels 是逗号分隔的挡位原文（与库里那列同形），空串 = 未配置。
-	EffortLevels       string  `json:"effort_levels,omitempty"`
+	EffortLevels string `json:"effort_levels,omitempty"`
+	// ThinkingDialect 是该模型的思考方言，空串 = 自动（按模型名推断）。
+	// 它和挡位一样是「照厂商文档配出来的运维知识」，换台机器重建时必须
+	// 一起搬走 —— 否则同一批模型在新环境里会退回自动推断，猜错的代价是 400。
+	ThinkingDialect string `json:"thinking_dialect,omitempty"`
+	// CanDisableThinking 是「能否关闭思考」的实测纠正，缺席 = 按厂商文档表。
+	// 它和方言一样是「对这条上游实测出来的知识」：中转会归一化各家写法，
+	// 文档表在这条链路上未必成立，换台机器重建时不能丢。
+	CanDisableThinking *bool   `json:"can_disable_thinking,omitempty"`
 	PriceInput         float64 `json:"price_input,omitempty"`
 	PriceCacheHit      float64 `json:"price_cache_hit,omitempty"`
 	PriceCacheCreation float64 `json:"price_cache_creation,omitempty"`

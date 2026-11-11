@@ -6,6 +6,7 @@ import (
 	"strings"
 	"sync"
 
+	"github.com/cn-maul/rosetta-gateway/internal/dialect"
 	"github.com/cn-maul/rosetta-gateway/internal/effort"
 )
 
@@ -95,6 +96,17 @@ type UpstreamModel struct {
 	// 与价格字段同理由放在这里：落库时静态、请求时只读，放进快照可以让热
 	// 路径零查库地拿到它（见上面价格字段的注释）。
 	EffortLevels []effort.Level
+
+	// ThinkingDialect 是该模型的思考字段方言（见 internal/dialect）。
+	//
+	// 空串 = 自动：数据面按 ModelID 推断，推不出来就只发协议标准字段。
+	// 它随快照下发而不是每次回查库，理由与 SupportsThinking/EffortLevels
+	// 相同 —— 请求热路径要按目标模型决定 payload 形状。
+	ThinkingDialect dialect.Dialect
+
+	// CanDisableThinking 是「这个模型能否真正关闭思考」的实测纠正。
+	// nil = 按厂商文档表，true/false = 以实测为准。见 dialect.CanDisable。
+	CanDisableThinking *bool
 
 	// 单价，单位「元 / 百万 tokens」，0 = 未配置（与 store.freezeUsageCost
 	// 的「未配价按 0 计」同义）。语义与上游_models 三列逐字对应：

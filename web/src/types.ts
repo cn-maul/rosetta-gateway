@@ -126,6 +126,10 @@ export interface DiscoveredModel {
   effort_levels?: string
   /** 三态：undefined = 上游没报（网关不干预）；true/false = 上游明确表态。 */
   supports_thinking?: boolean
+  /** 按模型名推断的思考方言，供添加时预填。 */
+  thinking_dialect?: string
+  /** 上面那个值是「推断的（detected）」还是「兜底的（fallback）」。 */
+  thinking_dialect_source?: string
 }
 
 // 批量导入的单条模型
@@ -138,6 +142,13 @@ export interface ModelImportItem {
   effort_levels?: string
   /** 见 DiscoveredModel.supports_thinking。 */
   supports_thinking?: boolean
+  /**
+   * 思考方言：deepseek / glm / qwen / minimax / kimi / openai / anthropic /
+   * passthrough。空串 = 自动（后端按 model_id 推断）。
+   */
+  thinking_dialect?: string
+  /** 能否关闭思考的实测纠正；缺席 = 按厂商文档表。 */
+  can_disable_thinking?: boolean
   /**
    * 单价三档（元 / 1M tokens）。只有「手动添加模型」这一档会填：
    * 探测导入时上游 /models 从不报价格。留空或填 0 = 不配价（库里落 NULL，
@@ -214,6 +225,27 @@ export interface UpstreamModel {
    * 所有未配置的模型凭空失去思考能力 —— 那是一次静默的能力回退。
    */
   supports_thinking?: boolean
+  /**
+   * 思考方言（见 ModelImportItem.thinking_dialect）。
+   *
+   * 空串 = 自动推断；后端算好的生效值在 effective_thinking_dialect，
+   * 来源在 thinking_dialect_source —— 前端自己不重复推断，避免两套口径。
+   */
+  thinking_dialect: string
+  effective_thinking_dialect: string
+  thinking_dialect_source: string
+  /**
+   * 能否关闭思考的**实测纠正**。
+   *
+   * 缺席 = 按厂商文档表（GLM-5.3 / Kimi K3 / MiniMax-M3.1-Flash 不能关）；
+   * true/false = 以实测为准。中转站会归一化各家写法，文档表在那条链路上
+   * 未必成立 —— 生效值见 effective_can_disable_thinking。
+   */
+  can_disable_thinking?: boolean
+  /** 后端按「实测纠正优先，否则文档表」算好的最终结果。 */
+  effective_can_disable_thinking: boolean
+  /** effective 的来源：manual（实测纠正）/ detected（厂商文档表）。 */
+  can_disable_thinking_source: string
   tokens_per_sec?: number // 近 5 次真实调用的平均输出速度；未调用过则不下发
   ttfb_ms?: number // 近 5 次流式调用的平均首字延迟（毫秒）；非流式/未测得则不下发
   success_rate?: number // 近 100 次调用成功率（0~1）
@@ -435,6 +467,16 @@ export interface UpstreamModelUpdate {
    * 映射成 false 在语义上完全相反。
    */
   supports_thinking?: boolean | null
+  /**
+   * 思考方言：缺席 = 不改；空串 = 改回自动（按模型名推断）；
+   * 已知值 = 管理员手工指定，推断不再覆盖它。
+   */
+  thinking_dialect?: string
+  /**
+   * 能否关闭思考的实测纠正，三态：缺席 = 不改；true/false = 以实测为准；
+   * **null = 清除**（回到厂商文档表）。
+   */
+  can_disable_thinking?: boolean | null
   // 单价（元 / 百万 tokens）也走这一个 PATCH：Settings 页「模型价格」正是
   // 按 provider_id + model_id 直接改这几列，与模型编辑共用同一个端点。
   price_input?: number
@@ -1285,6 +1327,18 @@ export interface ConfigExportModel {
   supports_thinking?: boolean
   /** 逗号分隔的挡位原文（与库里那列同形）；空 = 未配置。 */
   effort_levels?: string
+  /**
+   * 思考方言（见 UpstreamModel.thinking_dialect）；空 = 自动推断。
+   *
+   * 导出必须带上它：方言是照厂商文档配出来的运维知识，换台机器重建时
+   * 丢了就只能靠模型名重新猜，而中转站改过名的模型猜不出来。
+   */
+  thinking_dialect?: string
+  /**
+   * 能否关闭思考的实测纠正：缺席 = 按厂商文档表，true/false = 以实测为准。
+   * 导出必须带上它 —— 中转站归一化写法后，文档表在这条链路上可能是错的。
+   */
+  can_disable_thinking?: boolean
   price_input?: number
   price_cache_hit?: number
   price_cache_creation?: number

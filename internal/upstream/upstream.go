@@ -1388,8 +1388,14 @@ func buildClient(ctx context.Context, prov *ProviderEntry, apiKey string, cfg *c
 		// 且 Idempotency-Key 对 DeepSeek/vLLM/各类中转普遍无效。
 		// 网关自己的重试策略：故障转移链（route_targets），不是同一个上游反复打。
 		rosetta.WithQuirks(rosetta.Quirks{NoIdempotencyKey: true}),
-		// 不装任何 Extra 覆盖开关（既非 WithExtraOverrides，也非
-		// WithExtraOverrideKeys）：网关现在**不往 Extra 里写任何保留键**。
+		// 只放行 thinking 一个保留键：显式关闭思考必须把它写进上游 payload，
+		// 而各协议的开关形状不同（DeepSeek chat/anthropic 都是
+		// {"thinking":{"type":"disabled"}}，responses 是 reasoning.effort:none）。
+		// responses 侧走 EffortRaw，不需要这个键；chat 侧它不是保留键；
+		// 真正需要放开的只有 anthropic 目标（SDK 把 thinking 列为保留键）。
+		//
+		// 不装 WithExtraOverrides(true)（全放开）：那会让未来任何越界写入
+		// 静默覆盖 SDK 算好的 payload，extra_override_test.go 会当场红。
 		//
 		// 曾经要覆盖的 messages（Responses→chat 的 turn 合并）已在入站
 		// ToRosetta 修掉：一轮 assistant 直接合成一条 Message 多 Block，
@@ -1400,6 +1406,11 @@ func buildClient(ctx context.Context, prov *ProviderEntry, apiKey string, cfg *c
 		// 保持默认（碰撞即 ErrInvalidRequest）是一道免费的护栏：未来谁再
 		// 往 Extra 塞保留键，会在网关进程内被当场拒掉，而不是静默覆盖
 		// SDK 算好的 payload。回归防线见 extra_override_test.go。
+		// output_config 是第二个：DeepSeek/GLM/Qwen/MiniMax 的 Anthropic
+		// 兼容端点忽略 budget_tokens，强度只认 output_config.effort
+		// （见 internal/dialect）。SDK 只在结构化输出时写这个键，思考强度
+		// 得由网关补进去；不放开就会撞上 ErrInvalidRequest。
+		rosetta.WithExtraOverrideKeys("thinking", "output_config"),
 	}
 	// WithTimeout also bounds DetectClient's /models probe. Install it before
 	// auto-detection so a hanging endpoint cannot hold pool construction for

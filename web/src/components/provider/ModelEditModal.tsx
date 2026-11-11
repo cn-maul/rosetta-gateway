@@ -1,5 +1,20 @@
 import { useEffect, useMemo, useState } from 'react'
-import { Button, Input, Label, TextField, ToggleButton, ToggleButtonGroup, toast } from '@heroui/react'
+import {
+  Button,
+  Input,
+  Label,
+  ListBox,
+  ListBoxItem,
+  Select,
+  SelectIndicator,
+  SelectPopover,
+  SelectTrigger,
+  SelectValue,
+  TextField,
+  ToggleButton,
+  ToggleButtonGroup,
+  toast,
+} from '@heroui/react'
 import { api } from '../../api'
 import { AppModal } from '../../ui/AppModal'
 import { confirmBox } from '../../ui/confirm'
@@ -9,6 +24,10 @@ import { StatusChip } from '../../ui/StatusChip'
 import { effortTone } from '../../effortTone'
 import { fmtTokens } from '../../fmt'
 import { parseTokenCount } from '../../tokenCount'
+import {
+  THINKING_DIALECT_OPTIONS,
+  thinkingDialectSourceHint,
+} from '../../thinkingDialect'
 import type { DiscoveredModel, UpstreamModel } from '../../types'
 
 const is401 = (e: unknown): boolean => (e as { status?: number }).status === 401
@@ -54,6 +73,8 @@ export function ModelEditModal({
   const [priceOutput, setPriceOutput] = useState('0')
   const [effortCsv, setEffortCsv] = useState('')
   const [thinking, setThinkingState] = useState<Thinking>('unset')
+  const [dialect, setDialect] = useState('')
+  const [canDisable, setCanDisable] = useState<Thinking>('unset')
   const [saving, setSaving] = useState(false)
 
   useEffect(() => {
@@ -73,6 +94,14 @@ export function ModelEditModal({
       original.supports_thinking === undefined
         ? 'unset'
         : original.supports_thinking
+          ? 'yes'
+          : 'no',
+    )
+    setDialect(original.thinking_dialect ?? '')
+    setCanDisable(
+      original.can_disable_thinking === undefined
+        ? 'unset'
+        : original.can_disable_thinking
           ? 'yes'
           : 'no',
     )
@@ -169,6 +198,11 @@ export function ModelEditModal({
         // 三态映射：unset → null（后端解成「清除」）。不能省略字段 ——
         // 省略是「不改」，「切回未配置并保存」必须真的写下去。
         supports_thinking: thinking === 'unset' ? null : thinking === 'yes',
+        // 空串 = 改回自动；后端按模型名重新推断。
+        thinking_dialect: dialect,
+        // 能否关闭思考：unset → null（回到厂商文档表）。
+        // 这张表描述的是「直连厂商端点」；中转站归一化写法后实测可能相反。
+        can_disable_thinking: canDisable === 'unset' ? null : canDisable === 'yes',
       })
       onClose()
       toast.success('模型已更新')
@@ -268,6 +302,64 @@ export function ModelEditModal({
             </div>
           ) : null}
         </fieldset>
+
+        {/* 方言：决定「开关思考」这个动作要用哪家的话写。
+            它和挡位是两个轴 —— 挡位说支持哪几档，方言说这些字段叫什么。
+            放最后是因为它是最少改的一项：自动识别对绝大多数模型是对的，
+            只有中转站改了模型名、或同一名字在不同渠道行为不同时才需要动。 */}
+        <div className="flex flex-col gap-1">
+          <Label>思考方言</Label>
+          <Select
+            aria-label="思考方言"
+            selectedKey={dialect}
+            onSelectionChange={(key) => key !== null && setDialect(String(key))}
+          >
+            <SelectTrigger>
+              <SelectValue />
+              <SelectIndicator />
+            </SelectTrigger>
+            <SelectPopover>
+              <ListBox aria-label="厂商方言">
+                {THINKING_DIALECT_OPTIONS.map((o) => (
+                  <ListBoxItem key={o.value} id={o.value}>
+                    {o.label}
+                  </ListBoxItem>
+                ))}
+              </ListBox>
+            </SelectPopover>
+          </Select>
+          <span className="text-muted text-[11px]">
+            {dialect === '' && original.effective_thinking_dialect
+              ? `当前生效：${THINKING_DIALECT_OPTIONS.find((o) => o.value === original.effective_thinking_dialect)?.label ?? original.effective_thinking_dialect}（${thinkingDialectSourceHint(original.thinking_dialect_source)}）`
+              : THINKING_DIALECT_OPTIONS.find((o) => o.value === dialect)?.hint}
+          </span>
+        </div>
+
+        {/* 能否关闭思考：厂商文档说 GLM-5.3 / Kimi K3 / MiniMax-M3.1-Flash
+            不能关，但那是直连时的行为。中转站会归一化各家写法，实测可能
+            相反 —— 那时按文档表降级成「最低档」会让用户点了关闭、上游照旧
+            思考并计费。这里是按实测纠正的入口。 */}
+        <div className="flex flex-col gap-1">
+          <Label>能否关闭思考</Label>
+          <ToggleButtonGroup
+            aria-label="能否关闭思考"
+            selectionMode="single"
+            selectedKeys={[canDisable]}
+            onSelectionChange={(keys) => {
+              const v = String([...keys][0] ?? 'unset') as Thinking
+              setCanDisable(v)
+            }}
+          >
+            <ToggleButton id="unset">按厂商文档</ToggleButton>
+            <ToggleButton id="yes">能关</ToggleButton>
+            <ToggleButton id="no">不能关</ToggleButton>
+          </ToggleButtonGroup>
+          <span className="text-muted text-[11px]">
+            {canDisable === 'unset'
+              ? `当前生效：${original.effective_can_disable_thinking ? '能关' : '不能关（会降级到最低档）'}（按厂商文档表）`
+              : '以你的实测为准；改完保存后立即生效'}
+          </span>
+        </div>
       </form>
     </AppModal>
   )
@@ -311,6 +403,9 @@ export function ModelDiscoverModal({
   const [mPriceInput, setMPriceInput] = useState('0')
   const [mPriceCacheHit, setMPriceCacheHit] = useState('0')
   const [mPriceOutput, setMPriceOutput] = useState('0')
+  // 手动添加默认「自动」：管理员只要填对 model_id，后端推断通常就够了；
+  // 认错时再回来改（这正是方言挂模型而不是写死规则的意义）。
+  const [mDialect, setMDialect] = useState('')
 
   useEffect(() => {
     if (!open) return
@@ -326,6 +421,7 @@ export function ModelDiscoverModal({
     setMPriceInput('0')
     setMPriceCacheHit('0')
     setMPriceOutput('0')
+    setMDialect('')
   }, [open])
 
   const filteredDiscovered = useMemo(() => {
@@ -388,6 +484,10 @@ export function ModelDiscoverModal({
           // （「上游明确说不支持」），|| 会把它抹掉。
           effort_levels: d.effort_levels ?? '',
           supports_thinking: d.supports_thinking ?? undefined,
+          // 方言只传管理员没动过的那个：探测结果里的值是推断出来的建议，
+          // 原样传给后端等同于「把推断结果当手工配置存下来」，
+          // 以后上游改名就再也享受不到重新推断。空串 = 后端自己推。
+          thinking_dialect: '',
         })),
       )
       toast.success(`已添加 ${r.imported} 个模型`)
@@ -436,6 +536,7 @@ export function ModelDiscoverModal({
           price_input: prices[0],
           price_cache_hit: prices[1],
           price_output: prices[2],
+          thinking_dialect: mDialect,
         },
       ])
       toast.success(`已添加 ${r.imported} 个模型`)
@@ -543,6 +644,31 @@ export function ModelDiscoverModal({
                 {PriceField('输出', mPriceOutput, setMPriceOutput)}
               </div>
             </fieldset>
+            <div className="flex flex-col gap-1">
+              <Label>思考方言</Label>
+              <Select
+                aria-label="思考方言"
+                selectedKey={mDialect}
+                onSelectionChange={(key) => key !== null && setMDialect(String(key))}
+              >
+                <SelectTrigger>
+                  <SelectValue />
+                  <SelectIndicator />
+                </SelectTrigger>
+                <SelectPopover>
+                  <ListBox aria-label="厂商方言">
+                    {THINKING_DIALECT_OPTIONS.map((o) => (
+                      <ListBoxItem key={o.value} id={o.value}>
+                        {o.label}
+                      </ListBoxItem>
+                    ))}
+                  </ListBox>
+                </SelectPopover>
+              </Select>
+              <span className="text-muted text-[11px]">
+                {THINKING_DIALECT_OPTIONS.find((o) => o.value === mDialect)?.hint}
+              </span>
+            </div>
             <span className="text-muted text-[11px]">
               上游不实现 /models 或不给列表权限时用这一档。上下文窗口与最大输出填 0
               会套用「模型默认值」；单价留 0 = 不配价（之后可到列表里改），思考挡位请在

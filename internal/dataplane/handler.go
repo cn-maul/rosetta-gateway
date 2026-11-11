@@ -255,6 +255,15 @@ func (h *Handler) Handle(codec ingress.Codec) http.HandlerFunc {
 		}
 		decoded = ing
 		diag.setPublicModel(ing.Model)
+		if ing.Suffix.Raw != "" {
+			// 后缀是「这次请求为什么和默认配置发得不一样」的唯一线索，
+			// 必须在开始打上游之前就记下来。
+			logger.Info("model suffix override",
+				"model", ing.Model,
+				"suffix", ing.Suffix.Raw,
+				"dialect", string(ing.Suffix.Dialect),
+				"request_id", httpx.RequestIDFromContext(r.Context()))
+		}
 		if ing.Stream {
 			admissionStart := diag.begin("admission")
 			if !h.acquireStreamSlot(r.Context()) {
@@ -1005,6 +1014,7 @@ func (h *Handler) attemptStream(w http.ResponseWriter, r *http.Request, client *
 	upstreamReq := ing.BuildRosetta()
 	upstreamReq.Model = cand.UpstreamModel.ModelID
 	ing.ApplyThinkingCapability(upstreamReq, cand.UpstreamModel, upstreamProtocol)
+	ing.ApplyProtocolThinking(upstreamReq, cand.UpstreamModel, upstreamProtocol)
 	// 剥掉目标协议回放不了的思考块（chat 剥签名的与无文本的、anthropic 剥无签名的），
 	// 否则 harness 回传 thinking 后的第二轮必然 400。详见 replay.go。
 	h.applyReplayGate(upstreamReq, upstreamProtocol)
@@ -1577,6 +1587,7 @@ func (h *Handler) attemptNonStream(w http.ResponseWriter, r *http.Request, clien
 	upstreamReq := ing.BuildRosetta()
 	upstreamReq.Model = cand.UpstreamModel.ModelID
 	ing.ApplyThinkingCapability(upstreamReq, cand.UpstreamModel, upstreamProtocol)
+	ing.ApplyProtocolThinking(upstreamReq, cand.UpstreamModel, upstreamProtocol)
 	// 与 attemptStream 同一刀，理由见 replay.go。
 	h.applyReplayGate(upstreamReq, upstreamProtocol)
 	attempt.RequestBuildMs = time.Since(buildStart).Milliseconds()

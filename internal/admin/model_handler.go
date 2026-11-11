@@ -5,12 +5,14 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"strings"
 	"time"
 
 	"github.com/cn-maul/rosetta"
 	"github.com/cn-maul/rosetta-gateway/internal/config"
+	"github.com/cn-maul/rosetta-gateway/internal/dialect"
 	"github.com/cn-maul/rosetta-gateway/internal/effort"
 	"github.com/cn-maul/rosetta-gateway/internal/store"
 	"github.com/cn-maul/rosetta-gateway/internal/upstream"
@@ -67,6 +69,26 @@ type modelRequest struct {
 	// 此前这一列已在 schema 里存在却**既无接口字段也无界面入口**，于是
 	// 「配了不生效」—— 那正是这个字段要消灭的状态。
 	SupportsThinking *nullableBool `json:"supports_thinking"`
+
+	// ThinkingDialect 是该模型的思考方言。三种输入：
+	//   字段缺席 = 不改（PATCH）／自动（Create，按模型名推断）；
+	//   空串     = 显式设回「自动」；
+	//   已知方言 = 管理员手工指定，推断不再覆盖它。
+	//
+	// 用 *string 而不是值类型，是为了保住「缺席」与「空串」的区别 ——
+	// 前者是「别动」，后者是「改回自动」，两者在 PATCH 语义下完全不同。
+	ThinkingDialect *string `json:"thinking_dialect"`
+
+	// CanDisableThinking 是「这个模型能否真正关闭思考」的实测纠正，三态：
+	//   字段缺席 = 不改（PATCH）／自动（Create，按厂商文档表）；
+	//   true/false = 以实测为准；
+	//   null = 清除，回到按厂商文档表判断。
+	//
+	// 为什么需要它：dialect 里那张「GLM-5.3 / Kimi K3 / MiniMax-M3.1-Flash
+	// 不能关」的表描述的是直连厂商端点。中转站会归一化各家写法 ——
+	// 实测 opencode.ai 的 glm-5.3、kimi-k3.1-pro 接受 disabled。不提供纠正
+	// 入口时，用户点了「关思考」，网关却降级成最低档，上游照旧思考并计费。
+	CanDisableThinking *nullableBool `json:"can_disable_thinking"`
 }
 
 // nullableBool 解码 JSON 的三态布尔：true / false / null。
@@ -129,6 +151,33 @@ func levelListHint() string {
 	return strings.Join(names, " / ")
 }
 
+// applyThinkingDialect 校验并写入方言。
+//
+// 空串是合法值 = 自动，不是「无效」。非法值直接 400 而不是回落到自动：
+// 静默回落会让「填错了」表现为「配了但没生效」，而方言猜错的代价是
+// 真实请求 400。
+func applyThinkingDialect(m *store.UpstreamModel, raw string) error {
+	d, ok := dialect.Parse(raw)
+	if !ok {
+		names := make([]string, 0, len(dialect.All)+1)
+		for _, known := range dialect.All {
+			names = append(names, string(known))
+		}
+		return fmt.Errorf("thinking_dialect 取值不认识（收到 %q），合法值：auto（空串）/ %s",
+			raw, strings.Join(names, " / "))
+	}
+	m.ThinkingDialect = d
+	return nil
+}
+
+// canDisableSource 说明「能否关闭思考」这个判定来自哪里，供前端显示。
+func canDisableSource(v *bool) string {
+	if v == nil {
+		return string(dialect.SourceDetected)
+	}
+	return "manual"
+}
+
 // @ts-type UpstreamModel
 type modelResponse struct {
 	ID                 string  `json:"id"`
@@ -155,6 +204,21 @@ type modelResponse struct {
 	// SupportsThinking 三态：nil = 未配置（不下发该字段），
 	// true/false 才是显式声明。
 	SupportsThinking *bool `json:"supports_thinking,omitempty"`
+	// CanDisableThinking 是实测纠正值：nil = 按厂商文档表（默认）。
+	CanDisableThinking *bool `json:"can_disable_thinking,omitempty"`
+	// EffectiveCanDisable 是**最终会不会依据它下发关闭**，由后端算好下发，
+	// 前端不再自己推一遍（与方言的 effective 字段同一理由）。
+	EffectiveCanDisable bool `json:"effective_can_disable_thinking"`
+	// CanDisableSource 说明 EffectiveCanDisable 来自实测纠正还是文档表。
+	CanDisableSource string `json:"can_disable_thinking_source"`
+
+	// ThinkingDialect 是库里配的方言，空串 = 自动。
+	// EffectiveDialect 是**真正会用的那个**（自动 + 模型名推断的结果），
+	// 由后端算好下发：前端自己再推一遍就是两套口径，早晚对不上。
+	ThinkingDialect  dialect.Dialect `json:"thinking_dialect"`
+	EffectiveDialect dialect.Dialect `json:"effective_thinking_dialect"`
+	// DialectSource 说明 EffectiveDialect 是手工配的、推断的、还是兜底。
+	DialectSource dialect.Source `json:"thinking_dialect_source"`
 
 	// GroupID 是模型归组（跨上游同名合并统计）。空串 = 未归组。
 	// 只下发 id 不下发组名：组名要再查 model_groups，而前端本来就独立
@@ -307,6 +371,15 @@ func (h *ModelHandler) Create(w http.ResponseWriter, r *http.Request, providerID
 	if req.SupportsThinking != nil {
 		m.SupportsThinking = req.SupportsThinking.asOpt()
 	}
+	if req.ThinkingDialect != nil {
+		if err := applyThinkingDialect(m, *req.ThinkingDialect); err != nil {
+			writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+	}
+	if req.CanDisableThinking != nil {
+		m.CanDisableThinking = req.CanDisableThinking.asOpt()
+	}
 
 	if err := h.store.CreateUpstreamModel(r.Context(), m); err != nil {
 		if store.IsUniqueViolation(err) {
@@ -416,6 +489,17 @@ func (h *ModelHandler) Update(w http.ResponseWriter, r *http.Request, id string)
 	// 支持思考：nil = 不改；null = 清除（回到未配置）；true/false = 显式声明。
 	if req.SupportsThinking != nil {
 		existing.SupportsThinking = req.SupportsThinking.asOpt()
+	}
+	// 方言：nil = 不改；空串 = 改回自动（按模型名推断）；已知值 = 手工指定。
+	if req.ThinkingDialect != nil {
+		if err := applyThinkingDialect(existing, *req.ThinkingDialect); err != nil {
+			writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+	}
+	// 能否关闭思考：nil = 不改；null = 清除（回到文档表）；true/false = 实测值。
+	if req.CanDisableThinking != nil {
+		existing.CanDisableThinking = req.CanDisableThinking.asOpt()
 	}
 
 	if err := h.store.UpdateUpstreamModel(r.Context(), id, existing); err != nil {
@@ -724,6 +808,10 @@ type discoveredModel struct {
 	// SupportsThinking 三态：字段缺席 = 上游没报（不知道，网关不干预）；
 	// true/false = 上游明说。用 *bool 就是为了保住这个「不知道」。
 	SupportsThinking *bool `json:"supports_thinking,omitempty"`
+	// ThinkingDialect / DialectSource 是按模型名推断出的方言，供添加时
+	// **预填**给管理员看；他不认同可以改成别的，改过之后就不再推断。
+	ThinkingDialect dialect.Dialect `json:"thinking_dialect"`
+	DialectSource   dialect.Source  `json:"thinking_dialect_source"`
 }
 
 // effortCSV 把上游报的挡位数组转成库里那一列的 CSV 形状。
@@ -777,6 +865,7 @@ func (h *ModelHandler) Discover(w http.ResponseWriter, r *http.Request, provider
 		if maxOut <= 0 {
 			maxOut = def.MaxOutputTokens
 		}
+		effective, source := dialect.Resolve(dialect.Auto, c.ID)
 		result = append(result, discoveredModel{
 			ModelID:          c.ID,
 			DisplayName:      name,
@@ -784,7 +873,14 @@ func (h *ModelHandler) Discover(w http.ResponseWriter, r *http.Request, provider
 			MaxOutputTokens:  maxOut,
 			EffortLevels:     effortCSV(c.EffortLevels),
 			SupportsThinking: c.SupportsThinking,
+			ThinkingDialect:  dialect.Auto,
+			DialectSource:    source,
 		})
+		// 推断出的方言直接写进 ThinkingDialect 会让「发现」看起来像
+		// 「已有配置」；这里只回 DialectSource，真正的建议值放在
+		// 下一次响应里由 Resolve 给出。为了让前端能预填，仍把建议值
+		// 带上 —— 但来源标记为 detected，前端据此显示「已自动识别」。
+		result[len(result)-1].ThinkingDialect = effective
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"status": "ok", "models": result})
 }
@@ -800,6 +896,11 @@ type modelImportItem struct {
 	// 两者都是「**有值才写**」语义，理由见 importThinking 的注释。
 	EffortLevels     string `json:"effort_levels"`
 	SupportsThinking *bool  `json:"supports_thinking"`
+	// ThinkingDialect 是手工指定的方言。空串/缺席 = 自动（按模型名推断）。
+	// 探测导入时前端不传，让后端推断；手工添加时管理员可以直接选一家。
+	ThinkingDialect string `json:"thinking_dialect"`
+	// CanDisableThinking 是实测纠正值；nil = 按厂商文档表。
+	CanDisableThinking *bool `json:"can_disable_thinking,omitempty"`
 
 	// 价格三档（2026-10-31）只在「手动添加模型」这一档用得上：探测导入时
 	// 上游 /models 从不报价格，而手工添加的管理员已经在表单里把价填好了，
@@ -911,6 +1012,24 @@ func importThinking(m *store.UpstreamModel, it modelImportItem) {
 		v := *it.SupportsThinking
 		m.SupportsThinking = &v
 	}
+	// 方言只写显式给出的值：空串在这个接口里意味着「让后端推断」，
+	// 而库里的 NULL 恰好就是「自动」，两者一致，不需要额外区分。
+	//
+	// 非法值不在这里报错（导入是批量接口，一条脏数据不该拖垮整批）——
+	// 但也不能静默丢掉：记一条日志，管理员能从服务日志追到是哪一条。
+	if csv := strings.TrimSpace(it.ThinkingDialect); csv != "" {
+		if d, ok := dialect.Parse(csv); ok {
+			m.ThinkingDialect = d
+		} else {
+			slog.Warn("import: unknown thinking_dialect, falling back to auto",
+				"model", m.ModelID, "value", csv)
+		}
+	}
+	// 实测纠正值：只有显式带上才写，nil = 按厂商文档表。
+	if it.CanDisableThinking != nil {
+		v := *it.CanDisableThinking
+		m.CanDisableThinking = &v
+	}
 }
 
 func toModelResponse(m store.UpstreamModel) modelResponse {
@@ -920,6 +1039,7 @@ func toModelResponse(m store.UpstreamModel) modelResponse {
 	if levels == nil {
 		levels = []effort.Level{}
 	}
+	effective, source := dialect.Resolve(m.ThinkingDialect, m.ModelID)
 	return modelResponse{
 		ID:              m.ID,
 		ProviderID:      m.ProviderID,
@@ -931,11 +1051,17 @@ func toModelResponse(m store.UpstreamModel) modelResponse {
 		PriceCacheHit:   m.PriceCacheHit,
 		// PriceCacheCreation 之前声明了却没赋值，回给前端恒为 0：界面上一度
 		// 显示「缓存写入 0」而库里其实有价。2026-10-31 补上。
-		PriceCacheCreation: m.PriceCacheCreation,
-		PriceOutput:        m.PriceOutput,
-		EffortLevels:       levels,
-		UnknownLevels:      m.UnknownLevels,
-		SupportsThinking:   m.SupportsThinking,
-		GroupID:            m.GroupID,
+		PriceCacheCreation:  m.PriceCacheCreation,
+		PriceOutput:         m.PriceOutput,
+		EffortLevels:        levels,
+		UnknownLevels:       m.UnknownLevels,
+		SupportsThinking:    m.SupportsThinking,
+		CanDisableThinking:  m.CanDisableThinking,
+		EffectiveCanDisable: dialect.CanDisable(effective, m.ModelID, m.CanDisableThinking),
+		CanDisableSource:    canDisableSource(m.CanDisableThinking),
+		ThinkingDialect:     m.ThinkingDialect,
+		EffectiveDialect:    effective,
+		DialectSource:       source,
+		GroupID:             m.GroupID,
 	}
 }

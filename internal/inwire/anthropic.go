@@ -9,6 +9,8 @@ import (
 	"strings"
 
 	"github.com/cn-maul/rosetta"
+
+	"github.com/cn-maul/rosetta-gateway/internal/effort"
 )
 
 // Anthropic Messages 协议的入站解码（POST /v1/messages）。
@@ -51,7 +53,24 @@ type AnthropicMessagesRequest struct {
 	// 对 OpenAI 系上游而言，夹紧后的档位才是真正发出去的 reasoning_effort。
 	RawEffort string `json:"-"`
 
-	// Metadata / service_tier / 等未建模字段由 encoding/json 忽略。
+	// Suffix 是 model 尾巴上的一次性覆盖（@thinking:off 等）。
+	Suffix ModelSuffix `json:"-"`
+
+	// Metadata 是 Anthropic 的请求级元数据，其中唯一有语义的是 `user_id`
+	// （DeepSeek 的 Anthropic 兼容端点明确支持它，其余条目厂商一律忽略）。
+	//
+	// 之前整个字段被 encoding/json 忽略：客户端在 Anthropic 入口设了业务侧
+	// 用户标识，网关回 200，上游却从未收到 —— 与 Chat 入口丢 `user` 是同一个
+	// 漏点，只是另一个协议。
+	Metadata *AnthropicMetadata `json:"metadata,omitempty"`
+
+	// service_tier / container / mcp_servers 等未建模字段仍由
+	// encoding/json 忽略。
+}
+
+// AnthropicMetadata 只取 user_id；其余条目没有跨协议对应物。
+type AnthropicMetadata struct {
+	UserID string `json:"user_id,omitempty"`
 }
 
 type AnthropicMessage struct {
@@ -157,9 +176,11 @@ func DecodeAnthropicMessagesRequest(r *http.Request, maxBytes int64) (*Anthropic
 			if req.Thinking.BudgetTokens <= 0 {
 				return nil, fmt.Errorf("thinking: type=enabled requires budget_tokens > 0")
 			}
+		case "adaptive":
+			// Claude 5 一代的写法：模型自选预算，不需要 budget_tokens。
 		case "disabled":
 		default:
-			return nil, fmt.Errorf("thinking.type: must be enabled|disabled, got %q", req.Thinking.Type)
+			return nil, fmt.Errorf("thinking.type: must be enabled|adaptive|disabled, got %q", req.Thinking.Type)
 		}
 		// 预算 → 档位，与 rosetta 的 effortFromBudget 同一分界，
 		// 保证 ToRosetta 之后数据面拿到的档位与最终发出去的 budget 对得上。
@@ -171,6 +192,41 @@ func DecodeAnthropicMessagesRequest(r *http.Request, maxBytes int64) (*Anthropic
 				req.RawEffort = "medium"
 			default:
 				req.RawEffort = "high"
+			}
+		}
+	}
+
+	// model 后缀最后应用：优先于请求体，且要覆盖上面由预算折算出的档位。
+	baseModel, sfx, err := ParseModelSuffix(req.Model)
+	if err != nil {
+		return nil, err
+	}
+	req.Model = baseModel
+	req.Suffix = sfx
+	if sfx.Set {
+		switch {
+		case sfx.ThinkingOff:
+			req.Thinking = &AnthropicThinking{Type: "disabled"}
+			req.RawEffort = ""
+		case sfx.ThinkingOn:
+			switch {
+			case sfx.Adaptive:
+				req.Thinking = &AnthropicThinking{Type: "adaptive"}
+				req.RawEffort = ""
+			case sfx.Budget > 0:
+				req.Thinking = &AnthropicThinking{Type: "enabled", BudgetTokens: sfx.Budget}
+				req.RawEffort = string(budgetLevel(sfx.Budget))
+			default:
+				// Anthropic 没有 effort 字段，只能用预算表达强度。
+				level := sfx.Level
+				if level == effort.Unset {
+					level = effort.Medium
+				}
+				req.Thinking = &AnthropicThinking{
+					Type:         "enabled",
+					BudgetTokens: anthropicBudgetFor(level),
+				}
+				req.RawEffort = string(level)
 			}
 		}
 	}
@@ -243,6 +299,9 @@ func (a *AnthropicMessagesRequest) ToRosetta() *rosetta.ChatRequest {
 		TopK:            a.TopK,
 		StopSequences:   a.StopSequences,
 	}
+	if a.Metadata != nil {
+		req.User = a.Metadata.UserID
+	}
 
 	switch {
 	case len(a.System) == 0:
@@ -284,6 +343,15 @@ func (a *AnthropicMessagesRequest) ToRosetta() *rosetta.ChatRequest {
 
 	if a.Thinking != nil && a.Thinking.Type == "enabled" {
 		req.Thinking = &rosetta.ThinkingConfig{BudgetTokens: a.Thinking.BudgetTokens}
+	}
+	if a.Thinking != nil && a.Thinking.Type == "adaptive" {
+		req.Thinking = &rosetta.ThinkingConfig{Adaptive: true}
+	}
+	if a.Thinking != nil && a.Thinking.Type == "disabled" {
+		// `disabled` 必须真正下发：Anthropic 系上游（含 DeepSeek 的
+		// /anthropic 端点）在字段缺省时按默认开思考，省略不等于关闭。
+		// 数据面按目标协议决定最终形态，这里只标记意图。
+		req.Thinking = nil
 	}
 	if tc := anthropicToolChoiceToRosetta(a.ToolChoice); tc != nil {
 		req.ToolChoice = tc
@@ -338,6 +406,13 @@ func (a *AnthropicMessagesRequest) ThinkingBudget() int {
 		return 0
 	}
 	return a.Thinking.BudgetTokens
+}
+
+// ThinkingOff reports whether the client explicitly asked for no thinking
+// (`thinking:{"type":"disabled"}`). The field is absent on the wire to turn
+// thinking off, so this has to be tracked outside rosetta's ThinkingConfig.
+func (a *AnthropicMessagesRequest) ThinkingOff() bool {
+	return a.Thinking != nil && a.Thinking.Type == "disabled"
 }
 
 // 本入口不再需要 ApplyUpstreamExtras：tool_choice / top_k 已在 ToRosetta

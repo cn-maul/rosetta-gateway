@@ -4,6 +4,7 @@ import { StatusChip, type StatusTone } from '../ui/StatusChip'
 import { fmtSpeed, fmtSec, fmtPercent, fmtTokens } from '../fmt'
 import { unitPrice } from '../modelPrice'
 import { effortTone } from '../effortTone'
+import { thinkingDialectLabel } from '../thinkingDialect'
 import type { UpstreamModel } from '../types'
 
 /**
@@ -116,6 +117,19 @@ function thinkingCell(m: UpstreamModel) {  const supported =
           ))}
         </div>
       ) : null}
+      {/* 方言单独一行：它决定「开关思考」用哪家的字段拼写，和挡位是两个轴。
+          只显示生效值（自动时显示推断结果），不显示「配置值」——
+          管理员关心的是「这次请求实际按谁的话发」，而不是库里存了什么。 */}
+      <span
+        className="text-muted text-[11px]"
+        title={
+          m.thinking_dialect === ''
+            ? '自动识别：按模型名推断；认不出来就只发协议标准字段'
+            : '手动指定'
+        }
+      >
+        方言 {thinkingDialectLabel(m.effective_thinking_dialect)}
+      </span>
     </div>
   )
 }

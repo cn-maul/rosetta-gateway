@@ -6,6 +6,7 @@ import (
 	"errors"
 	"strings"
 
+	"github.com/cn-maul/rosetta-gateway/internal/dialect"
 	"github.com/cn-maul/rosetta-gateway/internal/effort"
 )
 
@@ -26,6 +27,21 @@ type UpstreamModel struct {
 	// 界面上会表现为「配了不生效」且无从排查。
 	EffortLevels  []effort.Level
 	UnknownLevels []string
+
+	// ThinkingDialect 是该模型使用的思考字段方言（见 internal/dialect）。
+	//
+	// 空串 = 自动（按 model_id 推断）。它与 EffortLevels 是两个轴：
+	// 挡位说「这个模型支持哪几档」，方言说「开关和档位要用哪家的话写」。
+	// 一个模型可以「支持 low/high/max」但方言未知 —— 那时网关只发协议
+	// 标准字段，不发明厂商私有键。
+	ThinkingDialect dialect.Dialect
+
+	// CanDisableThinking 是「这个模型能否真正关闭思考」的实测纠正。
+	//
+	// nil = 按厂商文档表判断（GLM-5.3 / Kimi K3 / MiniMax-M3.1-Flash 不能关），
+	// true/false = 以实测为准。中转站会归一化各家的写法，实测与文档不一致
+	// 时这张表就是错的 —— 见 dialect.CanDisable。
+	CanDisableThinking *bool
 
 	// 价格：单位为「元 / 百万 tokens」，0 = 未配置（费用统计按 0 计）。
 	// PriceInput 对应缓存未命中的输入，PriceCacheHit 对应缓存命中的输入，
@@ -48,7 +64,7 @@ type UpstreamModel struct {
 // 后者随 provider 级联删除，只是一个兼容镜像；统计口径的权威归属在独立表里。
 // 所有使用本常量的 SELECT 都必须把表引成 `upstream_models um` 并带上
 // `modelGroupJoin`，否则 group_id 会取到旧列或直接报错。
-const modelColumns = `um.id, um.provider_id, um.model_id, um.display_name, um.context_window, um.max_output_tokens, um.supports_thinking, um.effort_levels, um.price_input, um.price_cache_hit, um.price_cache_creation, um.price_output, COALESCE(mgm.group_id, '')`
+const modelColumns = `um.id, um.provider_id, um.model_id, um.display_name, um.context_window, um.max_output_tokens, um.supports_thinking, um.effort_levels, um.thinking_dialect, um.can_disable_thinking, um.price_input, um.price_cache_hit, um.price_cache_creation, um.price_output, COALESCE(mgm.group_id, '')`
 
 const modelGroupJoin = ` LEFT JOIN model_group_members mgm
 	ON mgm.provider_id = um.provider_id AND mgm.model_id = um.model_id`
@@ -85,6 +101,17 @@ func effortColumnValue(m *UpstreamModel) any {
 	return csv
 }
 
+// dialectColumnValue 把方言写进可空列：自动 = NULL。
+//
+// 落 NULL 而不是 "auto"：库里的 NULL 与「没配过」是同一件事，
+// 而 "auto" 会让「这一列到底有没有值」多一层解释。
+func dialectColumnValue(m *UpstreamModel) any {
+	if m.ThinkingDialect == "" {
+		return nil
+	}
+	return string(m.ThinkingDialect)
+}
+
 // scanner 覆盖 *sql.Row 与 *sql.Rows，便于复用同一段 scan 逻辑。
 type scanner interface {
 	Scan(dest ...any) error
@@ -99,11 +126,14 @@ func scanModel(sc scanner) (UpstreamModel, error) {
 	var ctxWindow, maxOut sql.NullInt64
 	var thinking sql.NullBool
 	var effortCSV sql.NullString
+	var dialectCSV sql.NullString
+	var canDisable sql.NullBool
 	var priceIn, priceHit, priceCreate, priceOut sql.NullFloat64
 	var groupID sql.NullString
 
 	err := sc.Scan(&m.ID, &m.ProviderID, &m.ModelID, &displayName,
-		&ctxWindow, &maxOut, &thinking, &effortCSV, &priceIn, &priceHit, &priceCreate, &priceOut, &groupID)
+		&ctxWindow, &maxOut, &thinking, &effortCSV, &dialectCSV, &canDisable,
+		&priceIn, &priceHit, &priceCreate, &priceOut, &groupID)
 	if err != nil {
 		return m, err
 	}
@@ -120,10 +150,22 @@ func scanModel(sc scanner) (UpstreamModel, error) {
 		v := thinking.Bool
 		m.SupportsThinking = &v
 	}
+	if canDisable.Valid {
+		v := canDisable.Bool
+		m.CanDisableThinking = &v
+	}
 	// NULL 与空串都表示「未配置」——两种都得到空 EffortLevels，数据面据此
 	// 不干预思考强度。解析在读取时做一次，快照侧拿到的是已就绪的切片。
 	if effortCSV.Valid && effortCSV.String != "" {
 		m.EffortLevels, m.UnknownLevels = effort.ParseLevels(effortCSV.String)
+	}
+	// 认不出的方言值按「自动」处理：库里的值只能来自本网关的写入路径
+	// （那里已经校验过），走到这里说明配置被外部改过 —— 退回自动比让
+	// 数据面拿一个不存在的方言去发请求安全。
+	if dialectCSV.Valid {
+		if d, ok := dialect.Parse(dialectCSV.String); ok {
+			m.ThinkingDialect = d
+		}
 	}
 	return m, nil
 }
@@ -198,10 +240,10 @@ func (s *Store) CreateUpstreamModelTx(ctx context.Context, tx Tx, m *UpstreamMod
 // createUpstreamModel 接受 execer，供事务内复用（见 ImportUpstreamModels）。
 func createUpstreamModel(ctx context.Context, ex execer, m *UpstreamModel) error {
 	_, err := ex.ExecContext(ctx,
-		`INSERT INTO upstream_models (id, provider_id, model_id, display_name, context_window, max_output_tokens, supports_thinking, effort_levels, price_input, price_cache_hit, price_cache_creation, price_output, group_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		`INSERT INTO upstream_models (id, provider_id, model_id, display_name, context_window, max_output_tokens, supports_thinking, effort_levels, thinking_dialect, can_disable_thinking, price_input, price_cache_hit, price_cache_creation, price_output, group_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		m.ID, m.ProviderID, m.ModelID, nullIfEmpty(m.DisplayName),
 		nullIfZeroInt(m.ContextWindow), nullIfZeroInt(m.MaxOutputTokens), m.SupportsThinking,
-		effortColumnValue(m),
+		effortColumnValue(m), dialectColumnValue(m), m.CanDisableThinking,
 		nullIfZeroFloat(m.PriceInput), nullIfZeroFloat(m.PriceCacheHit), nullIfZeroFloat(m.PriceCacheCreation), nullIfZeroFloat(m.PriceOutput),
 		nullIfEmpty(m.GroupID))
 	if err != nil {
@@ -233,10 +275,10 @@ func (s *Store) UpdateUpstreamModel(ctx context.Context, id string, m *UpstreamM
 		return ErrNotFound
 	}
 	if _, err := tx.ExecContext(ctx,
-		`UPDATE upstream_models SET model_id = ?, display_name = ?, context_window = ?, max_output_tokens = ?, supports_thinking = ?, effort_levels = ?, price_input = ?, price_cache_hit = ?, price_cache_creation = ?, price_output = ?, group_id = ? WHERE id = ?`,
+		`UPDATE upstream_models SET model_id = ?, display_name = ?, context_window = ?, max_output_tokens = ?, supports_thinking = ?, effort_levels = ?, thinking_dialect = ?, can_disable_thinking = ?, price_input = ?, price_cache_hit = ?, price_cache_creation = ?, price_output = ?, group_id = ? WHERE id = ?`,
 		m.ModelID, nullIfEmpty(m.DisplayName),
 		nullIfZeroInt(m.ContextWindow), nullIfZeroInt(m.MaxOutputTokens), m.SupportsThinking,
-		effortColumnValue(m),
+		effortColumnValue(m), dialectColumnValue(m), m.CanDisableThinking,
 		nullIfZeroFloat(m.PriceInput), nullIfZeroFloat(m.PriceCacheHit), nullIfZeroFloat(m.PriceCacheCreation), nullIfZeroFloat(m.PriceOutput),
 		nullIfEmpty(m.GroupID), id); err != nil {
 		return err
