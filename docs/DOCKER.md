@@ -2,11 +2,11 @@
 
 镜像：`ghcr.io/cn-maul/rosetta-gateway`
 
-**镜像版本号 = 软件版本号**，两者都取自 `web/package.json` 的 `version`（当前 **2.1.1**）。
-发布 `v2.1.1` tag 会得到 `:2.1.1` 与 `:latest` 两个标签；CI 会校验 tag 与
+**镜像版本号 = 软件版本号**，两者都取自 `web/package.json` 的 `version`（当前 **2.1.2**）。
+发布 `v2.1.2` tag 会得到 `:2.1.2` 与 `:latest` 两个标签；CI 会校验 tag 与
 `package.json` 一致，不一致直接构建失败（防止打出名不副实的镜像）。
 
-> 下文示例中的 `:2.1.1` 是**编写时的当前版本**。实际部署请先 `docker pull ghcr.io/cn-maul/rosetta-gateway:2.1.1`
+> 下文示例中的 `:2.1.2` 是**编写时的当前版本**。实际部署请先 `docker pull ghcr.io/cn-maul/rosetta-gateway:2.1.2`
 > 确认该 tag 存在，或直接用 `:latest`。
 
 架构：`linux/amd64`（`docker.yml` 的 buildx 只构建这一种；需要 arm64 再说）。
@@ -22,7 +22,7 @@ docker run -d \
   -p 127.0.0.1:8666:8666 \
   -v rosetta-gateway-data:/data \
   --restart unless-stopped \
-  ghcr.io/cn-maul/rosetta-gateway:2.1.1
+  ghcr.io/cn-maul/rosetta-gateway:2.1.2
 ```
 
 然后打开 `http://127.0.0.1:8666/admin/` —— 首次进入会显示「首次设置密码」表单，
@@ -176,7 +176,7 @@ Chrome / Edge / Brave / Opera 一律硬拦；Firefox 也拦，只是报错文案
 ```yaml
 services:
   rosetta-gateway:
-    image: ghcr.io/cn-maul/rosetta-gateway:2.1.1
+    image: ghcr.io/cn-maul/rosetta-gateway:2.1.2
     container_name: rosetta-gateway
     restart: unless-stopped
     # 正常关停的名义预算是 26s（剪枝 5s + 费用重算 2s + 对账 2s +
@@ -366,6 +366,14 @@ docker run --rm -v rosetta-gateway-data:/data -v "$PWD:/backup" alpine sh -c '
 ```bash
 docker compose pull && docker compose up -d
 ```
+
+**v2.1.1 → v2.1.2 可以直接原地升级，无数据库结构变更。** 这一版全在可观测性
+与内部整理上：调用历史的失败详情抽屉新增「失败决策轨迹」（把原本只在
+`route_trace` 里、界面从未展示的每个目标判定与原因展开出来），网关本地终止的
+两条 502（目标在熔断冷却 / 无健康凭据）补写了 `error_detail`——此前这两种
+情况在调用历史里只剩「502 + upstream_error」，无法与「上游真的坏了」区分；
+总览页新增「失败原因」区块，按错误码与上游两个维度汇总，用来判断是某一家
+在坏还是普遍超时。另有协议名映射收敛与请求构建复用两处内部重构，行为不变。
 
 **v2.1.0 → v2.1.1 可以直接原地升级。** 两处变化都在内部：上游 SDK 升到
 rosetta v1.3.2（恢复 Anthropic 侧的 `stop_sequences` / `service_tier` 发送，
