@@ -25,6 +25,10 @@ const reasons: Record<string, string> = {
   probe_busy_or_cooling: '目标仍在熔断冷却，或半开探测名额已被占用',
   no_healthy_credential: '没有可用的健康凭据',
   upstream_error: '上游响应、解析或连接发生错误；具体原因请结合错误详情判断',
+  // 与 upstream_error 刻意分开：这个错误不代表目标不可用，网关也不为它熔断，
+  // 界面必须说清「是上游实现缺陷」而不是「这家挂了」，否则会误导人去摘掉一个
+  // 其实还能用的上游。
+  stream_malformed: '上游在流末尾给出了自相矛盾的数据（内容已交付）；属上游实现缺陷，不计入熔断',
   upstream_timeout: '上游超时或连接失败',
   upstream_auth_error: '上游鉴权失败，请检查凭据或权限',
   upstream_quota_exhausted: '上游额度耗尽',

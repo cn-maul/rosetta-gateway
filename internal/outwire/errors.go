@@ -408,11 +408,17 @@ func FailoverEligible(err error) bool {
 	// 故障而存在的。修复前它落到文件末尾的 `return false`，于是链直接 break，
 	// 健康目标一个都不试。
 	//
-	// 注意这个哨兵**只在一元响应上出现**——SDK 侧刻意没给流式事件解析打这个
-	// 哨兵（见 rosetta 的 upstream_malformed_test.go 注释）：流式解不开时先前
-	// 事件可能已交付，此时重试会重放已交付的输出并可能重复计费。
-	// 所以「流式解不开」走的是流哨兵（ErrStreamTruncated/Overflow）那条路，
-	// 那条路按设计也不可转移。两者不冲突。
+	// 2026-11-11 更正：这里原先写着「这个哨兵只在一元响应上出现，流式解不开
+	// 走的是 ErrStreamTruncated/Overflow」——**已经不成立**。SDK v1.3.2 的
+	// provider_openai_responses.go 里 mapItemErr 会把流式解析中的身份冲突
+	// （errSealConflict / errIndexTaken 等）包成 ErrUpstreamMalformed，实测
+	// 报错原文形如 `rosetta: responses stream (POST ...): conflicting sealed
+	// payloads for one item: rosetta: upstream response could not be decoded`。
+	//
+	// 这条对 FailoverEligible 本身无害：已提交的流不走「转移」这条路（内容
+	// 已经交付，重试会重放），网关按 committed 分支处理。但「可转移」这个
+	// 返回值不能再被当成「它一定是未提交的一元错误」来理解 —— 之前那条注释
+	// 正是这么误导的，导致没人想到流末尾的元数据冲突也要单独归类。
 	if errors.Is(err, rosetta.ErrUpstreamMalformed) {
 		return true
 	}

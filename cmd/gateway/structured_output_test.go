@@ -36,6 +36,14 @@ type harnessChain struct {
 // buildHarnessFull（它的匿名入参结构被十几个既有用例内联声明，不便改签名）。
 func buildHarnessProtocols(t *testing.T, chain []harnessChain, failover bool, codec ingress.Codec) http.HandlerFunc {
 	t.Helper()
+	h, _, _ := buildHarnessProtocolsFull(t, chain, failover, codec)
+	return h
+}
+
+// buildHarnessProtocolsFull 同 buildHarnessProtocols，但把库与 pool 交出来，
+// 供需要断言落库字段或目标健康态的用例使用（与 buildHarnessFull 对齐）。
+func buildHarnessProtocolsFull(t *testing.T, chain []harnessChain, failover bool, codec ingress.Codec) (http.HandlerFunc, *store.Store, *upstream.Pool) {
+	t.Helper()
 
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 
@@ -111,7 +119,7 @@ func buildHarnessProtocols(t *testing.T, chain []harnessChain, failover bool, co
 	snapshot.Init(snap)
 
 	rl := ratelimit.New()
-	return handleIngress(pool, cfg, newUsageRecorder(db, logger), rl, codec)
+	return handleIngress(pool, cfg, newUsageRecorder(db, logger), rl, codec), db, pool
 }
 
 // fakeAnthropic 起一个 Anthropic Messages 形状的假上游（SDK 会 POST

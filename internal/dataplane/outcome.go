@@ -86,6 +86,20 @@ const (
 	OutcomeGatewayTimeout
 	OutcomeDownstreamWriteFailed
 	OutcomeEncodeFailed
+	// OutcomeCommittedMalformed 表示流已经提交（内容与思考都已交付给客户端），
+	// 但 SDK 在终止事件上判定上游自相矛盾，整条流按失败收尾。
+	//
+	// 与 OutcomeCommittedPartial（其余已提交失败）的唯一区别是**不罚目标**：
+	// 这类冲突是上游实现缺陷——最典型的是 responses 流里同一个 reasoning item
+	// 在 output_item.done 与终止事件 response.completed 中给了两份不同的
+	// encrypted_content（SDK 侧 errSealConflict → ErrUpstreamMalformed）。
+	// 它是元数据不一致，不是目标不可用：请求本身的内容已经正常生成并交付了。
+	//
+	// 为什么必须单独一类：这类错误的触发完全取决于上游的翻译层实现，一家中转
+	// 可能每次带思考的请求都犯。按普通已提交失败记账的话，默认阈值 3 就能把
+	// 整家上游熔断成 502，而客户端的实际体验只是「这家的思考元数据脏」——
+	// 熔断把一个局部缺陷放大成了全网不可用。实测见 2026-11-11 的 tiantoken。
+	OutcomeCommittedMalformed
 )
 
 func (k OutcomeKind) String() string {
@@ -106,6 +120,8 @@ func (k OutcomeKind) String() string {
 		return "downstream_write_failed"
 	case OutcomeEncodeFailed:
 		return "encode_failed"
+	case OutcomeCommittedMalformed:
+		return "committed_malformed"
 	default:
 		return "unknown"
 	}
@@ -120,6 +136,14 @@ type LaneDecision struct {
 	Success          bool
 	Eligible         bool
 	PenalizeUpstream bool
+	// NeutralUpstream means "记一次账，但两个方向都不算"：既不累加目标熔断，
+	// 也不清零既有的连续失败计数。
+	//
+	// 为什么要第三态：只把 PenalizeUpstream 置 false 会落进「记成功」分支
+	// （见 recordCommittedOutcome），而那会把一个坏目标的 consecutiveFails
+	// 清零 —— 于是一个「一半请求返回脏数据」的上游反而永远熔断不了。
+	// 目前唯一的产出者是 OutcomeCommittedMalformed。
+	NeutralUpstream  bool
 	DownstreamClient bool
 	GatewayTimeout   bool
 	Billable         bool
@@ -129,6 +153,14 @@ type LaneDecision struct {
 	DiagnosticStatus string
 	DiagnosticError  string
 }
+
+// errorCodeStreamMalformed 是「流已提交后上游给出自相矛盾数据」的落库错误码。
+//
+// 单独一个取值（而不是笼统的 upstream_error）有两个用处：
+//  1. committedKindFor 靠它把这类失败分到不罚目标的那一类；
+//  2. 失败原因聚合页会单独成一行——同一家中转每次带思考都犯这个错时，
+//     一个独立的 code 比混在 upstream_error 里更容易被认出来。
+const errorCodeStreamMalformed = "stream_malformed"
 
 // StreamCommitOutcome maps a persisted terminal status into the trace
 // vocabulary. It is retained for callers that only have the status value.
@@ -292,6 +324,15 @@ func LaneDecisionFor(kind OutcomeKind, committed, eligible bool, code string) La
 		d.DiagnosticError = code
 	case OutcomeGatewayOverflow:
 		d.Committed = true
+		d.TraceOutcome = "committed_fail"
+		d.TraceReason = code
+		d.DiagnosticStatus = "committed_fail"
+		d.DiagnosticError = code
+	case OutcomeCommittedMalformed:
+		// 已提交 + 不罚目标，见 OutcomeCommittedMalformed 的说明。
+		// TraceOutcome 仍是 committed_fail：对客户端而言这条流确实失败了，
+		// 调用历史的轨迹必须如实显示；只是不计入上游健康度。
+		d.Committed, d.NeutralUpstream = true, true
 		d.TraceOutcome = "committed_fail"
 		d.TraceReason = code
 		d.DiagnosticStatus = "committed_fail"

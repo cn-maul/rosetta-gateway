@@ -1425,6 +1425,29 @@ func (h *Handler) attemptStream(p attemptParams) Outcome {
 				// 成功率虚低，且真故障被 ERROR 噪音淹没。单独一个取值才能把两者分开。
 				status = store.UsageStatusCanceled
 				logger.Info("client disconnected mid-stream", "model", publicModel, "key_id", authCtx.KeyID, "error", err)
+			case errors.Is(err, rosetta.ErrUpstreamMalformed):
+				// 流已提交，但 SDK 在终止事件上判定上游自相矛盾。
+				//
+				// 最典型的现场是 responses 流：同一个 reasoning item 在
+				// output_item.done 与终止事件 response.completed 的 output
+				// 数组里给了两份不同的 encrypted_content，SDK 判
+				// errSealConflict 并包成 ErrUpstreamMalformed（见 SDK
+				// provider_openai_responses.go 的 mapItemErr）。
+				//
+				// 这类错误**不计入目标失败/熔断**（见 committedKindFor 与
+				// OutcomeCommittedMalformed）：它是上游翻译层的元数据缺陷，
+				// 而请求正文其实已经正常生成并交付。按普通失败记账的后果是
+				// 三次请求就把整家上游熔断成 502 —— 2026-11-11 的 tiantoken
+				// 正是这么把「某个模型一直 502」制造出来的。
+				//
+				// 仍要落库 + 报警：客户端确实收到了一条没有正常收尾的流。
+				status = store.UsageStatusError
+				errorCode = errorCodeStreamMalformed
+				errorDetail = outwire.UpstreamErrorDetail(err)
+				logger.Error("stream ended with an inconsistent upstream response",
+					"model", publicModel, "key_id", authCtx.KeyID,
+					"provider", cand.Provider.Slug, "error", err,
+					"note", "上游在终止事件上给出自相矛盾的数据；已提交无法重试，不计入目标熔断")
 			default:
 				status = store.UsageStatusError
 				errorCode = "upstream_error"
@@ -1587,7 +1610,7 @@ func (h *Handler) attemptStream(p attemptParams) Outcome {
 	// outer lane treat the already-recorded stream as an uncommitted failure and
 	// write a second 502/zero-token usage row for the same request.
 	out := Outcome{
-		Kind:      committedKindForStatus(status),
+		Kind:      committedKindFor(status, errorCode),
 		Committed: true,
 		Code:      errorCode,
 	}.normalize()
