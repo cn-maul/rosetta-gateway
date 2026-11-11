@@ -21,6 +21,7 @@ import { PageHeader } from '../ui/PageHeader'
 import { SectionCard } from '../ui/SectionCard'
 import { BarChart } from '../ui/BarChart'
 import { SkeletonBlock } from '../ui/SkeletonBlock'
+import { UsageFailuresPanel } from '../components/UsageFailuresPanel'
 import { buildUsageSeries } from '../usageSeries'
 
 /**
@@ -217,6 +218,15 @@ export function Overview() {
             error={trendErr}
             onRetry={() => void loadTrend(rangeKey)}
           />
+        </SectionCard>
+      </div>
+
+      {/* 失败原因排在用量趋势之后：总览的主线是「跑了多少」，这一块回答
+          「坏在哪」，放在最后作为收尾。它自己取数、自己报错，与上面两个
+          数据源互不影响 —— 失败查询挂了不该让用量数字也跟着空掉。 */}
+      <div className="mt-4">
+        <SectionCard title="失败原因">
+          <UsageFailuresPanel days={rangeDays(rangeKey)} />
         </SectionCard>
       </div>
     </>

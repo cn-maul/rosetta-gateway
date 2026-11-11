@@ -8,7 +8,10 @@ import { DataTable } from '../ui/DataTable'
 import type { UsageFailureCodeEntry, UsageFailureUpstreamEntry, UsageFailures } from '../types'
 
 /**
- * 「失败原因」页签：回答两个问题 —— 什么错最多、是不是某个上游在坏。
+ * 「失败原因」区块（总览页）：回答两个问题 —— 什么错最多、是不是某个上游在坏。
+ *
+ * 为什么放在总览而不是用量页的一个页签：这是排障入口，用户在「刚才好像
+ * 有问题」时第一眼要看的就是总览，不该再点两层页签才找到。
  *
  * 为什么不复用 UsageByGroup：那个组件的每一行都要算 token、费用、速度，
  * 而这里的分组对象是**失败**。把失败硬塞进 usageGroupEntry 会让 tokens 与
