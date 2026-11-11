@@ -35,19 +35,6 @@ func TestSlowestUpstreamPhasePrefersConcreteTransportStage(t *testing.T) {
 	}
 }
 
-func TestUpstreamProtocolNameUsesDetectedProtocol(t *testing.T) {
-	cases := map[rosetta.Protocol]string{
-		rosetta.ProtoOpenAIChat:      "chat",
-		rosetta.ProtoOpenAIResponses: "response",
-		rosetta.ProtoAnthropic:       "anthropic",
-	}
-	for protocol, want := range cases {
-		if got := upstreamProtocolName(protocol); got != want {
-			t.Errorf("upstreamProtocolName(%q) = %q, want %q", protocol, got, want)
-		}
-	}
-}
-
 func TestSetIngressRequestCapturesFullRequestShape(t *testing.T) {
 	diag := newRequestDiagnostics(httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil))
 	diag.setPublicModel("public-model")

@@ -43,8 +43,10 @@ type diagnosticsState struct {
 	userID      string
 	keyID       string
 
-	publicModel      string
-	ingressProtocol  string
+	publicModel     string
+	ingressProtocol string
+	// upstreamProtocol 取自**解析后的 client**（protocol.FromSDK），而不是
+	// provider 配置里的字符串：配置写 auto 时要报告它实际谈成的协议。
 	upstreamProtocol string
 	stream           bool
 	// effort 是最后一个 attempt 实际下发给上游的思考档位（见
@@ -491,7 +493,6 @@ func (d *requestDiagnostics) attrs() []any {
 		"credential_id", s.credentialID,
 		"upstream_request_id", s.upstreamRequest,
 		"upstream_response_id", s.upstreamResponse,
-		"queue_wait_ms", s.admissionMs,
 		"auth_ms", s.authMs,
 		"decode_ms", s.decodeMs,
 		"admission_ms", s.admissionMs,
@@ -1354,23 +1355,6 @@ func providerSlug(cand routing.Candidate) string {
 		return ""
 	}
 	return cand.Provider.Slug
-}
-
-// upstreamProtocolName maps the SDK's detected protocol to the stable values
-// stored in usage history and shown by the admin UI. Reading it from the
-// selected client (rather than the provider config) makes an "auto" provider
-// report the protocol it actually negotiated.
-func upstreamProtocolName(p rosetta.Protocol) string {
-	switch p {
-	case rosetta.ProtoOpenAIChat:
-		return "chat"
-	case rosetta.ProtoOpenAIResponses:
-		return "response"
-	case rosetta.ProtoAnthropic:
-		return "anthropic"
-	default:
-		return string(p)
-	}
 }
 
 func providerEndpointHost(cand routing.Candidate) string {

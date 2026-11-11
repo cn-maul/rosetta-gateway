@@ -759,17 +759,34 @@ func (h *Handler) Handle(codec ingress.Codec) http.HandlerFunc {
 				}
 				break
 			}
-			lastUpstreamProtocol = upstreamProtocolName(client.Protocol())
+			lastUpstreamProtocol = wireproto.FromSDK(client.Protocol())
 			diag.setSelected(cand, credID, lastUpstreamProtocol)
 
 			attemptTrace := upstream.NewAttemptTrace()
 			attemptCtx := upstream.WithAttemptTrace(r.Context(), attemptTrace)
 			attemptReq := r.WithContext(attemptCtx)
 			attemptStart := time.Now()
+			ap := attemptParams{
+				w:            w,
+				r:            attemptReq,
+				client:       client,
+				ing:          ing,
+				cand:         cand,
+				authCtx:      authCtx,
+				codec:        codec,
+				rate:         rate,
+				snap:         snap,
+				start:        start,
+				priorTrace:   routeTrace,
+				diag:         diag,
+				attemptTrace: attemptTrace,
+				index:        i + 1,
+				attemptStart: attemptStart,
+			}
 			if ing.Stream {
-				out = h.attemptStream(w, attemptReq, client, ing, cand, authCtx, codec, rate, snap, start, routeTrace, diag, attemptTrace, i+1, attemptStart)
+				out = h.attemptStream(ap)
 			} else {
-				out = h.attemptNonStream(w, attemptReq, client, ing, cand, authCtx, codec, rate, snap, start, routeTrace, diag, attemptTrace, i+1, attemptStart)
+				out = h.attemptNonStream(ap)
 			}
 			decision := out.LaneDecision()
 			if decision.Committed {
@@ -997,29 +1014,19 @@ func (h *Handler) effectiveProviderProtocol(c routing.Candidate) string {
 // 可转移」）。它必须带进来：本 attempt 一旦提交（写下首字节），usage 就在
 // 这里落库且不会再回到外层 —— 只写当前一跳会丢掉「为什么走到备用上游」，
 // 而那恰恰是这条记录最有价值的部分。
-func (h *Handler) attemptStream(w http.ResponseWriter, r *http.Request, client *rosetta.Client, ing *ingress.Request, cand routing.Candidate, authCtx *auth.Context, codec ingress.Codec, rate *RateCommit, snap *snapshot.Snapshot, start time.Time, priorTrace []string, diag *requestDiagnostics, attemptTrace *upstream.AttemptTrace, attemptIndex int, attemptStart time.Time) Outcome {
-	ctx := r.Context()
+func (h *Handler) attemptStream(p attemptParams) Outcome {
+	w, r := p.w, p.r
+	client, ing, cand, authCtx := p.client, p.ing, p.cand, p.authCtx
+	codec, rate, snap := p.codec, p.rate, p.snap
+	start, priorTrace, diag := p.start, p.priorTrace, p.diag
+	attemptTrace, attemptStart := p.attemptTrace, p.attemptStart
+
 	logger := h.usage.Logger()
 	publicModel := ing.Model
-	attempt := attemptFromCandidate(attemptIndex, cand, attemptTrace)
-	upstreamProtocol := upstreamProtocolName(client.Protocol())
-	ctx = withPromptCacheAffinity(ctx, ing, upstreamProtocol, conversationSessionID(r))
-	attempt.Protocol = upstreamProtocol
-	attempt.StartedAtMs = attemptStart.Sub(start).Milliseconds()
-	buildStart := time.Now()
-
-	// 每个 attempt 现造一份请求，并把公共别名换成该目标的上游 model_id。
-	// 必须在 attempt 内部做（而不是在调用点造好传进来）：链上各目标可能
-	// 对接不同协议的端点，复用同一实例会把上一个目标的改动带过去。
-	upstreamReq := ing.BuildRosetta()
-	upstreamReq.Model = cand.UpstreamModel.ModelID
-	ing.ApplyThinkingCapability(upstreamReq, cand.UpstreamModel, upstreamProtocol)
-	ing.ApplyProtocolThinking(upstreamReq, cand.UpstreamModel, upstreamProtocol)
-	// 剥掉目标协议回放不了的思考块（chat 剥签名的与无文本的、anthropic 剥无签名的），
-	// 否则 harness 回传 thinking 后的第二轮必然 400。详见 replay.go。
-	h.applyReplayGate(upstreamReq, upstreamProtocol)
-	attempt.RequestBuildMs = time.Since(buildStart).Milliseconds()
-	diag.setIngressRequest(upstreamReq, true)
+	upstreamReq, attempt, upstreamProtocol := h.startAttempt(p, true)
+	// affinity 依赖**解析后**的协议，因此只能挂在 startAttempt 之后；这
+	// 也正是两条路径原先唯一的行为差异（非流式早就是这个顺序）。
+	ctx := withPromptCacheAffinity(r.Context(), ing, upstreamProtocol, conversationSessionID(r))
 
 	// 首字预算只覆盖「等首个事件」这一段；建立连接那段交给 ResponseHeaderTimeout
 	// 与下面的总请求预算（2026-10-10 修复的 P2）。
@@ -1573,25 +1580,68 @@ func (h *Handler) attemptStream(w http.ResponseWriter, r *http.Request, client *
 	return out
 }
 
-// priorTrace 的含义与 attemptStream 相同：提交后的落库在这里发生，
-// 必须把此前目标的失败决策一并带上。
-func (h *Handler) attemptNonStream(w http.ResponseWriter, r *http.Request, client *rosetta.Client, ing *ingress.Request, cand routing.Candidate, authCtx *auth.Context, codec ingress.Codec, rate *RateCommit, snap *snapshot.Snapshot, start time.Time, priorTrace []string, diag *requestDiagnostics, attemptTrace *upstream.AttemptTrace, attemptIndex int, attemptStart time.Time) Outcome {
-	publicModel := ing.Model
-	attempt := attemptFromCandidate(attemptIndex, cand, attemptTrace)
-	upstreamProtocol := upstreamProtocolName(client.Protocol())
+// attemptParams 是一次上游尝试的全部输入。
+//
+// 这些值在流式与非流式两条路径上完全相同。十五个位置参数写两遍，改一个
+// 就要同时改两个签名；打包成结构体后，调用点按名字给值，新增一项也不再
+// 是一次签名手术。
+type attemptParams struct {
+	w            http.ResponseWriter
+	r            *http.Request
+	client       *rosetta.Client
+	ing          *ingress.Request
+	cand         routing.Candidate
+	authCtx      *auth.Context
+	codec        ingress.Codec
+	rate         *RateCommit
+	snap         *snapshot.Snapshot
+	start        time.Time
+	priorTrace   []string
+	diag         *requestDiagnostics
+	attemptTrace *upstream.AttemptTrace
+	index        int
+	attemptStart time.Time
+}
+
+// startAttempt 做两条路径逐字相同的准备：造一份本次 attempt 专用的请求、
+// 把公共别名换成该目标的上游 model_id、注入思考能力与方言、剥掉目标协议
+// 回放不了的块，最后写入诊断。
+//
+// 请求必须在 attempt 内部现造（而不是在调用点造好传进来）：链上各目标可能
+// 对接不同协议的端点，复用同一实例会把上一个目标的改动带过去。
+//
+// ctx 的构造**不**放在这里：流式没有独立超时，非流式有 NonStreamTimeout，
+// 两者的取消语义不同，合并只会把差异藏起来。
+func (h *Handler) startAttempt(p attemptParams, stream bool) (*rosetta.ChatRequest, attemptDiagnostics, string) {
+	attempt := attemptFromCandidate(p.index, p.cand, p.attemptTrace)
+	upstreamProtocol := wireproto.FromSDK(p.client.Protocol())
 	attempt.Protocol = upstreamProtocol
-	attempt.StartedAtMs = attemptStart.Sub(start).Milliseconds()
+	attempt.StartedAtMs = p.attemptStart.Sub(p.start).Milliseconds()
+
 	buildStart := time.Now()
-	// 同 attemptStream：别名 → 上游 model_id 的映射必须在本次 attempt 内
-	// 完成，不能由调用方造好传入。
-	upstreamReq := ing.BuildRosetta()
-	upstreamReq.Model = cand.UpstreamModel.ModelID
-	ing.ApplyThinkingCapability(upstreamReq, cand.UpstreamModel, upstreamProtocol)
-	ing.ApplyProtocolThinking(upstreamReq, cand.UpstreamModel, upstreamProtocol)
-	// 与 attemptStream 同一刀，理由见 replay.go。
+	upstreamReq := p.ing.BuildRosetta()
+	upstreamReq.Model = p.cand.UpstreamModel.ModelID
+	p.ing.ApplyThinkingCapability(upstreamReq, p.cand.UpstreamModel, upstreamProtocol)
+	p.ing.ApplyProtocolThinking(upstreamReq, p.cand.UpstreamModel, upstreamProtocol)
+	// 剥掉目标协议回放不了的思考块（chat 剥签名的与无文本的、anthropic 剥无签名的），
+	// 否则 harness 回传 thinking 后的第二轮必然 400。详见 replay.go。
 	h.applyReplayGate(upstreamReq, upstreamProtocol)
 	attempt.RequestBuildMs = time.Since(buildStart).Milliseconds()
-	diag.setIngressRequest(upstreamReq, false)
+	p.diag.setIngressRequest(upstreamReq, stream)
+	return upstreamReq, attempt, upstreamProtocol
+}
+
+// priorTrace 的含义与 attemptStream 相同：提交后的落库在这里发生，
+// 必须把此前目标的失败决策一并带上。
+func (h *Handler) attemptNonStream(p attemptParams) Outcome {
+	w, r := p.w, p.r
+	client, ing, cand, authCtx := p.client, p.ing, p.cand, p.authCtx
+	codec, rate, snap := p.codec, p.rate, p.snap
+	start, priorTrace, diag := p.start, p.priorTrace, p.diag
+	attemptTrace, attemptStart := p.attemptTrace, p.attemptStart
+
+	publicModel := ing.Model
+	upstreamReq, attempt, upstreamProtocol := h.startAttempt(p, false)
 
 	// 绑定 r.Context() 而非 context.Background()：客户端断开时上游调用应随之取消，
 	// 否则断连请求会一直占用上游连接与配额直到超时（默认 120s）。

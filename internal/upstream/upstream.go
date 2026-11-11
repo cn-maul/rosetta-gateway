@@ -1183,11 +1183,12 @@ func discoveryClient(ctx context.Context, p *store.Provider, apiKey string, clie
 	}
 	configured := wireproto.Normalize(p.Protocol)
 	if configured != "" && configured != wireproto.Auto {
-		if !wireproto.Valid(configured) {
+		sdkProto, ok := wireproto.ToSDK(configured)
+		if !ok {
 			return nil, fmt.Errorf("provider %s: 未知的 protocol %q（合法值：%s）",
 				p.Slug, configured, wireproto.AllowedValues)
 		}
-		opts = append(opts, rosetta.WithProtocol(discoveryProtocol(configured)))
+		opts = append(opts, rosetta.WithProtocol(sdkProto))
 		return rosetta.NewClient(opts...)
 	}
 	detected, err := rosetta.DetectClient(ctx, opts...)
@@ -1196,20 +1197,6 @@ func discoveryClient(ctx context.Context, p *store.Provider, apiKey string, clie
 	}
 	opts = append(opts, rosetta.WithProtocol(detected.Protocol()))
 	return rosetta.NewClient(opts...)
-}
-
-// discoveryProtocol 把网关内部协议名映射为 rosetta 协议。
-func discoveryProtocol(name string) rosetta.Protocol {
-	switch name {
-	case wireproto.Chat:
-		return rosetta.ProtoOpenAIChat
-	case wireproto.Response:
-		return rosetta.ProtoOpenAIResponses
-	case wireproto.Anthropic:
-		return rosetta.ProtoAnthropic
-	default:
-		return rosetta.ProtoOpenAIChat
-	}
 }
 
 // modelCandidateFromModelInfo 把 SDK 的 ModelInfo 转成网关的 ModelCandidate。
@@ -1453,7 +1440,7 @@ func buildClient(ctx context.Context, prov *ProviderEntry, apiKey string, cfg *c
 			prov.Protocol = wireproto.Chat
 			opts = append(opts, rosetta.WithProtocol(rosetta.ProtoOpenAIChat))
 		} else {
-			prov.Protocol = gatewayProtocolName(detected.Protocol())
+			prov.Protocol = wireproto.FromSDK(detected.Protocol())
 			opts = append(opts, rosetta.WithProtocol(detected.Protocol()))
 		}
 	} else {
@@ -1499,19 +1486,6 @@ func buildClient(ctx context.Context, prov *ProviderEntry, apiKey string, cfg *c
 	}
 
 	return rosetta.NewClient(opts...)
-}
-
-func gatewayProtocolName(p rosetta.Protocol) string {
-	switch p {
-	case rosetta.ProtoOpenAIChat:
-		return wireproto.Chat
-	case rosetta.ProtoOpenAIResponses:
-		return wireproto.Response
-	case rosetta.ProtoAnthropic:
-		return wireproto.Anthropic
-	default:
-		return string(p)
-	}
 }
 
 // modelInfosForProvider 把库里配好的模型思考能力转成 SDK 的 ModelInfo。
