@@ -66,6 +66,15 @@ type AnthropicMessagesRequest struct {
 
 	// service_tier / container / mcp_servers 等未建模字段仍由
 	// encoding/json 忽略。
+	//
+	// service_tier 是个**陷阱**，别顺手加透传：rosetta 的统一字段
+	// ChatRequest.ServiceTier 用的是 OpenAI 词表（default / flex / priority），
+	// 而 SDK 1.3.2 起 Anthropic 适配器只接受 auto / standard_only，其它值在
+	// 本地就返回 ErrInvalidRequest。也就是说「原样透传」等于把 OpenAI 客户端
+	// 的 priority 变成一次必然失败的 400。真要支持，必须在入口先把
+	// priority → auto、default → default 之类映射清楚，语义上不许猜。
+	// 目前保持不建模：字段被忽略，请求照常成功。回归网见
+	// internal/ingress/stop_sequences_wire_test.go。
 }
 
 // AnthropicMetadata 只取 user_id；其余条目没有跨协议对应物。

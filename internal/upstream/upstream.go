@@ -1178,6 +1178,8 @@ func discoveryClient(ctx context.Context, p *store.Provider, apiKey string, clie
 		rosetta.WithAPIKey(apiKey),
 		rosetta.WithHTTPClient(client),
 		rosetta.WithTimeout(15 * time.Second),
+		// 与 buildClient 同一个决定：Anthropic 只发 x-api-key。
+		rosetta.WithAnthropicBearerAuth(false),
 	}
 	configured := wireproto.Normalize(p.Protocol)
 	if configured != "" && configured != wireproto.Auto {
@@ -1388,6 +1390,15 @@ func buildClient(ctx context.Context, prov *ProviderEntry, apiKey string, cfg *c
 		// 且 Idempotency-Key 对 DeepSeek/vLLM/各类中转普遍无效。
 		// 网关自己的重试策略：故障转移链（route_targets），不是同一个上游反复打。
 		rosetta.WithQuirks(rosetta.Quirks{NoIdempotencyKey: true}),
+		// Anthropic 只发 x-api-key，不额外发 Authorization: Bearer。
+		// SDK 1.3.2 起 Bearer 变成默认（对齐官方 SDK 在 API 2026-10-21 的
+		// 做法），于是一次请求会同时带两份同一把密钥。官方端点两种都收，
+		// 但网关的上游绝大多数是第三方 Anthropic 兼容端点（DeepSeek / GLM /
+		// Qwen / MiniMax 的 /anthropic，以及各类中转），它们对重复凭据的
+		// 处理并不一致；而且同一个 secret 落到两条认证通道上，代理与访问日志
+		// 的脱敏面也翻倍。旧行为（只发 x-api-key）对所有兼容端点都成立，
+		// 关掉 Bearer 没有任何收益损失。r6_transport_test.go 守着这条约束。
+		rosetta.WithAnthropicBearerAuth(false),
 		// 只放行 thinking 一个保留键：显式关闭思考必须把它写进上游 payload，
 		// 而各协议的开关形状不同（DeepSeek chat/anthropic 都是
 		// {"thinking":{"type":"disabled"}}，responses 是 reasoning.effort:none）。
