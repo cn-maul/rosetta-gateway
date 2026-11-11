@@ -535,3 +535,47 @@ func TestFailover_NonTransferableErrorReleasesProbeSlot(t *testing.T) {
 		t.Fatalf("req3: want 200 (probe slot must be released after non-transferable 400), got %d body=%s", rec.Code, rec.Body.String())
 	}
 }
+
+// 唯一目标在冷却期时，网关在本地就返回 502 —— 上游一个字节都没收到。
+//
+// 这条路径以前落库的 error_detail 是空的，调用历史里只剩「502 +
+// upstream_error」：看的人分不清「上游坏了」和「目标在冷却」，而这两件事
+// 的处置完全不同（前者要查上游，后者等冷却或补凭据就行）。detail 是这条
+// 502 唯一的信息来源，所以必须钉住。
+func TestFailover_CooledDownTargetExplains502(t *testing.T) {
+	good := fakeGood()
+	defer good.Close()
+
+	h, db, pool := buildHarnessFull(t, []struct {
+		slug, url string
+		fail      bool
+	}{
+		{"only", good.URL, false},
+	}, true, ingress.NewOpenAIChat())
+
+	// 直接把唯一目标打进冷却，比连打三枪失败更快，也不依赖默认阈值。
+	// threshold=1 = 一次失败即熔断；token 传 0 表示「不是本次探针的结果」。
+	pool.RecordTargetFailure("only#t0", 0, 1)
+
+	rec := postChat(h, "flash")
+	if rec.Code != http.StatusBadGateway {
+		t.Fatalf("冷却期内的单目标链应回 502，得到 %d，body=%s", rec.Code, rec.Body.String())
+	}
+
+	rows := e2eWaitUsageCount(t, db, "k1", 1)
+	got := rows[0]
+	if got.HTTPStatus != http.StatusBadGateway {
+		t.Errorf("落库 http_status = %d，期望 502", got.HTTPStatus)
+	}
+	if got.ErrorCode != "upstream_error" {
+		t.Errorf("落库 error_code = %q，期望 upstream_error", got.ErrorCode)
+	}
+	// "gateway:" 前缀用来区分「网关本地判定」与「上游原文」：后者形如
+	// "message: ...\nraw: ..."，用户看到的分区不同。
+	if !strings.HasPrefix(got.ErrorDetail, "gateway:") {
+		t.Errorf("本地终止的 502 必须带网关判定说明，实际 error_detail = %q", got.ErrorDetail)
+	}
+	if !strings.Contains(got.ErrorDetail, "cooling down") {
+		t.Errorf("error_detail 应说明目标在冷却，实际 %q", got.ErrorDetail)
+	}
+}

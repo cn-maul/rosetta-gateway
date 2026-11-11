@@ -141,6 +141,9 @@ type e2eUsageRow struct {
 	Stream      bool
 	HTTPStatus  int
 	ErrorCode   string
+	// ErrorDetail 是失败原文/本地判定说明。**本地终止的 502 只有它说得出原因**，
+	// 所以断言「有没有解释」必须能读到这一列。
+	ErrorDetail string
 	RequestID   string
 }
 
@@ -148,7 +151,7 @@ func e2eUsageRows(t *testing.T, db *store.Store, keyID string) []e2eUsageRow {
 	t.Helper()
 	rows, err := db.DB().QueryContext(context.Background(),
 		`SELECT id, status, usage_state, total_tokens, cost_total, provider_id, upstream_model, stream,
-		        http_status, COALESCE(error_code,''), COALESCE(request_id,'')
+		        http_status, COALESCE(error_code,''), COALESCE(error_detail,''), COALESCE(request_id,'')
 		   FROM usage_records WHERE access_key_id = ? ORDER BY ts DESC, id DESC`, keyID)
 	if err != nil {
 		t.Fatalf("读 usage_records: %v", err)
@@ -159,7 +162,7 @@ func e2eUsageRows(t *testing.T, db *store.Store, keyID string) []e2eUsageRow {
 		var r e2eUsageRow
 		var stream int
 		if err := rows.Scan(&r.ID, &r.Status, &r.UsageState, &r.TotalTokens, &r.CostTotal,
-			&r.ProviderID, &r.Upstream, &stream, &r.HTTPStatus, &r.ErrorCode, &r.RequestID); err != nil {
+			&r.ProviderID, &r.Upstream, &stream, &r.HTTPStatus, &r.ErrorCode, &r.ErrorDetail, &r.RequestID); err != nil {
 			t.Fatalf("scan usage_records: %v", err)
 		}
 		r.Stream = stream == 1

@@ -1,6 +1,7 @@
 import { useMemo, useState } from 'react'
 import { Button } from '@heroui/react'
 import { copyText, fmtTimeMs, statusLabel } from '../fmt'
+import { parseRouteTrace, type TraceStep } from '../routeTrace'
 import type { UsageHistoryEntry } from '../types'
 import { AppDrawer } from '../ui/AppDrawer'
 import { StatusChip } from '../ui/StatusChip'
@@ -71,6 +72,58 @@ export function keyName(h: UsageHistoryEntry): string {
   return h.key_deleted ? `已删除 · ${name}` : name
 }
 
+/**
+ * 失败决策轨迹的完整展开。
+ *
+ * 列表里的 PathFlow 只画了上游名与一个箭头 —— 那够用来「看出换过目标」，
+ * 但看不出**为什么**换、以及某个目标为什么根本没被调用。抽屉里补的正是
+ * 被 PathFlow 丢掉的那半：每个目标的判定结果、判定依据、以及原因码的中文
+ * 解释（解析与措辞全部复用 src/routeTrace.ts，那里已有完整测试）。
+ */
+function RouteTrace({ steps }: { steps: TraceStep[] }) {
+  if (!steps.length) return null
+  return (
+    <div className="mt-4">
+      <h3 className="mb-1 text-xs font-semibold text-muted">失败决策轨迹</h3>
+      {/* 这段说明不能省：只给一串「跳过 / 失败」，没人知道该去查什么。 */}
+      <p className="mb-2 text-[11px] leading-relaxed text-muted">
+        按尝试顺序列出链上每个目标的结果。排在前面的目标没被采用，原因就在这里。
+      </p>
+      <ol className="space-y-1.5">
+        {steps.map((s, i) => {
+          const tone = !s.parsed ? 'dim' : s.outcome === 'ok' ? 'ok' : s.outcome === 'skip' || s.outcome === 'fail' ? 'dim' : 'err'
+          // 解析失败的旧记录没有 provider/model，只有原文；照原样吐出来，
+          // 不要空着 —— 空行会被读成「这里本来就没东西」。
+          const reason = s.parsed ? s.reasonLabel : ''
+          return (
+            <li key={i} className="flex items-start gap-2.5 rounded-lg bg-background-tertiary px-3 py-2">
+              <span className="mt-px shrink-0 font-mono text-[11px] text-muted">{s.attempt ?? i + 1}</span>
+              <div className="min-w-0 flex-1">
+                <div className="flex flex-wrap items-center gap-x-2 gap-y-1">
+                  <strong className="text-xs break-all">{s.parsed ? s.provider : '记录异常'}</strong>
+                  {s.model ? <span className="font-mono text-[11px] break-all text-muted">/ {s.model}</span> : null}
+                  <StatusChip tone={tone}>{s.outcomeLabel}</StatusChip>
+                </div>
+                {s.explanation ? (
+                  <p className="mt-1 text-[11px] leading-relaxed text-muted">{s.explanation}</p>
+                ) : null}
+                {reason ? (
+                  <p className="mt-1 text-[11px] leading-relaxed" title={s.reason}>
+                    原因：{reason}
+                  </p>
+                ) : null}
+                {!s.parsed ? (
+                  <code className="mt-1 block font-mono text-[11px] break-all text-muted">{s.raw}</code>
+                ) : null}
+              </div>
+            </li>
+          )
+        })}
+      </ol>
+    </div>
+  )
+}
+
 /** 错误详情分两段：上游那句 message 与完整 raw body。老记录可能只有一段
  * 裸文本/裸 JSON，这里统一识别，交给模板分区渲染。 */
 function errorView(detail: string | undefined) {
@@ -118,6 +171,7 @@ function Scale({ label, children, tone }: { label: string; children: React.React
 
 function DetailContent({ entry }: { entry: UsageHistoryEntry }) {
   const ev = useMemo(() => errorView(entry.error_detail), [entry])
+  const trace = useMemo(() => parseRouteTrace(entry.route_trace), [entry.route_trace])
   const [copyNotice, setCopyNotice] = useState('')
 
   const copyError = async () => {
@@ -149,6 +203,10 @@ function DetailContent({ entry }: { entry: UsageHistoryEntry }) {
         <Scale label="停在哪">{upstreamName(entry)}</Scale>
       </div>
 
+      {/* 轨迹紧跟在三格之后：它是「为什么是这个结果」的第一现场，
+          尤其在那两条本地终止的 502 上，轨迹是唯一的信息来源。 */}
+      <RouteTrace steps={trace} />
+
       {entry.error_detail ? (
         <div className="mt-3 flex justify-end">
           <Button variant="ghost" size="sm" onPress={() => void copyError()}>
@@ -159,7 +217,7 @@ function DetailContent({ entry }: { entry: UsageHistoryEntry }) {
 
       {ev.message ? (
         <div className="mt-1">
-          <h3 className="mb-2 text-xs font-semibold text-muted">上游返回的说明</h3>
+          <h3 className="mb-2 text-xs font-semibold text-muted">错误说明</h3>
           <pre className="rounded-xl bg-danger-soft px-3.5 py-3.5 text-xs leading-relaxed whitespace-pre-wrap break-words text-danger-soft-foreground">
             {ev.message}
           </pre>
@@ -179,7 +237,9 @@ function DetailContent({ entry }: { entry: UsageHistoryEntry }) {
             ? '这条请求成功了，没有错误详情。耗时、Token 与费用都印在列表那一行里。'
             : entry.status === 'canceled'
               ? '这条请求被调用方取消，上游没有返回错误正文。'
-              : '这条请求没有可展示的上游错误正文。失败可能发生在连接阶段（连不上、证书、DNS），或上游没回错误体；错误码与「停在哪」通常已足够定位。整条请求的耗时、Token 与费用在列表那一行里。'}
+              : trace.length > 0
+                ? '网关在本地就终止了这次请求，上游没有返回任何正文 —— 原因见上面的失败决策轨迹。'
+                : '这条请求没有可展示的上游错误正文。失败可能发生在连接阶段（连不上、证书、DNS），或上游没回错误体；错误码与「停在哪」通常已足够定位。整条请求的耗时、Token 与费用在列表那一行里。'}
         </p>
       ) : null}
     </>

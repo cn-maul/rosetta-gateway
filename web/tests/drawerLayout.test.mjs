@@ -35,7 +35,11 @@ test('请求详情抽屉只讲错误，不再重复表格里的字段', () => {
     assert.ok(!drawer.includes(dup), `抽屉不该再重复表格已显示的「${dup}」`)
   }
   // 错误详情三件套必须还在。
-  assert.match(drawer, /上游返回的说明/)
+  //
+  // 标题由「上游返回的说明」改为「错误说明」：网关本地终止的 502（目标在
+  // 冷却 / 无健康凭据）现在也会写 error_detail，那些话不是上游说的，
+  // 旧标题会把网关切断误读成上游报错。
+  assert.match(drawer, /错误说明/)
   assert.match(drawer, /完整原始响应/)
   assert.match(drawer, /停在哪/)
 })

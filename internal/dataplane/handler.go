@@ -732,8 +732,13 @@ func (h *Handler) Handle(codec ingress.Codec) http.HandlerFunc {
 							"request_id", httpx.RequestIDFromContext(r.Context()))
 						continue
 					}
+					// Detail 必须写：这条 502 在本地就终止了，上游一个字都没回，
+					// 没有它调用历史只剩「502 + upstream_error」，看的人无从判断
+					// 是上游坏了还是目标在冷却 —— 两者的处置完全不同。
 					out = Outcome{Eligible: true, StatusCode: http.StatusBadGateway,
-						Code: "upstream_error", Message: "no available upstream provider"}
+						Code: "upstream_error", Message: "no available upstream provider",
+						Detail: fmt.Sprintf("gateway: target %q is cooling down, or its probe slot is already held by another request",
+							providerSlug(cand))}
 					break
 				}
 				probeClaimed = true
@@ -758,8 +763,11 @@ func (h *Handler) Handle(codec ingress.Codec) http.HandlerFunc {
 					h.pool.ReleaseTargetProbe(cand.TargetID, probeToken)
 				}
 				probeRecorded = true // 名额已在上方显式归还
+				// 同上一处：本地终止，没有上游正文。cerr 已经区分了「上游被禁用」
+				// 与「没有健康凭据」，原样带上比再造一句更准。
 				out = Outcome{Eligible: true, StatusCode: http.StatusBadGateway,
-					Code: "upstream_error", Message: "no available upstream provider"}
+					Code: "upstream_error", Message: "no available upstream provider",
+					Detail: "gateway: " + cerr.Error()}
 				routeTrace = AppendRouteTrace(routeTrace, i+1, cand, "fail", "no_healthy_credential")
 				diag.addAttempt(attemptDiagnostics{
 					Index: i + 1, TargetID: cand.TargetID,
