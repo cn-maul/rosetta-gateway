@@ -54,8 +54,11 @@ function propertyNames(declaration, seen = new Set()) {
 }
 
 test('Go DTO contract contains every reviewed frontend response type', () => {
-  // 66 = 65 + 模型组历史成员（删上游后仍保留的归属投影）
-  assert.equal(DTO_CONTRACTS.length, 66)
+  // 69 = 66 + 失败原因聚合三件套（错误码行 / 上游行 / 响应）。
+  //
+  // 这个数字是**只增不猜**的守卫：加了一个带 @ts-type 的 Go 结构体就必须
+  // 回来改它，从而被迫确认「前端确实有这个接口、字段真的对得上」。
+  assert.equal(DTO_CONTRACTS.length, 69)
   const targets = DTO_CONTRACTS.map((contract) => contract.tsType)
   assert.equal(new Set(targets).size, targets.length, '一个 TS 类型不能映射多个 Go DTO')
 })

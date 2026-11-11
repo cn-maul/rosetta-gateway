@@ -384,6 +384,9 @@ func BuildApp(d Deps) *App {
 		{Pattern: "GET /admin/api/usage/by-model", Handler: usageHandler.GroupByModel, Public: false},
 		{Pattern: "GET /admin/api/usage/by-provider", Handler: usageHandler.GroupByProvider, Public: false},
 		{Pattern: "GET /admin/api/usage/by-day", Handler: usageHandler.GroupByDay, Public: false},
+		// 失败原因聚合：按 error_code 与 provider 两个维度回答「今天哪里在坏」。
+		// 走 callerScope 收窄，普通用户只看自己的失败。
+		{Pattern: "GET /admin/api/usage/failures", Handler: usageHandler.Failures, Public: false},
 		// 按用户汇总消费（钱包页「消费汇总」一表一行一个用户）。
 		// **admin-only 由 handler 内的 requireAdmin 把关** —— 路径在普通用户可
 		// 访问的 /admin/api/usage 前缀下，AdminGateGuard 的前缀白名单会整体放行，

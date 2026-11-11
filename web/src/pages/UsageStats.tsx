@@ -4,6 +4,7 @@ import { api, isAdmin } from '../api'
 import { PageHeader } from '../ui/PageHeader'
 import { UsageByGroup } from '../components/UsageByGroup'
 import { UsageByUser } from '../components/UsageByUser'
+import { UsageFailuresPanel } from '../components/UsageFailuresPanel'
 import { ModelGroups } from '../components/ModelGroups'
 import { UsageDetail } from './UsageDetail'
 import { oneOfInt, readPref, writePref } from '../ui/usePersistedState'
@@ -33,6 +34,10 @@ export function UsageStats() {
     { key: 'models', label: '按模型' },
     ...(admin ? [{ key: 'users', label: '按用户' }] : []),
     { key: 'keys', label: '按密钥' },
+    // 失败原因与上面几个不是同一类维度：那些看「花了多少」，这个看
+    // 「坏在哪」。放在用量页而不是单开一页，是因为它沿用了这里的时间
+    // 范围控件与作用域（普通用户只看自己的失败）。
+    { key: 'failures', label: '失败原因' },
     ...(admin ? [{ key: 'groups', label: '统计归并' }] : []),
   ]
 
@@ -55,7 +60,9 @@ export function UsageStats() {
       ? `将跨上游的同名模型合并统计；不改变路由、转发或权限 · ${scope}`
       : tab === 'users'
         ? `按用户汇总消费与用量；含已删除用户的历史记录 · ${scope}`
-        : ''
+        : tab === 'failures'
+          ? `按错误码与上游统计失败构成；用来判断是不是某个上游在坏 · ${scope}`
+          : ''
 
   const setTab = (key: string) => {
     const next = new URLSearchParams(searchParams)
@@ -128,6 +135,7 @@ export function UsageStats() {
             {tab === 'keys' ? (
               <UsageByGroup key="keys" firstCol="密钥" kind="key" fetch={fetchKeys} days={days} />
             ) : null}
+            {tab === 'failures' ? <UsageFailuresPanel days={days} /> : null}
           </Tabs.Panel>
         </Tabs>
       )}
