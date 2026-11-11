@@ -3,6 +3,8 @@ package dataplane
 import (
 	"net/http"
 
+	"github.com/cn-maul/rosetta"
+
 	"github.com/cn-maul/rosetta-gateway/internal/auth"
 	"github.com/cn-maul/rosetta-gateway/internal/billing"
 	"github.com/cn-maul/rosetta-gateway/internal/httpx"
@@ -35,11 +37,13 @@ import (
 // the quota itself, while a missed balance check spends real money and cannot
 // be detected afterwards. Keep the asymmetry unless the product decision
 // changes.
+// buildReq 是一个**惰性**构造器而不是现成的请求：余额豁免（管理员等）在
+// 这里直接放行，那种情况下不值得为一次纯记账的检查重建整份请求。
 func (h *Handler) precheckBalance(
 	w http.ResponseWriter,
 	r *http.Request,
 	authCtx *auth.Context,
-	ing *ingress.Request,
+	buildReq func() *rosetta.ChatRequest,
 	cands []routing.Candidate,
 	codec ingress.Codec,
 ) bool {
@@ -47,7 +51,7 @@ func (h *Handler) precheckBalance(
 		return true
 	}
 
-	est := billing.EstimateBalanceCostChain(ing.BuildRosetta(), cands)
+	est := billing.EstimateBalanceCostChain(buildReq(), cands)
 	chainPriced := billing.ChainHasPricedModel(cands)
 	if est <= 0 && !chainPriced {
 		return true

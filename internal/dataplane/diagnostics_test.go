@@ -126,6 +126,26 @@ func TestSetAttemptDiagnosisUsesUpstreamHTTPStatus(t *testing.T) {
 	}
 }
 
+// attrs() 是每请求一次的全量装配：60 多个键，整数要逐个装箱进 interface{}。
+// 这个基准是「日志级别降低时要不要短路」的依据 —— 见 handler.go 里
+// logger.Enabled 的注释。
+func BenchmarkDiagnosticAttrs(b *testing.B) {
+	d := newRequestDiagnostics(httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil))
+	d.setPublicModel("public-model")
+	d.setAuth("user-1", "key-1")
+	d.setIngressName("chat")
+	d.setRequestID("req-1")
+	d.setRemote("203.0.113.7:54321")
+	d.setResult("ok", "", "")
+	d.setStreamOutput(1200, 2, 85)
+	d.setUsage(1500)
+
+	b.ReportAllocs()
+	for b.Loop() {
+		_ = d.attrs()
+	}
+}
+
 func BenchmarkResponseObserverWrite(b *testing.B) {
 	payload := bytes.Repeat([]byte("x"), 256)
 	b.SetBytes(int64(len(payload)))

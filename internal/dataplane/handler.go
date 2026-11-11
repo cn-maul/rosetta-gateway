@@ -203,7 +203,11 @@ func (h *Handler) Handle(codec ingress.Codec) http.HandlerFunc {
 			if status, _, _ := diag.result(); status == "" {
 				diag.setResult(outcomeUsageStatus(obs.statusCode()), "", "")
 			}
-			logger.Info("gateway request diagnostic", diag.attrs()...)
+			// attrs() 会现搭一个 60 多个键的 []any（每个整数值都要装箱），
+			// 调低日志级别时这笔开销本该完全不发生。
+			if logger.Enabled(r.Context(), slog.LevelInfo) {
+				logger.Info("gateway request diagnostic", diag.attrs()...)
+			}
 		}()
 
 		authStart := diag.begin("auth")
@@ -333,10 +337,24 @@ func (h *Handler) Handle(codec ingress.Codec) http.HandlerFunc {
 				outCeilings = append(outCeilings, cand.UpstreamModel.MaxOutputTokens)
 			}
 		}
-		outputCeiling := ingress.RequestOutputCeiling(ing.BuildRosetta(), outCeilings)
+		// BuildRosetta 是全量重建（重新装配全部消息、工具与内容块），实测
+		// 约 10µs / 8KB / 59 allocs，且随会话长度线性增长。估算、额度
+		// 预占与余额预检只需要**读**它，没必要各自重建一份；attempt* 内部
+		// 仍然每次重建，那是协议差异所需，不能省。
+		//
+		// 主流配置（TPMLimit==0 且未配 quota 且余额豁免）下这里一次都不建。
+		var estReq *rosetta.ChatRequest
+		estInput := func() *rosetta.ChatRequest {
+			if estReq == nil {
+				estReq = ing.BuildRosetta()
+			}
+			return estReq
+		}
+		var outputCeiling int64
 		quotaStart := diag.begin("quota")
 		if needEstimate {
-			est = ingress.EstimateRequestTokens(ing.BuildRosetta(), outputCeiling)
+			outputCeiling = ingress.RequestOutputCeiling(estInput(), outCeilings)
+			est = ingress.EstimateRequestTokens(estInput(), outputCeiling)
 			rate = NewRateCommit(h.limiter, authCtx.KeyID, authCtx.TPMLimit, 0, db, logger)
 			rate.SetRequestID(httpx.RequestIDFromContext(r.Context()))
 		}
@@ -369,7 +387,8 @@ func (h *Handler) Handle(codec ingress.Codec) http.HandlerFunc {
 			logger.Error("quota lookup failed (fail-open)", "error", qerr, "key_id", authCtx.KeyID)
 		} else if quota > 0 {
 			if !needEstimate {
-				est = ingress.EstimateRequestTokens(ing.BuildRosetta(), outputCeiling)
+				outputCeiling = ingress.RequestOutputCeiling(estInput(), outCeilings)
+				est = ingress.EstimateRequestTokens(estInput(), outputCeiling)
 			}
 			reserved, rok, rerr := db.ReserveQuota(r.Context(), authCtx.KeyID, est)
 			switch {
@@ -432,7 +451,8 @@ func (h *Handler) Handle(codec ingress.Codec) http.HandlerFunc {
 		// 配置了额度」—— 与 key 级用 GetKeyQuota 判 quota>0 完全对称。
 		if u := h.snapshot().UsersByID[authCtx.UserID]; u != nil && u.QuotaTokens > 0 {
 			if !needEstimate {
-				est = ingress.EstimateRequestTokens(ing.BuildRosetta(), outputCeiling)
+				outputCeiling = ingress.RequestOutputCeiling(estInput(), outCeilings)
+				est = ingress.EstimateRequestTokens(estInput(), outputCeiling)
 			}
 			reserved, rok, rerr := db.ReserveUserQuota(r.Context(), authCtx.UserID, est)
 			switch {
@@ -562,7 +582,7 @@ func (h *Handler) Handle(codec ingress.Codec) http.HandlerFunc {
 		// 必然不等，预占了就得退款（等于把 ReserveQuota/ReleaseQuota 那套再
 		// 实现一遍，而那正是 2026-10-07 的 P0-2 教训）。所以这里是纯查询。
 		balanceStart := diag.begin("balance_precheck")
-		bal := h.precheckBalance(w, r, authCtx, ing, preflight, codec)
+		bal := h.precheckBalance(w, r, authCtx, estInput, preflight, codec)
 		diag.end("balance_precheck", balanceStart)
 		if !bal {
 			// 余额预检已写回 402/500。rate.Commit(0) 不能省：走到这里说明
