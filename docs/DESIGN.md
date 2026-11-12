@@ -718,18 +718,6 @@ GET    /admin/api/upstream-models                 全部上游模型扁平列表
                                                   供 Routes/Settings 一次拉全，替代逐 provider 的 N+1；
                                                   不挂吞吐重查询）
 
-GET    /admin/api/model-groups                    模型归组（统计展示层，不参与路由判定）
-POST   /admin/api/model-groups
-PATCH  /admin/api/model-groups/{id}
-DELETE /admin/api/model-groups/{id}
-GET    /admin/api/model-groups/{id}/members       组内上游模型
-POST   /admin/api/model-groups/{id}/assign        把多个上游模型指派进组（{id} 是**组** id）
-POST   /admin/api/model-groups/unassign           移出组（不属于任何组，故单独一个端点）
-
-GET    /admin/api/probes/models                   上游模型健康探测汇总（读 model_probes，
-                                                 按组白名单收窄；**不触发**探测）
-GET    /admin/api/probes/timeline                 探测时间线（「可用模型」页的连通率曲线）
-
 GET    /admin/api/routes
 POST   /admin/api/routes
 PATCH  /admin/api/routes/{id}
@@ -784,9 +772,8 @@ POST   /admin/api/config-export/export|import   配置导出/导入（§13.3，r
 GET    /admin/api/model-names                   公开模型名清单（按身份收窄，供白名单选择）；附带
                                                  `prices[]`（与 `models` **平行**的数组，prices[i]
                                                  对应 models[i]，三项单价元/百万 tokens，0 = 未配置）
-                                                 与 `meta[]`（`name` / `provider_name` /
-                                                 `upstream_model_id`，供连通率曲线
-                                                 按上游模型 id 与公开名对号）
+                                                 与 `meta[]`（`name` / `provider_name`，
+                                                 供卡片副标题显示首选供应商）
 PUT    /admin/api/users/{id}/balance             管理员充值/扣减余额，body `{delta_cents}`（分，正充负扣）
 GET    /admin/api/topups                         充值流水（按身份收窄：管理员看全部、
                                                  普通用户只看自己的）
@@ -921,8 +908,7 @@ OpenCode 主机补 `x-opencode-session`，同时把 `User-Agent` 设为
 成功，但多轮会话的 OpenCode 路由/缓存亲和性必须由客户端持续发送同一个稳定会话
 ID。DeepSeek Harness 的 Responses 路径会发送 `session_id` 与
 `x-client-request-id`，原生 Messages 路径会发送
-`x-deepseek-harness-session-id`。模型探测没有下游会话，使用独立的 `probe-` 请求
-ID，避免误把探测混进真实会话。
+`x-deepseek-harness-session-id`。出站代理测速不经过数据面，也不参与会话识别。
 
 对 OpenAI 系上游，数据面优先使用客户端显式提供的 `prompt_cache_key`；没有时用
 同一个稳定会话标识作为缓存亲和键。transport 通过 `x-session-affinity` /
@@ -1572,7 +1558,7 @@ per-model 配额、per-provider 配额仍不做，记入后续路线。
 | 配置类别 | 存放位置 | 可否运行时改 |
 |---|---|---|
 | Provider / 模型 / Route / Key / **用户与管理员账号** | **数据库** | 是（管理 API / Web 界面） |
-| 监听地址、DB 路径、日志级别、加密主密钥、**主密钥强度校验（`require_strong_master_key`）**、**公开源（`public_origin`）**、**可信代理网段（`trusted_proxy_cidrs`）**、**日界时区（`timezone`）**、**用量保留天数（`usage_retention_days`）**、**审计日志行数上限（`audit_log_keep_rows`）**、**连通率探测（`probes`）**、provider 重试默认、body 大小上限 | **配置文件** | 否（改后重启） |
+| 监听地址、DB 路径、日志级别、加密主密钥、**主密钥强度校验（`require_strong_master_key`）**、**公开源（`public_origin`）**、**可信代理网段（`trusted_proxy_cidrs`）**、**日界时区（`timezone`）**、**用量保留天数（`usage_retention_days`）**、**审计日志行数上限（`audit_log_keep_rows`）**、**代理测速（`probes`）**、provider 重试默认、body 大小上限 | **配置文件** | 否（改后重启） |
 | 超时与故障转移默认（`defaults.upstream_timeout_ms` / `stream_*` / `failover_*`） | **配置文件提供首次回落值；设置页写入 `app_settings.runtime_defaults`** | 是（设置页保存后 reload） |
 | 首次 bootstrap 的 provider/route | 配置文件（仅当 DB 为空时生效） | 否 |
 
@@ -1670,9 +1656,7 @@ AES-256-GCM 密文。无主密钥、密文损坏、主密钥不匹配或历史�
     "interval_sec": 600,
     "timeout_ms": 30000,
     "concurrency": 4,
-    "down_threshold": 3,
     "window_size": 10,
-    "healthy_rate": 0.8,
     "retention_days": 30
   },
   "defaults": {
@@ -1728,8 +1712,8 @@ AES-256-GCM 密文。无主密钥、密文损坏、主密钥不匹配或历史�
 `audit_log` 保留的最大**行数**（不是天数），与用量剪枝共用同一个每日循环。
 按行数而非按天，是因为本表的唯一读路径是 `ORDER BY id DESC LIMIT ?`
 （管理面只看最近几十条），更早的行没有任何下游消费者 —— 与 `usage_records`
-（超期数据会折叠进 `usage_daily_rollups`）和 `model_probes`（超期数据喂连通率
-趋势图）不同，审计日志没有聚合去向。此前只插不删，表随写操作次数无界增长。
+（超期数据会折叠进 `usage_daily_rollups`）和 `network_probes`（超期数据喂代理
+延迟趋势）不同，审计日志没有聚合去向。此前只插不删，表随写操作次数无界增长。
 取值 1~10000000，缺省 20000；写 `0` 或 `-1` 都显式关闭剪枝
 （合规审计要求全量留存时用）。
 
@@ -1746,21 +1730,18 @@ Windows 上才跟 `time.Local`，**只设一个会跨平台失效**（第一版�
 在 CI 上翻车的）。空串 = 沿用进程现有时区。它决定总览日趋势、钱包页按天消耗、
 用量归档的日界三处，配错的症状是「过了 0 点按天数据不切日」，详见 [DOCKER.md](DOCKER.md)。
 
-**`probes`（2026-10-14 新增，连通率探测）**：定时对上游模型发最小真实推理
-（`max_tokens=1`、不走 usage_recorder，**不扣网关用户的钱**，但上游侧照常计费
-几 token），结果落 `model_probes`，「可用模型」页每张卡片画的就是这条曲线。
-**默认开**（只有显式 `enabled:false` 才关闭；对象存在但缺省 `enabled`
-时仍按 true 处理）——
-用户明确要这个功能。其余默认值：间隔 600s、超时 30s、并发 4、连续 3 次失败判 down、
-窗口 10 次、成功率阈值 0.8、探测记录保留 30 天。每轮同一调度还对各出站网络做一次
-`generate_204` 连通性测速，写 `network_probes`，同样不碰冷却/熔断。
-**每轮每个模型恰好一次、每个网络恰好一次**；停用整个功能要写
+**`probes`（2026-11-12 收敛为代理测速）**：定时对每条出站网络发一次
+`generate_204` 连通性测速，结果落 `network_probes`，供「代理」页的延迟列
+使用，不碰冷却/熔断。上游模型可用性探测与「可用模型」页的绿色连通率柱状图
+已于 2026-11-12 移除（几乎无人查看，且每次探测都真实消耗上游 token）。
+**默认开**（只有显式 `enabled:false` 才关闭）。其余默认值：间隔 600s、
+超时 30s、并发 4、窗口 10 个样本、探测记录保留 30 天。
+**每轮每个网络恰好一次**；停用整个功能要写
 `"probes":{"enabled":false}`，而不是依赖对象缺省。
 两个必须说清的边界：探测**绝不写 pool 的冷却/熔断**（隔离红线，见
 `internal/probe/runner.go` 与 `store.go` 的建表注释）—— 否则「探测不通」会
 被放大成「上游整体不可用」；它也不是 `/admin/api/usage` 的一部分，与配额
-统计完全隔离。健康判定是「连续失败 + 窗口成功率」两个独立信号叠加
-（`probe.Classify`），单次结果噪声太大，据此切状态会让看板红绿来回跳。
+统计完全隔离。
 
 **故障转移相关默认**（`defaults` 下，全部可省略、缺省由 `setDefaults` 兜底）：
 `stream_first_token_timeout_ms` 是流式首字（TTFT）看门狗——区别于 `stream_idle_timeout_ms`（已出字后的空闲超时），掐的是「一个事件都没等到」的慢上游，触发即在写出 SSE 头前转移下一目标。
@@ -1867,12 +1848,11 @@ Docker 侧对齐，且避开浏览器的保留端口表（6666 是 IRC 段，浏
 用户与权限、供应商、供应商详情、路由、代理、账号设置、设置。
 其中 6 条路由要求管理员：`/users`、`/providers`、`/providers/:id`、
 `/routes`、`/networks`、`/settings`，未登录或非 admin 看不到也进不去。
-另有 4 条兼容重定向：`/profile`→`/wallet`、`/model-groups`→`/usage?tab=groups`、
-`/health`→`/models`、`*`→`/`。
+另有 3 条兼容重定向：`/profile`→`/wallet`、`/health`→`/models`、`*`→`/`。
 
 管理员侧栏 10 项（运行 3 项 + 网关配置 4 项 + 管理 3 项）；普通用户侧栏 5 项
 （我的总览 / 可用模型 / API 密钥 / 我的调用 / 余额与账单）。`/profile` 是
-`/wallet` 的兼容重定向；`/model-groups`、`/health` 和 catch-all 也只做重定向。
+`/wallet` 的兼容重定向；`/health` 和 catch-all 也只做重定向。
 `/history`、`/keys`、`/routes` 仍是可访问的真实入口，不再按旧文档描述为纯重定向。
 
 | 路由 | 页签 | 可见 | 内容 |
@@ -1881,27 +1861,27 @@ Docker 侧对齐，且避开浏览器的保留端口表（6666 是 IRC 段，浏
 | `/set-password` | 设置密码 | 公开 | 一次性设密链接落地页；`token` 位于 hash query，校验后设置密码并直接登录。登录用户也可访问，完成设置会切换为该账号的会话 |
 | `/` | 总览 | 全体 | 管理员首屏分两块：当前启用的上游/总数、上游模型总数、用户数、Key 数、累计 token 费用；以及所选区间请求数、成功率、平均首字、平均输出速度、费用、token 与缓存命中率。另有趋势、待处理项；普通用户看自己的区间质量指标、余额与配额 |
 | `/history` | 请求日志 | 全体 | `UsageStats.tsx` 固定渲染逐条 `UsageDetailDrawer.tsx`：时间、状态、流式/非流式、入站协议、公开路由名（下行显示实际上游模型）、密钥、新增输入 / 新增输出（下行显示缓存数）、输出速度、首字 / 总耗时、费用和详情。首字与总耗时按阈值着色：首字 5s / 10s、总耗时 10s / 30s 分别对应绿 / 橙 / 红。支持按时间范围 / 状态 / 模型 / key 过滤、分页和 CSV 导出 |
-| `/usage` | 用量与费用 | 全体 | `UsageStats.tsx` 的非日志形态：默认近 1 天，也可切到近 7 / 30 天。按上游、模型、密钥三个维度用排行表汇总，顶部先给出范围总计，每行展示请求量、成功 / 失败数、Tokens、固化费用、成功率进度条以及首字 / 输出速度；管理员另有「统计归并」（`ModelGroups.tsx`）。所有子页共用父页面的时间范围，避免切换页签后两页数字对不上 |
-| `/models` | 可用模型 | 全体 | **只读**清单：`GET /admin/api/model-names` 按身份收窄后的模型名（普通用户 = 所属组白名单 ∩ 全部路由名）+ 输入/输出/缓存命中三项单价；`restricted=true` 时显式提示「已被分组收窄」。每张模型卡同时画**连通率曲线**（探测数据，2026-10-14 并表）。刻意不给勾选控件 —— 白名单的写入口在 `/keys`（只能收紧）与 `/groups`（管理员按组收紧），且**空清单一律解释为「一个模型都调不了」而非 ModelPicker 的「一个都不选 = 不限制」**（后者只属于配置态）。未配置的单价显示「未配置」并弱化，**不显示 0.00**（会被读成「确认免费」） |
+| `/usage` | 用量与费用 | 全体 | `UsageStats.tsx` 的非日志形态：默认近 1 天，也可切到近 7 / 30 天。按上游、模型、密钥三个维度用排行表汇总，顶部先给出范围总计，每行展示请求量、成功 / 失败数、Tokens、固化费用、成功率进度条以及首字 / 输出速度。所有子页共用父页面的时间范围，避免切换页签后两页数字对不上 |
+| `/models` | 可用模型 | 全体 | **只读**清单：`GET /admin/api/model-names` 按身份收窄后的模型名（普通用户 = 所属组白名单 ∩ 全部路由名）+ 输入/输出/缓存命中三项单价；`restricted=true` 时显式提示「已被分组收窄」。刻意不给勾选控件 —— 白名单的写入口在 `/keys`（只能收紧）与 `/groups`（管理员按组收紧），且**空清单一律解释为「一个模型都调不了」而非 ModelPicker 的「一个都不选 = 不限制」**（后者只属于配置态）。未配置的单价显示「未配置」并弱化，**不显示 0.00**（会被读成「确认免费」） |
 | `/wallet` | 钱包与充值 | 全体 | **按身份分两种形态的同一页**：管理员看到全站的用户消费汇总 + 全部充值流水 + 充值入口（没有消耗记录，明细在「用量统计」页）；普通用户看到自己的余额、按天消耗与充值记录。自改密码已迁到「设置」页（2026-10-13）。余额（`balance_cents`）在 `balance_unlimited` 时显示「不限」而非 0.00 元，为 0 时显式提示「余额已用尽，请联系管理员充值」，对应数据面真实的 402 |
 | `/keys` | API 密钥 | 全体 | `AccessControl.tsx` 的密钥页签：普通用户只看到并管理自己的 `sk-gw-` key；管理员可查看/调整归属与限制，但不能给自己新建 key。密钥创建与页签路由分离，`/keys` 是可停留地址 |
 | `/users` | 用户与权限 | admin | `AccessControl.tsx` 的「用户 / 权限分组」两个页签。用户页含 CRUD、角色、启停、一次性设密/改密、余额充值；空密码普通用户可签发 24 小时设密链接，admin 新建时仍必须带初始密码。分组页维护成员与组级模型白名单 `PUT /admin/api/groups/{id}/models`。`delta_cents` 是相对金额，误操作不会把余额清零 |
 | `/networks` | 代理 | admin | 组件是 `Networks.tsx`：可复用的代理地址清单（2026-10-20）。provider 只存 `network_id`，实际地址由读路径 JOIN 派生。直连是保留 id `direct`，不是一行记录。删网络让引用它的上游回到直连，不删上游。列表可按行发起连通性测试并显示正常/失败状态 |
 | `/providers` | 上游服务 | admin | `Providers.tsx` 列表：类型用 `Chat / Response / Anthropic` 展示，紧跟一列用胶囊标出「直连」或「代理 · 名称」，模型/凭据摘要右对齐，操作列保留配置与删除，启停开关独立成最后一列；新建时可选择代理 |
 | `/providers/:id` | 上游详情 | admin | `ProviderDetail.tsx`：凭据、模型发现/导入、余额查询、连通性测试、批量改价与协议配置。模型测试结果通过页面底部的临时 toast 展示，不嵌入模型行。协议值在 API/DB 中仍为 `chat / response / anthropic` |
-| `/routes` | 模型与路由 | admin | `Routes.tsx`：公开模型名到有序上游链；`PUT /admin/api/routes/{id}/targets` 原子替换整条链。跨上游同名模型的统计归并在 `/usage?tab=groups`，不改变转发 |
+| `/routes` | 模型与路由 | admin | `Routes.tsx`：公开模型名到有序上游链；`PUT /admin/api/routes/{id}/targets` 原子替换整条链 |
 | `/account` | 账号设置 | 全体 | 当前用户自助改密、查看账号信息；管理员和普通用户都可访问 |
 | `/settings` | 系统设置 | admin | 五个页签：模型默认、运行时、模型价格、修改密码、导入导出（§13.3）。**审计日志页签已移除**（用户要求）—— 后端 `GET /admin/api/audit` 端点与 `api.ts` 的 `api.audit()` 都保留，那是运维取证的正路，删的只是界面那一块 |
 
 「用量看板」不是独立页 —— 按上游 / 模型 / 密钥的汇总以子页签形式内嵌在
-`/usage`，管理员另有跨上游同名模型的统计归并；逐条请求日志在 `/history`。
+`/usage`；逐条请求日志在 `/history`。
 设置页的导入导出即 §13.3 描述的功能。
 
 > **`/model-names` 加价格为什么是「平行数组」而不是把 `models` 改成对象数组**
 >
 > `/models` 页要显示单价，于是该端点的响应加了 `prices`。但它有**三个**调用方，
 > 其中两个（`/keys` 的 ModelPicker、`/groups`）只要模型名：ModelPicker 的选项是
-> `string[]`（受控 value/onChange + Set 去重 + includes 判定），`ModelGroups.tsx` 同样。改成
+> `string[]`（受控 value/onChange + Set 去重 + includes 判定），用户分组页同样。改成
 > `[{name, …}]` 会同时打破这两处，而它们并不需要价格 —— 为一个页面的展示去改
 > 两个组件的数据契约，收益与风险不成比例。
 >
@@ -1937,7 +1917,7 @@ Docker 侧对齐，且避开浏览器的保留端口表（6666 是 IRC 段，浏
 配置迁移只认**当前 schema**：导出/导入格式是唯一受支持的跨环境搬运方式。
 项目不再维护旧版本数据库的原地迁移工具，也不为历史 schema 保留第二套建表、
 列补丁或回填逻辑 —— 那会让同一份数据语义在两条路径上各自演化。
-上游模型没有独立启停状态：模型一旦添加就参与路由、探测和 `/v1/models`
+上游模型没有独立启停状态：模型一旦添加就参与路由和 `/v1/models`
 直连枚举；是否对外提供由公开路由及其启停状态决定。该字段的移除属于破坏性
 结构变更，`user_version` 因此提升到 2，旧库需导出配置后重建并重新导入。
 唯一例外是**向后兼容的纯新增对象**（如 `user_password_setup_tokens`）和**纯值归一化**
@@ -1992,7 +1972,7 @@ Docker 侧对齐，且避开浏览器的保留端口表（6666 是 IRC 段，浏
 >
 > 本轮补上的是 2026-10-06 之后新增的根级资产（`scripts/`、`docker/`、`.github/`、
 > `build.ps1`、`gateway.ps1`、`CONTRIBUTING.md`）与 `internal/` 下新增的
-> `effort`（思考挡位唯一口径）、`probe`（上游模型定时探测），以及 2026-10-21
+> `effort`（思考挡位唯一口径）、`probe`（出站代理定时测速），以及 2026-10-21
 > 重构拆出的 `httpx / identity / guard / access / usage / billing / billinghttp /
 > authhttp / ingress / dataplane / runtime / gatewayapp / api / catalog`。
 > 核对方式：`Get-ChildItem -Directory` + 逐个 `internal/*/` 的包注释。
@@ -2023,14 +2003,14 @@ rosetta-gateway/
 │       ├── ci.yml                  go / webui-sync / -race / repo-hygiene 四道门禁
 │       └── docker.yml               tag 触发构建推送 GHCR（发布前复跑最小门禁）
 ├── cmd/
-│   ├── gateway/                    进程入口与测试兼容桥接；HTTP 组装在 internal/api，生命周期在 internal/gatewayapp
+│   ├── gateway/                    进程入口与首次管理员引导；HTTP 组装在 internal/api，生命周期在 internal/gatewayapp
 ├── internal/
 │   ├── config/                     启动配置加载、校验、时区应用、端口占用检查
 │   ├── store/                      SQLite 连接、canonical schema、各表 DAO、归档与对账、探测记录
 │   ├── snapshot/                   运行时快照：路由索引、Provider 池，atomic.Pointer 热替换
 │   ├── routing/                    模型名解析（§5）
 │   ├── upstream/                   凭证池、健康与冷却、Client 生命周期、故障转移、出站代理
-│   ├── probe/                      上游模型定时探测与健康判定（写 model_probes，不碰熔断）
+│   ├── probe/                      出站代理定时测速（写 network_probes，不碰熔断）
 │   ├── ratelimit/                  RPM / TPM 固定窗口限速器
 │   ├── auth/                       下游 Key 校验
 │   ├── userauth/                   登录、PBKDF2、会话密钥、JWT 签发

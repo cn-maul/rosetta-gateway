@@ -4,6 +4,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"github.com/cn-maul/rosetta-gateway/internal/catalog"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -167,7 +168,7 @@ func TestListModels_ShapeSplit(t *testing.T) {
 	})
 	defer snapshot.Init(&snapshot.Snapshot{Routes: routing.NewRouteIndex(), Providers: map[string]*snapshot.ProviderSnapshot{}, KeysByHash: map[string]*snapshot.KeySnapshot{}, UsersByID: map[string]*snapshot.UserSnapshot{}})
 
-	h := handleListModels("")
+	h := catalog.List("")
 
 	authed := func(path string) *http.Request {
 		req := httptest.NewRequest(http.MethodGet, path, nil)
@@ -202,7 +203,7 @@ func TestListModels_ShapeSplit(t *testing.T) {
 	}
 
 	// 别名路径强制形状：/anthropic/v1/models 即使带 Bearer 也返回 Anthropic 形状。
-	anth := handleListModels("anthropic")
+	anth := catalog.List("anthropic")
 	rec4 := httptest.NewRecorder()
 	anth(rec4, authed("/anthropic/v1/models"))
 	if !strings.Contains(rec4.Body.String(), `"has_more":false`) {

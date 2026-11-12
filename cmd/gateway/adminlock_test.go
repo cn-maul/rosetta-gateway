@@ -224,7 +224,7 @@ func TestAdminLockout_AdminCannotCreateKey(t *testing.T) {
 		t.Fatalf("list keys: %v", err)
 	}
 
-	h := denyAdminKeyCreate(admin.NewKeyHandler(db).Create)
+	h := server.DenyAdminKeyCreate(admin.NewKeyHandler(db).Create)
 	req := httptest.NewRequest(http.MethodPost, "/admin/api/keys",
 		strings.NewReader(`{"name":"admin-self-key"}`))
 	req.Header.Set("Content-Type", "application/json")
@@ -257,7 +257,7 @@ func TestAdminLockout_NormalUserCanStillCreateKey(t *testing.T) {
 		fail      bool
 	}{{slug: "good", url: up.URL}}, false, ingress.NewOpenAIChat())
 
-	h := denyAdminKeyCreate(admin.NewKeyHandler(db).Create)
+	h := server.DenyAdminKeyCreate(admin.NewKeyHandler(db).Create)
 	req := httptest.NewRequest(http.MethodPost, "/admin/api/keys",
 		strings.NewReader(`{"name":"self-service"}`))
 	req.Header.Set("Content-Type", "application/json")
@@ -285,7 +285,7 @@ func TestAdminLockout_MissingIdentityIsRejected(t *testing.T) {
 		fail      bool
 	}{{slug: "good", url: up.URL}}, false, ingress.NewOpenAIChat())
 
-	h := denyAdminKeyCreate(admin.NewKeyHandler(db).Create)
+	h := server.DenyAdminKeyCreate(admin.NewKeyHandler(db).Create)
 	req := httptest.NewRequest(http.MethodPost, "/admin/api/keys",
 		strings.NewReader(`{"name":"anon"}`))
 	req.Header.Set("Content-Type", "application/json")
@@ -304,7 +304,7 @@ func TestAdminLockout_MissingIdentityIsRejected(t *testing.T) {
 func TestAdminLockout_EmptyIDIdentityIsRejected(t *testing.T) {
 	// 不需要库：下游 handler 是个 stub，只要证明请求**没被透传**下去即可。
 	called := false
-	h := denyAdminKeyCreate(func(w http.ResponseWriter, r *http.Request) { called = true })
+	h := server.DenyAdminKeyCreate(func(w http.ResponseWriter, r *http.Request) { called = true })
 	req := httptest.NewRequest(http.MethodPost, "/admin/api/keys", nil)
 	rec := httptest.NewRecorder()
 	h(rec, withRole(req, store.RoleAdmin, "")) // 空 ID

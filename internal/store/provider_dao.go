@@ -204,11 +204,5 @@ func (s *Store) DeleteProvider(ctx context.Context, id string) error {
 	if err := deleteByID(ctx, tx, "providers", id); err != nil {
 		return err
 	}
-	// upstream_models 随 provider 级联删除，但 model_group_members 按
-	// (provider_id, model_id) 独立存在 —— 有历史用量的必须保留（统计要靠
-	// 它继续合并），从没被调用过的空壳则一并清掉。
-	if err := deleteGroupMembershipsWithoutUsage(ctx, tx, id, ""); err != nil {
-		return err
-	}
 	return tx.Commit()
 }

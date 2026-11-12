@@ -51,7 +51,6 @@ export const DTO_CONTRACTS: readonly DTOFieldContract[] = [
     "providers",
     "credentials",
     "models",
-    "model_groups",
     "networks",
     "user_groups",
     "users",
@@ -187,34 +186,6 @@ export const DTO_CONTRACTS: readonly DTOFieldContract[] = [
     "price_cache_hit",
     "price_cache_creation",
     "price_output",
-    "group_name",
-  ] },
-  { goType: "internal/admin.modelGroupExport", tsType: "ConfigExportModelGroup", fields: [
-    "display_name",
-  ] },
-  { goType: "internal/admin.modelGroupHistoryMemberResponse", tsType: "ModelGroupHistoryMember", fields: [
-    "provider_id",
-    "model_id",
-    "provider_name",
-    "count",
-    "tokens",
-  ] },
-  { goType: "internal/admin.modelGroupResponse", tsType: "ModelGroup", fields: [
-    "id",
-    "display_name",
-    "member_count",
-    "created_at",
-  ] },
-  { goType: "internal/admin.modelHealthResponse", tsType: "ProbeHealth", fields: [
-    "model_id",
-    "provider_id",
-    "health",
-    "success_rate",
-    "window_count",
-    "window_ok",
-    "consecutive_fail",
-    "last_ts",
-    "last_error",
   ] },
   { goType: "internal/admin.modelImportItem", tsType: "ModelImportItem", fields: [
     "model_id",
@@ -231,7 +202,6 @@ export const DTO_CONTRACTS: readonly DTOFieldContract[] = [
   ] },
   { goType: "internal/admin.modelMeta", tsType: "ModelMeta", fields: [
     "name",
-    "upstream_model_id",
     "provider_name",
   ] },
   { goType: "internal/admin.modelPrice", tsType: "ModelPrice", fields: [
@@ -279,7 +249,6 @@ export const DTO_CONTRACTS: readonly DTOFieldContract[] = [
     "thinking_dialect",
     "effective_thinking_dialect",
     "thinking_dialect_source",
-    "group_id",
     "route_count",
     "is_route_head",
   ] },
@@ -373,9 +342,6 @@ export const DTO_CONTRACTS: readonly DTOFieldContract[] = [
     "ready_reason",
     "model_count",
     "cred_count",
-    "latency_ms",
-    "latency_p95_ms",
-    "latency_samples",
   ] },
   { goType: "internal/admin.providerUpdateRequest", tsType: "ProviderUpdatePayload", fields: [
     "name",
@@ -658,13 +624,6 @@ export const DTO_CONTRACTS: readonly DTOFieldContract[] = [
     "created_at",
     "last_login_at",
     "is_self",
-  ] },
-  { goType: "internal/store.ProbeTimelineBucket", tsType: "ProbeTimelineBucket", fields: [
-    "model_id",
-    "ts",
-    "count",
-    "ok",
-    "latency",
   ] },
   { goType: "internal/store.PruneResult", tsType: "PruneResult", fields: [
     "rollup_rows",

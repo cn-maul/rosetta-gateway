@@ -9,8 +9,8 @@ import (
 
 // NetworkProbe 是一次代理连通性探测的结果。
 //
-// 与 model_probes 分开一张表（理由见 schema.go 建表注释）：这里探的是
-// 「这条代理能不能出去」，不打上游、不计费，粒度是代理而不是模型。
+// 独立成表而不是塞进通用探测表：这里探的是「这条代理能不能出去」，
+// 不打上游、不计费，粒度是代理而不是模型。
 type NetworkProbe struct {
 	NetworkID string
 	Ts        int64
@@ -173,7 +173,7 @@ func (s *Store) networkP95Latency(ctx context.Context, cutoff int64, networkID s
 
 // PruneOldNetworkProbes 删除超期代理探测记录，返回删除行数。
 //
-// 保留期与 model_probes 共用 probes.retention_days：两者都是「排障线索」，
+// 保留期由 probes.retention_days 控制：探测记录是排障线索，
 // 分成两个配置项只会让人忘掉其中一个。
 func (s *Store) PruneOldNetworkProbes(ctx context.Context, keepDays int) (int64, error) {
 	if keepDays <= 0 {

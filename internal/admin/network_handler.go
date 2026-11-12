@@ -27,13 +27,26 @@ import (
 type NetworkHandler struct {
 	store *store.Store
 	// cfg 只为算探测窗口（probes.window_size × interval_sec）：列表上的
-	// 延迟数字必须与供应商列表、健康摘要是同一个窗口，否则同一时刻两个
-	// 页面能给出互相矛盾的平均值。cfg 为 nil 时 probeWindowMs 兜底 1 小时。
+	// 延迟数字必须始终反映同一个时间窗口，否则同一时刻刷新两次会看到
+	// 互相矛盾的平均值。cfg 为 nil 时 probeWindowMs 兜底 1 小时。
 	cfg *config.Config
 }
 
 func NewNetworkHandler(st *store.Store, cfg *config.Config) *NetworkHandler {
 	return &NetworkHandler{store: st, cfg: cfg}
+}
+
+// probeWindowMs 返回测速统计窗口（毫秒）。
+//
+// 窗口 = interval_sec × window_size：默认每 10 分钟测一次、看最近 10 个
+// 样本，即 100 分钟。配置缺失或非法时回退 1 小时 —— 调用方拿到的必须是
+// 一个正数，否则 cutoff 会跑到未来、列表永远显示“没有样本”。
+func probeWindowMs(cfg *config.Config) int64 {
+	const fallback = int64(time.Hour / time.Millisecond)
+	if cfg == nil || cfg.Probes.IntervalSec <= 0 || cfg.Probes.WindowSize <= 0 {
+		return fallback
+	}
+	return int64(cfg.Probes.IntervalSec) * int64(cfg.Probes.WindowSize) * 1000
 }
 
 // @ts-type Network

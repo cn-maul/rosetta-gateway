@@ -171,59 +171,6 @@ func TestDeleteUpstreamModelDetaching_跨路由共享(t *testing.T) {
 	}
 }
 
-// 探测记录级联清理。
-//
-// 探测记录是纯派生数据，对已删模型没有意义；留着会在 /probes/models 里
-// 变成一堆取不到模型行的孤儿记录。
-func TestDeleteUpstreamModelDetaching_清探测记录(t *testing.T) {
-	ctx := context.Background()
-	st := testStore(t, t.TempDir()+"/del4.db")
-	pid := newModelTestProvider(t, st)
-
-	seedChainModel(t, ctx, st, pid, "m1", "orphan")
-	seedChainModel(t, ctx, st, pid, "m2", "keep")
-	if err := st.CreateRoute(ctx, &Route{
-		ID: "r1", PublicName: "flash", ProviderID: pid, UpstreamModelID: "m2", Enabled: true,
-	}); err != nil {
-		t.Fatalf("create route: %v", err)
-	}
-	if err := st.ReplaceRouteTargets(ctx, "r1", []RouteTarget{
-		{ProviderID: pid, UpstreamModelID: "m2", Enabled: true},
-		{ProviderID: pid, UpstreamModelID: "m1", Enabled: true},
-	}); err != nil {
-		t.Fatalf("set chain: %v", err)
-	}
-
-	for _, id := range []string{"m1", "m2"} {
-		if err := st.RecordProbe(ctx, ProbeRecord{
-			ModelID: id, ProviderID: pid, Ts: 1, OK: true, LatencyMs: 5,
-		}); err != nil {
-			t.Fatalf("record probe %s: %v", id, err)
-		}
-	}
-
-	if _, err := st.DeleteUpstreamModelDetaching(ctx, "m1"); err != nil {
-		t.Fatalf("删除失败：%v", err)
-	}
-
-	var n int
-	if err := st.DB().QueryRowContext(ctx,
-		`SELECT count(*) FROM model_probes WHERE model_id='m1'`).Scan(&n); err != nil {
-		t.Fatalf("count probes: %v", err)
-	}
-	if n != 0 {
-		t.Errorf("已删模型还留着 %d 条探测记录（应级联清理）", n)
-	}
-	// 别人的探测记录必须留着。
-	if err := st.DB().QueryRowContext(ctx,
-		`SELECT count(*) FROM model_probes WHERE model_id='m2'`).Scan(&n); err != nil {
-		t.Fatalf("count probes m2: %v", err)
-	}
-	if n != 1 {
-		t.Errorf("m2 的探测记录被误删（剩 %d 条）", n)
-	}
-}
-
 // 不存在的 id 返回 ErrNotFound，而不是「删除成功」。
 func TestDeleteUpstreamModelDetaching_不存在(t *testing.T) {
 	ctx := context.Background()

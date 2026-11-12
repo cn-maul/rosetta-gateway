@@ -17,6 +17,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"github.com/cn-maul/rosetta-gateway/internal/api"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -48,7 +49,7 @@ func TestHealthz_数据库不可用时不回显底层错误(t *testing.T) {
 	// 这个错误串模拟真实 SQLite 错误里会出现的东西：路径 + 驱动细节。
 	const secretish = "unable to open database file: C:\\Users\\deploy\\rosetta\\data\\gateway.db (SQLITE_CANTOPEN)"
 	logger := discardLogger()
-	h := healthzHandler(failPinger{err: errors.New(secretish)}, dirtyReloader{}, logger)
+	h := api.HealthzHandler(failPinger{err: errors.New(secretish)}, dirtyReloader{}, logger)
 
 	req := httptest.NewRequest(http.MethodGet, "/healthz", nil)
 	rec := httptest.NewRecorder()
@@ -83,7 +84,7 @@ func TestHealthz_数据库不可用时不回显底层错误(t *testing.T) {
 // 健康时返回 200 + status=ok，且同样不该带任何 error 字段。
 func TestHealthz_健康时不带错误字段(t *testing.T) {
 	logger := discardLogger()
-	h := healthzHandler(cleanPinger{}, dirtyReloader{}, logger)
+	h := api.HealthzHandler(cleanPinger{}, dirtyReloader{}, logger)
 
 	req := httptest.NewRequest(http.MethodGet, "/healthz", nil)
 	rec := httptest.NewRecorder()
@@ -104,7 +105,7 @@ func TestHealthz_健康时不带错误字段(t *testing.T) {
 // 运行时落后于数据库时报 503 + degraded（与「数据库不可用」区分开）。
 func TestHealthz_运行时落后时报告degraded(t *testing.T) {
 	logger := discardLogger()
-	h := healthzHandler(cleanPinger{}, dirtyReloader{dirty: true}, logger)
+	h := api.HealthzHandler(cleanPinger{}, dirtyReloader{dirty: true}, logger)
 
 	req := httptest.NewRequest(http.MethodGet, "/healthz", nil)
 	rec := httptest.NewRecorder()

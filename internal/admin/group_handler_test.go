@@ -460,7 +460,7 @@ type modelNamesResponse struct {
 	// Prices 与 Models **按公开名逐位对应**（见 handler 里的说明）。
 	Prices []modelPrice `json:"prices"`
 	// Meta 同样逐位对应，且**长度必须与 Models 一致** ——
-	// 前端按 models[i] 取 meta[i].upstream_model_id 去挂连通率。
+	// 前端按 models[i] 取 meta[i].provider_name 做卡片副标题。
 	Meta []modelMeta `json:"meta"`
 }
 
@@ -499,13 +499,13 @@ func initPricedRouteSnapshot(t *testing.T, names map[string][3]float64, users ma
 	t.Cleanup(func() { snapshot.Init(&snapshot.Snapshot{}) })
 }
 
-// meta 必须与 models **逐位对齐**，且指向的是**同一个**上游模型行 ——
-// 这是「卡片上价格与连通率属于同一个模型」这件事的唯一保证。
+// meta 必须与 models **逐位对齐**，且指向的是**同一个**首选目标 ——
+// 这是「卡片上价格与供应商属于同一个模型」这件事的唯一保证。
 //
 // 两条各自会静默出错：
-//   - 长度不齐 → 前端按下标取到别人的 id，连通率挂错卡片；
+//   - 长度不齐 → 前端按下标取到别人的供应商标；
 //   - 只排 prices 不排 meta → meta 留在 ListRoutes 的 map 遍历顺序上，
-//     每次刷新卡片上的曲线都可能换人（且不报错）。
+//     每次刷新卡片上的供应商名都可能换人（且不报错）。
 func TestModelNames_MetaAlignsWithModelsAndPointsAtSameUpstream(t *testing.T) {
 	initPricedRouteSnapshot(t, map[string][3]float64{
 		"alpha": {1.5, 0.15, 6},
@@ -516,28 +516,16 @@ func TestModelNames_MetaAlignsWithModelsAndPointsAtSameUpstream(t *testing.T) {
 
 	got := fetchModelNames(t, h, asAdmin(httptest.NewRequest(http.MethodGet, "/admin/api/model-names", nil)))
 	if len(got.Meta) != len(got.Models) {
-		t.Fatalf("len(meta) = %d, want %d（平行数组必须对齐，否则连通率会挂到别的模型上）",
+		t.Fatalf("len(meta) = %d, want %d（平行数组必须对齐，否则供应商名会挂到别的模型上）",
 			len(got.Meta), len(got.Models))
 	}
 	for i, m := range got.Models {
 		if got.Meta[i].Name != m {
 			t.Errorf("meta[%d].name = %q, want %q", i, got.Meta[i].Name, m)
 		}
-		if got.Meta[i].UpstreamModelID == "" {
-			t.Errorf("meta[%d] (%s): upstream_model_id 为空，界面将无法挂上连通率", i, m)
-		}
 		if got.Meta[i].ProviderName == "" {
 			t.Errorf("meta[%d] (%s): provider_name 为空，卡片副标题会退化成 id 前缀", i, m)
 		}
-	}
-	// 同一份 fixtures 下每个公开名对应各自的上游模型行；错位会表现为
-	// 两个公开名拿到同一个 id。
-	ids := map[string]string{}
-	for i, m := range got.Models {
-		if prev, dup := ids[got.Meta[i].UpstreamModelID]; dup {
-			t.Errorf("meta 中 %q 与 %q 指向同一个上游模型 %q（映射错位）", prev, m, got.Meta[i].UpstreamModelID)
-		}
-		ids[got.Meta[i].UpstreamModelID] = m
 	}
 }
 

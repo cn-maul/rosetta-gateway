@@ -54,19 +54,6 @@ export interface Provider {
    */
   model_count?: number
   cred_count?: number
-  /**
-   * latency_ms / latency_p95_ms / latency_samples 是**探针测得的**网关到该
-   * 上游的往返耗时（窗口 = probes.window_size × interval_sec，与健康判定
-   * 同一口径；单位毫秒）。
-   *
-   * latency_samples = 0 表示窗口内没有成功的探测记录（从未探测、探测全
-   * 失败、或探针功能关闭）—— 界面显示「—」而不是「0 ms」，否则「一条都
-   * 没测到」会被读成「快到测不出来」。失败样本不计入平均：连不上的那条
-   * latency 是超时等待时间，混进去会让故障上游看起来很健康。
-   */
-  latency_ms?: number
-  latency_p95_ms?: number
-  latency_samples?: number
 }
 
 // 新增上游只需这三项 + 可选 api_key；slug、启用、超时、重试由后端决定。
@@ -250,11 +237,6 @@ export interface UpstreamModel {
   ttfb_ms?: number // 近 5 次流式调用的平均首字延迟（毫秒）；非流式/未测得则不下发
   success_rate?: number // 近 100 次调用成功率（0~1）
   call_count?: number // 成功率样本量（≤100）；缺失/0 表示未调用过
-  /**
-   * 模型归组 id（跨上游的同一个模型合并统计）。空/缺席 = 未归组。
-   * 组名由前端用 modelGroups() 全量列表本地解析（组是小表）。
-   */
-  group_id?: string
   /** 引用该模型的路由链数量；0 = 没被任何链引用，可以自由删除。 */
   route_count?: number
   /**
@@ -268,35 +250,6 @@ export interface UpstreamModel {
   // 没有 created_at：upstream_models 表压根没有这一列，接口也不下发。
   // 曾在这里声明过一次，导致列表里永远渲染出一个「—」日期列。
   // 也没有 default_extra_json：存了但没有任何地方拿它构造请求，已随列一并摘除。
-}
-
-/**
- * 模型归组：把不同上游的「同一个模型」（叫法往往不同）标成一组，
- * 用量统计按组名合并显示。
- *
- * 与 `Group`（用户分组）是**完全不同的概念**，别混用：那个管的是
- * 模型白名单与配额归属，这个纯粹是统计展示层的别名合并。
- */
-export interface ModelGroup {
-  id: string
-  display_name: string
-  member_count: number
-  created_at?: number
-}
-
-/**
- * 组内「当前模型行已不存在、但历史用量仍在」的成员。
- *
- * 删掉上游后 upstream_models 行会被级联删除，而归组归属按
- * (provider_id, model_id) 留在独立表里，统计才能继续按组合并。
- * provider_name 优先取当前上游名，上游已删时回退到用量里固化的旧名字。
- */
-export interface ModelGroupHistoryMember {
-  provider_id: string
-  model_id: string
-  provider_name: string
-  count: number
-  tokens: number
 }
 
 /**
@@ -346,35 +299,6 @@ export interface NetworkTestResult {
   status: 'ok' | 'error'
   message: string
   latency_ms: number
-}
-
-/**
- * 上游模型健康摘要（总览健康卡数据源）。
- *
- * health 四态：unknown（窗口内无探测）/ healthy / degraded / down。
- * 判定口径与后端 probe.Classify 一致：连续失败 ≥3 判 down，最近成功且
- * 窗口成功率 ≥80% 判 healthy，其余 degraded。
- */
-export interface ProbeHealth {
-  model_id: string
-  provider_id: string
-  health: 'unknown' | 'healthy' | 'degraded' | 'down'
-  success_rate: number // 窗口内成功率（0~1）；从未探测为 0
-  window_count: number
-  window_ok: number
-  consecutive_fail: number
-  last_ts: number // 最近探测时间（毫秒）；0 = 从未探测
-  last_error?: string // 最近失败原因（最近成功则为空）
-}
-
-/** 连通率时间轴的一个分桶（某模型某时间窗）。桶内无探测记录的行不返回。 */
-export interface ProbeTimelineBucket {
-  /** 模型 id —— 一次可查多个模型，前端靠它把桶分流到各自的卡片。 */
-  model_id: string
-  ts: number // 桶起点（毫秒）
-  count: number
-  ok: number
-  latency: number // 平均延迟（毫秒）
 }
 
 /**
@@ -792,8 +716,7 @@ export interface ModelPrice {
  */
 export interface ModelMeta {
   name: string
-  /** upstream_models.id（探测表的外键）。空 = 该路由解析不出可用目标。 */
-  upstream_model_id: string
+  /** 首选目标的供应商显示名，仅用于卡片副标题。 */
   provider_name: string
 }
 
@@ -1352,7 +1275,6 @@ export interface ConfigExportFile {
   providers?: ConfigExportProvider[]
   credentials?: ConfigExportCredential[]
   models?: ConfigExportModel[]
-  model_groups?: ConfigExportModelGroup[]
   networks?: ConfigExportNetwork[]
   /** v4 新增：用户分组（白名单为空 = 不限制）。 */
   user_groups?: ConfigExportUserGroup[]
@@ -1409,11 +1331,6 @@ export interface ConfigExportModel {
   price_cache_hit?: number
   price_cache_creation?: number
   price_output?: number
-  group_name?: string
-}
-
-export interface ConfigExportModelGroup {
-  display_name: string
 }
 
 export interface ConfigExportNetwork {

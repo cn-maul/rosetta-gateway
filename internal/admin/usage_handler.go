@@ -1002,22 +1002,7 @@ func (h *UsageHandler) GroupByKey(w http.ResponseWriter, r *http.Request) {
 	h.groupBy(w, r, "access_key_id", `COALESCE(a.name, '')`, "access_keys")
 }
 
-// GroupByModel 按「模型归组」聚合用量；未归组的模型保持按 upstream_model 分组。
-//
-// # 分组键为什么是 COALESCE(组名, upstream_model)
-//
-// 归组要解决的是「不同上游的同一个模型叫法不同、用量裂成 N 桶」。
-// 分组键取 `COALESCE(g.display_name, u.upstream_model)`：
-//   - 归了组的行 → 按组名合并（这正是需求）；
-//   - 没归组的行 → 逐字保持旧行为（键 = upstream_model），历史统计不受影响；
-//   - 归属表里没有这个 (provider_id, upstream_model) → 同样落回
-//     upstream_model，用量不丢。
-//
-// 组是**展示层派生**而不是落库维度：改一次组名，所有历史统计立刻跟着变,
-// 不需要回填几百万行明细（这正是把 group_id 固化进事实表做不到、
-// 也不该做的事 —— 见 store.go group_id 列的注释）。
-//
-// name 列回显组名（未归组为空串），前端据此能标出「这行是合并过的」。
+// GroupByModel 按上游模型（u.upstream_model）聚合用量。
 func (h *UsageHandler) GroupByModel(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query()
 	from, to, explicit, err := queryRangeExplicit(q, 7*24*time.Hour)
@@ -1031,11 +1016,7 @@ func (h *UsageHandler) GroupByModel(w http.ResponseWriter, r *http.Request) {
 	src, args := store.UsageSource(filter)
 	args = append(args, limit)
 
-	// JOIN 在归一化来源之外、聚合之前：usage 两侧（明细/归档）都带
-	// (provider_id, upstream_model) 这对不可变定位符，足以在查询时找回组。
-	// GROUP BY 写原表达式而不是别名 —— 与 groupBy 的既有口径一致
-	//（别名在 GROUP BY 里的可用性本就不该依赖）。
-	query := `SELECT COALESCE(g.display_name, u.upstream_model) AS key, ` +
+	query := `SELECT u.upstream_model AS key, ` +
 		`COALESCE(SUM(u.n), 0) AS count, ` +
 		store.UsageSumExpr("total_tokens", "u") + ` AS tokens, ` +
 		store.UsageSumExpr("cost_total", "u") + ` AS cost, ` +
@@ -1051,15 +1032,9 @@ func (h *UsageHandler) GroupByModel(w http.ResponseWriter, r *http.Request) {
 		`COALESCE(SUM(u.cached_tokens) * 1.0 / NULLIF(SUM(u.input_tokens), 0), 0) AS cache_hit_rate, ` +
 		store.UsageRatioExpr("gen_ok_sum", "n_gen_ok", "u") + ` AS avg_gen_ms, ` +
 		`COALESCE(SUM(u.n_gen_ok), 0) AS n_gen, ` +
-		`COALESCE(g.display_name, '') AS name` +
+		`'' AS name` +
 		` FROM ` + src +
-		// 归属必须直接读 model_group_members，不能 JOIN upstream_models 再取
-		// group_id：删掉一个上游后模型行被级联删除，那一侧的归属随之消失，
-		// 历史用量就会静默裂成单独一行。归属表按 (provider_id, model_id)
-		// 定位，正是 usage 两侧都带的不可变坐标。
-		` LEFT JOIN model_group_members mgm ON mgm.provider_id = u.provider_id AND mgm.model_id = u.upstream_model` +
-		` LEFT JOIN model_groups g ON g.id = mgm.group_id` +
-		` GROUP BY COALESCE(g.display_name, u.upstream_model)` +
+		` GROUP BY u.upstream_model` +
 		` ORDER BY tokens DESC`
 
 	// LIMIT 单独拼：同一条 query 去掉 LIMIT 就是一个统计分组总数的子查询，

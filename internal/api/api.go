@@ -171,8 +171,6 @@ func BuildApp(d Deps) *App {
 	networkHandler := admin.NewNetworkHandler(db, cfg)
 	credentialHandler := admin.NewCredentialHandler(db, masterKey)
 	modelHandler := admin.NewModelHandler(db, masterKey, cfg)
-	modelGroupHandler := admin.NewModelGroupHandler(db)
-	probeHandler := admin.NewProbeHandler(db, cfg)
 	routeHandler := admin.NewRouteHandler(db)
 	routeTargetHandler := admin.NewRouteTargetHandler(db)
 	keyHandler := admin.NewKeyHandler(db, masterKey)
@@ -322,32 +320,6 @@ func BuildApp(d Deps) *App {
 		// AutoReload 对 POST 自动生效（审计 + 快照重建），无需额外白名单。
 		{Pattern: "POST /admin/api/models/batch-price", Handler: modelHandler.BatchUpdatePrices, Public: false},
 
-		// 模型归组：把不同上游的「同一个模型」标成一组，用量统计可按组显示。
-		// 纯统计/展示层概念，不参与数据面路由判定。
-		{Pattern: "GET /admin/api/model-groups", Handler: modelGroupHandler.List, Public: false},
-		{Pattern: "POST /admin/api/model-groups", Handler: modelGroupHandler.Create, Public: false},
-		{Pattern: "PATCH /admin/api/model-groups/{id}", Handler: func(w http.ResponseWriter, r *http.Request) { modelGroupHandler.Update(w, r, r.PathValue("id")) }, Public: false},
-		{Pattern: "DELETE /admin/api/model-groups/{id}", Handler: func(w http.ResponseWriter, r *http.Request) { modelGroupHandler.Delete(w, r, r.PathValue("id")) }, Public: false},
-		{Pattern: "GET /admin/api/model-groups/{id}/members", Handler: func(w http.ResponseWriter, r *http.Request) { modelGroupHandler.GroupMembers(w, r, r.PathValue("id")) }, Public: false},
-		// 历史成员：组内已经没有当前 upstream_models 行、但归属表仍保留的
-		// (provider_id, model_id)。删上游后统计仍按组合并，管理页也必须
-		// 能看见并管理这些成员，否则成员数对不上、历史行无处可归。
-		{Pattern: "GET /admin/api/model-groups/{id}/history-members", Handler: func(w http.ResponseWriter, r *http.Request) {
-			modelGroupHandler.HistoryMembers(w, r, r.PathValue("id"))
-		}, Public: false},
-		{Pattern: "GET /admin/api/model-groups/orphan-history-members", Handler: modelGroupHandler.OrphanHistoryMembers, Public: false},
-		{Pattern: "POST /admin/api/model-groups/{id}/assign-history", Handler: func(w http.ResponseWriter, r *http.Request) {
-			modelGroupHandler.AssignHistoryMembers(w, r, r.PathValue("id"))
-		}, Public: false},
-		{Pattern: "POST /admin/api/model-groups/unassign-history", Handler: modelGroupHandler.UnassignHistoryMembers, Public: false},
-		// 指派/取消指派：路径里的 {id} 是**组** id（对某个组的操作）；
-		// 移出组不属于任何组，所以单独一个 unassign 端点而不是带空 group_id 的指派。
-		{Pattern: "POST /admin/api/model-groups/{id}/assign", Handler: func(w http.ResponseWriter, r *http.Request) { modelGroupHandler.AssignModels(w, r, r.PathValue("id")) }, Public: false},
-		{Pattern: "POST /admin/api/model-groups/unassign", Handler: modelGroupHandler.UnassignModels, Public: false},
-
-		// 上游模型健康探测（读 model_probes 表，不触发探测 —— 探测循环在后台跑）。
-		{Pattern: "GET /admin/api/probes/models", Handler: probeHandler.Models, Public: false},
-		{Pattern: "GET /admin/api/probes/timeline", Handler: probeHandler.Timeline, Public: false},
 		// 单模型可用性探测。与 provider 的 /providers/{id}/test 是两件事：
 		// 那个拉 /models 证明「endpoint + 凭据通」，这个发一次最小真实推理
 		// （max_tokens=1）证明「这个 model_id 现在真的能推理」—— 模型下架、

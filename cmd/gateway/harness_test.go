@@ -1,17 +1,38 @@
 package main
 
+// Package-local test scaffolding. Nothing here is compiled into the gateway
+// binary: production startup goes straight through gatewayapp.Run.
+
 import (
 	"log/slog"
-	"net/http"
 
 	"github.com/cn-maul/rosetta-gateway/internal/api"
 	"github.com/cn-maul/rosetta-gateway/internal/config"
+	"github.com/cn-maul/rosetta-gateway/internal/gatewayapp"
 	"github.com/cn-maul/rosetta-gateway/internal/ratelimit"
 	"github.com/cn-maul/rosetta-gateway/internal/runtime"
 	"github.com/cn-maul/rosetta-gateway/internal/store"
 	"github.com/cn-maul/rosetta-gateway/internal/upstream"
+	"github.com/cn-maul/rosetta-gateway/internal/usage"
 	"github.com/cn-maul/rosetta-gateway/internal/userauth"
 )
+
+type runtimeReloader = runtime.Reloader
+
+type usageRecorder = usage.Recorder
+
+const (
+	usageStatusOK  = usage.StatusOK
+	usageQueueSize = usage.QueueSize
+)
+
+func newUsageRecorder(db *store.Store, logger *slog.Logger) *usageRecorder {
+	return usage.New(usage.Config{
+		DB:              db,
+		Logger:          logger,
+		IsBalanceExempt: gatewayapp.BalanceExempt,
+	})
+}
 
 // routeDeps is the package-local compatibility shape used by the existing
 // end-to-end tests. The production assembler is owned by internal/api.
@@ -29,10 +50,6 @@ type routeDeps struct {
 
 type gatewayApp = api.App
 type registeredRoute = api.Route
-
-func buildHandler(d routeDeps) http.Handler {
-	return api.BuildHandler(toAPIDeps(d))
-}
 
 func buildApp(d routeDeps) *gatewayApp {
 	return api.BuildApp(toAPIDeps(d))

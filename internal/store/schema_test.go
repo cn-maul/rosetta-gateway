@@ -68,50 +68,6 @@ func TestSchema_AddsPasswordSetupTableToExistingCurrentDatabase(t *testing.T) {
 	}
 }
 
-// TestSchema_BackfillsModelGroupMemberships 守住升级路径：旧库只有
-// upstream_models.group_id，新表不存在时必须补建并把现有归组搬进去。
-func TestSchema_BackfillsModelGroupMemberships(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "groups.db")
-	st := openSchemaTestStore(t, path)
-	ctx := context.Background()
-	if err := st.CreateProvider(ctx, &Provider{
-		ID: "p1", Slug: "p1", Name: "P1", Protocol: "chat",
-		Endpoint: "http://example.test", Enabled: true,
-	}); err != nil {
-		t.Fatalf("provider: %v", err)
-	}
-	if err := st.CreateModelGroup(ctx, &ModelGroup{ID: "g1", DisplayName: "G1"}); err != nil {
-		t.Fatalf("group: %v", err)
-	}
-	if err := st.CreateUpstreamModel(ctx, &UpstreamModel{
-		ID: "m1", ProviderID: "p1", ModelID: "chat",
-	}); err != nil {
-		t.Fatalf("model: %v", err)
-	}
-	// 模拟旧版本：直接写镜像列，归属表里没有这一行。
-	if _, err := st.DB().Exec(
-		`UPDATE upstream_models SET group_id = 'g1' WHERE id = 'm1'`); err != nil {
-		t.Fatalf("set legacy group: %v", err)
-	}
-	if _, err := st.DB().Exec(`DELETE FROM model_group_members`); err != nil {
-		t.Fatalf("clear memberships: %v", err)
-	}
-	if err := st.Close(); err != nil {
-		t.Fatalf("close: %v", err)
-	}
-
-	reopened := openSchemaTestStore(t, path)
-	var got string
-	if err := reopened.DB().QueryRow(
-		`SELECT group_id FROM model_group_members WHERE provider_id = 'p1' AND model_id = 'chat'`,
-	).Scan(&got); err != nil {
-		t.Fatalf("旧库归组没有回填: %v", err)
-	}
-	if got != "g1" {
-		t.Fatalf("回填后的组 = %q, want g1", got)
-	}
-}
-
 func TestSchema_RejectsNonCurrentVersionWithoutModifyingDatabase(t *testing.T) {
 	for _, version := range []int{0, 1, currentSchemaVersion + 1} {
 		t.Run("version_"+schemaTestItoa(version), func(t *testing.T) {
@@ -424,16 +380,6 @@ func TestSchema_CanonicalObjectsAndColumns(t *testing.T) {
 	if tableColumns(t, st, "upstream_models")["enabled"] {
 		t.Error("upstream_models.enabled should not exist: models are always available once added")
 	}
-	var membershipTable int
-	if err := st.DB().QueryRow(
-		`SELECT COUNT(*) FROM sqlite_master
-		  WHERE type = 'table' AND name = 'model_group_members'`).Scan(&membershipTable); err != nil {
-		t.Fatalf("inspect model_group_members: %v", err)
-	}
-	if membershipTable != 1 {
-		t.Error("canonical schema is missing model_group_members")
-	}
-
 	var rowCount int
 	if err := st.DB().QueryRow(`SELECT COUNT(*) FROM usage_totals WHERE id = 1`).Scan(&rowCount); err != nil {
 		t.Fatalf("read usage_totals placeholder: %v", err)

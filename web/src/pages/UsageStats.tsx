@@ -4,13 +4,12 @@ import { api, isAdmin } from '../api'
 import { PageHeader } from '../ui/PageHeader'
 import { UsageByGroup } from '../components/UsageByGroup'
 import { UsageByUser } from '../components/UsageByUser'
-import { ModelGroups } from '../components/ModelGroups'
 import { UsageDetail } from './UsageDetail'
 import { oneOfInt, readPref, writePref } from '../ui/usePersistedState'
 
 /**
  * 用量与费用页（语义对齐旧 UsageStats.vue）：一个页面挂「按上游 / 按模型 /
- * 按密钥 /（管理员）统计归并」四个页签，tab 与 days 都在 URL query 上 ——
+ * 按用户 / 按密钥」页签，tab 与 days 都在 URL query 上 ——
  * 分享/刷新/回退时统计口径不丢。/history（请求日志）也由本组件承载：
  * 全宽布局 + UsageDetail 表格，不渲染页签。
  */
@@ -33,7 +32,6 @@ export function UsageStats() {
     { key: 'models', label: '按模型' },
     ...(admin ? [{ key: 'users', label: '按用户' }] : []),
     { key: 'keys', label: '按密钥' },
-    ...(admin ? [{ key: 'groups', label: '统计归并' }] : []),
   ]
 
   const rawTab = searchParams.get('tab') ?? 'providers'
@@ -51,11 +49,9 @@ export function UsageStats() {
   const title = logs ? '调用日志' : '用量与费用'
   const subtitle = logs
     ? `逐条查看调用结果、耗时与记录费用 · ${scope}`
-    : tab === 'groups'
-      ? `将跨上游的同名模型合并统计；不改变路由、转发或权限 · ${scope}`
-      : tab === 'users'
-        ? `按用户汇总消费与用量；含已删除用户的历史记录 · ${scope}`
-        : ''
+    : tab === 'users'
+      ? `按用户汇总消费与用量；含已删除用户的历史记录 · ${scope}`
+      : ''
 
   const setTab = (key: string) => {
     const next = new URLSearchParams(searchParams)
@@ -77,24 +73,22 @@ export function UsageStats() {
         title={title}
         sub={subtitle || undefined}
         actions={
-          logs || tab !== 'groups' ? (
-            <ToggleButtonGroup
-              aria-label="时间范围"
-              selectionMode="single"
-              disallowEmptySelection
-              selectedKeys={[String(days)]}
-              onSelectionChange={(keys) => {
-                const value = [...keys][0]
-                if (value !== undefined) setDays(Number(value))
-              }}
-            >
-              {DAY_OPTIONS.map((d) => (
-                <ToggleButton key={d} id={String(d)} size="sm">
-                  {DAY_LABELS[d]}
-                </ToggleButton>
-              ))}
-            </ToggleButtonGroup>
-          ) : undefined
+          <ToggleButtonGroup
+            aria-label="时间范围"
+            selectionMode="single"
+            disallowEmptySelection
+            selectedKeys={[String(days)]}
+            onSelectionChange={(keys) => {
+              const value = [...keys][0]
+              if (value !== undefined) setDays(Number(value))
+            }}
+          >
+            {DAY_OPTIONS.map((d) => (
+              <ToggleButton key={d} id={String(d)} size="sm">
+                {DAY_LABELS[d]}
+              </ToggleButton>
+            ))}
+          </ToggleButtonGroup>
         }
       />
 
@@ -117,7 +111,6 @@ export function UsageStats() {
             </Tabs.List>
           </Tabs.ListContainer>
           <Tabs.Panel id={tab}>
-            {tab === 'groups' && admin ? <ModelGroups /> : null}
             {tab === 'providers' ? (
               <UsageByGroup key="providers" firstCol="上游名称" kind="provider" fetch={fetchProviders} days={days} />
             ) : null}

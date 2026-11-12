@@ -36,12 +36,10 @@ func MapUpstreamError(err error) (int, string, string) {
 
 // UpstreamErrorCode 只做归类，**不写日志**。
 //
-// 为什么必须分开：探测路径（internal/probe）每轮对每个模型调一次归类，
-// 而 MapUpstreamError 的 400/404/529 分支会顺带 slog.Warn 一条
-// "upstream returned an error"。那条日志既没有 model 也没有 provider 字段
-// （MapUpstreamError 看不到它们），运维无法据此判断是哪个模型坏了 ——
-// 而探测失败本来就已经落进 model_probes.error_detail。结果是「每 10 分钟
-// 每坏一个模型就刷一条无法定位的 WARN」。归类是纯计算，不该有日志副作用。
+// 为什么必须分开：有些调用方（如可用性检查的辅助路径）只想知道错误该归到
+// 哪一类，不打算把错误回给客户端。MapUpstreamError 的 400/404/529 分支会
+// 顺带 slog.Warn 一条不带模型/上游字段的 "upstream returned an error"，
+// 在批量归类时会变成无法定位的日志噪声。归类是纯计算，不该有日志副作用。
 func UpstreamErrorCode(err error) (int, string, string) {
 	return mapUpstreamError(err, false)
 }

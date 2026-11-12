@@ -34,15 +34,16 @@ import (
 
 // exportFormatVersion 是当前导出体唯一接受的版本。
 //
-// 导出格式不做向后兼容：旧格式缺当前 schema 必需的结构（模型组、出站网络、
-// 用户、访问密钥、路由），部分字段缺失只会解成零值，结果是“导入成功但配置
-// 静默缩水”。发现非当前版本时必须明确拒绝，让用户重新导出，而不是尝试猜
-// 旧字段的语义。
+// 导出格式不做向后兼容：旧格式缺当前 schema 必需的结构（出站网络、用户、
+// 访问密钥、路由），部分字段缺失只会解成零值，结果是“导入成功但配置静默
+// 缩水”。发现非当前版本时必须明确拒绝，让用户重新导出，而不是尝试猜旧字段
+// 的语义。
 //
 // 版本史：
 //
 //	1  只有供应商 + 模型
 //	2  加模型组、把逐 provider 的 proxy_url 收敛成 networks
+//	   （模型组已于 2026-11-12 移除；旧 v4 文件里的该字段导入时被忽略）
 //	3  加密成为唯一形态（.json.enc，必带凭据）
 //	4  加用户（含余额与口令哈希）、访问密钥（含明文）、用户分组、路由与故障转移链
 const exportFormatVersion = 4
@@ -51,8 +52,8 @@ const exportFormatVersion = 4
 //
 // 注意这里**不含**任何本库内部主键（provider/model/route/user/key 的 id）：
 // id 跨库无意义，导入时一律现生成。跨库对齐全靠「人给的名字」——
-// provider 与模型组靠 slug、模型组靠显示名、网络靠网络名、用户靠用户名、
-// 路由靠公开名。这不是偷懒，而是因为那些名字本来就由管理员指定，
+// provider 靠 slug、网络靠网络名、用户靠用户名、路由靠公开名。这不是偷懒，
+// 而是因为那些名字本来就由管理员指定，
 // 是真正跨环境稳定的东西。
 // @ts-type ConfigExportFile
 type configExport struct {
@@ -72,16 +73,11 @@ type configExport struct {
 	Providers   []providerExport   `json:"providers,omitempty"`
 	Credentials []credentialExport `json:"credentials,omitempty"`
 	Models      []modelExport      `json:"models,omitempty"`
-	// ModelGroups 是模型归组（统计里显示的名称）。组内成员通过
-	// modelExport.group_name 按显示名关联 —— 跨库靠名字对齐，与 provider
-	// 靠 slug 对齐同理。
-	ModelGroups []modelGroupExport `json:"model_groups,omitempty"`
 	// Networks 是出站网络清单。成员通过 providerExport.network_name
 	// 按**网络名**关联：跨库 id 无意义（与 provider 靠 slug、模型组靠显示名
 	// 同一理由），而名字本来就是管理员给它的。
 	Networks []networkExport `json:"networks,omitempty"`
-	// UserGroups 是**用户可见性分组**（groups 表），与上面的 ModelGroups
-	// （模型归组，只影响统计显示）是两件不同的事。名字里带 user_ 就是为了
+	// UserGroups 是**用户可见性分组**（groups 表）。名字里带 user_ 是为了
 	// 让读文件的人不必去猜：分组成员通过 userExport.group_name 与
 	// accessKeyExport.group_name 按组名关联。
 	UserGroups []userGroupExport `json:"user_groups,omitempty"`
@@ -204,13 +200,6 @@ type networkExport struct {
 	ProxyURL string `json:"proxy_url"`
 }
 
-// modelGroupExport 是一个模型归组。只带显示名：组的 id 是本库内部主键，
-// 跨库无意义（同 provider 不带 id 的理由）。
-// @ts-type ConfigExportModelGroup
-type modelGroupExport struct {
-	DisplayName string `json:"display_name"`
-}
-
 // @ts-type ConfigExportProvider
 type providerExport struct {
 	Slug       string `json:"slug"`
@@ -260,8 +249,6 @@ type modelExport struct {
 	PriceCacheHit      float64 `json:"price_cache_hit,omitempty"`
 	PriceCacheCreation float64 `json:"price_cache_creation,omitempty"`
 	PriceOutput        float64 `json:"price_output,omitempty"`
-	// GroupName 是该模型所属归组的显示名。空 = 未归组。
-	GroupName string `json:"group_name,omitempty"`
 }
 
 // 算法标识写进文件，是为了让「用错算法」变成一句明确的错误而不是
@@ -291,7 +278,6 @@ func sealExport(body configExport, passphrase string) (configExport, error) {
 		Providers:   body.Providers,
 		Credentials: body.Credentials,
 		Models:      body.Models,
-		ModelGroups: body.ModelGroups,
 		Networks:    body.Networks,
 		UserGroups:  body.UserGroups,
 		Users:       body.Users,

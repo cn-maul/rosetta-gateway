@@ -360,13 +360,6 @@ func isKimiK3(modelID string) bool {
 // 客户端如果按 K2.x 的写法发了 thinking，网关必须替它去掉。
 func IsKimiK3(modelID string) bool { return isKimiK3(modelID) }
 
-// SupportsThinkingField 报告该模型是否接受 `thinking` 对象。
-//
-// 只有 K3 系列是「只认 reasoning_effort」的；其余方言都能收 thinking。
-func SupportsThinkingField(d Dialect, modelID string) bool {
-	return !(d == Kimi && isKimiK3(modelID))
-}
-
 // AcceptsReasoningEffort 报告该模型是否接受 reasoning_effort。
 //
 // 官方文档（platform.kimi.com/docs/guide/use-thinking-models）的对照表写得很

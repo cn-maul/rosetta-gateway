@@ -1,6 +1,6 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { RequestGeneration, selectionKey } from '../src/asyncState.ts'
+import { RequestGeneration } from '../src/asyncState.ts'
 import { unionSelection } from '../src/modelSelection.ts'
 
 test('R10 only the latest generation may publish state', async () => {
@@ -28,13 +28,6 @@ test('R10 invalidating on entity navigation rejects an in-flight response', asyn
   await Promise.resolve().then(() => {
     assert.equal(requests.isCurrent(generation), false)
   })
-})
-
-test('R10 timeline responses bind to selection and axis', () => {
-  assert.equal(selectionKey(['m2', 'm1'], 7, 'hour'), selectionKey(['m1', 'm2'], 7, 'hour'))
-  assert.notEqual(selectionKey(['m1'], 7, 'hour'), selectionKey(['m1'], 30, 'hour'))
-  assert.notEqual(selectionKey(['m1'], 7, 'hour'), selectionKey(['m1'], 7, 'day'))
-  assert.notEqual(selectionKey(['m1'], 7, 'hour'), selectionKey(['m1', 'm2'], 7, 'hour'))
 })
 
 test('R10 select-all filtered is a union and keeps hidden selections', () => {

@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"github.com/cn-maul/rosetta-gateway/internal/catalog"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -53,7 +54,7 @@ func TestListModels_DisclosesEffortLevels(t *testing.T) {
 	req := httptest.NewRequest(http.MethodGet, "/v1/models", nil)
 	req.Header.Set("Authorization", "Bearer "+testAccessKey)
 	rec := httptest.NewRecorder()
-	handleListModels("")(rec, req)
+	catalog.List("")(rec, req)
 
 	var out struct {
 		Data []map[string]any `json:"data"`
@@ -86,7 +87,7 @@ func TestListModels_未配置挡位不下发(t *testing.T) {
 	req := httptest.NewRequest(http.MethodGet, "/v1/models", nil)
 	req.Header.Set("Authorization", "Bearer "+testAccessKey)
 	rec := httptest.NewRecorder()
-	handleListModels("")(rec, req)
+	catalog.List("")(rec, req)
 
 	if strings.Contains(rec.Body.String(), "supported_reasoning") {
 		t.Fatalf("未配置挡位时不该下发 supported_reasoning：%s", rec.Body.String())
@@ -106,7 +107,7 @@ func TestListModels_下发max原样(t *testing.T) {
 	req := httptest.NewRequest(http.MethodGet, "/v1/models", nil)
 	req.Header.Set("Authorization", "Bearer "+testAccessKey)
 	rec := httptest.NewRecorder()
-	handleListModels("")(rec, req)
+	catalog.List("")(rec, req)
 
 	if rec.Code != http.StatusOK {
 		t.Fatalf("code = %d body = %s", rec.Code, rec.Body.String())
@@ -521,7 +522,7 @@ func TestListModels_披露思考开关(t *testing.T) {
 			req := httptest.NewRequest(http.MethodGet, "/v1/models", nil)
 			req.Header.Set("Authorization", "Bearer "+testAccessKey)
 			rec := httptest.NewRecorder()
-			handleListModels("")(rec, req)
+			catalog.List("")(rec, req)
 
 			body := rec.Body.String()
 			if !strings.Contains(body, c.want) {

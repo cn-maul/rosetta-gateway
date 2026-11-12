@@ -4,6 +4,8 @@ import (
 	"net/http"
 	"testing"
 	"time"
+
+	"github.com/cn-maul/rosetta-gateway/internal/httpx"
 )
 
 func serveWithPublicOrigin(h *csrfHarness, origin string, req *http.Request) (bool, int) {
@@ -71,7 +73,7 @@ func TestSessionCookie_SecureFollowsPublicOrigin(t *testing.T) {
 			req := newRequest(http.MethodPost, "/admin/api/login", nil)
 			rec := newRecorder()
 			handler := WithPublicOrigin(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-				SetSessionCookie(w, "tok", time.Now().Add(time.Hour), SessionCookieSecure(r))
+				SetSessionCookie(w, "tok", time.Now().Add(time.Hour), httpx.SessionCookieSecure(r))
 			}), tc.origin)
 			handler.ServeHTTP(rec, req)
 

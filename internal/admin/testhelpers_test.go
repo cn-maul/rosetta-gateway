@@ -1,6 +1,7 @@
 package admin
 
 import (
+	"bytes"
 	"encoding/json"
 	"io"
 	"net/http"
@@ -10,6 +11,16 @@ import (
 	"github.com/cn-maul/rosetta-gateway/internal/identity"
 	"github.com/cn-maul/rosetta-gateway/internal/store"
 )
+
+// jsonBody 把任意值编码成请求体。
+func jsonBody(t *testing.T, v any) *bytes.Buffer {
+	t.Helper()
+	raw, err := json.Marshal(v)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	return bytes.NewBuffer(raw)
+}
 
 // jsonRequest 构造一个带 JSON 请求体的测试请求。
 //

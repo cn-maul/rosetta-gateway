@@ -239,40 +239,6 @@ func outcomeUsageStatus(status int) string {
 	return "error"
 }
 
-func statusForDiagnostics(clientGone, gatewayTimeout bool) string {
-	switch {
-	case clientGone:
-		return "canceled"
-	case gatewayTimeout:
-		return "timeout"
-	default:
-		return "error"
-	}
-}
-
-func errorCodeForDiagnostics(clientGone, gatewayTimeout bool, code string) string {
-	switch {
-	case clientGone:
-		return ""
-	case gatewayTimeout:
-		return "gateway_timeout"
-	default:
-		return code
-	}
-}
-
-func (d *requestDiagnostics) setHTTPStatus(status int) {
-	d.mu.Lock()
-	d.responseStatus = status
-	d.mu.Unlock()
-}
-
-func (d *requestDiagnostics) setErrorRaw(raw string) {
-	d.mu.Lock()
-	d.errorRaw = raw
-	d.mu.Unlock()
-}
-
 func (d *requestDiagnostics) setRouteTrace(trace string) {
 	d.mu.Lock()
 	d.routeTrace = trace

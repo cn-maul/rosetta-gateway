@@ -39,6 +39,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/cn-maul/rosetta-gateway/internal/catalog"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
@@ -1796,7 +1797,7 @@ func TestE2E_Adv1_AdminKeyRejectedOnListModels(t *testing.T) {
 
 	// 用 DB 驱动的 handler 会更真实，但 /v1/models 只读快照与库，
 	// 手工 harness 的快照已足够（它测的是鉴权分支，不是重建）。
-	h := handleListModels("")
+	h := catalog.List("")
 
 	e2eRequireUserRole(t, store.RoleAdmin)
 

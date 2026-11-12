@@ -206,7 +206,7 @@ func Run(opts Options) (retErr error) {
 	recorder := usage.New(usage.Config{
 		DB:              db,
 		Logger:          logger,
-		IsBalanceExempt: balanceExempt,
+		IsBalanceExempt: BalanceExempt,
 	})
 	lifecycleState.AddWorkers(1)
 	go func() {
@@ -377,7 +377,11 @@ func secretSource(path string) string {
 	return path + "（自动生成并持久化）"
 }
 
-func balanceExempt(userID string) bool {
+// BalanceExempt 报告该用户是否不受余额约束。
+//
+// 判定本身归 billing；这里只负责从当前运行时快照取角色。导出是为了让
+// cmd/gateway 的测试复用同一实现，而不是再抄一份适配器。
+func BalanceExempt(userID string) bool {
 	u := snapshot.Get().UsersByID[userID]
 	return u != nil && billing.IsBalanceExempt(u.Role)
 }

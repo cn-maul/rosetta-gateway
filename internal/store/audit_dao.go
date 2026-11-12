@@ -73,8 +73,8 @@ func (s *Store) ListAuditEntries(ctx context.Context, limit int) ([]AuditEntry, 
 // 可观测性零贡献，却让表无界增长（写操作每次一条，配上自动重试与批量导入
 // 配置，几十 MB 起步）。用行数封顶同时也让磁盘占用有确定上界。
 //
-// 与 PruneOldUsage / PruneOldProbes 分开：这两张表的下游还有聚合与
-// 连通率趋势图，超期数据会被折叠进 rollup，而审计日志没有下游消费者。
+// 与 PruneOldUsage / PruneOldNetworkProbes 分开：用量表的下游还有聚合与
+// 归档，而审计日志没有下游消费者。
 func (s *Store) PruneAuditLog(ctx context.Context, keepRows int) (int64, error) {
 	if keepRows <= 0 {
 		return 0, nil

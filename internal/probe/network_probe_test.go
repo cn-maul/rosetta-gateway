@@ -32,7 +32,7 @@ func newProbeRunner(t *testing.T) (*Runner, *store.Store) {
 	cfg.Probes.Enabled = true
 	cfg.Probes.Concurrency = 2
 	cfg.Probes.TimeoutMs = 5000
-	return NewRunner(st, cfg, []byte("0123456789abcdef0123456789abcdef"), logger), st
+	return NewRunner(st, cfg, logger), st
 }
 
 func seedProbeNetwork(t *testing.T, st *store.Store, id string) {
@@ -65,7 +65,6 @@ func TestRunOnce_ProbesEachNetworkExactlyOnce(t *testing.T) {
 	r, st := newProbeRunner(t)
 	seedProbeModel(t, st)
 	seedProbeNetwork(t, st, "n1")
-	r.stagger = time.Nanosecond
 
 	var calls int32
 	r.proxyProbe = func(_ context.Context, _ string) (int64, error) {

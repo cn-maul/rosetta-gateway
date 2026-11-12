@@ -87,7 +87,7 @@ func Serve(deps ServeDeps) error {
 	pruneDone := startPruner(db, cfg, logger, shutdown, deps.Lifecycle)
 	recomputeDone := startRecompute(db, logger, shutdown, deps.Lifecycle)
 	reconcileDone := startReconcile(db, logger, shutdown, deps.Lifecycle)
-	probeDone := startProbe(db, cfg, deps.MasterKey, logger, probeCtx, deps.Lifecycle)
+	probeDone := startProbe(db, cfg, logger, probeCtx, deps.Lifecycle)
 
 	quit := make(chan os.Signal, 1)
 	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
@@ -344,7 +344,7 @@ func startReconcile(db *store.Store, logger *slog.Logger, shutdown <-chan struct
 	return done
 }
 
-func startProbe(db *store.Store, cfg *config.Config, masterKey []byte, logger *slog.Logger,
+func startProbe(db *store.Store, cfg *config.Config, logger *slog.Logger,
 	ctx context.Context, lifecycle *lifecycle.Manager) <-chan struct{} {
 	done := make(chan struct{})
 	if !cfg.Probes.Enabled {
@@ -359,7 +359,7 @@ func startProbe(db *store.Store, cfg *config.Config, masterKey []byte, logger *s
 		if lifecycle != nil {
 			defer lifecycle.WorkerExited()
 		}
-		probe.NewRunner(db, cfg, masterKey, logger).Run(ctx)
+		probe.NewRunner(db, cfg, logger).Run(ctx)
 	}()
 	return done
 }

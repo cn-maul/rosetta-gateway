@@ -20,7 +20,7 @@ const (
 	frontendSettingsRuntime = "Settings > runtime defaults"
 	frontendSettingsUsage   = "Settings > usage archive"
 	frontendProvider        = "Providers > effective timeout/retry"
-	frontendModelsHealth    = "Models > health"
+	frontendNetworkLatency  = "Networks > latency"
 )
 
 var configFieldInventory = []configFieldSpec{
@@ -96,8 +96,8 @@ var configFieldInventory = []configFieldSpec{
 	},
 	{
 		Path:     "probes",
-		ReadBy:   []string{"internal/gatewayapp/serve.go:startProbe", "internal/probe/runner.go:Run", "internal/admin/probe_handler.go:Timeline"},
-		Frontend: frontendModelsHealth,
+		ReadBy:   []string{"internal/gatewayapp/serve.go:startProbe", "internal/probe/runner.go:Run"},
+		Frontend: frontendNetworkLatency,
 	},
 	{
 		Path:     "defaults.upstream_timeout_ms",
@@ -222,41 +222,31 @@ var configFieldInventory = []configFieldSpec{
 	{
 		Path:     "probes.enabled",
 		ReadBy:   []string{"internal/gatewayapp/serve.go:startProbe"},
-		Frontend: frontendModelsHealth,
+		Frontend: frontendNetworkLatency,
 	},
 	{
 		Path:     "probes.interval_sec",
-		ReadBy:   []string{"internal/probe/runner.go:Run", "internal/admin/probe_handler.go:Timeline"},
-		Frontend: frontendModelsHealth,
+		ReadBy:   []string{"internal/probe/runner.go:Run", "internal/admin/network_handler.go:probeWindowMs"},
+		Frontend: frontendNetworkLatency,
 	},
 	{
 		Path:     "probes.timeout_ms",
 		ReadBy:   []string{"internal/probe/runner.go:Run"},
-		Frontend: frontendModelsHealth,
+		Frontend: frontendNetworkLatency,
 	},
 	{
 		Path:     "probes.concurrency",
 		ReadBy:   []string{"internal/probe/runner.go:Run"},
-		Frontend: frontendModelsHealth,
-	},
-	{
-		Path:     "probes.down_threshold",
-		ReadBy:   []string{"internal/admin/probe_handler.go:classify"},
-		Frontend: frontendModelsHealth,
+		Frontend: frontendNetworkLatency,
 	},
 	{
 		Path:     "probes.window_size",
-		ReadBy:   []string{"internal/probe/runner.go:Run", "internal/admin/probe_handler.go:Timeline"},
-		Frontend: frontendModelsHealth,
-	},
-	{
-		Path:     "probes.healthy_rate",
-		ReadBy:   []string{"internal/admin/probe_handler.go:classify"},
-		Frontend: frontendModelsHealth,
+		ReadBy:   []string{"internal/admin/network_handler.go:probeWindowMs"},
+		Frontend: frontendNetworkLatency,
 	},
 	{
 		Path:     "probes.retention_days",
 		ReadBy:   []string{"internal/probe/runner.go:Run"},
-		Frontend: frontendModelsHealth,
+		Frontend: frontendNetworkLatency,
 	},
 }

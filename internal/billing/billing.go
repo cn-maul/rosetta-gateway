@@ -119,9 +119,6 @@ func EstimateBalanceCostChain(req *rosetta.ChatRequest, cands []routing.Candidat
 // 取整，让两侧做同一种整数比较。
 func YuanToCents(y float64) int64 { return store.YuanToCents(y) }
 
-// centsToYuan 是 yuanToCents 的反向（展示/日志用）。
-func CentsToYuan(c int64) float64 { return float64(c) / 100 }
-
 // balanceVerdict 是预检的结论，供 handleIngress 决定放行还是拒绝。
 type Verdict int
 

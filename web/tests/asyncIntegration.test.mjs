@@ -5,7 +5,6 @@ import { readFileSync } from 'node:fs'
 // R10（异步所有权）：把「结果必须绑定到发起它的那次请求」写成源码断言。
 // React 重写后断言对象换成 .tsx 新源码，语义不变：
 //   - ProviderDetail 的余额查询按 provider id + 请求代际双重归属；
-//   - Models 的探测时间线按请求代际 + 选择键双重归属；
 //   - ModelPicker 的「全选」在搜索过滤下用 unionSelection 保住隐藏勾选。
 function source(path) {
   return readFileSync(new URL(path, import.meta.url), 'utf8')
@@ -17,14 +16,6 @@ test('R10 ProviderDetail scopes balance to provider generation', () => {
   assert.match(s, /result\.provider_id !== pid/)
   assert.match(s, /api\.providerBalance\(pid\)/)
   assert.match(s, /balanceRequests\.current\.invalidate\(\)/)
-})
-
-test('R10 Models binds timeline results to request generation and selection', () => {
-  const s = source('../src/pages/Models.tsx')
-  assert.match(s, /const timelineRequests = new RequestGeneration\(\)/)
-  assert.match(s, /selectionKey\(ids, requestedDays, requestedGranularity\)/)
-  assert.match(s, /timelineRequests\.isCurrent\(generation\)/)
-  assert.match(s, /timelineSelectionKey\.current !== currentKey/)
 })
 
 test('R10 ModelPicker select-all preserves hidden selections', () => {

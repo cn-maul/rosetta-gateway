@@ -7,7 +7,6 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
-	"log/slog"
 	"net/http"
 	"strings"
 	"time"
@@ -110,20 +109,6 @@ type providerResponse struct {
 	// 后者要真问上游才行，而那是一次带凭据的网络请求、不该挂在列表上。
 	ModelCount int `json:"model_count"`
 	CredCount  int `json:"cred_count"`
-	// LatencyMs / LatencyP95Ms / LatencySamples 是**探针测得的**网关到该上游
-	// 的往返耗时（窗口 = probes.window_size × interval_sec，与健康判定同一口径）。
-	//
-	// 为什么放在 provider 上而不是按模型：界面上这一列只有一格，而用户问的是
-	// 「网关到这个供应商的网络有多快」；一个供应商下挂多个模型，逐模型显示
-	// 既挤不下也不是这个位置想回答的问题。
-	//
-	// LatencySamples = 0 表示窗口内没有成功的探测记录（可能从未探测、探测
-	// 全失败、或探测功能关闭）—— 前端据此显示「—」而不是 0ms，否则
-	// 「一条都没探到」会被读成「快到 0 毫秒」。失败样本刻意不计入平均：
-	// 连不上的那条 latency 是超时等待时间，混进去会让故障上游看起来很健康。
-	LatencyMs      int64 `json:"latency_ms"`
-	LatencyP95Ms   int64 `json:"latency_p95_ms"`
-	LatencySamples int64 `json:"latency_samples"`
 }
 
 // normalizeProtocol 在 API 边界接收旧版配置名，但内部始终只写入新协议值。
@@ -169,7 +154,7 @@ func resolveNetworkID(ctx context.Context, st *store.Store, id string) (string, 
 	return n.ID, nil
 }
 
-// List 列出全部 provider，并附带**运行时**就绪状态与探针延迟。
+// List 列出全部 provider，并附带**运行时**就绪状态。
 //
 // 就绪状态来自当前快照而不是库：库只记录配了什么，快照才反映「池实际建出了什么」。
 // 两者不一致正是最该看见的信息（配了却没建起来 = 凭据问题）。
@@ -179,12 +164,9 @@ func (h *ProviderHandler) List(w http.ResponseWriter, r *http.Request) {
 		writeServerError(w, "list providers", err)
 		return
 	}
-	latency := h.probeLatency(r.Context())
 	result := make([]providerResponse, 0, len(providers))
 	for _, p := range providers {
-		res := toProviderResponseWithRuntime(p)
-		applyProbeLatency(&res, latency)
-		result = append(result, res)
+		result = append(result, toProviderResponseWithRuntime(p))
 	}
 	writeJSON(w, http.StatusOK, result)
 }
@@ -298,33 +280,6 @@ func (h *ProviderHandler) Get(w http.ResponseWriter, r *http.Request, id string)
 		return
 	}
 	writeJSON(w, http.StatusOK, toProviderResponseWithRuntime(*p))
-}
-
-// probeLatency 取窗口内各上游的探针延迟，供列表填充延迟列。
-//
-// 探测表查询失败不该让整张列表 500 —— 延迟只是排障线索，缺了它用户仍能
-// 管理上游。所以这里只记日志、返回空 map（前端显示「—」）。
-func (h *ProviderHandler) probeLatency(ctx context.Context) map[string]store.ProbeLatency {
-	lat, err := h.store.ProbeLatencyByProvider(ctx, probeWindowMs(h.cfg))
-	if err != nil {
-		slog.Warn("provider list: probe latency unavailable", "error", err)
-		return nil
-	}
-	return lat
-}
-
-// applyProbeLatency 把探针延迟填进响应。
-//
-// 只在窗口内有成功样本时才写 —— Samples=0 的供应商保持零值（前端据此显示
-// 「—」）。写 0ms 会让「从未探测」和「快得测不出来」在界面上不可区分。
-func applyProbeLatency(res *providerResponse, latency map[string]store.ProbeLatency) {
-	l, ok := latency[res.ID]
-	if !ok || l.Samples <= 0 {
-		return
-	}
-	res.LatencyMs = l.AvgMs
-	res.LatencyP95Ms = l.P95Ms
-	res.LatencySamples = l.Samples
 }
 
 func (h *ProviderHandler) Update(w http.ResponseWriter, r *http.Request, id string) {

@@ -46,10 +46,9 @@ func withCapturedSlog(t *testing.T) *captureHandler {
 
 // 探测路径专用：归类不得产生任何日志记录。
 //
-// 这条是「启动日志里那条 400 WARN」的回归钉：旧 classifyError 调的是
+// 这条是「批量归类刷 400 WARN」的回归钉：旧辅助路径调的是
 // MapUpstreamError，400/404/529 分支顺带 slog.Warn 一条不带模型名的
-// "upstream returned an error"。探测失败本来就落 model_probes.error_detail，
-// 再刷一条无法定位的 WARN 只是噪声。
+// "upstream returned an error"，再刷一条无法定位的 WARN 只是噪声。
 func TestUpstreamErrorCode_不产生任何日志(t *testing.T) {
 	cases := []error{
 		&rosetta.APIError{StatusCode: 400, Type: "server_error", Message: "Model is unavailable."},

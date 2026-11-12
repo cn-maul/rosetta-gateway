@@ -313,17 +313,9 @@ func (h *GroupHandler) ModelNames(w http.ResponseWriter, r *http.Request) {
 	prices := make([]modelPrice, 0, 32)
 	// meta 与 all / prices **同样逐位对应**：meta[i] 描述 all[i]。
 	//
-	// 为什么需要它（2026-10-14 页面合并）：探测数据（model_probes）是以
-	// **upstream_models.id** 组织的，而这份清单是以**公开路由名**组织的 ——
-	// 两者主键不同，前端要在一张卡片里同时显示「公开名 + 价格 + 连通率」
-	// 就必须有一张映射表。在前端用 models[] 去 join 做不到：这里返回的是
-	// 公开名，不是上游模型行 id。
-	//
-	// 只给**主目标**（故障转移链的 position 0）的上游模型 id，与
-	// priceForModel 取价的口径**逐字一致** —— 同一个 Candidates[0]。
-	// 这一点很重要：卡片上「显示的价格」与「显示的连通率」若来自链上的
-	// 不同位置，管理员会看到「A 的价配着 B 的健康」，而实际计费与实际
-	// 探测对象都是 A。
+	// 它只带供应商显示名，供模型卡片的副标题使用；与 priceForModel
+	// 走同一条 Candidates[0] 解析路径，保证「价格」与「供应商」说的是
+	// 同一个首选目标。
 	meta := make([]modelMeta, 0, 32)
 	routes := snapshot.Get().Routes
 	for _, route := range routes.ListRoutes() {
@@ -340,8 +332,7 @@ func (h *GroupHandler) ModelNames(w http.ResponseWriter, r *http.Request) {
 	//
 	// meta 必须**跟着一起排**：它与 prices 一样是按 all 的下标对齐的
 	// 平行数组，只排 prices 会让 meta 留在构造顺序上 —— 而构造顺序是
-	// ListRoutes 的 map 遍历顺序（随机）。后果是「A 模型的连通率挂在
-	// B 模型的卡片上」，且每次刷新结果不同。
+	// ListRoutes 的 map 遍历顺序（随机），供应商名会张冠李戴。
 	sort.Slice(prices, func(i, j int) bool { return prices[i].Name < prices[j].Name })
 	sort.Slice(meta, func(i, j int) bool { return meta[i].Name < meta[j].Name })
 
@@ -390,7 +381,7 @@ func (h *GroupHandler) ModelNames(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// modelMeta 把公开模型名连到上游模型行，供探测数据挂到同一张卡片上。
+// modelMeta 把公开模型名连到上游模型行，供可用模型卡片显示供应商副标题。
 //
 // 只含上游模型行 id 与供应商显示名 —— 刻意**不给** endpoint、凭据、协议、
 // 上游模型名本身之外的东西：这份端点普通用户也能读（见 server 里的
@@ -402,19 +393,14 @@ type modelMeta struct {
 	// Name 是所属的公开模型名 —— 排序与对齐用的键，语义与 modelPrice.Name
 	// 相同（prices 与 meta 都靠它与 models 逐位对齐，见构造处的注释）。
 	Name string `json:"name"`
-	// UpstreamModelID 是探测表 model_probes.model_id 的外键（32 位 hex）。
-	// 空 = 该路由解析不出可用目标（禁用/无可用模型），前端据此不画连通率。
-	UpstreamModelID string `json:"upstream_model_id"`
 	// ProviderName 是所属上游的显示名，仅用于给卡片加一个可读的副标题。
 	ProviderName string `json:"provider_name"`
 }
 
-// metaForModel 取公开名对应的上游模型行 id 与供应商名。
+// metaForModel 取公开名对应的供应商名。
 //
 // 与 priceForModel **走同一条解析路径**（同一个 Resolve、同一个
-// Candidates[0]）：卡片上的价格与连通率必须指向同一个上游模型，否则
-// 管理员会看到「A 模型的价配着 B 模型的健康曲线」，而真实计费与真实
-// 探测对象都是 A —— 这类错位没有任何界面提示能让人发现。
+// Candidates[0]）：卡片上的价格与供应商名必须指向同一个首选目标。
 func metaForModel(routes *routing.RouteIndex, name string) modelMeta {
 	out := modelMeta{Name: name}
 	res, err := routes.Resolve(name)
@@ -422,7 +408,6 @@ func metaForModel(routes *routing.RouteIndex, name string) modelMeta {
 		return out
 	}
 	c := res.Candidates[0]
-	out.UpstreamModelID = c.UpstreamModel.ID
 	// slug 在创建上游时由后端生成且**唯一**，比人类填的 name 更适合当
 	// 稳定标识；但用户看到的往往是 name，所以这里优先 name、再 slug、
 	// 两者都空时才回退短 id（见 frontend 的同类实现）。

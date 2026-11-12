@@ -25,7 +25,6 @@ import (
 func TestAdminQueries_HonorRequestCancellation(t *testing.T) {
 	st := newScopeStore(t)
 	uh := NewUsageHandler(st)
-	gh := NewModelGroupHandler(st)
 
 	cases := []struct {
 		name string
@@ -39,7 +38,6 @@ func TestAdminQueries_HonorRequestCancellation(t *testing.T) {
 		{"按上游", uh.GroupByProvider},
 		{"按天", uh.GroupByDay},
 		{"按用户", uh.GroupByUser},
-		{"模型组列表", gh.List},
 	}
 
 	for _, tc := range cases {

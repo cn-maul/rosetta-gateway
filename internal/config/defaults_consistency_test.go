@@ -12,15 +12,15 @@ import (
 //
 // 此前 setDefaults 用的是 `if !c.Probes.Enabled { c.Probes.Enabled = true }`，
 // 于是运维写 `{"probes":{"enabled":false}}`（最自然的关法）会被静默改回开启
-// —— 之后每 10 分钟对每个上游模型发一次真实推理并向上游付费，
-// 而配置文件里明明写着关闭。没有报错、没有日志，只有账单。
+// —— 之后每 10 分钟对每条代理发起一次测速，而配置文件里明明写着关闭。
+// 没有报错、没有日志，行为与配置直接相反。
 func TestProbes_显式关闭不被改回开启(t *testing.T) {
 	c, err := Parse([]byte(`{"listen":"127.0.0.1:8666","probes":{"enabled":false}}`))
 	if err != nil {
 		t.Fatalf("Parse: %v", err)
 	}
 	if c.Probes.Enabled {
-		t.Fatal(`probes.enabled=false 被静默改回 true —— 会持续对上游发起付费探测`)
+		t.Fatal(`probes.enabled=false 被静默改回 true —— 会持续发起代理测速`)
 	}
 	// 其余字段仍应被填上默认值（只尊重 enabled，不放过整块）。
 	if c.Probes.IntervalSec != 600 || c.Probes.TimeoutMs != 30000 || c.Probes.Concurrency != 4 {

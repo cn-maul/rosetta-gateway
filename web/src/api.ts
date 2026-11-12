@@ -451,11 +451,8 @@ import type {
   Credential,
   UpstreamModel,
   UpstreamModelUpdate,
-  ModelGroup,
   Network,
   NetworkTestResult,
-  ProbeHealth,
-  ProbeTimelineBucket,
   DiscoveredModel,
   ModelImportItem,
   ModelTestResult,
@@ -486,7 +483,6 @@ import type {
   Group,
   ModelPrice,
   ModelMeta,
-  ModelGroupHistoryMember,
 } from './types'
 
 /**
@@ -566,40 +562,6 @@ export const api = {
   batchUpdateModelPrices: (modelIds: string[], b: { price_input: number; price_cache_hit: number; price_output: number }) =>
     mutate(() => post<{ updated: number; price_input: number; price_cache_hit: number; price_output: number }>('/models/batch-price', { model_ids: modelIds, ...b })),
 
-  // 模型归组（跨上游的同一个模型合并统计；纯展示层，不参与数据面路由）
-  modelGroups: () => get<ModelGroup[]>('/model-groups'),
-  createModelGroup: (display_name: string) => mutate(() => post<ModelGroup>('/model-groups', { display_name })),
-  updateModelGroup: (id: string, display_name: string) => mutate(() => patch<ModelGroup>(`/model-groups/${id}`, { display_name })),
-  deleteModelGroup: (id: string) => mutate(() => del(`/model-groups/${id}`)),
-  assignModelsToGroup: (groupId: string, modelIds: string[]) =>
-    mutate(() => post<{ assigned: number }>(`/model-groups/${groupId}/assign`, { model_ids: modelIds })),
-  unassignModelsFromGroup: (modelIds: string[]) =>
-    mutate(() => post<{ unassigned: number }>('/model-groups/unassign', { model_ids: modelIds })),
-  /**
-   * 组内已经没有当前模型行、但历史用量仍在的成员。
-   *
-   * 删上游后统计继续按组名合并，靠的就是保留下来的归属行；成员弹窗必须
-   * 能看见这部分，否则「成员数」与实际可见成员对不上。
-   */
-  modelGroupHistoryMembers: (groupId: string) =>
-    get<ModelGroupHistoryMember[]>(`/model-groups/${groupId}/history-members`),
-  /**
-   * 有历史用量、没有当前模型行、也没归组的 (provider_id, model_id)。
-   * 这是「删上游导致归组丢失」的补救入口。
-   */
-  orphanHistoryMembers: () => get<ModelGroupHistoryMember[]>('/model-groups/orphan-history-members'),
-  assignHistoryMembersToGroup: (groupId: string, members: { provider_id: string; model_id: string }[]) =>
-    mutate(() => post<{ assigned: number }>(`/model-groups/${groupId}/assign-history`, { members })),
-  unassignHistoryMembersFromGroup: (members: { provider_id: string; model_id: string }[]) =>
-    mutate(() => post<{ unassigned: number }>('/model-groups/unassign-history', { members })),
-
-  // 上游模型健康探测（读 model_probes 表；探测循环在后台跑）
-  probeModels: () => get<ProbeHealth[]>('/probes/models'),
-  // 多模型一次查：modelIds 以逗号分隔。返回的桶带 model_id，前端分流到各卡片。
-  probeTimeline: (modelIds: string[], days = 7, granularity: 'hour' | 'day' = 'hour') =>
-    get<ProbeTimelineBucket[]>(
-      `/probes/timeline?model_id=${encodeURIComponent(modelIds.join(','))}&days=${days}&granularity=${granularity}`,
-    ),
   discoverModels: (providerId: string) =>
     post<{ status: string; message?: string; models?: DiscoveredModel[] }>(`/providers/${providerId}/models/discover`),
   importModels: (providerId: string, models: ModelImportItem[]) =>
@@ -828,17 +790,10 @@ export const api = {
    * modelNames 返回按身份收窄后的可用模型清单。
    *
    * 三个数组 `models` / `prices` / `meta` **逐位对应**（后端保证长度相等，
-   * 有测试钉住），所以下标 i 的模型名、价格、上游模型 id 是同一件事。
+   * 有测试钉住），所以下标 i 的模型名、价格、供应商名是同一件事。
    *
-   * # 为什么要有 meta（2026-10-14 页面合并）
-   *
-   * 探测数据挂在 `upstream_models.id` 上，而这份清单挂在**公开路由名**上 ——
-   * 主键不同。`Models.vue` 要在一张卡片里同时显示「价格 + 连通率」，
-   * 就得靠 meta 把两者对上。前端无法自己 join：model-names 返回的 models
-   * 是公开名而不是上游模型行 id，而 /admin/api/upstream-models 是 admin-only。
-   *
-   * meta 指向的与 prices 指向的是**同一个**上游模型（后端都取故障转移链
-   * 的 position 0），否则卡片会显示「A 的价配着 B 的健康」。
+   * meta 与 prices 都取故障转移链的 position 0（首选目标），否则卡片会
+   * 显示「A 的价配着 B 的供应商」。
    */
   modelNames: () =>
     get<{ models: string[]; restricted: boolean; prices?: ModelPrice[]; meta?: ModelMeta[] }>(

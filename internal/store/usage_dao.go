@@ -975,26 +975,6 @@ func (s *Store) GetUsageStats(ctx context.Context, from, to int64, scopeUserID s
 	return &stats, nil
 }
 
-// timeRangeClause 构造 ts 时间过滤的 WHERE 子句。from/to 为毫秒时间戳，
-// 0 表示不设该边界。prefix 是 ts 列的限定前缀（如 "u."，JOIN 时用来消歧），
-// 返回的 args 与 where 配套使用。
-func timeRangeClause(from, to int64, prefix string) (string, []any) {
-	var conds []string
-	var args []any
-	if from > 0 {
-		conds = append(conds, prefix+"ts >= ?")
-		args = append(args, from)
-	}
-	if to > 0 {
-		conds = append(conds, prefix+"ts <= ?")
-		args = append(args, to)
-	}
-	if len(conds) == 0 {
-		return "", nil
-	}
-	return " WHERE " + strings.Join(conds, " AND "), args
-}
-
 // GetRecentThroughput 返回最近若干次成功调用的平均输出速度（token/s）。
 // 用聚合口径（输出 token 之和 / 延迟之和），比逐条速率平均更稳，不会被单次快慢请求带偏。
 // 只统计 status='ok' 且确有输出、确有耗时的记录；不足样本时返回 0。

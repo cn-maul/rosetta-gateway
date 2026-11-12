@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"github.com/cn-maul/rosetta-gateway/internal/catalog"
 	"io"
 	"log/slog"
 	"net/http"
@@ -64,7 +65,7 @@ func TestModels_Metadata(t *testing.T) {
 		UsersByID:  map[string]*snapshot.UserSnapshot{},
 	})
 
-	h := handleListModels("")
+	h := catalog.List("")
 	rec := httptest.NewRecorder()
 	h(rec, authedGet("/v1/models"))
 	var list struct {
@@ -85,7 +86,7 @@ func TestModels_Metadata(t *testing.T) {
 
 	// PathValue 依赖 ServeMux 的路由上下文，必须经 mux 转发。
 	detailMux := http.NewServeMux()
-	detailMux.HandleFunc("GET /v1/models/{model}", handleGetModel(""))
+	detailMux.HandleFunc("GET /v1/models/{model}", catalog.Get(""))
 	rec2 := httptest.NewRecorder()
 	detailMux.ServeHTTP(rec2, authedGet("/v1/models/flash"))
 	if rec2.Code != http.StatusOK || !strings.Contains(rec2.Body.String(), `"context_length":128000`) {

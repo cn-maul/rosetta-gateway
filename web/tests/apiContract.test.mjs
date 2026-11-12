@@ -216,7 +216,7 @@ test('错误信封的 message 被翻成 ApiFail.message', async () => {
     jsonResponse(400, { error: { message: 'display_name 不能为空', type: 'invalid_request' } })
   const { api, ApiFail } = await freshApi()
 
-  await assert.rejects(() => api.createModelGroup(''), (err) => {
+  await assert.rejects(() => api.createProvider({ name: 'x', protocol: 'chat', endpoint: 'https://example.test' }), (err) => {
     assert.ok(err instanceof ApiFail)
     assert.equal(err.status, 400)
     assert.equal(err.message, 'display_name 不能为空')
@@ -354,9 +354,9 @@ test('模型白名单按组写入用 PUT 到 models 子路径', async () => {
 })
 
 test('生产路由快照完整且免鉴权端点集合固定', () => {
-  // 120 = 119 + 失败原因聚合（GET /admin/api/usage/failures）
-  assert.equal(API_ROUTES.length, 120, '路由增删必须同步承认契约变化')
-  assert.equal(new Set(API_ROUTES.map((r) => r.pattern)).size, 120, '路由 pattern 不得重复')
+  // 107 = 移除模型探测（2 条）与模型归组（11 条）后的真实生产契约。
+  assert.equal(API_ROUTES.length, 107, '路由增删必须同步承认契约变化')
+  assert.equal(new Set(API_ROUTES.map((r) => r.pattern)).size, 107, '路由 pattern 不得重复')
 
   const publicRoutes = API_ROUTES
     .filter((r) => r.public)

@@ -51,23 +51,10 @@ type UpstreamModel struct {
 	PriceCacheHit      float64
 	PriceCacheCreation float64
 	PriceOutput        float64
-
-	// GroupID 是模型归组（跨上游的同一个模型标成一组，统计合并显示）。
-	// 空串 = 未归组。组的权威显示名在 model_groups.display_name，
-	// 本列只是归属指针 —— 改组名不需要动这里（见 model_group_dao.go）。
-	GroupID string
 }
 
 // modelColumns 是 upstream_models 读路径共用的列清单。
-//
-// group_id 取 model_group_members 而不是 upstream_models.group_id：
-// 后者随 provider 级联删除，只是一个兼容镜像；统计口径的权威归属在独立表里。
-// 所有使用本常量的 SELECT 都必须把表引成 `upstream_models um` 并带上
-// `modelGroupJoin`，否则 group_id 会取到旧列或直接报错。
-const modelColumns = `um.id, um.provider_id, um.model_id, um.display_name, um.context_window, um.max_output_tokens, um.supports_thinking, um.effort_levels, um.thinking_dialect, um.can_disable_thinking, um.price_input, um.price_cache_hit, um.price_cache_creation, um.price_output, COALESCE(mgm.group_id, '')`
-
-const modelGroupJoin = ` LEFT JOIN model_group_members mgm
-	ON mgm.provider_id = um.provider_id AND mgm.model_id = um.model_id`
+const modelColumns = `um.id, um.provider_id, um.model_id, um.display_name, um.context_window, um.max_output_tokens, um.supports_thinking, um.effort_levels, um.thinking_dialect, um.can_disable_thinking, um.price_input, um.price_cache_hit, um.price_cache_creation, um.price_output`
 
 // nullIfZeroInt 把 0 写回 NULL。
 // context_window / max_output_tokens 是可空列，0 与"未知"语义不同，
@@ -129,11 +116,10 @@ func scanModel(sc scanner) (UpstreamModel, error) {
 	var dialectCSV sql.NullString
 	var canDisable sql.NullBool
 	var priceIn, priceHit, priceCreate, priceOut sql.NullFloat64
-	var groupID sql.NullString
 
 	err := sc.Scan(&m.ID, &m.ProviderID, &m.ModelID, &displayName,
 		&ctxWindow, &maxOut, &thinking, &effortCSV, &dialectCSV, &canDisable,
-		&priceIn, &priceHit, &priceCreate, &priceOut, &groupID)
+		&priceIn, &priceHit, &priceCreate, &priceOut)
 	if err != nil {
 		return m, err
 	}
@@ -145,7 +131,6 @@ func scanModel(sc scanner) (UpstreamModel, error) {
 	m.PriceCacheHit = priceHit.Float64
 	m.PriceCacheCreation = priceCreate.Float64
 	m.PriceOutput = priceOut.Float64
-	m.GroupID = groupID.String
 	if thinking.Valid {
 		v := thinking.Bool
 		m.SupportsThinking = &v
@@ -172,7 +157,7 @@ func scanModel(sc scanner) (UpstreamModel, error) {
 
 func (s *Store) ListUpstreamModels(ctx context.Context, providerID string) ([]UpstreamModel, error) {
 	rows, err := s.read.QueryContext(ctx,
-		`SELECT `+modelColumns+` FROM upstream_models um`+modelGroupJoin+
+		`SELECT `+modelColumns+` FROM upstream_models um`+
 			` WHERE um.provider_id = ? ORDER BY um.model_id`, providerID)
 	if err != nil {
 		return nil, err
@@ -192,7 +177,7 @@ func (s *Store) ListUpstreamModels(ctx context.Context, providerID string) ([]Up
 
 func (s *Store) ListAllUpstreamModels(ctx context.Context) ([]UpstreamModel, error) {
 	rows, err := s.read.QueryContext(ctx,
-		`SELECT `+modelColumns+` FROM upstream_models um`+modelGroupJoin+
+		`SELECT `+modelColumns+` FROM upstream_models um`+
 			` ORDER BY um.provider_id, um.model_id`)
 	if err != nil {
 		return nil, err
@@ -214,11 +199,10 @@ func (s *Store) GetUpstreamModel(ctx context.Context, id string) (*UpstreamModel
 	return getUpstreamModel(ctx, s.read, id)
 }
 
-// getUpstreamModel 是事务内版本（指派/移出组时要在同一笔事务里读模型，
-// 再从 provider_id + model_id 写归属表）。
+// getUpstreamModel 是事务内版本（删除/改名要在同一笔事务里确认模型存在）。
 func getUpstreamModel(ctx context.Context, q execer, id string) (*UpstreamModel, error) {
 	m, err := scanModel(q.QueryRowContext(ctx,
-		`SELECT `+modelColumns+` FROM upstream_models um`+modelGroupJoin+` WHERE um.id = ?`, id))
+		`SELECT `+modelColumns+` FROM upstream_models um WHERE um.id = ?`, id))
 	if err == sql.ErrNoRows {
 		return nil, nil
 	}
@@ -240,23 +224,11 @@ func (s *Store) CreateUpstreamModelTx(ctx context.Context, tx Tx, m *UpstreamMod
 // createUpstreamModel 接受 execer，供事务内复用（见 ImportUpstreamModels）。
 func createUpstreamModel(ctx context.Context, ex execer, m *UpstreamModel) error {
 	_, err := ex.ExecContext(ctx,
-		`INSERT INTO upstream_models (id, provider_id, model_id, display_name, context_window, max_output_tokens, supports_thinking, effort_levels, thinking_dialect, can_disable_thinking, price_input, price_cache_hit, price_cache_creation, price_output, group_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		`INSERT INTO upstream_models (id, provider_id, model_id, display_name, context_window, max_output_tokens, supports_thinking, effort_levels, thinking_dialect, can_disable_thinking, price_input, price_cache_hit, price_cache_creation, price_output) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		m.ID, m.ProviderID, m.ModelID, nullIfEmpty(m.DisplayName),
 		nullIfZeroInt(m.ContextWindow), nullIfZeroInt(m.MaxOutputTokens), m.SupportsThinking,
 		effortColumnValue(m), dialectColumnValue(m), m.CanDisableThinking,
-		nullIfZeroFloat(m.PriceInput), nullIfZeroFloat(m.PriceCacheHit), nullIfZeroFloat(m.PriceCacheCreation), nullIfZeroFloat(m.PriceOutput),
-		nullIfEmpty(m.GroupID))
-	if err != nil {
-		return err
-	}
-	// 导入/配置引导可能带着 group_id 建模型。归属表才是读路径的权威来源，
-	// 只写镜像列会让新库在重启前都看不到归组。
-	if m.GroupID != "" {
-		_, err = ex.ExecContext(ctx,
-			`INSERT INTO model_group_members (group_id, provider_id, model_id) VALUES (?, ?, ?)
-			 ON CONFLICT(provider_id, model_id) DO UPDATE SET group_id = excluded.group_id`,
-			m.GroupID, m.ProviderID, m.ModelID)
-	}
+		nullIfZeroFloat(m.PriceInput), nullIfZeroFloat(m.PriceCacheHit), nullIfZeroFloat(m.PriceCacheCreation), nullIfZeroFloat(m.PriceOutput))
 	return err
 }
 
@@ -275,36 +247,13 @@ func (s *Store) UpdateUpstreamModel(ctx context.Context, id string, m *UpstreamM
 		return ErrNotFound
 	}
 	if _, err := tx.ExecContext(ctx,
-		`UPDATE upstream_models SET model_id = ?, display_name = ?, context_window = ?, max_output_tokens = ?, supports_thinking = ?, effort_levels = ?, thinking_dialect = ?, can_disable_thinking = ?, price_input = ?, price_cache_hit = ?, price_cache_creation = ?, price_output = ?, group_id = ? WHERE id = ?`,
+		`UPDATE upstream_models SET model_id = ?, display_name = ?, context_window = ?, max_output_tokens = ?, supports_thinking = ?, effort_levels = ?, thinking_dialect = ?, can_disable_thinking = ?, price_input = ?, price_cache_hit = ?, price_cache_creation = ?, price_output = ? WHERE id = ?`,
 		m.ModelID, nullIfEmpty(m.DisplayName),
 		nullIfZeroInt(m.ContextWindow), nullIfZeroInt(m.MaxOutputTokens), m.SupportsThinking,
 		effortColumnValue(m), dialectColumnValue(m), m.CanDisableThinking,
 		nullIfZeroFloat(m.PriceInput), nullIfZeroFloat(m.PriceCacheHit), nullIfZeroFloat(m.PriceCacheCreation), nullIfZeroFloat(m.PriceOutput),
-		nullIfEmpty(m.GroupID), id); err != nil {
+		id); err != nil {
 		return err
-	}
-	// 归属定位符跟着 model_id 改名走。改名本身在 handler 层已禁止在有
-	// 历史用量后进行，所以这里只处理「还没产生用量就改拼写」的正常场景。
-	if old.ProviderID != m.ProviderID || old.ModelID != m.ModelID {
-		if _, err := tx.ExecContext(ctx,
-			`DELETE FROM model_group_members WHERE provider_id = ? AND model_id = ?`,
-			old.ProviderID, old.ModelID); err != nil {
-			return err
-		}
-		if m.GroupID != "" {
-			if _, err := tx.ExecContext(ctx,
-				`INSERT INTO model_group_members (group_id, provider_id, model_id) VALUES (?, ?, ?)
-				 ON CONFLICT(provider_id, model_id) DO UPDATE SET group_id = excluded.group_id`,
-				m.GroupID, m.ProviderID, m.ModelID); err != nil {
-				return err
-			}
-		}
-	} else if old.GroupID != m.GroupID {
-		if err := s.setGroupMemberships(ctx, tx, []GroupMemberRef{
-			{ProviderID: m.ProviderID, ModelID: m.ModelID},
-		}, m.GroupID); err != nil {
-			return err
-		}
 	}
 	return tx.Commit()
 }
@@ -350,10 +299,7 @@ func (s *Store) DeleteUpstreamModel(ctx context.Context, id string) error {
 	return tx.Commit()
 }
 
-// deleteUpstreamModelAndCleanGroup 删模型行，并清掉「没有历史用量」的组归属。
-//
-// 有历史用量的归属必须留下：统计仍要靠它把旧行并进组；没用量的是纯空壳，
-// 留下只会让组成员数多出一个既不在模型列表、又没有统计行的不可见成员。
+// deleteUpstreamModelAndCleanGroup 确认模型存在后删除它。
 func deleteUpstreamModelAndCleanGroup(ctx context.Context, tx execer, id string) error {
 	m, err := getUpstreamModel(ctx, tx, id)
 	if err != nil {
@@ -362,10 +308,7 @@ func deleteUpstreamModelAndCleanGroup(ctx context.Context, tx execer, id string)
 	if m == nil {
 		return ErrNotFound
 	}
-	if err := deleteByID(ctx, tx, "upstream_models", id); err != nil {
-		return err
-	}
-	return deleteGroupMembershipsWithoutUsage(ctx, tx, m.ProviderID, m.ModelID)
+	return deleteByID(ctx, tx, "upstream_models", id)
 }
 
 // ErrModelIsRouteHead 表示该模型是某条路由的**链首**，因此不能删。
@@ -390,12 +333,6 @@ var ErrModelIsRouteHead = errors.New("upstream model is a route head")
 // 中途状态会让快照读到断链：先删目标行、还没重排时，position 会出现空洞，
 // 而 Resolve 按 position 升序遍历 —— 空洞本身不致命，但配合「主目标列还没
 // 更新」就会让按名解析拿到已删除的模型。所以整个操作原子完成。
-//
-// # 探测记录级联清理
-//
-// model_probes 是纯派生数据（见 store.go 的建表注释），对已删模型没有意义，
-// 留着只会在 /probes/models 里变成一堆取不到模型行的孤儿。历史曲线断掉
-// 是可接受的：那个模型已经不存在了，「它以前通不通」不再有处置价值。
 func (s *Store) DeleteUpstreamModelDetaching(ctx context.Context, id string) ([]string, error) {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
@@ -438,11 +375,6 @@ func (s *Store) DeleteUpstreamModelDetaching(ctx context.Context, id string) ([]
 		if err := compactTargetPositions(ctx, tx, routeID); err != nil {
 			return nil, err
 		}
-	}
-
-	// 探测记录级联清理（见函数注释）。
-	if _, err := tx.ExecContext(ctx, `DELETE FROM model_probes WHERE model_id = ?`, id); err != nil {
-		return nil, err
 	}
 
 	if err := deleteUpstreamModelAndCleanGroup(ctx, tx, id); err != nil {

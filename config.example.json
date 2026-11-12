@@ -14,9 +14,7 @@
     "interval_sec": 600,
     "timeout_ms": 30000,
     "concurrency": 4,
-    "down_threshold": 3,
     "window_size": 10,
-    "healthy_rate": 0.8,
     "retention_days": 30
   },
   "defaults": {

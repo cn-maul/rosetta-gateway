@@ -220,12 +220,6 @@ type modelResponse struct {
 	// DialectSource 说明 EffectiveDialect 是手工配的、推断的、还是兜底。
 	DialectSource dialect.Source `json:"thinking_dialect_source"`
 
-	// GroupID 是模型归组（跨上游同名合并统计）。空串 = 未归组。
-	// 只下发 id 不下发组名：组名要再查 model_groups，而前端本来就独立
-	// 加载全量组列表（组是小表），本地映射即可 —— 后端 JOIN 出来只是
-	// 把同一份数据搬运两次。
-	GroupID string `json:"group_id,omitempty"`
-
 	// RouteCount 是引用该模型的路由链数量；IsRouteHead 表示它是不是
 	// 某条链的**链首**（2026-10-14 随「可删除非链首模型」一起加）。
 	//
@@ -516,11 +510,10 @@ func (h *ModelHandler) Update(w http.ResponseWriter, r *http.Request, id string)
 
 // Delete 删除一个上游模型，并自动把它从故障转移链里摘掉（2026-10-14）。
 //
-// 与旧行为的差别有两处，都是往「让删除可用」的方向改的：
+// 与旧行为的差别如下，都是往「让删除可用」的方向改的：
 //   - 摘链：链上的非链首成员可以被删掉，不必先去「路由」页手工移除。
 //     原来 route_targets.upstream_model_id 是 ON DELETE RESTRICT，删任何
 //     被引用的模型都会被数据库直接拒绝，界面上只是一句不明的错误。
-//   - 探测记录级联清理：model_probes 是纯派生数据，对已删模型没有意义。
 //
 // 链首仍然拒绝（409）：链的顺序是「先试谁」的显式配置，替管理员顺延等于
 // 悄悄改了他的流量分配。处置办法写进错误消息，让他知道去哪儿改。
@@ -1062,6 +1055,5 @@ func toModelResponse(m store.UpstreamModel) modelResponse {
 		ThinkingDialect:     m.ThinkingDialect,
 		EffectiveDialect:    effective,
 		DialectSource:       source,
-		GroupID:             m.GroupID,
 	}
 }

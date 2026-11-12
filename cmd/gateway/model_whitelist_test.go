@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"github.com/cn-maul/rosetta-gateway/internal/catalog"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -215,7 +216,7 @@ func initHarness(t *testing.T) {
 // fetchModelIDs 请求模型列表并取出 data[].id。
 func fetchModelIDs(t *testing.T, path string) []string {
 	t.Helper()
-	h := handleListModels("")
+	h := catalog.List("")
 	rec := httptest.NewRecorder()
 	h(rec, authedGet(path))
 	if rec.Code != http.StatusOK {

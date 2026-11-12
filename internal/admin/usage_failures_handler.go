@@ -113,7 +113,12 @@ func (h *UsageHandler) Failures(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// 1) 区间整体：总请求与失败数。一次扫出，避免再发一条只为算比率的查询。
-	if err := h.store.DB().QueryRowContext(r.Context(),
+	//
+	// 三条查询都走读池：这是**纯读**聚合，没有任何写。曾误用写池（DB()），
+	// 而写池只有 1 条连接，且用量落库、配额预检、审计写都在排队 ——
+	// 总览页每次打开都会用三条全区间聚合去挤这条连接。WAL 下读者互不阻塞，
+	// 读池有 4 条，没有理由不过去。
+	if err := h.store.Reader().QueryRowContext(r.Context(),
 		`SELECT COUNT(*), COALESCE(SUM(CASE WHEN `+usageFailureCond+` THEN 1 ELSE 0 END), 0)
 		   FROM usage_records WHERE `+where, args...,
 	).Scan(&resp.Total, &resp.Failed); err != nil {
@@ -126,7 +131,7 @@ func (h *UsageHandler) Failures(w http.ResponseWriter, r *http.Request) {
 
 	// 2) 按错误码。
 	codeArgs := append(append([]any{}, args...), limit)
-	codeRows, err := h.store.DB().QueryContext(r.Context(),
+	codeRows, err := h.store.Reader().QueryContext(r.Context(),
 		`SELECT COALESCE(NULLIF(error_code, ''), status) AS code,
 		        http_status,
 		        COUNT(*) AS n,
@@ -160,7 +165,7 @@ func (h *UsageHandler) Failures(w http.ResponseWriter, r *http.Request) {
 	// 顺带回答「这家是不是整体不行」：rate 的分母是该上游**全部**请求，
 	// 不是只有失败的请求 —— 用失败数当分母会得到恒等于 1 的废数。
 	upArgs := append(append([]any{}, args...), limit)
-	upRows, err := h.store.DB().QueryContext(r.Context(),
+	upRows, err := h.store.Reader().QueryContext(r.Context(),
 		`SELECT provider_id,
 		        COALESCE(MAX(provider_name), '') AS name,
 		        COUNT(*) AS total,

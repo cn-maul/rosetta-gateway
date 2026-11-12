@@ -26,10 +26,10 @@ func TestBuildApp_RegistersEveryCataloguedRoute(t *testing.T) {
 		usage: newUsageRecorder(db, discardLogger()),
 	})
 
-	// 120 是当前真实生产契约（含 5 条 /admin/api/ 方法兜底与 3 条 /v1
+	// 107 是当前真实生产契约（含 5 条 /admin/api/ 方法兜底与 3 条 /v1
 	// 子树兜底）。端点增删必须显式更新这个数，不能靠测试里手抄第三份清单。
-	if len(app.Routes) != 120 {
-		t.Fatalf("生产路由契约应为 120 条，实际 %d 条", len(app.Routes))
+	if len(app.Routes) != 107 {
+		t.Fatalf("生产路由契约应为 107 条，实际 %d 条", len(app.Routes))
 	}
 	seen := make(map[string]registeredRoute)
 	for _, r := range app.Routes {
@@ -53,8 +53,6 @@ func TestBuildApp_RegistersEveryCataloguedRoute(t *testing.T) {
 		"/v1/", "/openai/v1/", "/anthropic/v1/",
 		"POST /admin/api/login", "GET /admin/api/session",
 		"GET /admin/api/providers", "POST /admin/api/providers",
-		"GET /admin/api/model-groups/{id}/members",
-		"GET /admin/api/probes/timeline",
 		"GET /admin/api/usage/by-user", "POST /admin/api/usage/prune",
 		"GET /admin/api/usage/history.csv",
 		"PUT /admin/api/routes/{id}/targets",

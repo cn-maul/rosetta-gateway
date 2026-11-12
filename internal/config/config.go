@@ -139,11 +139,10 @@ type Config struct {
 	AuditLogKeepRows int `json:"audit_log_keep_rows"`
 	auditKeepRowsSet bool
 
-	// Probes 是上游模型定时探测的配置（2026-10-14）。
+	// Probes 是出站代理定时测速的配置（2026-11-12 起只剩代理测速，
+	// 模型可用性探测已移除）。
 	//
-	// 探测请求复用 upstream.TestUpstreamModel（max_tokens=1、不经
-	// usage_recorder），**不扣任何网关用户的钱**，但确实产生上游侧计费
-	// （每个模型每天约 3 token 量级）。默认开 —— 用户明确要这个功能。
+	// 每轮对每条代理发一次 generate_204，不经过上游、不计费。
 	Probes ProbeConfig `json:"probes"`
 
 	// trustedProxies 是 TrustedProxyCIDRs 校验、去重后的运行时形态。
@@ -153,26 +152,22 @@ type Config struct {
 
 // ProbeConfig 是定时探测的参数。
 //
-// 所有值都必须为正（interval/timeout/concurrency/down_threshold/window_size/
-// retention_days）：负值会让 time.NewTicker 当场 panic（config.go:242-253
-// 有一整段既往事故记录）。healthy_rate 是 0~1 的小数。
+// 所有值都必须为正（interval/timeout/concurrency/window_size/retention_days）：
+// 负值会让 time.NewTicker 当场 panic（config.go:242-253 有一整段既往事故记录）。
 type ProbeConfig struct {
-	Enabled       bool    `json:"enabled"`
-	IntervalSec   int     `json:"interval_sec"`
-	TimeoutMs     int     `json:"timeout_ms"`
-	Concurrency   int     `json:"concurrency"`
-	DownThreshold int     `json:"down_threshold"`
-	WindowSize    int     `json:"window_size"`
-	HealthyRate   float64 `json:"healthy_rate"`
-	RetentionDays int     `json:"retention_days"`
+	Enabled       bool `json:"enabled"`
+	IntervalSec   int  `json:"interval_sec"`
+	TimeoutMs     int  `json:"timeout_ms"`
+	Concurrency   int  `json:"concurrency"`
+	WindowSize    int  `json:"window_size"`
+	RetentionDays int  `json:"retention_days"`
 
 	// configured 记录「probes 块在配置里出现过」，不参与 JSON 编解码。
 	//
 	// 为什么必须显式记录而不能用 `c.Probes == (ProbeConfig{})` 判断：
 	// `{"probes":{"enabled":false}}` 反序列化后**恰好就是零值结构体**，
 	// 与「整块没配」不可区分，于是 setDefaults 判定为「没配过 → 默认开启」
-	// 并把用户明确写下的 false 改回 true —— 之后每 10 分钟对每个上游模型
-	// 发一次真实推理并向上游付费，而配置文件里明明写着关闭。
+	// 并把用户明确写下的 false 改回 true —— 而配置文件里明明写着关闭。
 	// 布尔值天然无法区分「显式 false」与「缺省」，只能靠 key 是否出现来判断。
 	configured bool
 	// enabledSet 记录 enabled 这个键本身是否出现。只出现 interval_sec 等
@@ -458,14 +453,8 @@ func (c *Config) setDefaults() {
 	if c.Probes.Concurrency == 0 {
 		c.Probes.Concurrency = 4
 	}
-	if c.Probes.DownThreshold == 0 {
-		c.Probes.DownThreshold = 3
-	}
 	if c.Probes.WindowSize == 0 {
 		c.Probes.WindowSize = 10
-	}
-	if c.Probes.HealthyRate == 0 {
-		c.Probes.HealthyRate = 0.8
 	}
 	if c.Probes.RetentionDays == 0 {
 		c.Probes.RetentionDays = 30
@@ -575,14 +564,8 @@ func (c *Config) validate() error {
 		if c.Probes.Concurrency < 1 {
 			return fmt.Errorf("probes.concurrency: must be >= 1, got %d", c.Probes.Concurrency)
 		}
-		if c.Probes.DownThreshold < 1 {
-			return fmt.Errorf("probes.down_threshold: must be >= 1, got %d", c.Probes.DownThreshold)
-		}
 		if c.Probes.WindowSize < 1 {
 			return fmt.Errorf("probes.window_size: must be >= 1, got %d", c.Probes.WindowSize)
-		}
-		if c.Probes.HealthyRate <= 0 || c.Probes.HealthyRate > 1 {
-			return fmt.Errorf("probes.healthy_rate: must be in (0,1], got %v", c.Probes.HealthyRate)
 		}
 		if c.Probes.RetentionDays < 1 {
 			return fmt.Errorf("probes.retention_days: must be >= 1, got %d", c.Probes.RetentionDays)

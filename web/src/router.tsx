@@ -68,7 +68,6 @@ const providersLoader = async (args: LoaderFunctionArgs) => {
   const url = new URL(args.request.url)
   const tab = url.searchParams.get('tab')
   if (tab === 'routes') throw redirect('/routes')
-  if (tab === 'model-groups') throw redirect('/usage?tab=groups')
   return authedLoader(true)(args)
 }
 
@@ -139,7 +138,6 @@ export const router = createHashRouter([
         handle: { title: '路由', adminOnly: true },
         loader: authedLoader(true),
       },
-      { path: '/model-groups', element: <Navigate to="/usage?tab=groups" replace /> },
       {
         path: '/networks',
         element: <Networks />,

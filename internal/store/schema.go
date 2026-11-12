@@ -186,41 +186,6 @@ func (s *Store) ensureCompatibleSchema(ctx context.Context) error {
 		ON network_probes(network_id, ts)`); err != nil {
 		return fmt.Errorf("ensure network probe index: %w", err)
 	}
-	// 2026-11-03：模型归组改成**独立于 upstream_models 的归属表**。
-	//
-	// 旧实现把归属落在 upstream_models.group_id 上，而那一行有
-	// `REFERENCES providers(id) ON DELETE CASCADE` —— 删掉一个上游时，
-	// 它的模型行被级联删除，组员关系跟着一起消失。历史用量仍然按
-	// (provider_id, upstream_model) 记着（那是固化事实），于是 by-model
-	// 查询 JOIN 不到组，静默退回按裸 model_id 分组：界面看起来像
-	// 「归组根本没生效」，而组里其实只剩另外几个上游。
-	//
-	// 用独立表的理由与 provider_name / key_name 固化同理：归属是
-	// **统计口径上的历史事实**，不该被一次配置删除抹掉。
-	if _, err := s.db.ExecContext(ctx, `CREATE TABLE IF NOT EXISTS model_group_members (
-		group_id    TEXT NOT NULL REFERENCES model_groups(id) ON DELETE CASCADE,
-		provider_id TEXT NOT NULL,
-		model_id    TEXT NOT NULL,
-		PRIMARY KEY (provider_id, model_id)
-	)`); err != nil {
-		return fmt.Errorf("ensure model group membership table: %w", err)
-	}
-	// 回填：把现有 upstream_models.group_id 搬到新表。按 (provider_id,
-	// model_id) 而非上游模型行 id —— 前者是 usage_records 里的不可变定位符，
-	// 后者会在模型被删后失去意义。ON CONFLICT 让重复启动幂等。
-	if _, err := s.db.ExecContext(ctx, `INSERT INTO model_group_members (group_id, provider_id, model_id)
-		SELECT um.group_id, um.provider_id, um.model_id
-		  FROM upstream_models um
-		 WHERE um.group_id IS NOT NULL
-		ON CONFLICT(provider_id, model_id) DO UPDATE SET group_id = excluded.group_id`); err != nil {
-		return fmt.Errorf("backfill model group membership: %w", err)
-	}
-	// 旧实现已经因为删上游丢掉的那部分归属，靠 status-quo 回填不回来
-	// （模型行没了）。这里按历史 public_model 与现存组成员的重合做一次
-	// 保守修补，必须有持久标记 —— 详见函数注释。
-	if err := s.repairOrphanGroupMembershipsOnce(ctx); err != nil {
-		return fmt.Errorf("repair orphan model group memberships: %w", err)
-	}
 	// This index depends on charge_next_at, so it must be created after the
 	// additive-column pass above. v1.6.8 has neither the column nor the index.
 	if _, err := s.db.ExecContext(ctx, `CREATE INDEX IF NOT EXISTS idx_usage_charge_retry
@@ -471,11 +436,6 @@ var canonicalSchemaStatements = []string{
 		last_error     TEXT,
 		created_at     INTEGER NOT NULL
 	)`,
-	`CREATE TABLE model_groups (
-		id           TEXT PRIMARY KEY,
-		display_name TEXT NOT NULL UNIQUE,
-		created_at   INTEGER NOT NULL
-	)`,
 	`CREATE TABLE upstream_models (
 		id                TEXT PRIMARY KEY,
 		provider_id       TEXT NOT NULL REFERENCES providers(id) ON DELETE CASCADE,
@@ -489,7 +449,6 @@ var canonicalSchemaStatements = []string{
 		price_cache_hit   REAL,
 		price_cache_creation REAL,
 		price_output      REAL,
-		group_id          TEXT REFERENCES model_groups(id) ON DELETE SET NULL,
 		UNIQUE (provider_id, model_id)
 	)`,
 	`CREATE TABLE groups (
@@ -542,12 +501,6 @@ var canonicalSchemaStatements = []string{
 		group_id     TEXT NOT NULL REFERENCES groups(id) ON DELETE CASCADE,
 		public_model TEXT NOT NULL,
 		PRIMARY KEY (group_id, public_model)
-	)`,
-	`CREATE TABLE model_group_members (
-		group_id    TEXT NOT NULL REFERENCES model_groups(id) ON DELETE CASCADE,
-		provider_id TEXT NOT NULL,
-		model_id    TEXT NOT NULL,
-		PRIMARY KEY (provider_id, model_id)
 	)`,
 	`CREATE TABLE routes (
 		id                TEXT PRIMARY KEY,
@@ -680,27 +633,8 @@ var canonicalSchemaStatements = []string{
 		ts                INTEGER NOT NULL,
 		remark            TEXT
 	)`,
-	`CREATE TABLE model_probes (
-		id           INTEGER PRIMARY KEY AUTOINCREMENT,
-		model_id     TEXT NOT NULL,
-		provider_id  TEXT NOT NULL,
-		ts           INTEGER NOT NULL,
-		ok           INTEGER NOT NULL,
-		in_band      INTEGER NOT NULL DEFAULT 0,
-		latency_ms   INTEGER NOT NULL DEFAULT 0,
-		error_kind   TEXT,
-		error_detail TEXT
-	)`,
-	// network_probes 记「经这条代理能不能出去」，与 model_probes 同构但
-	// **故意分开一张表**：
-	//
-	//   - 粒度不同：model_probes 是一次真实推理（按模型、会向上游计费），
-	//     network_probes 是一次 generate_204 探测（按代理、不打上游）；
-	//   - 生命周期不同：删模型要级联删 model_probes（纯派生），而删代理
-	//     时遗留的历史探测记录对排障仍有价值，不该跟着消失；
-	//   - 把两者塞进一张表要么多一列区分（`kind`），要么让所有既有查询都
-	//     加 `WHERE kind='model'` —— 前者会让索引区分度变差，后者是给每
-	//     一个历史调用点埋一颗雷。
+	// network_probes 记「经这条代理能不能出去」。独立成表是因为它的粒度
+	// 是代理、不打上游、不计费，与模型可用性无关。
 	`CREATE TABLE network_probes (
 		id         INTEGER PRIMARY KEY AUTOINCREMENT,
 		network_id TEXT NOT NULL,
@@ -733,8 +667,6 @@ var canonicalSchemaStatements = []string{
 	`CREATE INDEX idx_balance_charges_user ON balance_charges(user_id, ts)`,
 	`CREATE INDEX idx_balance_pending_user ON balance_pending(user_id)`,
 	`CREATE INDEX idx_balance_topups_user ON balance_topups(user_id, ts)`,
-	`CREATE INDEX idx_probes_model_ts ON model_probes(model_id, ts)`,
-	`CREATE INDEX idx_probes_provider_ts ON model_probes(provider_id, ts)`,
 	`CREATE INDEX idx_netprobes_net_ts ON network_probes(network_id, ts)`,
 
 	`INSERT INTO usage_totals (id) VALUES (1)`,
