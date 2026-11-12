@@ -770,12 +770,10 @@ KeysByHash map[string]*KeySnapshot  // KeySnapshot 内嵌 UserID/GroupID/限额
 理由：
 1. 方案 A 的双触发器问题很实在——且**触发器无法感知「key 被删除」**，
    会永久留下一个偏高的 `users.used_tokens`，用户永远撞 quota 上限。
-   这正是 `key_dao.go` 的 `RecomputeUsedTokens` 想解决的问题，
-   不该复制到用户层。
+   实时 SUM 口径没有这个缺陷，不需要为计数器再补修正入口。
 2. 方案 C 引入漂移且要额外补偿任务。
 3. 方案 B 的成本可控：`user.quota_tokens = 0`（不限）时**一次查询都不发**。
    局域网网关里「不限额」是常态，为常态付查询成本不合理。
-4. 即使用了 B，`RecomputeUsedTokens` 那样的显式重算入口也要补一个给用户层。
 
 **索引**：`CREATE INDEX idx_usage_user_ts ON usage_records(user_id, ts)`。
 

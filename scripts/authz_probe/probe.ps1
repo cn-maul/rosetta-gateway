@@ -243,7 +243,6 @@ try {
         'A-user-settings|user|GET|/admin/api/settings|403',
         'A-user-routes|user|GET|/admin/api/routes|403',
         'A-user-providers|user|GET|/admin/api/providers|403',
-        'A-user-audit|user|GET|/admin/api/audit|403',
         'A-user-byuser|user|GET|/admin/api/usage/by-user?from=0|403',
         'A-user-usage|user|GET|/admin/api/usage?from=0|200',
         'A-user-prune|user|POST|/admin/api/usage/prune|403',

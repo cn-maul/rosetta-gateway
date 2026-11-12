@@ -46,9 +46,8 @@ import type { ConfigExportFile, ConfigImportResult, PruneResult } from '../types
  * 系统设置（管理员）：设置项按分类分页展示，一次只看一类
  * （语义对齐旧 Settings.vue）。
  *
- * 「审计日志」页签已移除（用户要求）。后端 GET /admin/api/audit 端点与
- * api.ts 的 api.audit() 一并保留 —— 它们是运维取证的正路，删掉的是
- * 界面上的那一块，不是能力本身。
+ * 「审计日志」页签已移除（用户要求）：审计写入仍在服务端保留，但不再
+ * 提供管理面读取接口。
  */
 
 type TabKey = 'site' | 'model' | 'runtime' | 'price' | 'transfer'

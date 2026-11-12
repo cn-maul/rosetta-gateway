@@ -354,9 +354,10 @@ test('模型白名单按组写入用 PUT 到 models 子路径', async () => {
 })
 
 test('生产路由快照完整且免鉴权端点集合固定', () => {
-  // 107 = 移除模型探测（2 条）与模型归组（11 条）后的真实生产契约。
-  assert.equal(API_ROUTES.length, 107, '路由增删必须同步承认契约变化')
-  assert.equal(new Set(API_ROUTES.map((r) => r.pattern)).size, 107, '路由 pattern 不得重复')
+  // 103 = 在移除模型探测、模型归组之后，再删掉重算用量 / 状态概览 /
+  // 代理手动测试 / 审计读取四条无入口端点。
+  assert.equal(API_ROUTES.length, 103, '路由增删必须同步承认契约变化')
+  assert.equal(new Set(API_ROUTES.map((r) => r.pattern)).size, 103, '路由 pattern 不得重复')
 
   const publicRoutes = API_ROUTES
     .filter((r) => r.public)

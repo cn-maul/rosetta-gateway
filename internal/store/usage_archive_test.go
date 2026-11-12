@@ -227,7 +227,7 @@ func TestPrune_StatsUnchangedAcrossPrune(t *testing.T) {
 // access_keys.used_tokens 是**终身累计**，与 users 那条同口径：
 // DESIGN.md §4「quota_tokens ... 终身累计 input+output 上限」、
 // ReserveQuota 的注释「配额限的是终身累计，没有『窗口结束』这回事」，
-// 且 RecomputeUsedTokens 的数据源是 UsageSource（明细 + 归档）。
+// 且对账口径是 UsageSource（明细 + 归档）。
 //
 // 所以剪枝（把老明细聚合进表 A 后删除）**不得**改动这一列。
 // 曾有一段「配对回收」UPDATE 想按被剪量扣回它，因放在 DELETE 之后而恒为空操作
@@ -282,14 +282,15 @@ func TestPrune_KeyQuotaUnchangedAcrossPrune(t *testing.T) {
 	if afterQuota != beforeQuota {
 		t.Fatalf("quota_tokens 不该被剪枝改动：%d -> %d", beforeQuota, afterQuota)
 	}
-	// 与 RecomputeUsedTokens 对账：它走 UsageSource（明细+归档），是权威值。
-	// 两者必须一致 —— 不一致说明 used_tokens 与「明细+归档」分叉了。
-	recomputed, err := st.RecomputeUsedTokens(ctx, "k1")
-	if err != nil {
-		t.Fatalf("RecomputeUsedTokens: %v", err)
+	// 与 UsageSource（明细+归档）对账：那是权威值。两者必须一致 ——
+	// 不一致说明 used_tokens 与「明细+归档」分叉了。
+	src, args := UsageSource(UsageFilter{KeyID: "k1"})
+	var recomputed int64
+	if err := st.read.QueryRow(`SELECT `+UsageSumExpr("total_tokens", "u")+` FROM `+src, args...).Scan(&recomputed); err != nil {
+		t.Fatalf("recompute from UsageSource: %v", err)
 	}
 	if recomputed != afterUsed {
-		t.Fatalf("★ used_tokens(%d) 与 RecomputeUsedTokens 的权威值(%d) 分叉", afterUsed, recomputed)
+		t.Fatalf("★ used_tokens(%d) 与 UsageSource 的权威值(%d) 分叉", afterUsed, recomputed)
 	}
 }
 

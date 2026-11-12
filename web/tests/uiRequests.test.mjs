@@ -126,7 +126,7 @@ test('API 密钥页：刷新与重算用量两个按钮已删除', async () => {
   const keys = await read('components/Keys.tsx')
   assert.ok(!keys.includes('recomputeUsage'), 'Keys 里仍留着 recomputeUsage 实现')
   assert.ok(!keys.includes('recomputing={'), 'Keys 仍在传 recomputing')
-  // 后端能力保留：端点封装不该跟着删。
+  // 后端端点已删除：封装也一并移除，避免留下没有调用方的死接口。
   const api = await read('api.ts')
-  assert.ok(api.includes('recomputeKeyUsage'), 'api.recomputeKeyUsage 应保留（只是界面不再暴露）')
+  assert.ok(!api.includes('recomputeKeyUsage'), 'api.recomputeKeyUsage 应随后端端点一起删除')
 })

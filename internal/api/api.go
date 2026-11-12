@@ -181,7 +181,6 @@ func BuildApp(d Deps) *App {
 	// 登录页永远显示默认名。见 admin/site_handler.go 的注释。
 	siteHandler := admin.NewSiteHandler(db)
 	reloadHandler := admin.NewReloadHandler(reloader.Reload)
-	auditHandler := admin.NewAuditHandler(db)
 	usageHandler := admin.NewUsageHandler(db, cfg)
 	// 供应商 + 模型的导入导出。写在 settings 附近是因为它在界面上的入口
 	// 也在「设置」页里，与设置项同一层级。
@@ -298,7 +297,6 @@ func BuildApp(d Deps) *App {
 		{Pattern: "POST /admin/api/networks", Handler: networkHandler.Create, Public: false},
 		{Pattern: "PATCH /admin/api/networks/{id}", Handler: func(w http.ResponseWriter, r *http.Request) { networkHandler.Update(w, r, r.PathValue("id")) }, Public: false},
 		{Pattern: "DELETE /admin/api/networks/{id}", Handler: func(w http.ResponseWriter, r *http.Request) { networkHandler.Delete(w, r, r.PathValue("id")) }, Public: false},
-		{Pattern: "POST /admin/api/networks/{id}/test", Handler: func(w http.ResponseWriter, r *http.Request) { networkHandler.Test(w, r, r.PathValue("id")) }, Public: false},
 		// 上游余额查询：逐条凭据打上游的余额端点（见 internal/upstream/balance.go）。
 		// 纯读操作，不改任何配置，因此不触发 AutoReload（挂 reload 的写操作判据
 		// 看的是方法/路径白名单，这里是 POST 却明确不参与，理由见 handler 注释）。
@@ -344,13 +342,8 @@ func BuildApp(d Deps) *App {
 		{Pattern: "GET /admin/api/keys/{id}/secret", Handler: func(w http.ResponseWriter, r *http.Request) { keyHandler.Secret(w, r, r.PathValue("id")) }, Public: false},
 		{Pattern: "PATCH /admin/api/keys/{id}", Handler: func(w http.ResponseWriter, r *http.Request) { keyHandler.Update(w, r, r.PathValue("id")) }, Public: false},
 		{Pattern: "DELETE /admin/api/keys/{id}", Handler: func(w http.ResponseWriter, r *http.Request) { keyHandler.Delete(w, r, r.PathValue("id")) }, Public: false},
-		// 重算 used_tokens：触发器维护的派生值没有自愈路径，偏高后 key 会变成死 key。
-		{Pattern: "POST /admin/api/keys/{id}/recompute-usage", Handler: func(w http.ResponseWriter, r *http.Request) { keyHandler.RecomputeUsage(w, r, r.PathValue("id")) }, Public: false},
-
 		{Pattern: "GET /admin/api/stats", Handler: statsHandler.Get, Public: false},
-		{Pattern: "GET /admin/api/stats/overview", Handler: statsHandler.GetOverview, Public: false},
 		{Pattern: "POST /admin/api/reload", Handler: reloadHandler.Reload, Public: false},
-		{Pattern: "GET /admin/api/audit", Handler: auditHandler.List, Public: false},
 		{Pattern: "GET /admin/api/usage", Handler: usageHandler.Query, Public: false},
 		{Pattern: "GET /admin/api/usage/by-key", Handler: usageHandler.GroupByKey, Public: false},
 		{Pattern: "GET /admin/api/usage/by-model", Handler: usageHandler.GroupByModel, Public: false},

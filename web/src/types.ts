@@ -290,18 +290,6 @@ export interface Network {
 }
 
 /**
- * 代理连通性测试结果。
- *
- * status 与 HTTP 状态码是两件事：代理不可达、认证失败或目标不可达时管理
- * 接口仍返回 200，只把失败写在 status/message 里。
- */
-export interface NetworkTestResult {
-  status: 'ok' | 'error'
-  message: string
-  latency_ms: number
-}
-
-/**
  * 单模型可用性探测的结果。
  *
  * 注意 `status` 与 HTTP 状态码是两件事：探测失败（凭据错、模型下架、无权限、
@@ -720,17 +708,6 @@ export interface ModelMeta {
   provider_name: string
 }
 
-export interface AuditEntry {
-  id: number
-  ts: number
-  actor: string
-  remote: string
-  method: string
-  path: string
-  status: number
-  fields: string
-}
-
 export interface KeyCreateResponse extends AccessKey {
   plaintext_key: string // 创建响应里的明文；之后可通过 /keys/{id}/secret 再取
 }
@@ -830,27 +807,6 @@ export interface Stats {
     // 明细已被剪到的水位日（YYYY-MM-DD）；空 = 未剪过
     pruned_through_day: string
   }
-}
-
-/**
- * GET /admin/api/stats/overview 的响应。
- *
- * 当前配置计数与统计时间范围无关。上游额外区分“已启用”与“凭据就绪”：
- * 前者只是配置开关，后者才决定请求是否真的有机会到达上游。
- */
-export interface StatsOverview {
-  providers_total: number
-  providers_enabled: number
-  providers_ready: number
-  providers_unready: number
-  providers_unknown: number
-  routes_total: number
-  routes_enabled: number
-  upstream_models_total: number
-  users_total: number
-  users_enabled: number
-  keys_total: number
-  keys_enabled: number
 }
 
 // usage 分组端点（by-day / by-model / by-key / by-provider）的统一返回行
@@ -1240,12 +1196,6 @@ export interface PruneResult {
   pruned_through_day: string // 归档水位：已剪到含哪一天
   skipped: boolean
   reason?: string
-}
-
-/** POST /keys/{id}/recompute-usage 的响应：重算后的已用量。 */
-export interface RecomputeUsageResult {
-  status: string
-  used_tokens: number
 }
 
 // 通用错误响应：{"error":{"message":"...","type":"invalid_request_error"}}

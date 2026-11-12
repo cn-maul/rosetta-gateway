@@ -8,7 +8,6 @@ import (
 	"strconv"
 
 	"github.com/cn-maul/rosetta-gateway/internal/identity"
-	"github.com/cn-maul/rosetta-gateway/internal/snapshot"
 	"github.com/cn-maul/rosetta-gateway/internal/store"
 )
 
@@ -18,102 +17,6 @@ type StatsHandler struct {
 
 func NewStatsHandler(st *store.Store) *StatsHandler {
 	return &StatsHandler{store: st}
-}
-
-// statsOverviewResponse 是首页“当前状态”的一次性计数快照。
-//
-// 这些数字来自配置表而非 usage_records，和统计时间范围无关。单独端点
-// 而不是让前端拉 users/keys/upstream-models 全量列表再计数：用户与密钥
-// 列表带有账户资料与配额字段，为了五个数字传输整张表没有必要；模型总数
-// 也不能从公开路由列表反推（未接入路由的上游模型同样算“已导入”）。
-//
-// @ts-type StatsOverview
-type statsOverviewResponse struct {
-	ProvidersTotal      int `json:"providers_total"`
-	ProvidersEnabled    int `json:"providers_enabled"`
-	ProvidersReady      int `json:"providers_ready"`
-	ProvidersUnready    int `json:"providers_unready"`
-	ProvidersUnknown    int `json:"providers_unknown"`
-	RoutesTotal         int `json:"routes_total"`
-	RoutesEnabled       int `json:"routes_enabled"`
-	UpstreamModelsTotal int `json:"upstream_models_total"`
-	UsersTotal          int `json:"users_total"`
-	UsersEnabled        int `json:"users_enabled"`
-	KeysTotal           int `json:"keys_total"`
-	KeysEnabled         int `json:"keys_enabled"`
-}
-
-// GetOverview 返回与时间范围无关的当前配置计数（仅管理员）。
-func (h *StatsHandler) GetOverview(w http.ResponseWriter, r *http.Request) {
-	if _, ok := requireAdmin(w, r); !ok {
-		return
-	}
-	ctx := r.Context()
-
-	providers, err := h.store.ListProviders(ctx)
-	if err != nil {
-		writeServerError(w, "overview providers", err)
-		return
-	}
-	routes, err := h.store.ListRoutes(ctx)
-	if err != nil {
-		writeServerError(w, "overview routes", err)
-		return
-	}
-	models, err := h.store.ListAllUpstreamModels(ctx)
-	if err != nil {
-		writeServerError(w, "overview models", err)
-		return
-	}
-	users, err := h.store.ListUsers(ctx)
-	if err != nil {
-		writeServerError(w, "overview users", err)
-		return
-	}
-	keys, err := h.store.ListAccessKeys(ctx)
-	if err != nil {
-		writeServerError(w, "overview keys", err)
-		return
-	}
-
-	resp := statsOverviewResponse{
-		ProvidersTotal:      len(providers),
-		RoutesTotal:         len(routes),
-		UpstreamModelsTotal: len(models),
-		UsersTotal:          len(users),
-		KeysTotal:           len(keys),
-	}
-	for _, p := range providers {
-		if !p.Enabled {
-			continue
-		}
-		resp.ProvidersEnabled++
-		runtime, ok := snapshot.Get().Providers[p.Slug]
-		switch {
-		case !ok:
-			resp.ProvidersUnknown++
-		case runtime.Ready:
-			resp.ProvidersReady++
-		default:
-			resp.ProvidersUnready++
-		}
-	}
-	for _, route := range routes {
-		if route.Enabled {
-			resp.RoutesEnabled++
-		}
-	}
-	for _, user := range users {
-		if user.Status == store.UserStatusActive {
-			resp.UsersEnabled++
-		}
-	}
-	for _, key := range keys {
-		if key.Enabled {
-			resp.KeysEnabled++
-		}
-	}
-	writeJSON(w, http.StatusOK, resp)
 }
 
 // @ts-type Stats

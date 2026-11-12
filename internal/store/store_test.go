@@ -371,7 +371,7 @@ func TestStore_Pragmas(t *testing.T) {
 	}
 }
 
-// 审计 DAO：写入 → 读回（新→旧），字段名提取排序。
+// 审计 DAO：写入落库，字段名提取排序。
 func TestAuditDAO(t *testing.T) {
 	st := testStore(t, t.TempDir()+"/a.db")
 	ctx := context.Background()
@@ -391,12 +391,12 @@ func TestAuditDAO(t *testing.T) {
 			t.Fatalf("create audit %d: %v", i, err)
 		}
 	}
-	entries, err := st.ListAuditEntries(ctx, 2)
-	if err != nil {
-		t.Fatalf("list audit: %v", err)
+	var n int
+	if err := st.read.QueryRow(`SELECT COUNT(*) FROM audit_log`).Scan(&n); err != nil {
+		t.Fatalf("count audit: %v", err)
 	}
-	if len(entries) != 2 || entries[0].Path != "/admin/api/keys" || entries[0].ID < entries[1].ID {
-		t.Fatalf("list order/limit wrong: %+v", entries)
+	if n != 3 {
+		t.Fatalf("audit rows = %d, want 3", n)
 	}
 }
 

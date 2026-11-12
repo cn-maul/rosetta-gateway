@@ -24,16 +24,6 @@ export const DTO_CONTRACTS: readonly DTOFieldContract[] = [
     "message",
     "type",
   ] },
-  { goType: "internal/admin.auditEntryResponse", tsType: "AuditEntry", fields: [
-    "id",
-    "ts",
-    "actor",
-    "remote",
-    "method",
-    "path",
-    "status",
-    "fields",
-  ] },
   { goType: "internal/admin.bootstrapStatusResponse", tsType: "BootstrapStatus", fields: [
     "needs_setup",
     "username",
@@ -280,11 +270,6 @@ export const DTO_CONTRACTS: readonly DTOFieldContract[] = [
     "last_probe_error",
     "last_probe_at",
   ] },
-  { goType: "internal/admin.networkTestResponse", tsType: "NetworkTestResult", fields: [
-    "status",
-    "message",
-    "latency_ms",
-  ] },
   { goType: "internal/admin.passwordSetupLinkResponse", tsType: "PasswordSetupLink", fields: [
     "url_path",
     "expires_at",
@@ -353,10 +338,6 @@ export const DTO_CONTRACTS: readonly DTOFieldContract[] = [
     "quirks_json",
     "network_id",
     "balance_spec_json",
-  ] },
-  { goType: "internal/admin.recomputeUsageResponse", tsType: "RecomputeUsageResult", fields: [
-    "status",
-    "used_tokens",
   ] },
   { goType: "internal/admin.routeCatalogEntry", tsType: "RouteCatalogEntry", fields: [
     "id",
@@ -435,20 +416,6 @@ export const DTO_CONTRACTS: readonly DTOFieldContract[] = [
   { goType: "internal/admin.siteBrandingResponse", tsType: "SiteBranding", fields: [
     "site_name",
     "site_logo",
-  ] },
-  { goType: "internal/admin.statsOverviewResponse", tsType: "StatsOverview", fields: [
-    "providers_total",
-    "providers_enabled",
-    "providers_ready",
-    "providers_unready",
-    "providers_unknown",
-    "routes_total",
-    "routes_enabled",
-    "upstream_models_total",
-    "users_total",
-    "users_enabled",
-    "keys_total",
-    "keys_enabled",
   ] },
   { goType: "internal/admin.statsResponse", tsType: "Stats", fields: [
     "total_requests",

@@ -452,7 +452,6 @@ import type {
   UpstreamModel,
   UpstreamModelUpdate,
   Network,
-  NetworkTestResult,
   DiscoveredModel,
   ModelImportItem,
   ModelTestResult,
@@ -462,12 +461,10 @@ import type {
   RouteTarget,
   RouteTargetInput,
   AccessKey,
-  AuditEntry,
   KeyCreateResponse,
   KeySecretResponse,
   Settings,
   Stats,
-  StatsOverview,
   UsageGroupEntry,
   UsageGroupPage,
   UsageByUserPage,
@@ -475,7 +472,6 @@ import type {
   UsageHistoryPage,
   HistoryFilters,
   PruneResult,
-  RecomputeUsageResult,
   TopupPage,
   User,
   UserRole,
@@ -535,8 +531,6 @@ export const api = {
   updateNetwork: (id: string, b: { name: string; proxy_url: string }) =>
     mutate(() => patch<Network>(`/networks/${id}`, b)),
   deleteNetwork: (id: string) => mutate(() => del(`/networks/${id}`)),
-  testNetwork: (id: string, timeoutMs = 15_000) =>
-    post<NetworkTestResult>(`/networks/${id}/test`, undefined, timeoutMs),
 
   // credentials（挂在 provider 下）
   credentials: (providerId: string) => get<Credential[]>(`/providers/${providerId}/credentials`),
@@ -652,14 +646,6 @@ export const api = {
     },
   ) => mutate(() => patch<AccessKey>(`/keys/${id}`, b)),
   deleteKey: (id: string) => mutate(() => del(`/keys/${id}`)),
-  /**
-   * 重算某把密钥的 used_tokens（配额漂移的自愈手段）。
-   *
-   * 刻意**不包 mutate**：它只修正库里的派生计数，不改路由/凭据快照，
-   * 没有「改完必须 reload」的语义。
-   */
-  recomputeKeyUsage: (id: string) => post<RecomputeUsageResult>(`/keys/${id}/recompute-usage`),
-
   // ---------- 多用户与会话 ----------
 
   /**
@@ -739,9 +725,6 @@ export const api = {
   /** 自助改密码。会递增自己的 auth_version，**当前会话也随即失效**。 */
   changeMyPassword: (old_password: string, new_password: string) =>
     post('/me/password', { old_password, new_password }),
-  // 审计日志：管理后台写操作留痕（只记字段名，不记值）
-  audit: (limit = 50) => get<{ entries: AuditEntry[]; server_ts: number }>(`/audit?limit=${limit}`),
-
   // ---------- 分组与模型白名单（P1）----------
   //
   // 全部走 mutate()：模型可见性随内存快照下发，写操作后必须 reload 才生效。
@@ -810,7 +793,6 @@ export const api = {
   // 后端只对管理员返回该字段；普通用户传了也只会缺席。
   stats: (from = 0, to = Date.now(), includeLifetime = false) =>
     get<Stats>(`/stats?from=${from}&to=${to}${includeLifetime ? '&include_lifetime=true' : ''}`),
-  statsOverview: () => get<StatsOverview>('/stats/overview'),
   settings: () => get<Settings>('/settings'),
   // 站点品牌（站点名 + LOGO）。GET 是**公开**端点（登录页要在没有会话时读），
   // 所以它不能走 request() 之外的鉴权假设；PUT 需要管理员。

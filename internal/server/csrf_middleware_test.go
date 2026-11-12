@@ -10,8 +10,8 @@ package server
 //     CORS safelisted 简单请求）。
 //
 // 两者都是**逐 handler**才生效的。凡是不走 decodeJSON 的写端点就没有
-// 第二道门 —— 实测 `POST /admin/api/usage/prune`、`POST /admin/api/logout`、
-// `POST /admin/api/keys/{id}/recompute-usage` 这类无请求体端点，
+// 第二道门 —— 实测 `POST /admin/api/usage/prune`、`POST /admin/api/logout`
+// 这类无请求体端点，
 // 带有效会话 + 跨站头即可触达 handler 并返回 200。
 //
 // # 为什么 SameSite=Strict 挡不住这一类

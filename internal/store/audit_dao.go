@@ -2,7 +2,6 @@ package store
 
 import (
 	"context"
-	"database/sql"
 	"encoding/json"
 	"fmt"
 	"sort"
@@ -37,41 +36,11 @@ func (s *Store) CreateAuditEntry(ctx context.Context, e *AuditEntry) error {
 	return err
 }
 
-// ListAuditEntries 返回最近 limit 条审计记录（新→旧）。
-func (s *Store) ListAuditEntries(ctx context.Context, limit int) ([]AuditEntry, error) {
-	if limit <= 0 {
-		limit = 50
-	}
-	rows, err := s.read.QueryContext(ctx,
-		`SELECT id, ts, actor, remote, method, path, status, fields FROM audit_log ORDER BY id DESC LIMIT ?`, limit)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-
-	result := make([]AuditEntry, 0)
-	for rows.Next() {
-		var e AuditEntry
-		// fields 落库时走 nullIfEmpty：没有请求体（GET / DELETE，或 body 为
-		// 空）的记录存的是 NULL 而不是 ''。直接扫进 string 会报
-		// "converting NULL to string is unsupported"，**整页查询失败** ——
-		// 而只要有任意一条这类记录就会触发，等于审计日志页对所有部署恒 500。
-		var fields sql.NullString
-		if err := rows.Scan(&e.ID, &e.Ts, &e.Actor, &e.Remote, &e.Method, &e.Path, &e.Status, &fields); err != nil {
-			return nil, err
-		}
-		e.Fields = fields.String
-		result = append(result, e)
-	}
-	return result, rows.Err()
-}
-
 // PruneAuditLog 只保留最近 keepRows 条审计记录，返回删除行数。
 //
-// **按行数而不是按天**：本表的唯一读路径 ListAuditEntries 是
-// `ORDER BY id DESC LIMIT ?`，管理面永远只看最近几十条，保留更早的行对
-// 可观测性零贡献，却让表无界增长（写操作每次一条，配上自动重试与批量导入
-// 配置，几十 MB 起步）。用行数封顶同时也让磁盘占用有确定上界。
+// **按行数而不是按天**：本表只做留痕，运维取证只看最近一批记录，保留更早
+// 的行对可观测性零贡献，却让表无界增长（写操作每次一条，配上自动重试与
+// 批量导入配置，几十 MB 起步）。用行数封顶同时也让磁盘占用有确定上界。
 //
 // 与 PruneOldUsage / PruneOldNetworkProbes 分开：用量表的下游还有聚合与
 // 归档，而审计日志没有下游消费者。

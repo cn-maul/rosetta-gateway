@@ -4,10 +4,8 @@ import (
 	"bytes"
 	"encoding/json"
 	"io"
-	"log/slog"
 	"net/http"
 	"net/http/httptest"
-	"path/filepath"
 	"strings"
 	"testing"
 
@@ -63,22 +61,6 @@ func TestR9_AdminDecodeMapsWrongContentTypeTo415Only(t *testing.T) {
 
 	h.Create(rec, asAdmin(req))
 	assertSingleErrorEnvelope(t, rec, http.StatusUnsupportedMediaType)
-}
-
-func TestR9_AuditLimitRejectsMalformedValue(t *testing.T) {
-	st, err := store.Open(filepath.Join(t.TempDir(), "audit.db"),
-		slog.New(slog.NewTextHandler(io.Discard, nil)))
-	if err != nil {
-		t.Fatalf("open store: %v", err)
-	}
-	t.Cleanup(func() { _ = st.Close() })
-
-	rec := httptest.NewRecorder()
-	NewAuditHandler(st).List(rec,
-		httptest.NewRequest(http.MethodGet, "/admin/api/audit?limit=abc", nil))
-	if rec.Code != http.StatusBadRequest {
-		t.Fatalf("audit limit=abc status=%d body=%s, want 400", rec.Code, rec.Body.String())
-	}
 }
 
 func TestR9_GroupPatchRejectsBlankName(t *testing.T) {

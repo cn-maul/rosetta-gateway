@@ -461,15 +461,28 @@ func TestAuthzAuditActor_UsesAuthenticatedIdentity(t *testing.T) {
 		t.Fatalf("audit actors = %q, want %q", actors, want)
 	}
 
-	entries, err := h.db.ListAuditEntries(context.Background(), 3)
+	rows, err := h.db.Reader().QueryContext(context.Background(),
+		`SELECT actor FROM audit_log ORDER BY id DESC LIMIT ?`, len(want))
 	if err != nil {
-		t.Fatalf("list audit entries: %v", err)
+		t.Fatalf("list audit actors: %v", err)
 	}
-	if len(entries) != len(want) {
-		t.Fatalf("audit rows = %d, want %d", len(entries), len(want))
+	defer rows.Close()
+	var actorsInDB []string
+	for rows.Next() {
+		var actor string
+		if err := rows.Scan(&actor); err != nil {
+			t.Fatalf("scan audit actor: %v", err)
+		}
+		actorsInDB = append(actorsInDB, actor)
 	}
-	for i, entry := range entries {
-		if got, wantActor := entry.Actor, want[len(want)-1-i]; got != wantActor {
+	if err := rows.Err(); err != nil {
+		t.Fatalf("list audit actors: %v", err)
+	}
+	if len(actorsInDB) != len(want) {
+		t.Fatalf("audit rows = %d, want %d", len(actorsInDB), len(want))
+	}
+	for i, got := range actorsInDB {
+		if wantActor := want[len(want)-1-i]; got != wantActor {
 			t.Errorf("DB audit row %d actor = %q, want %q", i, got, wantActor)
 		}
 	}
@@ -694,8 +707,6 @@ func buildRealAdminMux(h *authzHarness) *http.ServeMux {
 	mux.HandleFunc("POST /admin/api/keys", keyH.Create) // 真实 main.go 外面还裹了 denyAdminKeyCreate
 	mux.HandleFunc("PATCH /admin/api/keys/{id}", func(w http.ResponseWriter, r *http.Request) { keyH.Update(w, r, r.PathValue("id")) })
 	mux.HandleFunc("DELETE /admin/api/keys/{id}", func(w http.ResponseWriter, r *http.Request) { keyH.Delete(w, r, r.PathValue("id")) })
-	mux.HandleFunc("POST /admin/api/keys/{id}/recompute-usage", func(w http.ResponseWriter, r *http.Request) { keyH.RecomputeUsage(w, r, r.PathValue("id")) })
-
 	mux.HandleFunc("GET /admin/api/usage", usageH.Query)
 	mux.HandleFunc("GET /admin/api/usage/by-key", usageH.GroupByKey)
 	mux.HandleFunc("GET /admin/api/usage/by-model", usageH.GroupByModel)
@@ -1135,7 +1146,7 @@ func TestAuthzScope_NumericIsolation(t *testing.T) {
 // TestAuthzIDOR_CrossUserKeyMutations 是 IDOR 的运行时验证。
 //
 // `/admin/api/keys` 在**白名单**里，所以普通用户能进这个前缀下的**所有**方法
-// —— 包括 PATCH / DELETE / recompute-usage。也就是说「能不能进」这一层
+// —— 包括 PATCH / DELETE。也就是说「能不能进」这一层
 // 完全不区分「这是不是我的 key」。唯一的作用域判定在 handler 的
 // ownedByCaller 里。
 //
@@ -1170,7 +1181,6 @@ func TestAuthzIDOR_CrossUserKeyMutations(t *testing.T) {
 		{"PATCH 改别人的 key（改名 + 关掉）", http.MethodPatch, "/admin/api/keys/" + victimKey,
 			`{"name":"pwned","enabled":false}`},
 		{"DELETE 删别人的 key", http.MethodDelete, "/admin/api/keys/" + victimKey, ""},
-		{"recompute-usage 重算别人的 key", http.MethodPost, "/admin/api/keys/" + victimKey + "/recompute-usage", ""},
 	}
 
 	for _, tc := range cases {

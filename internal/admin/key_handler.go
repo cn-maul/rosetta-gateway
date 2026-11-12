@@ -110,12 +110,6 @@ type keySecretResponse struct {
 	PlaintextKey string `json:"plaintext_key"`
 }
 
-// @ts-type RecomputeUsageResult
-type recomputeUsageResponse struct {
-	Status     string `json:"status"`
-	UsedTokens int64  `json:"used_tokens"`
-}
-
 // List 返回访问密钥列表。
 //
 // # 作用域收窄（多用户改造 P0.5，最要命的一类漏洞）
@@ -810,39 +804,6 @@ func (h *KeyHandler) Secret(w http.ResponseWriter, r *http.Request, id string) {
 	// 密钥明文不得进入浏览器缓存或中间缓存。
 	w.Header().Set("Cache-Control", "no-store")
 	writeJSON(w, http.StatusOK, keySecretResponse{PlaintextKey: plain})
-}
-
-// RecomputeUsage 从 usage_records 重算该密钥的已用量并覆盖 used_tokens。
-//
-// 存在的理由：used_tokens 由数据库触发器单调累加，没有任何回退路径。
-// 一旦因误写或 bug 偏高，配额预检会从此恒返回 429，而 Update 刻意不写
-// used_tokens（防止请求体随意改配额计数）—— 于是这把 key 在管理界面上
-// 变成「怎么改配置都救不回来」的死 key，只能直接改库。这个端点把
-// 恢复能力还给运维。
-func (h *KeyHandler) RecomputeUsage(w http.ResponseWriter, r *http.Request, id string) {
-	existing, err := h.store.GetAccessKey(r.Context(), id)
-	if err != nil {
-		writeServerError(w, "get key", err)
-		return
-	}
-	if existing == nil {
-		writeError(w, http.StatusNotFound, "key not found")
-		return
-	}
-	if !h.ownedByCaller(w, r, existing) {
-		return
-	}
-	used, err := h.store.RecomputeUsedTokens(r.Context(), id)
-	if err != nil {
-		// key 不存在时 DAO 返回 ErrNotFound → 404，而不是把「重算了一把
-		// 不存在的 key」报成 200 + used_tokens=0（前端会以为重算已完成）。
-		writeNotFoundOrError(w, "recompute key usage", "密钥不存在", err)
-		return
-	}
-	writeJSON(w, http.StatusOK, recomputeUsageResponse{
-		Status:     store.UsageStatusOK,
-		UsedTokens: used,
-	})
 }
 
 // toKeyResponse 把内部结构转成响应。username 从**快照**里的

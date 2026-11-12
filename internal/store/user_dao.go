@@ -458,9 +458,8 @@ func (s *Store) DeleteUser(ctx context.Context, id string) error {
 // SumUserUsedTokens 返回该用户名下所有 key 的已用 token 总和。
 //
 // 为什么不存一个计数器：见 §4.3。触发器按 access_key_id 累加，
-// key 被删除时无法回退那份计数——用户会永久撞在 quota 上限上，
-// 而管理界面里没有任何修正入口（这正是 key_dao.RecomputeUsedTokens
-// 想解决的问题，不该复制到用户层）。
+// key 被删除时无法回退那份计数——用户会永久撞在 quota 上限上。
+// 实时 SUM（明细 ∪ 归档）没有这个缺陷，也不需要在管理界面提供修正入口。
 //
 // 数据源是 UsageSource（明细 ∪ 日归档）。**这不是优化，是配额正确性**：
 // 本函数在热路径上做配额预检（main.go 用户级 429），若只查明细，
@@ -683,7 +682,7 @@ func (s *Store) UserQuotaAndUsed(ctx context.Context, userID string) (quota, use
 
 // RecomputeUserUsage 重算某用户的已用量并回写。
 //
-// 与 key_dao.RecomputeUsedTokens 同构：SUM 口径天然不会漂移，
+// 与 SumUserUsedTokens 同源：SUM 口径天然不会漂移，
 // 所以这个入口主要用于「让管理员看到与预检一致的数字」，
 // 以及将来若引入分用户累计表时的一次性回填。
 //

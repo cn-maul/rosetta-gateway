@@ -350,8 +350,8 @@ CREATE INDEX idx_usage_prov_ts   ON usage_records(provider_id, ts);
 `usage_totals`（恒定单行的表 B）由触发器在落库时实时累加，**与剪枝完全解耦**，
 保证「明细可删、终身累计不变」。聚合与删除在同一事务内对**同一批行**执行
 （先按 `id` 圈批，聚合与删除共用该集合），水位只在明细清空到切点时推进。
-对账入口：`POST /admin/api/keys/{id}/recompute-usage`（key 级）与
-`POST /admin/api/usage/prune`（手动剪枝）。
+对账入口：`POST /admin/api/usage/prune`（手动剪枝）。key 级与用户级的
+终身累计口径都以 `UsageSource`（明细 ∪ 归档）为准，不需要单独的重算端点。
 
 **查询侧的防线**：「近期表现」类统计（模型速度/成功率/TTFB，`ListModelThroughput`）固定只回看近 30 天（`throughputWindow`）——窗口函数要对全历史排序，调用量大的 provider 积累几十万行后，挂它的 `GET /providers/{id}/models` 会变成重查询并阻塞唯一的 DB 连接。总览页「全部」档的全区间聚合保留（只在打开总览页时触发），缓存命中率与总统计合并在同一条 SELECT 里完成。
 
@@ -683,8 +683,6 @@ POST   /admin/api/networks                      新建
 PATCH  /admin/api/networks/{id}
 DELETE /admin/api/networks/{id}                 引用它的上游回到直连（ON DELETE SET NULL），
                                                **不删上游**
-POST   /admin/api/networks/{id}/test            经代理访问固定探测地址；结果是测试结论，
-                                               失败仍返回 HTTP 200
 GET    /admin/api/providers                     列表
 POST   /admin/api/providers                     新建
 GET    /admin/api/providers/{id}                单个详情（编辑表单回显）
@@ -752,9 +750,7 @@ PATCH  /admin/api/keys/{id}                     可改 name / enabled / quota_to
                                                  **user_id（仅管理员，归属变更的唯一入口）**；
                                                  普通用户只能收紧不能放宽（guardNoLoosening）
 DELETE /admin/api/keys/{id}
-POST   /admin/api/keys/{id}/recompute-usage     从用量记录重算 used_tokens（配额漂移自愈）
 
-GET    /admin/api/audit?limit=                  管理写操作审计（新→旧，只记字段名不记值）
 GET    /admin/api/usage?from=&to=&group_by=key|model|provider|day
                                                  from/to 为毫秒时间戳；**from=0 一律表示
                                                  「全部历史」**（本端点与 by-* 系列语义统一，
@@ -766,7 +762,6 @@ GET    /admin/api/usage/by-provider|by-day|by-model|by-key    分维度用量（
 GET    /admin/api/usage/by-user                              **仅管理员**：按用户维度用量
 POST   /admin/api/usage/prune                   手动触发归档剪枝（每日定时之外的人口）
 GET    /admin/api/stats                         所选区间统计：请求/成功/失败/取消、token、费用、首字/速度加权样本
-GET    /admin/api/stats/overview                **仅管理员**：上游/公开模型/用户/Key 的当前配置计数与就绪状态
 GET/PUT /admin/api/settings                     运行时全局默认（超时/故障转移策略，§10）
 POST   /admin/api/config-export/export|import   配置导出/导入（§13.3，requireAdmin）
 GET    /admin/api/model-names                   公开模型名清单（按身份收窄，供白名单选择）；附带
@@ -1467,8 +1462,8 @@ Client 是 goroutine 安全的，进程内单例复用（内含连接池）。
 - **读库而非读快照**：`used_tokens` 每次请求都在变，内存快照只在管理写操作后重建；
   预检直查 SQLite，写锁天然把并发请求串行化，「检查」与「占用」之间不存在窗口。
 - **查询抖动 fail-open**：预检读库出错时记 error 日志并放行，不因一次读失败拒绝正常流量。
-- **自愈入口**：`POST /admin/api/keys/{id}/recompute-usage`（`RecomputeUsedTokens`）从
-  用量来源重算 `used_tokens`，是派生值漂移的唯一修正手段。
+- **口径**：`used_tokens` 由触发器单调累加；对账与展示一律以
+  `UsageSource`（明细 ∪ 归档）的 SUM 为准，不提供单独的修正端点。
 - **语义**：终身累计、不自动重置；`quota_tokens=0` = 不限（默认值）。
 
 ### 11.3 并发安全
@@ -1866,12 +1861,12 @@ Docker 侧对齐，且避开浏览器的保留端口表（6666 是 IRC 段，浏
 | `/wallet` | 钱包与充值 | 全体 | **按身份分两种形态的同一页**：管理员看到全站的用户消费汇总 + 全部充值流水 + 充值入口（没有消耗记录，明细在「用量统计」页）；普通用户看到自己的余额、按天消耗与充值记录。自改密码已迁到「设置」页（2026-10-13）。余额（`balance_cents`）在 `balance_unlimited` 时显示「不限」而非 0.00 元，为 0 时显式提示「余额已用尽，请联系管理员充值」，对应数据面真实的 402 |
 | `/keys` | API 密钥 | 全体 | `AccessControl.tsx` 的密钥页签：普通用户只看到并管理自己的 `sk-gw-` key；管理员可查看/调整归属与限制，但不能给自己新建 key。密钥创建与页签路由分离，`/keys` 是可停留地址 |
 | `/users` | 用户与权限 | admin | `AccessControl.tsx` 的「用户 / 权限分组」两个页签。用户页含 CRUD、角色、启停、一次性设密/改密、余额充值；空密码普通用户可签发 24 小时设密链接，admin 新建时仍必须带初始密码。分组页维护成员与组级模型白名单 `PUT /admin/api/groups/{id}/models`。`delta_cents` 是相对金额，误操作不会把余额清零 |
-| `/networks` | 代理 | admin | 组件是 `Networks.tsx`：可复用的代理地址清单（2026-10-20）。provider 只存 `network_id`，实际地址由读路径 JOIN 派生。直连是保留 id `direct`，不是一行记录。删网络让引用它的上游回到直连，不删上游。列表可按行发起连通性测试并显示正常/失败状态 |
+| `/networks` | 代理 | admin | 组件是 `Networks.tsx`：可复用的代理地址清单（2026-10-20）。provider 只存 `network_id`，实际地址由读路径 JOIN 派生。直连是保留 id `direct`，不是一行记录。删网络让引用它的上游回到直连，不删上游。连通性由后台定时探针测量并显示延迟 |
 | `/providers` | 上游服务 | admin | `Providers.tsx` 列表：类型用 `Chat / Response / Anthropic` 展示，紧跟一列用胶囊标出「直连」或「代理 · 名称」，模型/凭据摘要右对齐，操作列保留配置与删除，启停开关独立成最后一列；新建时可选择代理 |
 | `/providers/:id` | 上游详情 | admin | `ProviderDetail.tsx`：凭据、模型发现/导入、余额查询、连通性测试、批量改价与协议配置。模型测试结果通过页面底部的临时 toast 展示，不嵌入模型行。协议值在 API/DB 中仍为 `chat / response / anthropic` |
 | `/routes` | 模型与路由 | admin | `Routes.tsx`：公开模型名到有序上游链；`PUT /admin/api/routes/{id}/targets` 原子替换整条链 |
 | `/account` | 账号设置 | 全体 | 当前用户自助改密、查看账号信息；管理员和普通用户都可访问 |
-| `/settings` | 系统设置 | admin | 五个页签：模型默认、运行时、模型价格、修改密码、导入导出（§13.3）。**审计日志页签已移除**（用户要求）—— 后端 `GET /admin/api/audit` 端点与 `api.ts` 的 `api.audit()` 都保留，那是运维取证的正路，删的只是界面那一块 |
+| `/settings` | 系统设置 | admin | 五个页签：模型默认、运行时、模型价格、修改密码、导入导出（§13.3）。**审计日志页签与读取端点均已移除**；审计写入仍保留在服务端 |
 
 「用量看板」不是独立页 —— 按上游 / 模型 / 密钥的汇总以子页签形式内嵌在
 `/usage`；逐条请求日志在 `/history`。
@@ -1932,17 +1927,14 @@ Docker 侧对齐，且避开浏览器的保留端口表（6666 是 IRC 段，浏
   哈希，重新签发/管理员改密/禁用/删除都会使旧链接失效
 - 上游 key 在界面只显示掩码（`sk-...abcd`），明文不可回读
 - 所有写操作记审计日志（**已实现，2026-10-04**）：`server.AutoReload` 在每个管理写
-  操作上落 `audit_log`（谁=admin+来源 IP、何时、哪个资源、**哪些字段名**）。
-  字段名刻意不记值 —— 请求体里有上游 api_key 与管理密码明文。查询走
-  `GET /admin/api/audit`。
+  操作上落 `audit_log`（谁=会话身份+来源 IP、何时、哪个资源、**哪些字段名**）。
+  字段名刻意不记值 —— 请求体里有上游 api_key 与管理密码明文。审计表
+  `audit_log` 由 `PruneAuditLog` 按行数封顶，不在管理面提供读取端点。
 
-  **消费方式（2026-10 决策）**：界面上**没有**审计入口 —— 「设置」页的审计
-  日志页签已按要求移除，`web/src/` 下也没有审计页面。这是运维取证的正路，
-  所以后端端点与 `api.ts` 的 `api.audit()` 都保留，运维直接调 API 取证。
-  配套地，`audit_log.actor` 恒为 `"admin"` 的不精确**刻意不修**：当前唯一消费
-  方式是运维取证，单管理员场景下它不妨碍回答真正关心的问题（时间、端点、
-  改了哪些字段、结果如何）。若将来出现多管理员共用、或审计需用于对账/合规，
-  再改 `WriteAuditor` 的签名把会话身份透传进去。
+  **消费方式（2026-11 决策）**：界面上**没有**审计入口，管理面也不再提供
+  读取端点（`GET /admin/api/audit` 与 `ListAuditEntries` 已删除）。写入链路
+  保留 —— 需要取证时直接查 SQLite 的 `audit_log` 表。`audit_log.actor` 已由
+  `WriteAuditor` 从会话透传，普通用户、管理员与匿名引导入口可区分。
 
 ---
 
@@ -2155,7 +2147,6 @@ rosetta-gateway/
 |---|---|---|
 | 全链路无 TLS | 定位是局域网网关，设计上不做传输加密 | 对外暴露由部署层解决（反向代理终结 TLS，见 [DOCKER.md](DOCKER.md)） |
 | 删库 = 失明 | 身份、配额、路由、key 全部绑在同一个 SQLite 文件上（§12.1） | 不可重建的身份状态只有 `master.key` 与 `session_secret` 两把密钥，独立于库存放；删库后重新走首次初始化 |
-| `audit.actor` 恒为 "admin" | `WriteAuditor` 回调未透传会话身份，普通用户对自己资源的写操作也落 "admin" 记录 | **刻意不修**（2026-10 决策）：审计无 UI 入口，唯一消费方式是运维直接调 API 取证，单管理员场景下不影响取证。修法需改 `WriteAuditor` 签名并波及全部调用点 |
 | 配额预占 est 是预估值 | 预占含 `max_tokens` 全额，请求收尾按真实 usage 退预占；上游不回 usage 时退预占、漏账以 `usage_state="missing"` 显形（§11.1/§11.2） | 在途瞬间不精确，终态正确；漏账可从界面察觉 |
 | 归档明细的可见性边界 | 明细按 `usage_retention_days` 保留（缺省 30 天），更老区间的分组统计从日归档表取，按「宁可少算」口径（§4） | 极老日期的部分维度不可查；明细保留期内可按 `request_id` 查明细 |
 | `-race` 的 Windows 本机前置条件 | 需显式设置 `CC` 指向可用的 MinGW gcc；路径含空格时需按 [CONTRIBUTING.md](CONTRIBUTING.md) 的引号形式设置。这是机器本地前置条件，不是仓库保证 | 按 CONTRIBUTING.md 的 `CC` 说明执行本机 `go test -race`；CI 在 ubuntu 上使用默认 gcc 独立兜底 |

@@ -366,8 +366,8 @@ func (s *Store) PruneOldUsage(ctx context.Context, keepDays int) (*PruneResult, 
 	// 这两列是**终身累计**，不是「保留期内用量」：
 	//   - DESIGN.md §4 数据模型：`quota_tokens ... 0 = 不限；终身累计 input+output 上限`；
 	//   - key_dao.go ReserveQuota 的注释：「配额限的是终身累计，没有『窗口结束』这回事」；
-	//   - RecomputeUsedTokens / RecomputeUserUsage 的数据源是 UsageSource
-	//     （明细 + 归档），也就是它们把归档量算进权威值。
+	//   - 配额对账口径（SumUserUsedTokens / RecomputeUserUsage）的数据源是
+	//     UsageSource（明细 + 归档），也就是归档量属于权威值。
 	//
 	// 所以「明细被剪掉」不等于「用量消失」——那部分量已经进了表 A
 	// （usage_daily_rollups），仍然属于用户的终身累计。若在这里按被剪量

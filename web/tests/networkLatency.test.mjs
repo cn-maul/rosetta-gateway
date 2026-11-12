@@ -13,7 +13,7 @@ import { readFile } from 'node:fs/promises'
 
 const read = (rel) => readFile(new URL('../src/' + rel, import.meta.url), 'utf8')
 
-test('代理列表：不再有「测试」按钮与 api.testNetwork 调用', async () => {
+test('代理列表：不再有「测试」按钮，也不再依赖手动测试接口', async () => {
   const page = await read('pages/Networks.tsx')
 
   assert.ok(
@@ -25,6 +25,12 @@ test('代理列表：不再有「测试」按钮与 api.testNetwork 调用', asy
     !/<Button[^>]*>\s*测试\s*<\/Button>/.test(page),
     '「测试」按钮又回来了',
   )
+
+  // 手动测试端点已从后端删除，前端封装与类型也不该继续存在。
+  const api = await read('api.ts')
+  assert.ok(!api.includes('testNetwork'), 'api.testNetwork 应随后端端点一起删除')
+  const types = await read('types.ts')
+  assert.ok(!types.includes('NetworkTestResult'), 'types.ts 不应再保留手动测试的返回类型')
 })
 
 test('代理列表：延迟来自探针字段，无样本显示「—」', async () => {
