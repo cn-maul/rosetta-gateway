@@ -449,7 +449,6 @@ import type {
   UsageGroupEntry,
   UsageGroupPage,
   UsageByUserPage,
-  UsageFailures,
   UsageHistoryPage,
   HistoryFilters,
   PruneResult,
@@ -783,18 +782,6 @@ export const api = {
     get<UsageGroupPage>(`/usage/by-key?from=${from}&to=${to}&limit=${limit}`),
   usageByProvider: (from = 0, to = Date.now(), limit = 200) =>
     get<UsageGroupPage>(`/usage/by-provider?from=${from}&to=${to}&limit=${limit}`),
-  /**
-   * 失败原因聚合：按错误码与按上游两个维度回答「这段时间哪里在坏」。
-   *
-   * 与上面的 by-* 不同，它不看 token 与费用，只数失败次数 —— 因此返回
-   * 的是两个分组而不是一张 usageGroupEntry 表（那个结构里的 tokens/cost
-   * 在这里恒为 0，会让读的人以为「有失败但没花钱」是有意义的信号）。
-   *
-   * limit 默认 10：排障看的是 Top N，不是全量清单；超过 10 个错误码同时
-   * 在报，说明问题已经不在某一条上了。
-   */
-  usageFailures: (from: number, to: number, limit = 10) =>
-    get<UsageFailures>(`/usage/failures?from=${from}&to=${to}&limit=${limit}`),
   /**
    * 按用户汇总消费（钱包页「消费汇总」一表一行一个用户）。
    *

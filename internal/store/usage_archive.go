@@ -47,11 +47,11 @@ const usageDailyRollupsDDL = `CREATE TABLE IF NOT EXISTS usage_daily_rollups (
 	total_tokens     INTEGER NOT NULL DEFAULT 0,
 	-- 固化计价：不固化的话改价后历史费用永久算错。
 	cost_total       REAL NOT NULL DEFAULT 0,
-	-- 延迟按请求数加权平均所需（算术平均会被快慢请求互相抵消）。
-	latency_sum_ms   INTEGER NOT NULL DEFAULT 0,
-	-- 首字延迟同样按请求数加权平均所需。与 latency 分成两列而不是复用：
+	-- 首字延迟按请求数加权平均所需。注意这里**没有**总的 latency 累计列：
+	-- 统计侧只消费成功请求的 ok_latency_sum_ms（速度、生成耗时都以它为准），
+	-- 全量延迟累计从来没有读取方，留着只是每条明细多写一次。
 	-- ttfb 只在**真正流式**的请求上有值（非流式的 ttfb_ms 是 0），
-	-- 混进 latency_sum_ms 会把「没有首字概念」的请求也算进分母，
+	-- 混进延迟均值会把「没有首字概念」的请求也算进分母，
 	-- 平均值被一路稀释到没有参考价值。ttfb_count 记的是「测到过首字的
 	-- 请求数」，正是那个分母。
 	ttfb_sum_ms      INTEGER NOT NULL DEFAULT 0,
@@ -293,7 +293,7 @@ func (s *Store) PruneOldUsage(ctx context.Context, keepDays int) (*PruneResult, 
 			     ingress_protocol, stream,
 			     request_count, success_count, error_count,
 			     input_tokens, output_tokens, cached_tokens, cached_creation_tokens, reasoning_tokens, total_tokens,
-			     cost_total, latency_sum_ms, ttfb_sum_ms, ttfb_count,
+			     cost_total, ttfb_sum_ms, ttfb_count,
 			     ok_ttfb_sum_ms, ok_ttfb_count,
 			     ok_output_tokens, ok_latency_sum_ms, ok_sample_count, cost_pending_count)
 			 SELECT `+dayExpr+` AS day,
@@ -305,7 +305,6 @@ func (s *Store) PruneOldUsage(ctx context.Context, keepDays int) (*PruneResult, 
 			       COALESCE(SUM(cached_tokens), 0), COALESCE(SUM(cached_creation_tokens), 0),
 			       COALESCE(SUM(reasoning_tokens), 0),
 			       COALESCE(SUM(total_tokens), 0), COALESCE(SUM(cost_total), 0),
-			       COALESCE(SUM(latency_ms), 0),
 			       -- 只累计**真正测到过首字**的请求（ttfb_ms > 0）。非流式请求的
 			       -- ttfb_ms 是 0，算进 sum 无害但算进 count 会把分母撑大，
 			       -- 平均首字被一路稀释。两列必须同口径。
@@ -335,7 +334,6 @@ func (s *Store) PruneOldUsage(ctx context.Context, keepDays int) (*PruneResult, 
 			       reasoning_tokens = reasoning_tokens + excluded.reasoning_tokens,
 			       total_tokens     = total_tokens + excluded.total_tokens,
 			       cost_total       = cost_total + excluded.cost_total,
-			       latency_sum_ms   = latency_sum_ms + excluded.latency_sum_ms,
 			       ttfb_sum_ms      = ttfb_sum_ms + excluded.ttfb_sum_ms,
 			       ttfb_count       = ttfb_count + excluded.ttfb_count,
 			       ok_ttfb_sum_ms   = ok_ttfb_sum_ms + excluded.ok_ttfb_sum_ms,
@@ -422,20 +420,20 @@ func (s *Store) PruneOldUsage(ctx context.Context, keepDays int) (*PruneResult, 
 }
 
 // usageLifetime 是表 B 的一行（总览「全部」档的大数字）。
+//
+// 只保留**真正有消费方**的列：request/success/error 用于计数，total_tokens
+// 与 cost_total 用于金额与体量，first_record_at 是「全部」档的图起点，
+// pruned_through_day 是剪枝水位。表里另有 input/output/cached/reasoning/
+// latency 等冗余累计列（旧库仍存在），但没有任何接口读取它们 —— 触发器
+// 与这里都不再维护，免得每写一条明细就多做几次无效 UPDATE。
 type usageLifetime struct {
-	RequestCount         int64
-	SuccessCount         int64
-	ErrorCount           int64
-	InputTokens          int64
-	OutputTokens         int64
-	TotalTokens          int64
-	CachedTokens         int64
-	CachedCreationTokens int64
-	ReasoningTokens      int64
-	CostTotal            float64
-	LatencySumMs         int64
-	FirstRecordAt        int64
-	PrunedThrough        string
+	RequestCount  int64
+	SuccessCount  int64
+	ErrorCount    int64
+	TotalTokens   int64
+	CostTotal     float64
+	FirstRecordAt int64
+	PrunedThrough string
 }
 
 // GetUsageLifetime 读终身累计（表 B）。
@@ -446,12 +444,12 @@ type usageLifetime struct {
 func (s *Store) GetUsageLifetime(ctx context.Context) (*usageLifetime, error) {
 	var t usageLifetime
 	err := s.read.QueryRowContext(ctx,
-		`SELECT request_count, success_count, error_count, input_tokens, output_tokens,
-		        total_tokens, cached_tokens, cached_creation_tokens, reasoning_tokens, cost_total, latency_sum_ms,
+		`SELECT request_count, success_count, error_count,
+		        total_tokens, cost_total,
 		        first_record_at, pruned_through_day
 		   FROM usage_totals WHERE id = 1`).
-		Scan(&t.RequestCount, &t.SuccessCount, &t.ErrorCount, &t.InputTokens, &t.OutputTokens,
-			&t.TotalTokens, &t.CachedTokens, &t.CachedCreationTokens, &t.ReasoningTokens, &t.CostTotal, &t.LatencySumMs,
+		Scan(&t.RequestCount, &t.SuccessCount, &t.ErrorCount,
+			&t.TotalTokens, &t.CostTotal,
 			&t.FirstRecordAt, &t.PrunedThrough)
 	if err == sql.ErrNoRows {
 		return nil, nil

@@ -69,7 +69,6 @@ func TestR1_NormalShutdownJoinsEveryRegisteredWorker(t *testing.T) {
 	db := openServeTestStore(t)
 	cfg := config.Default()
 	cfg.Listen = "127.0.0.1:0"
-	cfg.Probes.Enabled = false
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	manager := lifecycle.NewManager(db, nil)
 	manager.SetBootstrap(lifecycle.BootstrapReady)

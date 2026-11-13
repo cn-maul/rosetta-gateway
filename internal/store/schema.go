@@ -103,7 +103,6 @@ func (s *Store) ensureCompatibleSchema(ctx context.Context) error {
 		{"upstream_models", "price_cache_creation", "REAL"},
 		{"usage_records", "cached_creation_tokens", "INTEGER NOT NULL DEFAULT 0"},
 		{"usage_daily_rollups", "cached_creation_tokens", "INTEGER NOT NULL DEFAULT 0"},
-		{"usage_totals", "cached_creation_tokens", "INTEGER NOT NULL DEFAULT 0"},
 		// 2026-10-23：调用历史要回答「实际是谁接的、上下游各是什么协议」。
 		// 这两列都是**固化值**，不是 JOIN 当前配置：provider 改名/删除、
 		// 路由改协议后，旧记录仍应显示当时的事实。
@@ -164,23 +163,6 @@ func (s *Store) ensureCompatibleSchema(ctx context.Context) error {
 		if err := s.ensureAdditiveColumn(ctx, col.table, col.column, col.decl); err != nil {
 			return err
 		}
-	}
-	// 2026-11-01：代理也改成定时测速（不再靠「测试」按钮），需要自己的
-	// 探测表。纯新增表，旧库原地补建即可，不必抬 currentSchemaVersion —
-	// 与上面加列的判据相同：可幂等创建、不破坏既有数据。
-	if _, err := s.db.ExecContext(ctx, `CREATE TABLE IF NOT EXISTS network_probes (
-		id         INTEGER PRIMARY KEY AUTOINCREMENT,
-		network_id TEXT NOT NULL,
-		ts         INTEGER NOT NULL,
-		ok         INTEGER NOT NULL,
-		latency_ms INTEGER NOT NULL DEFAULT 0,
-		error      TEXT
-	)`); err != nil {
-		return fmt.Errorf("ensure network probe table: %w", err)
-	}
-	if _, err := s.db.ExecContext(ctx, `CREATE INDEX IF NOT EXISTS idx_netprobes_net_ts
-		ON network_probes(network_id, ts)`); err != nil {
-		return fmt.Errorf("ensure network probe index: %w", err)
 	}
 	// This index depends on charge_next_at, so it must be created after the
 	// additive-column pass above. v1.6.8 has neither the column nor the index.
@@ -385,14 +367,8 @@ const usageTotalsInsertTriggerDDL = `CREATE TRIGGER trg_update_usage_totals
      request_count    = request_count + 1,
      success_count    = success_count + CASE WHEN NEW.status = 'ok' THEN 1 ELSE 0 END,
      error_count      = error_count + CASE WHEN NEW.status NOT IN ('ok', 'canceled') THEN 1 ELSE 0 END,
-     input_tokens     = input_tokens + NEW.input_tokens,
-     output_tokens    = output_tokens + NEW.output_tokens,
      total_tokens     = total_tokens + NEW.total_tokens,
-     cached_tokens    = cached_tokens + NEW.cached_tokens,
-     cached_creation_tokens = cached_creation_tokens + NEW.cached_creation_tokens,
-     reasoning_tokens = reasoning_tokens + NEW.reasoning_tokens,
      cost_total       = cost_total + NEW.cost_total,
-     latency_sum_ms   = latency_sum_ms + NEW.latency_ms,
      first_record_at  = CASE WHEN first_record_at = 0 THEN NEW.ts
                              ELSE MIN(first_record_at, NEW.ts) END
    WHERE id = 1;
@@ -564,14 +540,8 @@ var canonicalSchemaStatements = []string{
 		request_count      INTEGER NOT NULL DEFAULT 0,
 		success_count      INTEGER NOT NULL DEFAULT 0,
 		error_count        INTEGER NOT NULL DEFAULT 0,
-		input_tokens       INTEGER NOT NULL DEFAULT 0,
-		output_tokens      INTEGER NOT NULL DEFAULT 0,
-		cached_tokens      INTEGER NOT NULL DEFAULT 0,
-		cached_creation_tokens INTEGER NOT NULL DEFAULT 0,
-		reasoning_tokens   INTEGER NOT NULL DEFAULT 0,
 		total_tokens       INTEGER NOT NULL DEFAULT 0,
 		cost_total         REAL NOT NULL DEFAULT 0,
-		latency_sum_ms     INTEGER NOT NULL DEFAULT 0,
 		first_record_at    INTEGER NOT NULL DEFAULT 0,
 		pruned_through_day TEXT NOT NULL DEFAULT ''
 	)`,
@@ -627,17 +597,6 @@ var canonicalSchemaStatements = []string{
 		ts                INTEGER NOT NULL,
 		remark            TEXT
 	)`,
-	// network_probes 记「经这条代理能不能出去」。独立成表是因为它的粒度
-	// 是代理、不打上游、不计费，与模型可用性无关。
-	`CREATE TABLE network_probes (
-		id         INTEGER PRIMARY KEY AUTOINCREMENT,
-		network_id TEXT NOT NULL,
-		ts         INTEGER NOT NULL,
-		ok         INTEGER NOT NULL,
-		latency_ms INTEGER NOT NULL DEFAULT 0,
-		error      TEXT
-	)`,
-
 	`CREATE INDEX idx_usage_ts ON usage_records(ts)`,
 	`CREATE INDEX idx_usage_key_ts ON usage_records(access_key_id, ts)`,
 	`CREATE INDEX idx_usage_model_ts ON usage_records(public_model, ts)`,
@@ -661,8 +620,6 @@ var canonicalSchemaStatements = []string{
 	`CREATE INDEX idx_balance_charges_user ON balance_charges(user_id, ts)`,
 	`CREATE INDEX idx_balance_pending_user ON balance_pending(user_id)`,
 	`CREATE INDEX idx_balance_topups_user ON balance_topups(user_id, ts)`,
-	`CREATE INDEX idx_netprobes_net_ts ON network_probes(network_id, ts)`,
-
 	`INSERT INTO usage_totals (id) VALUES (1)`,
 
 	`CREATE TRIGGER trg_update_used_tokens

@@ -188,12 +188,6 @@ export const DTO_CONTRACTS: readonly DTOFieldContract[] = [
     "proxy_url",
     "provider_count",
     "created_at",
-    "latency_ms",
-    "latency_p95_ms",
-    "latency_samples",
-    "last_probe_ok",
-    "last_probe_error",
-    "last_probe_at",
   ] },
   { goType: "internal/admin.protocolProbeEntry", tsType: "ProtocolProbeEntry", fields: [
     "protocol",
@@ -209,7 +203,6 @@ export const DTO_CONTRACTS: readonly DTOFieldContract[] = [
     "protocol",
     "endpoint",
     "network_id",
-    "quirks_json",
     "api_key",
   ] },
   { goType: "internal/admin.providerResponse", tsType: "Provider", fields: [
@@ -221,7 +214,6 @@ export const DTO_CONTRACTS: readonly DTOFieldContract[] = [
     "enabled",
     "timeout_ms",
     "max_retries",
-    "quirks_json",
     "network_id",
     "proxy_url",
     "created_at",
@@ -238,7 +230,6 @@ export const DTO_CONTRACTS: readonly DTOFieldContract[] = [
     "enabled",
     "timeout_ms",
     "max_retries",
-    "quirks_json",
     "network_id",
   ] },
   { goType: "internal/admin.routeCatalogEntry", tsType: "RouteCatalogEntry", fields: [
@@ -356,29 +347,6 @@ export const DTO_CONTRACTS: readonly DTOFieldContract[] = [
   { goType: "internal/admin.usageByUserResponse", tsType: "UsageByUserPage", fields: [
     "records",
     "total",
-  ] },
-  { goType: "internal/admin.usageFailureCodeEntry", tsType: "UsageFailureCodeEntry", fields: [
-    "code",
-    "http_status",
-    "count",
-    "last_ts",
-  ] },
-  { goType: "internal/admin.usageFailureUpstreamEntry", tsType: "UsageFailureUpstreamEntry", fields: [
-    "provider_id",
-    "provider_name",
-    "total",
-    "failed",
-    "rate",
-    "last_fail_ts",
-  ] },
-  { goType: "internal/admin.usageFailuresResponse", tsType: "UsageFailures", fields: [
-    "from",
-    "to",
-    "total",
-    "failed",
-    "rate",
-    "codes",
-    "upstreams",
   ] },
   { goType: "internal/admin.usageGroupEntry", tsType: "UsageGroupEntry", fields: [
     "key",

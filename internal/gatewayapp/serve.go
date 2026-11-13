@@ -15,7 +15,6 @@ import (
 
 	"github.com/cn-maul/rosetta-gateway/internal/config"
 	"github.com/cn-maul/rosetta-gateway/internal/lifecycle"
-	"github.com/cn-maul/rosetta-gateway/internal/probe"
 	"github.com/cn-maul/rosetta-gateway/internal/runtime"
 	"github.com/cn-maul/rosetta-gateway/internal/store"
 	"github.com/cn-maul/rosetta-gateway/internal/usage"
@@ -53,9 +52,6 @@ func Serve(deps ServeDeps) error {
 	}
 	shutdown := make(chan struct{})
 
-	probeCtx, stopProbe := context.WithCancel(context.Background())
-	defer stopProbe()
-
 	// Bind before starting any maintenance worker or publishing ready. A
 	// startup failure must not leave a ready window or untracked background
 	// writes behind.
@@ -87,8 +83,6 @@ func Serve(deps ServeDeps) error {
 	pruneDone := startPruner(db, cfg, logger, shutdown, deps.Lifecycle)
 	recomputeDone := startRecompute(db, logger, shutdown, deps.Lifecycle)
 	reconcileDone := startReconcile(db, logger, shutdown, deps.Lifecycle)
-	probeDone := startProbe(db, cfg, logger, probeCtx, deps.Lifecycle)
-
 	quit := make(chan os.Signal, 1)
 	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
 	defer signal.Stop(quit)
@@ -109,16 +103,12 @@ func Serve(deps ServeDeps) error {
 		deps.Lifecycle.SetPhase(lifecycle.PhaseStopping)
 	}
 	close(shutdown)
-	stopProbe()
 	allJoined := waitLoop(pruneDone, budget.UsagePrune,
 		logger, "usage prune still running at shutdown; exiting anyway")
 	allJoined = waitLoop(recomputeDone, budget.CostRecompute,
 		logger, "cost recompute still running at shutdown; exiting anyway") && allJoined
 	allJoined = waitLoop(reconcileDone, budget.ChargeReconcile,
 		logger, "charge reconciliation still running at shutdown; exiting anyway") && allJoined
-	allJoined = waitLoop(probeDone, budget.ProbeJoin,
-		logger, "probe runner still running at shutdown") && allJoined
-
 	logger.Info("shutting down...")
 	ctx, cancel := context.WithTimeout(context.Background(), budget.HTTPDrain)
 	defer cancel()
@@ -340,26 +330,6 @@ func startReconcile(db *store.Store, logger *slog.Logger, shutdown <-chan struct
 				return
 			}
 		}
-	}()
-	return done
-}
-
-func startProbe(db *store.Store, cfg *config.Config, logger *slog.Logger,
-	ctx context.Context, lifecycle *lifecycle.Manager) <-chan struct{} {
-	done := make(chan struct{})
-	if !cfg.Probes.Enabled {
-		close(done)
-		return done
-	}
-	if lifecycle != nil {
-		lifecycle.AddWorkers(1)
-	}
-	go func() {
-		defer close(done)
-		if lifecycle != nil {
-			defer lifecycle.WorkerExited()
-		}
-		probe.NewRunner(db, cfg, logger).Run(ctx)
 	}()
 	return done
 }

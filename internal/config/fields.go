@@ -20,7 +20,6 @@ const (
 	frontendSettingsRuntime = "Settings > runtime defaults"
 	frontendSettingsUsage   = "Settings > usage archive"
 	frontendProvider        = "Providers > effective timeout/retry"
-	frontendNetworkLatency  = "Networks > latency"
 )
 
 var configFieldInventory = []configFieldSpec{
@@ -93,11 +92,6 @@ var configFieldInventory = []configFieldSpec{
 		Path:     "audit_log_keep_rows",
 		ReadBy:   []string{"internal/gatewayapp/serve.go:startPruner"},
 		Frontend: frontendNone,
-	},
-	{
-		Path:     "probes",
-		ReadBy:   []string{"internal/gatewayapp/serve.go:startProbe", "internal/probe/runner.go:Run"},
-		Frontend: frontendNetworkLatency,
 	},
 	{
 		Path:     "defaults.upstream_timeout_ms",
@@ -218,35 +212,5 @@ var configFieldInventory = []configFieldSpec{
 		Path:     "bootstrap.routes[].model",
 		ReadBy:   []string{"internal/gatewayapp/bootstrap.go:bootstrapDB"},
 		Frontend: frontendNone,
-	},
-	{
-		Path:     "probes.enabled",
-		ReadBy:   []string{"internal/gatewayapp/serve.go:startProbe"},
-		Frontend: frontendNetworkLatency,
-	},
-	{
-		Path:     "probes.interval_sec",
-		ReadBy:   []string{"internal/probe/runner.go:Run", "internal/admin/network_handler.go:probeWindowMs"},
-		Frontend: frontendNetworkLatency,
-	},
-	{
-		Path:     "probes.timeout_ms",
-		ReadBy:   []string{"internal/probe/runner.go:Run"},
-		Frontend: frontendNetworkLatency,
-	},
-	{
-		Path:     "probes.concurrency",
-		ReadBy:   []string{"internal/probe/runner.go:Run"},
-		Frontend: frontendNetworkLatency,
-	},
-	{
-		Path:     "probes.window_size",
-		ReadBy:   []string{"internal/admin/network_handler.go:probeWindowMs"},
-		Frontend: frontendNetworkLatency,
-	},
-	{
-		Path:     "probes.retention_days",
-		ReadBy:   []string{"internal/probe/runner.go:Run"},
-		Frontend: frontendNetworkLatency,
 	},
 }

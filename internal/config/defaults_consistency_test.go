@@ -8,50 +8,6 @@ import (
 	"testing"
 )
 
-// TestProbes_显式关闭不被改回开启 钉住「enabled 键是否出现」这条判据。
-//
-// 此前 setDefaults 用的是 `if !c.Probes.Enabled { c.Probes.Enabled = true }`，
-// 于是运维写 `{"probes":{"enabled":false}}`（最自然的关法）会被静默改回开启
-// —— 之后每 10 分钟对每条代理发起一次测速，而配置文件里明明写着关闭。
-// 没有报错、没有日志，行为与配置直接相反。
-func TestProbes_显式关闭不被改回开启(t *testing.T) {
-	c, err := Parse([]byte(`{"listen":"127.0.0.1:8666","probes":{"enabled":false}}`))
-	if err != nil {
-		t.Fatalf("Parse: %v", err)
-	}
-	if c.Probes.Enabled {
-		t.Fatal(`probes.enabled=false 被静默改回 true —— 会持续发起代理测速`)
-	}
-	// 其余字段仍应被填上默认值（只尊重 enabled，不放过整块）。
-	if c.Probes.IntervalSec != 600 || c.Probes.TimeoutMs != 30000 || c.Probes.Concurrency != 4 {
-		t.Fatalf("其余字段应照常取默认，实际 %+v", c.Probes)
-	}
-}
-
-// TestProbes_整块缺失默认开启：功能默认是开的，不能因为修了上一条就连环关掉。
-func TestProbes_整块缺失默认开启(t *testing.T) {
-	c, err := Parse([]byte(`{"listen":"127.0.0.1:8666"}`))
-	if err != nil {
-		t.Fatalf("Parse: %v", err)
-	}
-	if !c.Probes.Enabled {
-		t.Fatal("probes 整块缺失时应默认开启")
-	}
-}
-
-func TestProbes_部分对象仍默认开启(t *testing.T) {
-	c, err := Parse([]byte(`{"listen":"127.0.0.1:8666","probes":{"interval_sec":300}}`))
-	if err != nil {
-		t.Fatalf("Parse: %v", err)
-	}
-	if !c.Probes.Enabled {
-		t.Fatal("probes 对象缺省 enabled 时必须默认开启")
-	}
-	if c.Probes.IntervalSec != 300 {
-		t.Fatalf("显式 interval_sec 未保留，实际 %d", c.Probes.IntervalSec)
-	}
-}
-
 // TestAuditLogKeepRows 覆盖新配置项的缺省与关闭语义。
 func TestAuditLogKeepRows(t *testing.T) {
 	t.Run("缺省 20000", func(t *testing.T) {

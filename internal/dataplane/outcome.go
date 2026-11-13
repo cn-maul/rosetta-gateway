@@ -158,8 +158,8 @@ type LaneDecision struct {
 //
 // 单独一个取值（而不是笼统的 upstream_error）有两个用处：
 //  1. committedKindFor 靠它把这类失败分到不罚目标的那一类；
-//  2. 失败原因聚合页会单独成一行——同一家中转每次带思考都犯这个错时，
-//     一个独立的 code 比混在 upstream_error 里更容易被认出来。
+//  2. 调用日志里可据此筛选识别——同一家中转每次带思考都犯这个错时，
+//     独立的 code 比混在 upstream_error 里更容易被认出来。
 const errorCodeStreamMalformed = "stream_malformed"
 
 // StreamCommitOutcome maps a persisted terminal status into the trace

@@ -37,9 +37,8 @@ type providerCreateRequest struct {
 	Endpoint string `json:"endpoint"`
 	// NetworkID 指向 networks 表里的一条出站网络（代理配置）。
 	// 空串或 store.NetworkDirectID = 直连（默认），见 createProviderNetwork。
-	NetworkID  string `json:"network_id"`
-	QuirksJSON string `json:"quirks_json"`
-	APIKey     string `json:"api_key"`
+	NetworkID string `json:"network_id"`
+	APIKey    string `json:"api_key"`
 }
 
 // providerUpdateRequest 是上游的 PATCH 输入。
@@ -58,7 +57,6 @@ type providerUpdateRequest struct {
 	Enabled    *bool   `json:"enabled"`
 	TimeoutMs  *int    `json:"timeout_ms"`
 	MaxRetries *int    `json:"max_retries"`
-	QuirksJSON *string `json:"quirks_json"`
 	// NetworkID 是**指针**而非 string：空串是合法值（= 回到直连，清掉已选的
 	// 网络）。用 string 的话，未提供时会被序列化成 ""，与「显式清空」不可分辨，
 	// 于是「只想改个名字」会把网络悄悄抹掉。
@@ -75,7 +73,6 @@ type providerResponse struct {
 	Enabled    bool   `json:"enabled"`
 	TimeoutMs  int    `json:"timeout_ms"`
 	MaxRetries int    `json:"max_retries"`
-	QuirksJSON string `json:"quirks_json"`
 	// NetworkID 是该上游选择的出站网络。空串 = 直连。
 	//
 	// 响应同时带上 ProxyURL（派生值，即所选网络的地址）—— 那是**只读**的
@@ -219,7 +216,6 @@ func (h *ProviderHandler) Create(w http.ResponseWriter, r *http.Request) {
 		Enabled:    true,
 		TimeoutMs:  h.cfg.Defaults.UpstreamTimeoutMs,
 		MaxRetries: h.cfg.Defaults.MaxRetries,
-		QuirksJSON: req.QuirksJSON,
 		NetworkID:  networkID,
 		CreatedAt:  now,
 		UpdatedAt:  now,
@@ -342,11 +338,7 @@ func (h *ProviderHandler) Update(w http.ResponseWriter, r *http.Request, id stri
 		}
 		existing.MaxRetries = *req.MaxRetries
 	}
-	// 可清空字段
-	if req.QuirksJSON != nil {
-		existing.QuirksJSON = *req.QuirksJSON
-	}
-	// 出站网络同样可清空：留空 = 回到直连。与 QuirksJSON 同一档处理，
+	// 出站网络可清空：留空 = 回到直连。
 	// 因为「换成直连」和「从没选过网络」在使用上没有任何区别。
 	if req.NetworkID != nil {
 		networkID, err := resolveNetworkID(r.Context(), h.store, *req.NetworkID)
@@ -449,7 +441,6 @@ func toProviderResponse(p store.Provider) providerResponse {
 		Enabled:    p.Enabled,
 		TimeoutMs:  p.TimeoutMs,
 		MaxRetries: p.MaxRetries,
-		QuirksJSON: p.QuirksJSON,
 		NetworkID:  p.NetworkID,
 		ProxyURL:   p.ProxyURL,
 		CreatedAt:  p.CreatedAt,

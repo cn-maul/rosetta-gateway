@@ -108,10 +108,10 @@ func TestUsageSource_GenTimeRollupBranch(t *testing.T) {
 		`INSERT INTO usage_daily_rollups (day, user_id, access_key_id, public_model, upstream_model,
 		                                 provider_id, ingress_protocol, stream, request_count,
 		                                 success_count, error_count, input_tokens, output_tokens,
-		                                 total_tokens, cost_total, latency_sum_ms, ttfb_sum_ms,
+		                                 total_tokens, cost_total, ttfb_sum_ms,
 		                                 ttfb_count, ok_ttfb_sum_ms, ok_ttfb_count, ok_output_tokens,
 		                                 ok_latency_sum_ms, ok_sample_count, cost_pending_count)
-		 VALUES (?, '', 'k1', 'm', 'up', 'p', 'chat', 0, 3, 3, 0, 30, 60, 90, 0, 3000, 1000,
+		 VALUES (?, '', 'k1', 'm', 'up', 'p', 'chat', 0, 3, 3, 0, 30, 60, 90, 0, 1000,
 		         3, 1000, 3, 60, 3000, 3, 0)`, day); err != nil {
 		t.Fatalf("seed rollup: %v", err)
 	}
@@ -146,10 +146,10 @@ func TestUsageSource_GenTimeRollupBranchGuardsDirtyData(t *testing.T) {
 		`INSERT INTO usage_daily_rollups (day, user_id, access_key_id, public_model, upstream_model,
 		                                 provider_id, ingress_protocol, stream, request_count,
 		                                 success_count, error_count, input_tokens, output_tokens,
-		                                 total_tokens, cost_total, latency_sum_ms, ttfb_sum_ms,
+		                                 total_tokens, cost_total, ttfb_sum_ms,
 		                                 ttfb_count, ok_ttfb_sum_ms, ok_ttfb_count, ok_output_tokens,
 		                                 ok_latency_sum_ms, ok_sample_count, cost_pending_count)
-		 VALUES (?, '', 'k1', 'm', 'up', 'p', 'chat', 0, 1, 1, 0, 10, 20, 30, 0, 500, 900,
+		 VALUES (?, '', 'k1', 'm', 'up', 'p', 'chat', 0, 1, 1, 0, 10, 20, 30, 0, 900,
 		         1, 900, 1, 20, 500, 1, 0)`, day); err != nil {
 		t.Fatalf("seed rollup: %v", err)
 	}

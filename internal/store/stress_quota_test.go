@@ -442,12 +442,7 @@ func TestStress_Prune_LifetimeTotalsSurvivePrune(t *testing.T) {
 		{"request_count", before.RequestCount, after.RequestCount},
 		{"success_count", before.SuccessCount, after.SuccessCount},
 		{"error_count", before.ErrorCount, after.ErrorCount},
-		{"input_tokens", before.InputTokens, after.InputTokens},
-		{"output_tokens", before.OutputTokens, after.OutputTokens},
 		{"total_tokens", before.TotalTokens, after.TotalTokens},
-		{"cached_tokens", before.CachedTokens, after.CachedTokens},
-		{"reasoning_tokens", before.ReasoningTokens, after.ReasoningTokens},
-		{"latency_sum_ms", before.LatencySumMs, after.LatencySumMs},
 		{"first_record_at", before.FirstRecordAt, after.FirstRecordAt},
 	}
 	for _, p := range pairs {

@@ -210,7 +210,7 @@ func TestR12M2004DesignPointsAtLocalRaceSetup(t *testing.T) {
 func TestR12M2001BudgetContractStillPassesR12(t *testing.T) {
 	docker := readRepoFile(t, "docs/DOCKER.md")
 	requireContains(t, "docs/DOCKER.md", docker,
-		"正常关停的名义预算是 26s",
-		"上界为 30s",
-		"stop_grace_period: 31s")
+		"正常关停的名义预算是 24s",
+		"上界为 28s",
+		"stop_grace_period: 29s")
 }

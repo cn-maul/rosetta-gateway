@@ -14,7 +14,7 @@ import (
 // 建网络 → 上游选它 → 换回直连 → 删网络（引用自动回到直连，且上游还在）。
 func TestNetworkCRUDAndProviderReference(t *testing.T) {
 	st := newTestStore(t)
-	h := NewNetworkHandler(st, nil)
+	h := NewNetworkHandler(st)
 	ctx := context.Background()
 
 	// 建网络

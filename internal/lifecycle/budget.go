@@ -9,7 +9,6 @@ type ShutdownBudget struct {
 	UsagePrune       time.Duration
 	CostRecompute    time.Duration
 	ChargeReconcile  time.Duration
-	ProbeJoin        time.Duration
 	HTTPDrain        time.Duration
 	UsageDrain       time.Duration
 	UsageAbortJoin   time.Duration
@@ -22,7 +21,6 @@ func DefaultShutdownBudget() ShutdownBudget {
 		UsagePrune:       5 * time.Second,
 		CostRecompute:    2 * time.Second,
 		ChargeReconcile:  2 * time.Second,
-		ProbeJoin:        2 * time.Second,
 		HTTPDrain:        10 * time.Second,
 		UsageDrain:       5 * time.Second,
 		UsageAbortJoin:   2 * time.Second,
@@ -40,7 +38,7 @@ func (b ShutdownBudget) ComposeGracePeriod() time.Duration {
 
 // Nominal is the sum of waits that run on every normal shutdown.
 func (b ShutdownBudget) Nominal() time.Duration {
-	return b.UsagePrune + b.CostRecompute + b.ChargeReconcile + b.ProbeJoin +
+	return b.UsagePrune + b.CostRecompute + b.ChargeReconcile +
 		b.HTTPDrain + b.UsageDrain
 }
 

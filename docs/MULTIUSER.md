@@ -1030,14 +1030,14 @@ CREATE TABLE IF NOT EXISTS usage_totals (
     request_count    INTEGER NOT NULL DEFAULT 0,
     success_count    INTEGER NOT NULL DEFAULT 0,
     error_count      INTEGER NOT NULL DEFAULT 0,
-    input_tokens     INTEGER NOT NULL DEFAULT 0,
-    output_tokens    INTEGER NOT NULL DEFAULT 0,
-    cached_tokens    INTEGER NOT NULL DEFAULT 0,
-    reasoning_tokens INTEGER NOT NULL DEFAULT 0,
     cost_total       REAL NOT NULL DEFAULT 0,
-    latency_sum_ms   INTEGER NOT NULL DEFAULT 0,
+    total_tokens     INTEGER NOT NULL DEFAULT 0,
     first_record_at  INTEGER NOT NULL DEFAULT 0  -- 见下方「趋势起点」
 );
+
+-- 只有上面这几列有读取方（总览「全部」档 + 剪枝水位）。输入/输出/缓存/
+-- 推理/延迟的分项累计没有任何接口消费，不做冗余累加 —— 需要分项时走
+-- usage_daily_rollups（表 A），它是剪枝后仍可复现这些维度的唯一数据源。
 ```
 
 **表 B 为什么要单独一张**：表 A 是按维度分组的，
@@ -1060,13 +1060,9 @@ CREATE TRIGGER IF NOT EXISTS trg_update_usage_totals
         request_count  = request_count  + 1,
         success_count  = success_count  + CASE WHEN NEW.status = 'ok' THEN 1 ELSE 0 END,
         error_count    = error_count    + CASE WHEN NEW.status NOT IN ('ok','canceled') THEN 1 ELSE 0 END,
-        input_tokens   = input_tokens   + NEW.input_tokens,
-        output_tokens  = output_tokens  + NEW.output_tokens,
-        cached_tokens  = cached_tokens  + NEW.cached_tokens,
-        reasoning_tokens = reasoning_tokens + NEW.reasoning_tokens,
+        total_tokens   = total_tokens   + NEW.total_tokens,
         -- ⚠ 这里不能用「当前单价」算，见下方「单价固化」的坑
         cost_total     = cost_total + NEW.cost_total,  -- NEW.cost_total 是 Go 侧落库前算好的
-        latency_sum_ms = latency_sum_ms + NEW.latency_ms,
         -- 首次写入时置为 NEW.ts；已非 0 则取更早者。
         -- ⚠ 不能写 MIN(first_record_at, NEW.ts)：初始值 0 会让 MIN 恒为 0，永远置不进去。
         first_record_at = CASE WHEN first_record_at = 0 THEN NEW.ts

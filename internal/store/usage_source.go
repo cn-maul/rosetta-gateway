@@ -29,7 +29,7 @@ const (
 		CASE WHEN status = '` + UsageStatusOK + `' THEN 1 ELSE 0 END AS n_ok,
 		CASE WHEN status NOT IN ('` + UsageStatusOK + `', '` + UsageStatusCanceled + `') THEN 1 ELSE 0 END AS n_err,
 		input_tokens, output_tokens, cached_tokens, cached_creation_tokens, reasoning_tokens, total_tokens,
-		cost_total, latency_ms AS latency_sum,
+		cost_total,
 		CASE WHEN ttfb_ms > 0 THEN ttfb_ms ELSE 0 END AS ttfb_sum,
 		CASE WHEN ttfb_ms > 0 THEN 1 ELSE 0 END AS n_ttfb,
 		-- 近期性能的独立口径：只取成功请求。ttfb_sum/n_ttfb 还要服务
@@ -65,7 +65,7 @@ const (
 		success_count AS n_ok,
 		error_count AS n_err,
 		input_tokens, output_tokens, cached_tokens, cached_creation_tokens, reasoning_tokens, total_tokens,
-		cost_total, latency_sum_ms AS latency_sum,
+		cost_total,
 		ttfb_sum_ms AS ttfb_sum,
 		ttfb_count AS n_ttfb,
 		-- 成功请求的首字累计值，对应明细的 ttfb_ok_sum / n_ttfb_ok。

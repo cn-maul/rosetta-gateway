@@ -1,15 +1,11 @@
 package admin
 
 import (
-	"context"
 	"errors"
-	"log/slog"
 	"net/http"
 	"net/url"
 	"strings"
-	"time"
 
-	"github.com/cn-maul/rosetta-gateway/internal/config"
 	"github.com/cn-maul/rosetta-gateway/internal/store"
 )
 
@@ -24,27 +20,10 @@ import (
 // 的注释），由前端作为下拉的第一项展示。
 type NetworkHandler struct {
 	store *store.Store
-	// cfg 只为算探测窗口（probes.window_size × interval_sec）：列表上的
-	// 延迟数字必须始终反映同一个时间窗口，否则同一时刻刷新两次会看到
-	// 互相矛盾的平均值。cfg 为 nil 时 probeWindowMs 兜底 1 小时。
-	cfg *config.Config
 }
 
-func NewNetworkHandler(st *store.Store, cfg *config.Config) *NetworkHandler {
-	return &NetworkHandler{store: st, cfg: cfg}
-}
-
-// probeWindowMs 返回测速统计窗口（毫秒）。
-//
-// 窗口 = interval_sec × window_size：默认每 10 分钟测一次、看最近 10 个
-// 样本，即 100 分钟。配置缺失或非法时回退 1 小时 —— 调用方拿到的必须是
-// 一个正数，否则 cutoff 会跑到未来、列表永远显示“没有样本”。
-func probeWindowMs(cfg *config.Config) int64 {
-	const fallback = int64(time.Hour / time.Millisecond)
-	if cfg == nil || cfg.Probes.IntervalSec <= 0 || cfg.Probes.WindowSize <= 0 {
-		return fallback
-	}
-	return int64(cfg.Probes.IntervalSec) * int64(cfg.Probes.WindowSize) * 1000
+func NewNetworkHandler(st *store.Store) *NetworkHandler {
+	return &NetworkHandler{store: st}
 }
 
 // @ts-type Network
@@ -57,20 +36,6 @@ type networkResponse struct {
 	// 「删掉这条会影响几个上游」—— 前端逐个查是 N+1。
 	ProviderCount int   `json:"provider_count"`
 	CreatedAt     int64 `json:"created_at"`
-
-	// 以下是**探针测得**的连通性摘要（2026-11-01 起代理由后台定时测速，
-	// 不再靠「测试」按钮）。窗口与供应商延迟同一口径。
-	//
-	// LatencySamples = 0 表示窗口内没有成功样本；此时 LastOK/LastError
-	// 仍有意义 —— 它们回答「这段时间一次都没通，是没测过还是一直失败」，
-	// 而只显示「—」会把两种情况糊在一起。
-	LatencyMs      int64  `json:"latency_ms"`
-	LatencyP95Ms   int64  `json:"latency_p95_ms"`
-	LatencySamples int64  `json:"latency_samples"`
-	LastProbeOK    bool   `json:"last_probe_ok"`
-	LastProbeError string `json:"last_probe_error,omitempty"`
-	// LastProbeAt 是最近一次探测时间（毫秒），0 = 从未探测。
-	LastProbeAt int64 `json:"last_probe_at"`
 }
 
 func toNetworkResponse(n store.Network) networkResponse {
@@ -87,52 +52,12 @@ func (h *NetworkHandler) List(w http.ResponseWriter, r *http.Request) {
 		writeServerError(w, "list networks", err)
 		return
 	}
-	latency := h.networkProbeLatency(r.Context())
 	result := make([]networkResponse, 0, len(networks))
 	for _, n := range networks {
 		res := toNetworkResponse(n)
-		applyNetworkProbeLatency(&res, latency)
 		result = append(result, res)
 	}
 	writeJSON(w, http.StatusOK, result)
-}
-
-// networkProbeLatency 取窗口内各代理的测速摘要，供列表填充延迟列。
-//
-// 与 ProviderHandler 的 probeLatency 同一取舍：探测表查询失败只记日志、返回
-// nil（前端显示「—」），不让「代理清单」这个管理入口跟着 500 ——
-// 延迟是排障线索，不是配置本身。
-func (h *NetworkHandler) networkProbeLatency(ctx context.Context) map[string]store.NetworkLatency {
-	lat, err := h.store.NetworkLatencyByID(ctx, probeWindowMs(h.cfg))
-	if err != nil {
-		slog.Warn("network list: probe latency unavailable", "error", err)
-		return nil
-	}
-	return lat
-}
-
-// applyNetworkProbeLatency 把测速结果填进响应。
-//
-// 三条信息分开填，因为它们各自可能缺失：
-//   - 平均/P95/样本数只在窗口内有成功样本时才有意义（Samples=0 → 保持零值，
-//     前端显示「—」，不能写 0ms 把「没测通」印成「快」）；
-//   - 最近一次成败与时间**任何时候都填**：从没测过（LastProbeAt=0）与最近
-//     一次失败（LastProbeOK=false + 错误正文）是两种完全不同的状态，
-//     界面上必须能区分。
-func applyNetworkProbeLatency(res *networkResponse, latency map[string]store.NetworkLatency) {
-	l, ok := latency[res.ID]
-	if !ok {
-		return
-	}
-	res.LastProbeAt = l.LastTs
-	res.LastProbeOK = l.LastOK
-	res.LastProbeError = l.LastError
-	if l.Samples <= 0 {
-		return
-	}
-	res.LatencyMs = l.AvgMs
-	res.LatencyP95Ms = l.P95Ms
-	res.LatencySamples = l.Samples
 }
 
 type networkRequest struct {

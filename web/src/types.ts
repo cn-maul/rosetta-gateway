@@ -9,7 +9,6 @@ export interface Provider {
   enabled: boolean
   timeout_ms: number
   max_retries: number
-  quirks_json: string
   /**
    * 该上游选择的出站网络（networks.id）。空串 = 直连。
    *
@@ -53,7 +52,6 @@ export interface ProviderCreatePayload {
   name: string
   protocol: string
   endpoint: string
-  quirks_json?: string
   /** 出站网络（networks.id）；留空或 "direct" = 直连（新建的默认值）。 */
   network_id?: string
   api_key?: string
@@ -70,7 +68,6 @@ export interface ProviderUpdatePayload {
   enabled?: boolean
   timeout_ms?: number
   max_retries?: number
-  quirks_json?: string
   /**
    * 出站网络。传空串或 "direct" 是**换回直连**，不是「不改」——
    * 把上游从代理切回直连必须能表达。
@@ -251,23 +248,6 @@ export interface Network {
   provider_count: number
   created_at?: number
 
-  /**
-   * 以下是**探针测得**的连通性摘要（2026-11-01 起代理由后台定时测速，
-   * 不再有「测试」按钮）。窗口与供应商延迟同一口径：
-   * probes.window_size × interval_sec。
-   *
-   * latency_samples = 0 表示窗口内没有成功样本 → 界面显示「—」，不能
-   * 显示 0ms（「一次都没通」与「快到 0」是两件事）。此时
-   * last_probe_ok / last_probe_error 仍然有用：它们回答「没测过」还是
-   * 「一直在失败」。
-   */
-  latency_ms?: number
-  latency_p95_ms?: number
-  latency_samples?: number
-  last_probe_ok?: boolean
-  last_probe_error?: string
-  /** 最近一次探测时间（毫秒）；0 或缺失 = 从未探测。 */
-  last_probe_at?: number
 }
 
 /**
@@ -881,72 +861,6 @@ export interface UsageByUserPage {
   records: UsageByUserEntry[]
   /** 有消费的用户总数（去重），**不受 limit 影响**。 */
   total: number
-}
-
-/**
- * 失败原因聚合（GET /admin/api/usage/failures）的一个错误码分组。
- *
- * 这一组回答「什么错最多」。同一个 code 会按 http_status 拆开 ——
- * upstream_error 既可能是 502（上游不可达）也可能是 500（上游自己报错），
- * 合成一行会让两种完全不同的处置被混为一谈。
- */
-export interface UsageFailureCodeEntry {
-  /**
-   * 网关归一化短码。`error_code` 为空的老记录回退成 `status`
-   * （error / timeout / truncated），所以这里不会是空串。
-   */
-  code: string
-  http_status: number
-  count: number
-  /**
-   * 该组最近一次失败的时间（毫秒）。用来判断「这个错还在发生吗」——
-   * 只在历史堆里出现过、现在已经不报的错，和正在持续报的错，
-   * 处置优先级完全不同。
-   */
-  last_ts: number
-}
-
-/**
- * 失败原因聚合的一个上游分组。
- *
- * 这一组回答「是不是某个上游在坏」。rate 的分母是该上游**全部**请求，
- * 不是失败数 —— 用失败数当分母会得到恒等于 1 的废数。
- */
-export interface UsageFailureUpstreamEntry {
-  provider_id: string
-  /** 落库时固化的展示名，上游删除后仍在；空串表示旧记录没记名字。 */
-  provider_name: string
-  total: number
-  failed: number
-  /** 失败率（0–1），**由后端算好下发**，理由同 tps：公式只能有一处。 */
-  rate: number
-  /** 该上游最近一次失败的时间（毫秒）。 */
-  last_fail_ts: number
-}
-
-/**
- * 失败原因聚合的响应。
- *
- * # 口径
- *
- * `failed` 排除 `ok` 与 `canceled`：客户端中途断开不是上游的问题，
- * 混进来会让排障视图里塞满「用户自己关了页面」。
- *
- * # 覆盖范围
- *
- * 只覆盖**明细保留期**（默认 30 天）。更早的失败在归档表里只剩聚合计数，
- * 没有 error_code 与 provider 维度，说不出「因为什么」。所以界面文案不能
- * 让人把「30 天前没有失败」当成结论。
- */
-export interface UsageFailures {
-  from: number
-  to: number
-  total: number
-  failed: number
-  /** 区间整体失败率（0–1），后端算好。 */
-  rate: number
-  codes: UsageFailureCodeEntry[]
-  upstreams: UsageFailureUpstreamEntry[]
 }
 
 // 调用历史（/usage/history）的一行：一次真实请求

@@ -177,13 +177,13 @@ services:
     image: ghcr.io/cn-maul/rosetta-gateway:2.1.2
     container_name: rosetta-gateway
     restart: unless-stopped
-    # 正常关停的名义预算是 26s（剪枝 5s + 费用重算 2s + 对账 2s +
-    # 探测 join 2s + HTTP 10s + 用量落库 5s）；仅在前置 join 超时后，
-    # 才会再追加用量 abort join 2s 与运行时重试 join 2s，故上界为 30s。
-    # docker compose 的默认宽限期只有 **10s**，这里显式留到 31s。
+    # 正常关停的名义预算是 24s（剪枝 5s + 费用重算 2s + 对账 2s +
+    # HTTP 10s + 用量落库 5s）；仅在前置 join 超时后，
+    # 才会再追加用量 abort join 2s 与运行时重试 join 2s，故上界为 28s。
+    # docker compose 的默认宽限期只有 **10s**，这里显式留到 29s。
     # 不调大的话 `docker compose down` 会在用量队列还在落库时 SIGKILL，
     # 表现为「最后几次调用的用量查不到」（这些请求因此免单且配额被放宽）。
-    stop_grace_period: 31s
+    stop_grace_period: 29s
     ports:
       # 绑回环：网关自身不做 TLS，对外访问请走宿主机上的 TLS 反代
       # （反代回连 127.0.0.1:8666）。详见「快速开始」的说明。
@@ -386,7 +386,7 @@ rosetta v1.3.2（恢复 Anthropic 侧的 `stop_sequences` / `service_tier` 发�
 管理界面同步升级到 TypeScript 7（仅构建期，不影响运行时与页面行为）。
 
 **v1.7.2 → v2.0.0 可以直接原地升级。** 这一版把管理界面从 Vue 重写为
-React，并新增站点品牌、协议探测、请求诊断字段和网络测速记录。
+React，并新增站点品牌、协议探测与请求诊断字段。
 SQLite 启动时会原地补齐新表与新列，已有配置、用户、密钥、路由、余额和
 历史用量都会保留。升级前仍应按上面的步骤完整备份 `/data`。
 

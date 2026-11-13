@@ -100,11 +100,11 @@ func TestR1_JoinBarrierRequiresBothExitEvidenceAndZeroCount(t *testing.T) {
 
 func TestR1_ShutdownBudgetCoversNominalAndUpperBound(t *testing.T) {
 	budget := lifecycle.DefaultShutdownBudget()
-	if got := budget.Nominal().Seconds(); got != 26 {
-		t.Fatalf("nominal shutdown budget = %.0fs, want 26s", got)
+	if got := budget.Nominal().Seconds(); got != 24 {
+		t.Fatalf("nominal shutdown budget = %.0fs, want 24s", got)
 	}
-	if got := budget.UpperBound().Seconds(); got != 30 {
-		t.Fatalf("shutdown upper bound = %.0fs, want 30s", got)
+	if got := budget.UpperBound().Seconds(); got != 28 {
+		t.Fatalf("shutdown upper bound = %.0fs, want 28s", got)
 	}
 	if budget.ComposeGracePeriod() <= budget.UpperBound() {
 		t.Fatalf("compose grace %s must exceed upper bound %s",

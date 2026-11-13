@@ -15,28 +15,26 @@ type Credential struct {
 	Weight        int
 	Status        string
 	CooldownUntil int64
-	LastError     string
 	CreatedAt     int64
 }
 
 // credentialColumns 是 provider_credentials 两处读路径共用的列清单。
-const credentialColumns = `id, provider_id, label, api_key_enc, enabled, weight, status, cooldown_until, last_error, created_at`
+const credentialColumns = `id, provider_id, label, api_key_enc, enabled, weight, status, cooldown_until, created_at`
 
-// scanCredential 用 sql.NullString 承接可空列 label / last_error，
+// scanCredential 用 sql.NullString 承接可空列 label，
 // 否则列为 NULL 时扫描会直接报错。
 func scanCredential(sc scanner) (Credential, error) {
 	var c Credential
 	var enabled int
-	var label, lastError sql.NullString
+	var label sql.NullString
 
 	err := sc.Scan(&c.ID, &c.ProviderID, &label, &c.APIKeyEnc, &enabled,
-		&c.Weight, &c.Status, &c.CooldownUntil, &lastError, &c.CreatedAt)
+		&c.Weight, &c.Status, &c.CooldownUntil, &c.CreatedAt)
 	if err != nil {
 		return c, err
 	}
 	c.Enabled = enabled == 1
 	c.Label = label.String
-	c.LastError = lastError.String
 	return c, nil
 }
 
@@ -88,8 +86,8 @@ func createCredential(ctx context.Context, ex execer, c *Credential) error {
 		enabled = 1
 	}
 	_, err := ex.ExecContext(ctx,
-		`INSERT INTO provider_credentials (id, provider_id, label, api_key_enc, enabled, weight, status, cooldown_until, last_error, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		c.ID, c.ProviderID, nullIfEmpty(c.Label), c.APIKeyEnc, enabled, c.Weight, c.Status, c.CooldownUntil, nullIfEmpty(c.LastError), now)
+		`INSERT INTO provider_credentials (id, provider_id, label, api_key_enc, enabled, weight, status, cooldown_until, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		c.ID, c.ProviderID, nullIfEmpty(c.Label), c.APIKeyEnc, enabled, c.Weight, c.Status, c.CooldownUntil, now)
 	// 回写时间戳，否则创建响应里的 created_at 是 0，与库里不一致。
 	if err == nil {
 		c.CreatedAt = now
@@ -103,8 +101,8 @@ func (s *Store) UpdateCredential(ctx context.Context, id string, c *Credential) 
 		enabled = 1
 	}
 	res, err := s.db.ExecContext(ctx,
-		`UPDATE provider_credentials SET label = ?, api_key_enc = ?, enabled = ?, weight = ?, status = ?, cooldown_until = ?, last_error = ? WHERE id = ?`,
-		nullIfEmpty(c.Label), c.APIKeyEnc, enabled, c.Weight, c.Status, c.CooldownUntil, nullIfEmpty(c.LastError), id)
+		`UPDATE provider_credentials SET label = ?, api_key_enc = ?, enabled = ?, weight = ?, status = ?, cooldown_until = ? WHERE id = ?`,
+		nullIfEmpty(c.Label), c.APIKeyEnc, enabled, c.Weight, c.Status, c.CooldownUntil, id)
 	return checkAffected(res, err)
 }
 

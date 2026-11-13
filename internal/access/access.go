@@ -61,9 +61,6 @@ var userAccessibleRoutes = map[string]bool{
 	"GET /admin/api/usage/by-model":    true,
 	"GET /admin/api/usage/by-provider": true,
 	"GET /admin/api/usage/by-day":      true,
-	// 失败原因聚合同样按 user_id 收窄：普通用户能看自己的失败构成，
-	// 但看不到别人的上游与错误分布。
-	"GET /admin/api/usage/failures":    true,
 	"GET /admin/api/usage/history":     true,
 	"GET /admin/api/usage/history.csv": true,
 	"GET /admin/api/stats":             true,

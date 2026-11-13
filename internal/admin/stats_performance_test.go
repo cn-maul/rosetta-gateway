@@ -58,8 +58,4 @@ func TestStatsPerformanceUsesSelectedRangeAndScope(t *testing.T) {
 			}
 		})
 	}
-	got, err := st.GetRecentPerformance(t.Context(), 5, "")
-	if err != nil || got.ThroughputSamples != 5 || got.TtfbSamples != 3 {
-		t.Fatalf("admin samples=%+v err=%v", got, err)
-	}
 }

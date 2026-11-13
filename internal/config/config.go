@@ -139,60 +139,9 @@ type Config struct {
 	AuditLogKeepRows int `json:"audit_log_keep_rows"`
 	auditKeepRowsSet bool
 
-	// Probes 是出站代理定时测速的配置（2026-11-12 起只剩代理测速，
-	// 模型可用性探测已移除）。
-	//
-	// 每轮对每条代理发一次 generate_204，不经过上游、不计费。
-	Probes ProbeConfig `json:"probes"`
-
 	// trustedProxies 是 TrustedProxyCIDRs 校验、去重后的运行时形态。
 	// 不参与 JSON 编解码；调用方通过 TrustedProxyPrefixes 取只读副本。
 	trustedProxies []netip.Prefix
-}
-
-// ProbeConfig 是定时探测的参数。
-//
-// 所有值都必须为正（interval/timeout/concurrency/window_size/retention_days）：
-// 负值会让 time.NewTicker 当场 panic（config.go:242-253 有一整段既往事故记录）。
-type ProbeConfig struct {
-	Enabled       bool `json:"enabled"`
-	IntervalSec   int  `json:"interval_sec"`
-	TimeoutMs     int  `json:"timeout_ms"`
-	Concurrency   int  `json:"concurrency"`
-	WindowSize    int  `json:"window_size"`
-	RetentionDays int  `json:"retention_days"`
-
-	// configured 记录「probes 块在配置里出现过」，不参与 JSON 编解码。
-	//
-	// 为什么必须显式记录而不能用 `c.Probes == (ProbeConfig{})` 判断：
-	// `{"probes":{"enabled":false}}` 反序列化后**恰好就是零值结构体**，
-	// 与「整块没配」不可区分，于是 setDefaults 判定为「没配过 → 默认开启」
-	// 并把用户明确写下的 false 改回 true —— 而配置文件里明明写着关闭。
-	// 布尔值天然无法区分「显式 false」与「缺省」，只能靠 key 是否出现来判断。
-	configured bool
-	// enabledSet 记录 enabled 这个键本身是否出现。只出现 interval_sec 等
-	// 子字段时，enabled 仍须按缺省 true 处理，而不是布尔零值 false。
-	enabledSet bool
-}
-
-// UnmarshalJSON 记录 key 是否出现过。
-//
-// 用 map[string]json.RawMessage 只为取 presence，字段本身仍交给默认解码：
-// 这样新增探针字段时不需要在这里同步维护一份键名清单（漏一个就静默失效）。
-func (p *ProbeConfig) UnmarshalJSON(b []byte) error {
-	type plain ProbeConfig // 无方法，避免递归
-	var v plain
-	if err := json.Unmarshal(b, &v); err != nil {
-		return err
-	}
-	var keys map[string]json.RawMessage
-	if err := json.Unmarshal(b, &keys); err != nil {
-		return err
-	}
-	*p = ProbeConfig(v)
-	p.configured = len(keys) > 0
-	_, p.enabledSet = keys["enabled"]
-	return nil
 }
 
 type Defaults struct {
@@ -432,33 +381,6 @@ func (c *Config) setDefaults() {
 		c.AuditLogKeepRows = 20000
 	}
 
-	// 探测配置默认值。Enabled 默认 true（用户明确要这个功能）。
-	// 间隔 10 分钟、超时 30s、并发 4、连续 3 次判 down、窗口 10 次、
-	// 成功率 80%、保留 30 天。
-	//
-	// 「完全没配」与「显式 enabled=false」必须可区分（见 ProbeConfig.configured
-	// 的注释）：判据是 **probes 这个 key 有没有出现过**，不是它的值。
-	// 曾用 `c.Probes == (ProbeConfig{})` 判断，而 `{"probes":{"enabled":false}}`
-	// 反序列化后正好等于零值结构体，于是用户明确写的 false 被静默改回 true
-	// —— 之后每 10 分钟对每个模型发一次真实推理并向上游付费。
-	if !c.Probes.enabledSet {
-		c.Probes.Enabled = true
-	}
-	if c.Probes.IntervalSec == 0 {
-		c.Probes.IntervalSec = 600
-	}
-	if c.Probes.TimeoutMs == 0 {
-		c.Probes.TimeoutMs = 30000
-	}
-	if c.Probes.Concurrency == 0 {
-		c.Probes.Concurrency = 4
-	}
-	if c.Probes.WindowSize == 0 {
-		c.Probes.WindowSize = 10
-	}
-	if c.Probes.RetentionDays == 0 {
-		c.Probes.RetentionDays = 30
-	}
 }
 
 func (c *Config) validate() error {
@@ -549,27 +471,6 @@ func (c *Config) validate() error {
 	// 文档与部署；其余负值才是笔误。
 	if c.AuditLogKeepRows < -1 || c.AuditLogKeepRows > 10000000 {
 		return fmt.Errorf("audit_log_keep_rows: must be 0 or -1 (keep all) or 1..10000000, got %d", c.AuditLogKeepRows)
-	}
-
-	// 探测配置校验。这些值会喂给 time.NewTicker / context.WithTimeout /
-	// 并发信号量 —— 负值或零会让探测循环 panic 或整轮空转。
-	// 与 defaults 的区间校验同一理由（config.go:242-253 的既往事故记录）。
-	if c.Probes.Enabled {
-		if c.Probes.IntervalSec < 1 {
-			return fmt.Errorf("probes.interval_sec: must be >= 1, got %d", c.Probes.IntervalSec)
-		}
-		if c.Probes.TimeoutMs < 1 {
-			return fmt.Errorf("probes.timeout_ms: must be >= 1, got %d", c.Probes.TimeoutMs)
-		}
-		if c.Probes.Concurrency < 1 {
-			return fmt.Errorf("probes.concurrency: must be >= 1, got %d", c.Probes.Concurrency)
-		}
-		if c.Probes.WindowSize < 1 {
-			return fmt.Errorf("probes.window_size: must be >= 1, got %d", c.Probes.WindowSize)
-		}
-		if c.Probes.RetentionDays < 1 {
-			return fmt.Errorf("probes.retention_days: must be >= 1, got %d", c.Probes.RetentionDays)
-		}
 	}
 
 	// log_level 是启动日志的可见性开关。非法值会让 logger 静默退回 info

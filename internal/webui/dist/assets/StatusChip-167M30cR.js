@@ -1,0 +1,1 @@
+import{O as e}from"./heroui-BvT3H6q9.js";import{t}from"./react-lukXhb1W.js";var n=t(),r={ok:`success`,warn:`warning`,err:`danger`,info:`accent`,dim:`default`};function i({tone:t,size:i=`sm`,title:a,children:o}){return(0,n.jsx)(e,{color:r[t],size:i,title:a,children:o})}export{i as t};

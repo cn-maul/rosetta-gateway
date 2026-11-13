@@ -155,7 +155,6 @@ CREATE TABLE providers (
   enabled       INTEGER NOT NULL DEFAULT 1,
   timeout_ms    INTEGER NOT NULL DEFAULT 0,    -- 0 = 用全局默认
   max_retries   INTEGER NOT NULL DEFAULT 2,
-  quirks_json   TEXT,                      -- 透传 rosetta.Quirks
   created_at    INTEGER NOT NULL,
   updated_at    INTEGER NOT NULL
 );
@@ -765,7 +764,7 @@ PATCH 端点一律「只看请求体里出现了哪些字段」：
 - **编辑时只发你要改的字段即可**，不必回传完整对象。前端里唯一的正确写法是
   「只发要改的字段」（如启停开关只发 `{ enabled: ... }`）；回传整个对象等于做读-改-写，
   会把列表快照里的陈旧值一起写回去，静默回滚别的标签页刚做的改动。
-- `timeout_ms: 0`（=用全局默认）、`quirks_json: ""`（=清空）、
+- `timeout_ms: 0`（=用全局默认）、`network_id: ""`（=换回直连）、
   `context_window: 0`（=未设置）都是可表达的意图，不再是「空值即忽略」。
   （注意：故障转移与超时策略**不是**路由的 PATCH 字段，它们在「设置」页，见 §10。）
 
@@ -834,7 +833,7 @@ OpenCode 主机补 `x-opencode-session`，同时把 `User-Agent` 设为
 成功，但多轮会话的 OpenCode 路由/缓存亲和性必须由客户端持续发送同一个稳定会话
 ID。DeepSeek Harness 的 Responses 路径会发送 `session_id` 与
 `x-client-request-id`，原生 Messages 路径会发送
-`x-deepseek-harness-session-id`。出站代理测速不经过数据面，也不参与会话识别。
+`x-deepseek-harness-session-id`。
 
 对 OpenAI 系上游，数据面优先使用客户端显式提供的 `prompt_cache_key`；没有时用
 同一个稳定会话标识作为缓存亲和键。transport 通过 `x-session-affinity` /
@@ -1484,14 +1483,14 @@ per-model 配额、per-provider 配额仍不做，记入后续路线。
 | 配置类别 | 存放位置 | 可否运行时改 |
 |---|---|---|
 | Provider / 模型 / Route / Key / **用户与管理员账号** | **数据库** | 是（管理 API / Web 界面） |
-| 监听地址、DB 路径、日志级别、加密主密钥、**主密钥强度校验（`require_strong_master_key`）**、**公开源（`public_origin`）**、**可信代理网段（`trusted_proxy_cidrs`）**、**日界时区（`timezone`）**、**用量保留天数（`usage_retention_days`）**、**审计日志行数上限（`audit_log_keep_rows`）**、**代理测速（`probes`）**、provider 重试默认、body 大小上限 | **配置文件** | 否（改后重启） |
+| 监听地址、DB 路径、日志级别、加密主密钥、**主密钥强度校验（`require_strong_master_key`）**、**公开源（`public_origin`）**、**可信代理网段（`trusted_proxy_cidrs`）**、**日界时区（`timezone`）**、**用量保留天数（`usage_retention_days`）**、**审计日志行数上限（`audit_log_keep_rows`）**、provider 重试默认、body 大小上限 | **配置文件** | 否（改后重启） |
 | 超时与故障转移默认（`defaults.upstream_timeout_ms` / `stream_*` / `failover_*`） | **配置文件提供首次回落值；设置页写入 `app_settings.runtime_defaults`** | 是（设置页保存后 reload） |
 | 首次 bootstrap 的 provider/route | 配置文件（仅当 DB 为空时生效） | 否 |
 
 **关键纪律**：DB 非空时，配置文件里的 `providers` / `routes` 段落被**忽略并打印 warning**。这防止出现「界面改完、重启被配置文件覆盖」这类经典事故。
 
 **配置字段真源**：`internal/config/fields.go` 逐项列出 `config.Config`
-（含嵌套的 `defaults` / `bootstrap` / `probes`）的 JSON 路径、生产读取点和
+（含嵌套的 `defaults` / `bootstrap`）的 JSON 路径、生产读取点和
 前端入口；`internal/config/fields_test.go` 用反射与文件/符号校验它，新增、
 删除、改名或改 JSON tag 都会让测试失败。管理设置 DTO、`store.RuntimeDefaults`
 与 `snapshot.RuntimeDefaults` 也各有契约测试，避免三层字段漂移。
@@ -1577,14 +1576,6 @@ AES-256-GCM 密文。无主密钥、密文损坏、主密钥不匹配或历史�
   "require_tls_for_public_listen": false,
   "timezone": "Asia/Shanghai",
   "usage_retention_days": 30,
-  "probes": {
-    "enabled": true,
-    "interval_sec": 600,
-    "timeout_ms": 30000,
-    "concurrency": 4,
-    "window_size": 10,
-    "retention_days": 30
-  },
   "defaults": {
     "upstream_timeout_ms": 300000,
     "stream_idle_timeout_ms": 120000,
@@ -1638,8 +1629,8 @@ AES-256-GCM 密文。无主密钥、密文损坏、主密钥不匹配或历史�
 `audit_log` 保留的最大**行数**（不是天数），与用量剪枝共用同一个每日循环。
 按行数而非按天，是因为本表的唯一读路径是 `ORDER BY id DESC LIMIT ?`
 （管理面只看最近几十条），更早的行没有任何下游消费者 —— 与 `usage_records`
-（超期数据会折叠进 `usage_daily_rollups`）和 `network_probes`（超期数据喂代理
-延迟趋势）不同，审计日志没有聚合去向。此前只插不删，表随写操作次数无界增长。
+（超期数据会折叠进 `usage_daily_rollups`）不同，审计日志没有聚合去向。
+此前只插不删，表随写操作次数无界增长。
 取值 1~10000000，缺省 20000；写 `0` 或 `-1` 都显式关闭剪枝
 （合规审计要求全量留存时用）。
 
@@ -1655,19 +1646,6 @@ modernc SQLite 的 `'localtime'` 在 Linux 上走 C 的 `tzset`（只认 `TZ`）
 Windows 上才跟 `time.Local`，**只设一个会跨平台失效**（第一版修复就是这么
 在 CI 上翻车的）。空串 = 沿用进程现有时区。它决定总览日趋势、钱包页按天消耗、
 用量归档的日界三处，配错的症状是「过了 0 点按天数据不切日」，详见 [DOCKER.md](DOCKER.md)。
-
-**`probes`（2026-11-12 收敛为代理测速）**：定时对每条出站网络发一次
-`generate_204` 连通性测速，结果落 `network_probes`，供「代理」页的延迟列
-使用，不碰冷却/熔断。上游模型可用性探测与「可用模型」页的绿色连通率柱状图
-已于 2026-11-12 移除（几乎无人查看，且每次探测都真实消耗上游 token）。
-**默认开**（只有显式 `enabled:false` 才关闭）。其余默认值：间隔 600s、
-超时 30s、并发 4、窗口 10 个样本、探测记录保留 30 天。
-**每轮每个网络恰好一次**；停用整个功能要写
-`"probes":{"enabled":false}`，而不是依赖对象缺省。
-两个必须说清的边界：探测**绝不写 pool 的冷却/熔断**（隔离红线，见
-`internal/probe/runner.go` 与 `store.go` 的建表注释）—— 否则「探测不通」会
-被放大成「上游整体不可用」；它也不属于用量统计，与配额
-统计完全隔离。
 
 **故障转移相关默认**（`defaults` 下，全部可省略、缺省由 `setDefaults` 兜底）：
 `stream_first_token_timeout_ms` 是流式首字（TTFT）看门狗——区别于 `stream_idle_timeout_ms`（已出字后的空闲超时），掐的是「一个事件都没等到」的慢上游，触发即在写出 SSE 头前转移下一目标。
@@ -1790,7 +1768,7 @@ Docker 侧对齐，且避开浏览器的保留端口表（6666 是 IRC 段，浏
 | `/wallet` | 钱包与充值 | 全体 | **按身份分两种形态的同一页**：管理员看到全站的用户消费汇总 + 全部充值流水 + 充值入口（没有消耗记录，明细在「用量统计」页）；普通用户看到自己的余额、按天消耗与充值记录。自改密码已迁到「设置」页（2026-10-13）。余额（`balance_cents`）在 `balance_unlimited` 时显示「不限」而非 0.00 元，为 0 时显式提示「余额已用尽，请联系管理员充值」，对应数据面真实的 402 |
 | `/keys` | API 密钥 | 全体 | `AccessControl.tsx` 的密钥页签：普通用户只看到并管理自己的 `sk-gw-` key；管理员可查看/调整归属与限制，但不能给自己新建 key。密钥创建与页签路由分离，`/keys` 是可停留地址 |
 | `/users` | 用户与权限 | admin | `AccessControl.tsx` 的「用户 / 权限分组」两个页签。用户页含 CRUD、角色、启停、重置密码、余额充值；新建用户必须带初始密码。分组页维护成员与组级模型白名单 `PUT /admin/api/groups/{id}/models`。`delta_cents` 是相对金额，误操作不会把余额清零 |
-| `/networks` | 代理 | admin | 组件是 `Networks.tsx`：可复用的代理地址清单（2026-10-20）。provider 只存 `network_id`，实际地址由读路径 JOIN 派生。直连是保留 id `direct`，不是一行记录。删网络让引用它的上游回到直连，不删上游。连通性由后台定时探针测量并显示延迟 |
+| `/networks` | 代理 | admin | 组件是 `Networks.tsx`：可复用的代理地址清单（2026-10-20）。provider 只存 `network_id`，实际地址由读路径 JOIN 派生。直连是保留 id `direct`，不是一行记录。删网络让引用它的上游回到直连，不删上游 |
 | `/providers` | 上游服务 | admin | `Providers.tsx` 列表：类型用 `Chat / Response / Anthropic` 展示，紧跟一列用胶囊标出「直连」或「代理 · 名称」，模型/凭据摘要右对齐，操作列保留配置与删除，启停开关独立成最后一列；新建时可选择代理 |
 | `/providers/:id` | 上游详情 | admin | `ProviderDetail.tsx`：凭据、模型发现/导入、连通性测试、批量改价与协议配置。模型测试结果通过页面底部的临时 toast 展示，不嵌入模型行。协议值在 API/DB 中仍为 `chat / response / anthropic` |
 | `/routes` | 模型与路由 | admin | `Routes.tsx`：公开模型名到有序上游链；`PUT /admin/api/routes/{id}/targets` 原子替换整条链 |
@@ -1873,7 +1851,7 @@ Docker 侧对齐，且避开浏览器的保留端口表（6666 是 IRC 段，浏
 >
 > 本轮补上的是 2026-10-06 之后新增的根级资产（`scripts/`、`docker/`、`.github/`、
 > `build.ps1`、`gateway.ps1`、`CONTRIBUTING.md`）与 `internal/` 下新增的
-> `effort`（思考挡位唯一口径）、`probe`（出站代理定时测速），以及 2026-10-21
+> `effort`（思考挡位唯一口径），以及 2026-10-21
 > 重构拆出的 `httpx / identity / guard / access / usage / billing /
 > authhttp / ingress / dataplane / runtime / gatewayapp / api / catalog`。
 > 核对方式：`Get-ChildItem -Directory` + 逐个 `internal/*/` 的包注释。
@@ -1911,7 +1889,6 @@ rosetta-gateway/
 │   ├── snapshot/                   运行时快照：路由索引、Provider 池，atomic.Pointer 热替换
 │   ├── routing/                    模型名解析（§5）
 │   ├── upstream/                   凭证池、健康与冷却、Client 生命周期、故障转移、出站代理
-│   ├── probe/                      出站代理定时测速（写 network_probes，不碰熔断）
 │   ├── ratelimit/                  RPM / TPM 固定窗口限速器
 │   ├── auth/                       下游 Key 校验
 │   ├── userauth/                   登录、PBKDF2、会话密钥、JWT 签发

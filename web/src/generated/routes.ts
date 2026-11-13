@@ -44,7 +44,6 @@ export const API_ROUTES: readonly ApiRouteContract[] = [
   { pattern: "GET /admin/api/usage/by-model", public: false },
   { pattern: "GET /admin/api/usage/by-provider", public: false },
   { pattern: "GET /admin/api/usage/by-user", public: false },
-  { pattern: "GET /admin/api/usage/failures", public: false },
   { pattern: "GET /admin/api/usage/history", public: false },
   { pattern: "GET /admin/api/usage/history.csv", public: false },
   { pattern: "GET /admin/api/users", public: false },

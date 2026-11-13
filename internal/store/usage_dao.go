@@ -897,7 +897,6 @@ type UsageStats struct {
 	FirstRecordAt int64
 	// TTFBMs / TtfbSamples 是**所选区间**内成功流式请求的首字延迟：
 	// 分子是成功请求 ttfb 的累加值，分母是真正测到首字的成功请求数。
-	// 它与 RecentPerformance 的“最近 N 条”口径不同，不能把两者混用。
 	TtfbMs      float64
 	TtfbSamples int64
 	// TokensPerSec / ThroughputSamples 是**所选区间**内成功请求的输出速度：
