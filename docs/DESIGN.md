@@ -169,7 +169,6 @@ CREATE TABLE provider_credentials (
   weight        INTEGER NOT NULL DEFAULT 1,
   status        TEXT NOT NULL DEFAULT 'healthy',  -- healthy|cooling|disabled
   cooldown_until INTEGER NOT NULL DEFAULT 0,
-  last_error    TEXT,
   created_at    INTEGER NOT NULL
 );
 
@@ -2004,7 +2003,7 @@ rosetta-gateway/
 | 流式拉取 | ✅ | `Stream.Next()`，逐事件转下游 SSE 很顺 |
 | 流截断识别 | ✅ | `ErrStreamTruncated` |
 | 脏数据容错 | ✅ | Rosetta 侧宽松解码；网关管理 API 另用 `internal/admin` 的 `decodeJSON`（断言 Content-Type） |
-| 兼容服务降级 | ✅ | quirks + sticky probe |
+| 兼容服务降级 | ✅ | SDK 侧固定 `WithQuirks(NoIdempotencyKey: true)`；网关侧熔断 / half-open 与凭证亲和（`GetAnyClientByAffinity`） |
 | 模型元数据 | ✅ | `ModelInfo` / 手动配置注入（可覆盖 context window、输出上限、thinking 支持） |
 | 上下文预估 | ✅ | `EstimateTokens`（网关用于 usage 缺失兜底） |
 | 流空闲超时 | ❌ | 网关实现看门狗 |

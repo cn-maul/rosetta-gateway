@@ -390,7 +390,6 @@ var canonicalSchemaStatements = []string{
 		enabled            INTEGER NOT NULL DEFAULT 1,
 		timeout_ms         INTEGER NOT NULL DEFAULT 0,
 		max_retries        INTEGER NOT NULL DEFAULT 2,
-		quirks_json        TEXT,
 		network_id         TEXT REFERENCES networks(id) ON DELETE SET NULL,
 		created_at         INTEGER NOT NULL,
 		updated_at         INTEGER NOT NULL
@@ -404,7 +403,6 @@ var canonicalSchemaStatements = []string{
 		weight         INTEGER NOT NULL DEFAULT 1,
 		status         TEXT NOT NULL DEFAULT 'healthy',
 		cooldown_until INTEGER NOT NULL DEFAULT 0,
-		last_error     TEXT,
 		created_at     INTEGER NOT NULL
 	)`,
 	`CREATE TABLE upstream_models (
