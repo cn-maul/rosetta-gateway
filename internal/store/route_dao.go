@@ -113,10 +113,6 @@ func createRoute(ctx context.Context, ex execer, r *Route) error {
 	return err
 }
 
-func (s *Store) UpdateRoute(ctx context.Context, id string, r *Route) error {
-	return updateRoute(ctx, s.db, id, r)
-}
-
 // updateRoute 接受 execer，以便在事务里与「对齐链首」原子地一起完成。
 func updateRoute(ctx context.Context, ex execer, id string, r *Route) error {
 	enabled := 0

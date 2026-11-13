@@ -51,11 +51,6 @@ func NewUserAuth(mgr *userauth.Manager, st SessionStore) *UserAuthMiddleware {
 	}
 }
 
-func (a *UserAuthMiddleware) WithThrottle(th *FailureThrottle) *UserAuthMiddleware {
-	a.throttle = th
-	return a
-}
-
 func UserAuth(next http.Handler, mgr *userauth.Manager, st SessionStore) http.Handler {
 	return NewUserAuth(mgr, st).Guard(next)
 }

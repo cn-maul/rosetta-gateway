@@ -850,15 +850,6 @@ func (p *Pool) ReleaseTargetProbe(targetID string, token ProbeToken) {
 	}
 }
 
-func (p *Pool) TestConnection(ctx context.Context, providerSlug string) error {
-	client, _, err := p.GetAnyClient(providerSlug)
-	if err != nil {
-		return err
-	}
-	_, err = client.ListModels(ctx)
-	return err
-}
-
 func (p *Pool) getHealthyCredentials(prov *ProviderEntry) []*CredentialEntry {
 	now := time.Now()
 	var result []*CredentialEntry

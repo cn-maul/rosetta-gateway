@@ -141,18 +141,6 @@ func (s *Store) ListRouteTargets(ctx context.Context, routeID string) ([]RouteTa
 	return result, rows.Err()
 }
 
-func (s *Store) GetRouteTarget(ctx context.Context, id string) (*RouteTarget, error) {
-	t, err := scanRouteTarget(s.read.QueryRowContext(ctx,
-		`SELECT `+routeTargetColumns+` FROM route_targets WHERE id = ?`, id))
-	if err == sql.ErrNoRows {
-		return nil, nil
-	}
-	if err != nil {
-		return nil, err
-	}
-	return &t, nil
-}
-
 // createRouteTarget 接受 execer，供事务内复用（见 CreateRouteWithHeadTarget）。
 //
 // 不导出单条 create / update / delete：链的顺序与「position 连续 0..n-1」是
