@@ -1167,7 +1167,11 @@ Rosetta 用 `ErrStreamTruncated` 区分「干净结束」与「连接被掐断�
 
 ### 8.4 请求诊断与性能归因
 
-每个数据面请求在终态写一条 `INFO` 日志，`event=gateway_request_diagnostic`。
+每个数据面请求在终态写一条 `DEBUG` 日志，`event=gateway_request_diagnostic`
+（默认 `log_level=info` 时不输出；排障时把 `log_level` 调成 `debug` 即可打开）。
+之所以不放在 `INFO`：这条事件有 60 多个键，实测装配一次约 3.4µs / 7.6KiB /
+16 次分配，默认级别下按请求付费并不划算；而常规故障（限流、余额、上游 5xx、
+熔断、转移）各自已有独立的 `WARN`/`INFO` 事件，不依赖它。
 logger 写 stdout，格式由 `log_format` 决定：默认 `auto` —— stdout 是交互终端时
 用 `text`（人能直接读），否则用 JSON（容器/管道/重定向）；显式 `json` 时所有字段
 都可直接按 JSON 检索与聚合。日志只保留**元数据、数量与耗时**，绝不记录 prompt、

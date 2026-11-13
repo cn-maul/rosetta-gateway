@@ -203,10 +203,11 @@ func (h *Handler) Handle(codec ingress.Codec) http.HandlerFunc {
 			if status, _, _ := diag.result(); status == "" {
 				diag.setResult(outcomeUsageStatus(obs.statusCode()), "", "")
 			}
-			// attrs() 会现搭一个 60 多个键的 []any（每个整数值都要装箱），
-			// 调低日志级别时这笔开销本该完全不发生。
-			if logger.Enabled(r.Context(), slog.LevelInfo) {
-				logger.Info("gateway request diagnostic", diag.attrs()...)
+			// attrs() 会现搭一个 60 多个键的 []any（每个整数值都要装箱，
+			// 实测约 3.4µs / 7.6KiB / 16 次分配）。默认级别是 info，所以
+			// 这条事件只在显式 log_level=debug 时才装配与输出。
+			if logger.Enabled(r.Context(), slog.LevelDebug) {
+				logger.Debug("gateway request diagnostic", diag.attrs()...)
 			}
 		}()
 
@@ -1589,7 +1590,7 @@ func (h *Handler) attemptStream(p attemptParams) Outcome {
 	attempt.Committed = true
 	attempt.Success = status == store.UsageStatusOK
 	attempt.DurationMs = time.Since(attemptStart).Milliseconds()
-	attempt.ToolCalls = maxInt(attempt.ToolCalls, 0)
+	attempt.ToolCalls = max(attempt.ToolCalls, 0)
 	attempt.OutputRunes = partialOutRunes
 	attempt.PostTTFBMs = time.Since(firstEventAt).Milliseconds()
 	applyTraceTimings(&attempt, attemptTrace)

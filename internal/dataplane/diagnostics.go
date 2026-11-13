@@ -17,8 +17,10 @@ import (
 )
 
 // requestDiagnostics is the structured, terminal log record for one gateway
-// request. Keep these fields stable: operators build latency and failure-rate
-// queries directly on the JSON event.
+// request. It is emitted at DEBUG: the event is large (60+ fields, 7.6 KiB per
+// request), so operators opt in with log_level=debug instead of paying for it
+// on every request at the default level. Keep these fields stable: operators
+// build latency and failure-rate queries directly on the JSON event.
 type requestDiagnostics struct {
 	// mu guards the mutable request state. It is deliberately not part of
 	// diagnosticsState: snapshots must be immutable values and copying a
@@ -32,7 +34,6 @@ type requestDiagnostics struct {
 // out of this struct so a snapshot can be passed to pure helpers safely.
 type diagnosticsState struct {
 	startedAt time.Time
-	endedAt   time.Time
 
 	requestID   string
 	traceparent string
@@ -77,10 +78,8 @@ type diagnosticsState struct {
 
 	responseStatus int
 	responseBytes  int64
-	writeCount     int64
 	writeTotalMs   int64
 	writeMaxMs     int64
-	flushCount     int64
 	flushTotalMs   int64
 	flushMaxMs     int64
 	responseWrites int64
@@ -90,7 +89,6 @@ type diagnosticsState struct {
 	usageStatus string
 	errorCode   string
 	errorDetail string
-	errorRaw    string
 	routeTrace  string
 
 	providerID       string
@@ -280,10 +278,8 @@ func (d *requestDiagnostics) observeResponse(o *responseObserver) {
 		d.responseStatus = int(stats.status)
 	}
 	d.responseBytes = stats.bytes
-	d.writeCount = stats.writes
 	d.writeTotalMs = stats.writeMs
 	d.writeMaxMs = stats.writeMax
-	d.flushCount = stats.flushes
 	d.flushTotalMs = stats.flushMs
 	d.flushMaxMs = stats.flushMax
 	d.responseWrites = stats.writes
@@ -364,7 +360,7 @@ func (d *requestDiagnostics) setTerminal(clientGone, gatewayTimeout bool) {
 }
 
 func (d *requestDiagnostics) setIngressRequest(ing *rosetta.ChatRequest, stream bool) {
-	snapshot := inspectRequest(ing, stream)
+	snapshot := inspectRequest(ing)
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	d.messages = snapshot.messages
@@ -381,18 +377,6 @@ func (d *requestDiagnostics) effortLabel() string {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	return d.effort
-}
-
-func (d *requestDiagnostics) finish(status int, usageStatus, code, detail, raw, routeTrace string) {
-	d.mu.Lock()
-	d.endedAt = time.Now()
-	d.responseStatus = status
-	d.usageStatus = usageStatus
-	d.errorCode = code
-	d.errorDetail = detail
-	d.errorRaw = raw
-	d.routeTrace = routeTrace
-	d.mu.Unlock()
 }
 
 func (d *requestDiagnostics) addAttempt(a attemptDiagnostics) {
@@ -490,15 +474,10 @@ func (d *requestDiagnostics) attrs() []any {
 	if s.errorDetail != "" {
 		attrs = append(attrs, "error_detail", s.errorDetail)
 	}
-	if s.errorRaw != "" {
-		attrs = append(attrs, "error_raw", s.errorRaw)
-	}
 	return append(attrs, "observation_scope", "gateway_until_response_written")
 }
 
 type ingressSnapshot struct {
-	model       string
-	stream      bool
 	messages    int
 	tools       int
 	toolResults int
@@ -521,11 +500,7 @@ func gatewayPreUpstreamMs(s requestDiagnosticsSnapshot) int64 {
 			return maxInt64(a.StartedAtMs, 0)
 		}
 	}
-	ended := s.endedAt
-	if ended.IsZero() {
-		ended = time.Now()
-	}
-	return maxInt64(ended.Sub(s.startedAt).Milliseconds(), 0)
+	return max(time.Since(s.startedAt).Milliseconds(), 0)
 }
 
 func attemptMetric(a *attemptDiagnostics, pick func(attemptDiagnostics) int64) int64 {
@@ -692,7 +667,7 @@ func diagnoseSnapshot(s requestDiagnosticsSnapshot) (string, string, string) {
 		stage = slowestUpstreamPhase(last)
 	}
 	if s.clientGone {
-		if s.writeCount > 0 {
+		if s.responseWrites > 0 {
 			return "downstream_client", "high", "downstream_write"
 		}
 		return "downstream_client", "high", "downstream_request"
@@ -815,12 +790,11 @@ func diagnosticConfidence(a *attemptDiagnostics, fallback string) string {
 	return fallback
 }
 
-func inspectRequest(req *rosetta.ChatRequest, stream bool) ingressSnapshot {
-	s := ingressSnapshot{stream: stream}
+func inspectRequest(req *rosetta.ChatRequest) ingressSnapshot {
+	var s ingressSnapshot
 	if req == nil {
 		return s
 	}
-	s.model = req.Model
 	s.messages = len(req.Messages)
 	s.tools = len(req.Tools)
 	for _, m := range req.Messages {
@@ -1248,13 +1222,6 @@ func isTimeout(err error) bool {
 	}
 	var netErr net.Error
 	return errors.As(err, &netErr) && netErr.Timeout()
-}
-
-func maxInt(a, b int) int {
-	if a > b {
-		return a
-	}
-	return b
 }
 
 func upstreamRequestID(err error) string {
