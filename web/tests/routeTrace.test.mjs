@@ -1,7 +1,7 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import { parseRouteTrace, parseTraceStep } from '../src/routeTrace.ts'
-import { unitPrice, cacheUnitPrice, modelPriceLine } from '../src/modelPrice.ts'
+import { unitPrice, cacheUnitPrice } from '../src/modelPrice.ts'
 
 test('保留模型中的路径、冒号与箭头，保留未知原因原文', () => {
   const step = parseTraceStep('2:backup/org/model:latest -> alias -> fail_switch:vendor:extra')
@@ -56,5 +56,4 @@ test('参考单价保留有效数字，并标明缓存沿用与未配置', () =>
   assert.equal(cacheUnitPrice(0.0000123456789, 0), '¥0.0000123456789（沿用输入）')
   assert.equal(cacheUnitPrice(2, 0.1), '¥0.1')
   assert.equal(cacheUnitPrice(0, 0), '未配置')
-  assert.match(modelPriceLine({ price_input: 2, price_cache_hit: 0, price_output: 0 }), /缓存 ¥2（沿用输入） · 输出 未配置/)
 })

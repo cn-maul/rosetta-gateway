@@ -177,22 +177,6 @@ export function fmtRemainder(micros: number): string {
   return fmtMoney(micros / MICROS_PER_CENT / 100)
 }
 
-/**
- * 余额 + 待结算余数的合并展示（余额一行、余数跟在后面）。
- *
- * 为什么合并成一行而不是两个独立字段：它们回答的是同一个问题
- * 「我还有多少钱能用」，拆成两行会被读成两个不相干的数。
- */
-export function fmtBalanceWithRemainder(
-  cents: number,
-  unlimited: boolean,
-  micros: number,
-): string {
-  const base = fmtBalance(cents, unlimited)
-  const rem = fmtRemainder(micros)
-  return rem ? `${base}（另有 ${rem} 待结算）` : base
-}
-
 // 毫秒时间戳 → 「YYYY-MM-DD HH:MM:SS」。请求日志用它：排障时经常要跨天/跨年
 // 翻记录，只给 MM-DD 的话年份得靠上下文猜。充值流水那种「最近的记录」仍用
 // 下面的 fmtTimeMs —— 那里每一行都必然是同一年，省下的宽度留给金额。
@@ -209,15 +193,6 @@ export function fmtTimeMs(tsMs: number): string {
   const d = new Date(tsMs)
   const p = (x: number) => String(x).padStart(2, '0')
   return `${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`
-}
-
-export function fmtDate(unixSecOrMs: number): string {
-  if (!unixSecOrMs) return '—'
-  // 判断是秒级还是毫秒级：如果值大于 1e12，则是毫秒级
-  const ts = unixSecOrMs > 1e12 ? unixSecOrMs : unixSecOrMs * 1000
-  const d = new Date(ts)
-  const p = (x: number) => String(x).padStart(2, '0')
-  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}`
 }
 
 export function fmtDateTime(unixSecOrMs: number): string {
@@ -249,48 +224,6 @@ export function statusLabel(status: string): string {
       return '失败'
     default:
       return status || '—'
-  }
-}
-
-/**
- * 状态徽章样式。
- *
- * 2026-10-13：由「三类」改成**每种状态一个配色**。
- * 此前截断 / 超限 / 失败共用 badge-err（warning-soft，15% 浓度的暖橙），
- * 在浅色底上淡到认不出颜色，实际观感就是灰的 —— 于是「失败」与
- * 「已取消」长得一样，用户必须逐行读文字才知道出了什么事。
- *
- * 语义分层（配色见 styles.css 的 .badge-st-* 一段）：
- *   - ok        绿 —— 无事
- *   - error     红 —— 出错了，要看日志
- *   - overflow  深红 —— 请求超出模型上限，是配置问题而非故障，
- *                        比 error 更"已知原因"，故用同色系更深一档而不是换色
- *   - truncated 橙 —— 生成被中断，结果不完整
- *   - canceled  灰 —— 客户端主动断开，既不是网关的错也不是上游的错，
- *                 统计口径里同样不计入错误率；给它暖色会让
- *                 「用户关了个页面」看起来像线上故障。
- *   - timeout   橙 —— 网关自身总请求预算到期，不是上游故障；
- *                 与 truncated 同色系但文案不同，便于区分责任方。
- *
- * 未知状态回落 badge-off（中性灰）：不认识的值不该被当成异常标红，
- * 那会把「新增了状态但前端没跟上」误报成线上故障。
- */
-export function statusBadge(status: string): string {
-  switch (status) {
-    case 'ok':
-      return 'badge-st-ok'
-    case 'error':
-      return 'badge-st-error'
-    case 'overflow':
-      return 'badge-st-overflow'
-    case 'truncated':
-      return 'badge-st-truncated'
-    case 'canceled':
-      return 'badge-st-canceled'
-    case 'timeout':
-      return 'badge-st-timeout'
-    default:
-      return 'badge-off'
   }
 }
 

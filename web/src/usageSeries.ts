@@ -45,13 +45,6 @@ export function bucketDaysFor(days: number): number {
   return days > 31 ? 7 : 1
 }
 
-/** 图标题旁的聚合说明。 */
-export function granularityLabel(days: number): string {
-  const bucket = bucketDaysFor(days)
-  if (bucket === 1) return '按日聚合'
-  return bucket >= 30 ? '按月聚合' : '按周聚合'
-}
-
 export function buildUsageSeries({
   byDay,
   days,

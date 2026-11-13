@@ -1,7 +1,7 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import { readFile } from 'node:fs/promises'
-import { buildUsageSeries, bucketDaysFor, granularityLabel, labelStrideFor } from '../src/usageSeries.ts'
+import { buildUsageSeries, bucketDaysFor, labelStrideFor } from '../src/usageSeries.ts'
 
 // 2026-11-01 需求：总览页改叫「总览」，用量趋势不再用表格而用图表。
 //
@@ -83,14 +83,11 @@ test('「全部」档用终身累计的 first_record_at 定起点，不被剪枝
   assert.equal(series[0].key, '2026-10-01', '「全部」档的起点丢了，图会凭空变短')
 })
 
-test('桶宽与聚合说明随区间变化：日 / 周 / 月', () => {
+test('桶宽随区间变化：日 / 周 / 月', () => {
   assert.equal(bucketDaysFor(1), 1)
   assert.equal(bucketDaysFor(30), 1)
   assert.equal(bucketDaysFor(365), 7)
   assert.equal(bucketDaysFor(0), 30)
-  assert.equal(granularityLabel(7), '按日聚合')
-  assert.equal(granularityLabel(365), '按周聚合')
-  assert.equal(granularityLabel(0), '按月聚合')
 })
 
 test('横轴标签抽稀到约 12 个', () => {

@@ -66,7 +66,3 @@ export function checkPasswordStrength(p: string): string {
   return ''
 }
 
-/** 便捷判定：密码是否通过后端同款强度门槛。 */
-export function isStrongPassword(p: string): boolean {
-  return checkPasswordStrength(p) === ''
-}
