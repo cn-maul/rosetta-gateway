@@ -20,6 +20,13 @@ import (
 	"github.com/cn-maul/rosetta-gateway/internal/store"
 )
 
+// chainOf 把单个模型包成一条单目标候选链，供预算估算的测试使用。
+// 生产路径始终走 EstimateBalanceCostChain（一条链取最贵的目标），
+// 测试也走同一入口，避免只测到一条生产已不使用的单模型分支。
+func chainOf(m *routing.UpstreamModel) []routing.Candidate {
+	return []routing.Candidate{{UpstreamModel: m}}
+}
+
 // ---------------------------------------------------------------------
 // 测试辅助
 // ---------------------------------------------------------------------
@@ -367,7 +374,7 @@ func TestEstimateCost_UnpricedModelIsZero(t *testing.T) {
 		// MaxOutputTokens 有值也不该改变结论：没有单价就没有可乘的数。
 		{PriceInput: 0, PriceOutput: 0, PriceCacheHit: 0, MaxOutputTokens: 4096},
 	} {
-		if got := billing.EstimateBalanceCost(req, m); got != 0 {
+		if got := billing.EstimateBalanceCostChain(req, chainOf(m)); got != 0 {
 			t.Fatalf("未配价模型估出 %d 分，want 0（否则未配价部署会被误拒）", got)
 		}
 	}
@@ -402,8 +409,8 @@ func TestEstimateCost_PartialPricingDoesNotMakeInputFree(t *testing.T) {
 		MaxOutputTokens: 1,
 	}
 	// 只配输出价，输入价缺失。
-	onlyOut := billing.EstimateBalanceCost(req, &routing.UpstreamModel{PriceOutput: 1000})
-	full := billing.EstimateBalanceCost(req, &routing.UpstreamModel{PriceInput: 1000, PriceOutput: 1000})
+	onlyOut := billing.EstimateBalanceCostChain(req, chainOf(&routing.UpstreamModel{PriceOutput: 1000}))
+	full := billing.EstimateBalanceCostChain(req, chainOf(&routing.UpstreamModel{PriceInput: 1000, PriceOutput: 1000}))
 	if onlyOut <= 0 {
 		t.Fatalf("只配输出价却估出 %d 分：输入侧被当成免费，预检形同虚设", onlyOut)
 	}
@@ -433,7 +440,7 @@ func TestEstimateCost_CacheHitOnlyPricingIsNotTreatedAsUnpriced(t *testing.T) {
 		MaxOutputTokens: 4096,
 	}
 	// 只配缓存命中价（3 元/百万 tokens），输入价与输出价都为 0。
-	onlyCache := billing.EstimateBalanceCost(req, &routing.UpstreamModel{PriceCacheHit: 3})
+	onlyCache := billing.EstimateBalanceCostChain(req, chainOf(&routing.UpstreamModel{PriceCacheHit: 3}))
 	if onlyCache <= 0 {
 		t.Fatalf("只配 price_cache_hit 却估出 %d 分：预检把它当成「完全未配价」→ "+
 			"fail-open 漏放行（实扣仍按缓存价收费）", onlyCache)
@@ -474,12 +481,12 @@ func TestEstimateCost_IsUpperBoundOverActualCharge(t *testing.T) {
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			est := billing.EstimateBalanceCost(req, &routing.UpstreamModel{
+			est := billing.EstimateBalanceCostChain(req, chainOf(&routing.UpstreamModel{
 				PriceInput:         c.p.Input,
 				PriceCacheHit:      c.p.CacheHit,
 				PriceCacheCreation: c.p.CacheCreation,
 				PriceOutput:        c.p.Output,
-			})
+			}))
 			// 实扣可能的缓存命中 / 写入组合，取**最大**的那一笔。
 			var worst float64
 			for _, split := range []struct{ cached, creation float64 }{

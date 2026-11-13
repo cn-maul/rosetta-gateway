@@ -143,7 +143,7 @@ func TestRebuildFromDB_NoGroupsMeansUnrestricted(t *testing.T) {
 	}
 	// 组合判定：两个维度都不限制 → 任意模型可见。
 	for _, m := range []string{"anything", "任意"} {
-		if !u.AllowedModels.Intersect(k.AllowedModels).Allows(m) {
+		if !(u.AllowedModels.Allows(m) && k.AllowedModels.Allows(m)) {
 			t.Errorf("model %q should be visible with no whitelists", m)
 		}
 	}

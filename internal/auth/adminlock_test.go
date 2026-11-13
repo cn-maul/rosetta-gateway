@@ -13,6 +13,7 @@ import (
 	"testing"
 
 	"github.com/cn-maul/rosetta-gateway/internal/snapshot"
+	"github.com/cn-maul/rosetta-gateway/internal/store"
 )
 
 const (
@@ -44,7 +45,7 @@ func initAdminLockSnap(t *testing.T) {
 				AllowedModels: snapshot.AllowAll(), GroupModelAllow: snapshot.AllowAll()},
 		},
 		UsersByID: map[string]*snapshot.UserSnapshot{
-			adminUserID: {ID: adminUserID, Name: "root", Role: userRoleAdmin,
+			adminUserID: {ID: adminUserID, Name: "root", Role: store.RoleAdmin,
 				Status: snapshot.UserStatusActive, AuthVersion: 1,
 				AllowedModels: snapshot.AllowAll()},
 			testUserID: {ID: testUserID, Name: "alice", Role: "user",
@@ -91,36 +92,6 @@ func TestAuthenticate_NormalUserStillWorks(t *testing.T) {
 	}
 }
 
-// IsAdminOwner 判据要与 ErrAdminCannotCallModel **完全一致**。
-//
-// 这条用例的作用是防止两条判据各写各的：一旦 auth 拦截用「角色 == admin」、
-// 而 IsAdminOwner 用「IsAdmin() 或其他条件」，两者就会在某处漂移，
-// 表现为「拦截生效了但 org 端点没收窄」这类极难查的不一致。
-func TestContext_IsAdminOwnerMatchesLockout(t *testing.T) {
-	initAdminLockSnap(t)
-
-	if _, err := Authenticate(reqWithKey(adminUserKey)); err != ErrAdminCannotCallModel {
-		t.Fatalf("管理员 key 应被拒（前置条件不成立）：%v", err)
-	}
-
-	// 用一个手工构造的 Context 走 IsAdminOwner（被拒时 Authenticate 不给 Context，
-	// 只能自己构造 —— 这正是 IsAdminOwner 做成 Context 方法的原因：
-	// 它服务于「已经鉴权成功」的调用方，例如 orgCostsScope）。
-	admin := &Context{UserID: adminUserID}
-	if !admin.IsAdminOwner() {
-		t.Error("IsAdminOwner(管理员) = false，与 ErrAdminCannotCallModel 的判据不一致")
-	}
-	normal := &Context{UserID: testUserID}
-	if normal.IsAdminOwner() {
-		t.Error("IsAdminOwner(普通用户) = true，判据写反了")
-	}
-	// 查不到用户（数据不一致）必须**判非管理员**，而不是默认 true。
-	// 反过来写的话，一个 user_id 失效的 key 会被当成管理员而在别处被放行。
-	if (&Context{UserID: "u-ghost"}).IsAdminOwner() {
-		t.Error("查不到归属用户时必须判非管理员（fail-closed 方向应是「不放行」）")
-	}
-}
-
 // 判定顺序：管理员**同时**被禁用时，报「用户已禁用」而不是「管理员不能调模型」。
 //
 // 顺序反了会误导运维：账号被禁用时去查「为什么管理员不能调模型」是白费功夫，
@@ -133,8 +104,8 @@ func TestAuthenticate_DisabledAdminReportsDisabled(t *testing.T) {
 				AllowedModels: snapshot.AllowAll(), GroupModelAllow: snapshot.AllowAll()},
 		},
 		UsersByID: map[string]*snapshot.UserSnapshot{
-			adminUserID: {ID: adminUserID, Name: "root", Role: userRoleAdmin,
-				Status: "disabled", AuthVersion: 1, AllowedModels: snapshot.AllowAll()},
+			adminUserID: {ID: adminUserID, Name: "root", Role: store.RoleAdmin,
+				Status: store.UserStatusDisabled, AuthVersion: 1, AllowedModels: snapshot.AllowAll()},
 		},
 	})
 	t.Cleanup(func() { snapshot.Init(&snapshot.Snapshot{}) })
@@ -185,21 +156,6 @@ func TestAuthenticate_DemotedAdminCanCallAgain(t *testing.T) {
 	}
 }
 
-// 用户状态字面量与 snapshot/snapshot.go 的常量必须一致。
-//
-// 鉴权包里刻意复制了 "active"/"admin" 两个字面量（不 import store，避免把
-// 数据库驱动拖进热路径依赖图）。复制就意味着存在「两处不同步」的风险 —
-// 而不同步的症状是**静默**的（鉴权恒失败或恒放行）。这条用例把两处钉在一起。
-func TestAuthenticate_RoleAndStatusLiteralsMatchSnapshotPackage(t *testing.T) {
-	if userRoleAdmin != "admin" {
-		t.Errorf("userRoleAdmin = %q，与 store.RoleAdmin 的字面量不一致", userRoleAdmin)
-	}
-	admin := &snapshot.UserSnapshot{Role: userRoleAdmin, Status: snapshot.UserStatusActive}
-	if !admin.IsActive() {
-		t.Error("用 userRoleAdmin 构造的用户应处于 active —— IsActive 的比较字面量已漂移")
-	}
-}
-
 // 兜底：确认鉴权成功时才会拿到非 nil Context（管理员被拒时为 nil），
 // 且普通用户的 Context 带齐热路径需要的全部字段。
 func TestAuthenticate_ContextShapeForNormalUser(t *testing.T) {
@@ -211,12 +167,6 @@ func TestAuthenticate_ContextShapeForNormalUser(t *testing.T) {
 	}
 	if ctx.KeyID != testKeyID || ctx.UserID != testUserID || ctx.Name != "t" {
 		t.Fatalf("上下文字段不全：key=%q user=%q name=%q", ctx.KeyID, ctx.UserID, ctx.Name)
-	}
-	if ctx.UserStatus != snapshot.UserStatusActive {
-		t.Errorf("UserStatus = %q, want active", ctx.UserStatus)
-	}
-	if ctx.IsAdminOwner() {
-		t.Error("普通用户的 IsAdminOwner 必须为 false")
 	}
 	// 确认用的是 HTTP 头取 key 的真实路径（回归：若 extractKey 变了，
 	// 这里会因「拿不到 key」而红，错误信息直指问题）。

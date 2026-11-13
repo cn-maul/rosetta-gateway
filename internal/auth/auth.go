@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/cn-maul/rosetta-gateway/internal/snapshot"
+	"github.com/cn-maul/rosetta-gateway/internal/store"
 )
 
 type Context struct {
@@ -17,9 +18,6 @@ type Context struct {
 	Name  string
 	// UserID 是这把 key 的归属用户（多用户改造 P0）。热路径上**保证非空**。
 	UserID string
-	// UserStatus 随快照下发，让「用户被禁用」在热路径零成本生效，
-	// 不需要每请求查库。
-	UserStatus string
 	// RPMLimit / TPMLimit 是该 key 的每分钟限速额度（0 = 不限），
 	// 从快照随鉴权一并带出，供转发热路径执行限速（DESIGN §11.4）。
 	RPMLimit int
@@ -34,28 +32,12 @@ type Context struct {
 	GroupModelAllow snapshot.ModelAllow
 }
 
-// userRoleAdmin 与 store.RoleAdmin 保持字面量一致。
-//
-// 与 UserStatusActive 同理：复制常量而不 import store，是为了让鉴权热路径
-// 不依赖 store 包（那个包会把数据库驱动、事务、全部 DAO 拖进 auth 的依赖图）。
-// 两处字面量必须同步修改（值都是 "admin"）。
-const userRoleAdmin = "admin"
-
 // AllowsModel 报告本请求是否有权使用某个公开模型名。
 //
 // 两个维度独立判定而不是先求交再查：求交要为每个请求分配一个新切片，
 // 而这里白名单只有个位数，两次线性扫描的代价更低、且零分配。
 func (c *Context) AllowsModel(model string) bool {
 	return c.KeyModelAllow.Allows(model) && c.GroupModelAllow.Allows(model)
-}
-
-// IsAdminOwner 报告这把 key 的归属用户是不是管理员。
-//
-// 数据面据此把管理员彻底挡在门外（ErrAdminCannotCallModel）：管理员只做
-// 控制面管理，调用模型必须用**普通用户**的 key。
-func (c *Context) IsAdminOwner() bool {
-	u := snapshot.Get().UsersByID[c.UserID]
-	return u != nil && u.Role == userRoleAdmin
 }
 
 func Authenticate(r *http.Request) (*Context, error) {
@@ -146,7 +128,7 @@ func Authenticate(r *http.Request) (*Context, error) {
 	//
 	// 见 ErrAdminCannotCallModel 的注释：不保留、给清晰错误，让管理员知道
 	// 「要去建普通用户」而不是以为 key 坏了而反复重试。
-	if u.Role == userRoleAdmin {
+	if u.Role == store.RoleAdmin {
 		return nil, ErrAdminCannotCallModel
 	}
 
@@ -154,7 +136,6 @@ func Authenticate(r *http.Request) (*Context, error) {
 		KeyID:         matched.ID,
 		Name:          matched.Name,
 		UserID:        matched.UserID,
-		UserStatus:    u.Status,
 		RPMLimit:      matched.RPMLimit,
 		TPMLimit:      matched.TPMLimit,
 		KeyModelAllow: matched.AllowedModels,

@@ -36,6 +36,7 @@ import (
 	"net/http"
 	"testing"
 
+	"github.com/cn-maul/rosetta-gateway/internal/identity"
 	"github.com/cn-maul/rosetta-gateway/internal/store"
 	"github.com/cn-maul/rosetta-gateway/internal/userauth"
 )
@@ -88,7 +89,7 @@ func newCSRFHarness(t *testing.T) *csrfHarness {
 
 // withCookie / withBearer 是两种凭据的携带方式。
 func withCookie(req *http.Request, tok string) *http.Request {
-	req.AddCookie(&http.Cookie{Name: SessionCookieName, Value: tok})
+	req.AddCookie(&http.Cookie{Name: identity.SessionCookieName, Value: tok})
 	return req
 }
 

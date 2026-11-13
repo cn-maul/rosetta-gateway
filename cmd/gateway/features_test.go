@@ -12,9 +12,9 @@ import (
 	"time"
 
 	"github.com/cn-maul/rosetta-gateway/internal/admin"
+	"github.com/cn-maul/rosetta-gateway/internal/identity"
 	"github.com/cn-maul/rosetta-gateway/internal/ingress"
 	"github.com/cn-maul/rosetta-gateway/internal/routing"
-	"github.com/cn-maul/rosetta-gateway/internal/server"
 	"github.com/cn-maul/rosetta-gateway/internal/snapshot"
 	"github.com/cn-maul/rosetta-gateway/internal/store"
 )
@@ -32,7 +32,7 @@ func authedGet(path string) *http.Request {
 // （auth.Authenticate）里被读，管理面读的是 context。
 func asScopedGet(path, userID string) *http.Request {
 	req := authedGet(path)
-	return req.WithContext(context.WithValue(req.Context(), server.UserCtxKey(), &store.User{
+	return req.WithContext(identity.WithUser(req.Context(), &store.User{
 		ID: userID, Username: userID,
 		Role: store.RoleUser, Status: store.UserStatusActive, AuthVersion: 1,
 	}))

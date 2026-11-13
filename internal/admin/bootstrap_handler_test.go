@@ -92,12 +92,13 @@ func TestBootstrapSetup_IssuesUsableSession(t *testing.T) {
 
 	// 签发的令牌必须**立刻可用**：带的是 SetUserPassword 递增后的新
 	// auth_version。读旧版本号的话，前端刚拿到令牌就 401。
-	sess, err := mgr.Verify(got.Token, mustAuthVersion(t, st, u.ID))
-	if err != nil {
+	if err := mgr.Verify(got.Token, mustAuthVersion(t, st, u.ID)); err != nil {
 		t.Fatalf("issued token is not usable: %v", err)
 	}
-	if sess.UserID != u.ID {
-		t.Errorf("session user = %q, want %q", sess.UserID, u.ID)
+	if claims, err := mgr.Peek(got.Token); err != nil {
+		t.Fatalf("peek issued token: %v", err)
+	} else if claims.UserID != u.ID {
+		t.Errorf("session user = %q, want %q", claims.UserID, u.ID)
 	}
 
 	// 设完之后必须能用新密码走正常登录。

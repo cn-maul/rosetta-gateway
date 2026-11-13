@@ -276,12 +276,12 @@ func TestResponsesUsage_ReasoningTokensReported(t *testing.T) {
 
 	// 非流式
 	rec := httptest.NewRecorder()
-	WriteResponsesResponse(rec, &rosetta.ChatResponse{
+	WriteResponsesResponseWithTools(rec, &rosetta.ChatResponse{
 		ID:         "resp_2",
 		Content:    []rosetta.Block{{Type: rosetta.BlockText, Text: "x"}},
 		StopReason: rosetta.StopEnd,
 		Usage:      rosetta.Usage{InputTokens: 5, OutputTokens: 9, TotalTokens: 14, ReasoningTokens: 4},
-	}, "m")
+	}, "m", nil)
 	if !strings.Contains(rec.Body.String(), `"reasoning_tokens":4`) {
 		t.Fatalf("非流式 usage 缺 reasoning_tokens:\n%s", rec.Body.String())
 	}

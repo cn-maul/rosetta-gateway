@@ -259,18 +259,6 @@ func (s *Store) GetAccessKey(ctx context.Context, id string) (*AccessKey, error)
 	return k, err
 }
 
-// GetAccessKeyByHash 按 SHA-256 哈希取 key。数据面热路径走快照不查库，
-// 这条给需要单条查询的管理面路径用（如归属一致性核对）。
-func (s *Store) GetAccessKeyByHash(ctx context.Context, keyHash string) (*AccessKey, error) {
-	row := s.read.QueryRowContext(ctx,
-		`SELECT `+keyColumns+` FROM access_keys WHERE key_hash = ?`, keyHash)
-	k, err := scanAccessKey(row)
-	if err == sql.ErrNoRows {
-		return nil, nil
-	}
-	return k, err
-}
-
 // ListAccessKeysByUser 返回某用户名下的全部 key（按创建时间）。
 //
 // userID 为空时返回**空切片**而非全部 ——「无归属」不该被当成「查所有」，
@@ -299,13 +287,6 @@ func (s *Store) ListAccessKeysByUser(ctx context.Context, userID string) ([]Acce
 
 func (s *Store) CreateAccessKey(ctx context.Context, k *AccessKey) error {
 	return createAccessKey(ctx, s.db, k)
-}
-
-// CreateAccessKeyTx 在调用方的事务里插入访问密钥（配置导入用：密钥与它的
-// 归属用户必须在同一笔提交里 —— 用户建好而密钥没建，等于导进来的账号
-// 没有可用的凭证；反过来密钥没有归属用户则一律 401）。
-func (s *Store) CreateAccessKeyTx(ctx context.Context, tx Tx, k *AccessKey) error {
-	return createAccessKey(ctx, tx, k)
 }
 
 // createAccessKey 接受 execer，让同一份 SQL 既能在自动提交下跑也能进事务。
@@ -369,40 +350,14 @@ func (s *Store) UpdateAccessKey(ctx context.Context, id string, k *AccessKey) er
 	return checkAffected(res, err)
 }
 
-// ReassignAccessKey 单独改写一把 key 的归属。
-//
-// 单独一个方法而不是给 UpdateAccessKey 加参数：归属是「key 属于谁」的
-// 事实，不该由一个 PATCH 请求随手改写 —— 那等于允许把别人的 key 划到自己
-// 名下（见 UpdateAccessKey 的注释与 user_dao_test 的断言）。
-//
-// 认领（无归属 → 某用户）正是 Create 里承诺的「先建后认领」流程所缺的
-// 那一环：修复前 keyRequest 声明了 UserID，Update 却不读它，DAO 也不写
-// user_id，于是 PATCH {"user_id":"…"} 返回 200 而 user_id 恒为空，
-// 那把 key 之后永远 401（auth.go 的 ErrKeyUnowned）。
-//
-// 权限校验（只有管理员可改归属、目标用户必须存在）在 admin 层做。
-//
-// # 现状（2026-10-21 修 A7-P2-08 之后）
-//
-// 生产已无调用点：admin 的 Key PATCH 改走 UpdateAccessKeyWithOwner
-// （字段与归属同一个事务，避免两步写的部分提交窗口）。保留本方法是因为
-// 它是「只改归属、绝不碰别的字段」的单一职责入口 —— 与 UpdateAccessKey
-// 刻意不写 user_id 是同一条口径的两半。将来若有「纯转归属」的入口
-// （例如管理界面上单独的「转移」按钮），用它而不是现场拼 SQL。
-func (s *Store) ReassignAccessKey(ctx context.Context, id, userID string) error {
-	res, err := s.db.ExecContext(ctx,
-		`UPDATE access_keys SET user_id = ? WHERE id = ?`, nullIfEmpty(userID), id)
-	return checkAffected(res, err)
-}
-
 // UpdateAccessKeyWithOwner 在**一个事务**里更新 key 的字段并改写归属
 // （2026-10-21 修 A7-P2-08）。
 //
 // # 为什么需要它
 //
 // 原先 PATCH 是两次自动提交：先 UpdateAccessKey（名称/配额/有效期/…），
-// 再 ReassignAccessKey（归属）。第二步失败时第一步**已经落库**，而响应是
-// 404/500 —— 调用方看到失败，库里却已经是新配置。此时：
+// 再用一个只改归属的独立方法写 user_id。第二步失败时第一步**已经落库**，
+// 而响应是 404/500 —— 调用方看到失败，库里却已经是新配置。此时：
 //   - 客户端重试 → 以为回到原点，实际带着上一次的半截修改继续跑；
 //   - 运维手工核对 → 「明明保存失败了，怎么限制真的变了」；
 //   - 更坏的是**归属**：重命名成功、改归属失败，这把 key 仍属于原用户，

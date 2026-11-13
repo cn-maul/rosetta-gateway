@@ -53,7 +53,7 @@ func seedByUserUsage(t *testing.T, st *Store, id, userID, keyID string, ts, in, 
 // seedPriced 建 p1 + 单价 **1 元 / 百万** input token 的模型（输出免费）。
 //
 // ⚠️ 价格单位是「元 / 百万 tokens」，所以这里传 1.0 而不是 1_000_000 ——
-// priceUsage 的公式是 `token 数 × 单价 / 1e6`，传 1e6 会算出 50 万元一条，
+// PriceUsage 的公式是 `token 数 × 单价 / 1e6`，传 1e6 会算出 50 万元一条，
 // 于是金额断言全部离谱地偏大（而那种失败看起来像「聚合算错了」，
 // 实际只是价的量纲搞错了）。
 //

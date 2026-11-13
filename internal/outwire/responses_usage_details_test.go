@@ -42,14 +42,14 @@ type usageEnvelope struct {
 
 func TestResponsesNonStream_ReportsCachedAndReasoning(t *testing.T) {
 	rec := httptest.NewRecorder()
-	WriteResponsesResponse(rec, &rosetta.ChatResponse{
+	WriteResponsesResponseWithTools(rec, &rosetta.ChatResponse{
 		ID: "up-1", Model: "x",
 		Content: []rosetta.Block{{Type: rosetta.BlockText, Text: "答"}},
 		Usage: rosetta.Usage{
 			InputTokens: 100, CachedInputTokens: 72, ReasoningTokens: 30,
 			OutputTokens: 20, TotalTokens: 120,
 		},
-	}, "gw-model")
+	}, "gw-model", nil)
 
 	var out usageEnvelope
 	if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil {

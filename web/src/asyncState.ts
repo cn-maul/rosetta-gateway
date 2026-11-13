@@ -21,4 +21,3 @@ export class RequestGeneration {
   }
 }
 
-export type LoadState = 'not-loaded' | 'loading' | 'ready' | 'error'

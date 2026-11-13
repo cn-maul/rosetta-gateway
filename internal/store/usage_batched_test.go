@@ -308,7 +308,7 @@ func TestBatched_NegativeTokensClampedLikeSinglePath(t *testing.T) {
 			neg.InputTokens, neg.OutputTokens, neg.TotalTokens,
 			neg.ReasoningTokens, neg.CachedTokens)
 	}
-	// 费用也不能为负（priceUsage 对负 token 会算出负数）。
+	// 费用也不能为负（PriceUsage 对负 token 会算出负数）。
 	if costs[0] < 0 {
 		t.Errorf("负 token 产生了负费用 %v —— 会让「扣费」变成「充值」", costs[0])
 	}

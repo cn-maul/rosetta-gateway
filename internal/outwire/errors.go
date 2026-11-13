@@ -27,26 +27,8 @@ type ErrorDetail struct {
 // MapUpstreamError 把一次上游错误映射成「回给客户端的」状态码/错误码/文案，
 // 顺带把上游原文留在服务端日志里。
 //
-// 会写日志 —— 只应在真正要把错误回给客户端的路径上调用。若只是想知道错误
-// 该归到哪一类（探测、统计、分类），用 UpstreamErrorCode：它不产生任何
-// 日志记录（见 mapUpstreamError 的 logging 参数说明）。
+// 会写日志 —— 只应在真正要把错误回给客户端的路径上调用。
 func MapUpstreamError(err error) (int, string, string) {
-	return mapUpstreamError(err, true)
-}
-
-// UpstreamErrorCode 只做归类，**不写日志**。
-//
-// 为什么必须分开：有些调用方（如可用性检查的辅助路径）只想知道错误该归到
-// 哪一类，不打算把错误回给客户端。MapUpstreamError 的 400/404/529 分支会
-// 顺带 slog.Warn 一条不带模型/上游字段的 "upstream returned an error"，
-// 在批量归类时会变成无法定位的日志噪声。归类是纯计算，不该有日志副作用。
-func UpstreamErrorCode(err error) (int, string, string) {
-	return mapUpstreamError(err, false)
-}
-
-// mapUpstreamError 是两者的公共实现。logging=false 时一个日志都不写
-// （包括 logUpstreamMalformed），返回值完全相同。
-func mapUpstreamError(err error, logging bool) (int, string, string) {
 	if err == nil {
 		return http.StatusOK, "", ""
 	}
@@ -81,19 +63,15 @@ func mapUpstreamError(err error, logging bool) (int, string, string) {
 	// 客户端 SDK 也能据此重试到别处。日志里记原始错误便于定位，但不回显给客户端
 	// （响应文案是固定串，不含上游原文）。
 	if errors.Is(err, rosetta.ErrUpstreamMalformed) {
-		if logging {
-			logUpstreamMalformed(err)
-		}
+		logUpstreamMalformed(err)
 		return http.StatusBadGateway, "upstream_error", "upstream provider returned an unreadable response"
 	}
 	if errors.Is(err, rosetta.ErrResponseTooLarge) {
 		// 上游返回了超过网关读上限的响应体。与 ErrUpstreamMalformed 同属
 		// 「接受请求但返回不可用体」的目标级故障，归 502 并纳入故障转移，
 		// 只是错误形状不同（超限 vs 解不开）。
-		if logging {
-			slog.Warn("upstream response exceeded the read limit",
-				"error", err, "hint", "upstream returned a body larger than the gateway reads")
-		}
+		slog.Warn("upstream response exceeded the read limit",
+			"error", err, "hint", "upstream returned a body larger than the gateway reads")
 		return http.StatusBadGateway, "upstream_error", "upstream provider returned an oversized response"
 	}
 
@@ -111,9 +89,7 @@ func mapUpstreamError(err error, logging bool) (int, string, string) {
 			// 官方 SDK 对它做指数退避重试。压成 502 会让客户端退化成
 			// 「未知错误」而不重试 —— 而过载恰恰是最该重试的场景。
 			// 503 同理（Service Unavailable，也是可重试的过载信号）。
-			if logging {
-				logAPIError(apiErr)
-			}
+			logAPIError(apiErr)
 			return apiErr.StatusCode, "upstream_error", "upstream provider overloaded"
 		case apiErr.StatusCode >= 500:
 			return http.StatusBadGateway, "upstream_error", "upstream provider error"
@@ -121,23 +97,17 @@ func mapUpstreamError(err error, logging bool) (int, string, string) {
 			// 不回显上游原文：上游错误 message 里常带内部 URL、账号标识，
 			// 有时还有对方的 prompt片段。且这些文本对下游定位自己的问题无用
 			// —— 该做的是对照网关的路由配置。把原文放进日志而不是响应体。
-			if logging {
-				logAPIError(apiErr)
-			}
+			logAPIError(apiErr)
 			return http.StatusBadRequest, "invalid_request_error", "upstream rejected the request"
 		case apiErr.StatusCode == http.StatusNotFound, apiErr.StatusCode == http.StatusGone:
 			// 上游说「没有这个模型 / 没有这个端点」。这是目标级的配置问题，
 			// 不是网关内部故障 —— 旧实现落到 default 分支，把上游那句
 			// "not found" 原样塞进 502 upstream_error 里，客户端看不出该去查
 			// 自己的 model 名还是该去查网关的 provider 配置。
-			if logging {
-				logAPIError(apiErr)
-			}
+			logAPIError(apiErr)
 			return http.StatusNotFound, "model_not_found", "upstream provider does not serve this model"
 		default:
-			if logging {
-				logAPIError(apiErr)
-			}
+			logAPIError(apiErr)
 			return http.StatusBadGateway, "upstream_error", "upstream provider error"
 		}
 	}

@@ -7,7 +7,7 @@ package store
 // 审计前的现状是**两份计价公式**：
 //
 //   - cmd/gateway/billing.go 的 estimateBalanceCost —— 余额**预检**用；
-//   - internal/store/usage_dao.go 的 priceUsage —— 落库**实扣**用。
+//   - internal/store 里另一份手写的单价计算 —— 落库**实扣**用。
 //
 // 两者必须永远相等：预检按 A 估、实扣按 B 收，预检就失去意义。
 // 而「相等」这件事没有任何机制保证 —— 注释写了「改一侧必须同步另一侧」，

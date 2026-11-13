@@ -102,31 +102,6 @@ const (
 	OutcomeCommittedMalformed
 )
 
-func (k OutcomeKind) String() string {
-	switch k {
-	case OutcomeUpstreamFailed:
-		return "upstream_failed"
-	case OutcomeClientAborted:
-		return "client_aborted"
-	case OutcomeCommittedSuccess:
-		return "committed_success"
-	case OutcomeCommittedPartial:
-		return "committed_partial"
-	case OutcomeGatewayOverflow:
-		return "gateway_overflow"
-	case OutcomeGatewayTimeout:
-		return "gateway_timeout"
-	case OutcomeDownstreamWriteFailed:
-		return "downstream_write_failed"
-	case OutcomeEncodeFailed:
-		return "encode_failed"
-	case OutcomeCommittedMalformed:
-		return "committed_malformed"
-	default:
-		return "unknown"
-	}
-}
-
 // LaneDecision is the projection consumed by failover, diagnostics, route
 // tracing, and accounting. Deriving all of them here keeps stream and
 // non-stream commits on the same rules.

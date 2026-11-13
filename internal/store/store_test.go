@@ -64,7 +64,7 @@ func TestRuntimeDefaults_RoundTrip(t *testing.T) {
 		FailoverMaxTargets:        4,
 		FailoverFailureThreshold:  5,
 	}
-	if err := st.SetRuntimeDefaults(ctx, want); err != nil {
+	if err := st.SaveSettings(ctx, DefaultModelDefaults(), want); err != nil {
 		t.Fatalf("set: %v", err)
 	}
 	got, err := st.GetRuntimeDefaults(ctx)
@@ -375,13 +375,6 @@ func TestStore_Pragmas(t *testing.T) {
 func TestAuditDAO(t *testing.T) {
 	st := testStore(t, t.TempDir()+"/a.db")
 	ctx := context.Background()
-
-	if got := AuditFieldNames([]byte(`{"name":"x","enabled":true}`)); got != "enabled,name" {
-		t.Fatalf("field names = %q", got)
-	}
-	if got := AuditFieldNames([]byte(`not json`)); got != "" {
-		t.Fatalf("invalid json should yield empty fields, got %q", got)
-	}
 
 	for i, path := range []string{"/admin/api/keys", "/admin/api/routes", "/admin/api/keys"} {
 		if err := st.CreateAuditEntry(ctx, &AuditEntry{

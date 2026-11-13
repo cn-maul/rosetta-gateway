@@ -294,25 +294,11 @@ func (s *Store) AdjustBalanceWithLedger(ctx context.Context, userID string, delt
 	return t, nil
 }
 
-// insertTopup 写一条流水。单独拆出是为了让「写流水失败」能被调用方
-// 明确识别为**可恢复**的失败（余额已生效），而不是与余额调整的错误混为一谈。
-func (s *Store) insertTopup(ctx context.Context, t Topup) error {
-	tx, err := s.db.BeginTx(ctx, nil)
-	if err != nil {
-		return err
-	}
-	defer func() { _ = tx.Rollback() }() //nolint:errcheck // 已提交时是 no-op
-	if err := s.insertTopupTx(ctx, tx, t); err != nil {
-		return err
-	}
-	return tx.Commit()
-}
-
 // insertTopupTx 在**给定事务**里写一条流水。
 //
-// 与 insertTopup 的区别只是事务归属：充值路径（AdjustBalanceWithLedger）
-// 要把「加余额 → 结转欠款 → 写流水」压进**同一个事务**，所以流水也得
-// 用那个事务写，不能自己开一笔（自己开就是另一笔事务 = 流水与余额不同生共死）。
+// 充值路径（AdjustBalanceWithLedger）要把「加余额 → 结转欠款 → 写流水」
+// 压进**同一个事务**，所以流水必须用那个事务写，不能自己开一笔
+// （自己开就是另一笔事务 = 流水与余额不同生共死）。
 func (s *Store) insertTopupTx(ctx context.Context, tx *sql.Tx, t Topup) error {
 	wasUnlimited := 0
 	if t.WasUnlimited {

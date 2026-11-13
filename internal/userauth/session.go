@@ -2,7 +2,6 @@ package userauth
 
 import (
 	"crypto/rand"
-	"crypto/sha256"
 	"encoding/base64"
 	"errors"
 	"fmt"
@@ -36,17 +35,6 @@ var (
 	// 密码已改、账号被禁用或角色被调整，旧 token 随之失效。
 	ErrStaleVersion = errors.New("session has been invalidated")
 )
-
-// Session 是解出的会话载荷。
-type Session struct {
-	UserID string
-	// AuthVersion 是签发时的版本。校验时必须与数据库当前值一致。
-	AuthVersion int64
-	Role        string
-	Username    string
-	IssuedAt    time.Time
-	ExpiresAt   time.Time
-}
 
 // Manager 签发与校验会话令牌。
 //
@@ -236,12 +224,15 @@ func (m *Manager) Issue(u *UserClaims) (string, time.Time, error) {
 //
 // currentVersion 由调用方从数据库取（-1 表示查不到该用户）。
 // 这里刻意不自己查库：让数据访问留在调用方，避免认证逻辑与存储耦合。
-func (m *Manager) Verify(token string, currentVersion int64) (*Session, error) {
+//
+// 只返回错误而不带回解出的载荷：请求链上唯一的读者是 *store.User（以
+// auth_version 查库得到），令牌里的 role/username/exp 均已无消费方。
+func (m *Manager) Verify(token string, currentVersion int64) error {
 	if !m.Enabled() {
-		return nil, ErrTokenInvalid
+		return ErrTokenInvalid
 	}
 	if strings.TrimSpace(token) == "" {
-		return nil, ErrNoToken
+		return ErrNoToken
 	}
 
 	parsed, err := jwt.ParseWithClaims(token, &claims{},
@@ -257,41 +248,25 @@ func (m *Manager) Verify(token string, currentVersion int64) (*Session, error) {
 	)
 	if err != nil {
 		if errors.Is(err, jwt.ErrTokenExpired) {
-			return nil, ErrTokenExpired
+			return ErrTokenExpired
 		}
-		return nil, ErrTokenInvalid
+		return ErrTokenInvalid
 	}
 	c, ok := parsed.Claims.(*claims)
 	if !ok || !parsed.Valid {
-		return nil, ErrTokenInvalid
+		return ErrTokenInvalid
 	}
 	if c.Subject != c.UserID {
 		// 冗余校验：subject 与 uid 必须一致。不一致说明是手工拼装的 token。
-		return nil, ErrTokenInvalid
+		return ErrTokenInvalid
 	}
 
 	// auth_version 栅栏：改密码/禁用/改角色后，旧 token 立即作废。
 	// currentVersion < 0 表示用户已不存在（被删除）。
 	if currentVersion < 0 || c.AuthVersion != currentVersion {
-		return nil, ErrStaleVersion
+		return ErrStaleVersion
 	}
-
-	exp := time.Time{}
-	if c.ExpiresAt != nil {
-		exp = c.ExpiresAt.Time
-	}
-	iat := time.Time{}
-	if c.IssuedAt != nil {
-		iat = c.IssuedAt.Time
-	}
-	return &Session{
-		UserID:      c.UserID,
-		AuthVersion: c.AuthVersion,
-		Role:        c.Role,
-		Username:    c.Username,
-		IssuedAt:    iat,
-		ExpiresAt:   exp,
-	}, nil
+	return nil
 }
 
 // Peek 只解析令牌、**不比对 auth_version**，用于「先认出是谁，再去查库」的场景。
@@ -346,15 +321,6 @@ func randomID() string {
 		return strconv.FormatInt(time.Now().UnixNano(), 36)
 	}
 	return base64.RawURLEncoding.EncodeToString(b)
-}
-
-// Fingerprint 返回令牌的身份指纹，用于日志而不泄漏令牌本身。
-func (s *Session) Fingerprint() string {
-	if s == nil || s.UserID == "" {
-		return ""
-	}
-	sum := sha256.Sum256([]byte(s.UserID))
-	return base64.RawURLEncoding.EncodeToString(sum[:6])
 }
 
 // tightenSecretFilePermissions 把会话密钥文件的权限收紧到 0600。

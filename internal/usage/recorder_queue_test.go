@@ -101,7 +101,7 @@ func TestRecorder_QueueFullBlocksInsteadOfSyncWrite(t *testing.T) {
 	case <-time.After(150 * time.Millisecond):
 		// 期望：仍在等空位。
 	}
-	if n := rec.SyncFallbacks(); n != 0 {
+	if n := rec.syncFallbacks.Load(); n != 0 {
 		t.Fatalf("sync fallbacks = %d during the wait window, want 0", n)
 	}
 
@@ -119,7 +119,7 @@ func TestRecorder_QueueFullBlocksInsteadOfSyncWrite(t *testing.T) {
 	if got := done.Load(); got != int32(QueueSize+2) {
 		t.Fatalf("callbacks = %d, want %d", got, QueueSize+2)
 	}
-	if n := rec.SyncFallbacks(); n != 0 {
+	if n := rec.syncFallbacks.Load(); n != 0 {
 		t.Fatalf("sync fallbacks = %d, want 0 (no synchronous write should happen)", n)
 	}
 }
@@ -145,7 +145,7 @@ func TestRecorder_EnqueueTimeoutFallsBackToSyncWrite(t *testing.T) {
 	if waited < 25*time.Millisecond {
 		t.Fatalf("returned after %v: expected it to wait ~EnqueueWait (30ms) first", waited)
 	}
-	if n := rec.SyncFallbacks(); n != 1 {
+	if n := rec.syncFallbacks.Load(); n != 1 {
 		t.Fatalf("sync fallbacks = %d, want 1", n)
 	}
 	close(release)

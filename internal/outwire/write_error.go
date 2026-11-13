@@ -27,9 +27,9 @@ import (
 //
 // # 为什么用能力探测而不是把方法加进 StreamSink
 //
-// 与 BindWriteDeadline / BindDowngradedTools 同一理由：接口已有三个实现
-// 加测试替身，加方法会强制它们一起改，而「写失败上报」只在真实
-// ResponseWriter 路径上有意义（测试替身用 bytes.Buffer，永不失败）。
+// 与 BindWriteDeadline 同一理由：接口已有三个实现加测试替身，加方法会
+// 强制它们一起改，而「写失败上报」只在真实 ResponseWriter 路径上有意义
+// （测试替身用 bytes.Buffer，永不失败）。
 type WriteErrorReporter interface {
 	// WriteError 返回第一次写失败的原因；从未失败时为 nil。
 	// 实现必须可并发调用（心跳 goroutine 与主循环都会写）。

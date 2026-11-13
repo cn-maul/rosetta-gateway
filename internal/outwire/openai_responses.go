@@ -192,11 +192,6 @@ func (s *ResponsesSSE) WithResponseWriter(rw http.ResponseWriter) {
 	s.rw = rw
 }
 
-// WithDowngradedTools 接收入站降级过的工具表（见 BindDowngradedTools）。
-func (s *ResponsesSSE) WithDowngradedTools(tools map[string]string) {
-	s.downgraded = tools
-}
-
 func (s *ResponsesSSE) writeEvent(event string, payload map[string]any) {
 	setWriteDeadline(s.rw)
 	defer clearWriteDeadline(s.rw)
@@ -720,12 +715,7 @@ func (s *ResponsesSSE) SawTerminal() bool {
 	return s.sawTerminal
 }
 
-// WriteResponsesResponse 编码 Responses 非流式响应对象。
-func WriteResponsesResponse(w http.ResponseWriter, resp *rosetta.ChatResponse, model string) NonStreamWriteResult {
-	return WriteResponsesResponseWithTools(w, resp, model, nil)
-}
-
-// WriteResponsesResponseWithTools 是 WriteResponsesResponse 的带降级表版本：
+// WriteResponsesResponseWithTools 编码 Responses 非流式响应对象。
 // downgraded 把降级过的工具名映射回原生类型，输出的 item 相应地写成
 // custom_tool_call / local_shell_call 而非普通 function_call。
 func WriteResponsesResponseWithTools(w http.ResponseWriter, resp *rosetta.ChatResponse, model string, downgraded map[string]string) NonStreamWriteResult {

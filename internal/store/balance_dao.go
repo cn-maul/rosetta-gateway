@@ -11,7 +11,7 @@ package store
 //     见 User.BalanceCents 里的完整对比。
 //  3. **扣费金额由调用方给出，且必须等于 cost_total 换算的分**。本包
 //     **不重算费用**：调用方拿的是 CreateUsageRecordWithCost 返回的那个
-//     cost 值（元），用 YuanToCents 换算成分。公式只有 priceUsage 一份，
+//     cost 值（元），用 YuanToCents 换算成分。公式只有 PriceUsage 一份，
 //     所以「报表显示花了 X、余额扣了 Y」在结构上不可能发生。
 //
 // # 策略：预检拒绝，不做预占/退款

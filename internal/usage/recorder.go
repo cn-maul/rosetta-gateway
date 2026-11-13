@@ -252,20 +252,6 @@ const (
 // 抽成常量只是为了不重复 import context 后到处敲长名字。
 func ctxBackground() context.Context { return context.Background() }
 
-func newRecorder(db *store.Store, logger *slog.Logger) *Recorder {
-	u := &Recorder{
-		db:     db,
-		logger: logger,
-		queue:  make(chan persistJob, usageQueueSize),
-		stop:   make(chan struct{}),
-	}
-	for i := 0; i < usageWorkers; i++ {
-		u.wg.Add(1)
-		go u.worker()
-	}
-	return u
-}
-
 // worker 消费队列并落库，直到队列关闭。
 //
 // 落库**之后**按「请求是否成功」决定要不要扣余额（Lead 与用户确认的口径）。
@@ -963,12 +949,6 @@ func (u *Recorder) syncFallback(rec *store.UsageRecord, job persistJob) {
 	}
 	job.finish()
 }
-
-// SyncFallbacks 返回「等满整个窗口仍无空位、退化为同步写」的累计次数。
-//
-// 健康进程恒为 0。持续增长说明批量落库跟不上了（DB 卡住、磁盘满、
-// 或批次一直失败在重试），应结合 usage 队列水位一起看。
-func (u *Recorder) SyncFallbacks() int64 { return u.syncFallbacks.Load() }
 
 // markFlushFailed / clearFlushFailed / HasPendingUsage 记录「是否还攥着
 // 一批没落库成功的记录」（2026-10-12 修 P1-1）。

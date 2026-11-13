@@ -71,7 +71,7 @@ func completionMarkerCount(t *testing.T, st *Store, requestID, userID string) in
 // seedUsageForR0AC 造一条可供对账查询的用量记录。
 //
 // 这里直接写 SQL，刻意绕开计价：这些用例验的是「扣费完成标记」与
-// 「usage/cost 已落库」之间的一致性，不需要再测一次 priceUsage。
+// 「usage/cost 已落库」之间的一致性，不需要再测一次 PriceUsage。
 func seedUsageForR0AC(t *testing.T, st *Store, recordID, userID, requestID string,
 	cost float64, state string) {
 	t.Helper()
@@ -277,7 +277,7 @@ func TestR0AC04_SettlementAndReconciliationRemainIdempotent(t *testing.T) {
 						return err
 					}
 					for _, u := range found {
-						if err := st.ChargeUnchargedUsage(ctx, u); err != nil {
+						if _, err := st.ReconcileOneUnchargedUsage(ctx, u); err != nil {
 							return err
 						}
 					}
@@ -672,8 +672,8 @@ func TestReconcile_UnchargedUsageIsFoundAndCharged(t *testing.T) {
 	}
 
 	// 补扣后余额必须真的少了。
-	if err := st.ChargeUnchargedUsage(ctx, found[0]); err != nil {
-		t.Fatalf("ChargeUnchargedUsage: %v", err)
+	if _, err := st.ReconcileOneUnchargedUsage(ctx, found[0]); err != nil {
+		t.Fatalf("ReconcileOneUnchargedUsage: %v", err)
 	}
 	cents, limited, err := st.BalanceOf(ctx, "u1")
 	if err != nil {

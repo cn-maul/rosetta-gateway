@@ -161,14 +161,6 @@ func (s *Store) GetModelDefaults(ctx context.Context) (ModelDefaults, error) {
 	return d, nil
 }
 
-func (s *Store) SetModelDefaults(ctx context.Context, d ModelDefaults) error {
-	b, err := json.Marshal(d)
-	if err != nil {
-		return err
-	}
-	return s.setSetting(ctx, settingModelDefaultsKey, string(b))
-}
-
 // settingRuntimeDefaultsKey 是「运行时全局默认」的 app_settings 键。
 // 这些参数原先只存在于 config.json（改后要重启），或散落在每条 route 上；
 // 收拢到这里后可随保存即时生效（保存后前端触发 reload 重建快照）。
@@ -198,14 +190,6 @@ func (s *Store) GetRuntimeDefaults(ctx context.Context) (RuntimeDefaults, error)
 		return RuntimeDefaults{}, nil
 	}
 	return d, nil
-}
-
-func (s *Store) SetRuntimeDefaults(ctx context.Context, d RuntimeDefaults) error {
-	b, err := json.Marshal(d)
-	if err != nil {
-		return err
-	}
-	return s.setSetting(ctx, settingRuntimeDefaultsKey, string(b))
 }
 
 // settingSiteKey 是「站点品牌」（站点名称 + LOGO）的 app_settings 键。

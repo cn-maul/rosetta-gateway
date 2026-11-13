@@ -19,6 +19,7 @@ import (
 
 	"github.com/cn-maul/rosetta-gateway/internal/admin"
 	"github.com/cn-maul/rosetta-gateway/internal/catalog"
+	"github.com/cn-maul/rosetta-gateway/internal/identity"
 	"github.com/cn-maul/rosetta-gateway/internal/ingress"
 	"github.com/cn-maul/rosetta-gateway/internal/server"
 	"github.com/cn-maul/rosetta-gateway/internal/snapshot"
@@ -182,7 +183,7 @@ func TestAdminLockout_QueryEndpointsAlsoRejectAdmin(t *testing.T) {
 //
 // 与 internal/admin 的同名 helper 刻意分开：那边是 package admin 的测试，
 // 这边是 package main，两者不共享同一个测试二进制，不能互相引用。
-// 身份走 context（server.UserCtxKey）而不是 Authorization 头 —— 管理面读的是
+// 身份走 context（identity.WithUser）而不是 Authorization 头 —— 管理面读的是
 // context，头只在数据面 auth.Authenticate 里被读。
 func asAdminReq(r *http.Request) *http.Request {
 	return withRole(r, store.RoleAdmin, "admin-test")
@@ -193,7 +194,7 @@ func asNormalReq(r *http.Request) *http.Request {
 }
 
 func withRole(r *http.Request, role, id string) *http.Request {
-	ctx := context.WithValue(r.Context(), server.UserCtxKey(), &store.User{
+	ctx := identity.WithUser(r.Context(), &store.User{
 		ID: id, Username: id,
 		Role: role, Status: store.UserStatusActive, AuthVersion: 1,
 	})

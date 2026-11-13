@@ -283,7 +283,7 @@ func (h *KeyHandler) Create(w http.ResponseWriter, r *http.Request) {
 	// 归属：**一律是调用者自己**，管理员也不例外。
 	//
 	// 请求里的 user_id 被**完全忽略**（不报错、不生效）。管理员要替别人
-	// 建 key 只能建好之后走 Update 的「认领」（ReassignAccessKey）——
+	// 建 key 只能建好之后走 Update 的「认领」（UpdateAccessKeyWithOwner）——
 	// 那是一次可审计的独立动作，而不是在创建接口里留一个字段。
 	// 这样 key 的来源永远是「谁建的」，而归属变更永远是「谁改的」，
 	// 审计日志里两件事不会混在一条记录里。
@@ -724,7 +724,7 @@ func (h *KeyHandler) Update(w http.ResponseWriter, r *http.Request, id string) {
 
 	// 落库走**一个事务**（2026-10-21 修 A7-P2-08）。
 	//
-	// 原来是两次自动提交：UpdateAccessKey 之后 ReassignAccessKey。第二步
+	// 原来是两次自动提交：先 UpdateAccessKey、再单独改归属。第二步
 	// 失败时第一步已经落库，而响应是 404/500 —— 调用方看到失败、库里却是
 	// 新配置，重试与手工核对都会把「半截修改」当成原点。归属那一半更糟：
 	// 重命名成功、改归属失败，界面按旧响应显示新主人，下一次调用就用错了

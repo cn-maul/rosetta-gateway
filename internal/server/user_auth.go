@@ -1,40 +1,16 @@
 package server
 
 import (
-	"context"
 	"errors"
 	"net/http"
-	"time"
 
 	"github.com/cn-maul/rosetta-gateway/internal/access"
 	"github.com/cn-maul/rosetta-gateway/internal/httpx"
 	"github.com/cn-maul/rosetta-gateway/internal/identity"
-	"github.com/cn-maul/rosetta-gateway/internal/store"
 	"github.com/cn-maul/rosetta-gateway/internal/userauth"
 )
 
-// SessionCookieName 是会话 cookie 名。
-//
-// 刻意不用 __Host- 前缀：那要求 Secure 属性，而本项目跑在局域网 HTTP 上，
-// 浏览器不会接受没有 Secure 的 __Host- cookie。改用普通名字 + SameSite=Strict。
-const SessionCookieName = identity.SessionCookieName
-
-// SessionTTL 与 userauth.Manager 的令牌有效期一致。
-const SessionTTL = 8 * time.Hour
-
 type SessionStore = identity.SessionStore
-
-func SessionFromContext(ctx context.Context) *userauth.Session {
-	return identity.SessionFromContext(ctx)
-}
-
-func UserCtxKey() any { return identity.UserCtxKey() }
-
-func UserFromContext(ctx context.Context) *store.User {
-	return identity.UserFromContext(ctx)
-}
-
-func IsAdmin(ctx context.Context) bool { return identity.IsAdmin(ctx) }
 
 // UserAuthMiddleware 保护管理后台 API：只有用户会话一条通道。
 type UserAuthMiddleware struct {
@@ -49,10 +25,6 @@ func NewUserAuth(mgr *userauth.Manager, st SessionStore) *UserAuthMiddleware {
 		// 会话鉴权不跑 KDF，并发上限只会误伤正常页面（2026-10-10 修复）。
 		throttle: NewFailureThrottle(LoginFailLimit, LoginCooldown).WithoutConcurrencyCap(),
 	}
-}
-
-func UserAuth(next http.Handler, mgr *userauth.Manager, st SessionStore) http.Handler {
-	return NewUserAuth(mgr, st).Guard(next)
 }
 
 func (a *UserAuthMiddleware) Guard(next http.Handler) http.Handler {
@@ -110,8 +82,9 @@ func (a *UserAuthMiddleware) ServeHTTP(w http.ResponseWriter, r *http.Request, n
 		return
 	}
 
-	sess, err := a.mgr.Verify(token, u.AuthVersion)
-	if err != nil {
+	// 只做校验：会话内容（角色/用户名/到期时间）已由 *store.User 与
+	// token 自身承载，请求处理链上没有第二个读者。
+	if err := a.mgr.Verify(token, u.AuthVersion); err != nil {
 		a.throttle.Fail(ip)
 		httpx.WriteAuthError(w, http.StatusUnauthorized, sessionErrMessage(err))
 		return
@@ -131,7 +104,7 @@ func (a *UserAuthMiddleware) ServeHTTP(w http.ResponseWriter, r *http.Request, n
 	// slot; the derived context below is not visible to the outer middleware.
 	recordAuditActor(r.Context(), u.Username)
 
-	ctx := identity.WithSession(r.Context(), sess, u)
+	ctx := identity.WithUser(r.Context(), u)
 	next.ServeHTTP(w, r.WithContext(ctx))
 }
 
@@ -142,7 +115,7 @@ var safeMethods = map[string]bool{
 }
 
 func cookieAuthed(r *http.Request) bool {
-	c, err := r.Cookie(SessionCookieName)
+	c, err := r.Cookie(identity.SessionCookieName)
 	return err == nil && c.Value != ""
 }
 
@@ -158,20 +131,8 @@ func sessionErrMessage(err error) string {
 }
 
 func sessionToken(r *http.Request) string {
-	if c, err := r.Cookie(SessionCookieName); err == nil && c.Value != "" {
+	if c, err := r.Cookie(identity.SessionCookieName); err == nil && c.Value != "" {
 		return c.Value
 	}
 	return bearerToken(r)
-}
-
-func SetSessionCookie(w http.ResponseWriter, token string, exp time.Time, secure bool) {
-	identity.SetSessionCookie(w, token, exp, secure)
-}
-
-func ClearSessionCookie(w http.ResponseWriter) {
-	identity.ClearSessionCookie(w)
-}
-
-func TouchLogin(st SessionStore, ctx context.Context, userID string) {
-	identity.TouchLogin(st, ctx, userID)
 }

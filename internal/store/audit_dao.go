@@ -2,10 +2,7 @@ package store
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
-	"sort"
-	"strings"
 )
 
 // AuditEntry 是一条管理后台写操作的审计记录（DESIGN §13.3）。
@@ -75,20 +72,4 @@ func (s *Store) PruneAuditLog(ctx context.Context, keepRows int) (int64, error) 
 		return 0, err
 	}
 	return n, nil
-}
-
-// AuditFieldNames 从管理请求的 JSON body 提取顶层字段名（排序后逗号分隔）。
-// 解析失败（非 JSON、空 body）返回空串 —— 字段名是尽力而为的补充信息，
-// 不是审计成立的条件。
-func AuditFieldNames(body []byte) string {
-	var m map[string]json.RawMessage
-	if err := json.Unmarshal(body, &m); err != nil {
-		return ""
-	}
-	names := make([]string, 0, len(m))
-	for k := range m {
-		names = append(names, k)
-	}
-	sort.Strings(names)
-	return strings.Join(names, ",")
 }

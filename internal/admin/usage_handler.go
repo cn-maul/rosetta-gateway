@@ -5,7 +5,6 @@ import (
 	"database/sql"
 	"encoding/csv"
 	"fmt"
-	"math"
 	"net/http"
 	"net/url"
 	"strconv"
@@ -223,18 +222,6 @@ func callerScope(r *http.Request) string {
 		return "" // admin
 	}
 	return me.ID
-}
-
-// roundMillis 把 SQL 的 REAL 比值收敛回整毫秒。
-//
-// 落库是按 0.5ms 向上取整的单次值，聚合后出现小数是正常的（平均值本来
-// 就该允许小数），但对外契约一直是整数毫秒，这里四舍五入保持不变。
-// NULL → 0，与各查询原有的 COALESCE 口径一致。
-func roundMillis(v sql.NullFloat64) float64 {
-	if !v.Valid {
-		return 0
-	}
-	return math.Round(v.Float64)
 }
 
 // usageHistoryEntry 是「调用历史」表格的一行：一次真实请求的精简视图。

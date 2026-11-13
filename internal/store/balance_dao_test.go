@@ -150,7 +150,7 @@ func readRemainder(t *testing.T, st *Store, userID string) int64 {
 
 // 本用例是整个模块的核心：**扣掉的分必须等于 cost_total 换算的分**。
 //
-// 计价口径（priceUsage）：未命中输入 = MAX(input-cached,0)×price_input，
+// 计价口径（PriceUsage）：未命中输入 = MAX(input-cached,0)×price_input，
 // 命中输入 = cached×price_cache_hit（为 0 回退 price_input），输出 =
 // output×price_output，全部 /1e6，再舍入到 1e-9 元。
 // 这里 600k×0.2 + 400k×0.02 + 100k×0.8 = 0.208 元 → 21 分（0.208×100=20.8，
@@ -580,7 +580,7 @@ func TestYuanToCents(t *testing.T) {
 	}
 }
 
-// priceUsage 是全仓唯一的单价公式；这里钉住它的几条口径，防止有人为了
+// PriceUsage 是全仓唯一的单价公式；这里钉住它的几条口径，防止有人为了
 // 「优化」改坏回退规则（命中价回退输入价、负数夹 0、1e-9 舍入）。
 func TestPriceUsage_SharedPricingRules(t *testing.T) {
 	cases := []struct {
@@ -603,9 +603,9 @@ func TestPriceUsage_SharedPricingRules(t *testing.T) {
 		{"舍入到 1e-9（无长尾）", 0.003, 0, 0, 0, 1_000_000, 0, 0, 0, 0.003},
 	}
 	for _, c := range cases {
-		got := priceUsage(c.pin, c.phit, c.pcreate, c.pout, c.in, c.cached, c.creation, c.out)
+		got := PriceUsage(c.pin, c.phit, c.pcreate, c.pout, c.in, c.cached, c.creation, c.out)
 		if diff := got - c.want; diff > 1e-9 || diff < -1e-9 {
-			t.Errorf("%s: priceUsage = %v, want %v", c.name, got, c.want)
+			t.Errorf("%s: PriceUsage = %v, want %v", c.name, got, c.want)
 		}
 	}
 }

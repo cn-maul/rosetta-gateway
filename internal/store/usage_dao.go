@@ -354,15 +354,6 @@ func usageInsertArgs(r *UsageRecord, cost float64, costPending bool) []any {
 	}
 }
 
-// priceUsage 是包内别名，保留历史调用点与测试（见 pricing.go 的 PriceUsage）。
-//
-// 真正的定义在 pricing.go —— 全仓唯一，且现在**同时**被余额预检
-// （cmd/gateway/billing.go）与落库实扣共用，消除了审计 A4-P1-3 指出的
-// 两份公式漂移（只配 price_cache_hit 的模型预检 fail-open 漏放行）。
-func priceUsage(priceInput, priceCacheHit, priceCacheCreation, priceOutput, inputTokens, cachedTokens, cachedCreationTokens, outputTokens float64) float64 {
-	return PriceUsage(priceInput, priceCacheHit, priceCacheCreation, priceOutput, inputTokens, cachedTokens, cachedCreationTokens, outputTokens)
-}
-
 // usageStateCostPending 是 cost_total 因查价失败而**待重算**的标记
 // （2026-10-12 修 P1-2）。
 //
@@ -386,8 +377,8 @@ const usageStateCostPending = UsageStateCostPending
 
 // freezeUsageCost 算出一条用量的固化费用（元）。
 //
-// **只负责查价 + 记录待重算标记**，算钱一律委托 priceUsage
-// （见那里的「只有一份公式」）。
+// **只负责查价 + 记录待重算标记**，算钱一律委托 PriceUsage
+// （见 pricing.go 的「只有一份公式」）。
 //
 // **查价失败不返回错误、不阻断落库**：用量是硬需求（配额、限速、审计都靠它），
 // 费用不是。模型不存在、没配价、读池抖动，后果都只是这一条记录计 0 元 ——
@@ -574,22 +565,6 @@ func (s *Store) FindUnchargedUsage(ctx context.Context, limit int) ([]UnchargedU
 	return out, rows.Err()
 }
 
-// ChargeUnchargedUsage 补扣一条「已落库但没扣到钱」的用量记录。
-//
-// 幂等由 balance_charges 的占位行保证：同一个 (request_id, user_id)
-// 第二次调用会命中幂等快速路径，不会重复扣。所以这个方法可以安全地被
-// 对账任务反复调用。
-//
-// 欠费（ErrInsufficientBalance）**不算失败**：用户真的没钱了。这笔
-// 金额会进 balance_pending 待结算账本，用户充值后被结转（见
-// ChargeBalance 的欠费分支）。这里返回 nil，让对账任务把它当成
-// 「处理过了」—— 否则它会每轮都把同一笔捞出来重试，而重试永远不会
-// 成功（欠费不是瞬时故障）。
-func (s *Store) ChargeUnchargedUsage(ctx context.Context, u UnchargedUsage) error {
-	_, err := s.ReconcileOneUnchargedUsage(ctx, u)
-	return err
-}
-
 // ReconcileOneUnchargedUsage settles one reconciliation candidate and records
 // its typed outcome. A deferred result is durable retry state, not a success:
 // the row receives a bounded backoff so it cannot occupy every subsequent page.
@@ -692,7 +667,7 @@ func (s *Store) ReconcileUnchargedUsage(ctx context.Context, limit int) (Reconci
 // 欠费而没成功、或者两轮之间改了价）。若键不纳入目标费用，
 // 第二轮会命中第一轮的幂等行而不补扣 —— 那就是“改价后仍旧不收钱”。
 //
-// 粒度用微元（整数）而不是元：价格被保存到 1e-9 元（priceUsage 的舍入），
+// 粒度用微元（整数）而不是元：价格被保存到 1e-9 元（PriceUsage 的舍入），
 // 而微元粒度下的 1 微元 = 1e-6 元 才是真正意味着的最小可区分差异。
 //
 // record_id 里的分隔符适合性：record_id 是 32 位 hex（无冒号与细正符号），

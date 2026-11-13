@@ -52,6 +52,7 @@ import (
 	"github.com/cn-maul/rosetta-gateway/internal/access"
 	"github.com/cn-maul/rosetta-gateway/internal/admin"
 	"github.com/cn-maul/rosetta-gateway/internal/auth"
+	"github.com/cn-maul/rosetta-gateway/internal/identity"
 	"github.com/cn-maul/rosetta-gateway/internal/server"
 	"github.com/cn-maul/rosetta-gateway/internal/snapshot"
 	"github.com/cn-maul/rosetta-gateway/internal/store"
@@ -1271,7 +1272,7 @@ func TestAuthzCSRF_CookieAuthWriteRequiresJSONContentType(t *testing.T) {
 		if withCookie {
 			// 用 cookie 承载会话：浏览器跨站时会自动带上它 —— 这正是
 			// CSRF 的威胁模型（也是为什么 Content-Type 门禁必须存在）。
-			req.AddCookie(&http.Cookie{Name: server.SessionCookieName, Value: h.toks[idUser]})
+			req.AddCookie(&http.Cookie{Name: identity.SessionCookieName, Value: h.toks[idUser]})
 		}
 		req.RemoteAddr = "203.0.113.50:1111"
 		rec := httptest.NewRecorder()
@@ -1316,7 +1317,7 @@ func TestAuthzCSRF_CookieAuthWriteRequiresJSONContentType(t *testing.T) {
 // 就已经没有凭据了。Content-Type 门禁是第二道。
 func TestAuthzCSRF_SameSiteStrictOnSessionCookie(t *testing.T) {
 	rec := httptest.NewRecorder()
-	server.SetSessionCookie(rec, "tok", timeNowPlusHour(), false)
+	identity.SetSessionCookie(rec, "tok", timeNowPlusHour(), false)
 	cookies := rec.Result().Cookies()
 	if len(cookies) != 1 {
 		t.Fatalf("期望 1 个 cookie，得到 %d", len(cookies))

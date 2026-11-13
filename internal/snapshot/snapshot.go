@@ -7,6 +7,7 @@ import (
 	"sync/atomic"
 
 	"github.com/cn-maul/rosetta-gateway/internal/routing"
+	"github.com/cn-maul/rosetta-gateway/internal/store"
 )
 
 // Snapshot 是 /v1 数据面解析路由/密钥所用的只读快照。
@@ -60,12 +61,11 @@ type UserSnapshot struct {
 	AllowedModels ModelAllow
 }
 
-// UserStatusActive 与 store.UserStatusActive 保持字面量一致。
+// UserStatusActive 是「用户可用」状态，直接引用库模型里的权威常量。
 //
-// 这里复制常量而不 import store，是为了让鉴权热路径不依赖 store 包 ——
-// 那个包会把数据库驱动、事务、全部 DAO 一起拖进 auth 的依赖图。
-// 两处字面量必须同步修改（值都是 "active"）。
-const UserStatusActive = "active"
+// snapshot 本来就经 routing 传递依赖 store，单独复制一份字面量只会多出
+// 一处「必须同步修改」的隐性契约。
+const UserStatusActive = store.UserStatusActive
 
 // IsActive 报告该用户是否可用。
 func (u *UserSnapshot) IsActive() bool {
@@ -132,28 +132,11 @@ func (a ModelAllow) Allows(model string) bool {
 	return false
 }
 
-// Intersect 求两个白名单的交集：任一维度不限制即取另一个，都受限则取交。
+// RuntimeDefaults 是 store.RuntimeDefaults 在快照里的投影：字段一一对应，
+// 但只保留热路径需要的整数，0 一律表示「未配置，回落 config」。
 //
-// 交为空时结果是一个「受限的空白名单」= 拒绝全部，语义正确：
-// 组只允许 A、key 只允许 B（且 A≠B）时，这把 key 确实什么都调不了。
-func (a ModelAllow) Intersect(b ModelAllow) ModelAllow {
-	if a.Unrestricted {
-		return b
-	}
-	if b.Unrestricted {
-		return a
-	}
-	out := make([]string, 0, len(a.Models))
-	for _, m := range a.Models {
-		if b.Allows(m) {
-			out = append(out, m)
-		}
-	}
-	return ModelAllow{Models: out}
-}
-
-// RuntimeDefaults 镜像 store.RuntimeDefaults，避免 snapshot 的使用方（如 cmd/gateway
-// 的转发路径）为了读两个整数去依赖 store。0 一律表示「未配置，回落 config」。
+// 不直接复用 store 结构体：快照必须能在 rebuild 之后整体发布给并发 handler，
+// 与 store 的行模型解耦（runtime_contract_test 负责钉住字段同步）。
 type RuntimeDefaults struct {
 	UpstreamTimeoutMs         int
 	StreamIdleTimeoutMs       int

@@ -11,16 +11,12 @@ import (
 	"time"
 
 	"github.com/cn-maul/rosetta-gateway/internal/store"
-	"github.com/cn-maul/rosetta-gateway/internal/userauth"
 )
 
 type ctxKey string
 
-const (
-	sessionKey ctxKey = "admin_session"
-	// userKey 存 *store.User，供 handler 少查一次库。
-	userKey ctxKey = "admin_user"
-)
+// userKey 存 *store.User，供 handler 少查一次库。
+const userKey ctxKey = "admin_user"
 
 // SessionCookieName 是会话 cookie 名。
 const SessionCookieName = "rosetta_session"
@@ -32,37 +28,16 @@ type SessionStore interface {
 	TouchUserLogin(ctx context.Context, id string) error
 }
 
-// SessionFromContext 返回当前请求的会话；未登录时返回 nil。
-func SessionFromContext(ctx context.Context) *userauth.Session {
-	v, _ := ctx.Value(sessionKey).(*userauth.Session)
-	return v
-}
-
 // UserFromContext 返回当前请求的用户；未登录时返回 nil。
 func UserFromContext(ctx context.Context) *store.User {
 	v, _ := ctx.Value(userKey).(*store.User)
 	return v
 }
 
-// IsAdmin 报告当前请求是否带管理员身份。
-func IsAdmin(ctx context.Context) bool {
-	u := UserFromContext(ctx)
-	return u != nil && u.IsAdmin()
-}
-
-// WithSession 把会话与用户同时注入 context。
-func WithSession(ctx context.Context, sess *userauth.Session, u *store.User) context.Context {
-	ctx = context.WithValue(ctx, sessionKey, sess)
-	return context.WithValue(ctx, userKey, u)
-}
-
 // WithUser 只注入用户身份，主要用于 handler 测试。
 func WithUser(ctx context.Context, u *store.User) context.Context {
 	return context.WithValue(ctx, userKey, u)
 }
-
-// UserCtxKey 返回用户 context key，供必须手工构造 context 的测试使用。
-func UserCtxKey() any { return userKey }
 
 // SetSessionCookie 写出会话 cookie。
 //

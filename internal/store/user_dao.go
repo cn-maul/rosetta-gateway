@@ -219,12 +219,6 @@ func (s *Store) CreateUser(ctx context.Context, u *User) error {
 	return createUser(ctx, s.db, u)
 }
 
-// CreateUserTx 在调用方的事务里插入用户（配置导入用：用户与他的访问密钥
-// 必须在同一笔提交里，否则「用户建好了、密钥没建」会留一个登不进去的空壳）。
-func (s *Store) CreateUserTx(ctx context.Context, tx Tx, u *User) error {
-	return createUser(ctx, tx, u)
-}
-
 // createUser 接受 execer，让同一份 SQL 既能在自动提交下跑也能进事务。
 func createUser(ctx context.Context, ex execer, u *User) error {
 	now := time.Now().UnixMilli()

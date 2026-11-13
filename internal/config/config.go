@@ -223,14 +223,6 @@ type BootstrapRoute struct {
 
 var slugRe = regexp.MustCompile(`^[a-z0-9]{2,32}$`)
 
-func Load(path string) (*Config, error) {
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return nil, fmt.Errorf("read config: %w", err)
-	}
-	return Parse(data)
-}
-
 // Default 返回一份可直接启动的最小配置：不含任何 provider/route，
 // 全部由管理后台在前端添加。
 //

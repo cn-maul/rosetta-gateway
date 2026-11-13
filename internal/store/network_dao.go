@@ -2,9 +2,7 @@ package store
 
 import (
 	"context"
-	crand "crypto/rand"
 	"database/sql"
-	"encoding/hex"
 	"strings"
 	"time"
 )
@@ -129,11 +127,4 @@ func normalizeNetworkID(id string) string {
 		return ""
 	}
 	return id
-}
-
-// NewNetworkID 生成一条出站网络的主键。
-func NewNetworkID() string {
-	b := make([]byte, 16)
-	crand.Read(b)
-	return "net-" + hex.EncodeToString(b)
 }

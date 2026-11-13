@@ -32,7 +32,7 @@ import (
 // 的 —— 别因为数据面管理员被拦就把那条也一起关掉。
 func IsBalanceExempt(role string) bool { return role == store.RoleAdmin }
 
-// estimateBalanceCost 估算「本次请求大概要花多少钱」（单位：**分**）。
+// estimateBalanceCostWithInput 估算「本次请求大概要花多少钱」（单位：**分**）。
 //
 // 输入侧与 ingress.EstimateRequestTokens 同思路（文本/思考/工具参数/工具定义的字符
 // 估算），输出侧按 max_tokens **全额计上界** —— 输出长度事前不可知，流式更是
@@ -50,7 +50,7 @@ func IsBalanceExempt(role string) bool { return role == store.RoleAdmin }
 //
 // # 计价公式现在**与实扣同源**（2026-10-21 修 A4-P1-3 / 汇总 F3）
 //
-// 审计前这里是**手抄的第二份公式**，兜底规则与实扣的 store.priceUsage
+// 审计前这里是**手抄的第二份公式**，兜底规则与实扣的 store.PriceUsage
 // 不同（少了缓存价这一项），后果是：只配了 price_cache_hit 的模型在预检
 // 侧被判成「完全未配价」→ 提前 return 0 → **fail-open 漏放行**（余额 1 元
 // 的用户可以持续刷到余额耗尽，而实扣照收缓存价）。
@@ -62,10 +62,6 @@ func IsBalanceExempt(role string) bool { return role == store.RoleAdmin }
 //
 // 换句话说：预检估出的值 **≥** 实扣值（保守方向仍然正确），但
 // 「哪些 token 收费」的口径不再可能分叉。
-func EstimateBalanceCost(req *rosetta.ChatRequest, m *routing.UpstreamModel) int64 {
-	return estimateBalanceCostWithInput(req, m, ingress.EstimateInputTokensOnly(req))
-}
-
 func estimateBalanceCostWithInput(req *rosetta.ChatRequest, m *routing.UpstreamModel, inTokens int64) int64 {
 	// 输出侧按 max_tokens 全额计上界；客户端没给（<=0）时回落模型配置的最大
 	// 输出 —— 都拿不到就只按输入算（下界，宁可不高估）。

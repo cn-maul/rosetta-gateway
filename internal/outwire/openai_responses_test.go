@@ -197,7 +197,7 @@ func TestResponsesSSE_ToolCallAndFailure(t *testing.T) {
 // 回放时报 "Item with id 'rs_…' not found"。
 func TestWriteResponsesResponse_ReasoningSealed(t *testing.T) {
 	rec := httptest.NewRecorder()
-	WriteResponsesResponse(rec, &rosetta.ChatResponse{
+	WriteResponsesResponseWithTools(rec, &rosetta.ChatResponse{
 		ID: "up-9", Model: "x",
 		Content: []rosetta.Block{
 			{Type: rosetta.BlockThinking, Thinking: "先想一下", Sealed: "gAAAAA-secret", SealedBy: string(rosetta.ProtoOpenAIResponses), ReasoningID: "rs_abc"},
@@ -205,7 +205,7 @@ func TestWriteResponsesResponse_ReasoningSealed(t *testing.T) {
 		},
 		StopReason: rosetta.StopEnd,
 		Usage:      rosetta.Usage{InputTokens: 5, OutputTokens: 6, TotalTokens: 11},
-	}, "gw-model")
+	}, "gw-model", nil)
 
 	var out struct {
 		Output []struct {
@@ -236,7 +236,7 @@ func TestWriteResponsesResponse_ReasoningSealed(t *testing.T) {
 // 非流式对象：output 块序、status/usage、tool input 对象化。
 func TestWriteResponsesResponse(t *testing.T) {
 	rec := httptest.NewRecorder()
-	WriteResponsesResponse(rec, &rosetta.ChatResponse{
+	WriteResponsesResponseWithTools(rec, &rosetta.ChatResponse{
 		ID: "up-9", Model: "x",
 		Content: []rosetta.Block{
 			{Type: rosetta.BlockText, Text: "答"},
@@ -245,7 +245,7 @@ func TestWriteResponsesResponse(t *testing.T) {
 		},
 		StopReason: rosetta.StopLength,
 		Usage:      rosetta.Usage{InputTokens: 5, OutputTokens: 6, TotalTokens: 11},
-	}, "gw-model")
+	}, "gw-model", nil)
 
 	var out struct {
 		ID         string `json:"id"`

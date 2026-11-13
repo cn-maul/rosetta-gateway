@@ -1,13 +1,17 @@
 package server
 
-import "net/http"
+import (
+	"net/http"
+
+	"github.com/cn-maul/rosetta-gateway/internal/identity"
+)
 
 // DenyAdminKeyCreate blocks administrators from minting data-plane API keys.
 // The route-level policy is kept separate from KeyHandler.Create so ordinary
 // user self-service behavior remains unchanged.
 func DenyAdminKeyCreate(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		u := UserFromContext(r.Context())
+		u := identity.UserFromContext(r.Context())
 		if u == nil || u.ID == "" {
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusUnauthorized)

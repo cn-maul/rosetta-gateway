@@ -34,9 +34,12 @@ func TestManager_IssueVerifyRoundTrip(t *testing.T) {
 	if time.Until(exp) <= 0 {
 		t.Error("token already expired at issue time")
 	}
-	s, err := m.Verify(tok, 3)
-	if err != nil {
+	if err := m.Verify(tok, 3); err != nil {
 		t.Fatalf("verify: %v", err)
+	}
+	s, err := m.Peek(tok)
+	if err != nil {
+		t.Fatalf("peek: %v", err)
 	}
 	if s.UserID != "u1" || s.Role != "admin" || s.Username != "alice" {
 		t.Errorf("claims roundtrip wrong: %+v", s)
@@ -49,14 +52,14 @@ func TestVerify_StaleAuthVersionRejected(t *testing.T) {
 	m := newTestManager(t)
 	tok, _, _ := m.Issue(&UserClaims{UserID: "u1", AuthVersion: 1})
 
-	if _, err := m.Verify(tok, 1); err != nil {
+	if err := m.Verify(tok, 1); err != nil {
 		t.Fatalf("same version should verify: %v", err)
 	}
-	if _, err := m.Verify(tok, 2); err != ErrStaleVersion {
+	if err := m.Verify(tok, 2); err != ErrStaleVersion {
 		t.Errorf("newer version: err = %v, want ErrStaleVersion", err)
 	}
 	// currentVersion < 0 = 用户已不存在
-	if _, err := m.Verify(tok, -1); err != ErrStaleVersion {
+	if err := m.Verify(tok, -1); err != ErrStaleVersion {
 		t.Errorf("deleted user: err = %v, want ErrStaleVersion", err)
 	}
 }
@@ -74,7 +77,7 @@ func TestVerify_ExpiredToken(t *testing.T) {
 	if err != nil {
 		t.Fatalf("issue expired: %v", err)
 	}
-	if _, err := m.Verify(tok2, 1); err != ErrTokenExpired {
+	if err := m.Verify(tok2, 1); err != ErrTokenExpired {
 		t.Errorf("expired token: err = %v, want ErrTokenExpired", err)
 	}
 	_ = tok
@@ -86,7 +89,7 @@ func TestVerify_RejectsAlgNone(t *testing.T) {
 	// 手工构造：header={"alg":"none","typ":"JWT"}, payload 无签名
 	unsigned := "eyJhbGciOiJub25lIiwidHlwIjoiSldUIn0." +
 		"eyJ1aWQiOiJ1MSIsImF2IjoxLCJzdWIiOiJ1MSJ9."
-	if _, err := m.Verify(unsigned, 1); err == nil {
+	if err := m.Verify(unsigned, 1); err == nil {
 		t.Error("alg=none token was accepted")
 	}
 }
@@ -99,7 +102,7 @@ func TestVerify_RejectsForeignSignature(t *testing.T) {
 	if err != nil {
 		t.Fatalf("issue: %v", err)
 	}
-	if _, err := m.Verify(tok, 1); err != ErrTokenInvalid {
+	if err := m.Verify(tok, 1); err != ErrTokenInvalid {
 		t.Errorf("foreign-signed token: err = %v, want ErrTokenInvalid", err)
 	}
 }
@@ -107,7 +110,7 @@ func TestVerify_RejectsForeignSignature(t *testing.T) {
 func TestVerify_RejectsGarbage(t *testing.T) {
 	m := newTestManager(t)
 	for _, tok := range []string{"", "   ", "not.a.jwt", "a.b", "...."} {
-		if _, err := m.Verify(tok, 1); err == nil {
+		if err := m.Verify(tok, 1); err == nil {
 			t.Errorf("garbage token %q accepted", tok)
 		}
 	}
@@ -122,7 +125,7 @@ func TestVerify_RejectsTamperedPayload(t *testing.T) {
 		t.Fatalf("unexpected token shape: %d segments", len(parts))
 	}
 	// 把payload 换成 admin 身份
-	if _, err := m.Verify(parts[0]+"."+parts[1]+"x."+parts[2], 1); err == nil {
+	if err := m.Verify(parts[0]+"."+parts[1]+"x."+parts[2], 1); err == nil {
 		t.Error("tampered payload accepted")
 	}
 }
@@ -162,7 +165,7 @@ func TestManager_Disabled(t *testing.T) {
 	if _, _, err := m.Issue(&UserClaims{UserID: "u1"}); err == nil {
 		t.Error("nil manager issued a token")
 	}
-	if _, err := m.Verify("anything", 1); err != ErrTokenInvalid {
+	if err := m.Verify("anything", 1); err != ErrTokenInvalid {
 		t.Errorf("nil manager verify: err = %v, want ErrTokenInvalid", err)
 	}
 	if _, err := m.Peek("anything"); err != ErrTokenInvalid {
@@ -175,22 +178,6 @@ func TestNewManager_RejectsShortSecret(t *testing.T) {
 	t.Setenv(SecretEnvName, "too-short")
 	if _, err := NewManager(""); err == nil {
 		t.Error("short secret accepted; want error")
-	}
-}
-
-func TestFingerprint_StableAndDistinct(t *testing.T) {
-	a := &Session{UserID: "u1"}
-	b := &Session{UserID: "u1"}
-	c := &Session{UserID: "u2"}
-	if a.Fingerprint() != b.Fingerprint() {
-		t.Error("fingerprint not stable for same user")
-	}
-	if a.Fingerprint() == c.Fingerprint() {
-		t.Error("fingerprint collides across users")
-	}
-	var nilSess *Session
-	if nilSess.Fingerprint() != "" {
-		t.Error("nil session should have empty fingerprint")
 	}
 }
 
@@ -224,7 +211,7 @@ func TestNewManager_GeneratesAndPersistsSecret(t *testing.T) {
 		t.Fatalf("issue with reloaded secret: %v", err)
 	}
 	// 关键断言：重启前签发的令牌，重启后仍然有效。
-	if _, err := m2.Verify(tok, 1); err != nil {
+	if err := m2.Verify(tok, 1); err != nil {
 		t.Errorf("token issued before restart rejected after restart: %v", err)
 	}
 }

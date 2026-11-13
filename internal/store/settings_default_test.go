@@ -34,7 +34,7 @@ func TestModelDefaults_FallbackIs128K64K(t *testing.T) {
 	}
 
 	// 2) 显式配 0 / 负数（模型未设置 → NULL）也必须落回兜底，而不是 0。
-	if err := st.SetModelDefaults(ctx, ModelDefaults{}); err != nil {
+	if err := st.SaveSettings(ctx, ModelDefaults{}, RuntimeDefaults{}); err != nil {
 		t.Fatalf("set zero: %v", err)
 	}
 	z, err := st.GetModelDefaults(ctx)
@@ -47,7 +47,7 @@ func TestModelDefaults_FallbackIs128K64K(t *testing.T) {
 
 	// 3) 显式配置覆盖兜底，且不被回落逻辑改写。
 	want := ModelDefaults{ContextWindow: 32000, MaxOutputTokens: 8000}
-	if err := st.SetModelDefaults(ctx, want); err != nil {
+	if err := st.SaveSettings(ctx, want, RuntimeDefaults{}); err != nil {
 		t.Fatalf("set explicit: %v", err)
 	}
 	back, err := st.GetModelDefaults(ctx)
