@@ -159,8 +159,6 @@ type PruneResult struct {
 // # 切分点用本地时区
 //
 // 与表 A 的 day 列、前端 GroupByDay 同一口径（那是用户在界面上看到的那一套）。
-// 注意 SumTokensByDayForKey 用 UTC（/v1/organization/* 的数据源），
-// 两套并存是已知且刻意的。
 //
 // 不动表 B：终身累计与剪枝解耦，那是它存在的唯一理由。
 func (s *Store) PruneOldUsage(ctx context.Context, keepDays int) (*PruneResult, error) {

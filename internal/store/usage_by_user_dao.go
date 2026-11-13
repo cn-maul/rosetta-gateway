@@ -51,7 +51,7 @@ type UserUsageStat struct {
 //
 // # 数据源是 UsageSource（明细 ∪ 日归档）
 //
-// 与 GetUsageStats / SumCostBuckets 同一个理由：只查明细的话，30 天剪枝一跑，
+// 与 GetUsageStats 同一个理由：只查明细的话，30 天剪枝一跑，
 // 按用户的汇总就会**逐日缩水** —— 用户上个月花的钱会凭空消失，而这张表正是
 // 管理员用来对账的。归档那半边是「剪枝后合计不变」的唯一保证。
 //

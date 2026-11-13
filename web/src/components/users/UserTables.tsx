@@ -16,7 +16,7 @@ export interface UsersTableProps {
    * 不能靠一个全局 busy：点不同行本就该各自进行。 */
   pending: UserRowPending
   onEdit: (u: User) => void
-  /** 改密（有密码）或生成设密链接（无密码），由父级分派。 */
+  /** 重置该用户的密码，由父级分派。 */
   onPassword: (u: User) => void
   onToggle: (u: User) => void
   onDelete: (u: User) => void
@@ -97,13 +97,7 @@ export function UsersTable({ users, groups, loading, err, pending, onEdit, onPas
                         编辑
                       </Button>
                       <span
-                        title={
-                          u.status !== 'active'
-                            ? '请先启用该用户'
-                            : u.has_password
-                              ? '重置该用户的密码'
-                              : '生成 24 小时有效的一次性设密链接'
-                        }
+                        title={u.status !== 'active' ? '请先启用该用户' : '重置该用户的密码'}
                       >
                         <Button
                           variant="ghost"
@@ -111,7 +105,7 @@ export function UsersTable({ users, groups, loading, err, pending, onEdit, onPas
                           isDisabled={u.status !== 'active' || isPending(u.id)}
                           onPress={() => onPassword(u)}
                         >
-                          {rowLabel(u.id, u.has_password ? '改密' : '设密')}
+                          {rowLabel(u.id, '重置密码')}
                         </Button>
                       </span>
                       <span title={u.is_self ? '不能禁用自己的账号' : '禁用后该用户的所有登录状态立即失效'}>

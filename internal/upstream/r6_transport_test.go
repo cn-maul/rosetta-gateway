@@ -3,106 +3,58 @@ package upstream
 import (
 	"context"
 	"fmt"
+	"io"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"sync"
 	"testing"
-	"time"
 
 	"github.com/cn-maul/rosetta"
+	"github.com/cn-maul/rosetta-gateway/internal/crypto"
 	"github.com/cn-maul/rosetta-gateway/internal/store"
 )
 
-// R6-M06-01: a known hard limit does not make the used amount known. A failed
-// usage lookup must be exposed as unknown, never as an exact "hard limit - 0".
-func TestR6_OpenAIBalanceDoesNotInventZeroUsed(t *testing.T) {
-	cases := []struct {
-		name      string
-		usage     func(http.ResponseWriter)
-		timeout   time.Duration
-		wantInMsg string
-	}{
-		{
-			name: "usage non-200",
-			usage: func(w http.ResponseWriter) {
-				w.WriteHeader(http.StatusServiceUnavailable)
-			},
-			wantInMsg: "HTTP 503",
-		},
-		{
-			name: "usage malformed JSON",
-			usage: func(w http.ResponseWriter) {
-				fmt.Fprint(w, `{"total_usage":`)
-			},
-			wantInMsg: "解析",
-		},
-		{
-			name: "usage missing total_usage",
-			usage: func(w http.ResponseWriter) {
-				fmt.Fprint(w, `{"object":"list"}`)
-			},
-			wantInMsg: "total_usage",
-		},
-		{
-			name: "usage timeout",
-			usage: func(w http.ResponseWriter) {
-				time.Sleep(2 * time.Second)
-			},
-			timeout:   40 * time.Millisecond,
-			wantInMsg: "deadline",
-		},
+func balanceFixture(t *testing.T) (*store.Store, string, []byte) {
+	t.Helper()
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	st, err := store.Open(t.TempDir()+"/r6.db", logger)
+	if err != nil {
+		t.Fatalf("open store: %v", err)
 	}
+	t.Cleanup(func() { st.Close() })
 
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-				switch r.URL.Path {
-				case "/dashboard/billing/subscription":
-					fmt.Fprint(w, `{"hard_limit_usd":100}`)
-				case "/dashboard/billing/usage":
-					tc.usage(w)
-				default:
-					w.WriteHeader(http.StatusNotFound)
-				}
-			}))
-			defer srv.Close()
+	master := []byte("0123456789abcdef0123456789abcdef")
+	p := &store.Provider{
+		ID: "p1", Slug: "p1", Name: "P1", Protocol: "chat",
+		Endpoint: "http://127.0.0.1:0", Enabled: true,
+	}
+	if err := st.CreateProvider(context.Background(), p); err != nil {
+		t.Fatalf("create provider: %v", err)
+	}
+	enc, err := crypto.Encrypt([]byte("sk-secret"), master)
+	if err != nil {
+		t.Fatalf("encrypt: %v", err)
+	}
+	cred := &store.Credential{
+		ID: "c1", ProviderID: "p1", Label: "主号",
+		APIKeyEnc: enc, Enabled: true, Weight: 1, Status: "healthy",
+	}
+	if err := st.CreateCredential(context.Background(), cred); err != nil {
+		t.Fatalf("create credential: %v", err)
+	}
+	return st, p.ID, master
+}
 
-			st, pid, master := balanceFixture(t)
-			setEndpoint(t, st, pid, srv.URL)
-			asDialect(t, func(ctx context.Context, p *store.Provider, key string) (balanceReading, error) {
-				return fetchOpenAIBalance(ctx, p, key)
-			})
-
-			ctx := context.Background()
-			if tc.timeout > 0 {
-				var cancel context.CancelFunc
-				ctx, cancel = context.WithTimeout(ctx, tc.timeout)
-				defer cancel()
-			}
-			res, err := QueryProviderBalance(ctx, st, pid, master)
-			if err != nil {
-				t.Fatalf("query: %v", err)
-			}
-			if len(res.Results) != 1 {
-				t.Fatalf("results = %+v", res.Results)
-			}
-			r := res.Results[0]
-			if r.Status != "unknown" {
-				t.Fatalf("status = %q, want unknown (amount=%v detail=%q)", r.Status, r.Amount, r.Detail)
-			}
-			if r.Amount != 0 {
-				t.Fatalf("unknown usage exposed a precise amount: %v", r.Amount)
-			}
-			if r.FetchedAt == 0 {
-				t.Fatalf("unknown result lacks fetch time: %+v", r)
-			}
-			if !containsAny(r.Message, tc.wantInMsg) && !containsAny(r.Detail, tc.wantInMsg) {
-				t.Fatalf("failure reason %q missing from message=%q detail=%q", tc.wantInMsg, r.Message, r.Detail)
-			}
-			if res.Status != "unknown" {
-				t.Fatalf("provider status = %q, want unknown", res.Status)
-			}
-		})
+func setEndpoint(t *testing.T, st *store.Store, id, endpoint string) {
+	t.Helper()
+	p, err := st.GetProvider(context.Background(), id)
+	if err != nil || p == nil {
+		t.Fatalf("get provider: %v", err)
+	}
+	p.Endpoint = endpoint
+	if err := st.UpdateProvider(context.Background(), id, p); err != nil {
+		t.Fatalf("update provider: %v", err)
 	}
 }
 
@@ -175,33 +127,4 @@ func TestR6_AnthropicDiscoveryUsesResolvedProtocolAuth(t *testing.T) {
 			}
 		})
 	}
-}
-
-func containsAny(s, want string) bool {
-	return len(want) == 0 || (len(s) >= len(want) && containsFold(s, want))
-}
-
-func containsFold(s, want string) bool {
-	// This test only needs ASCII diagnostics and avoids importing strings solely
-	// for case-insensitive failure matching.
-	for i := 0; i+len(want) <= len(s); i++ {
-		ok := true
-		for j := range want {
-			a, b := s[i+j], want[j]
-			if a >= 'A' && a <= 'Z' {
-				a += 'a' - 'A'
-			}
-			if b >= 'A' && b <= 'Z' {
-				b += 'a' - 'A'
-			}
-			if a != b {
-				ok = false
-				break
-			}
-		}
-		if ok {
-			return true
-		}
-	}
-	return false
 }

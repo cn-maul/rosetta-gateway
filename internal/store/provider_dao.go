@@ -25,18 +25,9 @@ type Provider struct {
 	NetworkID string
 	// ProxyURL 是**派生**值：NetworkID 指向的网络的 proxy_url，直连时为空串。
 	// 它由读路径 JOIN 出来，供展示与池构建使用；不单独落库。
-	ProxyURL string
-	// BalanceSpecJSON 是余额查询的**显式配置**，JSON 串，空串 = 不配
-	// （回落到按端点特征的自动判定）。见 balance.go 的 parseBalanceSpec。
-	//
-	// 为什么是一整个 JSON 列而不是三个标量列（path / field / header）：
-	// 余额响应各家的形状差异很大（字段名、嵌套层级、币种键名），三个标量
-	// 迟早不够用，而每加一列就是一次 schema 迁移 + 三处读路径同步改。
-	// 一列 JSON 让「新增一种表达」不碰 schema，且留空即「未配置」的语义
-	// 与 proxy_url / quirks_json 一致。
-	BalanceSpecJSON string
-	CreatedAt       int64
-	UpdatedAt       int64
+	ProxyURL  string
+	CreatedAt int64
+	UpdatedAt int64
 
 	// ModelCount / CredCount 是**派生的统计值**，不在 providers 表里 ——
 	// 它们的真源分别是 upstream_models 与 provider_credentials 的行数。
@@ -73,7 +64,7 @@ const proxyExpr = `COALESCE(n.proxy_url, '')`
 // 列顺序必须与 scanProvider 的 Scan 顺序**逐字对应**：派生出来的代理地址
 // 在 providerColumns 之后、两个派生计数之前被扫 —— 那正是 providerSelect
 // 里 proxy_expr 写在那里的原因，不是随手排的。
-const providerColumns = `providers.id, providers.slug, providers.name, providers.protocol, providers.endpoint, providers.enabled, providers.timeout_ms, providers.max_retries, providers.quirks_json, providers.network_id, providers.balance_spec_json, providers.created_at, providers.updated_at`
+const providerColumns = `providers.id, providers.slug, providers.name, providers.protocol, providers.endpoint, providers.enabled, providers.timeout_ms, providers.max_retries, providers.quirks_json, providers.network_id, providers.created_at, providers.updated_at`
 
 // providerCounts 是两个派生计数（见 Provider.ModelCount 的注释）。
 const providerCounts = `
@@ -88,11 +79,9 @@ func scanProvider(sc scanner) (Provider, error) {
 	var quirks sql.NullString
 	var networkID sql.NullString
 	var proxyURL string
-	var balanceSpec sql.NullString
-
 	// 派生计数来自 COALESCE 出来的非空值，扫进 int 即可。
 	err := sc.Scan(&p.ID, &p.Slug, &p.Name, &p.Protocol, &p.Endpoint, &enabled,
-		&p.TimeoutMs, &p.MaxRetries, &quirks, &networkID, &balanceSpec, &p.CreatedAt, &p.UpdatedAt,
+		&p.TimeoutMs, &p.MaxRetries, &quirks, &networkID, &p.CreatedAt, &p.UpdatedAt,
 		&proxyURL,
 		&p.ModelCount, &p.CredCount)
 	if err != nil {
@@ -102,7 +91,6 @@ func scanProvider(sc scanner) (Provider, error) {
 	p.QuirksJSON = quirks.String
 	p.NetworkID = networkID.String
 	p.ProxyURL = proxyURL
-	p.BalanceSpecJSON = balanceSpec.String
 	return p, nil
 }
 
@@ -171,9 +159,9 @@ func createProvider(ctx context.Context, ex execer, p *Provider) error {
 		enabled = 1
 	}
 	_, err := ex.ExecContext(ctx,
-		`INSERT INTO providers (id, slug, name, protocol, endpoint, enabled, timeout_ms, max_retries, quirks_json, network_id, balance_spec_json, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		`INSERT INTO providers (id, slug, name, protocol, endpoint, enabled, timeout_ms, max_retries, quirks_json, network_id, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		p.ID, p.Slug, p.Name, p.Protocol, p.Endpoint, enabled, p.TimeoutMs, p.MaxRetries,
-		nullIfEmpty(p.QuirksJSON), nullIfEmpty(normalizeNetworkID(p.NetworkID)), nullIfEmpty(p.BalanceSpecJSON), now, now)
+		nullIfEmpty(p.QuirksJSON), nullIfEmpty(normalizeNetworkID(p.NetworkID)), now, now)
 	// 回写时间戳，否则创建响应里的 created_at/updated_at 是 0，与库里不一致。
 	if err == nil {
 		p.CreatedAt, p.UpdatedAt = now, now
@@ -187,9 +175,9 @@ func (s *Store) UpdateProvider(ctx context.Context, id string, p *Provider) erro
 		enabled = 1
 	}
 	res, err := s.db.ExecContext(ctx,
-		`UPDATE providers SET slug = ?, name = ?, protocol = ?, endpoint = ?, enabled = ?, timeout_ms = ?, max_retries = ?, quirks_json = ?, network_id = ?, balance_spec_json = ?, updated_at = ? WHERE id = ?`,
+		`UPDATE providers SET slug = ?, name = ?, protocol = ?, endpoint = ?, enabled = ?, timeout_ms = ?, max_retries = ?, quirks_json = ?, network_id = ?, updated_at = ? WHERE id = ?`,
 		p.Slug, p.Name, p.Protocol, p.Endpoint, enabled, p.TimeoutMs, p.MaxRetries,
-		nullIfEmpty(p.QuirksJSON), nullIfEmpty(normalizeNetworkID(p.NetworkID)), nullIfEmpty(p.BalanceSpecJSON),
+		nullIfEmpty(p.QuirksJSON), nullIfEmpty(normalizeNetworkID(p.NetworkID)),
 		time.Now().UnixMilli(), id)
 	return checkAffected(res, err)
 }

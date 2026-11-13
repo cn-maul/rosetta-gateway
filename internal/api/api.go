@@ -14,7 +14,6 @@ import (
 	"time"
 
 	"github.com/cn-maul/rosetta-gateway/internal/admin"
-	"github.com/cn-maul/rosetta-gateway/internal/billinghttp"
 	"github.com/cn-maul/rosetta-gateway/internal/catalog"
 	"github.com/cn-maul/rosetta-gateway/internal/config"
 	"github.com/cn-maul/rosetta-gateway/internal/dataplane"
@@ -181,9 +180,6 @@ func BuildApp(d Deps) *App {
 	// 登录页永远显示默认名。见 admin/site_handler.go 的注释。
 	siteHandler := admin.NewSiteHandler(db)
 	usageHandler := admin.NewUsageHandler(db, cfg)
-	// 供应商 + 模型的导入导出。写在 settings 附近是因为它在界面上的入口
-	// 也在「设置」页里，与设置项同一层级。
-	configTransferHandler := admin.NewConfigTransferHandler(db, masterKey, cfg)
 	userHandler := admin.NewUserHandler(db, sessionMgr)
 	records := make(map[string]Route)
 	mux := newRouteMux(false, records)
@@ -256,13 +252,6 @@ func BuildApp(d Deps) *App {
 		{Pattern: "GET /v1/models/{model...}", Handler: catalog.Get(""), Scope: routeRoot},
 		{Pattern: "GET /openai/v1/models/{model...}", Handler: catalog.Get("openai"), Scope: routeRoot},
 		{Pattern: "GET /anthropic/v1/models/{model...}", Handler: catalog.Get("anthropic"), Scope: routeRoot},
-		// 额度/费用查询（官方 usage/costs + 生态兼容 dashboard billing，见 billing.go）
-		{Pattern: "GET /dashboard/billing/subscription", Handler: billinghttp.Subscription(db), Scope: routeRoot},
-		{Pattern: "GET /v1/dashboard/billing/subscription", Handler: billinghttp.Subscription(db), Scope: routeRoot},
-		{Pattern: "GET /dashboard/billing/usage", Handler: billinghttp.Usage(db), Scope: routeRoot},
-		{Pattern: "GET /v1/dashboard/billing/usage", Handler: billinghttp.Usage(db), Scope: routeRoot},
-		{Pattern: "GET /v1/organization/costs", Handler: billinghttp.OrgCosts(db), Scope: routeRoot},
-		{Pattern: "GET /v1/organization/usage/completions", Handler: billinghttp.OrgUsageCompletions(db), Scope: routeRoot},
 		{Pattern: "POST /admin/api/login", Handler: userHandler.Login, Public: true},
 		{Pattern: "GET /admin/api/session", Handler: userHandler.SessionStatus, Public: true},
 		// 首次登录引导：没有这两个端点，新部署的 admin（空密码）永远登不进去。
@@ -270,13 +259,6 @@ func BuildApp(d Deps) *App {
 		{
 			Pattern: "POST /admin/api/bootstrap", Handler: userHandler.BootstrapSetup, Public: true,
 			RootHandler: server.AuditOnly(http.HandlerFunc(userHandler.BootstrapSetup), audit).ServeHTTP,
-		},
-		// 普通用户的一次性设密链接：只有管理员能签发，公开端点只接受高熵
-		// token。token 放在请求体里，避免被反向代理访问日志记录。
-		{Pattern: "POST /admin/api/password-setup/check", Handler: userHandler.CheckPasswordSetupLink, Public: true},
-		{
-			Pattern: "POST /admin/api/password-setup", Handler: userHandler.CompletePasswordSetup, Public: true,
-			RootHandler: server.AuditOnly(http.HandlerFunc(userHandler.CompletePasswordSetup), audit).ServeHTTP,
 		},
 		{Pattern: "GET /admin/api/providers", Handler: providerHandler.List, Public: false},
 		{Pattern: "POST /admin/api/providers", Handler: providerHandler.Create, Public: false},
@@ -295,11 +277,6 @@ func BuildApp(d Deps) *App {
 		{Pattern: "POST /admin/api/networks", Handler: networkHandler.Create, Public: false},
 		{Pattern: "PATCH /admin/api/networks/{id}", Handler: func(w http.ResponseWriter, r *http.Request) { networkHandler.Update(w, r, r.PathValue("id")) }, Public: false},
 		{Pattern: "DELETE /admin/api/networks/{id}", Handler: func(w http.ResponseWriter, r *http.Request) { networkHandler.Delete(w, r, r.PathValue("id")) }, Public: false},
-		// 上游余额查询：逐条凭据打上游的余额端点（见 internal/upstream/balance.go）。
-		// 纯读操作，不改任何配置，因此不触发 AutoReload（挂 reload 的写操作判据
-		// 看的是方法/路径白名单，这里是 POST 却明确不参与，理由见 handler 注释）。
-		{Pattern: "POST /admin/api/providers/{id}/balance", Handler: func(w http.ResponseWriter, r *http.Request) { providerHandler.Balance(w, r, r.PathValue("id")) }, Public: false},
-
 		{Pattern: "GET /admin/api/providers/{id}/credentials", Handler: func(w http.ResponseWriter, r *http.Request) { credentialHandler.List(w, r, r.PathValue("id")) }, Public: false},
 		{Pattern: "POST /admin/api/providers/{id}/credentials", Handler: func(w http.ResponseWriter, r *http.Request) { credentialHandler.Create(w, r, r.PathValue("id")) }, Public: false},
 		{Pattern: "PATCH /admin/api/credentials/{id}", Handler: func(w http.ResponseWriter, r *http.Request) { credentialHandler.Update(w, r, r.PathValue("id")) }, Public: false},
@@ -364,11 +341,6 @@ func BuildApp(d Deps) *App {
 		// PUT 需要管理员：改品牌等于改所有人（含未登录访客）看到的内容。
 		{Pattern: "GET /admin/api/site", Handler: siteHandler.Get, Public: true},
 		{Pattern: "PUT /admin/api/site", Handler: siteHandler.Update, Public: false},
-		// 供应商 + 模型的导入导出。admin-only 由 handler 内的 requireAdmin 把关
-		// —— 路径在 /admin/api/config- 前缀下，白名单管不到这里，而导出体里
-		// 可能含全部上游凭据，绝不能落到普通用户手里。
-		{Pattern: "POST /admin/api/config-export/export", Handler: configTransferHandler.Export, Public: false},
-		{Pattern: "POST /admin/api/config-export/import", Handler: configTransferHandler.Import, Public: false},
 		{Pattern: "GET /admin/api/usage/history", Handler: usageHandler.History, Public: false},
 		{Pattern: "GET /admin/api/me", Handler: userHandler.Me, Public: false},
 		{Pattern: "POST /admin/api/logout", Handler: userHandler.Logout, Public: false},
@@ -377,9 +349,6 @@ func BuildApp(d Deps) *App {
 		{Pattern: "PATCH /admin/api/users/{id}", Handler: func(w http.ResponseWriter, r *http.Request) { userHandler.UpdateUser(w, r, r.PathValue("id")) }, Public: false},
 		{Pattern: "DELETE /admin/api/users/{id}", Handler: func(w http.ResponseWriter, r *http.Request) { userHandler.DeleteUser(w, r, r.PathValue("id")) }, Public: false},
 		{Pattern: "POST /admin/api/users/{id}/password", Handler: func(w http.ResponseWriter, r *http.Request) { userHandler.ResetPassword(w, r, r.PathValue("id")) }, Public: false},
-		{Pattern: "POST /admin/api/users/{id}/password-setup", Handler: func(w http.ResponseWriter, r *http.Request) {
-			userHandler.CreatePasswordSetupLink(w, r, r.PathValue("id"))
-		}, Public: false},
 		// 余额充值：走 adminMux 即自动要求管理员 + 记审计（AutoReload 对
 		// PUT 走审计分支，字段名由 extractFieldNames 自动取，见 autoreload.go）。
 		// 审计记的是**字段名**（delta_cents）而非数值 —— 这是既有审计的粒度，

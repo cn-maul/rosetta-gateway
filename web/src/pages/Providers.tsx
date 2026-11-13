@@ -31,7 +31,7 @@ const is401 = (e: unknown): boolean => (e as { status?: number }).status === 401
 
 /**
  * 上游服务页（语义对齐旧 Providers.vue）：搜索 + 状态筛选 + 列表 +
- * 新建弹窗 + 行内启停/删除。列表仅取摘要，凭据、模型与余额请求留在
+ * 新建弹窗 + 行内启停/删除。列表仅取摘要，凭据与模型请求留在
  * 上游详情页。q/status 都在 URL query 上，刷新与分享不丢口径。
  */
 
@@ -285,7 +285,7 @@ export function Providers() {
         }
         footer={
           <p className="text-muted text-xs">
-            列表只取摘要；凭据、模型与余额请求在 <b>配置</b> 里逐个上游管理。
+            列表只取摘要；凭据与模型请求在 <b>配置</b> 里逐个上游管理。
           </p>
         }
       >
@@ -539,7 +539,7 @@ function CreateProviderModal({
           <Label>API Key</Label>
           <Input type="password" placeholder="sk-...（可留空，稍后在详情页添加）" className="font-mono" autoComplete="new-password" />
           <span className="mt-1 block text-[11px] text-muted">
-            添加即启用；slug、超时与重试将自动使用默认值。余额查询可在创建后到详情页设置。
+            添加即启用；slug、超时与重试将自动使用默认值。
           </span>
         </TextField>
         {/* 协议检测：填了 Endpoint（和 Key）之后可以先问一次，避免「建完发现

@@ -58,9 +58,9 @@ const (
 		COALESCE(user_id, '') AS user_id, access_key_id, public_model, upstream_model, provider_id`
 
 	// 归档分支：1 行 = 一天 × 一维度下的一组请求，计数已聚合在 request_count 里。
-	// bucket_ts 取**当天本地午夜**：分桶查询（/v1/organization/* 的 1h/1d 桶）
-	// 需要一个毫秒时间戳，而表 A 只有 day。取午夜是与 dayExpr 反向自洽的选法 ——
-	// 取别的点会让同一天在两个表达式下落到不同桶。
+	// bucket_ts 取**当天本地午夜**：调用方需要一个毫秒时间戳来比较时间段
+	// （例如成功率按最近 N 个有流量的桶取样），而表 A 只有 day。取午夜是
+	// 与 dayExpr 反向自洽的选法 —— 取别的点会让同一天在两个表达式下落到不同桶。
 	usageSourceRollupCols = `request_count AS n,
 		success_count AS n_ok,
 		error_count AS n_err,
@@ -191,7 +191,6 @@ func usageSource(alias string, f UsageFilter) (string, []any) {
 	//
 	// 旧规则是「dayStart >= From 且 dayEnd <= To」（整日包含）。它错在
 	// 假设 **To 一定是本地午夜** —— 而真实调用点的 To 几乎从不是：
-	//   - /v1/organization/*：To = end_date + 1 天的 UTC 零点；
 	//   - 管理端用量页：To = 「现在」（queryRangeExplicit）。
 	//
 	// 于是窗口上界总在某天的正中间，而那一天的数据在剪枝后已进归档表，

@@ -50,9 +50,9 @@ export function AppRoot() {
   useDocumentTitle()
   useSessionExpiryWatcher()
   const location = useLocation()
-  // 登录 / 首次设密没有侧栏可言；其余路由都住在 Shell（侧栏 + 顶栏 +
-  // 页脚版本号）里。Shell 渲染 <Outlet/>，页面组件由此进入内容区。
-  const isPublic = location.pathname === '/login' || location.pathname === '/set-password'
+  // 登录页没有侧栏可言；其余路由都住在 Shell（侧栏 + 顶栏 + 页脚版本号）里。
+  // Shell 渲染 <Outlet/>，页面组件由此进入内容区。
+  const isPublic = location.pathname === '/login'
   return (
     <>
       <ConfirmDialog />

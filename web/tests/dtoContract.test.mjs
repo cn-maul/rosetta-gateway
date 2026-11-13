@@ -54,13 +54,16 @@ function propertyNames(declaration, seen = new Set()) {
 }
 
 test('Go DTO contract contains every reviewed frontend response type', () => {
-  // 60 = 69 - 模型探测两件套（ProbeHealth / ProbeTimelineBucket）
+  // 45 = 69 - 模型探测两件套（ProbeHealth / ProbeTimelineBucket）
   //      - 模型归组三件套（ModelGroup / ModelGroupHistoryMember / ConfigExportModelGroup）
-  //      - 重算用量 / 状态概览 / 代理测试 / 审计条目四个已删除端点。
+  //      - 重算用量 / 状态概览 / 代理测试 / 审计条目四个已删除端点
+  //      - 配置导入导出（11 个类型：ConfigExport* 及各表的 Export 结构）
+  //      - 一次性设密链接两件套（PasswordSetupLink / PasswordSetupStatus）
+  //      - 上游余额查询两件套（ProviderBalance / CredentialBalance）。
   //
   // 这个数字是**只增不猜**的守卫：加了一个带 @ts-type 的 Go 结构体就必须
   // 回来改它，从而被迫确认「前端确实有这个接口、字段真的对得上」。
-  assert.equal(DTO_CONTRACTS.length, 60)
+  assert.equal(DTO_CONTRACTS.length, 45)
   const targets = DTO_CONTRACTS.map((contract) => contract.tsType)
   assert.equal(new Set(targets).size, targets.length, '一个 TS 类型不能映射多个 Go DTO')
 })

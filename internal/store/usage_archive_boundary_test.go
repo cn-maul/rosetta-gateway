@@ -5,9 +5,8 @@ package store
 // # 这是 P0-7 的回归防线（2026-10-21）
 //
 // 旧规则是「day_start >= from 且 day_end <= to」—— 它假设 **To 一定是本地
-// 午夜**。而真实调用点的 To 几乎从不是：
-//   - /v1/organization/*：To = end_date + 1 天的 UTC 零点；
-//   - 管理端用量页：To = 「现在」（queryRangeExplicit 的 to=0 兜底）。
+// 午夜**。而真实调用点的 To 几乎从不是：管理端用量页的 To 取「现在」
+// （queryRangeExplicit 的 to=0 兜底），From 来自区间控件。
 //
 // 于是窗口上界总在某天的正中间，而那一天的数据在剪枝后已进归档表、
 // 却不满足「整日包含」被整体排除。实测（真实库、8333 行明细、
@@ -65,8 +64,7 @@ func TestPrune_非午夜窗口剪枝前后数字不变(t *testing.T) {
 	// 下界若切在 12:00 之后（当天 12:00），明细支也排除了该天，同样测不出。
 	// 必须切在**两条记录之间**。
 	//
-	// 生产上正是这种形状：/v1/organization/* 的 start_date 换算成 UTC 零点，
-	// 在非 UTC 时区下是本地 08:00（不是午夜），而那个日期通常已在保留期外。
+	// 生产上正是这种形状：区间上下界都落在某天的中间，而不是本地午夜。
 	local := base.In(time.Local)
 	midnight := func(dayOffset int) time.Time {
 		return time.Date(local.Year(), local.Month(), local.Day(), 0, 0, 0, 0, time.Local).

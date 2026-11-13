@@ -2,7 +2,7 @@ import { useEffect, useState } from 'react'
 import { Button, Input, Label, TextField, toast } from '@heroui/react'
 import { api, ApiFail } from '../../api'
 import { AppModal } from '../../ui/AppModal'
-import { fmtTokens, fmtDateTime, fmtBalance, copyText } from '../../fmt'
+import { fmtTokens, fmtDateTime, fmtBalance } from '../../fmt'
 import { checkPasswordStrength } from '../../password'
 import { GroupSelect, RoleSelect } from './UserSelects'
 import type { Group, User, UserRole } from '../../types'
@@ -13,13 +13,11 @@ interface UserCreateModalProps {
   groups: Group[]
   /** 创建成功后由弹窗调用（父级刷新列表）。 */
   onSaved: () => void | Promise<void>
-  /** 密码留空创建成功时调用：父级接着生成一次性设密链接。 */
-  onNeedsSetupLink: (created: User) => void | Promise<void>
 }
 
 /** 新建用户：横版弹窗，字段两列排布。dismissable=false：
  * 表单填到一半误点遮罩就全丢，关闭只走「取消 / 创建」两个明确出口。 */
-export function UserCreateModal({ open, onClose, groups, onSaved, onNeedsSetupLink }: UserCreateModalProps) {
+export function UserCreateModal({ open, onClose, groups, onSaved }: UserCreateModalProps) {
   const [name, setName] = useState('')
   const [password, setPassword] = useState('')
   const [role, setRole] = useState<UserRole>('user')
@@ -45,27 +43,22 @@ export function UserCreateModal({ open, onClose, groups, onSaved, onNeedsSetupLi
       setErr('用户名必填')
       return
     }
-    // 管理员空密码不是「强度不足」，是安全边界：空密码 admin 会让免鉴权的
-    // bootstrap 引导判定重新命中。必须提交前拦掉，而不是等后端回 400。
-    if (role === 'admin' && !password) {
-      setErr('创建管理员必须设置初始密码（管理员不允许空密码账号）')
+    // 所有账号都必须有初始密码：一次性设密链接已删除，空密码账号
+    // 建出来就永远登不进去。空密码 admin 还会重开免鉴权的 bootstrap 窗口。
+    if (!password) {
+      setErr('初始密码必填')
       return
     }
-    // 普通用户初始密码可留空（建出「尚未设置密码」的账号），但填了就必须合规。
-    if (password) {
-      const weak = checkPasswordStrength(password)
-      if (weak) {
-        setErr(weak)
-        return
-      }
+    const weak = checkPasswordStrength(password)
+    if (weak) {
+      setErr(weak)
+      return
     }
     setBusy(true)
-    const needsSetupLink = !password
     try {
-      const created = await api.createUser({
+      await api.createUser({
         username: name.trim(),
-        // 密码留空则不传 —— 后端接受空密码，建出「尚未设置密码」的账号。
-        password: password || undefined,
+        password,
         role,
         group_id: group || undefined,
         quota_tokens: Number(quota) || 0,
@@ -78,7 +71,6 @@ export function UserCreateModal({ open, onClose, groups, onSaved, onNeedsSetupLi
       setQuota('0')
       await onSaved()
       toast.success('已创建')
-      if (needsSetupLink) await onNeedsSetupLink(created)
     } catch (e) {
       setErr(e instanceof ApiFail ? e.message : '创建失败')
     } finally {
@@ -110,14 +102,10 @@ export function UserCreateModal({ open, onClose, groups, onSaved, onNeedsSetupLi
           <Input placeholder="3-32 位字母数字-_." autoComplete="off" />
           <span className="text-muted text-[11px]">登录用。不支持中文与空格。</span>
         </TextField>
-        <TextField aria-label="初始密码" value={password} onChange={setPassword}>
-          <Label>初始密码</Label>
-          <Input type="password" autoComplete="new-password" placeholder="留空则生成一次性设密链接" />
-          {role === 'admin' && !password ? (
-            <span className="text-warning text-[11px]">创建管理员必须设置初始密码。</span>
-          ) : (
-            <span className="text-muted text-[11px]">留空后生成一次性设密链接；用户完成设置前不能登录。</span>
-          )}
+        <TextField aria-label="初始密码" isRequired value={password} onChange={setPassword}>
+          <Label>初始密码 *</Label>
+          <Input type="password" autoComplete="new-password" placeholder="至少 8 个字符" />
+          <span className="text-muted text-[11px]">创建后由用户自行登录修改。</span>
         </TextField>
         <div>
           <Label>角色</Label>
@@ -187,7 +175,7 @@ export function UserEditModal({
       return
     }
     if (role === 'admin' && u.role !== 'admin' && !u.has_password) {
-      setErr('该账号尚未设置密码，请先生成一次性设密链接，再升级为管理员')
+      setErr('该账号尚未设置密码，请先重置密码，再升级为管理员')
       return
     }
     if (Number(quota) < 0) {
@@ -249,7 +237,9 @@ export function UserEditModal({
               {user.is_self ? (
                 <span className="text-warning mt-1 block text-[11px]">不能降低自己的权限。</span>
               ) : !user.has_password ? (
-                <span className="text-warning mt-1 block text-[11px]">该账号未设密码，不能升为管理员。</span>
+                <span className="text-warning mt-1 block text-[11px]">
+                  该账号未设密码，请先重置密码再升级。
+                </span>
               ) : (
                 <span className="text-muted mt-1 block text-[11px]">
                   管理员可见全部页面与所有用户的数据。改角色会让该用户所有登录状态立即失效。
@@ -366,51 +356,3 @@ export function UserPasswordModal({
   )
 }
 
-export interface SetupLinkInfo {
-  user: User
-  url: string
-  expiresAt: number
-}
-
-/** 一次性设密链接。链接里包含明文 token，关闭时由父级立刻清掉状态
- * （后端只保存 token 哈希，前端也不留明文）。 */
-export function SetupLinkModal({ info, onClose }: { info: SetupLinkInfo | null; onClose: () => void }) {
-  if (!info) return null
-  const copy = async () => {
-    const ok = await copyText(info.url)
-    if (ok) toast.success('设密链接已复制')
-    else toast.danger('复制失败，请手动选择复制')
-  }
-  return (
-    <AppModal
-      open
-      onClose={onClose}
-      title={`设密链接 · ${info.user.username}`}
-      maxWidth="620px"
-      footer={
-        <div className="flex justify-end gap-2">
-          <Button variant="ghost" onPress={onClose}>
-            关闭
-          </Button>
-          <Button variant="primary" onPress={() => void copy()}>
-            复制链接
-          </Button>
-        </div>
-      }
-    >
-      <p className="text-muted text-[12.5px] leading-relaxed">
-        将下面的链接发给用户。链接 <b>24 小时</b>内有效且只能使用一次；重新生成会让旧链接立即失效。
-      </p>
-      <Input
-        aria-label="设密链接"
-        className="mt-3 font-mono text-[12px]"
-        value={info.url}
-        onChange={() => {}}
-        readOnly
-        onFocus={(e) => e.target.select()}
-      />
-      {info.expiresAt ? <div className="text-muted mt-2 text-[11px]">有效至 {fmtDateTime(info.expiresAt)}</div> : null}
-      <div className="text-warning mt-2 text-[11px]">链接等同于一次性凭据，不要发到公开群组或长期留存。</div>
-    </AppModal>
-  )
-}

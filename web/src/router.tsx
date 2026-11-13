@@ -3,7 +3,6 @@ import { createHashRouter, Navigate, redirect, type LoaderFunctionArgs } from 'r
 import { isAdmin, loadSession, session } from './api'
 import { AppRoot, Splash } from './ui/AppRoot'
 import { Login } from './ui/Login'
-import { PasswordSetup } from './ui/PasswordSetup'
 import { Networks, networksLoader } from './pages/Networks'
 const UsageStats = lazy(() => import('./pages/UsageStats').then((m) => ({ default: m.UsageStats })))
 const Overview = lazy(() => import('./pages/Overview').then((m) => ({ default: m.Overview })))
@@ -82,7 +81,6 @@ export const router = createHashRouter([
     },
     children: [
       { path: '/login', element: <Login />, handle: { title: '登录', public: true }, loader: loginLoader },
-      { path: '/set-password', element: <PasswordSetup />, handle: { title: '设置密码', public: true } },
       {
         index: true,
         element: <Overview />,

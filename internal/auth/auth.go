@@ -124,12 +124,11 @@ func Authenticate(r *http.Request) (*Context, error) {
 	//
 	// # 为什么放在**鉴权层**而不是 handleIngress 里加一道检查
 	//
-	// 数据面有**多条**入口都只做 auth.Authenticate：/v1 三个推理端点、
-	// /v1/models、/dashboard/billing/*、/v1/organization/*。在 handleIngress
-	// 里加检查只能覆盖推理端点，其余入口会各自漂移 —— 而漂移的方向恰恰是
-	// 最危险的：管理员旧 key 在 /v1/models 或 billing 查询上照常通过
-	// （billing 本来也用 admin 看全量，那是控制面语义），只有推理端点被挡，
-	// 口径就不再一致。收敛到 Authenticate 这一处，**所有**数据面入口同时生效。
+	// 数据面有**多条**入口都只做 auth.Authenticate：/v1 三个推理端点和
+	// /v1/models（含 /openai、/anthropic 别名）。在 handleIngress 里加检查
+	// 只能覆盖推理端点，模型列表会单独漂移 —— 而漂移的方向恰恰是最危险的：
+	// 管理员旧 key 在 /v1/models 上照常通过，只有推理端点被挡，口径就不再一致。
+	// 收敛到 Authenticate 这一处，**所有**数据面入口同时生效。
 	//
 	// # 为什么排在「用户存在」「用户启用」之后
 	//

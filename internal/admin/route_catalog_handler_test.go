@@ -65,7 +65,7 @@ func TestRouteCatalogContractAndAccess(t *testing.T) {
 					t.Fatal("runtime readiness missing")
 				}
 			}
-			for _, field := range []string{`"endpoint"`, `"proxy_url"`, `"api_key"`, `"password_hash"`, `"balance_spec_json"`} {
+			for _, field := range []string{`"endpoint"`, `"proxy_url"`, `"api_key"`, `"password_hash"`} {
 				if strings.Contains(rr.Body.String(), field) {
 					t.Fatalf("unexpected private field %s", field)
 				}

@@ -1,23 +1,13 @@
 package main
 
 import (
-	"context"
-	"crypto/sha256"
-	"encoding/hex"
-	"encoding/json"
 	"fmt"
-	"io"
-	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"testing"
-	"time"
 
-	"github.com/cn-maul/rosetta-gateway/internal/billinghttp"
 	"github.com/cn-maul/rosetta-gateway/internal/ingress"
-	"github.com/cn-maul/rosetta-gateway/internal/routing"
 	"github.com/cn-maul/rosetta-gateway/internal/snapshot"
-	"github.com/cn-maul/rosetta-gateway/internal/store"
 	"github.com/cn-maul/rosetta-gateway/internal/upstream"
 )
 
@@ -166,77 +156,5 @@ func TestCircuitBreaker_InstallDropsDeletedTargets(t *testing.T) {
 	// 目标不在 live 集合里 → 条目被丢弃 → 等价于「全新目标」，默认可用。
 	if !pool.TargetAvailable("p1#t0") {
 		t.Errorf("已删除的 target仍留有熔断状态")
-	}
-}
-
-func TestOrgBucket_TimestampsAreUnixSeconds(t *testing.T) {
-	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	db, err := store.Open(t.TempDir()+"/gw.db", logger)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer db.Close()
-
-	ts := time.Now().UnixMilli()
-	sum := sha256.Sum256([]byte(testAccessKey))
-	// 外键要求归属用户先存在（usage_records.user_id 同理），且 org-wide
-	// 端点按调用者身份收窄 —— 归属必须三处一致。
-	if err := db.CreateUser(context.Background(), &store.User{
-		ID: testUserID, Username: "tester", PasswordHash: "x",
-		Role: store.RoleUser, Status: store.UserStatusActive, AuthVersion: 1,
-	}); err != nil {
-		t.Fatal(err)
-	}
-	if err := db.CreateAccessKey(context.Background(), &store.AccessKey{
-		ID: "k1", KeyHash: hex.EncodeToString(sum[:]), KeyPrefix: "sk-gw-test",
-		Name: "t", Enabled: true, QuotaTokens: 0, UserID: testUserID,
-	}); err != nil {
-		t.Fatal(err)
-	}
-	if err := db.CreateUsageRecord(context.Background(), &store.UsageRecord{
-		ID: "u1", Ts: ts, AccessKeyID: "k1", UserID: testUserID, PublicModel: "flash", ProviderID: "p1",
-		UpstreamModel: "p1-model", IngressProtocol: "chat",
-		InputTokens: 10, OutputTokens: 5, TotalTokens: 15, Status: "ok", HTTPStatus: 200,
-	}); err != nil {
-		t.Fatal(err)
-	}
-	snapshot.Init(&snapshot.Snapshot{
-		Routes:     routing.NewRouteIndex(),
-		Providers:  map[string]*snapshot.ProviderSnapshot{},
-		KeysByHash: map[string]*snapshot.KeySnapshot{hex.EncodeToString(sum[:]): {ID: "k1", Enabled: true, UserID: testUserID, AllowedModels: snapshot.AllowAll(), GroupModelAllow: snapshot.AllowAll()}},
-		UsersByID:  snapshotUsersForTest(),
-	})
-
-	for name, h := range map[string]http.HandlerFunc{
-		"usage": billinghttp.OrgUsageCompletions(db),
-		"costs": billinghttp.OrgCosts(db),
-	} {
-		req := httptest.NewRequest(http.MethodGet, "/v1/organization/"+name+"?bucket_width=1d", nil)
-		req.Header.Set("Authorization", "Bearer "+testAccessKey)
-		rec := httptest.NewRecorder()
-		h(rec, req)
-		if rec.Code != http.StatusOK {
-			t.Fatalf("%s status=%d body=%s", name, rec.Code, rec.Body.String())
-		}
-		var page struct {
-			Data []struct {
-				StartTime int64 `json:"start_time"`
-				EndTime   int64 `json:"end_time"`
-			} `json:"data"`
-		}
-		if err := json.Unmarshal(rec.Body.Bytes(), &page); err != nil {
-			t.Fatalf("%s decode: %v body=%s", name, err, rec.Body.String())
-		}
-		if len(page.Data) == 0 {
-			t.Fatalf("%s 返回空页：%s", name, rec.Body.String())
-		}
-		b := page.Data[0]
-		// 桶起点落在当前这24h 内（毫秒值会是 1000 倍）。
-		if b.StartTime > 100_000_000_000 {
-			t.Errorf("%s start_time=%d 是毫秒，OpenAI 契约要求 Unix 秒", name, b.StartTime)
-		}
-		if d := b.EndTime - b.StartTime; d != 86400 {
-			t.Errorf("%s 桶宽=%d秒，期望 86400（桶起点与 end_time 单位不一致）", name, d)
-		}
 	}
 }

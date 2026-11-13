@@ -35,37 +35,6 @@ func TestSchema_FreshDatabaseUsesCurrentVersion(t *testing.T) {
 	if version != currentSchemaVersion {
 		t.Fatalf("user_version = %d, want %d", version, currentSchemaVersion)
 	}
-	var setupTable int
-	if err := st.DB().QueryRow(
-		`SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'user_password_setup_tokens'`,
-	).Scan(&setupTable); err != nil {
-		t.Fatalf("inspect password setup table: %v", err)
-	}
-	if setupTable != 1 {
-		t.Fatal("fresh database is missing user_password_setup_tokens")
-	}
-}
-
-func TestSchema_AddsPasswordSetupTableToExistingCurrentDatabase(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "existing.db")
-	st := openSchemaTestStore(t, path)
-	if _, err := st.DB().Exec(`DROP TABLE user_password_setup_tokens`); err != nil {
-		t.Fatalf("drop setup table: %v", err)
-	}
-	if err := st.Close(); err != nil {
-		t.Fatalf("close: %v", err)
-	}
-
-	reopened := openSchemaTestStore(t, path)
-	var n int
-	if err := reopened.DB().QueryRow(
-		`SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'user_password_setup_tokens'`,
-	).Scan(&n); err != nil {
-		t.Fatalf("inspect setup table: %v", err)
-	}
-	if n != 1 {
-		t.Fatal("existing current-version database did not gain user_password_setup_tokens")
-	}
 }
 
 func TestSchema_RejectsNonCurrentVersionWithoutModifyingDatabase(t *testing.T) {

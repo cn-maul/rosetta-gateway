@@ -56,10 +56,6 @@ type UserHandler struct {
 	// 成功登录才清零（Success 而非仅 Fail 计数）：这样合法用户输错几次后
 	// 仍能靠一次正确登录把额度还回来，不会因为累积的错输被永久卡住。
 	loginThr *guard.FailureThrottle
-	// setupThr is separate from loginThr: completing a password-setup invite
-	// is a different public KDF entry and must not lock normal login attempts
-	// from the same LAN address.
-	setupThr *guard.FailureThrottle
 }
 
 // loginAccountFailLimit / loginAccountCooldown 是账号维度限速的阈值。
@@ -254,9 +250,8 @@ func (h *UserHandler) Login(w http.ResponseWriter, r *http.Request) {
 	// 一个可用的枚举 oracle：拿到用户名列表即可确认哪些账号存在且未设密。
 	//
 	// 收紧后：非 admin 的空密码账号走下面的通用失败路径（与「用户不存在」
-	// 和「密码错误」同一条），泄露面回到零。代价是那种账号的本人看到的是
-	// 「密码错误」而非引导指引 —— 本人必须使用管理员单独签发的一次性
-	// 设密链接，不能从普通登录框推断账号是否尚未初始化。
+	// 和「密码错误」同一条），泄露面回到零。新建普通用户一律要求初始密码，
+	// 因此这类账号只可能来自历史数据。
 	if u != nil && u.PasswordHash == "" && u.Role == store.RoleAdmin {
 		failBoth()
 		writeError(w, http.StatusBadRequest,
@@ -355,15 +350,6 @@ func (h *UserHandler) accountThrottle() *guard.FailureThrottle {
 	return h.loginThr
 }
 
-func (h *UserHandler) passwordSetupThrottle() *guard.FailureThrottle {
-	h.mu.Lock()
-	defer h.mu.Unlock()
-	if h.setupThr == nil {
-		h.setupThr = guard.NewFailureThrottle(guard.LoginFailLimit, guard.LoginCooldown)
-	}
-	return h.setupThr
-}
-
 func writeTooMany(w http.ResponseWriter, retryAfter time.Duration) {
 	seconds := int(retryAfter.Seconds()) + 1
 	w.Header().Set("Retry-After", strconv.Itoa(seconds))
@@ -411,7 +397,6 @@ type bootstrapStatusResponse struct {
 //
 // 泄露面评估：只暴露「有没有一个待初始化管理员」与它的用户名。
 // 两者都是公开事实（启动日志就写了账号名），且不提供任何可用于登录的信息。
-// 与 password/check 的区别是语义完全不同 —— 后者已随双通道一起删除。
 //
 // 判定分两层：bootstrap_completed 标记已置 → 直接报「无需引导」，**不再看**
 // 是否存在空密码 admin —— 那个条件只是窗口曾经开过的原因（见文件顶部的

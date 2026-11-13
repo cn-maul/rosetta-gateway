@@ -14,7 +14,6 @@ import (
 	"time"
 
 	"github.com/cn-maul/rosetta-gateway/internal/admin"
-	"github.com/cn-maul/rosetta-gateway/internal/billinghttp"
 	"github.com/cn-maul/rosetta-gateway/internal/ingress"
 	"github.com/cn-maul/rosetta-gateway/internal/routing"
 	"github.com/cn-maul/rosetta-gateway/internal/server"
@@ -113,110 +112,6 @@ func TestModels_Metadata(t *testing.T) {
 	detailMux.ServeHTTP(rec4, authedGet("/v1/models/nope"))
 	if rec4.Code != http.StatusNotFound {
 		t.Fatalf("unknown model: code=%d", rec4.Code)
-	}
-}
-
-// 额度查询三件套：subscription（PTM 等价映射）、usage（美分）、organization/costs（cny）。
-func TestBillingEndpoints(t *testing.T) {
-	up := fakeGood()
-	defer up.Close()
-	_, db, _ := buildHarnessFull(t, []struct {
-		slug, url string
-		fail      bool
-	}{{slug: "good", url: up.URL}}, false, ingress.NewOpenAIChat())
-	ctx := context.Background()
-
-	// key 配额 200 万 token，已用 50 万（插一条 usage 记录驱动触发器）。
-	k, _ := db.GetAccessKey(ctx, "k1")
-	k.QuotaTokens = 2_000_000
-	if err := db.UpdateAccessKey(ctx, "k1", k); err != nil {
-		t.Fatalf("update key: %v", err)
-	}
-	if err := db.CreateUsageRecord(ctx, &store.UsageRecord{
-		ID: "u1", AccessKeyID: "k1", UserID: testUserID, PublicModel: "flash", ProviderID: "good",
-		UpstreamModel: "good-model", IngressProtocol: "chat",
-		InputTokens: 500_000, OutputTokens: 0, TotalTokens: 500_000,
-		UsageState: "reported", Status: "ok", HTTPStatus: 200,
-	}); err != nil {
-		t.Fatalf("seed usage: %v", err)
-	}
-
-	rec := httptest.NewRecorder()
-	billinghttp.Subscription(db)(rec, authedGet("/dashboard/billing/subscription"))
-	var sub struct {
-		Object       string  `json:"object"`
-		HardLimitUSD float64 `json:"hard_limit_usd"`
-		TotalUsed    float64 `json:"total_used"`
-		TotalAvail   float64 `json:"total_available"`
-	}
-	if err := json.Unmarshal(rec.Body.Bytes(), &sub); err != nil {
-		t.Fatalf("subscription: %v body=%s", err, rec.Body.String())
-	}
-	if sub.Object != "billing_subscription" || sub.HardLimitUSD != 2.0 || sub.TotalUsed != 0.5 || sub.TotalAvail != 1.5 {
-		t.Fatalf("subscription mapping: %+v", sub)
-	}
-
-	rec2 := httptest.NewRecorder()
-	billinghttp.Usage(db)(rec2, authedGet("/v1/dashboard/billing/usage"))
-	var usage struct {
-		Object     string  `json:"object"`
-		TotalUsage float64 `json:"total_usage"`
-		TotalToks  int64   `json:"total_tokens"`
-	}
-	if err := json.Unmarshal(rec2.Body.Bytes(), &usage); err != nil {
-		t.Fatalf("usage: %v", err)
-	}
-	if usage.Object != "list" || usage.TotalUsage != 50 || usage.TotalToks != 500_000 {
-		t.Fatalf("usage mapping: %+v", usage)
-	}
-
-	// organization/costs：给模型配 2 元/百万输出价，100 万输出 = 2 元。
-	// harness 的 provider 只存在于快照里，DB 需要实体行满足外键。
-	if err := db.CreateProvider(ctx, &store.Provider{
-		ID: "good", Slug: "good", Name: "good", Protocol: "chat",
-		Endpoint: up.URL, Enabled: true}); err != nil {
-		t.Fatalf("seed provider: %v", err)
-	}
-	if err := db.UpsertUpstreamModel(ctx, &store.UpstreamModel{
-		ID: "pm1", ProviderID: "good", ModelID: "good-model", PriceOutput: 2,
-	}); err != nil {
-		t.Fatalf("seed price: %v", err)
-	}
-	if err := db.CreateUsageRecord(ctx, &store.UsageRecord{
-		ID: "u2", AccessKeyID: "k1", UserID: testUserID, PublicModel: "flash", ProviderID: "good",
-		UpstreamModel: "good-model", IngressProtocol: "chat",
-		OutputTokens: 1_000_000, TotalTokens: 1_000_000,
-		UsageState: "reported", Status: "ok", HTTPStatus: 200,
-	}); err != nil {
-		t.Fatalf("seed usage 2: %v", err)
-	}
-	rec3 := httptest.NewRecorder()
-	billinghttp.OrgCosts(db)(rec3, authedGet("/v1/organization/costs?bucket_width=1d"))
-	var costs struct {
-		Object string `json:"object"`
-		Data   []struct {
-			Object    string `json:"object"`
-			StartTime int64  `json:"start_time"`
-			Results   []struct {
-				Object   string `json:"object"`
-				LineItem string `json:"line_item"`
-				Amount   struct {
-					Value    float64 `json:"value"`
-					Currency string  `json:"currency"`
-				} `json:"amount"`
-			} `json:"results"`
-		} `json:"data"`
-	}
-	if err := json.Unmarshal(rec3.Body.Bytes(), &costs); err != nil {
-		t.Fatalf("costs: %v body=%s", err, rec3.Body.String())
-	}
-	if costs.Object != "page" || len(costs.Data) == 0 || costs.Data[0].Object != "bucket" {
-		t.Fatalf("costs envelope: %+v", costs)
-	}
-	r0 := costs.Data[0].Results[0]
-	if r0.Object != "organization.costs.result" || r0.LineItem != "model:good-model" ||
-		r0.Amount.Currency != "cny" || r0.Amount.Value != 2 {
-		t.Fatalf("cost result: %+v", r0)
 	}
 }
 

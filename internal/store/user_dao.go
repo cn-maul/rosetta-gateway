@@ -331,11 +331,7 @@ func (s *Store) UpdateUserAndBumpAuthVersion(ctx context.Context, u *User) error
 		if err := checkAffected(res, err); err != nil {
 			return err
 		}
-		// Disabling or changing the role is a security-boundary change. Any
-		// outstanding password-setup link must die with the old account state.
-		_, err = ex.ExecContext(ctx,
-			`DELETE FROM user_password_setup_tokens WHERE user_id = ?`, u.ID)
-		return err
+		return nil
 	})
 }
 
@@ -352,9 +348,7 @@ func (s *Store) SetUserPassword(ctx context.Context, id, passwordHash string) er
 		if err := checkAffected(res, err); err != nil {
 			return err
 		}
-		_, err = ex.ExecContext(ctx,
-			`DELETE FROM user_password_setup_tokens WHERE user_id = ?`, id)
-		return err
+		return nil
 	})
 }
 

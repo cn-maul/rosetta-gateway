@@ -43,7 +43,7 @@ func TestCreateUser_DefaultsToUnlimitedBalance(t *testing.T) {
 
 	rec := httptest.NewRecorder()
 	h.CreateUser(rec, asAdmin(jsonRequest(http.MethodPost, "/admin/api/users",
-		strings.NewReader(`{"username":"fresh"}`))))
+		strings.NewReader(`{"username":"fresh","password":"Str0ngPassw0rd!"}`))))
 	if rec.Code != http.StatusCreated {
 		t.Fatalf("status = %d body=%s, want 201", rec.Code, rec.Body.String())
 	}
@@ -65,28 +65,27 @@ func TestCreateUser_DefaultsToUnlimitedBalance(t *testing.T) {
 	}
 }
 
-// 普通用户的空密码账号仍可建出，之后由管理员签发一次性设密链接。
-func TestCreateUser_AllowsEmptyPasswordRegularUser(t *testing.T) {
+// 普通用户也不允许空密码创建：一次性设密链接删除后，空密码账号无法登录。
+func TestCreateUser_RejectsEmptyPasswordRegularUser(t *testing.T) {
 	st := newScopeStore(t)
 	h := NewUserHandler(st, newTestManager(t))
 
 	rec := httptest.NewRecorder()
 	h.CreateUser(rec, asAdmin(jsonRequest(http.MethodPost, "/admin/api/users",
 		strings.NewReader(`{"username":"newbie"}`))))
-	if rec.Code != http.StatusCreated {
-		t.Fatalf("status = %d body=%s, want 201", rec.Code, rec.Body.String())
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d body=%s, want 400", rec.Code, rec.Body.String())
 	}
 	u, err := st.GetUserByUsername(t.Context(), "newbie")
-	if err != nil || u == nil {
-		t.Fatalf("get created user: %v", err)
+	if err != nil {
+		t.Fatalf("lookup created user: %v", err)
 	}
-	if u.Role != store.RoleUser || u.PasswordHash != "" {
-		t.Errorf("role=%q hash=%q, want a regular user with empty hash (behavior must be unchanged)",
-			u.Role, u.PasswordHash)
+	if u != nil {
+		t.Error("empty-password user was created despite the rejection")
 	}
 }
 
-// 把空密码账号升级成 admin 必须被拒：先完成一次性设密，再升级。
+// 把空密码账号升级成 admin 必须被拒：先重置密码，再升级。
 func TestUpdateUser_RejectsPromotingPasswordlessUser(t *testing.T) {
 	st := newScopeStore(t)
 	h := NewUserHandler(st, newTestManager(t))

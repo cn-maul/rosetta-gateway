@@ -7,12 +7,10 @@ import {
   Disclosure,
   Input,
   Label,
-  Separator,
   Spinner,
   Surface,
   Tabs,
   TextField,
-  TextArea,
   toast,
 } from '@heroui/react'
 import {
@@ -20,27 +18,23 @@ import {
   Archive,
   Boxes,
   Calculator,
-  Download,
   GitBranch,
   RotateCcw,
   Save,
-  ShieldAlert,
   Timer,
-  Upload,
 } from 'lucide-react'
 import { api } from '../api'
 import { confirmBox } from '../ui/confirm'
 import { PageHeader } from '../ui/PageHeader'
 import { SectionCard } from '../ui/SectionCard'
 import { StatusChip } from '../ui/StatusChip'
-import { FileImport } from '../ui/FileImport'
 import { fmtNum } from '../fmt'
 import { MODEL_DEFAULT_FALLBACKS, RUNTIME_DEFAULTS } from '../generated/defaults'
 import { PriceSettings } from '../components/PriceSettings'
 import { SiteBrandCard } from '../components/settings/SiteBrandCard'
 import { TokenField } from '../ui/TokenField'
 import { parseTokenCount } from '../tokenCount'
-import type { ConfigExportFile, ConfigImportResult, PruneResult } from '../types'
+import type { PruneResult } from '../types'
 
 /**
  * 系统设置（管理员）：设置项按分类分页展示，一次只看一类
@@ -50,7 +44,7 @@ import type { ConfigExportFile, ConfigImportResult, PruneResult } from '../types
  * 提供管理面读取接口。
  */
 
-type TabKey = 'site' | 'model' | 'runtime' | 'price' | 'transfer'
+type TabKey = 'site' | 'model' | 'runtime' | 'price'
 
 const TABS: { key: TabKey; label: string; sub: string }[] = [
   { key: 'site', label: '站点', sub: '站点名称与 LOGO：显示在登录页与侧栏左上角' },
@@ -62,41 +56,7 @@ const TABS: { key: TabKey; label: string; sub: string }[] = [
   // 改价只影响**此后**的用量：历史费用在落库时已按当时的价固化，
   // 所以这里改的是「往后怎么算」，不是「重算历史」。
   { key: 'price', label: '模型价格', sub: '按供应商 × 模型配置单价；改价只对之后的用量生效，不改写历史费用' },
-  {
-    key: 'transfer',
-    label: '导入导出',
-    sub: '完整配置的加密导出与导入',
-  },
 ]
-
-/** 预演结果只列非零项：零值堆在面板里只会让真正发生的变化更难找。 */
-function importPreviewRows(p: ConfigImportResult): { label: string; value: number }[] {
-  return [
-    { label: '新增供应商', value: p.providers_created },
-    { label: '新增模型', value: p.models_created },
-    { label: '跳过模型', value: p.models_skipped },
-    { label: '新增凭据', value: p.credentials_added },
-    { label: '新增用户分组', value: p.user_groups_created },
-    { label: '新增用户', value: p.users_created },
-    { label: '跳过用户', value: p.users_skipped },
-    { label: '新增访问密钥', value: p.access_keys_created },
-    { label: '跳过访问密钥', value: p.access_keys_skipped },
-    { label: '新增路由', value: p.routes_created },
-    { label: '跳过路由', value: p.routes_skipped },
-  ].filter((row) => row.value > 0)
-}
-
-/** 文件清单同样只列有内容的分段，省掉一串「0 个」。 */
-function importedFileRows(f: ConfigExportFile): { label: string; value: number }[] {
-  return [
-    { label: '供应商', value: f.providers?.length ?? 0 },
-    { label: '模型', value: f.models?.length ?? 0 },
-    { label: '凭据', value: f.credentials?.length ?? 0 },
-    { label: '用户', value: f.users?.length ?? 0 },
-    { label: '访问密钥', value: f.access_keys?.length ?? 0 },
-    { label: '路由', value: f.routes?.length ?? 0 },
-  ].filter((row) => row.value > 0)
-}
 
 // 运行时推荐默认值由 Go 侧生成（go generate ./internal/config）。
 // 原始定义在 internal/config/config.go；这里不再手抄一份数字。
@@ -224,28 +184,6 @@ export function Settings() {
 
   const [pruning, setPruning] = useState(false)
   const [pruneResult, setPruneResult] = useState<PruneResult | null>(null)
-
-  // ---------- 导入 / 导出 ----------
-  //
-  // 两个动作都是「文件进、文件出」，没有表单要保存，所以单独一节。
-  //
-  // 导出策略（2026-10-07 收敛）：**必带凭据 + 必加密**，产物统一是 .json.enc。
-  // 曾经「带凭据」是勾选、「加密」是可选项，四种组合里最危险的
-  // 「明文 + 带凭据」恰恰是最容易顺手点出来的那种；且两种产物格式让导入侧
-  // 要兼容两套形态。现在只有一个开关 —— 口令，没有它就导不出来。
-  // 「同时导出 API Key」的勾选随之删除：不带走凭据的导出文件在目标机器上
-  // 还要手工补密钥，实际没人这么用。
-  const [transferBusy, setTransferBusy] = useState(false)
-  const [exportPass, setExportPass] = useState('')
-
-  // 导入分两步：先读文件并干跑，把「会发生什么」摆出来，确认后才真写。
-  // 导入是改一个可能正在跑流量的库的动作，不能一击生效。
-  const [importFile, setImportFile] = useState<File | null>(null)
-  const [importParsed, setImportParsed] = useState<ConfigExportFile | null>(null)
-  const [importPass, setImportPass] = useState('')
-  const [importPreview, setImportPreview] = useState<ConfigImportResult | null>(null)
-  const [importError, setImportError] = useState('')
-  const [dragOver, setDragOver] = useState(false)
 
   // 价格页签是独立组件、自己拉数据；外层「刷新」按钮通过计数器触发它的重拉。
   const [priceRefresh, setPriceRefresh] = useState(0)
@@ -394,94 +332,6 @@ export function Settings() {
     } finally {
       setPruning(false)
     }
-  }
-
-  async function doExport() {
-    // 与后端同口径的前置校验：后端也会 400，这里先拦一层省一次往返，
-    // 并把按钮的可用态与这条规则对齐（见模板 disabled）。
-    if (exportPass.trim().length < 8) {
-      toast.danger('请先设置至少 8 位的加密口令：导出文件包含全部上游 API Key')
-      return
-    }
-    setTransferBusy(true)
-    try {
-      await api.exportConfig(exportPass)
-      toast.success('导出已开始下载，请确认文件已保存')
-    } catch (e) {
-      if ((e as { status?: number }).status !== 401) toast.danger('导出失败：' + (e as Error).message)
-    } finally {
-      setTransferBusy(false)
-    }
-  }
-
-  // onPickFile 读文件并立刻干跑一次，让用户先看到结果再决定要不要真导入。
-  async function onPickFile(file: File) {
-    resetImport()
-    setImportFile(file)
-    try {
-      const text = await file.text()
-      const parsed = JSON.parse(text) as ConfigExportFile
-      if (!parsed || typeof parsed.version !== 'number') {
-        setImportError('这不是有效的导出文件（缺少版本号）')
-        return
-      }
-      setImportParsed(parsed)
-      // 加密文件没有口令就没法看内容，先让用户填，而不是直接报一句错。
-      if (parsed.encrypted && !importPass) return
-      await runImport(true, parsed)
-    } catch (e) {
-      setImportError('读取文件失败：' + (e as Error).message)
-    }
-  }
-
-  function resetImport() {
-    setImportFile(null)
-    setImportParsed(null)
-    setImportPass('')
-    setImportPreview(null)
-    setImportError('')
-  }
-
-  // runImport 调后端导入。dryRun=true 时只算不写。
-  async function runImport(dryRun: boolean, parsedOverride?: ConfigExportFile) {
-    const parsed = parsedOverride ?? importParsed
-    if (!parsed) return
-    setTransferBusy(true)
-    try {
-      const res = await api.importConfig(parsed, importPass, dryRun)
-      setImportPreview(res)
-      if (!dryRun) {
-        toast.success(`导入完成：新增 ${res.providers_created} 个供应商、${res.models_created} 个模型`)
-        resetImport()
-      }
-    } catch (e) {
-      if ((e as { status?: number }).status !== 401) {
-        setImportError((e as Error).message)
-      }
-    } finally {
-      setTransferBusy(false)
-    }
-  }
-
-  async function confirmImport() {
-    const p = importPreview
-    if (!p) return
-    const renamed = Object.entries(p.providers_renamed ?? {})
-    const ok = await confirmBox({
-      title: '确认导入',
-      body:
-        `将新增 ${p.providers_created} 个供应商、${p.models_created} 个模型` +
-        (p.credentials_added ? `、${p.credentials_added} 条凭据` : '') +
-        '\n\n' +
-        (renamed.length
-          ? `以下供应商因重名会自动改名（原数据不受影响）：\n` +
-            renamed.map(([a, b]) => `　${a} → ${b}`).join('\n') +
-            '\n\n'
-          : '') +
-        `已存在的同名模型保留库里的配置，不覆盖。`,
-      confirmLabel: '导入',
-    })
-    if (ok) await runImport(false)
   }
 
   // recText 只负责把推荐值说成人话；是否偏离由 fieldIsCustom 单独判断，
@@ -848,226 +698,6 @@ export function Settings() {
           {/* ---------- 分类 3：模型价格（独立组件，自己拉数据） ---------- */}
           {tab === 'price' ? <PriceSettings refreshSignal={priceRefresh} /> : null}
 
-          {/* ---------- 分类 4：导入 / 导出 ---------- */}
-          {tab === 'transfer' ? (
-            <div className="grid items-start gap-4 lg:grid-cols-2">
-              <SectionCard
-                title={
-                  <span className="flex items-center gap-2.5">
-                    <span className="bg-warning-soft text-warning-soft-foreground flex h-8 w-8 shrink-0 items-center justify-center rounded-lg">
-                      <Download size={16} />
-                    </span>
-                    导出
-                  </span>
-                }
-                actions={<StatusChip tone="warn">含全部凭据</StatusChip>}
-              >
-                <div className="flex flex-col gap-4">
-                  <TextField aria-label="加密口令（必填，至少 8 位）" value={exportPass} onChange={setExportPass}>
-                    <Label>加密口令</Label>
-                    <Input type="password" autoComplete="new-password" placeholder="至少 8 位，导入时需使用同一口令" />
-                  </TextField>
-                  <div className="text-warning-soft-foreground flex items-start gap-1.5 text-[11px] leading-relaxed">
-                    <ShieldAlert className="mt-px h-3.5 w-3.5 shrink-0" />
-                    <span>文件含全部上游密钥，请离线保存，口令与文件分开传递。</span>
-                  </div>
-                  <Button
-                    variant="primary"
-                    className="w-full"
-                    isDisabled={transferBusy || exportPass.trim().length < 8}
-                    onPress={() => void doExport()}
-                  >
-                    <Download className="h-4 w-4" />
-                    {transferBusy ? '处理中…' : '导出为加密文件'}
-                  </Button>
-                </div>
-              </SectionCard>
-
-              <SectionCard
-                title={
-                  <span className="flex items-center gap-2.5">
-                    <span className="bg-accent-soft text-accent flex h-8 w-8 shrink-0 items-center justify-center rounded-lg">
-                      <Upload size={16} />
-                    </span>
-                    导入
-                  </span>
-                }
-              >
-                <div className="flex flex-col gap-4">
-                  <Surface
-                    variant="secondary"
-                    onDragOver={(e) => {
-                      e.preventDefault()
-                      if (!transferBusy) setDragOver(true)
-                    }}
-                    onDragLeave={() => setDragOver(false)}
-                    onDrop={(e) => {
-                      e.preventDefault()
-                      setDragOver(false)
-                      const f = e.dataTransfer.files?.[0]
-                      if (f && !transferBusy) void onPickFile(f)
-                    }}
-                    className={`flex flex-col items-center gap-2.5 rounded-xl border border-dashed px-4 py-6 text-center transition-colors ${
-                      dragOver ? 'border-accent bg-accent-soft' : 'border-separator'
-                    }`}
-                  >
-                    <div className="bg-accent-soft text-accent flex h-10 w-10 items-center justify-center rounded-full">
-                      <Upload size={18} />
-                    </div>
-                    <div className="min-w-0">
-                      <div className="truncate text-sm font-medium">
-                        {importFile ? importFile.name : '拖入或选择导出文件'}
-                      </div>
-                      <div className="text-muted mt-0.5 text-[11px]">
-                        {importFile ? '文件已载入' : '支持 .json / .json.enc'}
-                      </div>
-                    </div>
-                    <FileImport
-                      accept=".json,.json.enc,.enc,application/json"
-                      label={importFile ? '更换文件' : '选择文件'}
-                      disabled={transferBusy}
-                      onPick={(f) => void onPickFile(f)}
-                    />
-                  </Surface>
-
-                  {importParsed?.encrypted ? (
-                    <div className="flex flex-col gap-2">
-                      <TextField
-                        aria-label="文件口令"
-                        value={importPass}
-                        onChange={(v) => {
-                          setImportPass(v)
-                          setImportPreview(null)
-                        }}
-                      >
-                        <Label>文件口令</Label>
-                        <Input type="password" autoComplete="off" placeholder="导出时设置的口令" />
-                      </TextField>
-                      <Button
-                        variant="secondary"
-                        className="w-full"
-                        isDisabled={!importPass.trim() || transferBusy}
-                        onPress={() => void runImport(true)}
-                      >
-                        预演导入
-                      </Button>
-                    </div>
-                  ) : null}
-
-                  {importError ? (
-                    <Alert status="danger">
-                      <Alert.Indicator />
-                      <Alert.Content>
-                        <Alert.Title>{importError}</Alert.Title>
-                      </Alert.Content>
-                    </Alert>
-                  ) : null}
-
-                  {importParsed && !importParsed.encrypted ? (
-                    <div className="flex flex-wrap items-center gap-1.5">
-                      {importedFileRows(importParsed).map((row) => (
-                        <StatusChip key={row.label} tone="dim">
-                          {row.label} {row.value}
-                        </StatusChip>
-                      ))}
-                      {importParsed.version !== 1 ? (
-                        <StatusChip tone="warn" title="文件可能来自更新的网关">
-                          版本 {importParsed.version}
-                        </StatusChip>
-                      ) : null}
-                    </div>
-                  ) : null}
-
-                  {/* 预演结果：逐项计数，面板里只留真正会变化的项 */}
-                  {importPreview ? (
-                    <div className="flex flex-col gap-3">
-                      <div className="flex items-center gap-2">
-                        <h4 className="text-sm font-semibold">
-                          {importPreview.dry_run ? '预演结果' : '导入结果'}
-                        </h4>
-                        {importPreview.dry_run ? <StatusChip tone="info">尚未写入</StatusChip> : null}
-                      </div>
-
-                      {importPreviewRows(importPreview).length ? (
-                        <Surface variant="secondary" className="grid grid-cols-2 gap-x-4 gap-y-2 rounded-xl px-3.5 py-3">
-                          {importPreviewRows(importPreview).map((row) => (
-                            <div key={row.label} className="flex items-baseline justify-between gap-2">
-                              <span className="text-muted text-xs">{row.label}</span>
-                              <span className="text-sm font-semibold tabular-nums">{row.value}</span>
-                            </div>
-                          ))}
-                        </Surface>
-                      ) : null}
-
-                      {Object.keys(importPreview.providers_renamed ?? {}).length ? (
-                        <div className="rounded-lg border border-warning/30 bg-warning-soft px-3 py-2 text-xs text-warning-soft-foreground">
-                          <div className="font-medium">重名供应商将自动改名，原数据不受影响</div>
-                          <ul className="mt-1 list-disc space-y-0.5 pl-4">
-                            {Object.entries(importPreview.providers_renamed ?? {}).map(([from, to]) => (
-                              <li key={from}>
-                                <code>{from}</code> → <code>{to}</code>
-                              </li>
-                            ))}
-                          </ul>
-                        </div>
-                      ) : null}
-
-                      {importPreview.notes?.length ? (
-                        <Disclosure>
-                          <Disclosure.Heading>
-                            <Disclosure.Trigger>说明（{importPreview.notes.length} 条）</Disclosure.Trigger>
-                          </Disclosure.Heading>
-                          <Disclosure.Content>
-                            <Disclosure.Body>
-                              <ul className="text-muted list-disc space-y-0.5 pl-5 text-xs">
-                                {importPreview.notes.map((n, i) => (
-                                  <li key={i}>{n}</li>
-                                ))}
-                              </ul>
-                            </Disclosure.Body>
-                          </Disclosure.Content>
-                        </Disclosure>
-                      ) : null}
-
-                      {importPreview.warnings?.length ? (
-                        <Disclosure>
-                          <Disclosure.Heading>
-                            <Disclosure.Trigger>警告（{importPreview.warnings.length} 条）</Disclosure.Trigger>
-                          </Disclosure.Heading>
-                          <Disclosure.Content>
-                            <Disclosure.Body>
-                              <ul className="text-muted list-disc space-y-0.5 pl-5 text-xs">
-                                {importPreview.warnings.map((n, i) => (
-                                  <li key={i}>{n}</li>
-                                ))}
-                              </ul>
-                            </Disclosure.Body>
-                          </Disclosure.Content>
-                        </Disclosure>
-                      ) : null}
-
-                      <Separator />
-
-                      {importPreview.dry_run ? (
-                        <Button
-                          variant="primary"
-                          className="w-full"
-                          isDisabled={transferBusy}
-                          onPress={() => void confirmImport()}
-                        >
-                          确认导入
-                        </Button>
-                      ) : (
-                        <Button variant="secondary" className="w-full" onPress={resetImport}>
-                          再导一个
-                        </Button>
-                      )}
-                    </div>
-                  ) : null}
-                </div>
-              </SectionCard>
-            </div>
-          ) : null}
         </Tabs.Panel>
       </Tabs>
     </div>

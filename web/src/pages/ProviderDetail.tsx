@@ -3,7 +3,6 @@ import { Button, Spinner, toast } from '@heroui/react'
 import { useNavigate, useParams, useSearchParams } from 'react-router-dom'
 import { api } from '../api'
 import { useNetworks } from '../useNetworks'
-import { RequestGeneration } from '../asyncState'
 import { PageHeader } from '../ui/PageHeader'
 import { SectionCard } from '../ui/SectionCard'
 import { SkeletonBlock } from '../ui/SkeletonBlock'
@@ -19,7 +18,6 @@ import type {
   Credential,
   UpstreamModel,
   ModelTestResult,
-  ProviderBalance,
 } from '../types'
 
 const is401 = (e: unknown): boolean => (e as { status?: number }).status === 401
@@ -30,7 +28,7 @@ const is404 = (e: unknown): boolean => (e as { status?: number }).status === 404
  *
  * 为什么从 Providers 列表里独立成一张路由页：十几个上游时，列表页要同时
  * 承担「一屏扫完摘要」与「把某个上游的全部配置摊开」，两者的查阅频率差一个
- * 数量级。这里承接**全部**写操作（换钥、导入/删除模型、查余额、改设置），
+ * 数量级。这里承接**全部**写操作（换钥、导入/删除模型、改设置），
  * 列表页只保留读与两个轻量动作。没有第二处状态真相：列表页不做任何子资源
  * 请求。
  *
@@ -82,12 +80,6 @@ export function ProviderDetail() {
   const [togglingProvider, setTogglingProvider] = useState(false)
   const [credToggling, setCredToggling] = useState<Set<string>>(new Set())
   const [testing, setTesting] = useState<Set<string>>(new Set())
-
-  // 余额是点按查询、不是轮询快照：这是一个会被据此决定「要不要充值」的数字，
-  // 显示十分钟前的值比不显示更糟。取数时刻随结果一起显示。
-  const [balance, setBalance] = useState<ProviderBalance | undefined>(undefined)
-  const [balanceBusy, setBalanceBusy] = useState(false)
-  const balanceRequests = useRef(new RequestGeneration())
 
   // 模型探测的客户端超时必须大于运行时的上游超时，否则后端还没报真实原因，
   // 浏览器先掐成一句无信息的「请求超时」。设置读取失败时退回保守值。
@@ -182,9 +174,6 @@ export function ProviderDetail() {
     setModels([])
     setCredsErr('')
     setModelsErr('')
-    setBalance(undefined)
-    setBalanceBusy(false)
-    balanceRequests.current.invalidate()
     subsLoadedRef.current = { credentials: false, models: false }
     setCredsLoading(false)
     setModelsLoading(false)
@@ -332,41 +321,6 @@ export function ProviderDetail() {
     }
   }
 
-  // ---------- 余额 ----------
-
-  const queryBalance = async () => {
-    if (balanceBusy) return
-    const pid = idRef.current
-    const generation = balanceRequests.current.begin()
-    setBalanceBusy(true)
-    try {
-      const result = await api.providerBalance(pid)
-      if (
-        !balanceRequests.current.isCurrent(generation) ||
-        pid !== idRef.current ||
-        result.provider_id !== pid
-      )
-        return
-      setBalance(result)
-    } catch (e) {
-      if (is401(e)) return
-      if (!balanceRequests.current.isCurrent(generation) || pid !== idRef.current) return
-      // 管理接口失败与「上游余额查不到」是两件事：后者在响应里是
-      // status=error。分开显示，否则管理员会去换 key 而真正该做的是重试。
-      setBalance({
-        provider_id: pid,
-        provider: '',
-        status: 'error',
-        message: '管理接口调用失败：' + (e as Error).message,
-        results: [],
-      })
-    } finally {
-      if (balanceRequests.current.isCurrent(generation)) setBalanceBusy(false)
-    }
-  }
-
-  const balanceSpecConfigured = !!provider?.balance_spec_json?.trim()
-
   // ---------- 模型动作 ----------
 
   const removeModel = async (m: UpstreamModel) => {
@@ -503,8 +457,7 @@ export function ProviderDetail() {
           {/* 三块平铺：概览与凭据并排（各只六行键值 / 三列，天然适合窄栏，
                并排后首屏能同时看到「这个上游是谁」和「它现在用哪把 key」），
                模型表独占下一行（五列、可能几十行，占满才不用横向滚动）。
-               余额刻意不单独成块：它本来就逐凭据显示（同一把 key 可能只剩一把
-               有余额），汇总成一个数字反而要自己对应是哪把。 */}
+               */}
           <div className="grid items-start gap-5 lg:grid-cols-2">
             <ProviderOverviewCard
               provider={provider}
@@ -523,16 +476,11 @@ export function ProviderDetail() {
               </div>
             ) : (
               <CredentialPanel
-                providerId={provider.id}
                 creds={creds}
-                balance={balance}
-                balanceBusy={balanceBusy}
                 toggling={credTogglingIds}
-                balanceSpecConfigured={balanceSpecConfigured}
                 error={credsErr}
                 onRetry={() => void loadCredentials(true)}
                 onAdd={() => setCredModal({ open: true, editing: null })}
-                onQueryBalance={() => void queryBalance()}
                 onEdit={(c) => setCredModal({ open: true, editing: c })}
                 onRemove={(c) => void removeCred(c)}
                 onToggle={(c) => void toggleCred(c)}

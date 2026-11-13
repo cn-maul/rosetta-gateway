@@ -145,7 +145,7 @@ func toUserResponse(u *store.User, selfID string, keyCount int) userResponse {
 // group_handler.go:311 都显式拒绝空 ID，ChangePassword（本文件）也显式拒绝。
 //
 // 放行的后果是整条管理面失守：本文件的 ListUsers/CreateUser/UpdateUser/
-// DeleteUser、以及 config-transfer（含**全部上游明文凭据**）都会被空 ID 越权。
+// DeleteUser、以及上游凭据的增删改都会被空 ID 越权。
 //
 // 当前生产不可达：userKey 唯一的注入点是 UserAuthMiddleware
 // （internal/server/user_auth.go:302），其身份来自 store.GetUser 的 SQL 查询
@@ -300,22 +300,16 @@ func (h *UserHandler) CreateUser(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 密码对普通用户可以留空：空密码账号登不进去，由管理员稍后签发一个
-	// 有期限、只能使用一次的设密链接（不是公开注册）。**admin 没有留空的资格**：
-	// 空密码 admin 会让引导判定（存在 role=admin 且 password_hash='' 的账号）
-	// 重新命中，而免鉴权的 POST /admin/api/bootstrap 恰好认这个条件 ——
-	// 任何能连到端口的人都能给该账号设上自己的密码并直接拿到 admin 会话。
-	// 在产生的源头堵住（一次性 marker 是第二层防线，见 user_handler.go）。
-	hash := ""
-	if req.Password != "" {
-		var err error
-		hash, err = userauth.HashPassword(req.Password)
-		if err != nil {
-			writeError(w, http.StatusBadRequest, err.Error())
-			return
-		}
-	} else if role == store.RoleAdmin {
-		writeError(w, http.StatusBadRequest, "创建管理员必须设置初始密码（admin 不允许空密码账号）")
+	// 所有新账号都必须带初始密码。空密码账号无法登录，过去依赖一次性
+	// 设密链接补设；该链接已删除，留空只会建出一个永远进不去的账号。
+	// admin 尤其不能留空：空密码 admin 会让免鉴权的引导判定重新命中。
+	if req.Password == "" {
+		writeError(w, http.StatusBadRequest, "创建用户必须设置初始密码")
+		return
+	}
+	hash, err := userauth.HashPassword(req.Password)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 
@@ -455,12 +449,10 @@ func (h *UserHandler) UpdateUser(w http.ResponseWriter, r *http.Request, id stri
 		// 升级成 admin 前必须已有密码：空密码账号不能当管理员 —— 它会让
 		// 免鉴权引导端点（POST /admin/api/bootstrap）的判定重新命中，任何
 		// 能连到端口的人都能借道给它设上自己的密码并拿到 admin 会话。
-		// 只拦「user → admin」这一步；存量空密码 admin 改其它字段不受影响
-		// （那样只会把人锁死，堵不住任何口子）。拒绝而非代设密码：设密码
-		// 是管理员的显式动作（ResetPassword），顺手代劳会掩盖真实意图。
+		// 存量空密码账号需由管理员先重置密码，再升级。
 		if role == store.RoleAdmin && u.Role != store.RoleAdmin && u.PasswordHash == "" {
 			writeError(w, http.StatusBadRequest,
-				"该账号尚未设置密码，请先通过一次性设密链接完成设置，再升级为管理员")
+				"该账号尚未设置密码，请先重置密码，再升级为管理员")
 			return
 		}
 		if role != u.Role {

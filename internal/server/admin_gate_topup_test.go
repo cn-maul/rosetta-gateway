@@ -174,7 +174,7 @@ func TestAdminGate_NoIdentityIsRejected(t *testing.T) {
 // main.go 的路由装配），所以拦截空 ID 不会影响首次引导。
 //
 // 而放行它意味着：只要 context 里出现一个空 ID 的 admin，管理面全部端点
-// （含 config-transfer 的**上游明文凭据**导出）都会被越权访问。
+// （含上游凭据的增删改）都会被越权访问。
 // 生产中该状态不可达（userKey 唯一注入点是 GetUser 的 SQL 查询，空 id
 // 查不到行会被拦成 401），但闸门不该依赖「不可达」来维持安全。
 func TestAdminGate_EmptyIDAdminRejected(t *testing.T) {

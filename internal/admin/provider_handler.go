@@ -15,7 +15,6 @@ import (
 	wireproto "github.com/cn-maul/rosetta-gateway/internal/protocol"
 	"github.com/cn-maul/rosetta-gateway/internal/snapshot"
 	"github.com/cn-maul/rosetta-gateway/internal/store"
-	"github.com/cn-maul/rosetta-gateway/internal/upstream"
 )
 
 type ProviderHandler struct {
@@ -38,10 +37,9 @@ type providerCreateRequest struct {
 	Endpoint string `json:"endpoint"`
 	// NetworkID 指向 networks 表里的一条出站网络（代理配置）。
 	// 空串或 store.NetworkDirectID = 直连（默认），见 createProviderNetwork。
-	NetworkID       string `json:"network_id"`
-	QuirksJSON      string `json:"quirks_json"`
-	BalanceSpecJSON string `json:"balance_spec_json"`
-	APIKey          string `json:"api_key"`
+	NetworkID  string `json:"network_id"`
+	QuirksJSON string `json:"quirks_json"`
+	APIKey     string `json:"api_key"`
 }
 
 // providerUpdateRequest 是上游的 PATCH 输入。
@@ -65,8 +63,6 @@ type providerUpdateRequest struct {
 	// 网络）。用 string 的话，未提供时会被序列化成 ""，与「显式清空」不可分辨，
 	// 于是「只想改个名字」会把网络悄悄抹掉。
 	NetworkID *string `json:"network_id"`
-	// BalanceSpecJSON 与 NetworkID 同为指针：空串是「不配余额查询」的显式值。
-	BalanceSpecJSON *string `json:"balance_spec_json"`
 }
 
 // @ts-type Provider
@@ -85,11 +81,10 @@ type providerResponse struct {
 	// 响应同时带上 ProxyURL（派生值，即所选网络的地址）—— 那是**只读**的
 	// 展示用字段：前端填表只认 NetworkID，ProxyURL 存在只是让「这个网络
 	// 到底指向哪个地址」不必再发一次请求就能显示。
-	NetworkID       string `json:"network_id"`
-	ProxyURL        string `json:"proxy_url"`
-	BalanceSpecJSON string `json:"balance_spec_json"`
-	CreatedAt       int64  `json:"created_at"`
-	UpdatedAt       int64  `json:"updated_at"`
+	NetworkID string `json:"network_id"`
+	ProxyURL  string `json:"proxy_url"`
+	CreatedAt int64  `json:"created_at"`
+	UpdatedAt int64  `json:"updated_at"`
 	// Ready / ReadyReason 是**运行时**状态（P4 / 设计 §4.7），来自快照，
 	// 不是库里的配置字段。
 	//
@@ -210,34 +205,24 @@ func (h *ProviderHandler) Create(w http.ResponseWriter, r *http.Request) {
 	}
 
 	now := time.Now().UnixMilli()
-	// 创建时就校验余额配置：与 PATCH 同一份 parseBalanceSpec，保证
-	// 「保存通过」与「查询能跑」不会各说各话。
-	balanceSpec := balanceSpecOrEmpty(req.BalanceSpecJSON)
-	if balanceSpec != "" {
-		if _, err := upstream.ParseBalanceSpec(balanceSpec); err != nil {
-			writeError(w, http.StatusBadRequest, err.Error())
-			return
-		}
-	}
 	slug, err := h.uniqueSlug(r.Context(), slugify(name))
 	if err != nil {
 		writeServerError(w, "resolve unique slug", err)
 		return
 	}
 	p := &store.Provider{
-		ID:              generateID(),
-		Slug:            slug,
-		Name:            name,
-		Protocol:        protocol,
-		Endpoint:        endpoint,
-		Enabled:         true,
-		TimeoutMs:       h.cfg.Defaults.UpstreamTimeoutMs,
-		MaxRetries:      h.cfg.Defaults.MaxRetries,
-		QuirksJSON:      req.QuirksJSON,
-		NetworkID:       networkID,
-		BalanceSpecJSON: balanceSpec,
-		CreatedAt:       now,
-		UpdatedAt:       now,
+		ID:         generateID(),
+		Slug:       slug,
+		Name:       name,
+		Protocol:   protocol,
+		Endpoint:   endpoint,
+		Enabled:    true,
+		TimeoutMs:  h.cfg.Defaults.UpstreamTimeoutMs,
+		MaxRetries: h.cfg.Defaults.MaxRetries,
+		QuirksJSON: req.QuirksJSON,
+		NetworkID:  networkID,
+		CreatedAt:  now,
+		UpdatedAt:  now,
 	}
 
 	// 表单填了 api_key 就一并创建首条凭据。两半必须原子落库：
@@ -371,23 +356,6 @@ func (h *ProviderHandler) Update(w http.ResponseWriter, r *http.Request, id stri
 		}
 		existing.NetworkID = networkID
 	}
-	// 余额查询配置同样可清空（留空 = 回到按端点特征的自动判定）。
-	//
-	// **写前先校验**：path 缺失、给了绝对 URL、auth 取值非法这三类错误如果
-	// 放到查询时才报，管理员保存时看着一切正常，直到点「查余额」才发现 ——
-	// 而那一步还会顺便打一次上游。在这里挡住，错误信息直接来自
-	// parseBalanceSpec，与查询时读到的完全一致（同一份解析，不会两套口径）。
-	if req.BalanceSpecJSON != nil {
-		spec := strings.TrimSpace(*req.BalanceSpecJSON)
-		if spec != "" {
-			if _, err := upstream.ParseBalanceSpec(spec); err != nil {
-				writeError(w, http.StatusBadRequest, err.Error())
-				return
-			}
-		}
-		existing.BalanceSpecJSON = spec
-	}
-
 	if err := h.store.UpdateProvider(r.Context(), id, existing); err != nil {
 		writeProviderWriteError(w, "update provider", err)
 		return
@@ -402,38 +370,6 @@ func (h *ProviderHandler) Delete(w http.ResponseWriter, r *http.Request, id stri
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]string{"status": "deleted"})
-}
-
-// Balance 逐条查询该 provider 的凭据在上游侧的余额。
-//
-// # 为什么状态码恒为 200
-//
-// 与 Test / modelHandler.Test 同一口径：余额查不到（401、超时、上游没有这个
-// 端点）是**查询的结论**，不是管理接口调用失败。用 5xx 表达它会让前端只拿到
-// 一句统一文案，把「该换 key」「该充值」「这个上游压根不支持余额查询」三种
-// 完全不同的后续动作压成同一个错误 —— 而它们的处理方式互不相干。
-//
-// 只有「provider id 不存在」才 404：那是调用方用错了接口。
-func (h *ProviderHandler) Balance(w http.ResponseWriter, r *http.Request, id string) {
-	p, err := h.store.GetProvider(r.Context(), id)
-	if err != nil {
-		writeServerError(w, "get provider", err)
-		return
-	}
-	if p == nil {
-		writeError(w, http.StatusNotFound, "provider not found")
-		return
-	}
-
-	ctx, cancel := context.WithTimeout(r.Context(), 60*time.Second)
-	defer cancel()
-
-	res, err := upstream.QueryProviderBalance(ctx, h.store, id, h.masterKey)
-	if err != nil {
-		writeServerError(w, "query provider balance", err)
-		return
-	}
-	writeJSON(w, http.StatusOK, res)
 }
 
 // maxSlugLen 与 config 侧 bootstrap 的 slug 正则 `^[a-z0-9]{2,32}$` 一致。
@@ -503,33 +439,23 @@ func slugify(s string) string {
 	return slug
 }
 
-// balanceSpecOrEmpty 把创建请求里的 balance_spec_json 归一成库里的形态。
-//
-// 创建时也校验（不只是 PATCH）：写错就当场 400，不会留下一条
-// 「保存成功、点查余额才失败」的脏配置。空串原样返回 —— 那表示「不配，
-// 走自动判定」，是合法且最常见的输入。
-func balanceSpecOrEmpty(spec string) string {
-	return strings.TrimSpace(spec)
-}
-
 func toProviderResponse(p store.Provider) providerResponse {
 	return providerResponse{
-		ID:              p.ID,
-		Slug:            p.Slug,
-		Name:            p.Name,
-		Protocol:        p.Protocol,
-		Endpoint:        p.Endpoint,
-		Enabled:         p.Enabled,
-		TimeoutMs:       p.TimeoutMs,
-		MaxRetries:      p.MaxRetries,
-		QuirksJSON:      p.QuirksJSON,
-		NetworkID:       p.NetworkID,
-		ProxyURL:        p.ProxyURL,
-		BalanceSpecJSON: p.BalanceSpecJSON,
-		CreatedAt:       p.CreatedAt,
-		UpdatedAt:       p.UpdatedAt,
-		ModelCount:      p.ModelCount,
-		CredCount:       p.CredCount,
+		ID:         p.ID,
+		Slug:       p.Slug,
+		Name:       p.Name,
+		Protocol:   p.Protocol,
+		Endpoint:   p.Endpoint,
+		Enabled:    p.Enabled,
+		TimeoutMs:  p.TimeoutMs,
+		MaxRetries: p.MaxRetries,
+		QuirksJSON: p.QuirksJSON,
+		NetworkID:  p.NetworkID,
+		ProxyURL:   p.ProxyURL,
+		CreatedAt:  p.CreatedAt,
+		UpdatedAt:  p.UpdatedAt,
+		ModelCount: p.ModelCount,
+		CredCount:  p.CredCount,
 	}
 }
 

@@ -18,7 +18,7 @@ import (
 	"testing"
 
 	"github.com/cn-maul/rosetta-gateway/internal/admin"
-	"github.com/cn-maul/rosetta-gateway/internal/billinghttp"
+	"github.com/cn-maul/rosetta-gateway/internal/catalog"
 	"github.com/cn-maul/rosetta-gateway/internal/ingress"
 	"github.com/cn-maul/rosetta-gateway/internal/server"
 	"github.com/cn-maul/rosetta-gateway/internal/snapshot"
@@ -151,14 +151,14 @@ func TestAdminLockout_NormalUserUnaffected(t *testing.T) {
 	waitBalanceSettled(t, db, start-800, "普通用户应照常按实收扣费")
 }
 
-// 管理员的数据面查询端点（/v1/models、billing、org）同样被拒 —— 口径统一。
+// 管理员的数据面查询端点（/v1/models 系列）同样被拒 —— 口径统一。
 //
 // 理由：这些端点都只做 auth.Authenticate，拦截收敛在鉴权层就自动覆盖。
 // 若将来有人绕过鉴权直连某端点，这条会先红。
 func TestAdminLockout_QueryEndpointsAlsoRejectAdmin(t *testing.T) {
 	up := fakeGood()
 	defer up.Close()
-	_, db, _ := buildHarnessFull(t, []struct {
+	buildHarnessFull(t, []struct {
 		slug, url string
 		fail      bool
 	}{{slug: "good", url: up.URL}}, false, ingress.NewOpenAIChat())
@@ -168,10 +168,9 @@ func TestAdminLockout_QueryEndpointsAlsoRejectAdmin(t *testing.T) {
 		name string
 		h    http.HandlerFunc
 	}{
-		{"billing/subscription", billinghttp.Subscription(db)},
-		{"billing/usage", billinghttp.Usage(db)},
-		{"organization/costs", billinghttp.OrgCosts(db)},
-		{"organization/usage", billinghttp.OrgUsageCompletions(db)},
+		{"models/list", catalog.Get("")},
+		{"models/openai", catalog.Get("openai")},
+		{"models/anthropic", catalog.Get("anthropic")},
 	} {
 		rec := httptest.NewRecorder()
 		tc.h(rec, authedGet("/v1/x"))

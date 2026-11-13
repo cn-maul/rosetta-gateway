@@ -101,13 +101,6 @@ export function ProviderOverviewCard({
             {provider.max_retries ? `${provider.max_retries} 次` : '默认'}
           </span>
         </KvRow>
-        <KvRow k="余额查询">
-          {provider.balance_spec_json?.trim() ? (
-            <StatusChip tone="info">自定义</StatusChip>
-          ) : (
-            <span className="text-muted">未配置</span>
-          )}
-        </KvRow>
       </div>
     </SectionCard>
   )

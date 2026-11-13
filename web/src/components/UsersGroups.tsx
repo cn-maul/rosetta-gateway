@@ -4,11 +4,9 @@ import { api, ApiFail } from '../api'
 import { confirmBox } from '../ui/confirm'
 import { GroupFormModal, GroupModelsModal } from './users/GroupModals'
 import {
-  SetupLinkModal,
   UserCreateModal,
   UserEditModal,
   UserPasswordModal,
-  type SetupLinkInfo,
 } from './users/UserModals'
 import { GroupsTable, UsersTable } from './users/UserTables'
 import { boundCounts, deleteBlockedTitle } from './users/groupUtils'
@@ -35,7 +33,6 @@ export function UsersGroups({ tab }: { tab: 'users' | 'groups' }) {
   const [createOpen, setCreateOpen] = useState(false)
   const [editFor, setEditFor] = useState<User | null>(null)
   const [pwdFor, setPwdFor] = useState<User | null>(null)
-  const [setupLink, setSetupLink] = useState<SetupLinkInfo | null>(null)
   const [groupFormOpen, setGroupFormOpen] = useState(false)
   const [editingGroup, setEditingGroup] = useState<Group | null>(null)
   const [modelsFor, setModelsFor] = useState<Group | null>(null)
@@ -142,25 +139,6 @@ export function UsersGroups({ tab }: { tab: 'users' | 'groups' }) {
     }
   }
 
-  /** 生成一次性设密链接。明文只存在于本次响应和这个弹窗里：
-   * 后端只保存 token 哈希，关闭弹窗时前端也立刻抹掉明文 URL。 */
-  const generateSetupLink = async (u: User) => {
-    if (pending.has(u.id)) return
-    setRowPending(u.id, '生成中…')
-    try {
-      const link = await api.createPasswordSetupLink(u.id)
-      setSetupLink({
-        user: u,
-        url: new URL(link.url_path, window.location.origin).href,
-        expiresAt: link.expires_at,
-      })
-    } catch (e) {
-      toast.danger(e instanceof ApiFail ? e.message : '生成设密链接失败')
-    } finally {
-      setRowPending(u.id, null)
-    }
-  }
-
   const askDeleteGroup = async (g: Group) => {
     // 前置拦截，而不是「先确认再等一个 409」：后端一定会拒绝，
     // 让管理员为一个注定失败的操作多按一次确认毫无意义。
@@ -220,7 +198,7 @@ export function UsersGroups({ tab }: { tab: 'users' | 'groups' }) {
           err={err}
           pending={pending}
           onEdit={setEditFor}
-          onPassword={(u) => (u.has_password ? setPwdFor(u) : void generateSetupLink(u))}
+          onPassword={setPwdFor}
           onToggle={(u) => void toggleStatus(u)}
           onDelete={(u) => void askDelete(u)}
         />
@@ -244,9 +222,7 @@ export function UsersGroups({ tab }: { tab: 'users' | 'groups' }) {
         onClose={() => setCreateOpen(false)}
         groups={groups}
         onSaved={load}
-        onNeedsSetupLink={(created) => generateSetupLink(created)}
       />
-      <SetupLinkModal info={setupLink} onClose={() => setSetupLink(null)} />
       <UserEditModal user={editFor} onClose={() => setEditFor(null)} groups={groups} onSaved={load} />
       <UserPasswordModal user={pwdFor} onClose={() => setPwdFor(null)} onSaved={load} />
       <GroupFormModal open={groupFormOpen} editing={editingGroup} onClose={() => setGroupFormOpen(false)} onSaved={load} />

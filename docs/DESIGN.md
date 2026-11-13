@@ -8,8 +8,8 @@
 | 运行时依赖 | `github.com/cn-maul/rosetta` v1.3.1（上游 SDK）、`modernc.org/sqlite` v1.61.1（纯 Go SQLite，内置 SQLite 3.54.1；无 cgo，`CGO_ENABLED=0` 可构建）、`github.com/golang-jwt/jwt/v5`（管理会话） |
 | 工具链 | **Go 1.27.3 起**（`go.mod` 的 `go` 指令是唯一来源，CI 用 `go-version-file` 读取；1.27.3 之前的版本带已知安全漏洞，不得使用，本地也勿用更早的 1.27.x）。镜像构建固定 `golang:1.27.3-alpine3.24` 的 digest，并设 `GOTOOLCHAIN=local`，版本不足时构建直接失败，不会静默下载其他工具链 |
 | 版本 | 与 `web/package.json` 同源（当前 2.1.2），镜像与二进制共用 |
-| 状态 | **已实现**（P0–P3 全部落地，多用户、用量归档、配置导入导出均已上线） |
-| 更新 | 2026-11-01 |
+| 状态 | **已实现**（P0–P3 全部落地，多用户与用量归档已上线） |
+| 更新 | 2026-11-13 |
 
 ---
 
@@ -284,17 +284,6 @@ CREATE TABLE users (
   created_at    INTEGER NOT NULL,
   updated_at    INTEGER NOT NULL,
   last_login_at INTEGER NOT NULL DEFAULT 0
-);
-
--- 普通用户的一次性设密链接（2026-10-22）
--- 一个用户最多一条；重新签发覆盖旧记录。表是向后兼容的新增对象，
--- 旧数据库启动时用 CREATE TABLE IF NOT EXISTS 补齐，不提升 user_version。
-CREATE TABLE user_password_setup_tokens (
-  user_id    TEXT PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
-  token_hash TEXT NOT NULL UNIQUE,       -- SHA-256(明文 token)，不存明文
-  expires_at INTEGER NOT NULL,           -- 毫秒时间戳
-  created_by TEXT NOT NULL,              -- 签发链接的管理员 user id
-  created_at INTEGER NOT NULL
 );
 
 -- 分组与组级模型白名单（groups 刻意不带 quota/rpm/tpm 列 —— 没有执行点的列不建）
@@ -579,7 +568,6 @@ Qwen `help.aliyun.com/zh/model-studio/deep-thinking`；MiniMax
 | `POST /v1/responses` | OpenAI Responses | **已实现（2026-10-04）**——Codex CLI 等客户端接入点；`previous_response_id`/`store` 由上游承接（见 §17 R11）；`text.format` 跨协议映射为 chat 的 response_format；reasoning item 的 `encrypted_content` 随 Rosetta v1.2.0 起无损往返（同样见 R11） |
 | `GET /v1/models` | 形状按认证头分流（D9） | 已实现，`?include=upstream` 展开轨道二；**条目带容量元数据**（见 §5.3） |
 | `GET /v1/models/{model}` | 单模型详情 | 已实现（OpenAI/Anthropic 形状 + 容量元数据；`/openai/v1/models/{m}`、`/anthropic/v1/models/{m}` 别名） |
-| `GET /dashboard/billing/*`、`GET /v1/organization/usage|costs` | 额度/费用查询 | 已实现（2026-10-04），见 §6.4 |
 
 **D9 冲突说明**：OpenAI 与 Anthropic 的模型列表**路径完全相同**（都是 `GET /v1/models`），但响应结构不同：
 
@@ -638,29 +626,18 @@ NULL 只作为损坏数据的 fail-closed 状态处理，不再提供迁移或�
 - **窗口是一次性的**（2026-10-07 加固）：`app_settings` 里的 `bootstrap_completed`
   标记与首次设密在同一事务写入 —— 设过一次后，无论日后是否再出现空密码 admin
   （该形态本身已被下一条堵死），免鉴权窗口永不重开；
-- 防 线：只对 `role='admin' AND password_hash=''` 的账号生效（条件 UPDATE，
-  设过即 409）、创建 admin 必须带初始密码、空密码账号禁止升级为 admin、
+- 防线：只对 `role='admin' AND password_hash=''` 的账号生效（条件 UPDATE，
+  设过即 409）、创建用户必须带初始密码、空密码账号禁止升级为 admin、
   同源校验 + Content-Type 断言（防 CSRF）；
 - 暴露面边界：全新部署且监听非回环时，**能访问该端口的人**可以抢先完成首次设置
   —— 窗口只开这一次，抢到的人成为第一个管理员。局域网自用部署接受这一风险；
   默认回环监听把这一面进一步缩小，启动时另有 ERROR 告警
   （`FindUninitializedAdmin != nil && !isLoopbackListen`），部署后应立即设置密码。
 
-**普通用户的一次性设密链接**（2026-10-22）：
-
-- 系统不开放公开注册，也不允许空密码账号从普通登录框自助设密。管理员创建普通
-  用户时可以留空密码；用户列表随后显示「设密」，管理员签发一条 24 小时有效的
-  一次性链接。
-- 公开端点只有 `POST /admin/api/password-setup/check`（校验链接并显示目标用户名）
-  和 `POST /admin/api/password-setup`（设置密码并直接签发会话）。两者都要求同源 +
-  JSON Content-Type；设置密码的请求另按来源 IP 限速。
-- token 使用高熵随机值，数据库只存 SHA-256 哈希。链接形如
-  `/admin/#/set-password?token=...`，token 位于 hash fragment，不进入首次 HTTP
-  请求的访问日志。无效、过期、已消费、账号禁用等状态统一返回同一条错误，避免
-  账号或链接枚举。
-- 设密与消费 token 在同一数据库事务内完成，并递增 `auth_version`，因此旧会话
-  失效且链接不能重放。重新签发会覆盖旧链接；管理员改密、禁用、删除用户也会
-  清理或级联清理未使用的链接。
+**普通用户账号**：系统不开放公开注册。管理员创建用户时**必须直接设置初始密码**，
+创建后可通过「重置密码」下发新密码。一次性设密链接已于 2026-11-13 移除：
+它只省去管理员转交一次初始密码，却引入公开端点、token 生命周期和一处额外的
+安全边界，实际使用率很低。
 
 | 端点 | 放行规则 |
 |---|---|
@@ -668,15 +645,10 @@ NULL 只作为损坏数据的 fail-closed 状态处理，不再提供迁移或�
 | `GET /admin/api/bootstrap` | 恒放行（返回是否需要初始化与待初始化账号名） |
 | `POST /admin/api/bootstrap` | 仅当 `bootstrap_completed` 标记未写入且存在未初始化 admin 时放行；同源 + JSON Content-Type。标记与首次设密同事务写入，窗口一次性。它挂在 `publicAdminMux` 上因而**绕过**了 `adminAuto` 的审计，故单独套 `server.AuditOnly` 补上（只补审计，不触发快照重建 —— 它只改密码哈希） |
 | `POST /admin/api/login` | 免鉴权（登录本体；失败计入来源 IP 限速，§11.4） |
-| `POST /admin/api/password-setup/check` | 免鉴权；只接受一次性设密 token，返回目标用户名和过期时间；无效 token 统一返回 `valid=false` |
-| `POST /admin/api/password-setup` | 免鉴权；消费 token、写入密码并签发会话；按来源 IP 限速，token 使用与密码更新同事务 |
 | `POST /admin/api/logout` | **要会话**：它必须知道吊销谁（`BumpAuthVersion`）。「免鉴权」的登出只会清 cookie，而令牌在自然过期前仍然可用 —— 那是一次假登出 |
 | 其余 | `Authorization: Bearer <会话令牌>`，查 users 表比对 `auth_version` |
 
 ```
-POST   /admin/api/password-setup/check          校验普通用户的一次性设密链接
-POST   /admin/api/password-setup                设置密码并直接登录；token 一次性消费
-
 GET    /admin/api/networks                      代理清单；直连是保留 id
                                                "direct"，不在此列表里（2026-10-20）
 POST   /admin/api/networks                      新建
@@ -688,9 +660,6 @@ POST   /admin/api/providers                     新建
 GET    /admin/api/providers/{id}                单个详情（编辑表单回显）
 PATCH  /admin/api/providers/{id}
 DELETE /admin/api/providers/{id}
-POST   /admin/api/providers/{id}/balance        查询上游服务商余额（管理员；2026-10-11
-                                                 新增，透传 internal/upstream/balance.go；
-                                                 纯读，**刻意不触发** AutoReload 重建）
 
 GET    /admin/api/providers/{id}/credentials
 POST   /admin/api/providers/{id}/credentials
@@ -721,12 +690,11 @@ GET    /admin/api/routes/{id}/targets             读有序上游链（含 provi
 PUT    /admin/api/routes/{id}/targets             原子整体替换链；链首回写 routes 主目标列
 
 GET    /admin/api/users                         用户列表（admin）
-POST   /admin/api/users                         新建用户；role=admin 必须带初始密码
+POST   /admin/api/users                         新建用户；所有角色都必须带初始密码
 PATCH  /admin/api/users/{id}                    角色/状态/配额/分组/备注；改角色或状态
                                                  自动递增 auth_version 使旧会话失效
 DELETE /admin/api/users/{id}
 POST   /admin/api/users/{id}/password           管理员重置该用户密码
-POST   /admin/api/users/{id}/password-setup     为未设密普通用户签发 24 小时一次性链接
 PUT    /admin/api/users/{id}/balance             管理员充值/扣减余额，body `{delta_cents}`（分，正充负扣）
 
 GET    /admin/api/groups                        分组与组级模型白名单（admin）
@@ -756,13 +724,11 @@ GET    /admin/api/usage/by-user                              **仅管理员**：
 POST   /admin/api/usage/prune                   手动触发归档剪枝（每日定时之外的人口）
 GET    /admin/api/stats                         所选区间统计：请求/成功/失败/取消、token、费用、首字/速度加权样本
 GET/PUT /admin/api/settings                     运行时全局默认（超时/故障转移策略，§10）
-POST   /admin/api/config-export/export|import   配置导出/导入（§13.3，requireAdmin）
 GET    /admin/api/model-names                   公开模型名清单（按身份收窄，供白名单选择）；附带
                                                  `prices[]`（与 `models` **平行**的数组，prices[i]
                                                  对应 models[i]，三项单价元/百万 tokens，0 = 未配置）
                                                  与 `meta[]`（`name` / `provider_name`，
                                                  供卡片副标题显示首选供应商）
-PUT    /admin/api/users/{id}/balance             管理员充值/扣减余额，body `{delta_cents}`（分，正充负扣）
 GET    /admin/api/topups                         充值流水（按身份收窄：管理员看全部、
                                                  普通用户只看自己的）
 POST   /admin/api/me/password                    当前用户自助改密（校验旧密码；
@@ -780,33 +746,6 @@ POST   /admin/api/logout                         登出（递增 auth_version）
 所有写操作的事务边界：**先写 DB，提交成功后再重建快照**。DB 写失败则快照不动。
 
 **重建由服务端自动执行**（2026-10-01 起）：管理写请求成功（2xx）后，`server.AutoReload` 中间件就地调用 `internal/runtime.Reloader.Reload`（池重建 + 快照重建，`sync.Mutex` 串行化，两边都构建成功才原子替换，任一步失败运行时保持旧状态）。**重建失败有后台兜底**（2026-10-07 起）：失败即置 `dirty` 标志，`Reloader.WatchRetry` 按 30s 起步、指数退避（封顶 10 分钟）反复重试直至收敛，避免「响应已 200 +『已禁用』而数据面仍在放行」的分叉无限期存在（健康检查可读 `IsDirty`）。此前生效路径依赖调用方写完再手动触发重建——任何绕过前端的调用方（curl/脚本）写完不触发就是静默分叉，最敏感的是**禁用下游 Key 后 auth 读旧快照照常放行**。现在手动重建端点已删除，重建只有服务端自动执行这一条路径。
-
-### 6.4 额度/费用查询（2026-10-04）
-
-两套形状（实现见 `internal/billinghttp`），均需有效 sk-gw key：
-
-| 端点 | 形状来源 | 数据口径 |
-|---|---|---|
-| `GET /v1/organization/costs` | OpenAI 官方 Usage/Costs API（page + bucket + `organization.costs.result`） | **按调用者身份收窄**（管理员/运维凭据=全组织，普通用户=自己名下）；费用按 upstream_models 单价实时估算（口径同 §11.1 统计），`amount.currency` 诚实标 `cny` |
-| `GET /v1/organization/usage/completions` | 同上 | 同上；input/cached/output/请求数按 1h/1d 桶聚合 |
-| `GET /dashboard/billing/subscription`（含 `/v1/` 前缀别名） | one-api/new-api 时代起客户端通用 | **per-key**：`hard_limit_usd` 等承载 key 的 token 配额 |
-| `GET /dashboard/billing/usage`（含别名） | 同上 | **per-key**：区间内已用 token 折算 `total_usage`（美分） |
-
-「组织」= 本网关整个部署，因此上面两个 `/v1/organization/*` 端点**按调用者身份收窄**
-（实现见 `internal/billinghttp` 的 `orgCostsScope` + `store.SumUsageBucketsScoped` /
-`SumCostBucketsScoped`）。作用域只由服务端根据会话身份判定，绝不从 query 参数读取。
-修复前它们只做 `auth.Authenticate`，任何一把 `sk-gw` key 都能读到**别的租户**的
-模型名、用量与费用（实测普通用户的 `/admin/api/stats` 显示 `cost:0`，而同一把 key
-打 `/v1/organization/costs` 直接拿到 `value:0.000072 cny` —— 恰好是 stats 不给的那笔）。
-
-`/dashboard/billing/usage` 的 `start_date` / `end_date`（`YYYY-MM-DD`）**给了但解析不了、
-或区间反向，一律 400**：静默回退到「最近 30 天」等于把另一个窗口的数据返回给调用方
-却让它以为生效了。参数**缺省**才回退近 30 天。
-
-**单位映射（重要）**：dashboard billing 系把 **百万 tokens 记作 1 美元等价单位（PTM）**
-—— 客户端 UI 只消费两个数的比值（余额/进度条），同量纲保证比例正确；绝对值是
-token 量纲而非美元。key 未设配额时 `hard_limit_usd` 返回 1e9（避免 UI 把 0 显示成
-「零余额」），响应带 `total_tokens` 扩展字段供按 token 展示的工具使用。
 
 #### PATCH 语义：字段级部分更新
 
@@ -1794,7 +1733,7 @@ Docker 侧对齐，且避开浏览器的保留端口表（6666 是 IRC 段，浏
 > `-ldflags` 注入 `main.buildVersion`，与 CI/前端页脚同源。
 
 **鉴权**：管理 API 由 `adminGuarded` 鉴权链保护，凭据逻辑在 `internal/userauth` +
-`internal/admin`（users 表 + JWT 会话，见 §6.3）。**恰好 6 条路由免鉴权**，且必须显式
+`internal/admin`（users 表 + JWT 会话，见 §6.3）。**恰好 5 条路由免鉴权**，且必须显式
 注册到根 mux（`internal/api/api.go` 的 `routeSpecs` 表）—— 它们不进 `adminAuto`（那会走鉴权链），但也不能
 因为「没注册」而落到 `/admin/api/` 前缀上被鉴权拦掉，那样会得到 401 而非功能缺失，
 症状是「登录页一直转圈」：
@@ -1805,8 +1744,7 @@ Docker 侧对齐，且避开浏览器的保留端口表（6666 是 IRC 段，浏
 | `GET /admin/api/session` | 探测是否已登录（前端启动时决定去登录页还是主页） |
 | `GET /admin/api/bootstrap` | 查询是否需要引导（未初始化 → 前端弹「设置密码」） |
 | `POST /admin/api/bootstrap` | 设初始管理员密码，**仅在系统尚无任何凭据时开放** |
-| `POST /admin/api/password-setup/check` | 校验普通用户一次性设密链接；无效 token 统一返回 `valid=false` |
-| `POST /admin/api/password-setup` | 消费一次性 token、设置普通用户密码并直接签发会话 |
+| `GET /admin/api/site` | 站点品牌（登录页要显示站点名与 LOGO，必须匿名可读） |
 
 > **历史沿革（2026-10-06 已整体删除）**：统一认证之前是「`admin_auth.json` 密码文件 +
 > `config.json` 的 `admin_token`」双通道，前端存的是**管理密码**而不是令牌，靠三个
@@ -1830,8 +1768,8 @@ Docker 侧对齐，且避开浏览器的保留端口表（6666 是 IRC 段，浏
 
 ### 13.2 页面清单
 
-实际路由以 `web/src/router.tsx` 为准（2026-11-01 按 React 版核实）。共有 **13 个可渲染
-页面组件**：登录、普通用户设密、总览、调用日志/用量统计、可用模型、钱包、API 密钥/
+实际路由以 `web/src/router.tsx` 为准（2026-11-13 按 React 版核实）。共有 **12 个可渲染
+页面组件**：登录、总览、调用日志/用量统计、可用模型、钱包、API 密钥/
 用户与权限、供应商、供应商详情、路由、代理、账号设置、设置。
 其中 6 条路由要求管理员：`/users`、`/providers`、`/providers/:id`、
 `/routes`、`/networks`、`/settings`，未登录或非 admin 看不到也进不去。
@@ -1845,24 +1783,22 @@ Docker 侧对齐，且避开浏览器的保留端口表（6666 是 IRC 段，浏
 | 路由 | 页签 | 可见 | 内容 |
 |---|---|---|---|
 | `/login` | 登录 | 公开 | 账号密码换 JWT；未初始化时改走引导设密 |
-| `/set-password` | 设置密码 | 公开 | 一次性设密链接落地页；`token` 位于 hash query，校验后设置密码并直接登录。登录用户也可访问，完成设置会切换为该账号的会话 |
 | `/` | 总览 | 全体 | 管理员首屏分两块：当前启用的上游/总数、上游模型总数、用户数、Key 数、累计 token 费用；以及所选区间请求数、成功率、平均首字、平均输出速度、费用、token 与缓存命中率。另有趋势、待处理项；普通用户看自己的区间质量指标、余额与配额 |
 | `/history` | 请求日志 | 全体 | `UsageStats.tsx` 固定渲染逐条 `UsageDetailDrawer.tsx`：时间、状态、流式/非流式、入站协议、公开路由名（下行显示实际上游模型）、密钥、新增输入 / 新增输出（下行显示缓存数）、输出速度、首字 / 总耗时、费用和详情。首字与总耗时按阈值着色：首字 5s / 10s、总耗时 10s / 30s 分别对应绿 / 橙 / 红。支持按时间范围 / 状态 / 模型 / key 过滤、分页和 CSV 导出 |
 | `/usage` | 用量与费用 | 全体 | `UsageStats.tsx` 的非日志形态：默认近 1 天，也可切到近 7 / 30 天。按上游、模型、密钥三个维度用排行表汇总，顶部先给出范围总计，每行展示请求量、成功 / 失败数、Tokens、固化费用、成功率进度条以及首字 / 输出速度。所有子页共用父页面的时间范围，避免切换页签后两页数字对不上 |
 | `/models` | 可用模型 | 全体 | **只读**清单：`GET /admin/api/model-names` 按身份收窄后的模型名（普通用户 = 所属组白名单 ∩ 全部路由名）+ 输入/输出/缓存命中三项单价；`restricted=true` 时显式提示「已被分组收窄」。刻意不给勾选控件 —— 白名单的写入口在 `/keys`（只能收紧）与 `/groups`（管理员按组收紧），且**空清单一律解释为「一个模型都调不了」而非 ModelPicker 的「一个都不选 = 不限制」**（后者只属于配置态）。未配置的单价显示「未配置」并弱化，**不显示 0.00**（会被读成「确认免费」） |
 | `/wallet` | 钱包与充值 | 全体 | **按身份分两种形态的同一页**：管理员看到全站的用户消费汇总 + 全部充值流水 + 充值入口（没有消耗记录，明细在「用量统计」页）；普通用户看到自己的余额、按天消耗与充值记录。自改密码已迁到「设置」页（2026-10-13）。余额（`balance_cents`）在 `balance_unlimited` 时显示「不限」而非 0.00 元，为 0 时显式提示「余额已用尽，请联系管理员充值」，对应数据面真实的 402 |
 | `/keys` | API 密钥 | 全体 | `AccessControl.tsx` 的密钥页签：普通用户只看到并管理自己的 `sk-gw-` key；管理员可查看/调整归属与限制，但不能给自己新建 key。密钥创建与页签路由分离，`/keys` 是可停留地址 |
-| `/users` | 用户与权限 | admin | `AccessControl.tsx` 的「用户 / 权限分组」两个页签。用户页含 CRUD、角色、启停、一次性设密/改密、余额充值；空密码普通用户可签发 24 小时设密链接，admin 新建时仍必须带初始密码。分组页维护成员与组级模型白名单 `PUT /admin/api/groups/{id}/models`。`delta_cents` 是相对金额，误操作不会把余额清零 |
+| `/users` | 用户与权限 | admin | `AccessControl.tsx` 的「用户 / 权限分组」两个页签。用户页含 CRUD、角色、启停、重置密码、余额充值；新建用户必须带初始密码。分组页维护成员与组级模型白名单 `PUT /admin/api/groups/{id}/models`。`delta_cents` 是相对金额，误操作不会把余额清零 |
 | `/networks` | 代理 | admin | 组件是 `Networks.tsx`：可复用的代理地址清单（2026-10-20）。provider 只存 `network_id`，实际地址由读路径 JOIN 派生。直连是保留 id `direct`，不是一行记录。删网络让引用它的上游回到直连，不删上游。连通性由后台定时探针测量并显示延迟 |
 | `/providers` | 上游服务 | admin | `Providers.tsx` 列表：类型用 `Chat / Response / Anthropic` 展示，紧跟一列用胶囊标出「直连」或「代理 · 名称」，模型/凭据摘要右对齐，操作列保留配置与删除，启停开关独立成最后一列；新建时可选择代理 |
-| `/providers/:id` | 上游详情 | admin | `ProviderDetail.tsx`：凭据、模型发现/导入、余额查询、连通性测试、批量改价与协议配置。模型测试结果通过页面底部的临时 toast 展示，不嵌入模型行。协议值在 API/DB 中仍为 `chat / response / anthropic` |
+| `/providers/:id` | 上游详情 | admin | `ProviderDetail.tsx`：凭据、模型发现/导入、连通性测试、批量改价与协议配置。模型测试结果通过页面底部的临时 toast 展示，不嵌入模型行。协议值在 API/DB 中仍为 `chat / response / anthropic` |
 | `/routes` | 模型与路由 | admin | `Routes.tsx`：公开模型名到有序上游链；`PUT /admin/api/routes/{id}/targets` 原子替换整条链 |
 | `/account` | 账号设置 | 全体 | 当前用户自助改密、查看账号信息；管理员和普通用户都可访问 |
-| `/settings` | 系统设置 | admin | 五个页签：模型默认、运行时、模型价格、修改密码、导入导出（§13.3）。**审计日志页签与读取端点均已移除**；审计写入仍保留在服务端 |
+| `/settings` | 系统设置 | admin | 四个页签：站点品牌、模型默认、运行时、模型价格。**审计日志页签与读取端点均已移除**；审计写入仍保留在服务端 |
 
 「用量看板」不是独立页 —— 按上游 / 模型 / 密钥的汇总以子页签形式内嵌在
 `/usage`；逐条请求日志在 `/history`。
-设置页的导入导出即 §13.3 描述的功能。
 
 > **`/model-names` 加价格为什么是「平行数组」而不是把 `models` 改成对象数组**
 >
@@ -1879,35 +1815,16 @@ Docker 侧对齐，且避开浏览器的保留端口表（6666 是 IRC 段，浏
 
 > 布局在 2026-10-06 改为**侧边栏**（`329a7ca`，参考 hirezo），此前是顶部标签页。
 
-### 13.3 配置导入导出（2026-10-06 新增，2026-10-07 补数值校验）
+### 13.3 配置迁移口径
 
-`POST /admin/api/config-export/{export,import}`，入口在设置页。**只做供应商 +
-模型**两项：路由与故障转移链是本部署的组织结构（公开名是给调用方看的契约，
-跨环境照抄会撞名），访问密钥与分组根本不该离开这个库。
-
-- **导出必加密、必带凭据**（2026-10-07 收敛，此前是「明文默认不带凭据 + 勾选带凭据 +
-  口令可选」的四种组合）：凭据是这份文件里唯一「泄了就能花钱」的东西，明文带凭据的
-  文件又恰恰是最容易顺手导出的那种；且单一产物格式让导入侧不用兼容两套形态。
-  无口令请求一律 400，产物统一是当前版本的 `.json.enc`；明文文件与旧格式一律拒绝。
-- **导入语义是「只增不改」**：已存在的 slug 原样保留，新来的改名加 `-2`/`-3` 后缀。
-  覆盖要先删、删错了就没了；加后缀最坏只是库里多一个重复供应商，用户自己能看出来。
-- 导入**必须先干跑**（`dry_run`），界面先展示预览再确认写入。
-- 导出响应是文件下载（`Content-Disposition`），前端走独立的 `downloadFile()` 而非
-  通用 `request<T>` —— 后者会 `JSON.parse` 一整个配置清单。
-- **导入与手工创建同一套校验**（2026-10-07）：超时/重试/上下文窗口/单价等数值字段
-  不再绕过 provider/model handler 的非负与上界校验，违例跳过并进 warnings；
-  凭据的 `enabled` 必须由当前导出格式显式给出，缺字段的条目跳过并告警，
-  不再猜测为启用。
-- 两个端点都在 handler 内 `requireAdmin`：路径虽在 `/admin/api/` 前缀下（白名单管不到），
-  但导出体可能含全部上游凭据，绝不能落到普通用户手里。
-
-配置迁移只认**当前 schema**：导出/导入格式是唯一受支持的跨环境搬运方式。
-项目不再维护旧版本数据库的原地迁移工具，也不为历史 schema 保留第二套建表、
+配置迁移只认**当前 schema 的备份与重建**，不提供应用层导出/导入：
+跨环境搬运直接复制整个 `data/` 目录（或等价地备份 SQLite 文件），
+版本升级不做旧 schema 的原地迁移，也不为历史 schema 保留第二套建表、
 列补丁或回填逻辑 —— 那会让同一份数据语义在两条路径上各自演化。
 上游模型没有独立启停状态：模型一旦添加就参与路由和 `/v1/models`
 直连枚举；是否对外提供由公开路由及其启停状态决定。该字段的移除属于破坏性
-结构变更，`user_version` 因此提升到 2，旧库需导出配置后重建并重新导入。
-唯一例外是**向后兼容的纯新增对象**（如 `user_password_setup_tokens`）和**纯值归一化**
+结构变更，`user_version` 因此提升到 2，旧库需重建配置。
+唯一例外是**向后兼容的纯新增对象**和**纯值归一化**
 （如旧协议名 `openai-chat` / `openai-responses` 改成 `chat` / `response`）：
 它们不改变既有列、索引或约束，启动时可幂等执行，因此无需提升 `user_version`。
 
@@ -1915,8 +1832,8 @@ Docker 侧对齐，且避开浏览器的保留端口表（6666 是 IRC 段，浏
 
 - 管理面只有 users 表 + 会话一条通道（§6.3），不做「内网免鉴权」的假设；
   首次初始化窗口只对未设密码的 admin 开启，且启动时对「非回环监听 + 未初始化」打 ERROR
-- 普通用户不开放注册；一次性设密链接 24 小时有效、只能消费一次，服务端只存 token
-  哈希，重新签发/管理员改密/禁用/删除都会使旧链接失效
+- 普通用户不开放注册；管理员新建账号时必须直接设置初始密码，之后只能通过
+  「重置密码」下发新密码（重置会递增 `auth_version`，旧会话立即失效）
 - 上游 key 在界面只显示掩码（`sk-...abcd`），明文不可回读
 - 所有写操作记审计日志（**已实现，2026-10-04**）：`server.AutoReload` 在每个管理写
   操作上落 `audit_log`（谁=会话身份+来源 IP、何时、哪个资源、**哪些字段名**）。
@@ -1957,7 +1874,7 @@ Docker 侧对齐，且避开浏览器的保留端口表（6666 是 IRC 段，浏
 > 本轮补上的是 2026-10-06 之后新增的根级资产（`scripts/`、`docker/`、`.github/`、
 > `build.ps1`、`gateway.ps1`、`CONTRIBUTING.md`）与 `internal/` 下新增的
 > `effort`（思考挡位唯一口径）、`probe`（出站代理定时测速），以及 2026-10-21
-> 重构拆出的 `httpx / identity / guard / access / usage / billing / billinghttp /
+> 重构拆出的 `httpx / identity / guard / access / usage / billing /
 > authhttp / ingress / dataplane / runtime / gatewayapp / api / catalog`。
 > 核对方式：`Get-ChildItem -Directory` + 逐个 `internal/*/` 的包注释。
 
@@ -2011,9 +1928,8 @@ rosetta-gateway/
 │   ├── catalog/                    /v1/models 列表、详情与模型元数据
 │   ├── usage/                      异步用量落库、扣费、关停 drain
 │   ├── billing/                    纯计价与余额预检策略
-│   ├── billinghttp/                subscription / usage / costs 查询接口
 │   ├── authhttp/                   数据面鉴权错误到各协议错误信封的映射
-│   ├── admin/                      管理 API handlers（含配置导入导出）
+│   ├── admin/                      管理 API handlers
 │   ├── crypto/                     上游 key 加解密（AES-256-GCM）
 │   ├── webui/                      embed 静态资源（dist 由 web/ 构建同步而来）
 │   ├── httpx/                      HTTP 横切能力：客户端 IP、同源、Cookie、请求 ID

@@ -23,8 +23,8 @@
 import { createStore } from './store'
 import { rangeBounds } from './range'
 import type {
-  ApiError, BootstrapStatus, Me, SessionStatus, LoginResult, ConfigImportResult,
-  PasswordSetupLink, PasswordSetupStatus, ProtocolProbeResult, SiteBranding,
+  ApiError, BootstrapStatus, Me, SessionStatus, LoginResult,
+  ProtocolProbeResult, SiteBranding,
 } from './types'
 
 const TOKEN_KEY = 'rosetta_gw_admin_token'
@@ -193,11 +193,7 @@ session.set({ me: await get<Me>('/me') })
   return r
 }
 
-/**
- * Public password-setup requests must not inherit the normal 401 handler:
- * an invalid invitation is not an expired admin session, and clearing a
- * still-valid local session would be an unrelated side effect.
- */
+/** Public login/bootstrap requests must not inherit the normal 401 handler. */
 async function publicPost<T>(path: string, body: unknown): Promise<T> {
   let res: Response
   try {
@@ -227,20 +223,6 @@ async function publicPost<T>(path: string, body: unknown): Promise<T> {
     throw new ApiFail(res.status, err?.message ?? `请求失败 (HTTP ${res.status})`)
   }
   return data as T
-}
-
-export function checkPasswordSetup(token: string) {
-  return publicPost<PasswordSetupStatus>('/password-setup/check', { token })
-}
-
-/**
- * Complete a one-time invitation and directly establish the new user session.
- */
-export async function completePasswordSetup(token: string, password: string) {
-  const r = await publicPost<LoginResult>('/password-setup', { token, password })
-  saveToken(r.token)
-session.set({ me: await get<Me>('/me') })
-  return r
 }
 
 /**
@@ -455,7 +437,6 @@ import type {
   DiscoveredModel,
   ModelImportItem,
   ModelTestResult,
-  ProviderBalance,
   Route,
   RouteCatalog,
   RouteTarget,
@@ -508,20 +489,6 @@ export const api = {
   createProvider: (b: ProviderCreatePayload) => mutate(() => post<Provider>('/providers', b)),
   updateProvider: (id: string, b: ProviderUpdatePayload) => mutate(() => patch<Provider>(`/providers/${id}`, b)),
   deleteProvider: (id: string) => mutate(() => del(`/providers/${id}`)),
-  /**
-   * 逐条查询该 provider 的凭据在上游侧的余额。
-   *
-   * 走 POST 而非 GET 是为了与 test/discover 同一套「可能很慢的即时动作」惯例：
-   * 它要真打上游，且是**点按触发**的，不该被浏览器或中间层当成幂等的读缓存。
-   *
-   * 刻意不包 mutate：查余额不改任何配置，不需要写后重建。
-   *
-   * timeoutMs 要给足（前端传 60s）：后端逐条串行查询，且每条都可能等满
-   * 15s —— 多凭据的上游会超过管理 API 默认的 30s，沿用默认会把「后端还在查」
-   * 报成前端超时。
-   */
-  providerBalance: (id: string, timeoutMs = 60_000) =>
-    post<ProviderBalance>(`/providers/${id}/balance`, undefined, timeoutMs),
 
   // 出站网络（代理地址的共享清单）。直连不在这里 —— 它是保留 id
   // 'direct'，由界面作为下拉第一项硬编码（见 types.ts 的 Network）。
@@ -713,14 +680,6 @@ export const api = {
   /** 管理员重置他人密码。会递增该用户的 auth_version，其所有会话立即失效。 */
   resetUserPassword: (id: string, password: string) =>
     post(`/users/${id}/password`, { password }),
-  /**
-   * 管理员为尚未设密的普通用户生成一次性设密链接。
-   *
-   * 链接默认有效 24 小时，重新生成会让旧链接立即失效。服务端只存 token
-   * 的哈希值；明文 token 只出现在本次响应里。
-   */
-  createPasswordSetupLink: (id: string) =>
-    post<PasswordSetupLink>(`/users/${id}/password-setup`),
   /** 自助改密码。会递增自己的 auth_version，**当前会话也随即失效**。 */
   changeMyPassword: (old_password: string, new_password: string) =>
     post('/me/password', { old_password, new_password }),
@@ -809,16 +768,6 @@ export const api = {
   // 所以写后由服务端 AutoReload 重建才能即时生效（模型容量默认也一并保存）。
   saveSettings: (b: Settings) => mutate(() => put<Settings>('/settings', b)),
 
-  // ---------- 供应商 / 模型 导入导出 ----------
-  //
-  // 导出走独立的下载路径而**不是** request<T>：响应是文件而非 JSON，
-  // 而 request() 无条件 JSON.parse 一个文件大小的配置清单纯属浪费，
-  // 真正需要读 JSON 的只有「导入前预览文件内容」那一步。
-  // 导出必加密、必带凭据（2026-10-07）：后端对空口令直接 400。
-  exportConfig: (passphrase: string) =>
-    download('POST', '/config-export/export', { passphrase }, 'rosetta-config.json.enc'),
-  importConfig: (data: unknown, passphrase: string, dryRun: boolean) =>
-    post<ConfigImportResult>('/config-export/import', { data, passphrase, dry_run: dryRun }),
   // 四个 by-* 统一返回 { records, total }（2026-10-31）。total 是不受 limit
   // 影响的分组数 —— 没有它，一张被 limit 截断的表和一张完整的表在界面上
   // 完全同形，而用量统计页会把行求和当成「当前范围汇总」展示。

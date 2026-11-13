@@ -18,7 +18,7 @@
   half-open 探测，写出任何字节前自动转移。
 - **多用户与权限**：users 表是唯一身份来源（JWT 会话 + `auth_version` 栅栏），
   分组模型白名单，key 级收紧不放宽，管理写操作全量审计。普通用户不开放注册，
-  由管理员签发 24 小时有效的一次性设密链接。
+  由管理员创建账号并直接设置初始密码。
 - **配额与限速**：用户级 / key 级两级终身 token 配额（原子预占）+
   RPM/TPM 固定窗口限速。
 - **余额闸门**：用户级人民币余额（亚分精度累积、待结算账本），
@@ -63,11 +63,8 @@ docker run -d \
 都可以抢先初始化。窗口只开一次，设完即永久关闭。容器部署的目录布局、挂载方式与
 升级流程见 [docs/DOCKER.md](docs/DOCKER.md)。
 
-普通用户同样不由系统开放注册。管理员在「用户与权限」中新建普通用户时把初始密码
-留空，界面会生成一条一次性设密链接；把链接发给本人后，对方打开
-`/admin/#/set-password?token=...` 设置密码，完成后直接登录。链接 24 小时内有效、
-只能使用一次，重新生成、管理员改密、禁用或删除用户都会让旧链接失效。服务端只保存
-token 的 SHA-256 哈希，链接放在 URL hash 中，因此不会进入首次 HTTP 访问日志。
+普通用户同样不由系统开放注册。管理员在「用户与权限」中新建账号时必须直接填写
+初始密码；需要更换时用「重置密码」，旧会话随即失效。
 
 > **端口映射默认绑回环（`127.0.0.1:8666:8666`）是刻意的**（2026-10-21 修 A10-P0-1）。
 > 网关自身不做 TLS：管理员会话 cookie、JWT、上游凭据与下游 `Authorization` 头
@@ -137,8 +134,7 @@ curl http://<主机>:8666/v1/chat/completions \
 ```
 
 把 `ANTHROPIC_BASE_URL` 指向网关即可接 Claude Code，`base_url` 指向网关即可接
-OpenAI 系客户端；额度查询端点（`/dashboard/billing/*`、`/v1/organization/*`）
-与 one-api 系工具兼容。
+OpenAI 系客户端。
 
 路由到 **Anthropic 上游**时，`temperature` / `top_p` / `top_k` / `stop_sequences` /
 `service_tier` 不会下发：Anthropic 新版 API（`anthropic-version: 2026-10-21`）

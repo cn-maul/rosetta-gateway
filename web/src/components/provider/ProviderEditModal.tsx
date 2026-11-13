@@ -10,7 +10,6 @@ import {
   SelectPopover,
   SelectTrigger,
   SelectValue,
-  TextArea,
   TextField,
   toast,
 } from '@heroui/react'
@@ -51,7 +50,6 @@ export function ProviderEditModal({
   const [timeoutSec, setTimeoutSec] = useState('0')
   const [maxRetries, setMaxRetries] = useState('0')
   const [networkId, setNetworkId] = useState(NETWORK_DIRECT_ID)
-  const [balanceSpec, setBalanceSpec] = useState('')
   const [saving, setSaving] = useState(false)
 
   useEffect(() => {
@@ -62,7 +60,6 @@ export function ProviderEditModal({
     setTimeoutSec(String(provider.timeout_ms / 1000))
     setMaxRetries(String(provider.max_retries))
     setNetworkId(provider.network_id || NETWORK_DIRECT_ID)
-    setBalanceSpec(provider.balance_spec_json)
   }, [open, provider])
 
   // 没有 provider 就没有表单可填 —— 直接不渲染。所有 hook 已在此之上调用完毕，
@@ -77,8 +74,7 @@ export function ProviderEditModal({
     endpoint !== provider.endpoint ||
     (Number(timeoutSec) || 0) !== provider.timeout_ms / 1000 ||
     (Number(maxRetries) || 0) !== provider.max_retries ||
-    networkId !== (provider.network_id || NETWORK_DIRECT_ID) ||
-    balanceSpec !== provider.balance_spec_json
+    networkId !== (provider.network_id || NETWORK_DIRECT_ID)
 
   /** 有未保存改动时二次确认。这一页的表单里有 endpoint 与代理 ——
    *  误关掉一个改了一半的代理配置不致命，但「以为存上了、其实没有」才是真的坑。 */
@@ -107,11 +103,9 @@ export function ProviderEditModal({
         endpoint: endpoint.trim(),
         timeout_ms: Math.max(0, Math.round((Number(timeoutSec) || 0) * 1000)),
         max_retries: Number(maxRetries) || 0,
-        // 网络与余额查询配置**每次都发**，空串 = 清空。省略字段的语义是
-        // 「保持原值」，那会让「换回直连」「删掉自定义余额脚本」这两个动作
-        // 永远发不出去 —— 必须显式把空串写回去。
+        // 网络每次都发，空串 = 清空。省略字段的语义是「保持原值」，
+        // 那会让「换回直连」这个动作永远发不出去。
         network_id: networkId,
-        balance_spec_json: balanceSpec.trim(),
       })
       toast.success('上游已更新')
       // 关闭弹窗在重载**之后**：重载会同步 provider。顺序反了的话
@@ -219,18 +213,6 @@ export function ProviderEditModal({
               </ListBox>
             </SelectPopover>
           </Select>
-        </div>
-        <div className="col-span-2 flex flex-col gap-1">
-          <Label>余额查询（可选）</Label>
-          <TextArea
-            aria-label="余额查询（可选）"
-            rows={2}
-            spellCheck={false}
-            className="font-mono"
-            placeholder='{"path":"/credits","field":"data.remaining","currency":"USD"}'
-            value={balanceSpec}
-            onChange={(e) => setBalanceSpec(e.target.value)}
-          />
         </div>
       </form>
     </AppModal>

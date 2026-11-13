@@ -12,7 +12,7 @@ import (
 // currentSchemaVersion 是当前代码写入的数据库结构版本。
 //
 // 破坏性结构变更不提供原地迁移：提升版本并更新 canonical DDL，旧数据库
-// 会被拒绝启动。开发与测试库直接删除重建，正式环境通过配置导出/导入搬运。
+// 会被拒绝启动。开发与测试库直接删除重建。
 // 纯新增对象和值归一化仍可通过 ensureCompatibleSchema /
 // normalizeLegacyProtocolValues 原地补齐。
 const currentSchemaVersion = 2
@@ -47,8 +47,7 @@ func (s *Store) ensureSchema(ctx context.Context) error {
 	}
 
 	// Additive, backward-compatible objects may be introduced without bumping
-	// currentSchemaVersion. The setup-token table is one of those: old databases
-	// keep their data and gain the table on the next start.
+	// currentSchemaVersion.
 	if err := s.ensureCompatibleSchema(ctx); err != nil {
 		return err
 	}
@@ -72,9 +71,6 @@ func (s *Store) ensureSchema(ctx context.Context) error {
 // databases already stamped with currentSchemaVersion. Keep this limited to
 // additive objects: destructive changes still require a schema-version bump.
 func (s *Store) ensureCompatibleSchema(ctx context.Context) error {
-	if _, err := s.db.ExecContext(ctx, userPasswordSetupTokensDDL); err != nil {
-		return fmt.Errorf("ensure user password setup token schema: %w", err)
-	}
 	// R3 adds durable quota-lease and charge-retry state. Both objects are
 	// additive, so a database already stamped with currentSchemaVersion can
 	// acquire them in place. Keep this in compatibility setup rather than the
@@ -420,7 +416,6 @@ var canonicalSchemaStatements = []string{
 		max_retries        INTEGER NOT NULL DEFAULT 2,
 		quirks_json        TEXT,
 		network_id         TEXT REFERENCES networks(id) ON DELETE SET NULL,
-		balance_spec_json  TEXT,
 		created_at         INTEGER NOT NULL,
 		updated_at         INTEGER NOT NULL
 	)`,
@@ -477,7 +472,6 @@ var canonicalSchemaStatements = []string{
 		updated_at         INTEGER NOT NULL,
 		last_login_at      INTEGER NOT NULL DEFAULT 0
 	)`,
-	userPasswordSetupTokensDDL,
 	`CREATE TABLE access_keys (
 		id                  TEXT PRIMARY KEY,
 		key_hash            TEXT NOT NULL UNIQUE,

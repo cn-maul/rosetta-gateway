@@ -310,7 +310,7 @@ func TestUserHandler_CreateWithGroupAndValidation(t *testing.T) {
 
 	rec := httptest.NewRecorder()
 	h.CreateUser(rec, asAdmin(jsonRequest(http.MethodPost, "/admin/api/users",
-		strings.NewReader(`{"username":"alice","group_id":"g1"}`))))
+		strings.NewReader(`{"username":"alice","password":"Str0ngPassw0rd!","group_id":"g1"}`))))
 	if rec.Code != http.StatusCreated {
 		t.Fatalf("create: code = %d body = %s", rec.Code, rec.Body.String())
 	}
@@ -324,7 +324,7 @@ func TestUserHandler_CreateWithGroupAndValidation(t *testing.T) {
 	// 也就是「以为收紧了，实际放得更开」。
 	rec2 := httptest.NewRecorder()
 	h.CreateUser(rec2, asAdmin(jsonRequest(http.MethodPost, "/admin/api/users",
-		strings.NewReader(`{"username":"bob","group_id":"ghost"}`))))
+		strings.NewReader(`{"username":"bob","password":"Str0ngPassw0rd!","group_id":"ghost"}`))))
 	if rec2.Code != http.StatusBadRequest {
 		t.Fatalf("unknown group: code = %d body = %s, want 400", rec2.Code, rec2.Body.String())
 	}

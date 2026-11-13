@@ -25,14 +25,6 @@ export interface Provider {
    * 直连时为空串。
    */
   proxy_url: string
-  /**
-   * 余额查询的显式配置（JSON 串），空串 = 不配（走内置自动判定）。
-   *
-   * 内置判定只认 OpenAI 官方与 DeepSeek；接中转站、自建网关或
-   * Moonshot / OpenRouter 这类自带余额端点的上游时，在这里填 path 与
-   * field。只在编辑上游时的高级选项里出现 —— 新建时留空即可。
-   */
-  balance_spec_json: string
   created_at: number
   updated_at: number
   // ready 是**运行时**状态（后端快照），不是库里的配置字段：
@@ -64,15 +56,6 @@ export interface ProviderCreatePayload {
   quirks_json?: string
   /** 出站网络（networks.id）；留空或 "direct" = 直连（新建的默认值）。 */
   network_id?: string
-  /**
-   * 余额查询的显式配置（JSON 字符串，不是对象 —— 后端整串存、整串校验）。
-   * 留空 = 不配，回落到内置的自动判定（OpenAI 官方 / DeepSeek）。
-   *
-   * 只有接中转站、自建网关、或 Moonshot/OpenRouter 这类自带余额端点的
-   * 上游时才需要填。形如：
-   * `{"path":"/credits","field":"data.remaining","currency":"USD"}`
-   */
-  balance_spec_json?: string
   api_key?: string
 }
 
@@ -93,8 +76,6 @@ export interface ProviderUpdatePayload {
    * 把上游从代理切回直连必须能表达。
    */
   network_id?: string
-  /** 余额查询配置。传空串是**清空**（回到自动判定），与 proxy_url 同语义。 */
-  balance_spec_json?: string
 }
 
 // discover 端点返回的上游模型条目；后端已把探测不到的容量替换为设置里的默认值
@@ -322,38 +303,6 @@ export interface ModelTestResult {
   hint?: string
 }
 
-/** 单条凭据在上游侧的余额查询结果（对应 internal/upstream.CredentialBalance）。 */
-export interface CredentialBalance {
-  credential_id: string
-  label: string
-  /**
-   * ok=额度与用量都已确认；unknown=只拿到部分事实，不能给出精确可用额；
-   * error=查了但失败（凭据/网络）；unsupported=这个上游没有余额查询方式。
-   */
-  status: 'ok' | 'unknown' | 'error' | 'unsupported'
-  message?: string
-  /**
-   * 上游报告的可用额度，**未换算成元**（上游可能报 USD，汇率随时在动，
-   * 网关编一个换算值等于撒谎）。单位见 currency。
-   */
-  amount?: number
-  currency?: string
-  /** 上游附带的补充说明（总额度/已用/额度不足…），原样显示。 */
-  detail?: string
-  /** 取数时刻（毫秒时间戳）。余额是点按查询、不是后台轮询，界面要能说清它有多旧。 */
-  fetched_at?: number
-}
-
-/** GET /admin/api/providers/{id}/balance 的响应。 */
-export interface ProviderBalance {
-  provider_id: string
-  provider: string
-  /** ok=全部确认；partial=部分失败或未知；unknown=全部未知；error=全部失败；unsupported=该上游不支持。 */
-  status: 'ok' | 'partial' | 'unknown' | 'error' | 'unsupported'
-  message?: string
-  results: CredentialBalance[]
-}
-
 /**
  * PATCH /models/{id} 的载荷。
  *
@@ -516,29 +465,6 @@ export interface BootstrapStatus {
   /** 待初始化的账号名，供表单标题显示。needs_setup 为 false 时为空。 */
   username?: string
   session_enabled: boolean
-}
-
-/**
- * POST /admin/api/users/{id}/password-setup 的响应。
- *
- * token 只在这次响应里出现一次，服务端只保存哈希。`url_path` 把 token 放在
- * hash fragment 中，所以首次 HTTP 请求不会把 token 发到服务器访问日志里。
- */
-export interface PasswordSetupLink {
-  url_path: string
-  expires_at: number
-}
-
-/**
- * POST /admin/api/password-setup/check 的响应。
- *
- * 无效、过期、已使用、账号被禁用都统一返回 valid=false，不区分具体原因，
- * 避免公开端点变成账号/链接枚举 oracle。
- */
-export interface PasswordSetupStatus {
-  valid: boolean
-  username?: string
-  expires_at?: number
 }
 
 /** GET /admin/api/me 的响应。 */
@@ -1202,175 +1128,6 @@ export interface PruneResult {
 export interface ApiError {
   message: string
   type: string
-}
-
-// ---------- 供应商 / 模型的导入导出 ----------
-
-/**
- * 导出文件的结构。明文模式下三个数组有值；加密模式下只有 body/salt 有值，
- * 其余为空 —— 真正的内容在 body 里，用口令解开后是同一种结构。
- *
- * 前端要读它只是为了「告诉用户这份文件里有什么」以及判断要不要口令，
- * 不参与解析密文（那是后端的事，前端不该持有解密逻辑）。
- */
-export interface ConfigExportFile {
-  version: number
-  exported_at: number
-  encrypted?: boolean
-  body?: string
-  kdf?: string
-  cipher?: string
-  salt?: string
-  iterations?: number
-  providers?: ConfigExportProvider[]
-  credentials?: ConfigExportCredential[]
-  models?: ConfigExportModel[]
-  networks?: ConfigExportNetwork[]
-  /** v4 新增：用户分组（白名单为空 = 不限制）。 */
-  user_groups?: ConfigExportUserGroup[]
-  /** v4 新增：用户，含口令哈希与余额。 */
-  users?: ConfigExportUser[]
-  /** v4 新增：访问密钥，含**明文**密钥。 */
-  access_keys?: ConfigExportAccessKey[]
-  /** v4 新增：路由与故障转移链。 */
-  routes?: ConfigExportRoute[]
-}
-
-export interface ConfigExportProvider {
-  slug: string
-  name: string
-  protocol: string
-  endpoint: string
-  enabled: boolean
-  timeout_ms: number
-  max_retries: number
-  quirks_json?: string
-  network_name?: string
-}
-
-export interface ConfigExportCredential {
-  provider_slug: string
-  label: string
-  api_key: string
-  enabled: boolean
-  weight: number
-}
-
-export interface ConfigExportModel {
-  provider_slug: string
-  model_id: string
-  display_name?: string
-  context_window?: number
-  max_output_tokens?: number
-  supports_thinking?: boolean
-  /** 逗号分隔的挡位原文（与库里那列同形）；空 = 未配置。 */
-  effort_levels?: string
-  /**
-   * 思考方言（见 UpstreamModel.thinking_dialect）；空 = 自动推断。
-   *
-   * 导出必须带上它：方言是照厂商文档配出来的运维知识，换台机器重建时
-   * 丢了就只能靠模型名重新猜，而中转站改过名的模型猜不出来。
-   */
-  thinking_dialect?: string
-  /**
-   * 能否关闭思考的实测纠正：缺席 = 按厂商文档表，true/false = 以实测为准。
-   * 导出必须带上它 —— 中转站归一化写法后，文档表在这条链路上可能是错的。
-   */
-  can_disable_thinking?: boolean
-  price_input?: number
-  price_cache_hit?: number
-  price_cache_creation?: number
-  price_output?: number
-}
-
-export interface ConfigExportNetwork {
-  name: string
-  proxy_url: string
-}
-
-/**
- * 导入结果。**逐项**而不是只给总数：导入是「改一个可能正在服务线上」的库，
- * 用户需要知道哪几条进去了、哪几条被改名、哪几条被跳过。
- */
-export interface ConfigImportResult {
-  dry_run: boolean
-  providers_created: number
-  /** 原 slug → 改名后的 slug。只有发生冲突的才有条目。 */
-  providers_renamed?: Record<string, string>
-  models_created: number
-  models_skipped: number
-  credentials_added: number
-  credentials_skipped: number
-  /** v4 新增：下面四段各自计数，因为冲突语义不同（见后端 importResponse 注释）。 */
-  user_groups_created: number
-  users_created: number
-  users_skipped: number
-  access_keys_created: number
-  access_keys_skipped: number
-  routes_created: number
-  routes_skipped: number
-  warnings?: string[]
-  notes?: string[]
-}
-
-/**
- * v4 导入导出：用户分组。白名单为空 = **不限制**（不是全拒），
- * 所以导入侧只在文件确实带了成员时才写。
- */
-export interface ConfigExportUserGroup {
-  name: string
-  description?: string
-  models?: string[]
-}
-
-/**
- * v4 导入导出：用户。`balance_cents` 缺省 = **不限额**（库里落 NULL），
- * 与 0（余额耗尽）是两种不同的状态，不能合并。
- */
-export interface ConfigExportUser {
-  username: string
-  display_name?: string
-  /** PBKDF2 自描述串（算法与迭代数写在串里），跨机可直接校验。 */
-  password_hash?: string
-  role?: string
-  status?: string
-  quota_tokens?: number
-  used_tokens?: number
-  balance_cents?: number
-  remark?: string
-  group_name?: string
-}
-
-/**
- * v4 导入导出：访问密钥。带**明文**是因为库里只存 sha256 与密文，
- * 迁移后只有哈希等于把密钥永久作废。
- */
-export interface ConfigExportAccessKey {
-  key: string
-  name: string
-  user?: string
-  enabled?: boolean
-  quota_tokens?: number
-  rpm_limit?: number
-  tpm_limit?: number
-  allowed_models?: string[]
-  expires_at?: number
-  allowed_ips?: string
-  group_name?: string
-}
-
-/** v4 导入导出：路由。公开名撞名时**跳过不改名**（那是调用方代码里的地址）。 */
-export interface ConfigExportRoute {
-  public_name: string
-  enabled: boolean
-  failover_enabled: boolean
-  targets?: ConfigExportRouteTarget[]
-}
-
-export interface ConfigExportRouteTarget {
-  provider_slug: string
-  model_id: string
-  enabled: boolean
 }
 
 // Admin route catalog: provider selection needs no endpoint or credentials.

@@ -406,8 +406,8 @@ func TestCreateUser_RejectsBadUsername(t *testing.T) {
 	}
 }
 
-// 密码可以留空（建号后由本人设置）—— 这是引导流程的一部分。
-func TestCreateUser_AllowsEmptyPassword(t *testing.T) {
+// 密码不能留空：一次性设密链接删除后，空密码账号无法登录。
+func TestCreateUser_RejectsEmptyPassword(t *testing.T) {
 	st := newScopeStore(t)
 	h := NewUserHandler(st, nil)
 
@@ -416,13 +416,8 @@ func TestCreateUser_AllowsEmptyPassword(t *testing.T) {
 		strings.NewReader(`{"username":"dave"}`)))
 	h.CreateUser(rec, req)
 
-	if rec.Code != http.StatusCreated {
-		t.Fatalf("create with empty password: code=%d body=%s", rec.Code, rec.Body.String())
-	}
-	var u userResponse
-	_ = json.Unmarshal(rec.Body.Bytes(), &u)
-	if u.HasPassword {
-		t.Error("HasPassword should be false for a user created without one")
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("create with empty password: code=%d body=%s, want 400", rec.Code, rec.Body.String())
 	}
 }
 
