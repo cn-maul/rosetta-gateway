@@ -435,7 +435,6 @@ var canonicalSchemaStatements = []string{
 		role               TEXT NOT NULL DEFAULT 'user',
 		status             TEXT NOT NULL DEFAULT 'active',
 		quota_tokens       INTEGER NOT NULL DEFAULT 0,
-		used_tokens        INTEGER NOT NULL DEFAULT 0,
 		reserved_tokens    INTEGER NOT NULL DEFAULT 0,
 		balance_cents      INTEGER,
 		balance_remainder  INTEGER NOT NULL DEFAULT 0,

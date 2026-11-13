@@ -463,32 +463,6 @@ func TestSumUserUsedTokens(t *testing.T) {
 	}
 }
 
-func TestRecomputeUserUsage(t *testing.T) {
-	db := newStore(t)
-	ctx := context.Background()
-	if err := db.CreateUser(ctx, &User{ID: "u1", Username: "alice"}); err != nil {
-		t.Fatalf("create: %v", err)
-	}
-	seedUsage(t, db, "x1", "k1", "u1", 100)
-	seedUsage(t, db, "x2", "k1", "u1", 30)
-
-	used, err := db.RecomputeUserUsage(ctx, "u1")
-	if err != nil {
-		t.Fatalf("recompute: %v", err)
-	}
-	if used != 130 {
-		t.Errorf("recomputed = %d, want 130", used)
-	}
-	u, _ := db.GetUser(ctx, "u1")
-	if u.UsedTokens != 130 {
-		t.Errorf("users.used_tokens = %d after recompute, want 130", u.UsedTokens)
-	}
-	// 不存在的用户必须报 ErrNotFound，而不是回 0 + nil
-	if _, err := db.RecomputeUserUsage(ctx, "ghost"); err != ErrNotFound {
-		t.Errorf("recompute unknown user: err = %v, want ErrNotFound", err)
-	}
-}
-
 func TestCountUsers(t *testing.T) {
 	db := newStore(t)
 	ctx := context.Background()

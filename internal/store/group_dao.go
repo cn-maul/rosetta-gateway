@@ -83,13 +83,6 @@ func (s *Store) CreateGroup(ctx context.Context, g *Group) error {
 	return createGroup(ctx, s.db, g)
 }
 
-// CreateGroupTx 在调用方的事务里插入分组（配置导入用：分组与它的模型白名单
-// 必须在同一笔提交里，否则会留下「组建好了、白名单没写」的空组 —— 而空
-// 白名单的语义是「不限制」，等于静默把权限放宽）。
-func (s *Store) CreateGroupTx(ctx context.Context, tx Tx, g *Group) error {
-	return createGroup(ctx, tx, g)
-}
-
 // createGroup 接受 execer，让同一份 SQL 既能在自动提交下跑也能进事务。
 func createGroup(ctx context.Context, ex execer, g *Group) error {
 	now := time.Now().UnixMilli()
@@ -161,13 +154,6 @@ func (s *Store) DeleteGroup(ctx context.Context, id string) error {
 	return tx.Commit()
 }
 
-// CountGroups 返回组总数。供启动日志与快照判定「分组功能是否启用」。
-func (s *Store) CountGroups(ctx context.Context) (int, error) {
-	var n int
-	err := s.read.QueryRowContext(ctx, `SELECT COUNT(*) FROM groups`).Scan(&n)
-	return n, err
-}
-
 // GroupBindingCount 是分组被账号与访问密钥直接引用的数量。
 // 两类引用都会阻止删除，必须分别暴露，不能用账号数代替全部约束。
 type GroupBindingCount struct {
@@ -208,18 +194,6 @@ func (s *Store) CountGroupBindings(ctx context.Context, groupID string) (GroupBi
 		       (SELECT COUNT(*) FROM access_keys WHERE group_id = ?)`, groupID, groupID).
 		Scan(&count.Users, &count.Keys)
 	return count, err
-}
-
-// CountGroupMembers 返回组内账号数。
-//
-// 存在的理由：删除被拒时要把「还有几个人」告诉管理员 —— 只说「删不掉」
-// 会让人去查库，而真正该做的是把人迁走。单独一个 COUNT 而不是复用
-// ListUsers：后者会把全部账号（含密码哈希）读进内存，为一个数字不值得。
-func (s *Store) CountGroupMembers(ctx context.Context, groupID string) (int, error) {
-	var n int
-	err := s.read.QueryRowContext(ctx,
-		`SELECT COUNT(*) FROM users WHERE group_id = ?`, groupID).Scan(&n)
-	return n, err
 }
 
 // ListGroupModels 返回全部组的模型白名单：group_id → 公开模型名（已排序）。
@@ -284,14 +258,6 @@ func (s *Store) ReplaceGroupModels(ctx context.Context, groupID string, models [
 		return err
 	}
 	return tx.Commit()
-}
-
-// ReplaceGroupModelsTx 在调用方的事务里整体替换白名单。
-//
-// 配置导入必须走这条：分组与白名单分两笔提交时，「组已建、白名单没写」
-// 会留一个空白名单的组 —— 而空白名单的语义是**不限制**，即静默放权。
-func (s *Store) ReplaceGroupModelsTx(ctx context.Context, tx Tx, groupID string, models []string) error {
-	return replaceGroupModels(ctx, tx, groupID, models)
 }
 
 // replaceGroupModels 接受 execer：先删后插必须在同一笔事务里，否则中间

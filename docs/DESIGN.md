@@ -131,7 +131,7 @@
                       启动 TTFT/空闲看门狗 + 心跳
                       loop: stream.Next() → outwire 编码 → Flush
                       结束：EventMessageEnd → usage 入账 + 下游结束事件
-  → store      异步写入 usage_records（触发器同步累加 used_tokens 与终身累计）
+  → store      异步写入 usage_records（触发器同步累加 key 已用、用户已用与终身累计）
 ```
 
 ---
@@ -269,7 +269,7 @@ CREATE TABLE users (
   balance_cents INTEGER,                         -- 账户余额（分，人民币）。**NULL = 不限额**，
                    -- 0 = 真的一分钱都没有（触发 402）。与 quota_tokens 的「0 = 不限」
                    -- 刻意相反：0 在余额语义下是一个有意义的实数状态，必须能表达。
-  used_tokens   INTEGER NOT NULL DEFAULT 0,      -- 展示值；执行走实时 SUM
+  -- 用户级已用量不在此表：见 user_usage_totals（触发器维护的累加列）
   balance_remainder INTEGER NOT NULL DEFAULT 0,  -- 亚分累积余数，单位 1e-6 元（微元，1 分 = 10000 微元）
                   -- 扣费时整除扣分、余数留存，累积满一分才真正扣账 —— 避免
                   -- 「1 分余额被无限次亚分请求消耗」。存 INTEGER 而非 REAL：

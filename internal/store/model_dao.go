@@ -283,22 +283,6 @@ func (s *Store) UpstreamModelUsageExists(ctx context.Context, providerID, modelI
 	return exists != 0, nil
 }
 
-// DeleteUpstreamModel 删除一个上游模型；id 不存在时返回 ErrNotFound。
-//
-// 保留旧方法给不需要「自动摘链」的调用方；管理端点走
-// DeleteUpstreamModelDetaching（见下）。
-func (s *Store) DeleteUpstreamModel(ctx context.Context, id string) error {
-	tx, err := s.db.BeginTx(ctx, nil)
-	if err != nil {
-		return err
-	}
-	defer tx.Rollback()
-	if err := deleteUpstreamModelAndCleanGroup(ctx, tx, id); err != nil {
-		return err
-	}
-	return tx.Commit()
-}
-
 // deleteUpstreamModelAndCleanGroup 确认模型存在后删除它。
 func deleteUpstreamModelAndCleanGroup(ctx context.Context, tx execer, id string) error {
 	m, err := getUpstreamModel(ctx, tx, id)

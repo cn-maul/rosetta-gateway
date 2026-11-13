@@ -474,7 +474,7 @@ CREATE TABLE IF NOT EXISTS users (
     group_id      TEXT REFERENCES groups(id) ON DELETE SET NULL,
     -- 用户级总额度（token 计量）。0 = 不限
     quota_tokens  INTEGER NOT NULL DEFAULT 0,
-    used_tokens   INTEGER NOT NULL DEFAULT 0,
+    -- 用户级已用量不在此表：见 user_usage_totals
     -- 会话失效栅栏：改密/禁用/改角色时自增，见 §4.4
     auth_version  INTEGER NOT NULL DEFAULT 1,
     -- 备注，管理员可见

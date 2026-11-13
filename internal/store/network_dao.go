@@ -117,34 +117,6 @@ func (s *Store) DeleteNetwork(ctx context.Context, id string) error {
 	return deleteByID(ctx, s.db, "networks", id)
 }
 
-// NetworkProxyURLs 返回「网络 id → 代理 URL」的映射，供池构建时把
-// provider.network_id 解析成实际要用的 URL。
-//
-// 一次查询而不是每个 provider 现取：池重建是一次性动作，但每个 provider
-// 一次往返在十几条上游时就是十几次往返，而这张表通常只有 1~3 行。
-func (s *Store) NetworkProxyURLs(ctx context.Context) (map[string]string, error) {
-	rows, err := s.read.QueryContext(ctx, `SELECT id, proxy_url FROM networks`)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	out := make(map[string]string)
-	for rows.Next() {
-		var id, proxyURL string
-		if err := rows.Scan(&id, &proxyURL); err != nil {
-			return nil, err
-		}
-		out[id] = proxyURL
-	}
-	return out, rows.Err()
-}
-
-// ProviderProxyURL 是池构建需要的「一个 provider 实际走哪个 URL」。
-type ProviderProxyURL struct {
-	ProviderID string
-	ProxyURL   string
-}
-
 // normalizeNetworkID 把「直连」的两种写法（空串与保留 id）统一成空串，
 // 即库里永远只有一种表示 —— NULL。
 //
@@ -159,33 +131,7 @@ func normalizeNetworkID(id string) string {
 	return id
 }
 
-// ProviderProxyURLs 一次查出全部 provider 的出站 URL，把 network_id 解析
-// 成 networks.proxy_url（没有网络或网络已被删 → 空串 = 直连）。
-func (s *Store) ProviderProxyURLs(ctx context.Context) ([]ProviderProxyURL, error) {
-	rows, err := s.read.QueryContext(ctx, `
-		SELECT p.id, COALESCE(n.proxy_url, '')
-		FROM providers p
-		LEFT JOIN networks n ON n.id = p.network_id`)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	result := make([]ProviderProxyURL, 0)
-	for rows.Next() {
-		var e ProviderProxyURL
-		if err := rows.Scan(&e.ProviderID, &e.ProxyURL); err != nil {
-			return nil, err
-		}
-		result = append(result, e)
-	}
-	return result, rows.Err()
-}
-
 // NewNetworkID 生成一条出站网络的主键。
-//
-// 导出到 store 之外是为了让 admin 的配置导入走 CreateNetworkTx 时生成
-// 同一格式的 id；此前导入自己拼 "net-"+generateID()，与这里的格式看似
-// 相同，实际是两套生成器 —— 将来改前缀只会改到一处。
 func NewNetworkID() string {
 	b := make([]byte, 16)
 	crand.Read(b)

@@ -94,7 +94,10 @@ func toUserResponse(u *store.User, selfID string, keyCount int) userResponse {
 			Status:           u.Status,
 			GroupID:          u.GroupID,
 			QuotaTokens:      u.QuotaTokens,
-			UsedTokens:       u.UsedTokens,
+			// 已用量是**派生值**（user_usage_totals / 实时 SUM），不是 users
+			// 表上的列。列表路径会在本函数返回后用批量查询结果覆盖它；
+			// 其余路径（新建、改资料、充值响应）不带用量，留 0。
+			UsedTokens:       0,
 			BalanceCents:     0,
 			Unlimited:        true, // 「不限额」= 不参与余额计费
 			BalanceRemainder: 0,
@@ -115,7 +118,7 @@ func toUserResponse(u *store.User, selfID string, keyCount int) userResponse {
 		Status:      u.Status,
 		GroupID:     u.GroupID,
 		QuotaTokens: u.QuotaTokens,
-		UsedTokens:  u.UsedTokens,
+		UsedTokens:  0, // 同上：由 ListUsers 的批量查询覆盖
 		// 余额直接取 store.User 的两个字段：Unlimited 是**列值为 NULL** 的
 		// 表示（见 store.User.BalanceCents），不是「数值为 0」。手写 DTO 的
 		// 好处正在这里 —— store.User 没有 json tag，漏填一个字段只会安静地
@@ -199,13 +202,10 @@ func (h *UserHandler) ListUsers(w http.ResponseWriter, r *http.Request) {
 		usedByUser, keysByUser = nil, nil
 	}
 	for i := range users {
-		// 已用量优先用累加列的批量结果（与配额预检同一个数据源），
-		// 取不到才回落到 users.used_tokens —— 后者是导入时的快照，
-		// 与预检口径不一致，只能当兜底。
-		used, ok := usedByUser[users[i].ID]
-		if !ok {
-			used = users[i].UsedTokens
-		}
+		// 已用量取累加列的批量结果（与配额预检同一个数据源）。取不到时
+		// 保持 toUserResponse 的 0 —— 绝不能回落到另一份「快照」口径，
+		// 那会让界面数字与后端判超额的依据分叉。
+		used := usedByUser[users[i].ID]
 		resp := toUserResponse(&users[i], self, keysByUser[users[i].ID])
 		resp.UsedTokens = used
 		out = append(out, resp)

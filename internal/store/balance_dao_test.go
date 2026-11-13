@@ -506,7 +506,7 @@ func TestUserColumns_NoSilentColumnShift(t *testing.T) {
 
 	if err := st.CreateUser(ctx, &User{
 		ID: "u1", Username: "alice", DisplayName: "Alice", PasswordHash: "h",
-		Role: RoleAdmin, Status: UserStatusDisabled, QuotaTokens: 111, UsedTokens: 222,
+		Role: RoleAdmin, Status: UserStatusDisabled, QuotaTokens: 111,
 		AuthVersion: 333, Remark: "note", BalanceCents: 444, Unlimited: false,
 	}); err != nil {
 		t.Fatalf("create: %v", err)
@@ -525,7 +525,6 @@ func TestUserColumns_NoSilentColumnShift(t *testing.T) {
 		{"role", u.Role, RoleAdmin},
 		{"status", u.Status, UserStatusDisabled},
 		{"quota_tokens", u.QuotaTokens, int64(111)},
-		{"used_tokens", u.UsedTokens, int64(222)},
 		{"auth_version", u.AuthVersion, int64(333)},
 		{"remark", u.Remark, "note"},
 		{"balance_cents", u.BalanceCents, int64(444)},

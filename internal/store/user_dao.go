@@ -72,10 +72,6 @@ type User struct {
 	// 单位微元、不是分的小数：与 balance_cents 用 INTEGER 而非 REAL 同一
 	// 理由（浮点累加留长尾误差），见 store.go 的建表注释。
 	BalanceRemainder int64
-	// UsedTokens 不由本包维护 —— 见 §4.3 决策：用户级已用量
-	// 走实时 SUM 查询，不用触发器（触发器无法感知 key 被删除，
-	// 会永久留下偏高的计数）。此字段仅供管理面展示导入用。
-	UsedTokens int64
 	// AuthVersion 是会话失效栅栏：改密码/禁用/改角色时自增，
 	// JWT 里带的 av 与快照里的当前值不一致即 401。
 	AuthVersion int64
@@ -115,14 +111,14 @@ func (u *User) IsActive() bool { return u != nil && u.Status == UserStatusActive
 // ⚠️ **本常量与 scanUser 必须逐列同步**，新增列时两处一起改。手写列清单
 // 必然漂移，而漂移的典型后果不是报错而是**静默赋错值**：少一列时
 // database/sql 会把后面几列扫进前面的字段（把 balance_cents 扫进
-// used_tokens），编译与测试全绿，账目却在暗处对不上。key_dao.go 的 keyColumns
+// quota_tokens），编译与测试全绿，账目却在暗处对不上。key_dao.go 的 keyColumns
 // 注释记的就是同一个教训。
 //
 // balance_cents 用**布尔表达式** `IS NULL` 直接产出「不限额」标志，而不是
 // COALESCE(..,0) 再补一列：前者少一个扫描目标，也免得「NULL 与 0 谁在前面」
 // 这种顺序错位（正是上面警告的那类静默错误）。
 const userColumns = `id, username, COALESCE(display_name,''), COALESCE(password_hash,'') AS password_hash,
-		        role, status, COALESCE(group_id,''), quota_tokens, used_tokens, auth_version,
+		        role, status, COALESCE(group_id,''), quota_tokens, auth_version,
 		        COALESCE(remark,''), created_at, updated_at, last_login_at,
 		        COALESCE(balance_cents, 0) AS balance_cents,
 		        (balance_cents IS NULL) AS balance_unlimited,
@@ -248,11 +244,11 @@ func createUser(ctx context.Context, ex execer, u *User) error {
 	}
 	_, err := ex.ExecContext(ctx,
 		`INSERT INTO users (id, username, display_name, password_hash, role, status,
-		                    group_id, quota_tokens, used_tokens, auth_version, remark,
+		                    group_id, quota_tokens, auth_version, remark,
 		                    created_at, updated_at, last_login_at, balance_cents, balance_remainder)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		u.ID, u.Username, u.DisplayName, u.PasswordHash, u.Role, u.Status,
-		nullIfEmpty(u.GroupID), u.QuotaTokens, u.UsedTokens, u.AuthVersion, u.Remark,
+		nullIfEmpty(u.GroupID), u.QuotaTokens, u.AuthVersion, u.Remark,
 		u.CreatedAt, u.UpdatedAt, u.LastLoginAt, balanceValue(u.BalanceCents, u.Unlimited),
 		// 余数建号时恒为 0（新建账号不可能有历史消费）。显式写出而不是让它
 		// 走 DEFAULT，是为了让「这一列存在且为 0」与「忘了这一列」在代码里
@@ -281,8 +277,6 @@ func balanceValue(cents int64, unlimited bool) any {
 // UpdateUser 更新可管理字段。
 //
 // 刻意不写 used_tokens —— 它是派生值，改它等于让请求体随意篡改用量计数。
-// 修正用法的入口是 RecomputeUserUsage。
-//
 // 同样刻意**不写 auth_version**：会话失效栅栏只能前进，不能被资料更新碰。
 // 本方法处理的调用方（PATCH handler）拿到的是**读库时的旧快照**，若把快照里的
 // auth_version 原样写回，读库与落库之间发生的改密（SetUserPassword 已把版本
@@ -652,8 +646,7 @@ func (s *Store) ReleaseUserQuota(ctx context.Context, userID string, reserved in
 //   - quota 来自 users 表、used 来自累加列 user_usage_totals，**两张表**；
 //   - 已用量刻意复用 SumUserUsedTokens 的口径（那是配额**判定的**数据源），
 //     保证「界面显示的已用」与「后端判超额的已用」是同一个数字。
-//     若图省事改读 users.used_tokens（展示列），两者会分叉，用户会看到
-//     「明明还有额度却被拒」。
+//     换用其他口径就会分叉，用户会看到「明明还有额度却被拒」。
 //
 // 用户不存在时返回 (0, 0, nil)：quota=0 在前端恰好是「不限」的既有语义，
 // 与 meResponse 对未知用户的处理同口径。
@@ -674,45 +667,6 @@ func (s *Store) UserQuotaAndUsed(ctx context.Context, userID string) (quota, use
 	return quota, used, nil
 }
 
-// RecomputeUserUsage 重算某用户的已用量并回写。
-//
-// 与 SumUserUsedTokens 同源：SUM 口径天然不会漂移，
-// 所以这个入口主要用于「让管理员看到与预检一致的数字」，
-// 以及将来若引入分用户累计表时的一次性回填。
-//
-// 数据源必须是 UsageSource（明细 ∪ 日归档），与 SumUserUsedTokens 同口径：
-// 少算归档部分就等于**把这个入口变成「把用户已用量改小」** ——
-// 一次误用就永久放宽了该用户的配额，而界面上看不出任何异常。
-func (s *Store) RecomputeUserUsage(ctx context.Context, userID string) (int64, error) {
-	tx, err := s.db.BeginTx(ctx, nil)
-	if err != nil {
-		return 0, err
-	}
-	defer tx.Rollback()
-
-	var used int64
-	src, args := UsageSource(UsageFilter{UserID: userID})
-	if err := tx.QueryRowContext(ctx,
-		`SELECT `+UsageSumExpr("total_tokens", "u")+` FROM `+src, args...).Scan(&used); err != nil {
-		return 0, err
-	}
-	res, err := tx.ExecContext(ctx,
-		`UPDATE users SET used_tokens = ? WHERE id = ?`, used, userID)
-	if err != nil {
-		return 0, err
-	}
-	n, err := res.RowsAffected()
-	if err != nil {
-		s.logger.Debug("recompute user usage: RowsAffected unavailable", "error", err)
-	} else if n == 0 {
-		return 0, ErrNotFound
-	}
-	if err := tx.Commit(); err != nil {
-		return 0, err
-	}
-	return used, nil
-}
-
 // scanUser 用 COALESCE 承接可空列后落进结构体。
 //
 // 直接把可空列扫进 string/int 会在列为 NULL 时报
@@ -727,7 +681,7 @@ func scanUser(sc scanner) (*User, error) {
 	var u User
 	var unlimited int
 	if err := sc.Scan(&u.ID, &u.Username, &u.DisplayName, &u.PasswordHash,
-		&u.Role, &u.Status, &u.GroupID, &u.QuotaTokens, &u.UsedTokens, &u.AuthVersion,
+		&u.Role, &u.Status, &u.GroupID, &u.QuotaTokens, &u.AuthVersion,
 		&u.Remark, &u.CreatedAt, &u.UpdatedAt, &u.LastLoginAt,
 		&u.BalanceCents, &unlimited, &u.BalanceRemainder); err != nil {
 		return nil, err

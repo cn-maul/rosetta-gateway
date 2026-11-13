@@ -997,27 +997,6 @@ func (s *Store) GetRecentThroughput(ctx context.Context, limit int, scopeUserID 
 	return v, nil
 }
 
-// GetRecentTtfbMs 返回最近若干次成功调用的平均首字延迟（毫秒）。
-// 只统计 status='ok' 且 ttfb_ms>0（真正流式、拿到过首字）的记录，取算术平均；
-// 无样本时返回 0。与 GetRecentThroughput 口径一致（同一「近 N 次」窗口）。
-func (s *Store) GetRecentTtfbMs(ctx context.Context, limit int, scopeUserID string) (float64, error) {
-	if limit <= 0 {
-		limit = 5
-	}
-	userCond, args := scopeClause("", scopeUserID)
-	var v float64
-	err := s.read.QueryRowContext(ctx,
-		`SELECT COALESCE(AVG(ttfb_ms), 0)
-		   FROM (SELECT ttfb_ms FROM usage_records
-		          WHERE status = 'ok' AND ttfb_ms > 0`+userCond+`
-		          ORDER BY ts DESC LIMIT ?)`, append(args, limit)...).
-		Scan(&v)
-	if err != nil {
-		return 0, err
-	}
-	return v, nil
-}
-
 // scopeClause 构造「按用户收窄」的 AND 条件片段（含前导 AND）。
 //
 // prefix 是列限定前缀（"u." 或空）。scopeUserID 为空时返回空串 ——

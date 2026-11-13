@@ -221,8 +221,7 @@ func (h *StatsHandler) Get(w http.ResponseWriter, r *http.Request) { // from/to 
 	//
 	// 已用量走 store.SumUserUsedTokens：那是用户级配额**判定的同一个数据源**
 	// （累加列 user_usage_totals），所以界面上显示的「已用」与后端判「超额」
-	// 用的数字必然一致。若这里改读 users.used_tokens（展示列），两者会分叉，
-	// 用户会看到「明明还有额度却被拒」。
+	// 用的数字必然一致。改用其他口径就会分叉，用户会看到「明明还有额度却被拒」。
 	//
 	// 读失败按余额的同一口径处理：只记 WARN，字段留 0。quota_tokens=0 在前端
 	// 恰好是「不限」的既有语义，所以失败时表现为「不限」而不是一个错的配额数。

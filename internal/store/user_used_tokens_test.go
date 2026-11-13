@@ -22,9 +22,8 @@ func newArchiveStore(t *testing.T) *Store {
 	return st
 }
 
-// users.used_tokens 从「展示快照」升级为配额判定数据源（2026-10-11，
-// 见 internal/config 的 UsageRetentionDays 注释）之后，它由 trg_update_user_used_tokens
-// 触发器累加、并在剪枝事务里回收。
+// 用户级已用量由 user_usage_totals 累加列承载（trg_update_user_usage_totals
+// 触发器维护），配额判定直接读它，不走明细 SUM。
 //
 // 这一组测试钉的就是那条**配对不变量**：触发器只加不減，剪枝负责減；
 // 两者只要有一个漏掉，这个列就会单向虚高，配额因此低估已用量 ——
@@ -33,14 +32,14 @@ func newArchiveStore(t *testing.T) *Store {
 // 这类缺陷不会自己暴露：虚高的值永远「看起来像用过了」，没有任何症状，
 // 直到某天有人超额消耗了本该用完的额度才发现。所以必须用测试钉住。
 
-// userTokens 读 users.used_tokens 原始列（绕开 SumUserUsedTokens，
+// userTokens 读 user_usage_totals 原始列（绕开 SumUserUsedTokens，
 // 因为这里要检查的正是它下面的数据源本身）。
 func userTokens(t *testing.T, st *Store, userID string) int64 {
 	t.Helper()
 	var v int64
 	if err := st.read.QueryRowContext(context.Background(),
 		`SELECT total_tokens FROM user_usage_totals WHERE user_id = ?`, userID).Scan(&v); err != nil {
-		t.Fatalf("read users.used_tokens(%s): %v", userID, err)
+		t.Fatalf("read user_usage_totals.total_tokens(%s): %v", userID, err)
 	}
 	return v
 }
@@ -121,11 +120,6 @@ func TestUserUsedTokens_累加与剪枝回收配对(t *testing.T) {
 	// 注意这里**不能**去读 id 为空串的 user 行 —— fixture 从未建过它，
 	// 读到的是 sql.ErrNoRows 而非一个「错误的非零值」。真正要断言的是：
 	// 孤儿明细没有凭空造出一个用户，或把量记到某个真实用户头上。
-	var orphanSum int64
-	if err := st.read.QueryRowContext(ctx,
-		`SELECT COALESCE(SUM(used_tokens), 0) FROM users`).Scan(&orphanSum); err != nil {
-		t.Fatalf("sum all users: %v", err)
-	}
 	var u1Sum int64
 	src1, args1 := UsageSource(UsageFilter{UserID: "u1"})
 	if err := st.read.QueryRowContext(ctx,
@@ -143,8 +137,6 @@ func TestUserUsedTokens_累加与剪枝回收配对(t *testing.T) {
 	if count != 0 {
 		t.Fatalf("孤儿明细不应造出 id 为空串的用户，实际有 %d 行", count)
 	}
-	_ = orphanSum
-
 	t.Logf("配对验证通过：剪掉 %d 条、保留 %d 条后累加列仍等于真实合计", old, kept)
 }
 
@@ -189,8 +181,7 @@ func TestUserUsedTokens_空串用户不被累加(t *testing.T) {
 
 // TestSumUserUsedTokens_用户不存在返回零不报错 钉住改读列时的语义保持。
 //
-// 旧实现是「对明细做 SUM」，用户不存在时无匹配行 → 返回 0 + nil。
-// 改成 SELECT users.used_tokens 后自然语言上是 sql.ErrNoRows。
+// 用户不存在时累加列无匹配行 → 必须返回 0 + nil，而不是 sql.ErrNoRows。
 //
 // 调用方（main.go 的用户级配额检查）对错误 **fail-open**：只记 ERROR、
 // 不拒绝请求。若这里把 ErrNoRows 当错误返回，每次请求都会刷一条误导性
