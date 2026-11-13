@@ -72,7 +72,7 @@ func auditActor(ctx context.Context) string {
 			return id
 		}
 	}
-	// 免鉴权入口（首次设密、一次性设密链接）没有会话身份。
+	// 免鉴权入口（首次设密）没有会话身份。
 	// 不写空串：空 actor 在审计表里和「历史坏数据」无法区分。
 	return "anonymous"
 }
