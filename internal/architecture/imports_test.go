@@ -190,10 +190,11 @@ func checkRules(packages map[string]packageImports) []string {
 			forbid: []string{
 				modulePath + "/internal/admin",
 				modulePath + "/internal/server",
+				modulePath + "/internal/dataplane",
 				modulePath + "/internal/gatewayapp",
 				modulePath + "/cmd/gateway",
 			},
-			message: "catalog 只负责模型目录响应，不得依赖管理面、HTTP 服务器装配或进程入口",
+			message: "catalog 只负责模型目录响应，不得依赖管理面、请求转发、HTTP 服务器装配或进程入口",
 		},
 		{
 			from: modulePath + "/internal/api",

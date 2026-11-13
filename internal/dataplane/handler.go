@@ -326,7 +326,7 @@ func (h *Handler) Handle(codec ingress.Codec) http.HandlerFunc {
 		res, err := snap.Routes.Resolve(ing.Model)
 		diag.end("routing", routingStart)
 		if err != nil {
-			codec.WriteError(w, http.StatusNotFound, "model_not_found", ModelNotFoundMessage(snap, ing.Model))
+			codec.WriteError(w, http.StatusNotFound, "model_not_found", snapshot.ModelNotFoundMessage(snap, ing.Model))
 			diag.setResult("error", "model_not_found", "")
 			return
 		}
@@ -1002,18 +1002,6 @@ func (h *Handler) acquireStreamSlot(ctx context.Context) bool {
 // 已经过了 auth 与白名单（白名单在下面才判），能走到这里的调用方本来就有
 // 一把有效 key。列候选名不新增暴露面，因为同一把 key 调
 // GET /v1/models 就能拿到同一份清单。
-func ModelNotFoundMessage(snap *snapshot.Snapshot, requested string) string {
-	base := fmt.Sprintf("model %q not found", requested)
-	if snap == nil || snap.Routes == nil {
-		return base
-	}
-	sugg := snap.Routes.SuggestModel(requested, 5)
-	if len(sugg) == 0 {
-		return base + "（该名字没有匹配到已配置的模型；用 GET /v1/models 查看可用清单）"
-	}
-	return fmt.Sprintf("%s。可用的相似模型：%s", base, strings.Join(sugg, ", "))
-}
-
 // effectiveProviderProtocol returns the protocol the pool actually resolved,
 // falling back to the routing snapshot while the pool has no entry yet. The
 // configured value may be "auto"; protocol-specific behavior must never treat

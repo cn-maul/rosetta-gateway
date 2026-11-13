@@ -1,6 +1,7 @@
 package snapshot
 
 import (
+	"fmt"
 	"net/netip"
 	"strings"
 	"sync/atomic"
@@ -233,6 +234,23 @@ func (k *KeySnapshot) AllowsIP(addr netip.Addr) bool {
 		}
 	}
 	return false
+}
+
+// ModelNotFoundMessage 构造「模型名不存在」的错误文案，附带可用名建议。
+//
+// 放在 snapshot 而不是 dataplane：公开模型目录（catalog）也要给同一句话，
+// 而它不该为了一个字符串去依赖「请求转发」。本函数只读快照，没有 HTTP、
+// 运行时或计费依赖。
+func ModelNotFoundMessage(snap *Snapshot, requested string) string {
+	base := fmt.Sprintf("model %q not found", requested)
+	if snap == nil || snap.Routes == nil {
+		return base
+	}
+	sugg := snap.Routes.SuggestModel(requested, 5)
+	if len(sugg) == 0 {
+		return base + "（该名字没有匹配到已配置的模型；用 GET /v1/models 查看可用清单）"
+	}
+	return fmt.Sprintf("%s。可用的相似模型：%s", base, strings.Join(sugg, ", "))
 }
 
 var current atomic.Pointer[Snapshot]

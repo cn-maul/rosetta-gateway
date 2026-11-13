@@ -9,7 +9,6 @@ import (
 
 	"github.com/cn-maul/rosetta-gateway/internal/auth"
 	"github.com/cn-maul/rosetta-gateway/internal/authhttp"
-	"github.com/cn-maul/rosetta-gateway/internal/dataplane"
 	"github.com/cn-maul/rosetta-gateway/internal/outwire"
 	"github.com/cn-maul/rosetta-gateway/internal/routing"
 	"github.com/cn-maul/rosetta-gateway/internal/snapshot"
@@ -103,7 +102,7 @@ func Get(forceShape string) http.HandlerFunc {
 		snap := snapshot.Get()
 		res, rerr := snap.Routes.Resolve(modelID)
 		if rerr != nil {
-			writeErr(w, http.StatusNotFound, "model_not_found", dataplane.ModelNotFoundMessage(snap, modelID))
+			writeErr(w, http.StatusNotFound, "model_not_found", snapshot.ModelNotFoundMessage(snap, modelID))
 			return
 		}
 		if !authCtx.AllowsModel(res.Route.PublicName) {
