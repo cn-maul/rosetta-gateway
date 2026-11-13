@@ -1,126 +1,15 @@
 package main
 
 import (
-	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"encoding/json"
-	"io"
-	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"sync/atomic"
 	"testing"
 
-	"github.com/cn-maul/rosetta-gateway/internal/config"
 	"github.com/cn-maul/rosetta-gateway/internal/ingress"
-	"github.com/cn-maul/rosetta-gateway/internal/ratelimit"
-	"github.com/cn-maul/rosetta-gateway/internal/routing"
-	"github.com/cn-maul/rosetta-gateway/internal/snapshot"
-	"github.com/cn-maul/rosetta-gateway/internal/store"
-	"github.com/cn-maul/rosetta-gateway/internal/upstream"
 )
-
-// harnessChain 与 failover_test.go 里 buildHarness 的匿名链结构对应，
-// 但每个 provider 自带 protocol —— 硬约束过滤的用例必须让链上混有
-// chat 与 anthropic 两种协议，统一 chat 的旧 harness 不够用。
-type harnessChain struct {
-	slug     string
-	url      string
-	protocol string
-}
-
-// buildHarnessProtocols 组一套「pool + 快照 + 临时库」，链顺序由 providers
-// 入参决定（第一个=链首），protocol 逐 provider 生效。结构复制自
-// buildHarnessFull（它的匿名入参结构被十几个既有用例内联声明，不便改签名）。
-func buildHarnessProtocols(t *testing.T, chain []harnessChain, failover bool, codec ingress.Codec) http.HandlerFunc {
-	t.Helper()
-	h, _, _ := buildHarnessProtocolsFull(t, chain, failover, codec)
-	return h
-}
-
-// buildHarnessProtocolsFull 同 buildHarnessProtocols，但把库与 pool 交出来，
-// 供需要断言落库字段或目标健康态的用例使用（与 buildHarnessFull 对齐）。
-func buildHarnessProtocolsFull(t *testing.T, chain []harnessChain, failover bool, codec ingress.Codec) (http.HandlerFunc, *store.Store, *upstream.Pool) {
-	t.Helper()
-
-	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-
-	cfg := config.Default()
-	cfg.Defaults.MaxRetries = 0 // 关掉 SDK 内部重试，故障转移行为归网关自己
-	bps := make([]config.BootstrapProvider, 0, len(chain))
-	for _, c := range chain {
-		bps = append(bps, config.BootstrapProvider{
-			Slug:        c.slug,
-			Name:        c.slug,
-			Protocol:    c.protocol,
-			Endpoint:    c.url,
-			Credentials: []config.BootstrapCredential{{Label: "k", APIKey: "sk-" + c.slug}},
-		})
-	}
-	cfg.Bootstrap.Providers = bps
-
-	pool := upstream.NewPool(logger)
-	if err := pool.BuildFromConfig(cfg); err != nil {
-		t.Fatalf("build pool: %v", err)
-	}
-
-	db, err := store.Open(t.TempDir()+"/gw.db", logger)
-	if err != nil {
-		t.Fatalf("open db: %v", err)
-	}
-	t.Cleanup(func() { db.Close() })
-
-	if err := db.CreateUser(context.Background(), &store.User{
-		ID: testUserID, Username: "tester", PasswordHash: "x",
-		Role: store.RoleUser, Status: store.UserStatusActive, AuthVersion: 1,
-	}); err != nil {
-		t.Fatalf("seed user: %v", err)
-	}
-	sum0 := sha256.Sum256([]byte(testAccessKey))
-	if err := db.CreateAccessKey(context.Background(), &store.AccessKey{
-		ID: "k1", KeyHash: hex.EncodeToString(sum0[:]), KeyPrefix: "sk-gw-test",
-		Name: "t", Enabled: true, QuotaTokens: 0, UserID: testUserID,
-	}); err != nil {
-		t.Fatalf("seed access key: %v", err)
-	}
-
-	ri := routing.NewRouteIndex()
-	var targets []*routing.Target
-	for i, c := range chain {
-		ri.AddProvider(&routing.ProviderRef{ID: c.slug, Slug: c.slug, Endpoint: c.url, Protocol: c.protocol, Enabled: true})
-		ri.AddUpstreamModel(&routing.UpstreamModel{ID: c.slug + "/m", ProviderID: c.slug, ModelID: c.slug + "-model"})
-		targets = append(targets, &routing.Target{
-			ID: c.slug + "#t" + string(rune('0'+i)), RouteID: "r1",
-			ProviderID: c.slug, UpstreamModelID: c.slug + "/m", Position: i,
-			Enabled: true})
-	}
-	ri.AddRoute(&routing.Route{
-		ID: "r1", PublicName: "flash",
-		ProviderID: chain[0].slug, UpstreamModelID: chain[0].slug + "/m",
-		Enabled: true, FailoverEnabled: failover,
-	})
-	for _, tg := range targets {
-		ri.AddRouteTarget(tg)
-	}
-
-	sum := sha256.Sum256([]byte(testAccessKey))
-	sumHex := hex.EncodeToString(sum[:])
-	snap := &snapshot.Snapshot{
-		Routes:     ri,
-		Providers:  map[string]*snapshot.ProviderSnapshot{},
-		KeysByHash: map[string]*snapshot.KeySnapshot{sumHex: {ID: "k1", KeyHash: sumHex, Name: "t", Enabled: true, UserID: testUserID, AllowedModels: snapshot.AllowAll(), GroupModelAllow: snapshot.AllowAll()}},
-		UsersByID:  snapshotUsersForTest(),
-		Runtime: snapshot.RuntimeDefaults{
-			FailoverMaxTargets: len(chain),
-		},
-	}
-	snapshot.Init(snap)
-
-	rl := ratelimit.New()
-	return handleIngress(pool, cfg, newUsageRecorder(db, logger), rl, codec), db, pool
-}
 
 // fakeAnthropic 起一个 Anthropic Messages 形状的假上游（SDK 会 POST
 // <endpoint>/v1/messages），命中次数记入计数器供断言「未被命中」。

@@ -31,10 +31,7 @@ func TestFailover_CutStreamCountsAsFailureAndTripsCircuit(t *testing.T) {
 	cut := fakeStreamCutAfterFirstEvent()
 	defer cut.Close()
 
-	h, _, pool := buildHarnessFull(t, []struct {
-		slug, url string
-		fail      bool
-	}{{"p1", cut.URL, false}}, false, ingress.NewOpenAIChat())
+	h, _, pool := buildHarnessFull(t, []harnessChain{{slug: "p1", url: cut.URL}}, false, ingress.NewOpenAIChat())
 
 	targetID := "p1#t0"
 	for i := 0; i < 3; i++ {
@@ -63,10 +60,7 @@ func TestCircuitBreaker_NonStreamSuccessIsNotCountedAsFailure(t *testing.T) {
 	good := fakeGood()
 	defer good.Close()
 
-	h, _, pool := buildHarnessFull(t, []struct {
-		slug, url string
-		fail      bool
-	}{{"p1", good.URL, false}}, false, ingress.NewOpenAIChat())
+	h, _, pool := buildHarnessFull(t, []harnessChain{{slug: "p1", url: good.URL}}, false, ingress.NewOpenAIChat())
 
 	const targetID = "p1#t0"
 	// 阈值默认 3。连续 7 次非流式成功：若成功被误记为失败，第3 次就熔断。
@@ -85,10 +79,7 @@ func TestCircuitBreaker_NonStreamFailureIsCounted(t *testing.T) {
 	bad := fakeBad()
 	defer bad.Close()
 
-	h, _, pool := buildHarnessFull(t, []struct {
-		slug, url string
-		fail      bool
-	}{{"p1", bad.URL, true}}, true, ingress.NewOpenAIChat())
+	h, _, pool := buildHarnessFull(t, []harnessChain{{slug: "p1", url: bad.URL}}, true, ingress.NewOpenAIChat())
 	initFailoverRuntimeForTest(t, 1, 1)
 
 	const targetID = "p1#t0"
@@ -105,10 +96,7 @@ func TestCircuitBreaker_SurvivesPoolReinstall(t *testing.T) {
 	bad := fakeBad()
 	defer bad.Close()
 
-	h, _, pool := buildHarnessFull(t, []struct {
-		slug, url string
-		fail      bool
-	}{{"p1", bad.URL, true}}, true, ingress.NewOpenAIChat())
+	h, _, pool := buildHarnessFull(t, []harnessChain{{slug: "p1", url: bad.URL}}, true, ingress.NewOpenAIChat())
 	initFailoverRuntimeForTest(t, 1, 1)
 
 	const targetID = "p1#t0"
@@ -141,10 +129,7 @@ func TestCircuitBreaker_InstallDropsDeletedTargets(t *testing.T) {
 	bad := fakeBad()
 	defer bad.Close()
 
-	h, _, pool := buildHarnessFull(t, []struct {
-		slug, url string
-		fail      bool
-	}{{"p1", bad.URL, true}}, false, ingress.NewOpenAIChat())
+	h, _, pool := buildHarnessFull(t, []harnessChain{{slug: "p1", url: bad.URL}}, false, ingress.NewOpenAIChat())
 
 	for i := 0; i < 3; i++ {
 		postChat(h, "flash")

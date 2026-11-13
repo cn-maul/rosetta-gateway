@@ -460,10 +460,7 @@ func TestPerfBaselineNonStream(t *testing.T) {
 	good := fakeGood()
 	defer good.Close()
 
-	h, _ := buildHarness(t, []struct {
-		slug, url string
-		fail      bool
-	}{{"good", good.URL, false}}, false)
+	h, _ := buildHarness(t, []harnessChain{{slug: "good", url: good.URL}}, false)
 	gw := startGateway(t, h)
 	client := perfClient()
 	defer client.CloseIdleConnections()
@@ -547,10 +544,7 @@ func TestPerfBaselineStream(t *testing.T) {
 	good := fakeStreamGood()
 	defer good.Close()
 
-	h, _ := buildHarness(t, []struct {
-		slug, url string
-		fail      bool
-	}{{"good", good.URL, false}}, false)
+	h, _ := buildHarness(t, []harnessChain{{slug: "good", url: good.URL}}, false)
 	gw := startGateway(t, h)
 	client := perfClient()
 	defer client.CloseIdleConnections()
@@ -601,10 +595,7 @@ func TestPerfBaselineStream(t *testing.T) {
 	slow := fakeStreamMany(events, gap)
 	defer slow.Close()
 
-	h2, _ := buildHarness(t, []struct {
-		slug, url string
-		fail      bool
-	}{{"good", slow.URL, false}}, false)
+	h2, _ := buildHarness(t, []harnessChain{{slug: "good", url: slow.URL}}, false)
 	gw2 := startGateway(t, h2)
 	client2 := perfClient()
 	defer client2.CloseIdleConnections()
@@ -673,10 +664,7 @@ func TestPerfConcurrencyScaling(t *testing.T) {
 	good := fakeGood()
 	defer good.Close()
 
-	h, _ := buildHarness(t, []struct {
-		slug, url string
-		fail      bool
-	}{{"good", good.URL, false}}, false)
+	h, _ := buildHarness(t, []harnessChain{{slug: "good", url: good.URL}}, false)
 	gw := startGateway(t, h)
 	client := perfClient()
 	defer client.CloseIdleConnections()
@@ -734,10 +722,7 @@ func TestPerfDataPlaneNotLimitedByAuthConcurrencyCap(t *testing.T) {
 	good := fakeGood()
 	defer good.Close()
 
-	h, _ := buildHarness(t, []struct {
-		slug, url string
-		fail      bool
-	}{{"good", good.URL, false}}, false)
+	h, _ := buildHarness(t, []harnessChain{{slug: "good", url: good.URL}}, false)
 	gw := startGateway(t, h)
 	client := perfClient()
 	defer client.CloseIdleConnections()
@@ -785,10 +770,7 @@ func TestPerfGoroutineLeak(t *testing.T) {
 	good := fakeGood()
 	defer good.Close()
 
-	h, _ := buildHarness(t, []struct {
-		slug, url string
-		fail      bool
-	}{{"good", good.URL, false}}, false)
+	h, _ := buildHarness(t, []harnessChain{{slug: "good", url: good.URL}}, false)
 	env := newPerfEnv(t, h)
 	client := env.client
 
@@ -829,10 +811,7 @@ func TestPerfGoroutineLeakStream(t *testing.T) {
 	good := fakeStreamGood()
 	defer good.Close()
 
-	h, _ := buildHarness(t, []struct {
-		slug, url string
-		fail      bool
-	}{{"good", good.URL, false}}, false)
+	h, _ := buildHarness(t, []harnessChain{{slug: "good", url: good.URL}}, false)
 	env := newPerfEnv(t, h)
 	client := env.client
 
@@ -882,10 +861,7 @@ func TestPerfUpstreamConnectionRelease(t *testing.T) {
 	up, cs := newFakeUpstreamWithConnStats()
 	defer up.Close()
 
-	h, _ := buildHarness(t, []struct {
-		slug, url string
-		fail      bool
-	}{{"good", up.URL, false}}, false)
+	h, _ := buildHarness(t, []harnessChain{{slug: "good", url: up.URL}}, false)
 	env := newPerfEnv(t, h)
 	client := env.client
 
@@ -953,10 +929,7 @@ func TestPerfClientDisconnectReleasesResources(t *testing.T) {
 	slow := fakeStreamMany(200, 5*time.Millisecond)
 	defer slow.Close()
 
-	h, _ := buildHarness(t, []struct {
-		slug, url string
-		fail      bool
-	}{{"good", slow.URL, false}}, false)
+	h, _ := buildHarness(t, []harnessChain{{slug: "good", url: slow.URL}}, false)
 	env := newPerfEnv(t, h)
 
 	// 预热一条完整流（走正常结束路径，把懒初始化做完）。
@@ -1029,10 +1002,7 @@ func TestPerfMemoryGrowth(t *testing.T) {
 	good := fakeGood()
 	defer good.Close()
 
-	h, _ := buildHarness(t, []struct {
-		slug, url string
-		fail      bool
-	}{{"good", good.URL, false}}, false)
+	h, _ := buildHarness(t, []harnessChain{{slug: "good", url: good.URL}}, false)
 	env := newPerfEnv(t, h)
 	client := env.client
 
@@ -1127,10 +1097,7 @@ func TestPerfTTFTWatchdogOnHangingUpstream(t *testing.T) {
 	defer hang.Close()
 
 	const ttftMs = 150
-	h, _ := buildHarness(t, []struct {
-		slug, url string
-		fail      bool
-	}{{"hang", hang.URL, false}}, false, ttftMs)
+	h, _ := buildHarness(t, []harnessChain{{slug: "hang", url: hang.URL}}, false, ttftMs)
 	env := newPerfEnv(t, h)
 
 	// 单条：确认看门狗真的在 ttftMs 附近触发。
@@ -1221,10 +1188,7 @@ func TestPerfSlowUpstreamHighConcurrency(t *testing.T) {
 	slow := fakeSlowStream(80*time.Millisecond, 10)
 	defer slow.Close()
 
-	h, _ := buildHarness(t, []struct {
-		slug, url string
-		fail      bool
-	}{{"slow", slow.URL, false}}, false)
+	h, _ := buildHarness(t, []harnessChain{{slug: "slow", url: slow.URL}}, false)
 	env := newPerfEnv(t, h)
 
 	// runSlow 以固定并发跑 total 次慢流，返回结果与「关池后的残留 goroutine」。
@@ -1323,10 +1287,7 @@ func TestPerfUsageQueueSaturation(t *testing.T) {
 	good := fakeGood()
 	defer good.Close()
 
-	h, db := buildHarness(t, []struct {
-		slug, url string
-		fail      bool
-	}{{"good", good.URL, false}}, false)
+	h, db := buildHarness(t, []harnessChain{{slug: "good", url: good.URL}}, false)
 	env := newPerfEnv(t, h)
 	env.db = db
 	client := env.client
@@ -1386,10 +1347,7 @@ func TestPerfLongStreamMemoryBounded(t *testing.T) {
 		up := fakeStreamMany(events, 0)
 		defer up.Close()
 
-		h, _ := buildHarness(t, []struct {
-			slug, url string
-			fail      bool
-		}{{"good", up.URL, false}}, false)
+		h, _ := buildHarness(t, []harnessChain{{slug: "good", url: up.URL}}, false)
 		env := newPerfEnv(t, h)
 
 		// 预热（短流），把懒初始化做完再取基线。
@@ -1526,10 +1484,7 @@ func TestStreamHeadersNotHeldByRoleOnlyFirstChunk(t *testing.T) {
 	up := fakeStreamRoleOnlyFirst(2, gap)
 	defer up.Close()
 
-	h, _ := buildHarness(t, []struct {
-		slug, url string
-		fail      bool
-	}{{"good", up.URL, false}}, false)
+	h, _ := buildHarness(t, []harnessChain{{slug: "good", url: up.URL}}, false)
 	gw := startGateway(t, h)
 	client := perfClient()
 	defer client.CloseIdleConnections()

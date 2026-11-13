@@ -3,8 +3,6 @@ package main
 import (
 	"context"
 	"errors"
-	"io"
-	"log/slog"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -56,11 +54,7 @@ func countUsageRecords(t *testing.T, db *store.Store) int {
 
 func newFlakyRecorder(t *testing.T, failTimes int32) (*usageRecorder, *store.Store, *atomic.Int32) {
 	t.Helper()
-	db, err := store.Open(t.TempDir()+"/gw.db", slog.New(slog.NewTextHandler(io.Discard, nil)))
-	if err != nil {
-		t.Fatalf("open store: %v", err)
-	}
-	t.Cleanup(func() { db.Close() })
+	db := openTestStore(t)
 
 	// 素材要先落进去一部分，才能验「至少写了 N 条」；这里反过来：
 	// 我们要验的是「批量失败那批最终仍落库」，所以库里初始应为空。

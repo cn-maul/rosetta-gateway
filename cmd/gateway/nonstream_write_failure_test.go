@@ -39,10 +39,7 @@ func TestR0AC13_NonStreamEncodeFailureIsFinalizedOnce(t *testing.T) {
 		Codec: ingress.NewOpenAIChat(),
 		err:   errors.New("encode: unsupported response payload"),
 	}
-	h, db, pool := buildHarnessFull(t, []struct {
-		slug, url string
-		fail      bool
-	}{{"up", up.URL, false}}, true, codec)
+	h, db, pool := buildHarnessFull(t, []harnessChain{{slug: "up", url: up.URL}}, true, codec)
 	snap := *snapshot.Get()
 	snap.Runtime.FailoverFailureThreshold = 1
 	snapshot.Init(&snap)
@@ -127,10 +124,7 @@ func TestR0AC13_NonStreamDownstreamWriteFailureIsTerminalAndNotCharged(t *testin
 			}))
 			defer up.Close()
 
-			h, db, _ := buildHarnessFull(t, []struct {
-				slug, url string
-				fail      bool
-			}{{"up", up.URL, false}}, false, tc.codec)
+			h, db, _ := buildHarnessFull(t, []harnessChain{{slug: "up", url: up.URL}}, false, tc.codec)
 			priceRoute(t, db, "up", "up-model", 1_000_000, 1_000_000)
 			e2eSetBalance(t, db, 10_000)
 			startCents, startRem := e2eBalance(t, db)
@@ -180,10 +174,7 @@ func TestR0AC13_NonStreamDownstreamWriteFailureIsTerminalAndNotCharged(t *testin
 
 func TestR0AC14_NonStreamWriteFailureDoesNotPenalizeTargetOrCredential(t *testing.T) {
 	up := newFakeUpstream(t, replyOK("pong"))
-	h, db, pool := buildHarnessFull(t, []struct {
-		slug, url string
-		fail      bool
-	}{{"up", up.URL(), false}}, true, ingress.NewOpenAIChat())
+	h, db, pool := buildHarnessFull(t, []harnessChain{{slug: "up", url: up.URL()}}, true, ingress.NewOpenAIChat())
 	snap := *snapshot.Get()
 	snap.Runtime.FailoverFailureThreshold = 1
 	snapshot.Init(&snap)

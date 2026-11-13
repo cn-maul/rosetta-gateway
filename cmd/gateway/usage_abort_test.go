@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"context"
 	"errors"
-	"io"
 	"log/slog"
 	"strings"
 	"testing"
@@ -21,11 +20,7 @@ import (
 // 返回、db.Close() 与它并发，日志刷满 "database is closed"，而进程一退
 // 手上那批记录就连一条可对账的痕迹都没有。
 func TestUsageShutdown_AbortStopsRetryLoopAndLogsPending_X0(t *testing.T) {
-	db, err := store.Open(t.TempDir()+"/gw.db", slog.New(slog.NewTextHandler(io.Discard, nil)))
-	if err != nil {
-		t.Fatalf("open store: %v", err)
-	}
-	t.Cleanup(func() { db.Close() })
+	db := openTestStore(t)
 
 	var logs bytes.Buffer
 	// 批量写永久失败；随后把库关掉，让降级逐条也失败 —— 记录只能留在

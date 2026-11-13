@@ -31,10 +31,7 @@ import (
 // 套件看不见「拒绝范围写宽了、正常请求也被拒」这种回归。
 func TestE2E_Adv10_MultipleChoicesRejected(t *testing.T) {
 	up := newFakeUpstream(t, replyOK("pong"))
-	h, db := buildHarness(t, []struct {
-		slug, url string
-		fail      bool
-	}{{slug: "good", url: up.URL()}}, false)
+	h, db := buildHarness(t, []harnessChain{{slug: "good", url: up.URL()}}, false)
 	_ = db
 
 	// n=3 → 400，且上游零调用。

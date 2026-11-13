@@ -39,8 +39,6 @@ package main
 import (
 	"context"
 	"fmt"
-	"io"
-	"log/slog"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -48,12 +46,6 @@ import (
 
 	"github.com/cn-maul/rosetta-gateway/internal/store"
 )
-
-// discardLoggerForSplit 是本地丢弃日志器（与 failover_test.go 的 buildHarness
-// 里那个同款）。微基准要跑几千次事务，日志必须丢掉，否则输出淹没数字。
-func discardLoggerForSplit() *slog.Logger {
-	return slog.New(slog.NewTextHandler(io.Discard, nil))
-}
 
 // splitArm 记录一个手臂的原始数字。
 type splitArm struct {
@@ -125,10 +117,7 @@ func TestSplitInsertVsCharge(t *testing.T) {
 	good := fakeGood()
 	defer good.Close()
 
-	h, db := buildHarness(t, []struct {
-		slug, url string
-		fail      bool
-	}{{"good", good.URL, false}}, false)
+	h, db := buildHarness(t, []harnessChain{{slug: "good", url: good.URL}}, false)
 	// 包一层生产同款的 Middleware，让 request_id 存在（扣费幂等键）。
 	// 不包的话 charge() 会因空 request_id 静默跳过，扣费成本恒为 0。
 	// 复用 e2e_fake_upstream_test.go 的 middlewareForTest，不另造一份 ——
@@ -267,7 +256,7 @@ func TestSplitStoreTxCeiling(t *testing.T) {
 	if testing.Short() {
 		t.Skip("事务天花板微基准是重负载的，-short 下跳过")
 	}
-	logger := discardLoggerForSplit()
+	logger := discardLogger()
 	db, err := store.Open(t.TempDir()+"/split.db", logger)
 	if err != nil {
 		t.Fatalf("open: %v", err)

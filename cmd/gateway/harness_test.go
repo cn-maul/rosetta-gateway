@@ -5,6 +5,7 @@ package main
 
 import (
 	"log/slog"
+	"testing"
 
 	"github.com/cn-maul/rosetta-gateway/internal/api"
 	"github.com/cn-maul/rosetta-gateway/internal/config"
@@ -32,6 +33,30 @@ func newUsageRecorder(db *store.Store, logger *slog.Logger) *usageRecorder {
 		Logger:          logger,
 		IsBalanceExempt: gatewayapp.BalanceExempt,
 	})
+}
+
+// openTestStore 开一个临时库并登记关闭。日志丢弃：这些用例断言的是数据，
+// 不是日志；需要看见 DB 报错的用例（如 bootstrap）自己保留 stderr logger。
+func openTestStore(t *testing.T) *store.Store {
+	t.Helper()
+	db, err := store.Open(t.TempDir()+"/gw.db", discardLogger())
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	t.Cleanup(func() { db.Close() })
+	return db
+}
+
+// newDiscardApp 组一个只关心路由/管理面形状的 app：临时库、丢弃日志，
+// 空的 pool 与限流器。数据面语义由 handleIngress 侧用例覆盖。
+func newDiscardApp(t *testing.T) (*gatewayApp, *store.Store) {
+	t.Helper()
+	db := openTestStore(t)
+	return buildApp(routeDeps{
+		db: db, cfg: config.Default(), logger: discardLogger(),
+		pool: upstream.NewPool(discardLogger()), rateLimiter: ratelimit.New(),
+		usage: newUsageRecorder(db, discardLogger()),
+	}), db
 }
 
 // routeDeps is the package-local compatibility shape used by the existing

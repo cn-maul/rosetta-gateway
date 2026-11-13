@@ -27,10 +27,7 @@ import (
 func TestE2E_KeyNameRecorded(t *testing.T) {
 	for _, stream := range []bool{false, true} {
 		up := newFakeUpstream(t, pickReply(stream, "pong"))
-		h, db := buildHarness(t, []struct {
-			slug, url string
-			fail      bool
-		}{{slug: "good", url: up.URL()}}, false)
+		h, db := buildHarness(t, []harnessChain{{slug: "good", url: up.URL()}}, false)
 
 		priceRoute(t, db, "good", "good-model", 1_000_000, 1_000_000)
 		e2eSetBalance(t, db, 10_000)

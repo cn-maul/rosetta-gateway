@@ -5,26 +5,10 @@ import (
 	"sort"
 	"strings"
 	"testing"
-
-	"github.com/cn-maul/rosetta-gateway/internal/config"
-	"github.com/cn-maul/rosetta-gateway/internal/ratelimit"
-	"github.com/cn-maul/rosetta-gateway/internal/store"
-	"github.com/cn-maul/rosetta-gateway/internal/upstream"
 )
 
 func TestBuildApp_RegistersEveryCataloguedRoute(t *testing.T) {
-	db, err := store.Open(t.TempDir()+"/routes.db", discardLogger())
-	if err != nil {
-		t.Fatalf("open store: %v", err)
-	}
-	t.Cleanup(func() { db.Close() })
-
-	cfg := config.Default()
-	app := buildApp(routeDeps{
-		db: db, cfg: cfg, logger: discardLogger(),
-		pool: upstream.NewPool(discardLogger()), rateLimiter: ratelimit.New(),
-		usage: newUsageRecorder(db, discardLogger()),
-	})
+	app, _ := newDiscardApp(t)
 
 	// 86 是当前真实生产契约（含 5 条 /admin/api/ 方法兜底与 3 条 /v1
 	// 子树兜底）。端点增删必须显式更新这个数，不能靠测试里手抄第三份清单。
@@ -95,18 +79,7 @@ func TestBuildApp_RegistersEveryCataloguedRoute(t *testing.T) {
 }
 
 func TestBuildApp_HandlersMatchServeMuxPatterns(t *testing.T) {
-	db, err := store.Open(t.TempDir()+"/routes-pattern.db", discardLogger())
-	if err != nil {
-		t.Fatalf("open store: %v", err)
-	}
-	t.Cleanup(func() { db.Close() })
-
-	cfg := config.Default()
-	app := buildApp(routeDeps{
-		db: db, cfg: cfg, logger: discardLogger(),
-		pool: upstream.NewPool(discardLogger()), rateLimiter: ratelimit.New(),
-		usage: newUsageRecorder(db, discardLogger()),
-	})
+	app, _ := newDiscardApp(t)
 
 	sorted := append([]registeredRoute(nil), app.Routes...)
 	sort.Slice(sorted, func(i, j int) bool { return sorted[i].Pattern < sorted[j].Pattern })

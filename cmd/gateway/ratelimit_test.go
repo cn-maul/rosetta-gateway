@@ -15,10 +15,7 @@ import (
 func TestRateLimit_RPMRejectsThirdRequest(t *testing.T) {
 	up := fakeGood()
 	defer up.Close()
-	h, db, _ := buildHarnessFull(t, []struct {
-		slug, url string
-		fail      bool
-	}{{slug: "good", url: up.URL}}, false, ingress.NewOpenAIChat())
+	h, db, _ := buildHarnessFull(t, []harnessChain{{slug: "good", url: up.URL}}, false, ingress.NewOpenAIChat())
 
 	// 给 k1 配 RPM=2，并从 DB 重建快照（快照是限速额度的下发通道）。
 	k, err := db.GetAccessKey(context.Background(), "k1")

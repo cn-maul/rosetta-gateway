@@ -15,11 +15,8 @@ func goodHarness(t *testing.T) (http.HandlerFunc, *store.Store) {
 	t.Helper()
 	good := fakeGood()
 	t.Cleanup(good.Close)
-	return buildHarness(t, []struct {
-		slug, url string
-		fail      bool
-	}{
-		{"good", good.URL, false},
+	return buildHarness(t, []harnessChain{
+		{slug: "good", url: good.URL},
 	}, false)
 }
 

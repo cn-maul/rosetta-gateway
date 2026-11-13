@@ -49,7 +49,7 @@ import (
 // batchProbeDB 开一个带价格模型的库，供两种落库路径共用。
 func batchProbeDB(t *testing.T) (*store.Store, func(*store.UsageRecord)) {
 	t.Helper()
-	db, err := store.Open(t.TempDir()+"/batch.db", discardLoggerForSplit())
+	db, err := store.Open(t.TempDir()+"/batch.db", discardLogger())
 	if err != nil {
 		t.Fatalf("open: %v", err)
 	}

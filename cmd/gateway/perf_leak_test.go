@@ -164,10 +164,7 @@ func TestDiagBottleneck(t *testing.T) {
 	good := fakeGood()
 	defer good.Close()
 
-	h, db := buildHarness(t, []struct {
-		slug, url string
-		fail      bool
-	}{{"good", good.URL, false}}, false)
+	h, db := buildHarness(t, []harnessChain{{slug: "good", url: good.URL}}, false)
 	env := newPerfEnv(t, h)
 
 	const n = 1500
@@ -255,7 +252,7 @@ func TestDiagBottleneck(t *testing.T) {
 					}
 					next++
 					mu.Unlock()
-					_, _, _, _ = db.GetKeyQuota(contextTODO(), "k1")
+					_, _, _, _ = db.GetKeyQuota(context.Background(), "k1")
 				}
 			}()
 		}
@@ -276,7 +273,7 @@ func TestDiagBottleneck(t *testing.T) {
 				IngressProtocol: "chat", Status: usageStatusOK,
 				InputTokens: 5, OutputTokens: 3, TotalTokens: 8,
 			}
-			if _, err := db.CreateUsageRecordWithCost(contextTODO(), rec); err != nil {
+			if _, err := db.CreateUsageRecordWithCost(context.Background(), rec); err != nil {
 				t.Fatalf("insert usage: %v", err)
 			}
 		}
@@ -319,10 +316,6 @@ func usageRowCount(t *testing.T, db *store.Store) int {
 	return n
 }
 
-// contextTODO 是 context.Background 的本地别名，避免诊断文件顶部再引一个包
-// （本文件其余部分不需要 context）。
-func contextTODO() context.Context { return context.Background() }
-
 // TestPerfDiagUsageWriteIsTheCause 用「不产生用量记录的请求」做因果对照。
 //
 // # 为什么需要这个对照
@@ -352,10 +345,7 @@ func TestDiagUsageWriteIsTheCause(t *testing.T) {
 	good := fakeGood()
 	defer good.Close()
 
-	h, db := buildHarness(t, []struct {
-		slug, url string
-		fail      bool
-	}{{"good", good.URL, false}}, false)
+	h, db := buildHarness(t, []harnessChain{{slug: "good", url: good.URL}}, false)
 	env := newPerfEnv(t, h)
 
 	// 热路径预热（两条路径都要）
@@ -470,10 +460,7 @@ func TestDiagUsageWriteCeiling(t *testing.T) {
 	}
 	good := fakeGood()
 	defer good.Close()
-	h, db := buildHarness(t, []struct {
-		slug, url string
-		fail      bool
-	}{{"good", good.URL, false}}, false)
+	h, db := buildHarness(t, []harnessChain{{slug: "good", url: good.URL}}, false)
 	_ = h
 
 	mkRec := func() *store.UsageRecord {
@@ -520,7 +507,7 @@ func TestDiagUsageWriteCeiling(t *testing.T) {
 	//
 	// 不插的话每次落库都会多一次失败的读 + 一条 WARN 日志，
 	// 量出来的不是生产口径。
-	if err := db.CreateUpstreamModel(contextTODO(), &store.UpstreamModel{
+	if err := db.CreateUpstreamModel(context.Background(), &store.UpstreamModel{
 		ID: "um-diag", ProviderID: "good", ModelID: "good-model",
 		PriceInput: 1, PriceOutput: 2,
 	}); err != nil {
@@ -531,7 +518,7 @@ func TestDiagUsageWriteCeiling(t *testing.T) {
 	measureFull := func(label string, ops int) float64 {
 		start := time.Now()
 		for i := 0; i < ops; i++ {
-			if _, err := db.CreateUsageRecordWithCost(contextTODO(), mkRec()); err != nil {
+			if _, err := db.CreateUsageRecordWithCost(context.Background(), mkRec()); err != nil {
 				t.Fatalf("insert: %v", err)
 			}
 		}
@@ -545,7 +532,7 @@ func TestDiagUsageWriteCeiling(t *testing.T) {
 
 	// 3. 灌到 2 万行，再量一次 —— 验证是否随表增长恶化
 	for i := 0; i < 18000; i++ {
-		if _, err := db.CreateUsageRecordWithCost(contextTODO(), mkRec()); err != nil {
+		if _, err := db.CreateUsageRecordWithCost(context.Background(), mkRec()); err != nil {
 			t.Fatalf("bulk insert: %v", err)
 		}
 	}
@@ -575,7 +562,7 @@ func TestDiagUsageWriteCeiling(t *testing.T) {
 			go func() {
 				defer wg.Done()
 				for i := 0; i < opsEach; i++ {
-					if _, err := db.CreateUsageRecordWithCost(contextTODO(), mkRec()); err != nil {
+					if _, err := db.CreateUsageRecordWithCost(context.Background(), mkRec()); err != nil {
 						return
 					}
 				}
@@ -620,10 +607,7 @@ func TestDiagSustainedBackpressure(t *testing.T) {
 	good := fakeGood()
 	defer good.Close()
 
-	h, db := buildHarness(t, []struct {
-		slug, url string
-		fail      bool
-	}{{"good", good.URL, false}}, false)
+	h, db := buildHarness(t, []harnessChain{{slug: "good", url: good.URL}}, false)
 	env := newPerfEnv(t, h)
 
 	for i := 0; i < 200; i++ {
@@ -737,10 +721,7 @@ func TestDiagVariance(t *testing.T) {
 	good := fakeGood()
 	defer good.Close()
 
-	h, _ := buildHarness(t, []struct {
-		slug, url string
-		fail      bool
-	}{{"good", good.URL, false}}, false)
+	h, _ := buildHarness(t, []harnessChain{{slug: "good", url: good.URL}}, false)
 	env := newPerfEnv(t, h)
 
 	for i := 0; i < 100; i++ {
@@ -797,10 +778,7 @@ func TestDiagGoroutineStacksSlowUpstream(t *testing.T) {
 	slow := fakeSlowStream(80*time.Millisecond, 10)
 	defer slow.Close()
 
-	h, _ := buildHarness(t, []struct {
-		slug, url string
-		fail      bool
-	}{{"slow", slow.URL, false}}, false)
+	h, _ := buildHarness(t, []harnessChain{{slug: "slow", url: slow.URL}}, false)
 	env := newPerfEnv(t, h)
 
 	// 预热

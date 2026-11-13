@@ -51,10 +51,7 @@ func TestAdminLockout_AdminCannotCallV1(t *testing.T) {
 
 	// 自己搭 harness，让「被计数的上游」真的挂在链上 —— 否则 hits 恒为 0，
 	// 断言会因**错误的原因**通过（那个计数服务器压根没被调用过）。
-	h, db := buildHarness(t, []struct {
-		slug, url string
-		fail      bool
-	}{{slug: "good", url: up.URL}}, false)
+	h, db := buildHarness(t, []harnessChain{{slug: "good", url: up.URL}}, false)
 	priceRoute(t, db, "good", "good-model", 1_000_000, 1_000_000)
 	adminSnapRole(t, store.RoleAdmin)
 
@@ -158,10 +155,7 @@ func TestAdminLockout_NormalUserUnaffected(t *testing.T) {
 func TestAdminLockout_QueryEndpointsAlsoRejectAdmin(t *testing.T) {
 	up := fakeGood()
 	defer up.Close()
-	buildHarnessFull(t, []struct {
-		slug, url string
-		fail      bool
-	}{{slug: "good", url: up.URL}}, false, ingress.NewOpenAIChat())
+	buildHarnessFull(t, []harnessChain{{slug: "good", url: up.URL}}, false, ingress.NewOpenAIChat())
 	adminSnapRole(t, store.RoleAdmin)
 
 	for _, tc := range []struct {
@@ -213,10 +207,7 @@ func withRole(r *http.Request, role, id string) *http.Request {
 func TestAdminLockout_AdminCannotCreateKey(t *testing.T) {
 	up := fakeGood()
 	defer up.Close()
-	_, db, _ := buildHarnessFull(t, []struct {
-		slug, url string
-		fail      bool
-	}{{slug: "good", url: up.URL}}, false, ingress.NewOpenAIChat())
+	_, db, _ := buildHarnessFull(t, []harnessChain{{slug: "good", url: up.URL}}, false, ingress.NewOpenAIChat())
 
 	before, err := db.ListAccessKeys(context.Background())
 	if err != nil {
@@ -251,10 +242,7 @@ func TestAdminLockout_AdminCannotCreateKey(t *testing.T) {
 func TestAdminLockout_NormalUserCanStillCreateKey(t *testing.T) {
 	up := fakeGood()
 	defer up.Close()
-	_, db, _ := buildHarnessFull(t, []struct {
-		slug, url string
-		fail      bool
-	}{{slug: "good", url: up.URL}}, false, ingress.NewOpenAIChat())
+	_, db, _ := buildHarnessFull(t, []harnessChain{{slug: "good", url: up.URL}}, false, ingress.NewOpenAIChat())
 
 	h := server.DenyAdminKeyCreate(admin.NewKeyHandler(db).Create)
 	req := httptest.NewRequest(http.MethodPost, "/admin/api/keys",
@@ -279,10 +267,7 @@ func TestAdminLockout_NormalUserCanStillCreateKey(t *testing.T) {
 func TestAdminLockout_MissingIdentityIsRejected(t *testing.T) {
 	up := fakeGood()
 	defer up.Close()
-	_, db, _ := buildHarnessFull(t, []struct {
-		slug, url string
-		fail      bool
-	}{{slug: "good", url: up.URL}}, false, ingress.NewOpenAIChat())
+	_, db, _ := buildHarnessFull(t, []harnessChain{{slug: "good", url: up.URL}}, false, ingress.NewOpenAIChat())
 
 	h := server.DenyAdminKeyCreate(admin.NewKeyHandler(db).Create)
 	req := httptest.NewRequest(http.MethodPost, "/admin/api/keys",

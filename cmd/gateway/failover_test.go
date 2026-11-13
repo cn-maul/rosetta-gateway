@@ -5,8 +5,6 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
-	"io"
-	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -88,34 +86,36 @@ func fakeStreamHang() *httptest.Server {
 	}))
 }
 
-// buildHarness 组一套「pool + 快照 + 临时库」，链顺序由 providers 入参决定（第一个=链首）。
-func buildHarness(t *testing.T, chain []struct {
-	slug, url string
-	fail      bool
-}, failover bool, ttftMs ...int) (http.HandlerFunc, *store.Store) {
-	t.Helper()
-	h, db, _ := buildHarnessFull(t, chain, failover, ingress.NewOpenAIChat(), ttftMs...)
-	return h, db
+// harnessChain 是链路夹具里的一跳：谁、打哪个地址、以什么上游协议对话。
+// protocol 留空时按 "chat" 处理，这也是绝大多数用例的形态。
+type harnessChain struct {
+	slug     string
+	url      string
+	protocol string
 }
 
-// buildHarnessFull 同 buildHarness，但额外把 pool 交出来，供需要断言健康态
-// （凭据冷却 / 目标熔断）的用例使用。可选 ttftMs 覆盖 route 的流式首字超时。
-func buildHarnessFull(t *testing.T, chain []struct {
-	slug, url string
-	fail      bool
-}, failover bool, codec ingress.Codec, ttftMs ...int) (http.HandlerFunc, *store.Store, *upstream.Pool) {
+// buildHarnessChain 组一套「pool + 快照 + 临时库」，链顺序由 chain 入参决定
+// （第一个=链首）。可选 ttftMs 覆盖 route 的流式首字超时。
+//
+// 这是包里唯一的链路夹具构造器：buildHarness / buildHarnessFull /
+// buildHarnessProtocols 都是它的薄包装。
+func buildHarnessChain(t *testing.T, chain []harnessChain, failover bool, codec ingress.Codec, ttftMs ...int) (http.HandlerFunc, *store.Store, *upstream.Pool) {
 	t.Helper()
 
-	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	logger := discardLogger()
 
 	cfg := config.Default()
 	cfg.Defaults.MaxRetries = 0 // 关掉 SDK 内部重试，把「转移」这件事单独交给网关验证
 	bps := make([]config.BootstrapProvider, 0, len(chain))
 	for _, c := range chain {
+		protocol := c.protocol
+		if protocol == "" {
+			protocol = "chat"
+		}
 		bps = append(bps, config.BootstrapProvider{
 			Slug:        c.slug,
 			Name:        c.slug,
-			Protocol:    "chat",
+			Protocol:    protocol,
 			Endpoint:    c.url,
 			Credentials: []config.BootstrapCredential{{Label: "k", APIKey: "sk-" + c.slug}},
 		})
@@ -155,7 +155,11 @@ func buildHarnessFull(t *testing.T, chain []struct {
 	ri := routing.NewRouteIndex()
 	var targets []*routing.Target
 	for i, c := range chain {
-		ri.AddProvider(&routing.ProviderRef{ID: c.slug, Slug: c.slug, Endpoint: c.url, Protocol: "chat", Enabled: true})
+		protocol := c.protocol
+		if protocol == "" {
+			protocol = "chat"
+		}
+		ri.AddProvider(&routing.ProviderRef{ID: c.slug, Slug: c.slug, Endpoint: c.url, Protocol: protocol, Enabled: true})
 		ri.AddUpstreamModel(&routing.UpstreamModel{ID: c.slug + "/m", ProviderID: c.slug, ModelID: c.slug + "-model"})
 		targets = append(targets, &routing.Target{
 			ID: c.slug + "#t" + string(rune('0'+i)), RouteID: "r1",
@@ -208,6 +212,33 @@ func buildHarnessFull(t *testing.T, chain []struct {
 	return handleIngress(pool, cfg, usageRec, rl, codec), db, pool
 }
 
+// buildHarness 组一套「pool + 快照 + 临时库」，链顺序由 chain 入参决定（第一个=链首）。
+func buildHarness(t *testing.T, chain []harnessChain, failover bool, ttftMs ...int) (http.HandlerFunc, *store.Store) {
+	t.Helper()
+	h, db, _ := buildHarnessFull(t, chain, failover, ingress.NewOpenAIChat(), ttftMs...)
+	return h, db
+}
+
+// buildHarnessFull 同 buildHarness，但额外把 pool 交出来，供需要断言健康态
+// （凭据冷却 / 目标熔断）的用例使用。可选 ttftMs 覆盖 route 的流式首字超时。
+func buildHarnessFull(t *testing.T, chain []harnessChain, failover bool, codec ingress.Codec, ttftMs ...int) (http.HandlerFunc, *store.Store, *upstream.Pool) {
+	t.Helper()
+	return buildHarnessChain(t, chain, failover, codec, ttftMs...)
+}
+
+// buildHarnessProtocols 是 buildHarnessChain 的只取 handler 的包装，
+// 供链上混有 chat / anthropic / responses 的协议用例使用。
+func buildHarnessProtocols(t *testing.T, chain []harnessChain, failover bool, codec ingress.Codec) http.HandlerFunc {
+	t.Helper()
+	h, _, _ := buildHarnessChain(t, chain, failover, codec)
+	return h
+}
+
+func buildHarnessProtocolsFull(t *testing.T, chain []harnessChain, failover bool, codec ingress.Codec) (http.HandlerFunc, *store.Store, *upstream.Pool) {
+	t.Helper()
+	return buildHarnessChain(t, chain, failover, codec)
+}
+
 func postChat(h http.HandlerFunc, model string) *httptest.ResponseRecorder {
 	body := `{"model":"` + model + `","messages":[{"role":"user","content":"hi"}],"stream":false}`
 	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
@@ -236,12 +267,9 @@ func TestFailover_NonStreamSwitchesOnUpstream404(t *testing.T) {
 	defer missing.Close()
 	defer good.Close()
 
-	h, _ := buildHarness(t, []struct {
-		slug, url string
-		fail      bool
-	}{
-		{"missing", missing.URL, true},
-		{"good", good.URL, false},
+	h, _ := buildHarness(t, []harnessChain{
+		{slug: "missing", url: missing.URL},
+		{slug: "good", url: good.URL},
 	}, true)
 
 	rec := postChat(h, "flash")
@@ -259,11 +287,8 @@ func TestFailover_SingleTarget404MapsToModelNotFound(t *testing.T) {
 	missing := fakeNotFound()
 	defer missing.Close()
 
-	h, _ := buildHarness(t, []struct {
-		slug, url string
-		fail      bool
-	}{
-		{"missing", missing.URL, true},
+	h, _ := buildHarness(t, []harnessChain{
+		{slug: "missing", url: missing.URL},
 	}, false)
 
 	rec := postChat(h, "flash")
@@ -282,12 +307,9 @@ func TestFailover_NonStreamSwitchesOnUpstream5xx(t *testing.T) {
 	defer bad.Close()
 	defer good.Close()
 
-	h, _ := buildHarness(t, []struct {
-		slug, url string
-		fail      bool
-	}{
-		{"bad", bad.URL, true},
-		{"good", good.URL, false},
+	h, _ := buildHarness(t, []harnessChain{
+		{slug: "bad", url: bad.URL},
+		{slug: "good", url: good.URL},
 	}, true)
 
 	rec := postChat(h, "flash")
@@ -306,12 +328,9 @@ func TestFailover_DisabledKeepsSingleTarget(t *testing.T) {
 	defer bad.Close()
 	defer good.Close()
 
-	h, _ := buildHarness(t, []struct {
-		slug, url string
-		fail      bool
-	}{
-		{"bad", bad.URL, true},
-		{"good", good.URL, false},
+	h, _ := buildHarness(t, []harnessChain{
+		{slug: "bad", url: bad.URL},
+		{slug: "good", url: good.URL},
 	}, false)
 
 	rec := postChat(h, "flash")
@@ -328,12 +347,9 @@ func TestFailover_AllTargetsFail(t *testing.T) {
 	bad := fakeBad()
 	defer bad.Close()
 
-	h, _ := buildHarness(t, []struct {
-		slug, url string
-		fail      bool
-	}{
-		{"bad", bad.URL, true},
-		{"bad2", bad.URL, true},
+	h, _ := buildHarness(t, []harnessChain{
+		{slug: "bad", url: bad.URL},
+		{slug: "bad2", url: bad.URL},
 	}, true)
 
 	rec := postChat(h, "flash")
@@ -355,12 +371,9 @@ func TestFailover_ClientGoneAbortsBeforeAnyUpstream(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	h, _ := buildHarness(t, []struct {
-		slug, url string
-		fail      bool
-	}{
-		{"bad", srv.URL, true},
-		{"bad2", srv.URL, true},
+	h, _ := buildHarness(t, []harnessChain{
+		{slug: "bad", url: srv.URL},
+		{slug: "bad2", url: srv.URL},
 	}, true)
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -397,11 +410,8 @@ func TestFailover_ClientDisconnectMidFlightDoesNotPoisonCredential(t *testing.T)
 	defer srv.Close()
 	defer close(release)
 
-	h, _, pool := buildHarnessFull(t, []struct {
-		slug, url string
-		fail      bool
-	}{
-		{"slow", srv.URL, false},
+	h, _, pool := buildHarnessFull(t, []harnessChain{
+		{slug: "slow", url: srv.URL},
 	}, true, ingress.NewOpenAIChat())
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -434,12 +444,9 @@ func TestFailover_StreamSwitchesOnUpstream5xx(t *testing.T) {
 	defer bad.Close()
 	defer good.Close()
 
-	h, _ := buildHarness(t, []struct {
-		slug, url string
-		fail      bool
-	}{
-		{"bad", bad.URL, true},
-		{"good", good.URL, false},
+	h, _ := buildHarness(t, []harnessChain{
+		{slug: "bad", url: bad.URL},
+		{slug: "good", url: good.URL},
 	}, true)
 
 	rec := postChatStream(h, "flash")
@@ -462,12 +469,9 @@ func TestFailover_StreamSwitchesOnFirstTokenTimeout(t *testing.T) {
 	defer hang.Close()
 	defer good.Close()
 
-	h, _ := buildHarness(t, []struct {
-		slug, url string
-		fail      bool
-	}{
-		{"hang", hang.URL, true},
-		{"good", good.URL, false},
+	h, _ := buildHarness(t, []harnessChain{
+		{slug: "hang", url: hang.URL},
+		{slug: "good", url: good.URL},
 	}, true, 150) // route 级 TTFT 覆盖 = 150ms
 
 	rec := postChatStream(h, "flash")
@@ -516,12 +520,9 @@ func TestFailover_NonTransferableErrorReleasesProbeSlot(t *testing.T) {
 	defer leak.Close()
 	defer bad.Close()
 
-	h, _, _ := buildHarnessFull(t, []struct {
-		slug, url string
-		fail      bool
-	}{
-		{"p1", leak.URL, true},
-		{"p2", bad.URL, true},
+	h, _, _ := buildHarnessFull(t, []harnessChain{
+		{slug: "p1", url: leak.URL},
+		{slug: "p2", url: bad.URL},
 	}, true, ingress.NewOpenAIChat())
 
 	if rec := postChat(h, "flash"); rec.Code != http.StatusBadGateway {
@@ -546,11 +547,8 @@ func TestFailover_CooledDownTargetExplains502(t *testing.T) {
 	good := fakeGood()
 	defer good.Close()
 
-	h, db, pool := buildHarnessFull(t, []struct {
-		slug, url string
-		fail      bool
-	}{
-		{"only", good.URL, false},
+	h, db, pool := buildHarnessFull(t, []harnessChain{
+		{slug: "only", url: good.URL},
 	}, true, ingress.NewOpenAIChat())
 
 	// 直接把唯一目标打进冷却，比连打三枪失败更快，也不依赖默认阈值。

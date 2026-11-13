@@ -6,27 +6,14 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
-
-	"github.com/cn-maul/rosetta-gateway/internal/config"
-	"github.com/cn-maul/rosetta-gateway/internal/ratelimit"
-	"github.com/cn-maul/rosetta-gateway/internal/store"
-	"github.com/cn-maul/rosetta-gateway/internal/upstream"
 )
 
 // routeTestApp 只用于验证**路由层**行为（pattern 匹配与兜底响应形状），
 // 不参与鉴权/数据面语义 —— 那些由 handleIngress 侧的用例覆盖。
 func routeTestApp(t *testing.T) *gatewayApp {
 	t.Helper()
-	db, err := store.Open(t.TempDir()+"/routes.db", discardLogger())
-	if err != nil {
-		t.Fatalf("open store: %v", err)
-	}
-	t.Cleanup(func() { db.Close() })
-	return buildApp(routeDeps{
-		db: db, cfg: config.Default(), logger: discardLogger(),
-		pool: upstream.NewPool(discardLogger()), rateLimiter: ratelimit.New(),
-		usage: newUsageRecorder(db, discardLogger()),
-	})
+	app, _ := newDiscardApp(t)
+	return app
 }
 
 // 模型详情必须能寻址含 "/" 的模型 id。

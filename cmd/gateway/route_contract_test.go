@@ -8,28 +8,13 @@ import (
 	"encoding/json"
 	"fmt"
 	"testing"
-
-	"github.com/cn-maul/rosetta-gateway/internal/config"
-	"github.com/cn-maul/rosetta-gateway/internal/ratelimit"
-	"github.com/cn-maul/rosetta-gateway/internal/store"
-	"github.com/cn-maul/rosetta-gateway/internal/upstream"
 )
 
 func TestExportRouteContract(t *testing.T) {
 	if testing.Short() {
 		t.Skip("route contract export is run by internal/server authz tests")
 	}
-	db, err := store.Open(t.TempDir()+"/route-contract.db", discardLogger())
-	if err != nil {
-		t.Fatalf("open store: %v", err)
-	}
-	t.Cleanup(func() { db.Close() })
-
-	app := buildApp(routeDeps{
-		db: db, cfg: config.Default(), logger: discardLogger(),
-		pool: upstream.NewPool(discardLogger()), rateLimiter: ratelimit.New(),
-		usage: newUsageRecorder(db, discardLogger()),
-	})
+	app, _ := newDiscardApp(t)
 	b, err := json.Marshal(app.Routes)
 	if err != nil {
 		t.Fatalf("marshal route contract: %v", err)

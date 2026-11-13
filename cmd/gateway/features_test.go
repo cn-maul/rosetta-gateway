@@ -4,8 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"github.com/cn-maul/rosetta-gateway/internal/catalog"
-	"io"
-	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"strconv"
@@ -117,11 +115,7 @@ func TestModels_Metadata(t *testing.T) {
 
 // History 过滤（status）与 CSV 导出共用同一套过滤。
 func TestUsageHistoryFilterAndCSV(t *testing.T) {
-	db, err := store.Open(t.TempDir()+"/h.db", slog.New(slog.NewTextHandler(io.Discard, nil)))
-	if err != nil {
-		t.Fatalf("open store: %v", err)
-	}
-	t.Cleanup(func() { db.Close() })
+	db := openTestStore(t)
 	for i, st := range []string{"ok", "error", "ok"} {
 		if err := db.CreateUsageRecord(context.Background(), &store.UsageRecord{
 			ID: "r-" + strconv.Itoa(i), AccessKeyID: "k1", UserID: testUserID,
@@ -165,10 +159,7 @@ func TestUsageHistoryFilterAndCSV(t *testing.T) {
 func TestResponsesIngress_NonStream(t *testing.T) {
 	up := fakeGood()
 	defer up.Close()
-	h, _, _ := buildHarnessFull(t, []struct {
-		slug, url string
-		fail      bool
-	}{{slug: "good", url: up.URL}}, false, ingress.NewResponses())
+	h, _, _ := buildHarnessFull(t, []harnessChain{{slug: "good", url: up.URL}}, false, ingress.NewResponses())
 
 	body := `{"model":"flash","input":"hi","max_output_tokens":256}`
 	req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(body))
@@ -206,10 +197,7 @@ func TestResponsesIngress_NonStream(t *testing.T) {
 func TestResponsesIngress_Stream(t *testing.T) {
 	up := fakeStreamGood()
 	defer up.Close()
-	h, _, _ := buildHarnessFull(t, []struct {
-		slug, url string
-		fail      bool
-	}{{slug: "good", url: up.URL}}, false, ingress.NewResponses())
+	h, _, _ := buildHarnessFull(t, []harnessChain{{slug: "good", url: up.URL}}, false, ingress.NewResponses())
 
 	body := `{"model":"flash","input":"hi","stream":true}`
 	req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(body))

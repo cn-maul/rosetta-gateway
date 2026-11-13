@@ -64,10 +64,7 @@ func TestE2E_EffortRecordedFromClientRequest(t *testing.T) {
 				// 流式与非流式是两条独立的收尾路径（attemptStream 与
 				// attemptNonStream 各写一次 Record），必须分别跑。
 				up := newFakeUpstream(t, pickReply(stream, "pong"))
-				h, db := buildHarness(t, []struct {
-					slug, url string
-					fail      bool
-				}{{slug: "good", url: up.URL()}}, false)
+				h, db := buildHarness(t, []harnessChain{{slug: "good", url: up.URL()}}, false)
 
 				priceRoute(t, db, "good", "good-model", 1_000_000, 1_000_000)
 				e2eSetBalance(t, db, 10_000)
@@ -105,10 +102,7 @@ func TestE2E_EffortRecordedFromClientRequest(t *testing.T) {
 // 若 diagnostics 拿的是夹取前的请求，这里会读到 xhigh。
 func TestE2E_EffortClampedByModelCapability(t *testing.T) {
 	up := newFakeUpstream(t, replyOK("pong"))
-	h, db := buildHarness(t, []struct {
-		slug, url string
-		fail      bool
-	}{{slug: "good", url: up.URL()}}, false)
+	h, db := buildHarness(t, []harnessChain{{slug: "good", url: up.URL()}}, false)
 
 	// buildHarness 造的模型没有 effort_levels 配置（= 不夹取），这里把快照里
 	// 那个模型的支持集改成 [low, medium]。改快照而不是库：数据面热路径只读

@@ -285,10 +285,7 @@ func e2eChatBodyMaxTokens(model string, maxTokens int) string {
 // 所以断言刻意做全：状态码 + 响应体形状 + 上游收到的模型名 + DB 行 + 余额。
 func TestE2E_A1_NonStreamHappyPathChargesAndRecords(t *testing.T) {
 	up := newFakeUpstream(t, replyOK("pong"))
-	h, db := buildHarness(t, []struct {
-		slug, url string
-		fail      bool
-	}{{slug: "good", url: up.URL()}}, false)
+	h, db := buildHarness(t, []harnessChain{{slug: "good", url: up.URL()}}, false)
 
 	// 定价必须**同时**写快照与库：快照供余额预检，库供固化计价。
 	// 只写一处会造成「预检以为有价、实际 cost_total=0」的假绿（见 priceRoute）。
@@ -396,10 +393,7 @@ func TestE2E_A1_NonStreamHappyPathChargesAndRecords(t *testing.T) {
 // usage_state 判定全都是分开写的。
 func TestE2E_A2_StreamHappyPathRecordsAndCharges(t *testing.T) {
 	up := newFakeUpstream(t, replySSE("pong"))
-	h, db := buildHarness(t, []struct {
-		slug, url string
-		fail      bool
-	}{{slug: "good", url: up.URL()}}, false)
+	h, db := buildHarness(t, []harnessChain{{slug: "good", url: up.URL()}}, false)
 
 	priceRoute(t, db, "good", "good-model", 1_000_000, 1_000_000)
 	e2eSetBalance(t, db, 10_000)
@@ -589,10 +583,7 @@ func TestE2E_B_AuthRejectionsNeverReachUpstream(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			up := newFakeUpstream(t, replyOK("pong"))
-			h, db := buildHarness(t, []struct {
-				slug, url string
-				fail      bool
-			}{{slug: "good", url: up.URL()}}, false)
+			h, db := buildHarness(t, []harnessChain{{slug: "good", url: up.URL()}}, false)
 			priceRoute(t, db, "good", "good-model", 1_000_000, 1_000_000)
 			e2eSetBalance(t, db, 10_000)
 
@@ -627,10 +618,7 @@ func TestE2E_B_AuthRejectionsNeverReachUpstream(t *testing.T) {
 // 实现，前一条断言照样绿。
 func TestE2E_B2_RejectedRequestDoesNotCharge(t *testing.T) {
 	up := newFakeUpstream(t, replyOK("pong"))
-	h, db := buildHarness(t, []struct {
-		slug, url string
-		fail      bool
-	}{{slug: "good", url: up.URL()}}, false)
+	h, db := buildHarness(t, []harnessChain{{slug: "good", url: up.URL()}}, false)
 	priceRoute(t, db, "good", "good-model", 1_000_000, 1_000_000)
 	e2eSetBalance(t, db, 10_000)
 
@@ -663,10 +651,7 @@ func TestE2E_B2_RejectedRequestDoesNotCharge(t *testing.T) {
 func TestE2E_C1_FailoverOn5xxPreservesChainOrder(t *testing.T) {
 	first := newFakeUpstream(t, replyStatus(http.StatusInternalServerError, "boom"))
 	second := newFakeUpstream(t, replyOK("pong"))
-	h, db := buildHarness(t, []struct {
-		slug, url string
-		fail      bool
-	}{
+	h, db := buildHarness(t, []harnessChain{
 		{slug: "p1", url: first.URL()},
 		{slug: "p2", url: second.URL()},
 	}, true)
@@ -728,10 +713,7 @@ func TestE2E_C2_FailoverOn404And401(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			first := newFakeUpstream(t, replyStatus(tc.firstCode, tc.firstMsg))
 			second := newFakeUpstream(t, replyOK("pong"))
-			h, _ := buildHarness(t, []struct {
-				slug, url string
-				fail      bool
-			}{
+			h, _ := buildHarness(t, []harnessChain{
 				{slug: "p1", url: first.URL()},
 				{slug: "p2", url: second.URL()},
 			}, true)
@@ -776,10 +758,7 @@ func TestE2E_C3_StreamCommittedThenFailedIsNotRetried(t *testing.T) {
 		`{"id":"c1","object":"chat.completion.chunk","created":0,"model":"upstream-model","choices":[{"index":0,"delta":{"content":"PARTIAL"},"finish_reason":null}]}`))
 	// 次目标：完全健康。它的计数必须保持 0。
 	healthy := newFakeUpstream(t, replySSE("SHOULD-NOT-APPEAR"))
-	h, db := buildHarness(t, []struct {
-		slug, url string
-		fail      bool
-	}{
+	h, db := buildHarness(t, []harnessChain{
 		{slug: "p1", url: broken.URL()},
 		{slug: "p2", url: healthy.URL()},
 	}, true)
@@ -829,10 +808,7 @@ func TestE2E_C3_StreamCommittedThenFailedIsNotRetried(t *testing.T) {
 // D1：token 配额用尽 → 429 且**不碰上游**，且预占不留残渣。
 func TestE2E_D1_QuotaExhaustedRejectsWithoutTouchingUpstream(t *testing.T) {
 	up := newFakeUpstream(t, replyOK("pong"))
-	h, db := buildHarness(t, []struct {
-		slug, url string
-		fail      bool
-	}{{slug: "good", url: up.URL()}}, false)
+	h, db := buildHarness(t, []harnessChain{{slug: "good", url: up.URL()}}, false)
 
 	// 配额 100，已用 100 → 剩余 0。
 	if err := db.UpdateAccessKey(context.Background(), "k1", &store.AccessKey{
@@ -875,10 +851,7 @@ func TestE2E_D1_QuotaExhaustedRejectsWithoutTouchingUpstream(t *testing.T) {
 // 配额充足的 key），TPM 额度必须仍然可用。
 func TestE2E_D1b_QuotaRejectedRequestsDoNotConsumeTPMBudget(t *testing.T) {
 	up := newFakeUpstream(t, replyOK("pong"))
-	h, db := buildHarness(t, []struct {
-		slug, url string
-		fail      bool
-	}{{slug: "good", url: up.URL()}}, false)
+	h, db := buildHarness(t, []harnessChain{{slug: "good", url: up.URL()}}, false)
 
 	// 快照侧给一把 key 配 TPM 限额（RPM/TPM 经快照下发，见 D2 的同一手法）。
 	old := snapshot.Get()
@@ -948,10 +921,7 @@ func TestE2E_D1b_QuotaRejectedRequestsDoNotConsumeTPMBudget(t *testing.T) {
 // D2：RPM 超限 → 429 + Retry-After，且不碰上游。
 func TestE2E_D2_RPMExceededRejectsWithoutTouchingUpstream(t *testing.T) {
 	up := newFakeUpstream(t, replyOK("pong"))
-	h, db, _ := buildHarnessFull(t, []struct {
-		slug, url string
-		fail      bool
-	}{{slug: "good", url: up.URL()}}, false, ingress.NewOpenAIChat())
+	h, db, _ := buildHarnessFull(t, []harnessChain{{slug: "good", url: up.URL()}}, false, ingress.NewOpenAIChat())
 
 	// RPM 额度经快照下发（与既有 ratelimit_test 同一手法：
 	// harness 的路由只在手工快照里，不能整体 RebuildFromDB）。
@@ -1000,10 +970,7 @@ func TestE2E_D2_RPMExceededRejectsWithoutTouchingUpstream(t *testing.T) {
 // 所以必须分开验证 —— 只测一条会漏掉另外两条的泄漏。
 func TestE2E_D3_ReservationReleasedAfterSuccess(t *testing.T) {
 	up := newFakeUpstream(t, replyOK("pong"))
-	h, db := buildHarness(t, []struct {
-		slug, url string
-		fail      bool
-	}{{slug: "good", url: up.URL()}}, false)
+	h, db := buildHarness(t, []harnessChain{{slug: "good", url: up.URL()}}, false)
 
 	// 配额给得足够大，只要预占能归还，多个请求都该通过。
 	if err := db.UpdateAccessKey(context.Background(), "k1", &store.AccessKey{
@@ -1038,10 +1005,7 @@ func TestE2E_D3_ReservationReleasedAfterSuccess(t *testing.T) {
 // 漏掉它会让每次失败都永久吃掉一笔预占。
 func TestE2E_D4_ReservationReleasedAfterChainExhausted(t *testing.T) {
 	bad := newFakeUpstream(t, replyStatus(http.StatusInternalServerError, "boom"))
-	h, db := buildHarness(t, []struct {
-		slug, url string
-		fail      bool
-	}{{slug: "bad", url: bad.URL()}}, false)
+	h, db := buildHarness(t, []harnessChain{{slug: "bad", url: bad.URL()}}, false)
 
 	if err := db.UpdateAccessKey(context.Background(), "k1", &store.AccessKey{
 		ID: "k1", Name: "t", Enabled: true, QuotaTokens: 1000, UserID: testUserID,
@@ -1116,10 +1080,7 @@ func TestE2E_D4_ReservationReleasedAfterChainExhausted(t *testing.T) {
 //   - 预占归还：断开的请求不该永久吃掉终身配额。
 func TestE2E_F1_ClientDisconnectReleasesUpstreamAndMarksCanceled(t *testing.T) {
 	up := newDisconnectingUpstream(t)
-	h, db := buildHarness(t, []struct {
-		slug, url string
-		fail      bool
-	}{{slug: "slow", url: up.srv.URL}}, false)
+	h, db := buildHarness(t, []harnessChain{{slug: "slow", url: up.srv.URL}}, false)
 
 	if err := db.UpdateAccessKey(context.Background(), "k1", &store.AccessKey{
 		ID: "k1", Name: "t", Enabled: true, QuotaTokens: 100_000, UserID: testUserID,
@@ -1196,10 +1157,7 @@ func TestE2E_F1_ClientDisconnectReleasesUpstreamAndMarksCanceled(t *testing.T) {
 // （一条是账、另一条是闸）。
 func TestE2E_F1b_ClientDisconnectStillConsumesTokenQuota(t *testing.T) {
 	up := newDisconnectingUpstream(t)
-	h, db := buildHarness(t, []struct {
-		slug, url string
-		fail      bool
-	}{{slug: "slow", url: up.srv.URL}}, false)
+	h, db := buildHarness(t, []harnessChain{{slug: "slow", url: up.srv.URL}}, false)
 
 	// 配额给足，避免中途被 429 打断（这条要测的是「记不记账」，
 	// 不是「配额够不够」）。
@@ -1293,10 +1251,7 @@ func TestE2E_F1b_ClientDisconnectStillConsumesTokenQuota(t *testing.T) {
 //  4. 预占归零。
 func TestE2E_F1c_DownstreamWriteFailureMarksCanceled(t *testing.T) {
 	up := newTrickleUpstream(t, 12, 10*time.Millisecond)
-	h, db := buildHarness(t, []struct {
-		slug, url string
-		fail      bool
-	}{{slug: "slow", url: up.srv.URL}}, false)
+	h, db := buildHarness(t, []harnessChain{{slug: "slow", url: up.srv.URL}}, false)
 
 	if err := db.UpdateAccessKey(context.Background(), "k1", &store.AccessKey{
 		ID: "k1", Name: "t", Enabled: true, QuotaTokens: 100_000, UserID: testUserID,
@@ -1348,10 +1303,7 @@ func TestE2E_F1c_DownstreamWriteFailureMarksCanceled(t *testing.T) {
 // committed downstream-write terminal, never an uncommitted 502 summary.
 func TestE2E_F1d_FirstDownstreamWriteFailureIsSingleTerminal(t *testing.T) {
 	up := newTrickleUpstream(t, 12, 10*time.Millisecond)
-	h, db := buildHarness(t, []struct {
-		slug, url string
-		fail      bool
-	}{{slug: "slow", url: up.srv.URL}}, false)
+	h, db := buildHarness(t, []harnessChain{{slug: "slow", url: up.srv.URL}}, false)
 
 	if err := db.UpdateAccessKey(context.Background(), "k1", &store.AccessKey{
 		ID: "k1", Name: "t", Enabled: true, QuotaTokens: 100_000, UserID: testUserID,
@@ -1790,10 +1742,7 @@ func TestE2E_E3_AdminModelAllowlistTakesEffectWithoutRestart(t *testing.T) {
 // —— 恰恰是「管理员只做控制面」这条需求要消除的敞口。
 func TestE2E_Adv1_AdminKeyRejectedOnListModels(t *testing.T) {
 	up := newFakeUpstream(t, replyOK("pong"))
-	_, db := buildHarness(t, []struct {
-		slug, url string
-		fail      bool
-	}{{slug: "good", url: up.URL()}}, false)
+	_, db := buildHarness(t, []harnessChain{{slug: "good", url: up.URL()}}, false)
 
 	// 用 DB 驱动的 handler 会更真实，但 /v1/models 只读快照与库，
 	// 手工 harness 的快照已足够（它测的是鉴权分支，不是重建）。
@@ -1832,10 +1781,7 @@ func TestE2E_Adv1_AdminKeyRejectedOnListModels(t *testing.T) {
 // 随机 request_id 生成。
 func TestE2E_Adv2_DuplicateRequestIDChargesOnce(t *testing.T) {
 	up := newFakeUpstream(t, replyOK("pong"))
-	_, db := buildHarness(t, []struct {
-		slug, url string
-		fail      bool
-	}{{slug: "good", url: up.URL()}}, false)
+	_, db := buildHarness(t, []harnessChain{{slug: "good", url: up.URL()}}, false)
 	// 定价必须与余额相称：单价 1000 元/百万 token，1000 输入 + 1000 输出
 	// → 单条 2.00 元（200 分）。余额 100.00 元（10000 分）足够付**两次**，
 	// 这样「扣了一次」与「扣了两次」在余额上是可区分的两个数。
@@ -1943,10 +1889,7 @@ func TestE2E_Adv3_NonStreamClientDisconnectReleasesReservation(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	h, db := buildHarness(t, []struct {
-		slug, url string
-		fail      bool
-	}{{slug: "slow", url: srv.URL}}, false)
+	h, db := buildHarness(t, []harnessChain{{slug: "slow", url: srv.URL}}, false)
 	if err := db.UpdateAccessKey(context.Background(), "k1", &store.AccessKey{
 		ID: "k1", Name: "t", Enabled: true, QuotaTokens: 100_000, UserID: testUserID,
 	}); err != nil {
@@ -1997,10 +1940,7 @@ func TestE2E_Adv3_NonStreamClientDisconnectReleasesReservation(t *testing.T) {
 // check-then-act 窗口。
 func TestE2E_Adv4_ConcurrentQuotaReserveDoesNotOverIssue(t *testing.T) {
 	up := newFakeUpstream(t, replyOK("pong"))
-	h, db := buildHarness(t, []struct {
-		slug, url string
-		fail      bool
-	}{{slug: "good", url: up.URL()}}, false)
+	h, db := buildHarness(t, []harnessChain{{slug: "good", url: up.URL()}}, false)
 
 	// 配额 1000，每个请求 max_tokens=500 → 理论上最多放行 2 个（1000/500）。
 	if err := db.UpdateAccessKey(context.Background(), "k1", &store.AccessKey{
@@ -2076,10 +2016,7 @@ func TestE2E_Adv5_FirstTokenTimeoutCutsHangingUpstream(t *testing.T) {
 	defer hang.Close()
 
 	// ttftMs=200：route 级首字超时。
-	h, db := buildHarness(t, []struct {
-		slug, url string
-		fail      bool
-	}{{slug: "hang", url: hang.URL}}, true, 200)
+	h, db := buildHarness(t, []harnessChain{{slug: "hang", url: hang.URL}}, true, 200)
 
 	start := time.Now()
 	rec := e2ePost(h, "/v1/chat/completions", testAccessKey, e2eChatBody("flash", true))
@@ -2124,10 +2061,7 @@ func TestE2E_Adv6_MalformedUpstreamBodyIsNotOK(t *testing.T) {
 		// 200 + 非法 JSON。
 		_, _ = w.Write([]byte(`{"choices": [ this is not json`))
 	})
-	h, _ := buildHarness(t, []struct {
-		slug, url string
-		fail      bool
-	}{{slug: "bad", url: bad.URL()}}, false)
+	h, _ := buildHarness(t, []harnessChain{{slug: "bad", url: bad.URL()}}, false)
 
 	rec := e2ePost(h, "/v1/chat/completions", testAccessKey, e2eChatBody("flash", false))
 	t.Logf("Adv6 status=%d body=%s", rec.Code, strings.TrimSpace(rec.Body.String()))
@@ -2149,10 +2083,7 @@ func TestE2E_Adv6_MalformedUpstreamBodyIsNotOK(t *testing.T) {
 // 这种指向不了任何一层的错误。所以拒绝路径必须走普通 JSON 响应。
 func TestE2E_Adv7_StreamRejectionUsesJSONNotSSE(t *testing.T) {
 	up := newFakeUpstream(t, replySSE("pong"))
-	h, db := buildHarness(t, []struct {
-		slug, url string
-		fail      bool
-	}{{slug: "good", url: up.URL()}}, false)
+	h, db := buildHarness(t, []harnessChain{{slug: "good", url: up.URL()}}, false)
 
 	// 用白名单把 flash 挡掉（比配额更早、且与流式无关）。
 	old := snapshot.Get()
@@ -2199,10 +2130,7 @@ func TestE2E_Adv8_TruncatedStreamRecordsExactlyOnce(t *testing.T) {
 	broken := newFakeUpstream(t, replySSEThenFail(
 		`{"id":"c1","object":"chat.completion.chunk","created":0,"model":"upstream-model","choices":[{"index":0,"delta":{"content":"PARTIAL"},"finish_reason":null}]}`))
 	healthy := newFakeUpstream(t, replySSE("SHOULD-NOT-APPEAR"))
-	h, db := buildHarness(t, []struct {
-		slug, url string
-		fail      bool
-	}{
+	h, db := buildHarness(t, []harnessChain{
 		{slug: "p1", url: broken.URL()},
 		{slug: "p2", url: healthy.URL()},
 	}, true)
@@ -2246,10 +2174,7 @@ func TestE2E_Adv8_TruncatedStreamRecordsExactlyOnce(t *testing.T) {
 // —— 一个入口被限死、另一个敞开的部署会让人误以为限速生效了。
 func TestE2E_Adv9_RateLimitSharedAcrossIngressPaths(t *testing.T) {
 	up := newFakeUpstream(t, replyOK("pong"))
-	h, db, _ := buildHarnessFull(t, []struct {
-		slug, url string
-		fail      bool
-	}{{slug: "good", url: up.URL()}}, false, ingress.NewOpenAIChat())
+	h, db, _ := buildHarnessFull(t, []harnessChain{{slug: "good", url: up.URL()}}, false, ingress.NewOpenAIChat())
 	_ = db
 
 	// RPM=1，然后一个 chat 请求用掉额度，紧接着一个 messages 请求应被拒。
@@ -2290,10 +2215,7 @@ func TestE2E_Adv9_RateLimitSharedAcrossIngressPaths(t *testing.T) {
 // —— 若事务隔离或占位时机有偏差，两个都会占位成功并各扣一次。
 func TestE2E_Adv10_ConcurrentSameRequestIDChargesOnce(t *testing.T) {
 	up := newFakeUpstream(t, replyOK("pong"))
-	_, db := buildHarness(t, []struct {
-		slug, url string
-		fail      bool
-	}{{slug: "good", url: up.URL()}}, false)
+	_, db := buildHarness(t, []harnessChain{{slug: "good", url: up.URL()}}, false)
 	priceRoute(t, db, "good", "good-model", 1000, 1000)
 	e2eSetBalance(t, db, 10_000)
 

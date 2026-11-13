@@ -69,10 +69,7 @@ func TestUpstreamMapping_ReplacesPublicAliasWithModelID(t *testing.T) {
 	up := recordingUpstream(t, ch, false)
 	defer up.Close()
 
-	h, _ := buildHarness(t, []struct {
-		slug, url string
-		fail      bool
-	}{{"p1", up.URL, false}}, false)
+	h, _ := buildHarness(t, []harnessChain{{slug: "p1", url: up.URL}}, false)
 
 	rec := postRaw(h, `{"model":"flash","messages":[{"role":"user","content":"hi"}],"stream":false}`)
 	if rec.Code != http.StatusOK {
@@ -90,10 +87,7 @@ func TestUpstreamPassthrough_ExtraFieldsReachUpstream(t *testing.T) {
 	up := recordingUpstream(t, ch, false)
 	defer up.Close()
 
-	h, _ := buildHarness(t, []struct {
-		slug, url string
-		fail      bool
-	}{{"p1", up.URL, false}}, false)
+	h, _ := buildHarness(t, []harnessChain{{slug: "p1", url: up.URL}}, false)
 
 	rec := postRaw(h, `{"model":"flash","messages":[{"role":"user","content":"hi"}],"stream":false,
 		"response_format":{"type":"json_object"},"seed":42,
@@ -116,10 +110,7 @@ func TestUpstreamMapping_StreamAlsoReplacesPublicAlias(t *testing.T) {
 	up := recordingUpstream(t, ch, true)
 	defer up.Close()
 
-	h, _ := buildHarness(t, []struct {
-		slug, url string
-		fail      bool
-	}{{"p1", up.URL, false}}, false)
+	h, _ := buildHarness(t, []harnessChain{{slug: "p1", url: up.URL}}, false)
 
 	rec := postRaw(h, `{"model":"flash","messages":[{"role":"user","content":"hi"}],"stream":true}`)
 	if rec.Code != http.StatusOK {
@@ -146,10 +137,7 @@ func TestUpstreamPassthrough_NoExtraLeakAcrossFailoverTargets(t *testing.T) {
 	defer bad.Close()
 	defer good.Close()
 
-	h, _ := buildHarness(t, []struct {
-		slug, url string
-		fail      bool
-	}{{"pA", bad.URL, true}, {"pB", good.URL, false}}, true)
+	h, _ := buildHarness(t, []harnessChain{{slug: "pA", url: bad.URL}, {slug: "pB", url: good.URL}}, true)
 
 	rec := postRaw(h, `{"model":"flash","messages":[{"role":"user","content":"hi"}],"stream":false,
 		"presence_penalty":0.3}`)

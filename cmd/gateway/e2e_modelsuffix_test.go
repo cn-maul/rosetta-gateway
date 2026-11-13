@@ -28,10 +28,7 @@ func suffixHarness(t *testing.T) (http.HandlerFunc, *map[string]any) {
 	}))
 	t.Cleanup(srv.Close)
 
-	h, _, _ := buildHarnessFull(t, []struct {
-		slug, url string
-		fail      bool
-	}{{slug: "ds", url: srv.URL}}, false, ingress.NewOpenAIChat())
+	h, _, _ := buildHarnessFull(t, []harnessChain{{slug: "ds", url: srv.URL}}, false, ingress.NewOpenAIChat())
 	return h, &got
 }
 
