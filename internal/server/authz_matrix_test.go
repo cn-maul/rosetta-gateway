@@ -707,7 +707,6 @@ func buildRealAdminMux(h *authzHarness) *http.ServeMux {
 	mux.HandleFunc("POST /admin/api/keys", keyH.Create) // 真实 main.go 外面还裹了 denyAdminKeyCreate
 	mux.HandleFunc("PATCH /admin/api/keys/{id}", func(w http.ResponseWriter, r *http.Request) { keyH.Update(w, r, r.PathValue("id")) })
 	mux.HandleFunc("DELETE /admin/api/keys/{id}", func(w http.ResponseWriter, r *http.Request) { keyH.Delete(w, r, r.PathValue("id")) })
-	mux.HandleFunc("GET /admin/api/usage", usageH.Query)
 	mux.HandleFunc("GET /admin/api/usage/by-key", usageH.GroupByKey)
 	mux.HandleFunc("GET /admin/api/usage/by-model", usageH.GroupByModel)
 	mux.HandleFunc("GET /admin/api/usage/by-provider", usageH.GroupByProvider)
@@ -724,7 +723,6 @@ func buildRealAdminMux(h *authzHarness) *http.ServeMux {
 	mux.HandleFunc("GET /admin/api/users", userH.ListUsers)
 	mux.HandleFunc("PUT /admin/api/users/{id}/balance", func(w http.ResponseWriter, r *http.Request) { userH.AdjustBalance(w, r, r.PathValue("id")) })
 	mux.HandleFunc("GET /admin/api/groups", groupH.List)
-	mux.HandleFunc("GET /admin/api/routes", routeH.List)
 	mux.HandleFunc("GET /admin/api/route-catalog", routeH.Catalog)
 	mux.HandleFunc("GET /admin/api/model-names", groupH.ModelNames)
 	return mux
@@ -959,13 +957,6 @@ func TestAuthzScope_NormalUserSeesOnlyOwnData(t *testing.T) {
 		mustContain []string
 	}{
 		{
-			name: "GET /admin/api/usage",
-			path: "/admin/api/usage?from=0&limit=100",
-			// bob 的 user_id 会出现在明细的 user_id 字段里。
-			mustNotContain: []string{idOther},
-			mustContain:    []string{"records"},
-		},
-		{
 			name: "GET /admin/api/usage/by-key",
 			path: "/admin/api/usage/by-key?from=0",
 			// 按 key 分组时会带出 key 名（key-bob）。
@@ -1053,7 +1044,7 @@ func TestAuthzScope_NormalUserSeesOnlyOwnData(t *testing.T) {
 
 	// 反向：管理员必须看得到两个人（否则上面的"没泄露"可能只是数据没进去）。
 	for _, path := range []string{
-		"/admin/api/usage?from=0&limit=100",
+		"/admin/api/usage/history?from=0&limit=100",
 		"/admin/api/topups?limit=50",
 		"/admin/api/keys",
 		"/admin/api/usage/by-user?from=0",
@@ -1127,20 +1118,20 @@ func TestAuthzScope_NumericIsolation(t *testing.T) {
 		t.Errorf("管理员 cost = %v，want 1.0", all.Cost)
 	}
 
-	// 明细条数也要隔离：alice 的 /usage 只能有 1 条（不是 2 条）。
+	// 明细条数也要隔离：alice 的 /usage/history 只能有 1 条（不是 2 条）。
 	var detail struct {
 		Records []struct {
 			UserID string `json:"user_id"`
 		} `json:"records"`
 	}
-	res := h.do(guarded, idUser, http.MethodGet, "/admin/api/usage?from=0&limit=100", "")
+	res := h.do(guarded, idUser, http.MethodGet, "/admin/api/usage/history?from=0&limit=100", "")
 	if err := json.Unmarshal([]byte(res.Body), &detail); err != nil {
 		t.Fatalf("解析 usage: %v body=%s", err, truncate(res.Body))
 	}
 	if len(detail.Records) != 1 {
 		t.Errorf("alice 的用量明细有 %d 条，want 1（全站是 2 条）", len(detail.Records))
 	}
-	t.Logf("alice /usage 明细条数 = %d（全站 2 条）", len(detail.Records))
+	t.Logf("alice /usage/history 明细条数 = %d（全站 2 条）", len(detail.Records))
 }
 
 // TestAuthzIDOR_CrossUserKeyMutations 是 IDOR 的运行时验证。

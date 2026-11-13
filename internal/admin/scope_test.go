@@ -67,8 +67,8 @@ func seedTwoUsers(t *testing.T, st *store.Store) {
 
 // ---- 用量作用域收窄（数据泄露防线）----
 
-// 普通用户查用量只能看到自己的。这是多用户改造最要命的一类漏洞：
-// 改造前 /admin/api/usage 返回全局数据。
+// 普通用户查用量明细只能看到自己的。这是多用户改造最要命的一类漏洞：
+// 改造前明细端点返回全局数据。
 func TestUsage_ScopedToOwnUser(t *testing.T) {
 	st := newScopeStore(t)
 	seedTwoUsers(t, st)
@@ -78,25 +78,26 @@ func TestUsage_ScopedToOwnUser(t *testing.T) {
 
 	h := NewUsageHandler(st)
 
-	// alice 查：只应看到自己的 150
+	// alice 查：只应看到自己的两条记录。
 	rec := httptest.NewRecorder()
-	req := asUser(httptest.NewRequest(http.MethodGet, "/admin/api/usage?limit=100", nil), "u1")
-	h.Query(rec, req)
+	req := asUser(httptest.NewRequest(http.MethodGet, "/admin/api/usage/history?limit=100", nil), "u1")
+	h.History(rec, req)
 
 	var resp struct {
-		Summary struct {
-			TotalRequests int64 `json:"total_requests"`
-			TotalTokens   int64 `json:"total_tokens"`
-		} `json:"summary"`
+		Records []usageHistoryEntry `json:"records"`
 	}
 	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
 		t.Fatalf("unmarshal: %v (body=%s)", err, rec.Body.String())
 	}
-	if resp.Summary.TotalTokens != 150 {
-		t.Errorf("alice sees %d tokens, want 150 (bob's 9999 leaked!)", resp.Summary.TotalTokens)
+	if len(resp.Records) != 2 {
+		t.Fatalf("alice sees %d records, want 2", len(resp.Records))
 	}
-	if resp.Summary.TotalRequests != 2 {
-		t.Errorf("alice sees %d requests, want 2", resp.Summary.TotalRequests)
+	var tokens int64
+	for _, r := range resp.Records {
+		tokens += r.TotalTokens
+	}
+	if tokens != 150 {
+		t.Errorf("alice sees %d tokens, want 150 (bob's 9999 leaked!)", tokens)
 	}
 }
 
@@ -110,69 +111,12 @@ func TestUsage_CannotPeekOthersViaKeyIDParam(t *testing.T) {
 
 	h := NewUsageHandler(st)
 	rec := httptest.NewRecorder()
-	req := asUser(httptest.NewRequest(http.MethodGet, "/admin/api/usage?key_id=k2&limit=100", nil), "u1")
-	h.Query(rec, req)
+	req := asUser(httptest.NewRequest(http.MethodGet, "/admin/api/usage/history?key_id=k2&limit=100", nil), "u1")
+	h.History(rec, req)
 
 	body := rec.Body.String()
 	if strings.Contains(body, "9999") {
 		t.Errorf("alice saw bob's usage by passing key_id=k2: %s", body)
-	}
-}
-
-// TestUsage_FractionalLatencyDoesNot500 钉住一条 P1 的修复。
-//
-// 平均延迟只要不是整数，`/admin/api/usage` 过去就整个 500：
-// UsageRatioExpr 的 `* 1.0` 与 groupByClause 的 AVG() 都产出 REAL，
-// 而扫描目标是 int64，database/sql 走 FormatFloat→ParseInt 遇小数即失败。
-// 而且 summarize 在明细查询之前跑，所以连一条记录都读不出来。
-//
-// 套件此前抓不到它，因为 seedUsageRow 把每行 latency_ms 固定成 10，
-// 任何条数的平均值都恰好整除。
-func TestUsage_FractionalLatencyDoesNot500(t *testing.T) {
-	st := newScopeStore(t)
-	seedTwoUsers(t, st)
-	// 10 + 10 + 15 = 35 / 3 = 11.666… 必然是小数
-	for i, latency := range []int{10, 10, 15} {
-		_, err := st.DB().Exec(`INSERT INTO usage_records
-			(id, ts, access_key_id, user_id, public_model, provider_id, upstream_model, ingress_protocol,
-			 stream, input_tokens, output_tokens, total_tokens, usage_state, status, http_status, latency_ms)
-			VALUES (?,?,?,?, 'm','p','up','chat', 0, 10,2,12, 'reported','ok',200,?)`,
-			fmt.Sprintf("f%d", i), time.Now().UnixMilli(), "k1", "u1", latency)
-		if err != nil {
-			t.Fatalf("seed latency=%d: %v", latency, err)
-		}
-	}
-
-	h := NewUsageHandler(st)
-	for _, q := range []string{
-		"/admin/api/usage?limit=100",
-		"/admin/api/usage?group_by=key",
-		"/admin/api/usage?group_by=model",
-		"/admin/api/usage?group_by=day",
-	} {
-		t.Run(q, func(t *testing.T) {
-			rec := httptest.NewRecorder()
-			h.Query(rec, asUser(httptest.NewRequest(http.MethodGet, q, nil), "u1"))
-			if rec.Code != http.StatusOK {
-				t.Fatalf("%s -> %d, 期望 200（body=%s）", q, rec.Code, rec.Body.String())
-			}
-			var resp struct {
-				Summary struct {
-					TotalRequests int64   `json:"total_requests"`
-					AvgLatencyMs  float64 `json:"avg_latency_ms"`
-				} `json:"summary"`
-			}
-			if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
-				t.Fatalf("unmarshal: %v (body=%s)", err, rec.Body.String())
-			}
-			if resp.Summary.TotalRequests != 3 {
-				t.Fatalf("total_requests=%d, 期望 3（记录一条都不能少）", resp.Summary.TotalRequests)
-			}
-			// 11.666… 四舍五入成整数毫秒，对外契约仍是整数
-			if resp.Summary.AvgLatencyMs != 12 {
-				t.Fatalf("avg_latency_ms=%v, 期望 12（35/3 取整）", resp.Summary.AvgLatencyMs)
-			}
-		})
 	}
 }
 
@@ -222,7 +166,7 @@ func TestUsage_AdminSeesEverything(t *testing.T) {
 
 	h := NewUsageHandler(st)
 	rec := httptest.NewRecorder()
-	h.Query(rec, asAdmin(httptest.NewRequest(http.MethodGet, "/admin/api/usage?limit=100", nil)))
+	h.History(rec, asAdmin(httptest.NewRequest(http.MethodGet, "/admin/api/usage/history?limit=100", nil)))
 
 	body := rec.Body.String()
 	if !strings.Contains(body, "9999") {
@@ -239,7 +183,7 @@ func TestUsage_NoIdentitySeesNothing(t *testing.T) {
 
 	h := NewUsageHandler(st)
 	rec := httptest.NewRecorder()
-	h.Query(rec, httptest.NewRequest(http.MethodGet, "/admin/api/usage?limit=100", nil))
+	h.History(rec, httptest.NewRequest(http.MethodGet, "/admin/api/usage/history?limit=100", nil))
 
 	if strings.Contains(rec.Body.String(), "9999") {
 		t.Errorf("unauthenticated request saw data: %s", rec.Body.String())

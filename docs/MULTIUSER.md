@@ -851,7 +851,7 @@ JWT 的 alg 混淆、过期、吊销等坑不值得自己踩。这也与 §6.1�
 |---|---|---|
 | `GET /admin/api/keys` 返回**所有** key | 普通用户看到别人的 key_prefix、已用量 | 用户只看自己的；管理员看全部（`?scope=all`） |
 | `PATCH /admin/api/keys/{id}` 不校验归属 | 改别人的 key | 先校验 `key.user_id == session.user_id \|\| role==admin` |
-| `GET /admin/api/usage` 全局聚合 | 普通用户看全局用量 | 按 user_id 过滤 |
+| `GET /admin/api/usage/by-*` 聚合 | 普通用户看全局用量 | 按 user_id 过滤 |
 | `GET /admin/api/stats` | 同上 | 管理员专属 |
 | `GET /admin/api/providers` `/routes` `/settings` | 普通用户能改上游 | **保持 admin-only**，多用户阶段不放开 |
 
@@ -878,19 +878,18 @@ type Scope struct {
 >
 > 正确做法是两层都要：
 >
-> **第 1 层（端点层）**：`server.AdminGateGuard` —— **白名单**模式。
-> 明确列出普通用户可访问的前缀，其余默认要求管理员：
+> **第 1 层（端点层）**：`access.AdminGateGuard` —— **精确路由白名单**模式。
+> 明确列出普通用户可访问的「方法 + 路由模式」，其余默认要求管理员：
 >
 > ```go
-> // 2026-10-07 与 internal/server/user_auth.go 对齐（旧清单里的
-> // /admin/api/password/ 与 /admin/api/auth/ 已随统一认证删除）：
-> var userAccessiblePrefixes = []string{
->     "/admin/api/keys",  // 作用域收窄：只看自己的
->     "/admin/api/usage", // 含 by-* 与 history，均按 user_id 收窄
->     "/admin/api/stats", // 同上；费用对普通用户归零（见 stats_handler）
->     "/admin/api/me",
->     "/admin/api/logout",
->     "/admin/api/model-names", // 公开模型名，供白名单自助收紧（已收窄）
+> // 摘自 internal/access/access.go；新增端点默认 fail-closed：
+> var userAccessibleRoutes = map[string]bool{
+>     "GET /admin/api/keys":              true, // 作用域收窄：只看自己的
+>     "GET /admin/api/usage/by-key":      true, // 所有 by-* / history 均按 user_id 收窄
+>     "GET /admin/api/usage/history":     true,
+>     "GET /admin/api/stats":             true, // 费用对普通用户归零
+>     "GET /admin/api/me":                true,
+>     "GET /admin/api/model-names":       true, // 公开模型名，供白名单自助收紧
 > }
 > ```
 >
@@ -935,8 +934,8 @@ CSP 是 `script-src 'self'`，任何内联脚本会被**静默拦掉**，
 现状（`snapshot/rebuild.go` 包注释写明的分工）：
 
 ```
-ReloadHandler:  先重建上游池（BuildFromStore，解密 api_key）
-                → 再 RebuildFromDB + snapshot.Swap
+runtime.Reloader: 先重建上游池（BuildFromStore，解密 api_key）
+                  → 再 RebuildFromDB + snapshot.Swap
 ```
 
 `Swap` 是原子的，但**两步之间有窗口**：池已换新、快照还是旧的。

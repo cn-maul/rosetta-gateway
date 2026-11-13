@@ -23,7 +23,7 @@ type ProviderFailure struct {
 // RebuildFromDB 只搬运「路由/上游/密钥」这三类解析元数据。
 // 凭据解密不在这里发生——上游池在 BuildFromStore 里自行解密建客户端，
 // 所以本函数不需要主密钥，也不需要 logger，同样不需要池
-// （池的重建由 ReloadHandler 显式先做，分工是「先池后快照」）。
+// （池的重建由 runtime.Reloader 先做，分工是「先池后快照」）。
 //
 // failures 是池重建时报告的「未就绪 provider」清单（P4 / 设计 §4.7）。
 // 它随快照下发，让管理面能标出「这个 provider 配了但不可用」——

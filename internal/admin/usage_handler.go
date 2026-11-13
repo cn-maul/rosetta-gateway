@@ -53,9 +53,8 @@ const exportTimeout = 60 * time.Second
 // clampLimit 解析并钳制 limit。
 //
 // 必须钳制：SQLite 的 `LIMIT -1` 语义是「不限制」，而 strconv.ParseInt("-1")
-// 恰好得到 -1 —— `/admin/api/usage?limit=-1` 会静默拉全表，
-// `limit=999999999` 同理把整表物化进内存。同一个不变量在 History 里已经做对了，
-// 这里是漏掉的那一处。
+// 恰好得到 -1 —— `limit=-1` 会静默拉全表，`limit=999999999` 同理把整表
+// 物化进内存。所有分页端点都走这里，避免各 handler 各写一遍。
 func clampLimit(raw string, def, max int64) int64 {
 	n, err := strconv.ParseInt(raw, 10, 64)
 	if err != nil || n <= 0 {
@@ -139,24 +138,22 @@ func groupFilter(from, to int64, explicit bool, scopeUserID string) (where strin
 }
 
 // usageFilter 构造明细查询的 WHERE，并把同一组条件翻译成 store.UsageFilter
-// 供聚合查询（summarize / by-*）复用。
+// 供聚合查询（by-*）复用。
 //
 // 之所以一次返回两种形态：明细列表与聚合合计**必须落在同一组过滤条件上**。
 // 之前靠的是「两处各拆一遍参数」，那正是 usageFilter 这类单一构造点要消灭的
 // 重复；现在多返回一个结构体仍然只有一处拆解，且改条件只需改这一处。
 //
-// 只构造一次、两处复用。分开拼两份迟早会漂移 —— 旧实现的 group_by 分支就直接
-// `args = []any{from, to}` 把 key_id / model / provider_id 三个过滤条件整体丢了，
-// 于是「按密钥筛选 + 按天分组」会静默返回全量数据。
+// 只构造一次、两处复用。分开拼两份迟早会漂移 —— 任一分支只取 from/to 而丢掉
+// key_id / model / provider_id，就会静默返回全量数据。
 //
-// explicit && from==0 → 「全部历史」（不设下界），与 by-* 端点同口径。此前 /usage
-// 明细把 from=0 当「最近 window」，而 by-* 把 from=0 当「全部」——同名参数语义相反，
-// curl/API 调用方极易踩坑，这里统一。
+// explicit && from==0 → 「全部历史」（不设下界），与 by-* 端点同口径，
+// 避免同名参数在不同端点语义相反。
 //
 // # scopeUserID：多用户改造的权限收窄（最要命的一类漏洞）
 //
 // 传入非空值时**强制**追加 `user_id = ?`。这是所有用量端点
-// （Query / by-key / by-model / by-provider / by-day / History / CSV）
+// （by-key / by-model / by-provider / by-day / by-user / History / CSV）
 // 共用的唯一 WHERE 构造点 —— 收在这里而不是各 handler 里，
 // 是因为**漏一处就是数据泄露**，而漏写是这类改动最常见的失误。
 //
@@ -226,200 +223,6 @@ func callerScope(r *http.Request) string {
 		return "" // admin
 	}
 	return me.ID
-}
-
-// usageRecordColumns 是 usageRecordEntry 对应的列顺序，明细查询与分组查询共用。
-const usageRecordColumns = `ts, public_model, provider_id, upstream_model, ingress_protocol, stream, ` +
-	`input_tokens, output_tokens, total_tokens, status, latency_ms`
-
-// groupByClause 返回按 group_by 维度聚合时的 SELECT 列与 GROUP BY 子句。
-//
-// 关键约束：SELECT 里**不能**出现任何非聚合裸列。旧实现图省事把
-// `ts, public_model, provider_id, ...` 原样留着、只追加一个 GROUP BY ——
-// SQLite 对此不报错，而是每个分组取「某一行」的值，结果不确定（换个查询计划就变）。
-// 这里所有非分组列一律给确定的中性值。
-//
-// 分组统计的是**明细表**（usage_records）：这是本端点的既有边界 ——
-// 记录列表本身就是明细（单次调用无法从日聚合还原），剪枝把老明细挪进归档
-// 之后，records 与 group_by 出来的分组行一起变少，而同一响应里的 summary
-// 走 store.UsageSource（明细+归档）不受影响。要看整个保留期之外的全区间
-// 维度汇总，用 /usage/by-*，不要用 group_by。
-func groupByClause(groupBy string) (selectCols, groupClause string, ok bool) {
-	const blank = `'' as public_model, '' as provider_id, '' as upstream_model, ` +
-		`'' as ingress_protocol, 0 as stream`
-	const agg = `SUM(input_tokens) as input_tokens, SUM(output_tokens) as output_tokens, ` +
-		`SUM(total_tokens) as total_tokens, '' as status, AVG(latency_ms) as latency_ms`
-
-	switch groupBy {
-	case "day":
-		// 日界用**本地时区**，与 /usage/by-day、归档表 day 列、前端 GroupByDay
-		// 同一套口径。原实现写的是 `(ts/86400000)*86400000` —— 那是
-		// 「epoch 以来的第几天」（UTC），与中国区相差 8 小时，于是同一个界面里
-		// 两个按天趋势的数字对不上。
-		//
-		// 仍是**毫秒时间戳**（不是日期字符串）：ts 列被 Scan 进 int64，
-		// 换类型会把整个请求打成 500（usageRecordEntry.Ts 是 int64）。
-		// 所以把「本地日期的午夜」换算回毫秒 —— strftime('%s') 按 **UTC**
-		// 解释 epoch，得先减一个时区偏移才能得到真正的本地午夜。
-		//
-		// 口径必须逐字等于 store.dayExpr 的分桶，否则剪枝前后同一窗口差一天。
-		const localMidnightMs = `CAST(strftime('%s', ts / 1000, 'unixepoch', 'localtime') AS INTEGER) * 1000`
-		return localMidnightMs + ` as ts, ` + blank + `, ` + agg,
-			` GROUP BY ` + localMidnightMs, true
-	case "key":
-		return `0 as ts, ` + blank + `, ` + agg, ` GROUP BY access_key_id`, true
-	case "model":
-		return `0 as ts, ` + blank + `, ` + agg, ` GROUP BY public_model`, true
-	case "provider":
-		return `0 as ts, ` + blank + `, ` + agg, ` GROUP BY provider_id`, true
-	}
-	return "", "", false
-}
-
-type usageQueryResponse struct {
-	Records []usageRecordEntry `json:"records"`
-	Summary usageSummary       `json:"summary"`
-}
-
-// latency 扫描目标必须是 float64，不能是 int64。
-//
-// 两条聚合表达式都产出 REAL：`UsageRatioExpr` 靠 `* 1.0` 强制浮点除法，
-// `groupByClause` 用的 `AVG(latency_ms)` 在 SQLite 里同样返回 REAL。
-// modernc.org/sqlite 把 REAL 交回 float64，而 database/sql 对 `*int64`
-// 目标走的是「先 FormatFloat 再 ParseInt」—— 平均延迟一旦是小数
-// （13.3333…）就 ParseInt 失败，整个请求 500，且 `summarize` 在明细查询
-// 之前跑，所以连一条记录都不返回。实测：延迟恰好整除的 60 秒窗 200，
-// 含不同时延的 1 小时窗与默认 24 小时窗都 500。
-type usageRecordEntry struct {
-	Ts              int64   `json:"ts"`
-	PublicModel     string  `json:"public_model"`
-	ProviderID      string  `json:"provider_id"`
-	UpstreamModel   string  `json:"upstream_model"`
-	IngressProtocol string  `json:"ingress_protocol"`
-	Stream          bool    `json:"stream"`
-	InputTokens     int64   `json:"input_tokens"`
-	OutputTokens    int64   `json:"output_tokens"`
-	TotalTokens     int64   `json:"total_tokens"`
-	Status          string  `json:"status"`
-	LatencyMs       float64 `json:"latency_ms"`
-}
-
-type usageSummary struct {
-	TotalRequests int64   `json:"total_requests"`
-	TotalTokens   int64   `json:"total_tokens"`
-	InputTokens   int64   `json:"input_tokens"`
-	OutputTokens  int64   `json:"output_tokens"`
-	ErrorCount    int64   `json:"error_count"`
-	AvgLatencyMs  float64 `json:"avg_latency_ms"`
-}
-
-func (h *UsageHandler) Query(w http.ResponseWriter, r *http.Request) {
-	q := r.URL.Query()
-	from, to, explicit, err := queryRangeExplicit(q, 24*time.Hour)
-	if err != nil {
-		writeError(w, http.StatusBadRequest, err.Error())
-		return
-	}
-	limit := clampLimit(q.Get("limit"), defaultUsageLimit, maxUsageLimit)
-
-	// 记录列表走明细（单次调用无法从日聚合还原），summary 走合并来源。
-	// 两者共用 usageFilter 拆出的同一组条件。
-	//
-	// ?group_by= 只作用于**记录列表**：它把明细行按维度合计，仍然是明细表的
-	// 聚合，剪枝之后同样查不到已归档日期（与不带 group_by 的 records 一致）。
-	// 也就是说：带 group_by 时 summary 覆盖整个区间、分组行只覆盖保留期内的
-	// 明细 —— 这不是错算，是「同一响应里两个来源各自的边界」。要全区间按维度
-	// 汇总请用 /admin/api/usage/by-day|by-key|by-model|by-provider（走
-	// store.UsageSource，明细与归档合并后再聚合）。
-	where, args, filter := usageFilter(from, to, explicit, q, callerScope(r))
-
-	summary, err := h.summarize(r.Context(), filter)
-	if err != nil {
-		writeServerError(w, "usage summary", err)
-		return
-	}
-
-	selectCols := usageRecordColumns
-	groupClause := ""
-	if cols, group, ok := groupByClause(q.Get("group_by")); ok {
-		selectCols, groupClause = cols, group
-	}
-
-	// 明细行必须带唯一列兜底：毫秒时间戳在并发写入下会重复，纯 `ts DESC` 让同
-	// 毫秒记录随机重排，翻页时同一条可能跳变或漏现 —— 与 History 端点
-	// (u.ts DESC, u.id DESC) 同一口径。分组行没有单一 id（ts 也常是 0/日桶），不套用。
-	orderBy := ` ORDER BY ts DESC`
-	if groupClause == "" {
-		orderBy += `, id DESC`
-	}
-	query := `SELECT ` + selectCols + ` FROM usage_records` + where + groupClause +
-		orderBy + ` LIMIT ?`
-	rowArgs := append(append([]any{}, args...), limit)
-
-	rows, err := h.store.Reader().QueryContext(r.Context(), query, rowArgs...)
-	if err != nil {
-		writeServerError(w, "usage query", err)
-		return
-	}
-	defer rows.Close()
-
-	records := make([]usageRecordEntry, 0)
-	for rows.Next() {
-		var rec usageRecordEntry
-		// 延迟先落到 sql.NullFloat64 再取整：AVG() 返回 REAL，直接扫进
-		// 整型会因 ParseInt 失败把整个请求打成 500（见类型注释）。
-		var latency sql.NullFloat64
-		if err := rows.Scan(&rec.Ts, &rec.PublicModel, &rec.ProviderID, &rec.UpstreamModel, &rec.IngressProtocol,
-			&rec.Stream, &rec.InputTokens, &rec.OutputTokens, &rec.TotalTokens, &rec.Status, &latency); err != nil {
-			// 旧实现是 continue：某一行扫不动就静默丢掉，页面上少一条没人知道。
-			writeServerError(w, "usage scan", err)
-			return
-		}
-		rec.LatencyMs = roundMillis(latency)
-		records = append(records, rec)
-	}
-	if err := rows.Err(); err != nil {
-		writeServerError(w, "usage rows", err)
-		return
-	}
-
-	writeJSON(w, http.StatusOK, usageQueryResponse{
-		Records: records,
-		Summary: summary,
-	})
-}
-
-// summarize 对**全量**过滤结果做聚合，而不是把被 LIMIT 截断的当页记录累加起来。
-//
-// 页内累加会让 total_requests / avg_latency_ms 变成「本页」的口径，而字段名与
-// 前端文案说的都是总量 —— 运维据此判断流量规模会系统性偏低。
-//
-// 数据源是 store.UsageSource（明细 ∪ 日归档），与 store.GetUsageStats 同构：
-// 只查明细的话，剪枝一跑起来这里的合计就会逐日变小，而它和下面的记录列表
-// 并排显示在同一张卡上 —— 合计比列表还小是没法解释的。
-//
-// avg_latency_ms 用「延迟总和 / 请求数」而不是 AVG(延迟列)：归档行的
-// latency_sum_ms 是一组请求的累计值，直接平均等于把一天的耗时当成一次请求
-// 折进去。两支归一后 SUM(延迟)/SUM(请求数) 对明细也正好等于原口径的 AVG。
-func (h *UsageHandler) summarize(ctx context.Context, f store.UsageFilter) (usageSummary, error) {
-	var s usageSummary
-	src, args := store.UsageSource(f)
-	// `* 1.0` 让这条比值走 REAL，扫整型会 ParseInt 失败（见 usageSummary 注释）。
-	var avgLatency sql.NullFloat64
-	err := h.store.Reader().QueryRowContext(ctx,
-		`SELECT COALESCE(SUM(u.n), 0),
-		       `+store.UsageSumExpr("total_tokens", "u")+`,
-		       `+store.UsageSumExpr("input_tokens", "u")+`,
-		       `+store.UsageSumExpr("output_tokens", "u")+`,
-		       COALESCE(SUM(u.n_err), 0),
-		       `+store.UsageRatioExpr("latency_sum", "n", "u")+`
-		   FROM `+src, args...).
-		Scan(&s.TotalRequests, &s.TotalTokens, &s.InputTokens, &s.OutputTokens, &s.ErrorCount, &avgLatency)
-	if err != nil {
-		return usageSummary{}, err
-	}
-	s.AvgLatencyMs = roundMillis(avgLatency)
-	return s, nil
 }
 
 // roundMillis 把 SQL 的 REAL 比值收敛回整毫秒。

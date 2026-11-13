@@ -51,19 +51,6 @@ type routeResponse struct {
 	FailoverEnabled bool `json:"failover_enabled"`
 }
 
-func (h *RouteHandler) List(w http.ResponseWriter, r *http.Request) {
-	routes, err := h.store.ListRoutes(r.Context())
-	if err != nil {
-		writeServerError(w, "list routes", err)
-		return
-	}
-	result := make([]routeResponse, 0, len(routes))
-	for _, route := range routes {
-		result = append(result, toRouteResponse(route))
-	}
-	writeJSON(w, http.StatusOK, result)
-}
-
 // writeRouteWriteError 把 route 写操作的失败映射成合适的状态码。
 //
 // 重名（public_name 带 UNIQUE 约束）此前返回 500 + 裸的

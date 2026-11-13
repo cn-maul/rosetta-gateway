@@ -82,7 +82,7 @@ func (h *SettingsHandler) Get(w http.ResponseWriter, r *http.Request) {
 //     「立即超时」，把全部转发打挂（config.validate 里有同一份约束）；
 //   - 尝试目标数与熔断阈值至少为 1，否则故障转移要么不转移、要么第一次失败就熔断。
 //
-// 保存后由前端触发 POST /admin/api/reload 重建快照，运行时立即生效（无需重启）。
+// 保存后由 server.AutoReload 重建快照，运行时立即生效（无需重启）。
 func (h *SettingsHandler) Update(w http.ResponseWriter, r *http.Request) {
 	var req settingsResponse
 	if err := decodeJSON(w, r, &req); err != nil {

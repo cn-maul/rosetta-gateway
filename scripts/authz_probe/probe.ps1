@@ -241,10 +241,10 @@ try {
         'A-anon-users|anon|GET|/admin/api/users|401',
         'A-user-users|user|GET|/admin/api/users|403',
         'A-user-settings|user|GET|/admin/api/settings|403',
-        'A-user-routes|user|GET|/admin/api/routes|403',
+        'A-user-routes|user|GET|/admin/api/route-catalog|403',
         'A-user-providers|user|GET|/admin/api/providers|403',
         'A-user-byuser|user|GET|/admin/api/usage/by-user?from=0|403',
-        'A-user-usage|user|GET|/admin/api/usage?from=0|200',
+        'A-user-usage|user|GET|/admin/api/usage/history?from=0|200',
         'A-user-prune|user|POST|/admin/api/usage/prune|403',
         'A-admin-users|admin|GET|/admin/api/users|200',
         'A-admin-byuser|admin|GET|/admin/api/usage/by-user?from=0|200'

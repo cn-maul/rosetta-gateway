@@ -12,10 +12,10 @@
 //    注意：故障转移的策略参数（尝试预算 / 熔断阈值 / 各类超时）**不是**按路由的
 //    部分更新字段，它们在「设置」页统一配置（见 saveSettings）。
 //
-// 2. 写操作（create/update/delete）成功后**不需要**再调 POST /admin/api/reload：
-//    服务端的 server.AutoReload 会对每个通过鉴权的写操作自动重建内存快照
-//    （普通用户同样覆盖）。前端重复调用不但多余，还会在普通用户身上必然
-//    403 并把成功的保存误报成失败 —— 详见 mutate() 的注释。
+// 2. 写操作（create/update/delete）成功后**不需要**前端再触发重建：服务端的
+//    server.AutoReload 会对每个通过鉴权的写操作自动重建内存快照（普通用户
+//    同样覆盖）。前端额外调用不但多余，还会在普通用户身上必然 403 并把成功
+//    的保存误报成失败 —— 详见 mutate() 的注释。
 // 3. 错误响应统一为 {"error":{"message":...,"type":...}}。
 // 4. 鉴权头：Authorization: Bearer <会话令牌>。401 只有一个含义——会话无效，
 //    清本地令牌并把人送回登录页。
@@ -414,25 +414,25 @@ export const del = <T>(path: string) => request<T>('DELETE', path)
 /**
  * 写操作统一入口。
  *
- * # 不再调 POST /admin/api/reload（2026-10-10 修复）
+ * # 写完即生效，不由前端触发重建
  *
- * 旧实现在写操作成功后主动调一次 `/reload` 刷新内存快照，失败就把整次操作
+ * 旧实现在写操作成功后额外调一次 reload 端点刷新内存快照，失败就把整次操作
  * 报成「资源已保存，但刷新内存快照失败」。两个问题：
  *
- *  1. **对普通用户必然失败。** `/admin/api/reload` 不在普通用户白名单里
- *     （见 internal/server/user_auth.go 的 userAccessiblePrefixes），
- *     于是 POST /keys 成功（key 已建好）→ 紧接着 reload 403 →
- *     界面上却显示「创建失败：需要管理员权限」。用户会以为 key 没建，
- *     反复点，攒出一堆同名 key。
+ *  1. **对普通用户必然失败。** 该端点不在普通用户白名单里（见
+ *     internal/server/user_auth.go 的 userAccessiblePrefixes），于是
+ *     POST /keys 成功（key 已建好）→ 紧接着 reload 403 → 界面上却显示
+ *     「创建失败：需要管理员权限」。用户会以为 key 没建，反复点，攒出
+ *     一堆同名 key。
  *  2. **纯属多余。** 服务端的 server.AutoReload（挂在鉴权链**外侧**，
  *     见 cmd/gateway/main.go）已经对**每个**通过鉴权的写操作自动重建快照，
  *     管理员与普通用户一视同仁。所以这次调用从不产生任何实际效果 ——
  *     它唯一的作用是在权限不足时制造一条假失败。
  *
- * 保留它唯一的价值是「万一服务端重建失败再试一次」，但那个兜底已经由
- * 服务端的 MarkDirty + 后台重试循环接管（internal/server 的 autoreload
- * 注释与 cmd/gateway 的 watchReloadRetry），比前端再发一次请求可靠得多：
- * 前端一关掉页面，兜底就失效了。
+ * 「万一服务端重建失败再试一次」这个兜底也不需要前端来做：它已由服务端的
+ * MarkDirty + 后台重试循环接管（internal/server 的 autoreload 注释与
+ * cmd/gateway 的 watchReloadRetry），比前端再发一次请求可靠得多 —— 前端
+ * 一关掉页面，兜底就失效了。
  *
  * 现在写完就是写完。失败只可能是**这次写本身**失败 —— 那种情况下
  * 直接把原始错误抛出去，不加任何前缀，避免把「服务端重建的问题」
@@ -514,7 +514,7 @@ export const api = {
    * 走 POST 而非 GET 是为了与 test/discover 同一套「可能很慢的即时动作」惯例：
    * 它要真打上游，且是**点按触发**的，不该被浏览器或中间层当成幂等的读缓存。
    *
-   * 刻意不包 mutate：查余额不改任何配置，没有「改完要 reload」的语义。
+   * 刻意不包 mutate：查余额不改任何配置，不需要写后重建。
    *
    * timeoutMs 要给足（前端传 60s）：后端逐条串行查询，且每条都可能等满
    * 15s —— 多凭据的上游会超过管理 API 默认的 30s，沿用默认会把「后端还在查」
@@ -564,9 +564,8 @@ export const api = {
    * 单模型可用性探测：真实发一次最小推理（max_tokens=1），回答
    * 「这个 model_id 现在能不能用」。
    *
-   * 与 testProvider 的区别是本质的：那个拉 /models 只证明「endpoint + 凭据通」，
-   * 模型下架 / 无权限 / 名字写错时它照样绿。见 internal/upstream/upstream.go 的
-   * TestUpstreamModel。
+ * 仅拉 /models 只能证明「endpoint + 凭据通」，模型下架 / 无权限 / 名字写错时
+ * 它照样绿。见 internal/upstream/upstream.go 的 TestUpstreamModel。
    *
    * timeoutMs 必须由调用方传「运行时非流式超时 + 余量」：这是真的打上游，
    * 慢模型可能吃满 upstream_timeout_ms，不能沿用管理 API 的默认 30s
@@ -581,7 +580,7 @@ export const api = {
   updateRoute: (id: string, b: Partial<Route>) => mutate(() => patch<Route>(`/routes/${id}`, b)),
   deleteRoute: (id: string) => mutate(() => del(`/routes/${id}`)),
 
-  // 故障转移目标链（有序）。整体替换后由 mutate 统一 reload 快照。
+  // 故障转移目标链（有序）。整体替换后由服务端 AutoReload 重建快照。
   routeTargets: (routeId: string) => get<RouteTarget[]>(`/routes/${routeId}/targets`),
   saveRouteTargets: (routeId: string, targets: RouteTargetInput[]) =>
     mutate(() => put<RouteTarget[]>(`/routes/${routeId}/targets`, { targets })),
@@ -651,9 +650,9 @@ export const api = {
   /**
    * 用户列表（仅管理员）。
    *
-   * 刻意**不包 mutate**：它不改变运行时快照，改账号不需要 reload。
-   * 真正需要 reload 的是「禁用账号」—— 那条在后端自己调了 reload
-   * （user_admin_handler.UpdateUser），因为被禁用用户的 key 要立刻失效。
+   * 刻意**不包 mutate**：它不改变运行时快照，所以不走写后重建的语义。
+   * 真正需要重建的是「禁用账号」（被禁用用户的 key 要立刻失效）——
+   * 那条由服务端 AutoReload 在写成功后统一执行。
    */
   users: () => get<User[]>('/users'),
   createUser: (b: {
@@ -691,7 +690,7 @@ export const api = {
    * 明确的操作，相对调整不可能造成这种结果 —— 打错也只是多充或少充。
    *
    * **刻意不包 mutate()**：余额变更不需要重建快照（预检与扣费都直接读库），
-   * 触发一次 reload 只是白白多一次全量快照重建。
+   * 触发一次重建只是白白多一次全量快照重建。
    */
   adjustUserBalance: (id: string, deltaCents: number) =>
     put<User>(`/users/${id}/balance`, { delta_cents: deltaCents }),
@@ -727,9 +726,9 @@ export const api = {
     post('/me/password', { old_password, new_password }),
   // ---------- 分组与模型白名单（P1）----------
   //
-  // 全部走 mutate()：模型可见性随内存快照下发，写操作后必须 reload 才生效。
-  // （后端还有 server.AutoReload 兜底，这里是前端自己的契约，两边都做不冲突
-  //   —— 重复重建只是一次内存重建，而漏掉重建是「改了权限不生效」的静默故障。）
+  // 全部走 mutate()：模型可见性随内存快照下发，写操作后必须重建才生效。
+  // 重建由服务端 server.AutoReload 统一执行；mutate() 只是「这属于写操作」
+  // 的统一入口，不再自行发额外请求。
 
   groups: () => get<Group[]>('/groups'),
   createGroup: (b: { name: string; description?: string }) =>
@@ -807,7 +806,7 @@ export const api = {
   probeProtocols: (b: { endpoint: string; api_key: string; network_id: string }) =>
     post<ProtocolProbeResult>('/providers/probe-protocols', b, 25_000),
   // 设置里含运行时全局默认（超时 + 故障转移策略），这些值由快照驱动转发路径，
-  // 所以必须走 mutate() 触发 reload 才能即时生效（模型容量默认也一并保存）。
+  // 所以写后由服务端 AutoReload 重建才能即时生效（模型容量默认也一并保存）。
   saveSettings: (b: Settings) => mutate(() => put<Settings>('/settings', b)),
 
   // ---------- 供应商 / 模型 导入导出 ----------

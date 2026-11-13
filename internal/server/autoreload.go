@@ -78,7 +78,7 @@ func auditActor(ctx context.Context) string {
 }
 
 // AutoReload 在管理写操作成功落库后自动重建运行时（上游池 + 快照），
-// 使配置变更不再依赖前端自觉调用 POST /admin/api/reload：
+// 使配置变更不依赖前端或调用方额外触发重建：
 // 任何带凭据的调用方（curl / 脚本 / 第三方集成）写完立即生效 ——
 // 包括安全敏感的「禁用下游 Key」：auth 校验读的是快照，不重建就照常放行。
 //
@@ -88,14 +88,13 @@ func auditActor(ctx context.Context) string {
 // 触发规则：
 //   - 只对写方法（POST/PATCH/PUT/DELETE）触发，GET 一律跳过；
 //   - 只在响应状态码 < 400（业务成功）时触发，失败的写入不重建；
-//   - POST /admin/api/reload 本身就是重建，跳过以免双跑；providers 的
-//     test / models/discover 是只读探测，也不触发。
+//   - models/{id}/test 与 providers/discover 是只读探测，不触发。
 //     首次设置密码（/admin/api/bootstrap）要审计但同样不重建 —— 见下方。
 //
 // 重建与请求生命周期解耦（context.Background() + 超时）：客户端写完就断开
 // 不该把重建一起取消，否则这次写入会悬空到下一次触发。
 // 重建失败时响应已发出、无法改写，只能 ERROR 留痕 —— 运行时与库的分叉
-// 由下一次写操作或手动 reload 收敛。
+// 由后台 WatchRetry 或下一次写操作收敛。
 // onFail 在重建失败时被调用，用于通知调用方「需要后台兜底重试」。
 //
 // 为什么是显式参数而不是从 reload 函数做类型断言：reload 是
@@ -151,7 +150,7 @@ func AutoReload(next http.Handler, reload func(context.Context) error, audit Wri
 		// 漏掉这条的后果不是数据不一致，而是每次点「探测」都白跑一次池重建：
 		// 多一次开销、多一次失败机会（重建失败还会点亮 dirty 标志，让后台
 		// 兜底重试被一个与配置无关的探测请求触发）。
-		if p == "/admin/api/reload" || p == "/admin/api/providers/probe-protocols" ||
+		if p == "/admin/api/providers/probe-protocols" ||
 			strings.HasSuffix(p, "/test") || strings.HasSuffix(p, "/discover") {
 			return
 		}

@@ -26,10 +26,10 @@ func TestBuildApp_RegistersEveryCataloguedRoute(t *testing.T) {
 		usage: newUsageRecorder(db, discardLogger()),
 	})
 
-	// 103 是当前真实生产契约（含 5 条 /admin/api/ 方法兜底与 3 条 /v1
+	// 99 是当前真实生产契约（含 5 条 /admin/api/ 方法兜底与 3 条 /v1
 	// 子树兜底）。端点增删必须显式更新这个数，不能靠测试里手抄第三份清单。
-	if len(app.Routes) != 103 {
-		t.Fatalf("生产路由契约应为 103 条，实际 %d 条", len(app.Routes))
+	if len(app.Routes) != 99 {
+		t.Fatalf("生产路由契约应为 99 条，实际 %d 条", len(app.Routes))
 	}
 	seen := make(map[string]registeredRoute)
 	for _, r := range app.Routes {

@@ -11,7 +11,7 @@ import (
 //
 // 交互方式与前端「编辑链」对齐：一次 PUT 整体替换（按数组顺序重排 position），
 // 而非逐条增删改 —— 有序列表的插入/删除/上下移在客户端算好新顺序后一把提交最自然。
-// 落库后由前端照旧调 POST /admin/api/reload 重建快照，运行时才看得到新链。
+// 落库后由 server.AutoReload 自动重建快照，运行时才看得到新链。
 type RouteTargetHandler struct {
 	store *store.Store
 }

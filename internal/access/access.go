@@ -57,7 +57,6 @@ var userAccessibleRoutes = map[string]bool{
 	"PATCH /admin/api/keys/{id}":      true,
 	"DELETE /admin/api/keys/{id}":     true,
 	// 用量与统计：均按 user_id 收窄。
-	"GET /admin/api/usage":             true,
 	"GET /admin/api/usage/by-key":      true,
 	"GET /admin/api/usage/by-model":    true,
 	"GET /admin/api/usage/by-provider": true,

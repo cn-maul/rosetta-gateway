@@ -19,7 +19,7 @@ func newTestLogger() *slog.Logger {
 }
 
 // 管理写操作成功后必须自动触发重建（不再依赖前端调 reload）；
-// GET、失败的写入、reload 端点自身、只读探测端点都不触发。
+// GET、失败的写入、只读探测端点都不触发。
 func TestAutoReload_TriggersOnSuccessfulWrite(t *testing.T) {
 	var reloads int
 	reload := func(context.Context) error { reloads++; return nil }
@@ -64,12 +64,6 @@ func TestAutoReload_TriggersOnSuccessfulWrite(t *testing.T) {
 	call(http.MethodPatch, "/admin/api/deny")
 	if reloads != 4 {
 		t.Fatalf("failed write must not trigger reload, got %d", reloads)
-	}
-
-	// reload 端点自身会重建，跳过以免双跑。
-	call(http.MethodPost, "/admin/api/reload")
-	if reloads != 4 {
-		t.Fatalf("reload endpoint must not auto-reload itself, got %d", reloads)
 	}
 
 	// 只读探测端点不触发。

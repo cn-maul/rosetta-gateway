@@ -688,7 +688,6 @@ POST   /admin/api/providers                     新建
 GET    /admin/api/providers/{id}                单个详情（编辑表单回显）
 PATCH  /admin/api/providers/{id}
 DELETE /admin/api/providers/{id}
-POST   /admin/api/providers/{id}/test           连通性测试（调 ListModels）
 POST   /admin/api/providers/{id}/balance        查询上游服务商余额（管理员；2026-10-11
                                                  新增，透传 internal/upstream/balance.go；
                                                  纯读，**刻意不触发** AutoReload 重建）
@@ -703,10 +702,9 @@ POST   /admin/api/providers/{id}/models
 POST   /admin/api/providers/{id}/models/discover  从上游 /models 拉取并批量导入
 POST   /admin/api/providers/{id}/models/import    批量导入（单事务，要么全进要么全不进）
 POST   /admin/api/models/{id}/test                单模型可用性探测：发一次最小真实推理
-                                                 （max_tokens=1）。与 /providers/{id}/test 是
-                                                 两件事 —— 那个证明「endpoint + 凭据通」，
-                                                 这个证明「这个 model_id 现在真的能推理」
-                                                 （模型下架 / 无权限 / 名字写错时前者照样绿）
+                                                 （max_tokens=1）：证明「这个 model_id
+                                                 现在真的能推理」（模型下架 / 无权限 /
+                                                 名字写错时只有它会变红）
 POST   /admin/api/models/batch-price              批量改价：同一组价格写到多个模型。
                                                  POST 语义是**整体替换**，与单条 PATCH 的
                                                  nil=不改 不同（model_handler.batchPriceRequest）
@@ -716,7 +714,6 @@ GET    /admin/api/upstream-models                 全部上游模型扁平列表
                                                   供 Routes/Settings 一次拉全，替代逐 provider 的 N+1；
                                                   不挂吞吐重查询）
 
-GET    /admin/api/routes
 POST   /admin/api/routes
 PATCH  /admin/api/routes/{id}
 DELETE /admin/api/routes/{id}
@@ -751,10 +748,6 @@ PATCH  /admin/api/keys/{id}                     可改 name / enabled / quota_to
                                                  普通用户只能收紧不能放宽（guardNoLoosening）
 DELETE /admin/api/keys/{id}
 
-GET    /admin/api/usage?from=&to=&group_by=key|model|provider|day
-                                                 from/to 为毫秒时间戳；**from=0 一律表示
-                                                 「全部历史」**（本端点与 by-* 系列语义统一，
-                                                 未传 from 时 Query 默认近 24h）
 GET    /admin/api/usage/history                  逐条调用明细（分页 + status/model/key_id 过滤）
 GET    /admin/api/usage/history.csv             同一套过滤的 CSV 导出（后端一次最多 1000 行，
                                                  超出时响应头 X-Export-Total 给真实总行数）
@@ -776,7 +769,6 @@ POST   /admin/api/me/password                    当前用户自助改密（校�
                                                  改密后递增 auth_version 使旧会话失效）
 GET    /admin/api/me                            当前用户信息
 POST   /admin/api/logout                         登出（递增 auth_version）
-POST   /admin/api/reload                        从 DB 重建内存快照（前端兜底，见下）
 ```
 
 调用明细固化 `provider_name` 与 `upstream_protocol`，前者回答「当时实际是哪家上游」，
@@ -787,7 +779,7 @@ POST   /admin/api/reload                        从 DB 重建内存快照（前�
 
 所有写操作的事务边界：**先写 DB，提交成功后再重建快照**。DB 写失败则快照不动。
 
-**重建由服务端自动执行**（2026-10-01 起）：管理写请求成功（2xx）后，`server.AutoReload` 中间件就地调用 `internal/runtime.Reloader.Reload`（池重建 + 快照重建，`sync.Mutex` 串行化，两边都构建成功才原子替换，任一步失败运行时保持旧状态）。**重建失败有后台兜底**（2026-10-07 起）：失败即置 `dirty` 标志，`Reloader.WatchRetry` 按 30s 起步、指数退避（封顶 10 分钟）反复重试直至收敛，避免「响应已 200 +『已禁用』而数据面仍在放行」的分叉无限期存在（健康检查可读 `IsDirty`）。此前生效路径完全依赖前端写完自觉调 `POST /admin/api/reload`——任何绕过前端的调用方（curl/脚本）写完不调 reload 就是静默分叉，最敏感的是**禁用下游 Key 后 auth 读旧快照照常放行**。前端 `mutate()` 里的 reload 调用保留为兜底。
+**重建由服务端自动执行**（2026-10-01 起）：管理写请求成功（2xx）后，`server.AutoReload` 中间件就地调用 `internal/runtime.Reloader.Reload`（池重建 + 快照重建，`sync.Mutex` 串行化，两边都构建成功才原子替换，任一步失败运行时保持旧状态）。**重建失败有后台兜底**（2026-10-07 起）：失败即置 `dirty` 标志，`Reloader.WatchRetry` 按 30s 起步、指数退避（封顶 10 分钟）反复重试直至收敛，避免「响应已 200 +『已禁用』而数据面仍在放行」的分叉无限期存在（健康检查可读 `IsDirty`）。此前生效路径依赖调用方写完再手动触发重建——任何绕过前端的调用方（curl/脚本）写完不触发就是静默分叉，最敏感的是**禁用下游 Key 后 auth 读旧快照照常放行**。现在手动重建端点已删除，重建只有服务端自动执行这一条路径。
 
 ### 6.4 额度/费用查询（2026-10-04）
 
@@ -1735,7 +1727,7 @@ Windows 上才跟 `time.Local`，**只设一个会跨平台失效**（第一版�
 `"probes":{"enabled":false}`，而不是依赖对象缺省。
 两个必须说清的边界：探测**绝不写 pool 的冷却/熔断**（隔离红线，见
 `internal/probe/runner.go` 与 `store.go` 的建表注释）—— 否则「探测不通」会
-被放大成「上游整体不可用」；它也不是 `/admin/api/usage` 的一部分，与配额
+被放大成「上游整体不可用」；它也不属于用量统计，与配额
 统计完全隔离。
 
 **故障转移相关默认**（`defaults` 下，全部可省略、缺省由 `setDefaults` 兜底）：

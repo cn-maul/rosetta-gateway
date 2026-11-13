@@ -1,7 +1,6 @@
 package admin
 
 import (
-	"context"
 	"fmt"
 	"log/slog"
 	"net/http"
@@ -260,25 +259,6 @@ func (h *StatsHandler) Get(w http.ResponseWriter, r *http.Request) { // from/to 
 		}
 	}
 	writeJSON(w, http.StatusOK, resp)
-}
-
-// ReloadHandler 处理手动触发的 POST /admin/api/reload。
-// 实际重建逻辑由注入的 reload 函数提供（cmd/gateway 的 runtimeReloader），
-// 与管理写操作后的自动 reload（server.AutoReload）共用同一把串行锁。
-type ReloadHandler struct {
-	reload func(ctx context.Context) error
-}
-
-func NewReloadHandler(reload func(ctx context.Context) error) *ReloadHandler {
-	return &ReloadHandler{reload: reload}
-}
-
-func (h *ReloadHandler) Reload(w http.ResponseWriter, r *http.Request) {
-	if err := h.reload(r.Context()); err != nil {
-		writeServerError(w, "reload runtime", err)
-		return
-	}
-	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 }
 
 // parseOptionalUnixMilli 解析一个可选的毫秒时间戳查询参数。

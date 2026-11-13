@@ -76,7 +76,6 @@ func TestAdminGate_UserAccessiblePrefixesAreReachableByNormalUser(t *testing.T) 
 		// 含路径参数的：请求用具体 id，注册模式用生产里的 {id}。
 		{http.MethodPatch, "/admin/api/keys/k1", "/admin/api/keys/{id}"},
 		{http.MethodDelete, "/admin/api/keys/k1", "/admin/api/keys/{id}"},
-		{http.MethodGet, "/admin/api/usage", "/admin/api/usage"},
 		{http.MethodGet, "/admin/api/usage/history", "/admin/api/usage/history"},
 		{http.MethodGet, "/admin/api/usage/history.csv", "/admin/api/usage/history.csv"},
 		{http.MethodGet, "/admin/api/usage/by-key", "/admin/api/usage/by-key"},
@@ -109,7 +108,6 @@ func TestAdminGate_AdminOnlyPrefixesRejectNormalUser(t *testing.T) {
 		{http.MethodPut, "/admin/api/users/someone/balance"},
 		{http.MethodPost, "/admin/api/users/someone/password"},
 		{http.MethodGet, "/admin/api/groups"},
-		{http.MethodGet, "/admin/api/routes"},
 		{http.MethodGet, "/admin/api/providers"},
 		{http.MethodGet, "/admin/api/settings"},
 		// 本次加固的直接动机：这两个在 /admin/api/usage 前缀下，

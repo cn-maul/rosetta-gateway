@@ -180,7 +180,6 @@ func BuildApp(d Deps) *App {
 	// —— 登录页在拿到会话之前就要渲染品牌，放在需要会话的 settings 里会让
 	// 登录页永远显示默认名。见 admin/site_handler.go 的注释。
 	siteHandler := admin.NewSiteHandler(db)
-	reloadHandler := admin.NewReloadHandler(reloader.Reload)
 	usageHandler := admin.NewUsageHandler(db, cfg)
 	// 供应商 + 模型的导入导出。写在 settings 附近是因为它在界面上的入口
 	// 也在「设置」页里，与设置项同一层级。
@@ -228,11 +227,11 @@ func BuildApp(d Deps) *App {
 		}
 	}
 
-	// 管理写操作成功后自动重建运行时（池 + 快照）：配置生效不再依赖前端自觉调
-	// POST /admin/api/reload，任何带凭据的调用方（curl/脚本）写完立即生效 ——
+	// 管理写操作成功后自动重建运行时（池 + 快照）：配置生效不依赖调用方额外
+	// 触发，任何带凭据的调用方（curl/脚本）写完立即生效 ——
 	// 包括禁用下游 Key 这类安全敏感操作（auth 读快照，不重建就照常放行）。
 	// AutoReload 在鉴权链外侧：401/429 的失败响应不会触发重建。
-	// 前端 mutate() 里的 reload 调用保留为兜底（服务端重建失败时再给一次机会）。
+	// 前端写操作因此只发一次请求；重建失败由 MarkDirty + 后台重试接管。
 	adminAuto := server.AutoReload(adminGuarded, reloader.Reload, audit, logger, reloader.MarkDirty)
 
 	routeSpecs := []routeSpec{
@@ -284,7 +283,6 @@ func BuildApp(d Deps) *App {
 		{Pattern: "GET /admin/api/providers/{id}", Handler: func(w http.ResponseWriter, r *http.Request) { providerHandler.Get(w, r, r.PathValue("id")) }, Public: false},
 		{Pattern: "PATCH /admin/api/providers/{id}", Handler: func(w http.ResponseWriter, r *http.Request) { providerHandler.Update(w, r, r.PathValue("id")) }, Public: false},
 		{Pattern: "DELETE /admin/api/providers/{id}", Handler: func(w http.ResponseWriter, r *http.Request) { providerHandler.Delete(w, r, r.PathValue("id")) }, Public: false},
-		{Pattern: "POST /admin/api/providers/{id}/test", Handler: func(w http.ResponseWriter, r *http.Request) { providerHandler.Test(w, r, r.PathValue("id")) }, Public: false},
 		// 协议探测：对同一个 endpoint 并发试 chat / response / anthropic 三条
 		// 路径，回答「这个中转支持哪几种协议」。与 {id}/test 不同，它不依赖
 		// 任何已配置的 provider —— 管理员在创建上游**之前**就要用。
@@ -318,14 +316,12 @@ func BuildApp(d Deps) *App {
 		// AutoReload 对 POST 自动生效（审计 + 快照重建），无需额外白名单。
 		{Pattern: "POST /admin/api/models/batch-price", Handler: modelHandler.BatchUpdatePrices, Public: false},
 
-		// 单模型可用性探测。与 provider 的 /providers/{id}/test 是两件事：
-		// 那个拉 /models 证明「endpoint + 凭据通」，这个发一次最小真实推理
-		// （max_tokens=1）证明「这个 model_id 现在真的能推理」—— 模型下架、
-		// 账号无权限、名字写错时前者照样绿。见 upstream.TestUpstreamModel。
+		// 单模型可用性探测：发一次最小真实推理（max_tokens=1），证明
+		// 「这个 model_id 现在真的能推理」—— 仅凭 /models 列表无法区分
+		// 模型下架、账号无权限、名字写错。见 upstream.TestUpstreamModel。
 		{Pattern: "POST /admin/api/models/{id}/test", Handler: func(w http.ResponseWriter, r *http.Request) { modelHandler.Test(w, r, r.PathValue("id")) }, Public: false},
 		{Pattern: "GET /admin/api/upstream-models", Handler: modelHandler.ListAll, Public: false},
 
-		{Pattern: "GET /admin/api/routes", Handler: routeHandler.List, Public: false},
 		{Pattern: "GET /admin/api/route-catalog", Handler: routeHandler.Catalog, Public: false},
 		{Pattern: "POST /admin/api/routes", Handler: routeHandler.Create, Public: false},
 		{Pattern: "PATCH /admin/api/routes/{id}", Handler: func(w http.ResponseWriter, r *http.Request) { routeHandler.Update(w, r, r.PathValue("id")) }, Public: false},
@@ -343,8 +339,6 @@ func BuildApp(d Deps) *App {
 		{Pattern: "PATCH /admin/api/keys/{id}", Handler: func(w http.ResponseWriter, r *http.Request) { keyHandler.Update(w, r, r.PathValue("id")) }, Public: false},
 		{Pattern: "DELETE /admin/api/keys/{id}", Handler: func(w http.ResponseWriter, r *http.Request) { keyHandler.Delete(w, r, r.PathValue("id")) }, Public: false},
 		{Pattern: "GET /admin/api/stats", Handler: statsHandler.Get, Public: false},
-		{Pattern: "POST /admin/api/reload", Handler: reloadHandler.Reload, Public: false},
-		{Pattern: "GET /admin/api/usage", Handler: usageHandler.Query, Public: false},
 		{Pattern: "GET /admin/api/usage/by-key", Handler: usageHandler.GroupByKey, Public: false},
 		{Pattern: "GET /admin/api/usage/by-model", Handler: usageHandler.GroupByModel, Public: false},
 		{Pattern: "GET /admin/api/usage/by-provider", Handler: usageHandler.GroupByProvider, Public: false},

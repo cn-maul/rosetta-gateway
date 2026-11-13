@@ -11,9 +11,9 @@ import (
 
 // TestQueryRange_RejectsReversedRange 坐实「反区间必须报错」。
 //
-// from > to 在 SQL 里恒为空集。此前只有 /stats 拦这条，6 个 usage 端点
-// 全放行：同一个错误参数在 /stats 报 400、在 /usage 报 200 空表、在
-// /usage/history.csv 只给一行表头。排查的人会先去怀疑采集、剪枝、时区，
+// from > to 在 SQL 里恒为空集。此前只有 /stats 拦这条，多个 usage 端点
+// 全放行：同一个错误参数在 /stats 报 400、在别处报 200 空表、
+// 在 /usage/history.csv 只给一行表头。排查的人会先去怀疑采集、剪枝、时区，
 // 唯独不会怀疑自己把两个时间戳填反了 —— 所以这条必须在解析层拦掉。
 func TestQueryRange_RejectsReversedRange(t *testing.T) {
 	q, _ := url.ParseQuery("from=2000&to=1000")
@@ -51,7 +51,6 @@ func TestUsageEndpoints_RejectReversedRangeWithSingleEnvelope(t *testing.T) {
 		name string
 		call func(w http.ResponseWriter, r *http.Request)
 	}{
-		{"usage", h.Query},
 		{"usage/history", h.History},
 		{"usage/history.csv", h.ExportCSV},
 		{"usage/by-day", h.GroupByDay},

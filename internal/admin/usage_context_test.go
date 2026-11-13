@@ -30,7 +30,6 @@ func TestAdminQueries_HonorRequestCancellation(t *testing.T) {
 		name string
 		call func(w http.ResponseWriter, r *http.Request)
 	}{
-		{"用量明细", uh.Query},
 		{"调用历史", uh.History},
 		{"导出 CSV", uh.ExportCSV},
 		{"按密钥", uh.GroupByKey},
@@ -42,7 +41,7 @@ func TestAdminQueries_HonorRequestCancellation(t *testing.T) {
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			req := asAdmin(jsonRequest(http.MethodGet, "/admin/api/usage?from=0&to=0", nil))
+			req := asAdmin(jsonRequest(http.MethodGet, "/admin/api/usage/history?from=0&to=0", nil))
 			ctx, cancel := context.WithCancel(req.Context())
 			cancel() // 模拟「客户端已经走了」
 			req = req.WithContext(ctx)

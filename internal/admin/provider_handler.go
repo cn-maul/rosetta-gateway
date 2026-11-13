@@ -404,44 +404,6 @@ func (h *ProviderHandler) Delete(w http.ResponseWriter, r *http.Request, id stri
 	writeJSON(w, http.StatusOK, map[string]string{"status": "deleted"})
 }
 
-// Test 用即时构建的客户端拉取模型列表来验证连通性，不依赖内存池，
-// 因此刚添加、尚未 reload 的上游也能立即测通。
-func (h *ProviderHandler) Test(w http.ResponseWriter, r *http.Request, id string) {
-	p, err := h.store.GetProvider(r.Context(), id)
-	if err != nil {
-		writeServerError(w, "get provider", err)
-		return
-	}
-	if p == nil {
-		writeError(w, http.StatusNotFound, "provider not found")
-		return
-	}
-
-	client, err := upstream.NewProviderClient(r.Context(), h.store, id, h.masterKey, h.cfg)
-	if err != nil {
-		writeJSON(w, http.StatusOK, map[string]string{"status": "error", "message": err.Error()})
-		return
-	}
-
-	ctx, cancel := context.WithTimeout(r.Context(), 15*time.Second)
-	defer cancel()
-
-	start := time.Now()
-	models, err := client.ListModels(ctx)
-	if err != nil {
-		writeJSON(w, http.StatusOK, map[string]string{"status": "error", "message": err.Error()})
-		return
-	}
-	latencyMs := time.Since(start).Milliseconds()
-
-	writeJSON(w, http.StatusOK, map[string]any{
-		"status":      "ok",
-		"message":     fmt.Sprintf("连接正常，%dms", latencyMs),
-		"latency_ms":  latencyMs,
-		"model_count": len(models),
-	})
-}
-
 // Balance 逐条查询该 provider 的凭据在上游侧的余额。
 //
 // # 为什么状态码恒为 200
