@@ -2,11 +2,11 @@
 
 镜像：`ghcr.io/cn-maul/rosetta-gateway`
 
-**镜像版本号 = 软件版本号**，两者都取自 `web/package.json` 的 `version`（当前 **2.1.2**）。
-发布 `v2.1.2` tag 会得到 `:2.1.2` 与 `:latest` 两个标签；CI 会校验 tag 与
+**镜像版本号 = 软件版本号**，两者都取自 `web/package.json` 的 `version`（当前 **2.2.0**）。
+发布 `v2.2.0` tag 会得到 `:2.2.0` 与 `:latest` 两个标签；CI 会校验 tag 与
 `package.json` 一致，不一致直接构建失败（防止打出名不副实的镜像）。
 
-> 下文示例中的 `:2.1.2` 是**编写时的当前版本**。实际部署请先 `docker pull ghcr.io/cn-maul/rosetta-gateway:2.1.2`
+> 下文示例中的 `:2.2.0` 是**编写时的当前版本**。实际部署请先 `docker pull ghcr.io/cn-maul/rosetta-gateway:2.2.0`
 > 确认该 tag 存在，或直接用 `:latest`。
 
 架构：`linux/amd64`（`docker.yml` 的 buildx 只构建这一种；需要 arm64 再说）。
@@ -22,7 +22,7 @@ docker run -d \
   -p 127.0.0.1:8666:8666 \
   -v rosetta-gateway-data:/data \
   --restart unless-stopped \
-  ghcr.io/cn-maul/rosetta-gateway:2.1.2
+  ghcr.io/cn-maul/rosetta-gateway:2.2.0
 ```
 
 然后打开 `http://127.0.0.1:8666/admin/` —— 首次进入会显示「首次设置密码」表单，
@@ -174,7 +174,7 @@ Chrome / Edge / Brave / Opera 一律硬拦；Firefox 也拦，只是报错文案
 ```yaml
 services:
   rosetta-gateway:
-    image: ghcr.io/cn-maul/rosetta-gateway:2.1.2
+    image: ghcr.io/cn-maul/rosetta-gateway:2.2.0
     container_name: rosetta-gateway
     restart: unless-stopped
     # 正常关停的名义预算是 24s（剪枝 5s + 费用重算 2s + 对账 2s +
@@ -364,6 +364,30 @@ docker run --rm -v rosetta-gateway-data:/data -v "$PWD:/backup" alpine sh -c '
 ```bash
 docker compose pull && docker compose up -d
 ```
+
+**v2.1.2 → v2.2.0 可以直接原地升级，无数据库结构版本变更（仍是 schema 2）。**
+这一版是一次**功能收敛**：把长期没人用、或只有写没有读的入口与列删掉，
+公开行为有几处**不兼容**变化，升级前请对照下面的清单确认没有依赖：
+
+- 管理面移除：模型分组（`/admin/api/model-groups/*`）、审计日志读取
+  （`GET /admin/api/audit`）、旧用量聚合（`GET /admin/api/usage`、`/usage/failures`、
+  `/stats/overview`）、路由列表（`GET /admin/api/routes`，改用 `/route-catalog`）、
+  自动重载（`POST /admin/api/reload`）、模型探测（`/admin/api/probes/*`、
+  `POST /admin/api/providers/{id}/test`、`POST /admin/api/networks/{id}/test`）、
+  上游余额查询（`POST /admin/api/providers/{id}/balance`）、
+  用量重算（`POST /admin/api/keys/{id}/recompute-usage`）。
+- 兼容层移除：配置导入导出（`/admin/api/config-export/*`）、一次性设密链接
+  （`/admin/api/password-setup*`、`/admin/api/users/{id}/password-setup`）、
+  `usage_totals` 的额度兼容字段。
+- 下游兼容端点移除：`/dashboard/billing/subscription|usage`、
+  `/v1/dashboard/billing/*`、`/v1/organization/costs`、
+  `/v1/organization/usage/completions`。**按 one-api/new-api 习惯读额度或费用的
+  第三方客户端会直接 404**，需要改成查管理面的用量接口。
+- 新库不再创建 `providers.quirks_json`、`provider_credentials.last_error`
+  以及 `model_groups` / `model_group_members` / `network_probes` /
+  `user_password_setup_tokens` 等表；老库的物理列与表**保留不动**，
+  只是代码不再读写，因此回滚到 v2.1.2 也不会丢数据。
+- 删除用户改为**重置密码**（管理员下发新密码），不再生成一次性链接。
 
 **v2.1.1 → v2.1.2 可以直接原地升级，无数据库结构变更。** 这一版全在可观测性
 与内部整理上：调用历史的失败详情抽屉新增「失败决策轨迹」（把原本只在
