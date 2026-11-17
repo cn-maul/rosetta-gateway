@@ -87,13 +87,13 @@ func toUserResponse(u *store.User, selfID string, keyCount int) userResponse {
 	// 充值响应里是真余额」这种同一账号两个答案的矛盾。
 	if u.Role == store.RoleAdmin {
 		return userResponse{
-			ID:               u.ID,
-			Username:         u.Username,
-			DisplayName:      u.DisplayName,
-			Role:             u.Role,
-			Status:           u.Status,
-			GroupID:          u.GroupID,
-			QuotaTokens:      u.QuotaTokens,
+			ID:          u.ID,
+			Username:    u.Username,
+			DisplayName: u.DisplayName,
+			Role:        u.Role,
+			Status:      u.Status,
+			GroupID:     u.GroupID,
+			QuotaTokens: u.QuotaTokens,
 			// 已用量是**派生值**（user_usage_totals / 实时 SUM），不是 users
 			// 表上的列。列表路径会在本函数返回后用批量查询结果覆盖它；
 			// 其余路径（新建、改资料、充值响应）不带用量，留 0。
