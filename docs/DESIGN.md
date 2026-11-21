@@ -6,7 +6,7 @@
 | 项目性质 | 独立项目，不在 Rosetta 上改造（2026-09-15 定，理由见 §2.1） |
 | module path | `github.com/cn-maul/rosetta-gateway` |
 | 运行时依赖 | `github.com/cn-maul/rosetta` v1.3.1（上游 SDK）、`modernc.org/sqlite` v1.61.1（纯 Go SQLite，内置 SQLite 3.54.1；无 cgo，`CGO_ENABLED=0` 可构建）、`github.com/golang-jwt/jwt/v5`（管理会话） |
-| 工具链 | **Go 1.27.3 起**（`go.mod` 的 `go` 指令是唯一来源，CI 用 `go-version-file` 读取；1.27.3 之前的版本带已知安全漏洞，不得使用，本地也勿用更早的 1.27.x）。镜像构建固定 `golang:1.27.3-alpine3.24` 的 digest，并设 `GOTOOLCHAIN=local`，版本不足时构建直接失败，不会静默下载其他工具链 |
+| 工具链 | **Go 1.27.4 起**（`go.mod` 的 `go` 指令是唯一来源，CI 用 `go-version-file` 读取）。镜像构建固定 `golang:1.27.4-alpine3.24` 的 digest，并设 `GOTOOLCHAIN=local`，版本不足时构建直接失败，不会静默下载其他工具链 |
 | 版本 | 与 `web/package.json` 同源（当前 2.2.0），镜像与二进制共用 |
 | 状态 | **已实现**（P0–P3 全部落地，多用户与用量归档已上线） |
 | 更新 | 2026-11-13 |
@@ -1285,9 +1285,15 @@ Client 是 goroutine 安全的，进程内单例复用（内含连接池）。
 
 - `weight` 加权的随机选择（默认）、或轮询
 - 跳过 `disabled` 或处于冷却（`cooldown_until > now`）的凭证
-- 冷却回写（已启用，`outwire.CredentialCooldown`）：只冷却能归因到**凭据本身**的失败 —— 401/403 冷却 30 分钟；402 冷却 1 小时；429 冷却 60s。
+- 凭据冷却（`outwire.CredentialCooldown`）：401/403 冷却 30 分钟，402 冷却 1 小时。429 采用 SDK 解析的 `Retry-After`，限制在 1–60 秒。缺失或无效时使用 60 秒。
   408 / 5xx / 传输层错误 / 各类超时**不冷却凭据**，只累计目标熔断：它们说明目标或链路暂时不可用，不代表这把 key 失效。旧口径把上述错误也冷却 60s，对单 key provider 等于「第一次抖动就把唯一凭据踢出轮换」，第二跳若也在冷却则整条链直接 502，且冷却期内没有成功请求能触发复苏。
-  注：Rosetta v0.5.1 未在 `APIError` 上暴露 `Retry-After`，故 429 统一按 60s 上限处理（不读上游响应头）。
+- 上游 `max_retries` 控制支持重试的 SDK 调用，例如模型列表查询。生成请求在同一目标只发一次，是否切换目标由路由的故障转移设置决定。
+
+### 每日配额对账与协议边界
+
+每日预占按请求 ID 归属到准入日。请求进入 SDK 调用前标记为已启动。结算事务只处理尚有预占记录的请求。重启或租约到期时，未启动的请求退回次数与估算 token，已启动且已落库的用量用实耗结算，已启动但缺用量的请求保留估值。新增表不回写旧汇总数据。
+
+Responses 流按 SDK 的输出项和正文块编号分别累计。`v1.3.3` 未公开原始 `content_index`，网关按每个输出项中首次出现的正文块分配连续编号。Anthropic 同协议响应转发 `server_tool_use` 及 web search、web fetch、code execution、bash code execution、text editor code execution、tool search 的结果块。流式转发覆盖同一块的 `input_json_delta`，并重建连续的块编号。跨协议响应省略这些 Anthropic 原生块。入站原生工具定义及工具历史块目前返回 400，需等待 SDK 提供请求侧表达再支持完整回放。
 - 冷却回写只影响「同一 provider 内换哪把 key」，不决定跨 provider 转移。
 - **凭据只有两种失效方式**：`cooling`（冷却到期自动恢复）与 `disabled`（运营显式停用）——
   二者都在 `getHealthyCredentials` 里被真正过滤。旧实现另有一个 `MarkCredentialError`，
@@ -1864,7 +1870,7 @@ rosetta-gateway/
 ├── README.md                       项目门面：简介、快速开始、文档索引
 ├── AGENTS.md                       代理工具与本地代码索引说明
 ├── config.example.json             配置样例（config.json 本身不入库）
-├── Dockerfile                      两段式（golang:1.27.3-alpine 构建 → alpine 运行），CGO_ENABLED=0
+├── Dockerfile                      两段式（golang:1.27.4-alpine 构建 → alpine 运行），CGO_ENABLED=0
 ├── build.ps1                       纯编译脚本：前端构建 + go build → bin\gateway.exe
 ├── gateway.ps1                     一键脚本：编译 + 启动/停止（前台 / -Detached / -Stop）
 ├── docker/

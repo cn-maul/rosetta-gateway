@@ -1,10 +1,47 @@
 package dataplane
 
 import (
+	"github.com/cn-maul/rosetta-gateway/internal/ingress"
+	"github.com/cn-maul/rosetta-gateway/internal/protocol"
 	"github.com/cn-maul/rosetta-gateway/internal/routing"
 	"github.com/cn-maul/rosetta-gateway/internal/store"
 	"github.com/cn-maul/rosetta-gateway/internal/upstream"
 )
+
+func (h *Handler) selectAttemptCandidates(res *routing.Resolution, clients *upstream.ClientView, req *ingress.Request, binding continuationBinding, bound bool, limit int) []routing.Candidate {
+	candidates := res.Candidates
+	if !res.Route.FailoverEnabled {
+		candidates = preflightCandidates(false, 1, candidates)
+	}
+	if req.PreviousResponseID != "" || req.OutputFormat == "json_object" {
+		compatible := make([]routing.Candidate, 0, len(candidates))
+		for _, candidate := range candidates {
+			wire := effectiveProviderProtocol(clients, candidate)
+			if req.PreviousResponseID != "" && (!bound || wire != protocol.Response ||
+				candidate.TargetID != binding.targetID || candidate.Provider.ID != binding.providerID ||
+				candidate.Provider.Endpoint != binding.endpoint || candidate.UpstreamModel.ModelID != binding.modelID) {
+				continue
+			}
+			if req.OutputFormat != "" && req.OutputFormat != "json_schema" && wire == protocol.Anthropic {
+				continue
+			}
+			compatible = append(compatible, candidate)
+		}
+		candidates = compatible
+	}
+	if res.Route.FailoverEnabled && req.PreviousResponseID == "" {
+		var available []routing.Candidate
+		for _, candidate := range candidates {
+			if h.pool.TargetAvailable(candidate.TargetID) {
+				available = append(available, candidate)
+			}
+		}
+		if len(available) > 0 {
+			candidates = available
+		}
+	}
+	return preflightCandidates(res.Route.FailoverEnabled, limit, candidates)
+}
 
 // preflightCandidates returns the exact candidate set the request lane may
 // attempt. Balance and output reservations must use this set, not the full

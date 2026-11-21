@@ -565,6 +565,10 @@ export const api = {
     quota_tokens?: number
     rpm_limit?: number
     tpm_limit?: number
+    /** 每日请求上限，0 = 不限。与 rpm/tpm 互斥（四者最多一个非 0）。 */
+    daily_request_limit?: number
+    /** 每日 token 上限，0 = 不限。与 rpm/tpm 互斥（四者最多一个非 0）。 */
+    daily_token_limit?: number
     /**
      * 归属用户（多用户改造）。
      *
@@ -594,6 +598,14 @@ export const api = {
       quota_tokens?: number
       rpm_limit?: number
       tpm_limit?: number
+      /**
+       * 每日上限，0 = 不限。与 rpm/tpm 互斥：一把密钥同时只能启用一种限额。
+       *
+       * 切换限额方式时**必须把其余三档显式发 0** —— 不传等于「保持原值」，
+       * 旧值会留在库里，后端互斥校验随即拒绝整个 PATCH。
+       */
+      daily_request_limit?: number
+      daily_token_limit?: number
       /**
        * PATCH 语义：
        *   - 不传（字段缺席）→ 保持原白名单；
@@ -806,7 +818,10 @@ export const api = {
    * 同样不包 mutate：动的是用量数据，运行时快照不受影响。
    * 返回的 skipped=true 不是错误（水位已到位 / 无待归档数据），原因在 reason。
    */
-  pruneUsage: () => post<PruneResult>('/usage/prune'),
+  pruneUsage: (keepDays?: number) =>
+    post<PruneResult>(
+      keepDays === undefined ? '/usage/prune' : `/usage/prune?keep_days=${keepDays}`,
+    ),
 
   // 调用历史：分页查询（limit = 每页条数，offset = 偏移）。
   // 返回 { records, total }，total 是**过滤后的总条数**（不受分页影响）。

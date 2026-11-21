@@ -4,6 +4,15 @@ import { api, isAdmin } from '../../api'
 import { AppModal } from '../../ui/AppModal'
 import { ModelPicker } from '../ModelPicker'
 import { daysLeft, expiresAtFromDays } from './keyUtils'
+import { TokenField } from '../../ui/TokenField'
+import { parseTokenCount } from '../../tokenCount'
+import {
+  LimitFields,
+  detectLimitMode,
+  limitPayload,
+  validateLimit,
+  type LimitState,
+} from './LimitFields'
 import type { AccessKey, Group } from '../../types'
 
 /** 新建后返回给父级用于展示明文；父级负责刷新列表。 */
@@ -78,20 +87,32 @@ export function KeyCreateModal({
 }) {
   const [name, setName] = useState('')
   const [quota, setQuota] = useState('0')
-  const [rpm, setRpm] = useState('0')
-  const [tpm, setTpm] = useState('0')
+  const [limit, setLimit] = useState<LimitState>({
+    mode: 'none',
+    rpm: '',
+    tpm: '',
+    dailyRequests: '',
+    dailyTokens: '',
+  })
   const [models, setModels] = useState<string[]>([])
   const [days, setDays] = useState('0')
   const [ips, setIps] = useState('')
   const [groupId, setGroupId] = useState('')
   const [busy, setBusy] = useState(false)
 
+  /** 配额支持 1M / 1B；空串 = 0（不限）。解析失败必须报出来，
+   *  否则 `Number(x) || 0` 会把打错的字静默变成「不限」。 */
+  const quotaTokens = (): number | null => {
+    const raw = quota.trim()
+    if (!raw) return 0
+    return parseTokenCount(raw)
+  }
+
   useEffect(() => {
     if (!open) return
     setName('')
     setQuota('0')
-    setRpm('0')
-    setTpm('0')
+    setLimit({ mode: 'none', rpm: '', tpm: '', dailyRequests: '', dailyTokens: '' })
     setModels([])
     setDays('0')
     setIps('')
@@ -106,6 +127,18 @@ export function KeyCreateModal({
       toast.danger('名称为必填项')
       return
     }
+    const quotaValue = quotaTokens()
+    if (quotaValue === null) {
+      toast.danger('Token 配额无法识别，请填数字或 1M / 1B 这类写法')
+      return
+    }
+    if (isAdmin()) {
+      const bad = validateLimit(limit)
+      if (bad) {
+        toast.danger(bad)
+        return
+      }
+    }
     setBusy(true)
     try {
       const created = await api.createKey({
@@ -114,9 +147,8 @@ export function KeyCreateModal({
         // 照发只是让界面显示「设了」而实际没生效 —— 静默失效比直接不显示更糟。
         ...(isAdmin()
           ? {
-              quota_tokens: Number(quota) || 0,
-              rpm_limit: Number(rpm) || 0,
-              tpm_limit: Number(tpm) || 0,
+              quota_tokens: quotaValue,
+              ...limitPayload(limit),
             }
           : {}),
         allowed_models: models,
@@ -143,7 +175,7 @@ export function KeyCreateModal({
       open={open}
       onClose={onClose}
       title="新建访问密钥"
-      maxWidth="500px"
+      maxWidth="760px"
       dismissable={false}
       footer={
         <div className="flex justify-end gap-2">
@@ -179,60 +211,57 @@ export function KeyCreateModal({
           <span className="mb-1.5 block text-[13px] font-medium">可用模型</span>
           <ModelPicker value={models} onChange={setModels} options={modelOptions} restricted={modelsRestricted} />
         </div>
-        <div className="grid gap-4 sm:grid-cols-2">
-          <TextField aria-label="有效期（天）" value={days} onChange={setDays}>
-            <Label>有效期（天）</Label>
-            <Input type="number" min={0} step={1} placeholder="0" />
-            <span className="text-muted text-[11px]">0 = 永不过期。到期后该密钥请求返回 403。</span>
-          </TextField>
-          <TextField aria-label="来源 IP 白名单" value={ips} onChange={setIps}>
-            <Label>来源 IP 白名单</Label>
-            <Input placeholder="留空 = 不限制" autoComplete="off" />
-            <span className="text-muted text-[11px]">
-              逗号分隔的 CIDR 或单 IP，如 <code>10.0.0.0/8, 203.0.113.7</code>。按直连地址判定，不认{' '}
-              <code>X-Forwarded-For</code>。
-            </span>
-          </TextField>
+        {/* 宽版双栏：左列是「这把 key 是什么/能用什么」，右列是「限制」。
+            之前所有字段单列堆叠，弹窗又窄，滚到底才能看到配额与限速。 */}
+        <div className="grid gap-x-6 gap-y-4 sm:grid-cols-2">
+          <div className="flex flex-col gap-4">
+            <TextField aria-label="有效期（天）" value={days} onChange={setDays}>
+              <Label>有效期（天）</Label>
+              <Input type="number" min={0} step={1} placeholder="0" />
+              <span className="text-muted text-[11px]">0 = 永不过期。到期后该密钥请求返回 403。</span>
+            </TextField>
+            <TextField aria-label="来源 IP 白名单" value={ips} onChange={setIps}>
+              <Label>来源 IP 白名单</Label>
+              <Input placeholder="留空 = 不限制" autoComplete="off" />
+              <span className="text-muted text-[11px]">
+                逗号分隔的 CIDR 或单 IP，如 <code>10.0.0.0/8, 203.0.113.7</code>。按直连地址判定，不认{' '}
+                <code>X-Forwarded-For</code>。
+              </span>
+            </TextField>
+            {isAdmin() ? (
+              <div>
+                <Label>分组覆盖</Label>
+                <div className="mt-1.5">
+                  <GroupCoverSelect value={groupId} onChange={setGroupId} groupOptions={groupOptions} />
+                </div>
+                <span className="text-muted mt-1.5 block text-[11px]">
+                  让这把密钥用另一个组的模型范围，常用于「给某个人的某把密钥单独收紧」。
+                </span>
+              </div>
+            ) : null}
+          </div>
+          <div className="flex flex-col gap-4">
+            {isAdmin() ? (
+              <TokenField
+                label="Token 配额"
+                value={quota}
+                onChange={setQuota}
+                placeholder="0"
+                hint="终身累计 input+output 上限，用尽后返回 429；0 = 不限，可写 1M / 1B。与下面的速率限额相互独立。"
+              />
+            ) : (
+              <TextField aria-label="Token 配额" value={quotaHint} onChange={() => {}}>
+                <Label>Token 配额</Label>
+                <Input disabled />
+                <span className="text-muted text-[11px]">
+                  你的密钥额度不能超过管理员为你设置的用户级配额。有效期与 IP 白名单可以自己设 ——
+                  那只会让你的密钥更受限，不会更宽松。
+                </span>
+              </TextField>
+            )}
+            {isAdmin() ? <LimitFields state={limit} onChange={setLimit} /> : null}
+          </div>
         </div>
-        {isAdmin() ? (
-          <div>
-            <Label>分组覆盖</Label>
-            <div className="mt-1.5">
-              <GroupCoverSelect value={groupId} onChange={setGroupId} groupOptions={groupOptions} />
-            </div>
-            <span className="text-muted mt-1.5 block text-[11px]">
-              让这把密钥用另一个组的模型范围，常用于「给某个人的某把密钥单独收紧」。
-            </span>
-          </div>
-        ) : null}
-        {isAdmin() ? (
-          <div className="grid gap-4 sm:grid-cols-3">
-            <TextField aria-label="Token 配额" value={quota} onChange={setQuota}>
-              <Label>Token 配额</Label>
-              <Input type="number" min={0} step={1} placeholder="0" />
-              <span className="text-muted text-[11px]">累计 input+output token 上限，用尽后 /v1 返回 429；0 = 不限</span>
-            </TextField>
-            <TextField aria-label="RPM 限速" value={rpm} onChange={setRpm}>
-              <Label>RPM 限速</Label>
-              <Input type="number" min={0} step={1} placeholder="0" />
-              <span className="text-muted text-[11px]">每分钟请求数上限；0 = 不限</span>
-            </TextField>
-            <TextField aria-label="TPM 限速" value={tpm} onChange={setTpm}>
-              <Label>TPM 限速</Label>
-              <Input type="number" min={0} step={1} placeholder="0" />
-              <span className="text-muted text-[11px]">每分钟 token 上限（估算预占+事后校正）；0 = 不限</span>
-            </TextField>
-          </div>
-        ) : (
-          <TextField aria-label="Token 配额" value={quotaHint} onChange={() => {}}>
-            <Label>Token 配额</Label>
-            <Input disabled />
-            <span className="text-muted text-[11px]">
-              你的密钥额度不能超过管理员为你设置的用户级配额。有效期与 IP 白名单可以自己设 ——
-              那只会让你的密钥更受限，不会更宽松。
-            </span>
-          </TextField>
-        )}
       </form>
     </AppModal>
   )
@@ -252,8 +281,13 @@ export function KeyEditModal({
 }) {
   const [name, setName] = useState('')
   const [quota, setQuota] = useState('0')
-  const [rpm, setRpm] = useState('0')
-  const [tpm, setTpm] = useState('0')
+  const [limit, setLimit] = useState<LimitState>({
+    mode: 'none',
+    rpm: '',
+    tpm: '',
+    dailyRequests: '',
+    dailyTokens: '',
+  })
   const [models, setModels] = useState<string[]>([])
   const [days, setDays] = useState('0')
   // 打开编辑框时的天数快照。保存时只在用户显式改过天数后才发送 expires_at：
@@ -267,12 +301,28 @@ export function KeyEditModal({
   const [ips, setIps] = useState('')
   const [groupId, setGroupId] = useState('')
 
+  const quotaTokens = (): number | null => {
+    const raw = quota.trim()
+    if (!raw) return 0
+    return parseTokenCount(raw)
+  }
+
   useEffect(() => {
     if (!k) return
     setName(k.name)
     setQuota(String(k.quota_tokens ?? 0))
-    setRpm(String(k.rpm_limit ?? 0))
-    setTpm(String(k.tpm_limit ?? 0))
+    setLimit({
+      mode: detectLimitMode({
+        rpm: k.rpm_limit ?? 0,
+        tpm: k.tpm_limit ?? 0,
+        dailyRequests: k.daily_request_limit ?? 0,
+        dailyTokens: k.daily_token_limit ?? 0,
+      }),
+      rpm: k.rpm_limit ? String(k.rpm_limit) : '',
+      tpm: k.tpm_limit ? String(k.tpm_limit) : '',
+      dailyRequests: k.daily_request_limit ? String(k.daily_request_limit) : '',
+      dailyTokens: k.daily_token_limit ? String(k.daily_token_limit) : '',
+    })
     setModels([...(k.allowed_models ?? [])])
     const d = String(daysLeft(k.expires_at ?? 0))
     setDays(k.expires_at > 0 ? d : '0')
@@ -287,6 +337,18 @@ export function KeyEditModal({
       toast.danger('名称为必填项')
       return
     }
+    const quotaValue = quotaTokens()
+    if (quotaValue === null) {
+      toast.danger('Token 配额无法识别，请填数字或 1M / 1B 这类写法')
+      return
+    }
+    if (isAdmin()) {
+      const bad = validateLimit(limit)
+      if (bad) {
+        toast.danger(bad)
+        return
+      }
+    }
     try {
       await api.updateKey(k.id, {
         name: name.trim(),
@@ -296,9 +358,8 @@ export function KeyEditModal({
         // （含改名）全部丢失。不发这个字段 = 保持原值（PATCH 语义）。
         ...(isAdmin()
           ? {
-              quota_tokens: Number(quota) || 0,
-              rpm_limit: Number(rpm) || 0,
-              tpm_limit: Number(tpm) || 0,
+              quota_tokens: quotaValue,
+              ...limitPayload(limit),
             }
           : {}),
         allowed_models: models,
@@ -320,7 +381,7 @@ export function KeyEditModal({
       open={k !== null}
       onClose={onClose}
       title="编辑密钥"
-      maxWidth="500px"
+      maxWidth="760px"
       dismissable={false}
       footer={
         <div className="flex justify-end gap-2">
@@ -348,54 +409,53 @@ export function KeyEditModal({
           <span className="mb-1.5 block text-[13px] font-medium">可用模型</span>
           <ModelPicker value={models} onChange={setModels} options={modelOptions} restricted={modelsRestricted} />
         </div>
-        <div className="grid gap-4 sm:grid-cols-2">
-          <TextField aria-label="有效期（天）" value={days} onChange={setDays}>
-            <Label>有效期（天）</Label>
-            <Input type="number" min={0} step={1} placeholder="0" />
-            {keyExpired ? (
-              <span className="text-muted text-[11px]">
-                该密钥已过期。改动天数会重新设定有效期（从现在起 N 天）；不改动则维持过期状态。
-              </span>
-            ) : (
-              <span className="text-muted text-[11px]">
-                0 = 永不过期。改动天数会按「从现在起 N 天」重设截止时间；不改动则保持原值。
-              </span>
-            )}
-          </TextField>
-          <TextField aria-label="来源 IP 白名单" value={ips} onChange={setIps}>
-            <Label>来源 IP 白名单</Label>
-            <Input placeholder="留空 = 不限制" autoComplete="off" />
-            <span className="text-muted text-[11px]">逗号分隔的 CIDR 或单 IP。写错会让这把密钥从所有地址都连不上。</span>
-          </TextField>
-        </div>
-        {isAdmin() ? (
-          <div>
-            <Label>分组覆盖</Label>
-            <div className="mt-1.5">
-              <GroupCoverSelect value={groupId} onChange={setGroupId} groupOptions={groupOptions} />
+        {/* 宽版双栏：左「有效期 / 来源 / 分组」，右「配额 / 限额」。
+            编辑弹窗原来 500px 单列，字段一多就要滚很久。
+            普通用户没有右栏内容（配额与限额都是管理员专属），此时退回
+            单列 —— 否则半张弹窗是空白，看起来像加载失败。 */}
+        <div className={`grid gap-x-6 gap-y-4 ${isAdmin() ? 'sm:grid-cols-2' : ''}`}>
+          <div className="flex flex-col gap-4">
+            <TextField aria-label="有效期（天）" value={days} onChange={setDays}>
+              <Label>有效期（天）</Label>
+              <Input type="number" min={0} step={1} placeholder="0" />
+              {keyExpired ? (
+                <span className="text-muted text-[11px]">
+                  该密钥已过期。改动天数会重新设定有效期（从现在起 N 天）；不改动则维持过期状态。
+                </span>
+              ) : (
+                <span className="text-muted text-[11px]">
+                  0 = 永不过期。改动天数会按「从现在起 N 天」重设截止时间；不改动则保持原值。
+                </span>
+              )}
+            </TextField>
+            <TextField aria-label="来源 IP 白名单" value={ips} onChange={setIps}>
+              <Label>来源 IP 白名单</Label>
+              <Input placeholder="留空 = 不限制" autoComplete="off" />
+              <span className="text-muted text-[11px]">逗号分隔的 CIDR 或单 IP。写错会让这把密钥从所有地址都连不上。</span>
+            </TextField>
+            {isAdmin() ? (
+              <div>
+                <Label>分组覆盖</Label>
+                <div className="mt-1.5">
+                  <GroupCoverSelect value={groupId} onChange={setGroupId} groupOptions={groupOptions} />
+                </div>
+                <span className="text-muted mt-1.5 block text-[11px]">这把密钥用哪个组的模型范围。</span>
+              </div>
+            ) : null}
+          </div>
+          {isAdmin() ? (
+            <div className="flex flex-col gap-4">
+              <TokenField
+                label="Token 配额"
+                value={quota}
+                onChange={setQuota}
+                placeholder="0"
+                hint="终身累计 input+output 上限，用尽后返回 429；0 = 不限，可写 1M / 1B。与下面的速率限额相互独立。"
+              />
+              <LimitFields state={limit} onChange={setLimit} />
             </div>
-            <span className="text-muted mt-1.5 block text-[11px]">这把密钥用哪个组的模型范围。</span>
-          </div>
-        ) : null}
-        {isAdmin() ? (
-          <div className="grid gap-4 sm:grid-cols-3">
-            <TextField aria-label="Token 配额" value={quota} onChange={setQuota}>
-              <Label>Token 配额</Label>
-              <Input type="number" min={0} step={1} placeholder="0" />
-              <span className="text-muted text-[11px]">累计 input+output token 上限，用尽后 /v1 返回 429；0 = 不限</span>
-            </TextField>
-            <TextField aria-label="RPM 限速" value={rpm} onChange={setRpm}>
-              <Label>RPM 限速</Label>
-              <Input type="number" min={0} step={1} placeholder="0" />
-              <span className="text-muted text-[11px]">每分钟请求数上限；0 = 不限</span>
-            </TextField>
-            <TextField aria-label="TPM 限速" value={tpm} onChange={setTpm}>
-              <Label>TPM 限速</Label>
-              <Input type="number" min={0} step={1} placeholder="0" />
-              <span className="text-muted text-[11px]">每分钟 token 上限（估算预占+事后校正）；0 = 不限</span>
-            </TextField>
-          </div>
-        ) : null}
+          ) : null}
+        </div>
       </form>
     </AppModal>
   )

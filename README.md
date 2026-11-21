@@ -98,7 +98,7 @@ docker run -d \
 
 ### 源码构建
 
-前置 Go 1.27.3+（与 `go.mod` 的 `go` 指令一致，CI 由 `go-version-file` 单一来源读取；不要使用较早的 1.27.x）。前端产物已入库（`internal/webui/dist`），只改后端无需 Node：
+前置 Go 1.27.4+（与 `go.mod` 的 `go` 指令一致，CI 由 `go-version-file` 单一来源读取；不要使用较早的 1.27.x）。前端产物已入库（`internal/webui/dist`），只改后端无需 Node：
 
 ```bash
 go build -o gateway ./cmd/gateway

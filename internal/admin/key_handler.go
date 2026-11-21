@@ -46,6 +46,10 @@ type keyRequest struct {
 	// RPMLimit / TPMLimit：Key 维度每分钟限速（DESIGN §11.4），0 = 不限。
 	RPMLimit *int `json:"rpm_limit"`
 	TPMLimit *int `json:"tpm_limit"`
+	// DailyRequestLimit / DailyTokenLimit：Key 维度每日上限，0 = 不限。
+	// 与 rpm/tpm 互斥 —— 一把 key 同时只能启用一种限额（见 validateLimitMode）。
+	DailyRequestLimit *int `json:"daily_request_limit"`
+	DailyTokenLimit   *int `json:"daily_token_limit"`
 	// AllowedModels 是 key 级模型白名单（多用户改造 P1）。
 	//
 	// PATCH 语义与其它字段一致（nil = 保持原值），但这里多一层含义：
@@ -88,6 +92,10 @@ type keyResponse struct {
 	UsedTokens  int64  `json:"used_tokens"`
 	RPMLimit    int    `json:"rpm_limit"`
 	TPMLimit    int    `json:"tpm_limit"`
+	// DailyRequestLimit / DailyTokenLimit 是每日上限（0 = 不限）。
+	// 与 rpm/tpm 互斥：四者里最多只有一个非 0。
+	DailyRequestLimit int `json:"daily_request_limit"`
+	DailyTokenLimit   int `json:"daily_token_limit"`
 	// AllowedModels 为空数组 = 该 key 不限制模型（与「用户所属组」求交）。
 	// 前端要能区分「空 = 不限」与「有值 = 白名单」，否则会把它渲染成
 	// 「一个模型都不允许」。
@@ -222,13 +230,9 @@ func (h *KeyHandler) Create(w http.ResponseWriter, r *http.Request) {
 		quota = *req.QuotaTokens
 	}
 
-	rpm, tpm, bad, err := limitPair(req)
+	limits, bad := limitsFromRequest(req)
 	if bad != "" {
 		writeError(w, http.StatusBadRequest, bad)
-		return
-	}
-	if err != nil {
-		writeServerError(w, "parse limits", err)
 		return
 	}
 
@@ -276,8 +280,16 @@ func (h *KeyHandler) Create(w http.ResponseWriter, r *http.Request) {
 				"quota_tokens 不能超过你的用户级额度")
 			return
 		}
-		// rpm/tpm 一律清零：没有用户级上限可比，留任意填就是不限速的口子。
-		rpm, tpm = 0, 0
+		// rpm/tpm 与每日限额一律清零：没有用户级上限可比，留任意填就是
+		// 不限速的口子。
+		limits.rpm, limits.tpm, limits.dailyRequests, limits.dailyTokens = 0, 0, 0, 0
+	}
+	// 新建时四种限额全部来自请求（普通用户已在上面清零），没有库中旧值
+	// 要合并。互斥校验放在清零之后：否则普通用户传了会被忽略的
+	// rpm+tpm 组合，会收到一个与最终结果无关的 400。
+	if msg := validateLimitMode(limits); msg != "" {
+		writeError(w, http.StatusBadRequest, msg)
+		return
 	}
 
 	// 归属：**一律是调用者自己**，管理员也不例外。
@@ -307,16 +319,18 @@ func (h *KeyHandler) Create(w http.ResponseWriter, r *http.Request) {
 	_ = req.UserID // 保留字段：PATCH 的认领路径复用同一结构体
 
 	k := &store.AccessKey{
-		ID:          generateID(),
-		KeyHash:     keyHash,
-		KeyPrefix:   keyPrefix,
-		KeyEnc:      keyEnc,
-		Name:        name,
-		Enabled:     enabled,
-		QuotaTokens: quota,
-		UserID:      owner,
-		RPMLimit:    rpm,
-		TPMLimit:    tpm,
+		ID:                generateID(),
+		KeyHash:           keyHash,
+		KeyPrefix:         keyPrefix,
+		KeyEnc:            keyEnc,
+		Name:              name,
+		Enabled:           enabled,
+		QuotaTokens:       quota,
+		UserID:            owner,
+		RPMLimit:          limits.rpm,
+		TPMLimit:          limits.tpm,
+		DailyRequestLimit: limits.dailyRequests,
+		DailyTokenLimit:   limits.dailyTokens,
 	}
 	// 模型白名单（P1）：与组白名单求交，且 key 级只能更紧。
 	// 校验名字真实存在 —— 拼错的后果是「这个模型谁都调不了」而界面无异常。
@@ -446,6 +460,14 @@ func (h *KeyHandler) guardNoLoosening(w http.ResponseWriter, r *http.Request, re
 	}
 	if req.TPMLimit != nil && !canTightenLimit(int64(existing.TPMLimit), int64(*req.TPMLimit)) {
 		writeError(w, http.StatusForbidden, "TPM 限速只能调紧不能放宽或清零（0 = 不限，需管理员修改）")
+		return false
+	}
+	if req.DailyRequestLimit != nil && !canTightenLimit(int64(existing.DailyRequestLimit), int64(*req.DailyRequestLimit)) {
+		writeError(w, http.StatusForbidden, "每日请求上限只能调紧不能放宽或清零（0 = 不限，需管理员修改）")
+		return false
+	}
+	if req.DailyTokenLimit != nil && !canTightenLimit(int64(existing.DailyTokenLimit), int64(*req.DailyTokenLimit)) {
+		writeError(w, http.StatusForbidden, "每日 token 上限只能调紧不能放宽或清零（0 = 不限，需管理员修改）")
 		return false
 	}
 	if req.ExpiresAt != nil && !canTightenExpiry(existing.ExpiresAt, *req.ExpiresAt) {
@@ -655,6 +677,39 @@ func (h *KeyHandler) Update(w http.ResponseWriter, r *http.Request, id string) {
 		}
 		existing.TPMLimit = *req.TPMLimit
 	}
+	if req.DailyRequestLimit != nil {
+		if *req.DailyRequestLimit < 0 {
+			writeError(w, http.StatusBadRequest, "daily_request_limit cannot be negative")
+			return
+		}
+		existing.DailyRequestLimit = *req.DailyRequestLimit
+	}
+	if req.DailyTokenLimit != nil {
+		if *req.DailyTokenLimit < 0 {
+			writeError(w, http.StatusBadRequest, "daily_token_limit cannot be negative")
+			return
+		}
+		existing.DailyTokenLimit = *req.DailyTokenLimit
+	}
+	// 互斥校验必须用**更新后**的完整状态：PATCH 只传一个字段时，库里
+	// 另一个限额可能还开着。放在这里（所有限额字段都写好之后）才能正确
+	// 判断用户到底留下了几种。
+	//
+	// 只在请求确实动了限额字段时才校验：老库里存在互斥规则上线前写入的
+	// 「rpm 与 tpm 同时非 0」的记录，用户改个名字不该被一条自己没碰的
+	// 历史冲突拦住 —— 那种组合仍按原样继续生效，等情况被编辑时再收敛。
+	if req.RPMLimit != nil || req.TPMLimit != nil ||
+		req.DailyRequestLimit != nil || req.DailyTokenLimit != nil {
+		if msg := validateLimitMode(limitValues{
+			rpm:           existing.RPMLimit,
+			tpm:           existing.TPMLimit,
+			dailyRequests: existing.DailyRequestLimit,
+			dailyTokens:   existing.DailyTokenLimit,
+		}); msg != "" {
+			writeError(w, http.StatusBadRequest, msg)
+			return
+		}
+	}
 	// 模型白名单：nil = 保持原值，[] = 清除（回到不限制），非空 = 覆盖。
 	// 空数组归一成 nil 再落库，使「清除」与「从没配过」在数据层是同一状态
 	// —— 两个语义本来就该是同一个：都不限制。
@@ -820,22 +875,24 @@ func toKeyResponse(k store.AccessKey) keyResponse {
 		}
 	}
 	return keyResponse{
-		ID:            k.ID,
-		KeyPrefix:     k.KeyPrefix,
-		CanCopy:       k.HasSecret,
-		Name:          k.Name,
-		Enabled:       k.Enabled,
-		UserID:        k.UserID,
-		Username:      username,
-		QuotaTokens:   k.QuotaTokens,
-		UsedTokens:    k.UsedTokens,
-		RPMLimit:      k.RPMLimit,
-		TPMLimit:      k.TPMLimit,
-		AllowedModels: allowedModelsForResponse(k.AllowedModels),
-		ExpiresAt:     k.ExpiresAt,
-		AllowedIPs:    k.AllowedIPs,
-		GroupID:       k.GroupID,
-		CreatedAt:     k.CreatedAt,
+		ID:                k.ID,
+		KeyPrefix:         k.KeyPrefix,
+		CanCopy:           k.HasSecret,
+		Name:              k.Name,
+		Enabled:           k.Enabled,
+		UserID:            k.UserID,
+		Username:          username,
+		QuotaTokens:       k.QuotaTokens,
+		UsedTokens:        k.UsedTokens,
+		RPMLimit:          k.RPMLimit,
+		TPMLimit:          k.TPMLimit,
+		DailyRequestLimit: k.DailyRequestLimit,
+		DailyTokenLimit:   k.DailyTokenLimit,
+		AllowedModels:     allowedModelsForResponse(k.AllowedModels),
+		ExpiresAt:         k.ExpiresAt,
+		AllowedIPs:        k.AllowedIPs,
+		GroupID:           k.GroupID,
+		CreatedAt:         k.CreatedAt,
 	}
 }
 
@@ -858,20 +915,76 @@ func allowedModelsForResponse(models []string) []string {
 	return store.NormalizeModelNames(models)
 }
 
-// limitPair 解析 rpm_limit / tpm_limit（PATCH 语义 + 非负校验）。
-// 返回值约定：bad 非空 = 校验失败（直接 400）；否则 err 上抛为 500。
-func limitPair(req keyRequest) (rpm, tpm int, bad string, err error) {
+// limitValues 是「生效后」的四种限额取值（0 = 未启用）。
+type limitValues struct {
+	rpm           int
+	tpm           int
+	dailyRequests int
+	dailyTokens   int
+}
+
+// limitsFromRequest 解析请求里声明的四种限额，顺带做非负校验。
+// 未声明的字段保持 0 —— 调用方负责把它与库里现值合并后再校验互斥。
+func limitsFromRequest(req keyRequest) (limitValues, string) {
+	var v limitValues
 	if req.RPMLimit != nil {
 		if *req.RPMLimit < 0 {
-			return 0, 0, "rpm_limit cannot be negative", nil
+			return v, "rpm_limit cannot be negative"
 		}
-		rpm = *req.RPMLimit
+		v.rpm = *req.RPMLimit
 	}
 	if req.TPMLimit != nil {
 		if *req.TPMLimit < 0 {
-			return 0, 0, "tpm_limit cannot be negative", nil
+			return v, "tpm_limit cannot be negative"
 		}
-		tpm = *req.TPMLimit
+		v.tpm = *req.TPMLimit
 	}
-	return rpm, tpm, "", nil
+	if req.DailyRequestLimit != nil {
+		if *req.DailyRequestLimit < 0 {
+			return v, "daily_request_limit cannot be negative"
+		}
+		v.dailyRequests = *req.DailyRequestLimit
+	}
+	if req.DailyTokenLimit != nil {
+		if *req.DailyTokenLimit < 0 {
+			return v, "daily_token_limit cannot be negative"
+		}
+		v.dailyTokens = *req.DailyTokenLimit
+	}
+	return v, ""
+}
+
+// validateLimitMode 强制「同一时刻只启用一种限额」。
+//
+// # 为什么是互斥而不是叠加
+//
+// 四种限额的计量口径互不相通：rpm 数请求、tpm 数 token/分钟，每日两档数
+// 请求 / token 每天。同时开两种，运维看到 429 时无法判断是哪一条拦的
+// —— 错误码一样、排查入口却有两套。明确「一次只开一个」之后，限流只有
+// 一个可能来源。
+//
+// # 判定对象必须是「合并后的完整状态」
+//
+// PATCH 允许只传一个字段，所以不能只数请求里出现了几个非 0 值：改 rpm 时
+// 库里可能还留着 daily_token_limit=1000。调用方要先把库里现值与请求合并，
+// 再交给这里 —— 否则「从每日限额切到 RPM」会永远被用户没碰的那个旧字段挡住。
+func validateLimitMode(v limitValues) string {
+	var active []string
+	if v.rpm > 0 {
+		active = append(active, "rpm_limit")
+	}
+	if v.tpm > 0 {
+		active = append(active, "tpm_limit")
+	}
+	if v.dailyRequests > 0 {
+		active = append(active, "daily_request_limit")
+	}
+	if v.dailyTokens > 0 {
+		active = append(active, "daily_token_limit")
+	}
+	if len(active) <= 1 {
+		return ""
+	}
+	return "一把密钥同时只能启用一种限额，当前同时设置了 " +
+		strings.Join(active, " / ") + "；请只保留一个，其余置 0"
 }

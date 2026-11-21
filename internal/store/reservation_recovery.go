@@ -91,6 +91,9 @@ func (s *Store) recoverStaleReservations(ctx context.Context) (int64, error) {
 		  WHERE released = 0`); err != nil {
 		return 0, fmt.Errorf("close prior-run reservation leases: %w", err)
 	}
+	if _, err := recoverDailyQuota(ctx, tx, 1<<63-1); err != nil {
+		return 0, fmt.Errorf("recover prior-run daily reservations: %w", err)
+	}
 	if err := tx.Commit(); err != nil {
 		return 0, fmt.Errorf("commit reservation recovery: %w", err)
 	}

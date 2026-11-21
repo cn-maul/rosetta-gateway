@@ -37,6 +37,8 @@ export function rateText(k: AccessKey): string {
   const parts: string[] = []
   if ((k.rpm_limit ?? 0) > 0) parts.push(`${k.rpm_limit} req/min`)
   if ((k.tpm_limit ?? 0) > 0) parts.push(`${fmtTokens(k.tpm_limit)} tok/min`)
+  if ((k.daily_request_limit ?? 0) > 0) parts.push(`${k.daily_request_limit} req/day`)
+  if ((k.daily_token_limit ?? 0) > 0) parts.push(`${fmtTokens(k.daily_token_limit)} tok/day`)
   return parts.join(' · ')
 }
 
@@ -48,7 +50,9 @@ export function anyLimit(k: AccessKey): boolean {
     !!k.allowed_ips ||
     !!k.group_id ||
     (k.rpm_limit ?? 0) > 0 ||
-    (k.tpm_limit ?? 0) > 0
+    (k.tpm_limit ?? 0) > 0 ||
+    (k.daily_request_limit ?? 0) > 0 ||
+    (k.daily_token_limit ?? 0) > 0
   )
 }
 

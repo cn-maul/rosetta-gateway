@@ -10,6 +10,7 @@ import (
 	"github.com/cn-maul/rosetta-gateway/internal/httpx"
 	"github.com/cn-maul/rosetta-gateway/internal/ingress"
 	"github.com/cn-maul/rosetta-gateway/internal/routing"
+	"github.com/cn-maul/rosetta-gateway/internal/snapshot"
 )
 
 // Balance handling has two deliberately different accounting meanings:
@@ -46,8 +47,9 @@ func (h *Handler) precheckBalance(
 	buildReq func() *rosetta.ChatRequest,
 	cands []routing.Candidate,
 	codec ingress.Codec,
+	snap *snapshot.Snapshot,
 ) bool {
-	if h.balanceExempt(authCtx.UserID) {
+	if user := snap.UsersByID[authCtx.UserID]; user != nil && billing.IsBalanceExempt(user.Role) {
 		return true
 	}
 
@@ -80,9 +82,4 @@ func (h *Handler) precheckBalance(
 	default:
 		return true
 	}
-}
-
-func (h *Handler) balanceExempt(userID string) bool {
-	u := h.snapshot().UsersByID[userID]
-	return u != nil && billing.IsBalanceExempt(u.Role)
 }

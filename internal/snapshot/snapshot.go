@@ -8,6 +8,7 @@ import (
 
 	"github.com/cn-maul/rosetta-gateway/internal/routing"
 	"github.com/cn-maul/rosetta-gateway/internal/store"
+	"github.com/cn-maul/rosetta-gateway/internal/upstream"
 )
 
 // Snapshot 是 /v1 数据面解析路由/密钥所用的只读快照。
@@ -24,6 +25,7 @@ import (
 // 都是「新建 → 填充 → Swap」，符合上述要求。
 
 type Snapshot struct {
+	Clients   *upstream.ClientView
 	Routes    *routing.RouteIndex
 	Providers map[string]*ProviderSnapshot
 	// KeysByHash 以 SHA-256(明文key) 的 hex 为键建索引，供热路径 O(1) 鉴权
@@ -180,6 +182,10 @@ type KeySnapshot struct {
 	// 随快照下发：热路径取额度不查库，管理改动经 reload 生效。
 	RPMLimit int
 	TPMLimit int
+	// DailyRequestLimit / DailyTokenLimit 是 Key 维度每日上限，0 = 不限。
+	// 计数本身在库里（跨重启有效），这里只随快照带出阈值。
+	DailyRequestLimit int
+	DailyTokenLimit   int
 	// AllowedModels 是 key 级模型白名单（P1）。未配置 → AllowAll()。
 	// 与用户的 AllowedModels 求交，且 key 级只能更紧。
 	AllowedModels ModelAllow

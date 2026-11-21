@@ -34,6 +34,10 @@ func TestR0AC10_RebuildFailureMarksDirtyUntilSuccessfulRetry(t *testing.T) {
 
 	pool := upstream.NewPool(logger)
 	reloader := runtime.New(st, []byte("test-master-key"), pool, config.Default(), logger)
+	if err := reloader.Reload(ctx); err != nil {
+		t.Fatalf("seed runtime: %v", err)
+	}
+	initial := snapshot.Get()
 
 	// Fail the snapshot stage after the pool stage has succeeded. Renaming the
 	// settings table makes GetRuntimeDefaults return a real SQL error, then the
@@ -47,6 +51,9 @@ func TestR0AC10_RebuildFailureMarksDirtyUntilSuccessfulRetry(t *testing.T) {
 	}
 	if !reloader.IsDirty() {
 		t.Fatal("failed initial-style reload did not mark runtime dirty")
+	}
+	if snapshot.Get() != initial || initial.Clients == nil {
+		t.Fatal("failed rebuild replaced the published runtime view")
 	}
 
 	health := api.HealthzHandler(st, reloader, logger)
@@ -68,6 +75,9 @@ func TestR0AC10_RebuildFailureMarksDirtyUntilSuccessfulRetry(t *testing.T) {
 	}
 	if reloader.IsDirty() {
 		t.Fatal("successful retry did not clear runtime dirty state")
+	}
+	if current := snapshot.Get(); current == initial || current.Clients == initial.Clients {
+		t.Fatal("successful rebuild did not exchange the complete runtime view")
 	}
 
 	rec = httptest.NewRecorder()

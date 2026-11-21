@@ -12,6 +12,11 @@ import (
 type NonStreamWriteResult struct {
 	Committed bool
 	Err       error
+	// ResponseID is the identifier actually written to the client. Protocol
+	// encoders that generate an ID when the upstream omitted one must report
+	// the generated value so continuation state keys on what the caller saw,
+	// not on the empty upstream value.
+	ResponseID string
 }
 
 // EncodeError reports a failure that happened before any downstream bytes

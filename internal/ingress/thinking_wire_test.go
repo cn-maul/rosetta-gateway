@@ -202,6 +202,40 @@ func TestWire_ChatThinkingEnabledKeepsVendorFields(t *testing.T) {
 	}
 }
 
+func TestWire_ChatThinkingObjectStillTranslatesEffort(t *testing.T) {
+	got := probeWireModel(t, NewOpenAIChat(),
+		`{"model":"m","messages":[{"role":"user","content":"hi"}],"thinking":{"type":"enabled","clear_thinking":false},"reasoning_effort":"medium"}`,
+		rosetta.ProtoOpenAIChat, "/chat", modelWith(dialect.GLM, "glm-5.3"))
+	th, _ := got["thinking"].(map[string]any)
+	if th == nil || th["type"] != "enabled" || th["clear_thinking"] != false {
+		t.Fatalf("thinking = %v", got["thinking"])
+	}
+	if got["reasoning_effort"] != "high" {
+		t.Fatalf("glm-5.3 medium 应翻译成 high，实际 %v", got["reasoning_effort"])
+	}
+}
+
+func TestWire_AnthropicJSONSchemaUsesOutputConfig(t *testing.T) {
+	got := probeWireModel(t, NewAnthropicMessages(),
+		`{"model":"m","max_tokens":1024,"messages":[{"role":"user","content":"hi"}],"output_config":{"format":{"type":"json_schema","schema":{"type":"object","properties":{"x":{"type":"string"}}}}}}`,
+		rosetta.ProtoAnthropic, "/anthropic", modelWith(dialect.Anthropic, "claude-sonnet-5-5"))
+	config, _ := got["output_config"].(map[string]any)
+	format, _ := config["format"].(map[string]any)
+	if format["type"] != "json_schema" || format["schema"] == nil {
+		t.Fatalf("output_config = %v", got["output_config"])
+	}
+}
+
+func TestWire_StructuredOutputKeepsEffort(t *testing.T) {
+	got := probeWireModel(t, NewOpenAIChat(),
+		`{"model":"m","messages":[{"role":"user","content":"hi"}],"reasoning_effort":"high","response_format":{"type":"json_schema","json_schema":{"name":"out","schema":{"type":"object"}}}}`,
+		rosetta.ProtoAnthropic, "/anthropic", modelWith(dialect.DeepSeek, "deepseek-chat"))
+	config, _ := got["output_config"].(map[string]any)
+	if config["effort"] != "high" || config["format"] == nil {
+		t.Fatalf("output_config = %v", got["output_config"])
+	}
+}
+
 // Anthropic 目标 + 真 Claude：关闭走 thinking.type=disabled。
 func TestWire_AnthropicDisabledExplicit(t *testing.T) {
 	got := probeWireModel(t, NewAnthropicMessages(),

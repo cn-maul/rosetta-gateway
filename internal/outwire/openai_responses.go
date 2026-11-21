@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -40,32 +41,11 @@ type ResponsesSSE struct {
 
 	id      string
 	started bool // response.created 已发出
-	// 打开中的 message item（content_index 恒 0：一个 message 一个 text part）。
+	// The sequential message lane handles upstream events without an output index.
 	msgOpen bool
 	text    strings.Builder
-	// msgSourceIdx 是「当前打开的 message item 对应的上游 output_index」。
-	//
-	// # 为什么需要它（2026-10-21 修 A3-P1-3 / 汇总 O3）
-	//
-	// 此前 s.text 这个 builder **跨 item 共享且从不清空**：开第二个
-	// message item 时，第二个的 output_text.done 文本是
-	// 「第一个的文本 + 第二个的文本」（实测 "AAABBB"）。客户端若按
-	// output_text.done 而非按 delta 累积，第二段文本就被污染成累计值；
-	// response.completed 内嵌的 output 数组同样带这个错值。
-	//
-	// 修法有两个层次：
-	//   1. **开新 item 时清空 s.text**（下面 Event 里的 s.text.Reset()）
-	//      —— 这修的是「第二个 item 的文本包含第一个 item 的内容」；
-	//   2. **按上游 output_index 切 item** —— 这修的是「两个 item 被
-	//      合并成一个」。Responses 协议允许一条回复里有多个 message
-	//      item（工具调用循环里就会出现），上游会用不同的
-	//      output_index 区分它们。
-	//
-	// 只有当上游给了 output_index 时才按它切；没给（别的协议族、极简
-	// 上游）则退回「靠 tool 事件切换」的老行为。
-	msgSourceIdx int
-	// msgSourceKnown 标记 msgSourceIdx 是否有效（上游给了 output_index）。
-	msgSourceKnown bool
+	// Rosetta v1.3.3 exposes distinct BlockIndex slots for indexed text parts.
+	indexedMessages map[int]*responsesTextMessage
 	// 打开中的 function_call item。
 	toolOpen bool
 	toolID   string
@@ -145,7 +125,7 @@ type ResponsesSSE struct {
 	// writeErr 是第一次写失败（2026-10-21 修 *X12）。见 write_error.go。
 	writeErr error
 	// output 累积已收尾的 output item（response.completed 内嵌完整对象）。
-	output []map[string]any
+	output []responsesOutputItem
 	// pendingIndex 是「下一个 item 应当占的 output_index」。
 	//
 	// # 为什么需要它（2026-10-21 修 A3-P1-4 / 汇总 O4）
@@ -211,6 +191,16 @@ func (s *ResponsesSSE) writeEvent(event string, payload map[string]any) {
 	if s.flusher != nil {
 		s.flusher.Flush()
 	}
+}
+
+// DownstreamResponseID reports the response id carried by the events already
+// written to the client. Continuation state must key on this value: the sink
+// owns the id the client can quote back, which may differ from the upstream
+// id when the upstream omitted one or the sink accepted an id late.
+func (s *ResponsesSSE) DownstreamResponseID() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.id
 }
 
 func (s *ResponsesSSE) responseSkeleton(status string) map[string]any {
@@ -286,7 +276,7 @@ func (s *ResponsesSSE) closeMessage() {
 	s.writeEvent("response.output_item.done", map[string]any{
 		"output_index": idx, "item": item,
 	})
-	s.output = append(s.output, item)
+	s.output = append(s.output, responsesOutputItem{idx, item})
 	s.msgOpen = false
 }
 
@@ -317,7 +307,7 @@ func (s *ResponsesSSE) closeTool() {
 	s.writeEvent("response.output_item.done", map[string]any{
 		"output_index": idx, "item": item,
 	})
-	s.output = append(s.output, item)
+	s.output = append(s.output, responsesOutputItem{idx, item})
 	s.toolOpen = false
 }
 
@@ -493,7 +483,82 @@ func (s *ResponsesSSE) closeReason(ev *rosetta.Event) {
 	s.writeEvent("response.output_item.done", map[string]any{
 		"output_index": s.reasonIdx, "item": done,
 	})
-	s.output = append(s.output, done)
+	s.output = append(s.output, responsesOutputItem{s.reasonIdx, done})
+}
+
+type responsesOutputItem struct {
+	index int
+	item  map[string]any
+}
+
+type responsesTextMessage struct {
+	partByBlock map[int]int
+	parts       []*strings.Builder
+}
+
+func (s *ResponsesSSE) indexedTextDelta(event *rosetta.Event) {
+	index := *event.OutputIndex
+	itemID := s.id + "-msg-" + itoa(index)
+	message := s.indexedMessages[index]
+	if message == nil {
+		if s.indexedMessages == nil {
+			s.indexedMessages = make(map[int]*responsesTextMessage)
+		}
+		s.allocIndex(event.OutputIndex)
+		message = &responsesTextMessage{partByBlock: make(map[int]int)}
+		s.indexedMessages[index] = message
+		s.writeEvent("response.output_item.added", map[string]any{
+			"output_index": index,
+			"item": map[string]any{"type": "message", "id": itemID, "status": "in_progress",
+				"role": "assistant", "content": []any{}},
+		})
+	}
+	partIndex, exists := message.partByBlock[event.BlockIndex]
+	if !exists {
+		partIndex = len(message.parts)
+		message.partByBlock[event.BlockIndex] = partIndex
+		message.parts = append(message.parts, new(strings.Builder))
+		s.writeEvent("response.content_part.added", map[string]any{
+			"item_id": itemID, "output_index": index, "content_index": partIndex,
+			"part": responsesTextPart(""),
+		})
+	}
+	message.parts[partIndex].WriteString(event.Text)
+	s.wroteContent = true
+	s.writeEvent("response.output_text.delta", map[string]any{
+		"item_id": itemID, "output_index": index, "content_index": partIndex, "delta": event.Text,
+	})
+}
+
+func responsesTextPart(text string) map[string]any {
+	return map[string]any{"type": "output_text", "text": text, "annotations": []any{}}
+}
+
+func (s *ResponsesSSE) closeIndexedMessages() {
+	indices := make([]int, 0, len(s.indexedMessages))
+	for index := range s.indexedMessages {
+		indices = append(indices, index)
+	}
+	sort.Ints(indices)
+	for _, index := range indices {
+		itemID := s.id + "-msg-" + itoa(index)
+		message := s.indexedMessages[index]
+		content := make([]map[string]any, 0, len(message.parts))
+		for partIndex, text := range message.parts {
+			s.writeEvent("response.output_text.done", map[string]any{
+				"item_id": itemID, "output_index": index, "content_index": partIndex, "text": text.String(),
+			})
+			part := responsesTextPart(text.String())
+			s.writeEvent("response.content_part.done", map[string]any{
+				"item_id": itemID, "output_index": index, "content_index": partIndex, "part": part,
+			})
+			content = append(content, part)
+		}
+		item := map[string]any{"type": "message", "id": itemID, "status": "completed", "role": "assistant", "content": content}
+		s.writeEvent("response.output_item.done", map[string]any{"output_index": index, "item": item})
+		s.output = append(s.output, responsesOutputItem{index, item})
+	}
+	s.indexedMessages = nil
 }
 
 func (s *ResponsesSSE) Event(ev *rosetta.Event) {
@@ -509,16 +574,11 @@ func (s *ResponsesSSE) Event(ev *rosetta.Event) {
 			return
 		}
 		s.ensureStarted("")
-		// 上游的 output_index 变了 → 这是**另一个** message item
-		// （2026-10-21 修 A3-P1-3 / 汇总 O3）。Responses 协议允许一条
-		// 回复里有多个 message item（工具调用循环里就会出现），
-		// 上游用不同的 output_index 区分它们。
-		//
-		// 不切的后果：两个 item 被合并成一个，第二个 item 的文本里
-		// 混着第一个的内容（"AAABBB"），且两个 item 拿到同一个 id。
-		if ev.OutputIndex != nil && s.msgOpen && s.msgSourceKnown &&
-			*ev.OutputIndex != s.msgSourceIdx {
+		if ev.OutputIndex != nil && *ev.OutputIndex >= 0 {
+			s.closeReason(nil)
 			s.closeMessage()
+			s.indexedTextDelta(ev)
+			return
 		}
 		// output_index 是严格递增的分配序：思考 item 还没 done 就开新的
 		// message item，客户端会看到交错的半开 item。
@@ -530,12 +590,6 @@ func (s *ResponsesSSE) Event(ev *rosetta.Event) {
 			// 新 item 的文本从空开始：s.text 跨 item 共享，不清就会让
 			// 第二个 item 的文本带上第一个的内容（2026-10-21 修 A3-P1-3）。
 			s.text.Reset()
-			if ev.OutputIndex != nil {
-				s.msgSourceIdx = *ev.OutputIndex
-				s.msgSourceKnown = true
-			} else {
-				s.msgSourceKnown = false
-			}
 			s.writeEvent("response.output_item.added", map[string]any{
 				"output_index": idx,
 				"item":         map[string]any{"type": "message", "id": itemID, "status": "in_progress", "role": "assistant", "content": []any{}},
@@ -603,6 +657,19 @@ func (s *ResponsesSSE) Event(ev *rosetta.Event) {
 	}
 }
 
+func responsesIncompleteReason(stop rosetta.StopReason) string {
+	switch stop {
+	case rosetta.StopLength:
+		return "max_output_tokens"
+	case rosetta.StopContentFilter:
+		return "content_filter"
+	case rosetta.StopRefusal:
+		return "refusal"
+	default:
+		return ""
+	}
+}
+
 func (s *ResponsesSSE) Finish(status string, stop rosetta.StopReason, usage rosetta.Usage, _ bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -617,6 +684,7 @@ func (s *ResponsesSSE) Finish(status string, stop rosetta.StopReason, usage rose
 	s.closeReason(nil)
 	s.closeMessage()
 	s.closeTool()
+	s.closeIndexedMessages()
 
 	if status != "ok" {
 		resp := s.responseSkeleton("failed")
@@ -631,13 +699,17 @@ func (s *ResponsesSSE) Finish(status string, stop rosetta.StopReason, usage rose
 	eventName := "response.completed"
 	resp := s.responseSkeleton("completed")
 	if len(s.output) > 0 {
-		resp["output"] = s.output
+		sort.SliceStable(s.output, func(left, right int) bool { return s.output[left].index < s.output[right].index })
+		output := make([]map[string]any, 0, len(s.output))
+		for _, entry := range s.output {
+			output = append(output, entry.item)
+		}
+		resp["output"] = output
 	}
-	// StopLength 在 Responses 语义里是「未完成」而非失败。
-	if stop == rosetta.StopLength {
+	if reason := responsesIncompleteReason(stop); reason != "" {
 		eventName = "response.incomplete"
 		resp["status"] = "incomplete"
-		resp["incomplete_details"] = map[string]any{"reason": "max_output_tokens"}
+		resp["incomplete_details"] = map[string]any{"reason": reason}
 	}
 	resp["usage"] = map[string]any{
 		"input_tokens":  usage.InputTokens,
@@ -789,9 +861,9 @@ func WriteResponsesResponseWithTools(w http.ResponseWriter, resp *rosetta.ChatRe
 
 	status := "completed"
 	var incomplete any
-	if resp.StopReason == rosetta.StopLength {
+	if reason := responsesIncompleteReason(resp.StopReason); reason != "" {
 		status = "incomplete"
-		incomplete = map[string]any{"reason": "max_output_tokens"}
+		incomplete = map[string]any{"reason": reason}
 	}
 
 	usage := map[string]any{
@@ -815,7 +887,7 @@ func WriteResponsesResponseWithTools(w http.ResponseWriter, resp *rosetta.ChatRe
 		}
 	}
 
-	return encodeNonStreamPayload(w, map[string]any{
+	result := encodeNonStreamPayload(w, map[string]any{
 		"id":                  id,
 		"object":              "response",
 		"created_at":          time.Now().Unix(),
@@ -827,6 +899,10 @@ func WriteResponsesResponseWithTools(w http.ResponseWriter, resp *rosetta.ChatRe
 		"error":               nil,
 		"incomplete_details":  incomplete,
 	})
+	if result.Err == nil {
+		result.ResponseID = id
+	}
+	return result
 }
 
 func itoa(n int) string {

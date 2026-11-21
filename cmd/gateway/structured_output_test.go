@@ -24,7 +24,7 @@ func fakeAnthropic(t *testing.T, hits *atomic.Int64) *httptest.Server {
 	}))
 }
 
-// (a) 链上只有 anthropic 上游 + 带 json_schema 的 Chat 请求 → 400，
+// (a) 链上只有 anthropic 上游 + 带 json_object 的 Chat 请求 → 400，
 // 且文案点明结构化输出 —— 而不是 200 但约束静默丢失（P1-8）。
 func TestStructuredOutput_AnthropicOnlyChainRejected(t *testing.T) {
 	var hits atomic.Int64
@@ -34,7 +34,7 @@ func TestStructuredOutput_AnthropicOnlyChainRejected(t *testing.T) {
 	h := buildHarnessProtocols(t, []harnessChain{{slug: "claude", url: anth.URL, protocol: "anthropic"}}, false, ingress.NewOpenAIChat())
 
 	rec := postRaw(h, `{"model":"flash","messages":[{"role":"user","content":"hi"}],"stream":false,
-		"response_format":{"type":"json_schema","json_schema":{"name":"out","strict":true,"schema":{"type":"object"}}}}`)
+		"response_format":{"type":"json_object"}}`)
 	if rec.Code != http.StatusBadRequest {
 		t.Fatalf("want 400, got %d body=%s", rec.Code, rec.Body.String())
 	}
@@ -46,7 +46,7 @@ func TestStructuredOutput_AnthropicOnlyChainRejected(t *testing.T) {
 	}
 }
 
-// (b) 链 [chat(可转移失败), anthropic] + json_schema → 最终错误，
+// (b) 链 [chat(可转移失败), anthropic] + json_object → 最终错误，
 // 而不是「转移到 anthropic 后 200 但约束丢失」。anthropic 假上游必须零命中。
 func TestStructuredOutput_FailoverSkipsAnthropicCandidate(t *testing.T) {
 	var hits atomic.Int64
@@ -61,7 +61,7 @@ func TestStructuredOutput_FailoverSkipsAnthropicCandidate(t *testing.T) {
 	}, true, ingress.NewOpenAIChat())
 
 	rec := postRaw(h, `{"model":"flash","messages":[{"role":"user","content":"hi"}],"stream":false,
-		"response_format":{"type":"json_schema","json_schema":{"name":"out","schema":{"type":"object"}}}}`)
+		"response_format":{"type":"json_object"}}`)
 	if rec.Code == http.StatusOK {
 		t.Fatalf("结构化输出请求不得在 anthropic 上游拿到 200（约束会静默丢失）：%s", rec.Body.String())
 	}
@@ -98,7 +98,7 @@ func TestStructuredOutput_OpenAIChatTargetStillServes(t *testing.T) {
 	}
 }
 
-// Responses 入口同样受硬约束约束：text.format 为 json_schema 时，
+// Responses 入口同样受硬约束约束：text.format 为 json_object 时，
 // anthropic-only 链 → 400。
 func TestStructuredOutput_ResponsesIngressAnthropicChainRejected(t *testing.T) {
 	var hits atomic.Int64
@@ -107,7 +107,7 @@ func TestStructuredOutput_ResponsesIngressAnthropicChainRejected(t *testing.T) {
 
 	h := buildHarnessProtocols(t, []harnessChain{{slug: "claude", url: anth.URL, protocol: "anthropic"}}, false, ingress.NewResponses())
 
-	body := `{"model":"flash","input":"hi","text":{"format":{"type":"json_schema","name":"out","schema":{"type":"object"}}}}`
+	body := `{"model":"flash","input":"hi","text":{"format":{"type":"json_object"}}}`
 	req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(body))
 	req.Header.Set("Authorization", "Bearer "+testAccessKey)
 	rec := httptest.NewRecorder()
@@ -124,8 +124,7 @@ func TestStructuredOutput_ResponsesIngressAnthropicChainRejected(t *testing.T) {
 	}
 }
 
-// Anthropic 入站协议没有结构化输出概念，永不触发过滤：
-// anthropic 入口 → anthropic 上游照常 200。
+// 不含输出格式约束时，Anthropic 同协议请求照常通过。
 func TestStructuredOutput_AnthropicIngressNotFiltered(t *testing.T) {
 	var hits atomic.Int64
 	anth := fakeAnthropic(t, &hits)

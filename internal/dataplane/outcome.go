@@ -11,6 +11,7 @@ import (
 
 	"github.com/cn-maul/rosetta"
 	"github.com/cn-maul/rosetta-gateway/internal/outwire"
+	"github.com/cn-maul/rosetta-gateway/internal/protocol"
 	"github.com/cn-maul/rosetta-gateway/internal/routing"
 	"github.com/cn-maul/rosetta-gateway/internal/store"
 )
@@ -486,4 +487,22 @@ func IsClientGone(ctx context.Context, err error) bool {
 	}
 	// ctx.Err() 也只认 Canceled：DeadlineExceeded 属于预算到期，见上。
 	return errors.Is(ctx.Err(), context.Canceled)
+}
+
+const responsesSealConflictReason = "conflicting sealed payloads for one item"
+
+// isResponsesSealConflict is the v1.3.3 adapter until the SDK exports a typed seal conflict.
+func isResponsesSealConflict(err error, upstreamProtocol string) bool {
+	if upstreamProtocol != protocol.Response {
+		return false
+	}
+	for current := err; current != nil; current = errors.Unwrap(current) {
+		cause := errors.Unwrap(current)
+		if cause != nil && cause.Error() == responsesSealConflictReason &&
+			strings.HasPrefix(current.Error(), "rosetta: responses stream (") &&
+			strings.HasSuffix(current.Error(), "): malformed event: "+responsesSealConflictReason) {
+			return true
+		}
+	}
+	return false
 }

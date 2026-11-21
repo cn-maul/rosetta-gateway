@@ -95,10 +95,10 @@ export function ProviderOverviewCard({
             <span className="text-muted">直连（不经过代理）</span>
           )}
         </KvRow>
-        <KvRow k="超时 / 重试">
+        <KvRow k="超时 / 模型列表重试">
           <span className="text-muted">
             {fmtTimeoutSec(provider.timeout_ms)} /{' '}
-            {provider.max_retries ? `${provider.max_retries} 次` : '默认'}
+            {provider.max_retries} 次
           </span>
         </KvRow>
       </div>

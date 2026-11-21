@@ -14,19 +14,20 @@
 //
 // # 边界
 //
-// 只认「十进制数字 + 可选 K/M 后缀」，不认「万」「亿」：后者是中文数量级
+// 只认「十进制数字 + 可选 K/M/B 后缀」，不认「万」「亿」：后者是中文数量级
 // 而不是 token 计量的习惯写法，猜错一个数量级（万 = 10000 还是 1024 的倍数）
 // 比拒绝解析更危险。小数允许（1.5M = 1572864），四舍五入到整数。
 
 const SUFFIX_SCALE: Record<string, number> = {
   k: 1024,
   m: 1024 * 1024,
+  b: 1024 * 1024 * 1024,
 }
 
 /**
  * 解析 token 数量输入。
  *
- * 接受：`131072`、`128K`、`128k`、`1M`、`1.5M`、`1 024 000`（空格/逗号/下划线分隔）。
+ * 接受：`131072`、`128K`、`128k`、`1M`、`1B`、`1.5M`、`1 024 000`（空格/逗号/下划线分隔）。
  * 返回 `null` 表示无法解析（空串、负号、非数字、未知后缀）。
  *
  * 刻意不把「无法解析」当成 0：0 在这两个字段上有确定含义（未设置、回落默认
@@ -35,7 +36,7 @@ const SUFFIX_SCALE: Record<string, number> = {
 export function parseTokenCount(raw: string): number | null {
   const cleaned = raw.replace(/[\s,_]/g, '').trim()
   if (!cleaned) return null
-  const m = /^(\d+(?:\.\d+)?)([kKmM]?)$/.exec(cleaned)
+  const m = /^(\d+(?:\.\d+)?)([kKmMbB]?)$/.exec(cleaned)
   if (!m) return null
   const value = Number(m[1])
   if (!Number.isFinite(value)) return null

@@ -51,7 +51,8 @@ func seedRestrictedKey(t *testing.T, st *store.Store) *store.AccessKey {
 	k := &store.AccessKey{
 		ID: "kr", KeyHash: "h-kr", KeyPrefix: "sk-", Name: "restricted",
 		Enabled: false, QuotaTokens: 1000, UserID: "u1",
-		RPMLimit: 10, TPMLimit: 1000,
+		// 限额是互斥的：示例 key 只开 RPM 一档（TPM 场景另建 key 覆盖）。
+		RPMLimit:   10,
 		ExpiresAt:  time.Now().Add(48 * time.Hour).UnixMilli(),
 		AllowedIPs: "10.0.0.0/8",
 	}
@@ -62,10 +63,25 @@ func seedRestrictedKey(t *testing.T, st *store.Store) *store.AccessKey {
 }
 
 func patchKey(h *KeyHandler, as func(*http.Request) *http.Request, body string) *httptest.ResponseRecorder {
+	return patchKeyID(h, as, "kr", body)
+}
+
+func patchKeyID(h *KeyHandler, as func(*http.Request) *http.Request, id, body string) *httptest.ResponseRecorder {
 	rec := httptest.NewRecorder()
-	req := as(jsonRequest(http.MethodPatch, "/admin/api/keys/kr", strings.NewReader(body)))
-	h.Update(rec, req, "kr")
+	req := as(jsonRequest(http.MethodPatch, "/admin/api/keys/"+id, strings.NewReader(body)))
+	h.Update(rec, req, id)
 	return rec
+}
+
+func seedTPMKey(t *testing.T, st *store.Store, id string, tpm int) {
+	t.Helper()
+	k := &store.AccessKey{
+		ID: id, KeyHash: "h-" + id, KeyPrefix: "sk-", Name: id,
+		Enabled: true, UserID: "u1", TPMLimit: tpm,
+	}
+	if err := st.CreateAccessKey(context.Background(), k); err != nil {
+		t.Fatalf("seed tpm key: %v", err)
+	}
 }
 
 func TestKeyUpdate_OwnerCannotReenableDisabledKey(t *testing.T) {
@@ -107,21 +123,30 @@ func TestKeyUpdate_OwnerCannotLoosenQuotaAndLimits(t *testing.T) {
 		"clear quota": `{"quota_tokens":0}`,
 		"raise rpm":   `{"rpm_limit":100}`,
 		"clear rpm":   `{"rpm_limit":0}`,
-		"raise tpm":   `{"tpm_limit":5000}`,
-		"clear tpm":   `{"tpm_limit":0}`,
 	} {
 		rec := patchKey(h, asU, body)
 		if rec.Code != http.StatusForbidden {
 			t.Errorf("%s: code=%d body=%s, want 403", name, rec.Code, rec.Body.String())
 		}
 	}
+	// TPM 打开时同样只能收紧：另建一把只开 TPM 的 key。
+	seedTPMKey(t, st, "ktpm", 1000)
+	for name, body := range map[string]string{
+		"raise tpm": `{"tpm_limit":5000}`,
+		"clear tpm": `{"tpm_limit":0}`,
+	} {
+		rec := patchKeyID(h, asU, "ktpm", body)
+		if rec.Code != http.StatusForbidden {
+			t.Errorf("%s: code=%d body=%s, want 403", name, rec.Code, rec.Body.String())
+		}
+	}
 	// 收紧方向必须放行。
-	rec := patchKey(h, asU, `{"quota_tokens":500,"rpm_limit":5,"tpm_limit":500}`)
+	rec := patchKey(h, asU, `{"quota_tokens":500,"rpm_limit":5}`)
 	if rec.Code != http.StatusOK {
 		t.Errorf("tighten limits: code=%d body=%s, want 200", rec.Code, rec.Body.String())
 	}
 	k, _ := st.GetAccessKey(context.Background(), "kr")
-	if k.QuotaTokens != 500 || k.RPMLimit != 5 || k.TPMLimit != 500 {
+	if k.QuotaTokens != 500 || k.RPMLimit != 5 {
 		t.Errorf("tightened values not applied: %+v", k)
 	}
 }
@@ -137,7 +162,7 @@ func TestKeyUpdate_OwnerCanSetLimitsOnUnrestrictedKey(t *testing.T) {
 	// 现值 0（不限）：给自己加限制是收紧，放行。
 	rec := httptest.NewRecorder()
 	req := asUser(jsonRequest(http.MethodPatch, "/admin/api/keys/kfree",
-		strings.NewReader(`{"quota_tokens":100,"rpm_limit":10,"tpm_limit":1000}`)), "u1")
+		strings.NewReader(`{"quota_tokens":100,"rpm_limit":10}`)), "u1")
 	h.Update(rec, req, "kfree")
 	if rec.Code != http.StatusOK {
 		t.Errorf("self-tighten unlimited key: code=%d body=%s, want 200", rec.Code, rec.Body.String())
@@ -339,14 +364,14 @@ func TestKeyCreate_NoUserCeilingAndAdminUncapped(t *testing.T) {
 	setUserQuota(t, st, "u1", 5000)
 	rec = createKey(h, func(r *http.Request) *http.Request {
 		return asAdminID(r, "admin-real")
-	}, `{"name":"by-admin","quota_tokens":777777,"rpm_limit":600,"tpm_limit":600}`)
+	}, `{"name":"by-admin","quota_tokens":777777,"rpm_limit":600}`)
 	if rec.Code != http.StatusCreated {
 		t.Fatalf("admin create: code=%d body=%s, want 201", rec.Code, rec.Body.String())
 	}
 	if err := json.Unmarshal(rec.Body.Bytes(), &created); err != nil {
 		t.Fatalf("unmarshal: %v", err)
 	}
-	if created.QuotaTokens != 777777 || created.RPMLimit != 600 || created.TPMLimit != 600 {
+	if created.QuotaTokens != 777777 || created.RPMLimit != 600 {
 		t.Errorf("admin was capped: %+v", created)
 	}
 }

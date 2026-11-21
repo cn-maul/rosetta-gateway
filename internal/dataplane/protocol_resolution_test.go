@@ -18,18 +18,18 @@ func TestEffectiveProviderProtocolUsesResolvedAutoValue(t *testing.T) {
 	detected := routing.Candidate{Provider: &routing.ProviderRef{
 		Slug: "detected", Protocol: "auto",
 	}}
-	if got := h.effectiveProviderProtocol(detected); got != "anthropic" {
+	if got := effectiveProviderProtocol(h.pool.ClientView(), detected); got != "anthropic" {
 		t.Fatalf("auto protocol = %q, want anthropic", got)
 	}
 
 	fallback := routing.Candidate{Provider: &routing.ProviderRef{
 		Slug: "not-built", Protocol: "openai-chat",
 	}}
-	if got := h.effectiveProviderProtocol(fallback); got != "chat" {
+	if got := effectiveProviderProtocol(h.pool.ClientView(), fallback); got != "chat" {
 		t.Fatalf("fallback protocol = %q, want chat", got)
 	}
 
-	if got := (&Handler{}).effectiveProviderProtocol(routing.Candidate{}); got != "" {
+	if got := effectiveProviderProtocol(nil, routing.Candidate{}); got != "" {
 		t.Fatalf("nil provider protocol = %q, want empty", got)
 	}
 }

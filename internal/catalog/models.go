@@ -23,13 +23,13 @@ func List(forceShape string) http.HandlerFunc {
 			writeErr = outwire.WriteAnthropicError
 		}
 
-		authCtx, err := auth.Authenticate(r)
+		snap := snapshot.Get()
+		authCtx, err := auth.AuthenticateSnapshot(r, snap)
 		if err != nil {
 			authhttp.WriteAuthError(w, err, writeErr)
 			return
 		}
 
-		snap := snapshot.Get()
 		ids := make([]string, 0, 16)
 		seen := make(map[string]bool)
 		for _, route := range snap.Routes.ListRoutes() {
@@ -92,14 +92,14 @@ func Get(forceShape string) http.HandlerFunc {
 		if shape == "anthropic" {
 			writeErr = outwire.WriteAnthropicError
 		}
-		authCtx, err := auth.Authenticate(r)
+		snap := snapshot.Get()
+		authCtx, err := auth.AuthenticateSnapshot(r, snap)
 		if err != nil {
 			authhttp.WriteAuthError(w, err, writeErr)
 			return
 		}
 
 		modelID := r.PathValue("model")
-		snap := snapshot.Get()
 		res, rerr := snap.Routes.Resolve(modelID)
 		if rerr != nil {
 			writeErr(w, http.StatusNotFound, "model_not_found", snapshot.ModelNotFoundMessage(snap, modelID))

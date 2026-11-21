@@ -31,10 +31,8 @@ type Request struct {
 	// to choose a cache shard, while the model never sees it.
 	CacheKey string
 
-	// RequiresStructuredOutput marks a hard structured-output constraint
-	// (chat response_format or responses text.format set to json_object /
-	// json_schema). Such requests must not be sent to Anthropic upstreams.
-	RequiresStructuredOutput bool
+	OutputFormat       string
+	PreviousResponseID string
 
 	// RawEffort is the client's original effort level before normalization.
 	// An empty string means it was not specified.
@@ -376,14 +374,8 @@ func (r *Request) wireChat(req *rosetta.ChatRequest, d dialect.Dialect, modelID 
 		// 不补的话就只能指望上游把缺失的 thinking 当默认值，而 M3.1-Flash
 		// 的唯一合法取值是 adaptive。
 		setExtra(req, "thinking", map[string]any{"type": thinkingOnType(d)})
-		if lvl := r.wireLevel(req); lvl != effort.Unset && lvl != effort.None {
-			if wire, ok := dialect.WireEffort(d, modelID, canDisable, lvl); ok && wire != string(lvl) {
-				req.Thinking.EffortRaw = wire
-				req.Thinking.Effort = rosetta.EffortUnset
-				req.Thinking.BudgetTokens = 0
-			}
-		}
-	} else if req.Thinking != nil {
+	}
+	if req.Thinking != nil {
 		// A client that only sent `reasoning_effort` gets no thinking object:
 		// every dialect here accepts a bare effort, and inventing an `enabled`
 		// object would add a field some of them do not know.

@@ -378,6 +378,10 @@ export interface AccessKey {
   used_tokens: number
   rpm_limit: number // 每分钟请求数上限，0 = 不限
   tpm_limit: number // 每分钟 token 上限，0 = 不限
+  /** 每日请求数上限，0 = 不限。与 rpm/tpm 互斥：四者最多一个非 0。 */
+  daily_request_limit: number
+  /** 每日 token 上限，0 = 不限。与 rpm/tpm 互斥：四者最多一个非 0。 */
+  daily_token_limit: number
   /**
    * key 级模型白名单（P1）。
    *

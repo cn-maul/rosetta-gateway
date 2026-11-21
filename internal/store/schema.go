@@ -89,6 +89,29 @@ func (s *Store) ensureCompatibleSchema(ctx context.Context) error {
 	)`); err != nil {
 		return fmt.Errorf("ensure quota reservation lease table: %w", err)
 	}
+	// 密钥级每日用量计数（2026-11-17）。
+	//
+	// 纯新增表，老库可以原地补 —— 与配额租约表同一类对象。计数按本地日界
+	// 分桶（day 是 'YYYY-MM-DD' 文本），所以跨天不需要任何清零任务：
+	// 新的一天就是新的一行。
+	//
+	// requests / tokens 是**已放行**的累计值，在请求准入时与限额判定写在
+	// 同一条 UPDATE 里（见 Store.ReserveDailyQuota），因此并发请求被 SQLite
+	// 写锁串行化，不存在「都读到同一个已用量然后全部通过」的超发。
+	if _, err := s.db.ExecContext(ctx, `CREATE TABLE IF NOT EXISTS access_key_daily_usage (
+		access_key_id TEXT NOT NULL,
+		day           TEXT NOT NULL,
+		requests      INTEGER NOT NULL DEFAULT 0,
+		tokens        INTEGER NOT NULL DEFAULT 0,
+		PRIMARY KEY (access_key_id, day)
+	)`); err != nil {
+		return fmt.Errorf("ensure access key daily usage table: %w", err)
+	}
+	for _, stmt := range []string{dailyQuotaReservationsDDL, dailyQuotaLeaseIndexDDL, dailyQuotaUsageTriggerDDL} {
+		if _, err := s.db.ExecContext(ctx, stmt); err != nil {
+			return fmt.Errorf("ensure daily quota reservation schema: %w", err)
+		}
+	}
 	// 2026-10-22 修 F2：cache creation 的独立单价与归档列。
 	//
 	// 这些是**带默认值的纯新增列**，旧库可以原地升级，不需要提升
@@ -116,6 +139,16 @@ func (s *Store) ensureCompatibleSchema(ctx context.Context) error {
 		// 鉴权查询；key_enc 是明文的可选加密副本，旧库补列后历史行为空，
 		// 因此老密钥仍然不可回读，也没有任何明文回退路径。
 		{"access_keys", "key_enc", "BLOB"},
+		// 2026-11-17：密钥级每日限额（请求数 / token）。
+		//
+		// 与 rpm/tpm 的区别是**窗口宽度**：rpm/tpm 是滑动的一分钟，靠内存桶
+		// 计数、重启归零也无关紧要；每日限额必须跨重启、跨进程保持一致，
+		// 否则「重启一次就多一整天的额度」—— 所以它落在库里（见
+		// access_key_daily_usage），内存里只放**在途预占**。
+		//
+		// 0 = 不限，与 rpm/tpm 同口径。
+		{"access_keys", "daily_request_limit", "INTEGER NOT NULL DEFAULT 0"},
+		{"access_keys", "daily_token_limit", "INTEGER NOT NULL DEFAULT 0"},
 		// 2026-10-25 R3: recoverable accounting retry state. The defaults
 		// preserve existing behavior: every historical row is immediately
 		// eligible, has made no retry attempts, and has no recorded error.
@@ -458,6 +491,8 @@ var canonicalSchemaStatements = []string{
 		user_id             TEXT REFERENCES users(id) ON DELETE CASCADE,
 		rpm_limit           INTEGER NOT NULL DEFAULT 0,
 		tpm_limit           INTEGER NOT NULL DEFAULT 0,
+		daily_request_limit INTEGER NOT NULL DEFAULT 0,
+		daily_token_limit   INTEGER NOT NULL DEFAULT 0,
 		allowed_models_json TEXT,
 		expires_at          INTEGER NOT NULL DEFAULT 0,
 		allowed_ips         TEXT,

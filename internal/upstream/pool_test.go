@@ -115,6 +115,30 @@ func TestInstall_PreservesHealthOfLiveTargets(t *testing.T) {
 	}
 }
 
+func TestClientViewPinsProviderGeneration(t *testing.T) {
+	pool := newTestPool()
+	first := newTestConfig()
+	if err := pool.BuildFromConfig(first); err != nil {
+		t.Fatal(err)
+	}
+	view := pool.ClientView()
+	before, _, err := view.GetAnyClientByAffinity("testprov", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := pool.BuildFromConfig(newTestConfig()); err != nil {
+		t.Fatal(err)
+	}
+	after, _, err := pool.GetAnyClient("testprov")
+	if err != nil || after == before {
+		t.Fatalf("new pool did not replace the client: %v", err)
+	}
+	pinned, _, err := view.GetAnyClientByAffinity("testprov", "")
+	if err != nil || pinned != before {
+		t.Fatalf("old view lost its client: %v", err)
+	}
+}
+
 // TestTargetAvailable_IsPureQuery 钉住一条 P1 的修复。
 //
 // TargetAvailable 过去顺带把目标标成 halfOpen（占用探测名额）。调用方

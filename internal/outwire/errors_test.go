@@ -53,6 +53,9 @@ func TestCredentialCooldown(t *testing.T) {
 		{"403", &rosetta.APIError{StatusCode: 403}, 30 * time.Minute},
 		{"402", &rosetta.APIError{StatusCode: 402}, time.Hour},
 		{"429", &rosetta.APIError{StatusCode: 429}, 60 * time.Second},
+		{"429 retry hint", fmt.Errorf("upstream: %w", &rosetta.APIError{StatusCode: 429, RetryAfter: 17 * time.Second}), 17 * time.Second},
+		{"429 minimum", &rosetta.APIError{StatusCode: 429, RetryAfter: time.Millisecond}, time.Second},
+		{"429 maximum", &rosetta.APIError{StatusCode: 429, RetryAfter: time.Hour}, time.Minute},
 		// 5xx / 408 / 传输错误是目标或链路故障，不是这把 key 的问题。
 		// 给它们非零冷却会让单 key provider 在第一次抖动后整家消失，
 		// 而目标级熔断已经承担了隔离坏上游的职责。

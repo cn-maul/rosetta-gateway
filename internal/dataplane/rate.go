@@ -37,6 +37,13 @@ type RateCommit struct {
 	// requestID owns the durable reservation lease. Without it we retain the
 	// legacy best-effort release, but production request paths always set it.
 	requestID string
+	// daily 是本次请求在**当天**计数上占下的份额（请求数 + token 预占）。
+	// nil 表示没走每日额度（未配置上限，或还没到准入那一步）。
+	//
+	// 它与 TPM 预占的口径刻意保持一致：usage 缺失时保留估算值（不清零），
+	// 否则「上游不报用量」就成了绕过每日 token 上限的通道。
+	daily        *store.DailyQuotaReservation
+	dailyStarted bool
 }
 
 // Commit 用量已知时的**全量**收尾：TPM 按真实用量校正 + 退配额预占。
@@ -50,7 +57,29 @@ func (rc *RateCommit) Commit(actual int64) {
 		return
 	}
 	rc.limiter.CommitTPM(rc.keyID, rc.limit, rc.reserved, actual)
+	rc.settleDaily(actual)
 	rc.ReleaseQuota()
+}
+
+// SettleDailyQuota 把当天的 token 预占校正为真实用量。
+//
+// 只清指针不删计数：请求数在准入时已经记下，任何终结路径都不再回滚它
+// ——一次调用就是一次，无论成功失败。
+func (rc *RateCommit) settleDaily(actual int64) {
+	if rc == nil || rc.daily == nil {
+		return
+	}
+	d := *rc.daily
+	rc.daily = nil
+	if rc.store == nil {
+		return
+	}
+	if err := rc.store.SettleDailyQuota(context.Background(), rc.keyID, d, actual); err != nil {
+		if rc.logger != nil {
+			rc.logger.Warn("settle daily quota failed",
+				"key_id", rc.keyID, "actual_tokens", actual, "error", err)
+		}
+	}
 }
 
 // ReleaseQuota 只退终身配额的预占，**不碰 TPM 窗口**。
@@ -173,6 +202,46 @@ func (rc *RateCommit) SetUserQuotaReserved(userID string, reserved int64) {
 		rc.userID = userID
 		rc.userQuotaReserved = reserved
 		rc.syncLease()
+	}
+}
+
+// SetDailyReservation records the current day's request/token reservation.
+func (rc *RateCommit) SetDailyReservation(res store.DailyQuotaReservation) {
+	if rc != nil {
+		if res.Day == "" {
+			return
+		}
+		rc.daily = &res
+	}
+}
+
+func (rc *RateCommit) StartDaily(ctx context.Context) error {
+	if rc == nil || rc.daily == nil || rc.dailyStarted {
+		return nil
+	}
+	if err := rc.store.StartDailyQuota(ctx, rc.keyID, *rc.daily); err != nil {
+		return err
+	}
+	rc.dailyStarted = true
+	return nil
+}
+
+// ReleaseDaily closes a reservation without known usage. The store retains the
+// estimate when the upstream attempt already started.
+func (rc *RateCommit) ReleaseDaily() {
+	if rc == nil || rc.daily == nil {
+		return
+	}
+	d := *rc.daily
+	rc.daily = nil
+	if rc.store == nil {
+		return
+	}
+	if err := rc.store.ReleaseDailyQuota(context.Background(), rc.keyID, d); err != nil {
+		if rc.logger != nil {
+			rc.logger.Warn("release daily quota failed",
+				"key_id", rc.keyID, "error", err)
+		}
 	}
 }
 

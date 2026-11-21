@@ -66,3 +66,18 @@ test('解析失败必须当场报错，不能静默变 0', () => {
     '设置页不允许用 Number() 直接转换默认上下文窗口',
   )
 })
+
+test('配额输入支持 K/M/B 且解析失败不静默变 0', () => {
+  // 配额（用户级、密钥级）同样是「以 token 计的数量」，管理员会写 1M / 1B。
+  // 数字输入框会把后缀吃掉 → 保存成 0 = 不限，等于悄悄解除限制。
+  for (const rel of ['components/users/UserModals.tsx', 'components/keys/KeyFormModals.tsx']) {
+    const src = read(rel)
+    assert.ok(src.includes('parseTokenCount'), `${rel} 的配额输入必须走 parseTokenCount`)
+    assert.ok(
+      !src.includes('quota_tokens: Number('),
+      `${rel} 不允许用 Number() 直接转换配额（丢后缀会变成 0 = 不限）`,
+    )
+    assert.ok(src.includes('quotaValue === null'), `${rel} 保存前必须判解析结果`)
+    assert.ok(src.includes('<TokenField'), `${rel} 的配额输入必须用 TokenField（文本 + 解析）`)
+  }
+})

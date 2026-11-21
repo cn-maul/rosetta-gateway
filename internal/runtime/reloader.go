@@ -1,7 +1,6 @@
 // Package runtime owns the combined upstream-pool and snapshot rebuild.
 //
-// The rebuild is an explicit atomic operation: the pool and snapshot are
-// prepared independently, then installed only after both preparations succeed.
+// A completed rebuild publishes the routing snapshot with its client generation.
 package runtime
 
 import (
@@ -21,10 +20,8 @@ import (
 
 // Reloader serializes pool and snapshot rebuilds.
 //
-// The pool and snapshot are two separate atomic domains. Building both before
-// installing either prevents a failed second step from leaving them divergent;
-// the mutex keeps an admin-triggered reload and the background retry from
-// interleaving.
+// Its mutex serializes admin reloads and background retries. In-flight
+// requests continue to use the client view in their original snapshot.
 type Reloader struct {
 	mu        sync.Mutex
 	db        *store.Store
@@ -160,7 +157,7 @@ func (r *Reloader) Reload(ctx context.Context) error {
 		r.MarkDirty()
 		return fmt.Errorf("rebuild snapshot: %w", err)
 	}
-	r.pool.Install(providers, liveTargetIDs(ctx, r.db))
+	snap.Clients = r.pool.Install(providers, liveTargetIDs(ctx, r.db))
 	snapshot.Swap(snap)
 	r.markClean()
 	return nil

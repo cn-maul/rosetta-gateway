@@ -132,7 +132,15 @@ func anthropicUsageFields(u rosetta.Usage, emitInput bool) map[string]any {
 // content 块按 rosetta 统一内容的原始顺序输出（thinking → text → tool_use），
 // 上游是 OpenAI 系时 thinking 以 reasoning_content 聚合而来，天然只有一块。
 func WriteAnthropicResponse(w http.ResponseWriter, resp *rosetta.ChatResponse, model string) NonStreamWriteResult {
-	content := make([]map[string]any, 0, len(resp.Content))
+	return writeAnthropicResponse(w, resp, model, false)
+}
+
+func WriteSameProtocolAnthropicResponse(w http.ResponseWriter, resp *rosetta.ChatResponse, model string) NonStreamWriteResult {
+	return writeAnthropicResponse(w, resp, model, true)
+}
+
+func writeAnthropicResponse(w http.ResponseWriter, resp *rosetta.ChatResponse, model string, sameProtocol bool) NonStreamWriteResult {
+	content := make([]any, 0, len(resp.Content))
 	for _, blk := range resp.Content {
 		switch blk.Type {
 		case rosetta.BlockText:
@@ -171,6 +179,9 @@ func WriteAnthropicResponse(w http.ResponseWriter, resp *rosetta.ChatResponse, m
 			})
 		}
 	}
+	if sameProtocol && len(resp.Unknown) > 0 {
+		content = mergeAnthropicServerBlocks(resp.Raw, content)
+	}
 
 	// 统一 Usage 的 InputTokens 已含缓存读写（OpenAI 语义），Anthropic wire
 	// 要求三桶互斥 —— 拆分逻辑见 anthropicUsageFields。
@@ -191,6 +202,52 @@ func WriteAnthropicResponse(w http.ResponseWriter, resp *rosetta.ChatResponse, m
 		"stop_sequence": nil,
 		"usage":         usage,
 	})
+}
+
+func isAnthropicServerBlock(kind string) bool {
+	switch kind {
+	case "server_tool_use", "web_search_tool_result", "web_fetch_tool_result",
+		"code_execution_tool_result", "bash_code_execution_tool_result", "text_editor_code_execution_tool_result",
+		"tool_search_tool_result":
+		return true
+	default:
+		return false
+	}
+}
+
+func mergeAnthropicServerBlocks(raw json.RawMessage, normalized []any) []any {
+	var envelope struct {
+		Content []json.RawMessage `json:"content"`
+	}
+	if json.Unmarshal(raw, &envelope) != nil {
+		return normalized
+	}
+	merged := make([]any, 0, len(envelope.Content))
+	knownIndex := 0
+	for _, rawBlock := range envelope.Content {
+		var block struct {
+			Type string `json:"type"`
+		}
+		if json.Unmarshal(rawBlock, &block) != nil {
+			return normalized
+		}
+		switch block.Type {
+		case "text", "tool_use", "thinking", "redacted_thinking":
+			if knownIndex >= len(normalized) || normalized[knownIndex].(map[string]any)["type"] != block.Type {
+				return normalized
+			}
+			merged = append(merged, normalized[knownIndex])
+			knownIndex++
+		default:
+			if isAnthropicServerBlock(block.Type) {
+				merged = append(merged, rawBlock)
+			}
+		}
+	}
+	if knownIndex != len(normalized) {
+		return normalized
+	}
+	return merged
 }
 
 // anthropicToolInput 把上游给的工具参数规范化成 Anthropic 的 input 对象。
@@ -249,10 +306,12 @@ type AnthropicSSE struct {
 	// （Event/Finish）会并发到达，与 SSEWriter 同理。
 	mu sync.Mutex
 
-	id         string
-	started    bool // message_start 已发出
-	blockIndex int
-	openType   string // "" | "text" | "thinking" | "tool_use"
+	id                string
+	started           bool // message_start 已发出
+	blockIndex        int
+	openType          string // "" | "text" | "thinking" | "tool_use"
+	openSourceIndex   int
+	serverSourceIndex int
 	// openToolIdx 是当前开放 tool_use 块对应的 ToolIndex（同块判据，见 ensureBlock）。
 	openToolIdx int
 	// toolIdx 把上游的 ToolIndex 重编号成「第几个工具调用」
@@ -434,7 +493,11 @@ func (s *AnthropicSSE) Event(ev *rosetta.Event) {
 	case rosetta.EventMessageStart:
 		s.ensureStarted(ev.ID)
 	case rosetta.EventTextDelta:
+		if s.openType == "text" && s.openSourceIndex != ev.BlockIndex {
+			s.closeOpenBlock()
+		}
 		s.ensureBlock("text", 0)
+		s.openSourceIndex = ev.BlockIndex
 		if ev.Text != "" {
 			s.wroteContent = true
 		}
@@ -443,7 +506,11 @@ func (s *AnthropicSSE) Event(ev *rosetta.Event) {
 			"delta": map[string]any{"type": "text_delta", "text": ev.Text},
 		})
 	case rosetta.EventThinkingDelta:
+		if s.openType == "thinking" && s.openSourceIndex != ev.BlockIndex {
+			s.closeOpenBlock()
+		}
 		s.ensureBlock("thinking", 0)
+		s.openSourceIndex = ev.BlockIndex
 		if ev.Text != "" {
 			s.wroteContent = true
 			s.writeEvent("content_block_delta", map[string]any{
@@ -470,8 +537,55 @@ func (s *AnthropicSSE) Event(ev *rosetta.Event) {
 			"type": "content_block_delta", "index": s.blockIndex - 1,
 			"delta": map[string]any{"type": "input_json_delta", "partial_json": ev.ArgumentsDelta},
 		})
+	case rosetta.EventRedactedThinkingDelta:
+		s.ensureStarted("")
+		s.closeOpenBlock()
+		s.writeEvent("content_block_start", map[string]any{"type": "content_block_start", "index": s.blockIndex,
+			"content_block": map[string]any{"type": "redacted_thinking", "data": ev.Text}})
+		s.blockIndex++
+		s.openType = "redacted_thinking"
+		s.wroteContent = true
+		s.closeOpenBlock()
+	case rosetta.EventUnknown:
+		s.serverToolEvent(ev.Raw)
 	case rosetta.EventMessageEnd:
 		s.sawTerminal = true
+	}
+}
+
+func (s *AnthropicSSE) serverToolEvent(raw json.RawMessage) {
+	var frame struct {
+		Type         string          `json:"type"`
+		Index        *int            `json:"index"`
+		ContentBlock json.RawMessage `json:"content_block"`
+		Delta        json.RawMessage `json:"delta"`
+	}
+	if json.Unmarshal(raw, &frame) != nil || frame.Index == nil || *frame.Index < 0 {
+		return
+	}
+	switch frame.Type {
+	case "content_block_start":
+		var block struct {
+			Type string `json:"type"`
+		}
+		if json.Unmarshal(frame.ContentBlock, &block) != nil || !isAnthropicServerBlock(block.Type) {
+			return
+		}
+		s.ensureStarted("")
+		s.closeOpenBlock()
+		s.writeEvent(frame.Type, map[string]any{"type": frame.Type, "index": s.blockIndex, "content_block": frame.ContentBlock})
+		s.blockIndex++
+		s.openType = "server_tool"
+		s.serverSourceIndex = *frame.Index
+		s.wroteContent = true
+	case "content_block_delta":
+		var delta struct {
+			Type string `json:"type"`
+		}
+		if s.openType == "server_tool" && s.serverSourceIndex == *frame.Index &&
+			json.Unmarshal(frame.Delta, &delta) == nil && delta.Type == "input_json_delta" {
+			s.writeEvent(frame.Type, map[string]any{"type": frame.Type, "index": s.blockIndex - 1, "delta": frame.Delta})
+		}
 	}
 }
 

@@ -21,6 +21,13 @@ test('parses K and M suffixes as binary multiples', () => {
   assert.equal(parseTokenCount('512K'), 524288)
 })
 
+test('parses B suffix for quotas above one billion tokens', () => {
+  // 配额（终身累计）会超过 1B，输入框必须接受同一套写法。
+  assert.equal(parseTokenCount('1B'), 1073741824)
+  assert.equal(parseTokenCount('1b'), 1073741824)
+  assert.equal(parseTokenCount('2.5B'), 2684354560)
+})
+
 test('parses decimals in suffixed values', () => {
   assert.equal(parseTokenCount('1.5M'), 1572864)
   assert.equal(parseTokenCount('0.5K'), 512)
@@ -46,6 +53,7 @@ test('hint only appears for suffixed input', () => {
   assert.equal(tokenCountHint('131 072'), '= 131,072 tokens')
   assert.equal(tokenCountHint('128K'), '= 131,072 tokens')
   assert.equal(tokenCountHint('1M'), '= 1,048,576 tokens')
+  assert.equal(tokenCountHint('1B'), '= 1,073,741,824 tokens')
   assert.equal(tokenCountHint('0'), '')
   assert.equal(tokenCountHint('abc'), '')
 })

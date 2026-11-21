@@ -428,8 +428,7 @@ func FailoverEligible(err error) bool {
 // 下一跳时若那家也在冷却，整条链会直接返回 502，而且冷却期内没有任何请求
 // 能成功以触发 RecordCredentialSuccess 复苏。
 //
-// 429 本应按 Retry-After，但 rosetta v0.5.1 未把该 header 暴露到 APIError 上
-// （重试退避在 SDK 内部完成），故取 DESIGN 的 60s 上限作为保守值。
+// 429 使用 SDK 解析后的 Retry-After，限制在 1–60 秒，缺失时取 60 秒。
 func CredentialCooldown(err error) time.Duration {
 	var apiErr *rosetta.APIError
 	if errors.As(err, &apiErr) {
@@ -439,7 +438,10 @@ func CredentialCooldown(err error) time.Duration {
 		case apiErr.StatusCode == http.StatusPaymentRequired:
 			return time.Hour
 		case apiErr.StatusCode == http.StatusTooManyRequests:
-			return 60 * time.Second
+			if apiErr.RetryAfter <= 0 {
+				return time.Minute
+			}
+			return min(time.Minute, max(time.Second, apiErr.RetryAfter))
 		}
 	}
 	return 0

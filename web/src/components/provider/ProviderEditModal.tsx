@@ -187,9 +187,10 @@ export function ProviderEditModal({
           <Label>超时（秒）</Label>
           <Input type="number" min={0} step={0.1} />
         </TextField>
-        <TextField aria-label="最大重试次数" value={maxRetries} onChange={setMaxRetries}>
-          <Label>最大重试次数</Label>
+        <TextField aria-label="模型列表最大重试次数" value={maxRetries} onChange={setMaxRetries}>
+          <Label>模型列表最大重试次数</Label>
           <Input type="number" min={0} max={10} step={1} />
+          <p slot="description" className="text-xs text-muted">生成请求由路由的故障转移策略处理。</p>
         </TextField>
         <div className="col-span-2 flex flex-col gap-1">
           <Label>代理</Label>

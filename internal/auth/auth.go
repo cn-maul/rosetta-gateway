@@ -22,6 +22,10 @@ type Context struct {
 	// 从快照随鉴权一并带出，供转发热路径执行限速（DESIGN §11.4）。
 	RPMLimit int
 	TPMLimit int
+	// DailyRequestLimit / DailyTokenLimit 是该 key 的每日上限（0 = 不限）。
+	// 计数在库中（store.ReserveDailyQuota），这里只带阈值。
+	DailyRequestLimit int
+	DailyTokenLimit   int
 	// KeyModelAllow / GroupModelAllow 是模型可见性的两个维度（P1）：
 	// key 级白名单（access_keys.allowed_models_json）与用户所属组的白名单
 	// （user_group_models）。两者求**交**，且 key 级只能更紧。
@@ -41,6 +45,10 @@ func (c *Context) AllowsModel(model string) bool {
 }
 
 func Authenticate(r *http.Request) (*Context, error) {
+	return AuthenticateSnapshot(r, snapshot.Get())
+}
+
+func AuthenticateSnapshot(r *http.Request, snap *snapshot.Snapshot) (*Context, error) {
 	key := extractKey(r)
 	if key == "" {
 		return nil, ErrNoKey
@@ -55,7 +63,7 @@ func Authenticate(r *http.Request) (*Context, error) {
 	// 前缀匹配信息无法反推哈希原像，更无法还原 key 本身，不构成可用的
 	// 侧信道。慢哈希（bcrypt 类）同样不必要：key 是网关生成的高熵随机串
 	// （DESIGN §6.2），不是用户口令。
-	matched := snapshot.Get().KeysByHash[hashHex]
+	matched := snap.KeysByHash[hashHex]
 	if matched == nil {
 		return nil, ErrInvalidKey
 	}
@@ -88,7 +96,6 @@ func Authenticate(r *http.Request) (*Context, error) {
 
 	// 归属用户的启用状态随快照一并带出，热路径据此零成本拒绝已禁用账号
 	// （不查库，禁用随 Swap 立即生效）。
-	snap := snapshot.Get()
 	u := snap.UsersByID[matched.UserID]
 	if u == nil {
 		// 查不到归属用户 → 拒绝。两种成因都不该放行：
@@ -133,12 +140,15 @@ func Authenticate(r *http.Request) (*Context, error) {
 	}
 
 	return &Context{
-		KeyID:         matched.ID,
-		Name:          matched.Name,
-		UserID:        matched.UserID,
-		RPMLimit:      matched.RPMLimit,
-		TPMLimit:      matched.TPMLimit,
-		KeyModelAllow: matched.AllowedModels,
+		KeyID:    matched.ID,
+		Name:     matched.Name,
+		UserID:   matched.UserID,
+		RPMLimit: matched.RPMLimit,
+		TPMLimit: matched.TPMLimit,
+		// 每日上限（2026-11-17）：阈值随快照下发，计数本身在库里。
+		DailyRequestLimit: matched.DailyRequestLimit,
+		DailyTokenLimit:   matched.DailyTokenLimit,
+		KeyModelAllow:     matched.AllowedModels,
 		// 组白名单直接取**已解析好的**那一份：P2 的 key 级组覆盖
 		// （access_keys.group_id）在快照重建时就已折算完毕，
 		// 热路径不需要判断「该用 key 的组还是用户的组」。

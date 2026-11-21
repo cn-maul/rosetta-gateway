@@ -3,11 +3,66 @@ package outwire
 import (
 	"encoding/json"
 	"net/http/httptest"
+	"slices"
 	"strings"
 	"testing"
 
 	"github.com/cn-maul/rosetta"
 )
+
+func TestResponsesSSE_InterleavedIndexedTextParts(t *testing.T) {
+	recorder := httptest.NewRecorder()
+	sink := NewResponsesSSE(recorder, nil, "resp_1", "model", nil)
+	first, tool, last := 0, 1, 2
+	for _, event := range []*rosetta.Event{
+		{Type: rosetta.EventTextDelta, OutputIndex: &first, BlockIndex: 0, Text: "first"},
+		{Type: rosetta.EventToolCall, OutputIndex: &tool, ToolIndex: 1, ToolID: "call_1", ToolName: "lookup"},
+		{Type: rosetta.EventTextDelta, OutputIndex: &first, BlockIndex: 3, Text: "second"},
+		{Type: rosetta.EventTextDelta, OutputIndex: &last, BlockIndex: 4, Text: "third"},
+		{Type: rosetta.EventToolCall, OutputIndex: &tool, ToolIndex: 1, ArgumentsDelta: "{}"},
+		{Type: rosetta.EventTextDelta, OutputIndex: &first, BlockIndex: 0, Text: " part"},
+	} {
+		sink.Event(event)
+	}
+	sink.Finish("ok", rosetta.StopEnd, rosetta.Usage{}, false)
+	var deltas, dones []int
+	for _, event := range collect(t, recorder.Body.String()) {
+		var payload struct {
+			OutputIndex int `json:"output_index"`
+			PartIndex   int `json:"content_index"`
+			Response    struct {
+				Output []struct {
+					Type      string `json:"type"`
+					Arguments string `json:"arguments"`
+					Content   []struct {
+						Text string `json:"text"`
+					} `json:"content"`
+				} `json:"output"`
+			} `json:"response"`
+		}
+		if err := json.Unmarshal([]byte(event[1]), &payload); err != nil {
+			t.Fatal(err)
+		}
+		switch event[0] {
+		case "response.output_text.delta":
+			if payload.OutputIndex == 0 {
+				deltas = append(deltas, payload.PartIndex)
+			}
+		case "response.output_text.done":
+			if payload.OutputIndex == 0 {
+				dones = append(dones, payload.PartIndex)
+			}
+		case "response.completed":
+			output := payload.Response.Output
+			if len(output) != 3 || len(output[0].Content) != 2 || output[0].Content[0].Text != "first part" || output[0].Content[1].Text != "second" || output[1].Type != "function_call" || output[1].Arguments != "{}" || len(output[2].Content) != 1 || output[2].Content[0].Text != "third" {
+				t.Fatalf("unexpected completed output: %+v", output)
+			}
+		}
+	}
+	if !slices.Equal(deltas, []int{0, 1, 0}) || !slices.Equal(dones, []int{0, 1}) {
+		t.Fatalf("delta indices = %v, done indices = %v", deltas, dones)
+	}
+}
 
 // responses 事件序列：created → (item.added → part.added → text.delta →
 // part.done → item.done) → completed（带 usage 与完整文本）。
@@ -282,5 +337,76 @@ func TestWriteResponsesResponse(t *testing.T) {
 	}
 	if out.Usage.InputTokens != 5 || out.Usage.OutputTokens != 6 {
 		t.Fatalf("usage: %+v", out.Usage)
+	}
+}
+
+func TestResponsesIncompleteReasonPreservesContentFilter(t *testing.T) {
+	cases := []struct {
+		stop rosetta.StopReason
+		want string
+	}{
+		{rosetta.StopLength, "max_output_tokens"},
+		{rosetta.StopContentFilter, "content_filter"},
+		{rosetta.StopRefusal, "refusal"},
+		{rosetta.StopEnd, ""},
+	}
+	for _, tc := range cases {
+		if got := responsesIncompleteReason(tc.stop); got != tc.want {
+			t.Fatalf("stop %q: %q, want %q", tc.stop, got, tc.want)
+		}
+	}
+	rec := httptest.NewRecorder()
+	WriteResponsesResponseWithTools(rec, &rosetta.ChatResponse{StopReason: rosetta.StopContentFilter}, "m", nil)
+	var out struct {
+		Status     string `json:"status"`
+		Incomplete struct {
+			Reason string `json:"reason"`
+		} `json:"incomplete_details"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if out.Status != "incomplete" || out.Incomplete.Reason != "content_filter" {
+		t.Fatalf("response = %+v", out)
+	}
+}
+
+// The streaming path must expose the same incomplete reason as the JSON path.
+// A filtered stream otherwise ends as a normal response.completed, which tells
+// the client the model finished voluntarily.
+func TestResponsesSSE_ContentFilterEmitsIncomplete(t *testing.T) {
+	rec := httptest.NewRecorder()
+	s := NewResponsesSSE(rec, nil, "resp_filter", "gw-model", nil)
+
+	s.Event(&rosetta.Event{Type: rosetta.EventMessageStart, ID: "resp_filter"})
+	s.Event(&rosetta.Event{Type: rosetta.EventTextDelta, Text: "blocked"})
+	s.Event(&rosetta.Event{Type: rosetta.EventMessageEnd, StopReason: rosetta.StopContentFilter})
+	s.Finish("ok", rosetta.StopContentFilter, rosetta.Usage{InputTokens: 5, OutputTokens: 1, TotalTokens: 6}, false)
+
+	raw := rec.Body.String()
+	if strings.Contains(raw, "event: response.completed") {
+		t.Fatalf("content-filtered stream must not report completion:\n%s", raw)
+	}
+	if !strings.Contains(raw, "event: response.incomplete") {
+		t.Fatalf("content-filtered stream must emit response.incomplete:\n%s", raw)
+	}
+	var terminal struct {
+		Response struct {
+			Status     string `json:"status"`
+			Incomplete struct {
+				Reason string `json:"reason"`
+			} `json:"incomplete_details"`
+		} `json:"response"`
+	}
+	for _, entry := range collect(t, raw) {
+		if entry[0] != "response.incomplete" {
+			continue
+		}
+		if err := json.Unmarshal([]byte(entry[1]), &terminal); err != nil {
+			t.Fatalf("decode response.incomplete: %v", err)
+		}
+	}
+	if terminal.Response.Status != "incomplete" || terminal.Response.Incomplete.Reason != "content_filter" {
+		t.Fatalf("terminal payload = %+v", terminal.Response)
 	}
 }

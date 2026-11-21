@@ -193,13 +193,15 @@ func RebuildFromDB(ctx context.Context, st *store.Store, failures []ProviderFail
 			groupAllow = groupModelAllow(groupModels, k.GroupID)
 		}
 		keysByHash[k.KeyHash] = &KeySnapshot{
-			ID:       k.ID,
-			KeyHash:  k.KeyHash,
-			Name:     k.Name,
-			Enabled:  k.Enabled,
-			UserID:   k.UserID,
-			RPMLimit: k.RPMLimit,
-			TPMLimit: k.TPMLimit,
+			ID:                k.ID,
+			KeyHash:           k.KeyHash,
+			Name:              k.Name,
+			Enabled:           k.Enabled,
+			UserID:            k.UserID,
+			RPMLimit:          k.RPMLimit,
+			TPMLimit:          k.TPMLimit,
+			DailyRequestLimit: k.DailyRequestLimit,
+			DailyTokenLimit:   k.DailyTokenLimit,
 			// nil 切片 = 未配置限制 → AllowAll；非 nil（哪怕为空，
 			// 那是 JSON 损坏的兜底）= AllowOnly。两种取值的约定见
 			// store.AccessKey.AllowedModels。

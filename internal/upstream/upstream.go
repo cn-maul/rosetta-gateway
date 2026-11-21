@@ -2,6 +2,7 @@ package upstream
 
 import (
 	"context"
+	"crypto/sha256"
 	"errors"
 	"fmt"
 	"hash/fnv"
@@ -487,30 +488,33 @@ type LiveTargets struct {
 //
 // liveTargetIDs 是重建后仍然存在的 target ID 全集（来自 route_targets）。
 // 不在其中的旧条目被丢弃：targetID 每次保存链都重新生成，留着会单调堆积。
-func (p *Pool) Install(providers map[string]*ProviderEntry, live LiveTargets) {
+func (p *Pool) Install(providers map[string]*ProviderEntry, live LiveTargets) *ClientView {
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	for _, provider := range providers {
+		for _, cred := range provider.Credentials {
+			if prior := p.credIndex[cred.ID]; prior != nil && prior.APIKey == cred.APIKey && prior.Status == "cooling" &&
+				cred.Enabled && cred.Status != "disabled" && prior.CooldownUntil.After(cred.CooldownUntil) {
+				cred.CooldownUntil = prior.CooldownUntil
+				cred.Status = prior.Status
+			}
+		}
+	}
 	p.providers = providers
 	p.reindexLocked()
+	view := &ClientView{pool: p, providers: providers}
 
 	// 集合未知（读库失败）→ 保留**全部**既有熔断状态。
 	//
 	// 原因见 LiveTargets 的注释：一次读池抖动就把全站熔断状态清空，
 	// 会让正在熔断的坏上游立刻复活。而旧实现的“返回空集”恰好导致这一点。
 	if !live.Known {
-		return
+		return view
 	}
 
 	kept := make(map[string]*targetHealth, len(live.IDs))
 	for tid := range live.IDs {
 		if h, ok := p.targets[tid]; ok {
-			// 沿用旧的健康状态（含未到期的 until），但**清掉 halfOpenToken**。
-			//
-			// halfOpen 的含义是「有一个探测请求正在途」，只对该请求所在的
-			// 进程实例有效。重建时上一个在途请求要么已完成（结果已记账、
-			// 名额已释放），要么随旧池一起作废 —— 两种情况下把它继承下来
-			// 都是错的，而错的方向是「永久不可用」：没有任何东西会再来
-			// 释放它。until 没到期时本来就该熔断，保留它即可。
 			h.halfOpenToken = 0
 			h.halfOpenCycle = 0
 			kept[tid] = h
@@ -519,6 +523,21 @@ func (p *Pool) Install(providers map[string]*ProviderEntry, live LiveTargets) {
 		}
 	}
 	p.targets = kept
+	return view
+}
+
+type ClientView struct {
+	pool      *Pool
+	providers map[string]*ProviderEntry
+}
+
+func (p *Pool) ClientView() *ClientView {
+	if p == nil {
+		return nil
+	}
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	return &ClientView{pool: p, providers: p.providers}
 }
 
 // ProvidersSnapshot 返回当前 provider 表的浅拷贝，仅供测试与诊断使用。
@@ -539,12 +558,14 @@ func (p *Pool) ProvidersSnapshot() map[string]*ProviderEntry {
 // Callers that need protocol-specific behavior must consult this method rather
 // than treating the configured "auto" as a synonym for Chat.
 func (p *Pool) ResolvedProtocol(providerSlug string) string {
-	if p == nil {
+	return p.ClientView().ResolvedProtocol(providerSlug)
+}
+
+func (v *ClientView) ResolvedProtocol(providerSlug string) string {
+	if v == nil {
 		return ""
 	}
-	p.mu.RLock()
-	defer p.mu.RUnlock()
-	prov, ok := p.providers[providerSlug]
+	prov, ok := v.providers[providerSlug]
 	if !ok || prov == nil {
 		return ""
 	}
@@ -564,26 +585,47 @@ func (p *Pool) GetAnyClientByAffinity(providerSlug, affinity string) (*rosetta.C
 }
 
 func (p *Pool) getAnyClient(providerSlug, affinity string) (*rosetta.Client, string, error) {
+	return p.ClientView().GetAnyClientByAffinity(providerSlug, affinity)
+}
+
+func (v *ClientView) GetAnyClientByAffinity(providerSlug, affinity string) (*rosetta.Client, string, error) {
+	client, credentialID, _, err := v.SelectClient(providerSlug, affinity, "", [32]byte{})
+	return client, credentialID, err
+}
+
+func (v *ClientView) SelectClient(providerSlug, affinity, pinnedCredential string, pinnedVersion [32]byte) (*rosetta.Client, string, [32]byte, error) {
+	if v == nil {
+		return nil, "", [32]byte{}, fmt.Errorf("provider %q not found or disabled", providerSlug)
+	}
+	p := v.pool
 	p.mu.RLock()
 	defer p.mu.RUnlock()
 
-	prov, ok := p.providers[providerSlug]
+	prov, ok := v.providers[providerSlug]
 	if !ok || !prov.Enabled {
-		return nil, "", fmt.Errorf("provider %q not found or disabled", providerSlug)
+		return nil, "", [32]byte{}, fmt.Errorf("provider %q not found or disabled", providerSlug)
 	}
 
 	healthy := p.getHealthyCredentials(prov)
 	if len(healthy) == 0 {
-		return nil, "", fmt.Errorf("no healthy credentials for provider %q", providerSlug)
+		return nil, "", [32]byte{}, fmt.Errorf("no healthy credentials for provider %q", providerSlug)
+	}
+	if pinnedCredential != "" {
+		for _, credential := range healthy {
+			if credential.ID == pinnedCredential && sha256.Sum256([]byte(credential.APIKey)) == pinnedVersion {
+				return credential.Client, credential.ID, pinnedVersion, nil
+			}
+		}
+		return nil, "", [32]byte{}, errors.New("the original upstream credential is unavailable")
 	}
 
 	var cred *CredentialEntry
-	if affinity == "" {
+	if affinity = strings.TrimSpace(affinity); affinity == "" {
 		cred = p.selectWeighted(healthy)
 	} else {
 		cred = p.selectWeightedByAffinity(healthy, affinity)
 	}
-	return cred.Client, cred.ID, nil
+	return cred.Client, cred.ID, sha256.Sum256([]byte(cred.APIKey)), nil
 }
 
 // MarkCredentialCooldown 把一把凭据踢出健康轮换一段时间（冷却）。
@@ -857,10 +899,14 @@ func (p *Pool) getHealthyCredentials(prov *ProviderEntry) []*CredentialEntry {
 		if !cred.Enabled {
 			continue
 		}
-		if cred.Status == "cooling" && now.Before(cred.CooldownUntil) {
+		health := cred
+		if current := p.credIndex[cred.ID]; current != nil && current.APIKey == cred.APIKey {
+			health = current
+		}
+		if health.Status == "cooling" && now.Before(health.CooldownUntil) {
 			continue
 		}
-		if cred.Status == "disabled" {
+		if health.Status == "disabled" {
 			continue
 		}
 		result = append(result, cred)
@@ -1456,6 +1502,7 @@ func buildClient(ctx context.Context, prov *ProviderEntry, apiKey string, cfg *c
 	// cache-affinity headers.
 	opts = append(opts, rosetta.WithHTTPClient(
 		withConversationAffinityTransport(tracedHC, prov.Endpoint, prov.Protocol, prov.Slug)))
+	opts = append(opts, rosetta.WithUnknownEvents(prov.Protocol == wireproto.Anthropic))
 
 	// 把网关这一侧配好的模型能力注入 SDK 的模型档案。
 	//

@@ -61,9 +61,14 @@ type AccessKey struct {
 	// GroupID 是 key 级分组覆盖（P2）。空串 = 沿用归属用户的分组。
 	GroupID string
 	// RPMLimit / TPMLimit 是 Key 维度的每分钟限速（DESIGN §11.4），0 = 不限。
-	RPMLimit  int
-	TPMLimit  int
-	CreatedAt int64
+	RPMLimit int
+	TPMLimit int
+	// DailyRequestLimit / DailyTokenLimit 是 Key 维度的**每日**上限
+	// （2026-11-17），0 = 不限。与 rpm/tpm 的区别是窗口宽度（一天 vs 一分钟），
+	// 且计数落库、跨重启有效（见 daily_quota.go）。
+	DailyRequestLimit int
+	DailyTokenLimit   int
+	CreatedAt         int64
 }
 
 // keyColumns 是 access_keys 的统一投影。
@@ -76,7 +81,7 @@ type AccessKey struct {
 // user_id 必须用 COALESCE 兜成空串：它是外键列，无归属 key 在 SQLite 里
 // 是真 NULL，而把 NULL 扫进 string 会报
 // "converting NULL to string is unsupported"（见 model_dao 的同款注释）。
-const keyColumns = `id, key_hash, key_prefix, (key_enc IS NOT NULL) AS has_secret, name, enabled, quota_tokens, used_tokens, COALESCE(user_id, '') AS user_id, rpm_limit, tpm_limit, allowed_models_json, expires_at, COALESCE(allowed_ips, '') AS allowed_ips, COALESCE(group_id, '') AS group_id, created_at`
+const keyColumns = `id, key_hash, key_prefix, (key_enc IS NOT NULL) AS has_secret, name, enabled, quota_tokens, used_tokens, COALESCE(user_id, '') AS user_id, rpm_limit, tpm_limit, daily_request_limit, daily_token_limit, allowed_models_json, expires_at, COALESCE(allowed_ips, '') AS allowed_ips, COALESCE(group_id, '') AS group_id, created_at`
 
 func scanAccessKey(sc scanner) (*AccessKey, error) {
 	var k AccessKey
@@ -87,6 +92,7 @@ func scanAccessKey(sc scanner) (*AccessKey, error) {
 	var allowedJSON sql.NullString
 	if err := sc.Scan(&k.ID, &k.KeyHash, &k.KeyPrefix, &hasSecret, &k.Name, &enabled,
 		&k.QuotaTokens, &k.UsedTokens, &k.UserID, &k.RPMLimit, &k.TPMLimit,
+		&k.DailyRequestLimit, &k.DailyTokenLimit,
 		&allowedJSON, &k.ExpiresAt, &k.AllowedIPs, &k.GroupID, &k.CreatedAt); err != nil {
 		return nil, err
 	}
@@ -297,10 +303,11 @@ func createAccessKey(ctx context.Context, ex execer, k *AccessKey) error {
 		enabled = 1
 	}
 	_, err := ex.ExecContext(ctx,
-		`INSERT INTO access_keys (id, key_hash, key_prefix, key_enc, name, enabled, quota_tokens, user_id, rpm_limit, tpm_limit, allowed_models_json, expires_at, allowed_ips, group_id, created_at)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		`INSERT INTO access_keys (id, key_hash, key_prefix, key_enc, name, enabled, quota_tokens, user_id, rpm_limit, tpm_limit, daily_request_limit, daily_token_limit, allowed_models_json, expires_at, allowed_ips, group_id, created_at)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		k.ID, k.KeyHash, k.KeyPrefix, nullableBytes(k.KeyEnc), k.Name, enabled, k.QuotaTokens, nullIfEmpty(k.UserID),
-		k.RPMLimit, k.TPMLimit, encodeAllowedModels(k.AllowedModels), k.ExpiresAt,
+		k.RPMLimit, k.TPMLimit, k.DailyRequestLimit, k.DailyTokenLimit,
+		encodeAllowedModels(k.AllowedModels), k.ExpiresAt,
 		nullIfEmpty(k.AllowedIPs), nullIfEmpty(k.GroupID), now)
 	// 回写时间戳：落库用的是局部变量 now，结构体仍是零值 → 创建响应里的
 	// created_at 会是 0，与随后 GET 到的同一条记录不一致（前端会显示「建于 1970」）。
@@ -342,9 +349,11 @@ func (s *Store) UpdateAccessKey(ctx context.Context, id string, k *AccessKey) er
 	}
 	res, err := s.db.ExecContext(ctx,
 		`UPDATE access_keys SET name = ?, enabled = ?, quota_tokens = ?, rpm_limit = ?, tpm_limit = ?,
+		        daily_request_limit = ?, daily_token_limit = ?,
 		        allowed_models_json = ?, expires_at = ?, allowed_ips = ?, group_id = ?
 		  WHERE id = ?`,
 		k.Name, enabled, k.QuotaTokens, k.RPMLimit, k.TPMLimit,
+		k.DailyRequestLimit, k.DailyTokenLimit,
 		encodeAllowedModels(k.AllowedModels), k.ExpiresAt,
 		nullIfEmpty(k.AllowedIPs), nullIfEmpty(k.GroupID), id)
 	return checkAffected(res, err)
@@ -381,9 +390,11 @@ func (s *Store) UpdateAccessKeyWithOwner(ctx context.Context, id string, k *Acce
 		}
 		res, err := ex.ExecContext(ctx,
 			`UPDATE access_keys SET name = ?, enabled = ?, quota_tokens = ?, rpm_limit = ?, tpm_limit = ?,
+			        daily_request_limit = ?, daily_token_limit = ?,
 			        allowed_models_json = ?, expires_at = ?, allowed_ips = ?, group_id = ?
 			  WHERE id = ?`,
 			k.Name, enabled, k.QuotaTokens, k.RPMLimit, k.TPMLimit,
+			k.DailyRequestLimit, k.DailyTokenLimit,
 			encodeAllowedModels(k.AllowedModels), k.ExpiresAt,
 			nullIfEmpty(k.AllowedIPs), nullIfEmpty(k.GroupID), id)
 		if err != nil {
@@ -422,7 +433,16 @@ func (s *Store) GetKeyQuota(ctx context.Context, id string) (quota, used int64, 
 
 // DeleteAccessKey 删除一把访问密钥；id 不存在时返回 ErrNotFound。
 func (s *Store) DeleteAccessKey(ctx context.Context, id string) error {
-	return deleteByID(ctx, s.db, "access_keys", id)
+	if err := deleteByID(ctx, s.db, "access_keys", id); err != nil {
+		return err
+	}
+	// 每日计数没有外键（它按 (key, day) 分桶，不是 key 的从属实体），
+	// 删 key 后顺手清掉，免得留下永远读不到的孤儿行。这里刻意忽略错误：
+	// key 已经删掉了，孤儿行只占空间，不能让清理失败把一次成功的删除
+	// 报成失败 —— 调用方会以为 key 还在。
+	_, _ = s.db.ExecContext(ctx,
+		`DELETE FROM access_key_daily_usage WHERE access_key_id = ?`, id)
+	return nil
 }
 
 // ReserveQuota 为一次请求**原子地**预占 est 个 token 的配额，返回是否放行。

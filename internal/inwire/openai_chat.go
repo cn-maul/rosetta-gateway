@@ -508,16 +508,18 @@ func maxTokens(r *OpenAIChatRequest) int {
 // （见 handleIngress 的过滤逻辑）。response_format 缺失、type 为 "text"
 // 或畸形 JSON 时返回 false：前两者本就无约束，畸形体交给上游拒绝。
 func (r *OpenAIChatRequest) RequiresStructuredOutput() bool {
-	if len(r.ResponseFormat) == 0 {
-		return false
-	}
+	format := r.OutputFormatType()
+	return format == "json_object" || format == "json_schema"
+}
+
+func (r *OpenAIChatRequest) OutputFormatType() string {
 	var f struct {
 		Type string `json:"type"`
 	}
 	if json.Unmarshal(r.ResponseFormat, &f) != nil {
-		return false
+		return ""
 	}
-	return f.Type == "json_object" || f.Type == "json_schema"
+	return f.Type
 }
 
 func convertMessage(m OpenAIMessage) rosetta.Message {

@@ -184,6 +184,10 @@ export function Settings() {
 
   const [pruning, setPruning] = useState(false)
   const [pruneResult, setPruneResult] = useState<PruneResult | null>(null)
+  // 本次手动剪枝的保留天数。留空 = 沿用 config.json 的 usage_retention_days。
+  // 单独一个输入框而不是改全局配置：手动剪枝是「现在就要收掉」，改配置是
+  // 「以后都这么保留」，两者混在一个控件里会让人以为改一次就永久生效。
+  const [keepDays, setKeepDays] = useState('')
 
   // 价格页签是独立组件、自己拉数据；外层「刷新」按钮通过计数器触发它的重拉。
   const [priceRefresh, setPriceRefresh] = useState(0)
@@ -311,9 +315,21 @@ export function Settings() {
   // 运维还需要一个「现在就要」的入口：排查完问题立即收掉明细，或确认归档
   // 是否真的在跑 —— 否则唯一手段是 curl。
   const runPrune = async () => {
+    // 后端接受 1..3650；这里先挡，不让人白等一次往返。空 = 用配置值。
+    const rawKeep = keepDays.trim()
+    let keepArg: number | undefined
+    if (rawKeep !== '') {
+      const n = Number(rawKeep)
+      if (!Number.isInteger(n) || n < 1 || n > 3650) {
+        toast.danger('保留天数必须是 1–3650 的整数，留空则沿用配置值')
+        return
+      }
+      keepArg = n
+    }
+    const scope = keepArg === undefined ? '按配置的保留窗口' : `保留最近 ${keepArg} 天`
     const ok = await confirmBox({
       title: '立即执行归档剪枝？',
-      body: '保留窗口（默认 30 天）之前的调用明细将聚合进按天累计后删除。累计数据保留，但单次调用的明细不可恢复。',
+      body: `${scope}，更早的调用明细将聚合进按天累计后删除。累计数据保留，但单次调用的明细不可恢复。`,
       // 不可恢复的操作必须标成危险操作：文案已说明后果，视觉却与普通按钮
       // 同色，两者矛盾会削弱文案本身的作用。
       danger: true,
@@ -322,7 +338,7 @@ export function Settings() {
     if (!ok) return
     setPruning(true)
     try {
-      const r = await api.pruneUsage()
+      const r = await api.pruneUsage(keepArg)
       setPruneResult(r)
       // skipped 不是失败：水位已到位 / 无待归档数据都会走这条，原因在 reason。
       if (r.skipped) toast.success(`本次跳过：${r.reason || '无待归档的数据'}`)
@@ -668,13 +684,22 @@ export function Settings() {
                       用量归档
                     </span>
                   }
-                  description="调用明细保留 30 天，更早的记录聚合进「按天累计」后删除；累计永久保留。"
+                  description="按时长保留调用明细，更早的记录聚合进「按天累计」后删除；累计永久保留。默认 30 天，由 config.json 的 usage_retention_days 决定（1–3650）。"
                   actions={
                     <Button variant="secondary" size="sm" isDisabled={pruning} onPress={() => void runPrune()}>
                       {pruning ? '剪枝中…' : '立即归档剪枝'}
                     </Button>
                   }
                 >
+                  <div className="mb-3 max-w-[220px]">
+                    <TextField aria-label="本次保留天数" value={keepDays} onChange={setKeepDays}>
+                      <Label>本次保留天数</Label>
+                      <Input type="number" min={1} max={3650} step={1} placeholder="留空 = 用配置值" />
+                      <span className="text-muted text-[11px]">
+                        留空沿用 config.json 的 usage_retention_days；填了就只影响这一次。
+                      </span>
+                    </TextField>
+                  </div>
                   {pruneResult ? (
                     <Surface variant="secondary" className="text-muted rounded-lg px-3.5 py-3 text-[12.5px]">
                       {pruneResult.skipped ? (

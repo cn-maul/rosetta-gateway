@@ -4,6 +4,8 @@ import { api, ApiFail } from '../../api'
 import { AppModal } from '../../ui/AppModal'
 import { fmtTokens, fmtDateTime, fmtBalance } from '../../fmt'
 import { checkPasswordStrength } from '../../password'
+import { TokenField } from '../../ui/TokenField'
+import { parseTokenCount } from '../../tokenCount'
 import { GroupSelect, RoleSelect } from './UserSelects'
 import type { Group, User, UserRole } from '../../types'
 
@@ -25,6 +27,14 @@ export function UserCreateModal({ open, onClose, groups, onSaved }: UserCreateMo
   const [quota, setQuota] = useState('0')
   const [err, setErr] = useState('')
   const [busy, setBusy] = useState(false)
+
+  /** 配额允许 1M / 1B 这类写法；解析失败必须报错，不能静默落成 0（= 不限）。
+   *  0 是「不限」，与「没填」同义，所以空串按 0 处理，其余输入必须能解析。 */
+  const quotaTokens = (): number | null => {
+    const raw = quota.trim()
+    if (!raw) return 0
+    return parseTokenCount(raw)
+  }
 
   useEffect(() => {
     if (!open) return
@@ -49,6 +59,11 @@ export function UserCreateModal({ open, onClose, groups, onSaved }: UserCreateMo
       setErr('初始密码必填')
       return
     }
+    const quotaValue = quotaTokens()
+    if (quotaValue === null) {
+      setErr('额度上限无法识别，请填数字或 1M / 1B 这类写法')
+      return
+    }
     const weak = checkPasswordStrength(password)
     if (weak) {
       setErr(weak)
@@ -61,7 +76,7 @@ export function UserCreateModal({ open, onClose, groups, onSaved }: UserCreateMo
         password,
         role,
         group_id: group || undefined,
-        quota_tokens: Number(quota) || 0,
+        quota_tokens: quotaValue,
       })
       onClose()
       setName('')
@@ -121,11 +136,13 @@ export function UserCreateModal({ open, onClose, groups, onSaved }: UserCreateMo
           </div>
           <span className="text-muted mt-1 block text-[11px]">分组决定能用哪些模型。未分组 = 不限制。</span>
         </div>
-        <TextField aria-label="额度上限（token）" value={quota} onChange={setQuota}>
-          <Label>额度上限（token）</Label>
-          <Input type="number" min={0} step={1} placeholder="0" />
-          <span className="text-muted text-[11px]">0 = 不限</span>
-        </TextField>
+        <TokenField
+          label="额度上限（token）"
+          value={quota}
+          onChange={setQuota}
+          placeholder="0"
+          hint="0 = 不限；可写 1M / 1B"
+        />
       </div>
       {err ? (
         <div className="text-danger mt-3 text-[12.5px]" role="alert">
@@ -156,6 +173,12 @@ export function UserEditModal({
   const [err, setErr] = useState('')
   const [busy, setBusy] = useState(false)
 
+  const quotaTokens = (): number | null => {
+    const raw = quota.trim()
+    if (!raw) return 0
+    return parseTokenCount(raw)
+  }
+
   useEffect(() => {
     if (!user) return
     setRole(user.role)
@@ -178,8 +201,9 @@ export function UserEditModal({
       setErr('该账号尚未设置密码，请先重置密码，再升级为管理员')
       return
     }
-    if (Number(quota) < 0) {
-      setErr('额度上限不能为负')
+    const quotaValue = quotaTokens()
+    if (quotaValue === null) {
+      setErr('额度上限无法识别，请填数字或 1M / 1B 这类写法')
       return
     }
     const roleChanged = role !== u.role
@@ -190,7 +214,7 @@ export function UserEditModal({
         // 空串 = 明确的「移出分组」（后端用指针区分「不传」与「传空」），
         // 不能用 undefined，否则「清空分组」这个动作表达不出去。
         group_id: group,
-        quota_tokens: Number(quota) || 0,
+        quota_tokens: quotaValue,
         remark: remark.trim(),
       })
       toast.success(roleChanged ? '已保存，该用户的登录状态已失效' : '已保存')
@@ -253,11 +277,13 @@ export function UserEditModal({
               </div>
               <span className="text-muted mt-1 block text-[11px]">分组决定能用哪些模型。未分组 = 不限制。</span>
             </div>
-            <TextField aria-label="额度上限（token）" value={quota} onChange={setQuota}>
-              <Label>额度上限（token）</Label>
-              <Input type="number" min={0} step={1} placeholder="0" />
-              <span className="text-muted text-[11px]">0 = 不限。已用 {fmtTokens(user.used_tokens)}。</span>
-            </TextField>
+            <TokenField
+              label="额度上限（token）"
+              value={quota}
+              onChange={setQuota}
+              placeholder="0"
+              hint={`0 = 不限。已用 ${fmtTokens(user.used_tokens)}；可写 1M / 1B。`}
+            />
             <TextField aria-label="备注" value={remark} onChange={setRemark}>
               <Label>备注</Label>
               <Input placeholder="可选，仅管理员可见" autoComplete="off" />

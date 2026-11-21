@@ -38,11 +38,12 @@ type AnthropicMessagesRequest struct {
 	TopP        *float64 `json:"top_p,omitempty"`
 	TopK        *int     `json:"top_k,omitempty"`
 
-	StopSequences []string             `json:"stop_sequences,omitempty"`
-	Stream        bool                 `json:"stream,omitempty"`
-	Tools         []AnthropicTool      `json:"tools,omitempty"`
-	ToolChoice    *AnthropicToolChoice `json:"tool_choice,omitempty"`
-	Thinking      *AnthropicThinking   `json:"thinking,omitempty"`
+	StopSequences []string               `json:"stop_sequences,omitempty"`
+	Stream        bool                   `json:"stream,omitempty"`
+	Tools         []AnthropicTool        `json:"tools,omitempty"`
+	ToolChoice    *AnthropicToolChoice   `json:"tool_choice,omitempty"`
+	Thinking      *AnthropicThinking     `json:"thinking,omitempty"`
+	OutputConfig  *AnthropicOutputConfig `json:"output_config,omitempty"`
 
 	// RawEffort 是 thinking.budget_tokens 映射出的**档位**（原值，见
 	// OpenAIChatRequest.RawEffort）；空串 = 未请求思考。
@@ -88,6 +89,7 @@ type AnthropicMessage struct {
 }
 
 type AnthropicTool struct {
+	Type        string          `json:"type,omitempty"`
 	Name        string          `json:"name"`
 	Description string          `json:"description,omitempty"`
 	InputSchema json.RawMessage `json:"input_schema,omitempty"`
@@ -140,6 +142,21 @@ type anthropicBlock struct {
 
 // DecodeAnthropicMessagesRequest 解析 /v1/messages 请求体。
 // 超限以 *http.MaxBytesError 报出（调用方映射 413），与 OpenAI 入口同一套纪律。
+type AnthropicOutputConfig struct {
+	Effort string `json:"effort,omitempty"`
+	Format *struct {
+		Type   string          `json:"type"`
+		Schema json.RawMessage `json:"schema"`
+	} `json:"format,omitempty"`
+}
+
+func (a *AnthropicMessagesRequest) OutputFormatType() string {
+	if a.OutputConfig == nil || a.OutputConfig.Format == nil {
+		return ""
+	}
+	return a.OutputConfig.Format.Type
+}
+
 func DecodeAnthropicMessagesRequest(r *http.Request, maxBytes int64) (*AnthropicMessagesRequest, error) {
 	if maxBytes <= 0 {
 		maxBytes = defaultMaxBodyBytes
@@ -159,6 +176,12 @@ func DecodeAnthropicMessagesRequest(r *http.Request, maxBytes int64) (*Anthropic
 
 	if req.Model == "" {
 		return nil, fmt.Errorf("model is required")
+	}
+	if req.OutputConfig != nil && req.OutputConfig.Format != nil {
+		format := req.OutputConfig.Format
+		if format.Type != "json_schema" || !strings.HasPrefix(strings.TrimSpace(string(format.Schema)), "{") {
+			return nil, fmt.Errorf("output_config.format requires type json_schema and a schema object")
+		}
 	}
 	// Anthropic 协议的 max_tokens 是必填（OpenAI 才是可选）：官方 SDK 与
 	// Claude Code 都会带，缺失说明不是合法的 Messages 请求。
@@ -205,6 +228,12 @@ func DecodeAnthropicMessagesRequest(r *http.Request, maxBytes int64) (*Anthropic
 		}
 	}
 
+	if req.OutputConfig != nil && req.OutputConfig.Effort != "" {
+		req.RawEffort = req.OutputConfig.Effort
+		if req.Thinking == nil {
+			req.Thinking = &AnthropicThinking{Type: "adaptive"}
+		}
+	}
 	// model 后缀最后应用：优先于请求体，且要覆盖上面由预算折算出的档位。
 	baseModel, sfx, err := ParseModelSuffix(req.Model)
 	if err != nil {
@@ -248,6 +277,11 @@ func DecodeAnthropicMessagesRequest(r *http.Request, maxBytes int64) (*Anthropic
 	//
 	// system 同理：它是 string | 块数组，单对象形态若放过，
 	// contentString 会静默拼出空串，指令整段丢失。
+	for index, tool := range req.Tools {
+		if tool.Type != "" && tool.Type != "custom" {
+			return nil, fmt.Errorf("tools[%d].type: unsupported Anthropic tool type %q", index, tool.Type)
+		}
+	}
 	if err := validateContentShape("messages", req.Messages); err != nil {
 		return nil, err
 	}
@@ -311,6 +345,11 @@ func (a *AnthropicMessagesRequest) ToRosetta() *rosetta.ChatRequest {
 	if a.Metadata != nil {
 		req.User = a.Metadata.UserID
 	}
+	if a.OutputFormatType() == "json_schema" {
+		req.ResponseFormat = &rosetta.ResponseFormat{
+			Type: "json_schema", Name: "response", Schema: a.OutputConfig.Format.Schema,
+		}
+	}
 
 	switch {
 	case len(a.System) == 0:
@@ -354,7 +393,7 @@ func (a *AnthropicMessagesRequest) ToRosetta() *rosetta.ChatRequest {
 		req.Thinking = &rosetta.ThinkingConfig{BudgetTokens: a.Thinking.BudgetTokens}
 	}
 	if a.Thinking != nil && a.Thinking.Type == "adaptive" {
-		req.Thinking = &rosetta.ThinkingConfig{Adaptive: true}
+		req.Thinking = &rosetta.ThinkingConfig{Adaptive: true, EffortRaw: a.RawEffort}
 	}
 	if a.Thinking != nil && a.Thinking.Type == "disabled" {
 		// `disabled` 必须真正下发：Anthropic 系上游（含 DeepSeek 的

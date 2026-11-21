@@ -54,16 +54,16 @@ func (openaiChatCodec) Decode(r *http.Request, maxBytes int64) (*Request, error)
 		return nil, err
 	}
 	return &Request{
-		BuildRosetta:             req.ToRosetta,
-		Stream:                   req.Stream,
-		Model:                    req.Model,
-		CacheKey:                 req.PromptCacheKey,
-		WantsStreamUsage:         wantsStreamUsage(req),
-		RequiresStructuredOutput: req.RequiresStructuredOutput(),
-		RawEffort:                req.RawEffort,
-		ThinkingOff:              req.ThinkingOff,
-		ThinkingRaw:              req.Thinking,
-		Suffix:                   ModelSuffixOverride{Dialect: req.Suffix.DialectOverride(), Raw: req.Suffix.Raw},
+		BuildRosetta:     req.ToRosetta,
+		Stream:           req.Stream,
+		Model:            req.Model,
+		CacheKey:         req.PromptCacheKey,
+		WantsStreamUsage: wantsStreamUsage(req),
+		OutputFormat:     req.OutputFormatType(),
+		RawEffort:        req.RawEffort,
+		ThinkingOff:      req.ThinkingOff,
+		ThinkingRaw:      req.Thinking,
+		Suffix:           ModelSuffixOverride{Dialect: req.Suffix.DialectOverride(), Raw: req.Suffix.Raw},
 	}, nil
 }
 
@@ -90,15 +90,15 @@ func (anthropicMessagesCodec) Decode(r *http.Request, maxBytes int64) (*Request,
 		return nil, err
 	}
 	return &Request{
-		BuildRosetta:             req.ToRosetta,
-		Stream:                   req.Stream,
-		Model:                    req.Model,
-		WantsStreamUsage:         false, // Anthropic message_delta always carries usage
-		RequiresStructuredOutput: false, // Anthropic ingress has no structured-output concept
-		RawEffort:                req.RawEffort,
-		AnthropicBudget:          req.ThinkingBudget(),
-		ThinkingOff:              req.ThinkingOff(),
-		Suffix:                   ModelSuffixOverride{Dialect: req.Suffix.DialectOverride(), Raw: req.Suffix.Raw},
+		BuildRosetta:     req.ToRosetta,
+		Stream:           req.Stream,
+		Model:            req.Model,
+		WantsStreamUsage: false, // Anthropic message_delta always carries usage
+		OutputFormat:     req.OutputFormatType(),
+		RawEffort:        req.RawEffort,
+		AnthropicBudget:  req.ThinkingBudget(),
+		ThinkingOff:      req.ThinkingOff(),
+		Suffix:           ModelSuffixOverride{Dialect: req.Suffix.DialectOverride(), Raw: req.Suffix.Raw},
 	}, nil
 }
 
@@ -125,16 +125,17 @@ func (openaiResponsesCodec) Decode(r *http.Request, maxBytes int64) (*Request, e
 		return nil, err
 	}
 	return &Request{
-		BuildRosetta:             req.ToRosetta,
-		Stream:                   req.Stream,
-		Model:                    req.Model,
-		CacheKey:                 req.PromptCacheKey,
-		WantsStreamUsage:         false, // response.completed always carries usage
-		RequiresStructuredOutput: req.RequiresStructuredOutput(),
-		RawEffort:                req.RawEffort,
-		ThinkingOff:              req.ThinkingOff(),
-		DowngradedTools:          req.DowngradedTools(),
-		Suffix:                   ModelSuffixOverride{Dialect: req.Suffix.DialectOverride(), Raw: req.Suffix.Raw},
+		BuildRosetta:       req.ToRosetta,
+		Stream:             req.Stream,
+		Model:              req.Model,
+		CacheKey:           req.PromptCacheKey,
+		WantsStreamUsage:   false, // response.completed always carries usage
+		OutputFormat:       req.OutputFormatType(),
+		PreviousResponseID: req.PreviousResponseID,
+		RawEffort:          req.RawEffort,
+		ThinkingOff:        req.ThinkingOff(),
+		DowngradedTools:    req.DowngradedTools(),
+		Suffix:             ModelSuffixOverride{Dialect: req.Suffix.DialectOverride(), Raw: req.Suffix.Raw},
 	}, nil
 }
 

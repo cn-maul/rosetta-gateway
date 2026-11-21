@@ -632,3 +632,39 @@ func TestDecodeResponses_NamespaceToolChoiceHonored(t *testing.T) {
 		t.Fatalf("ToolChoice = %+v —— namespace 约束没被兑现，原样发给上游会指向不存在的工具", req.ToolChoice)
 	}
 }
+
+func TestDecodeResponses_NamespaceToolChoiceWithMultipleTools(t *testing.T) {
+	got := decodeResponses(t, `{"model":"m","input":"hi","tools":[
+		{"type":"namespace","name":"shell","tools":[
+			{"type":"function","name":"ls","parameters":{"type":"object"}},
+			{"type":"function","name":"cat","parameters":{"type":"object"}}
+		]},
+		{"type":"function","name":"shelling","parameters":{"type":"object"}}
+	],"tool_choice":{"type":"namespace","name":"shell"}}`)
+	req := got.ToRosetta()
+	if len(req.Tools) != 2 || req.Tools[0].Name != "shell__ls" || req.Tools[1].Name != "shell__cat" {
+		t.Fatalf("tools = %+v", req.Tools)
+	}
+	if req.ToolChoice == nil || req.ToolChoice.Mode != rosetta.ToolChoiceRequired {
+		t.Fatalf("ToolChoice = %+v, want required", req.ToolChoice)
+	}
+}
+
+func TestDecodeResponses_NamespaceToolChoiceRejectsUnknown(t *testing.T) {
+	_, err := DecodeResponsesRequest(httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"model":"m","input":"hi","tools":[
+		{"type":"namespace","name":"shell","tools":[{"type":"function","name":"ls"}]}
+	],"tool_choice":{"type":"namespace","name":"missing"}}`)), 0)
+	if err == nil || !strings.Contains(err.Error(), "exactly one") {
+		t.Fatalf("err = %v", err)
+	}
+}
+
+func TestDecodeResponses_DuplicateFlattenedToolRejected(t *testing.T) {
+	_, err := DecodeResponsesRequest(httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"model":"m","input":"hi","tools":[
+		{"type":"function","name":"shell__ls"},
+		{"type":"namespace","name":"shell","tools":[{"type":"function","name":"ls"}]}
+	]}`)), 0)
+	if err == nil || !strings.Contains(err.Error(), "duplicate name") {
+		t.Fatalf("err = %v", err)
+	}
+}

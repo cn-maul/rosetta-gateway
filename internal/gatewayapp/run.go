@@ -190,7 +190,9 @@ func Run(opts Options) (retErr error) {
 		if err := pool.BuildFromConfig(cfg); err != nil {
 			logger.Error("failed to build upstream pool from config", "error", err)
 		}
-		snapshot.Init(buildSnapshotFromConfig(cfg))
+		snap := buildSnapshotFromConfig(cfg)
+		snap.Clients = pool.ClientView()
+		snapshot.Init(snap)
 	}
 
 	reloadCtx, stopReloadRetry := context.WithCancel(context.Background())

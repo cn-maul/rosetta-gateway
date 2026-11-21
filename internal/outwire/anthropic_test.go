@@ -10,6 +10,26 @@ import (
 	"github.com/cn-maul/rosetta"
 )
 
+func TestAnthropicSSE_ServerToolsRetainBlockBoundaries(t *testing.T) {
+	recorder := httptest.NewRecorder()
+	sink := NewAnthropicSSE(recorder, nil, "msg_1", "model")
+	sink.Event(&rosetta.Event{Type: rosetta.EventTextDelta, Text: "before", BlockIndex: 0})
+	for _, raw := range []string{
+		`{"type":"content_block_start","index":3,"content_block":{"type":"server_tool_use","id":"srv","name":"web_search","input":{}}}`,
+		`{"type":"content_block_delta","index":3,"delta":{"type":"input_json_delta","partial_json":"{}"}}`,
+		`{"type":"content_block_start","index":4,"content_block":{"type":"web_search_tool_result","tool_use_id":"srv","content":[]}}`,
+		`{"type":"content_block_start","index":5,"content_block":{"type":"unknown_future_result","content":[]}}`,
+	} {
+		sink.Event(&rosetta.Event{Type: rosetta.EventUnknown, Raw: []byte(raw)})
+	}
+	sink.Event(&rosetta.Event{Type: rosetta.EventTextDelta, Text: "after", BlockIndex: 6})
+	sink.Finish("ok", rosetta.StopEnd, rosetta.Usage{}, false)
+	raw := recorder.Body.String()
+	if strings.Count(raw, "event: content_block_start\n") != 4 || strings.Count(raw, "event: content_block_stop\n") != 4 || !strings.Contains(raw, `"type":"server_tool_use"`) || !strings.Contains(raw, `"type":"web_search_tool_result"`) || strings.Contains(raw, `unknown_future_result`) {
+		t.Fatalf("unexpected stream: %s", raw)
+	}
+}
+
 // collect 逐行抽出 SSE 事件，返回 event 名与 data 载荷的配对序列。
 func collect(t *testing.T, raw string) [][2]string {
 	t.Helper()

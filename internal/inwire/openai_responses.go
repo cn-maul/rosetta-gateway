@@ -66,16 +66,7 @@ type ResponsesRequest struct {
 	Include            []string        `json:"include,omitempty"`
 	Text               json.RawMessage `json:"text,omitempty"` // {"format": {...}}
 
-	// flattenedToolChoice 是 ToRosetta 展平 namespace 后**重写过的**
-	// tool_choice（指向 namespace 内工具的会被换成展平后的名字）。
-	//
-	// 为什么存在请求结构体上而不是现算：ToRosetta 是逐 attempt 调用的工厂，
-	// 展平映射表只在那一刻有输入（原始 tools 形态）。把结果记在结构体上，
-	// 同一次 attempt 内的后续步骤（诊断、run 记录）读到的就是这一次的展平
-	// 结果，不会重复计算，也不会跨 attempt 串味。
-	//
-	// nil = 未重写过，沿用 ToolChoice 原值。
-	flattenedToolChoice json.RawMessage `json:"-"`
+	namespaceChoice string
 
 	// downgradedTools 记录被降级成 function 的工具：工具名 → 原生类型
 	// （"custom" / "local_shell"）。出站据此把模型对它的调用还原成
@@ -385,6 +376,13 @@ func DecodeResponsesRequest(r *http.Request, maxBytes int64) (*ResponsesRequest,
 			return nil, err
 		}
 	}
+	seenTools := make(map[string]bool)
+	for _, tool := range flattenNamespaceTools(req.Tools) {
+		if seenTools[tool.Name] {
+			return nil, fmt.Errorf("tools: duplicate name %q after namespace flattening", tool.Name)
+		}
+		seenTools[tool.Name] = true
+	}
 	// 降级表在这里就建好（而不是 ToRosetta 里）：出站的 sink 与非流式编码器
 	// 在第一次 attempt 之前构造，那一刻还没人调过 ToRosetta。
 	req.downgradedTools = responsesDowngradedTools(req.Tools)
@@ -398,11 +396,20 @@ func DecodeResponsesRequest(r *http.Request, maxBytes int64) (*ResponsesRequest,
 			if json.Unmarshal(req.ToolChoice, &obj) != nil {
 				return nil, fmt.Errorf("tool_choice: must be a string or {type,name} object")
 			}
-			// namespace 也接受：客户端可以用命名空间强制「在这个组里选」，
-			// 展平后这个约束由 rewriteToolChoice 兑现（组内唯一的匹配会被
-			// 改写成展平名）。多于一个匹配时保持原值发出，不猜。
 			if (obj.Type == "function" || obj.Type == "namespace") && obj.Name == "" {
 				return nil, fmt.Errorf("tool_choice: type=%s requires name", obj.Type)
+			}
+			if obj.Type == "namespace" {
+				matches := 0
+				for _, tool := range req.Tools {
+					if tool.Type == "namespace" && tool.Name == obj.Name {
+						matches++
+					}
+				}
+				if matches != 1 {
+					return nil, fmt.Errorf("tool_choice: namespace %q must identify exactly one declared namespace", obj.Name)
+				}
+				req.namespaceChoice = obj.Name
 			}
 		}
 	}
@@ -650,9 +657,6 @@ func (a *ResponsesRequest) rewriteToolChoice(tools []ResponsesTool, flat []roset
 	if json.Unmarshal(a.ToolChoice, &obj) != nil || obj.Name == "" {
 		return nil // 字符串形态或非 function 选择，与展平无关
 	}
-	if obj.Type == "namespace" {
-		return a.rewriteNamespaceToolChoice(obj.Name, flat)
-	}
 	if obj.Type != "function" {
 		return nil
 	}
@@ -696,52 +700,6 @@ func (a *ResponsesRequest) rewriteToolChoice(tools []ResponsesTool, flat []roset
 	return out
 }
 
-// rewriteNamespaceToolChoice 兑现 `{"type":"namespace","name":"shell"}`
-// 形态的 tool_choice（2026-10-21 修 A2-P1-6）。
-//
-// # 为什么要单独处理
-//
-// decode 阶段**明确接受** namespace 形态（见 ToolChoice 字段的注释：
-// 「namespace 也接受：客户端可以用命名空间强制『在这个组里选』，
-// 展平后这个约束由 rewriteToolChoice 兑现」）。但修复前 rewriteToolChoice
-// 只处理 `obj.Type == "function"`，namespace 落进 `return nil` ——
-// **约束从未被兑现**，原始 `{"type":"namespace","name":"shell"}` 被原样
-// 发给上游，而上游的工具表里只有展平后的 `shell__ls`，没有名为 `shell`
-// 的工具。
-//
-// 结果要么 400，要么**静默退回 auto** —— 后者正是 DESIGN §7.3 明令要避免的
-// 「客户端要强制，实际拿到模型自由选择，且无任何信号」。
-//
-// # 兑现规则
-//
-// 在展平后的表里找所有 `ns.Name + "__"` 前缀的候选：
-//   - 恰好一个 → 改写成 `{"type":"function","name":"<展平名>"}`；
-//   - 多于一个 → 保持原值（歧义不猜，多半会被上游拒绝）；
-//   - 一个都没有 → 保持原值（约束无对应物，原样发出让上游自己决定）。
-func (a *ResponsesRequest) rewriteNamespaceToolChoice(nsName string, flat []rosetta.ToolDefinition) json.RawMessage {
-	prefix := nsName + "__"
-	var match string
-	for _, t := range flat {
-		if !strings.HasPrefix(t.Name, prefix) {
-			continue
-		}
-		if match != "" && match != t.Name {
-			// 命名空间内不止一个工具：无法确定「强制哪一个」，
-			// 不猜 —— 原样发出。
-			return nil
-		}
-		match = t.Name
-	}
-	if match == "" {
-		return nil
-	}
-	out, err := json.Marshal(map[string]any{"type": "function", "name": match})
-	if err != nil {
-		return nil
-	}
-	return out
-}
-
 // ToRosetta 组装统一请求。input 是字符串时整体作为一条 user 消息。
 func (a *ResponsesRequest) ToRosetta() *rosetta.ChatRequest {
 	req := &rosetta.ChatRequest{
@@ -757,14 +715,25 @@ func (a *ResponsesRequest) ToRosetta() *rosetta.ChatRequest {
 	if a.MaxOutputTokens != nil {
 		req.MaxOutputTokens = *a.MaxOutputTokens
 	}
-	if len(a.Tools) > 0 {
+	if a.namespaceChoice != "" {
+		for _, tool := range a.Tools {
+			if tool.Type == "namespace" && tool.Name == a.namespaceChoice {
+				req.Tools = flattenNamespaceTools([]ResponsesTool{tool})
+				break
+			}
+		}
+		if len(req.Tools) == 1 {
+			req.ToolChoice = &rosetta.ToolChoice{Mode: rosetta.ToolChoiceTool, Name: req.Tools[0].Name}
+		} else {
+			req.ToolChoice = &rosetta.ToolChoice{Mode: rosetta.ToolChoiceRequired}
+		}
+	} else {
 		req.Tools = flattenNamespaceTools(a.Tools)
-		// namespace 展平后，指向内层工具的 tool_choice 必须跟着改名，
-		// 否则上游会去找一个不存在的工具名（或干脆拒绝）。
-		a.flattenedToolChoice = a.rewriteToolChoice(a.Tools, req.Tools)
-	}
-	if tc := responsesToolChoiceToRosetta(a.effectiveToolChoice()); tc != nil {
-		req.ToolChoice = tc
+		choice := a.ToolChoice
+		if rewritten := a.rewriteToolChoice(a.Tools, req.Tools); rewritten != nil {
+			choice = rewritten
+		}
+		req.ToolChoice = responsesToolChoiceToRosetta(choice)
 	}
 	if rf := responsesTextFormatToRosetta(a.Text); rf != nil {
 		req.ResponseFormat = rf
@@ -1239,19 +1208,6 @@ func responsesItemReasoningText(item responsesItem) string {
 // 曾经唯一需要出站接管的「一轮拆成多条 assistant」已在入站 ToRosetta 合并成
 // 一条 Message 修掉，出站交给 SDK 编码器即可（2026-11-07）。
 
-// effectiveToolChoice 返回本次 attempt 该用的 tool_choice 原值。
-//
-// ToRosetta 是逐 attempt 调用的工厂，展平与 tool_choice 重写都在它内部发生，
-// 所以同一 attempt 里读到的 flattenedToolChoice 一定对应这一份展平结果，
-// 不存在跨 attempt 串味（BuildRosetta 不复用同一个实例，见 ingress.Request
-// 的注释）。
-func (a *ResponsesRequest) effectiveToolChoice() json.RawMessage {
-	if len(a.flattenedToolChoice) > 0 {
-		return a.flattenedToolChoice
-	}
-	return a.ToolChoice
-}
-
 // responsesToolChoiceToRosetta 把 Responses 的 tool_choice（string 或
 // {"type":"function","name"}，namespace 已在 ToRosetta 展平）翻译成 rosetta
 // 的统一 ToolChoice。不认识的形状返回 nil（丢弃）。
@@ -1358,10 +1314,12 @@ func (a *ResponsesRequest) textPassthroughKeys() map[string]any {
 // 而不是放行后让约束静默失效（见 handleIngress）。format 缺失或为默认的
 // "text" 时返回 false。
 func (a *ResponsesRequest) RequiresStructuredOutput() bool {
+	format := a.OutputFormatType()
+	return format == "json_object" || format == "json_schema"
+}
+
+func (a *ResponsesRequest) OutputFormatType() string {
 	f := a.textFormatMap()
-	if f == nil {
-		return false
-	}
-	t, _ := f["type"].(string)
-	return t == "json_object" || t == "json_schema"
+	format, _ := f["type"].(string)
+	return format
 }

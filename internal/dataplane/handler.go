@@ -54,14 +54,15 @@ type Deps struct {
 // Handler serves protocol-independent model requests through the configured
 // upstream failover chain.
 type Handler struct {
-	pool     *upstream.Pool
-	cfg      *config.Config
-	usage    *usage.Recorder
-	limiter  *ratelimit.Limiter
-	snapshot SnapshotProvider
-	db       *store.Store
-	logger   *slog.Logger
-	streams  chan struct{}
+	pool          *upstream.Pool
+	cfg           *config.Config
+	usage         *usage.Recorder
+	limiter       *ratelimit.Limiter
+	snapshot      SnapshotProvider
+	db            *store.Store
+	logger        *slog.Logger
+	streams       chan struct{}
+	continuations continuationIndex
 	// admissionTimeout 是等待流式并发名额的上限（见 defaultStreamAdmissionTimeout）。
 	admissionTimeout time.Duration
 }
@@ -212,7 +213,12 @@ func (h *Handler) Handle(codec ingress.Codec) http.HandlerFunc {
 		}()
 
 		authStart := diag.begin("auth")
-		authCtx, err := auth.Authenticate(r)
+		snap := h.snapshot()
+		clients := snap.Clients
+		if clients == nil {
+			clients = h.pool.ClientView()
+		}
+		authCtx, err := auth.AuthenticateSnapshot(r, snap)
 		diag.end("auth", authStart)
 		if err != nil {
 			diag.setResult("error", "invalid_api_key", err.Error())
@@ -322,7 +328,6 @@ func (h *Handler) Handle(codec ingress.Codec) http.HandlerFunc {
 		needEstimate := authCtx.TPMLimit > 0
 		// Route resolution must precede estimation: an omitted client cap
 		// reserves against the largest output ceiling in the candidate chain.
-		snap := h.snapshot()
 		routingStart := diag.begin("routing")
 		res, err := snap.Routes.Resolve(ing.Model)
 		diag.end("routing", routingStart)
@@ -353,13 +358,27 @@ func (h *Handler) Handle(codec ingress.Codec) http.HandlerFunc {
 		}
 		var outputCeiling int64
 		quotaStart := diag.begin("quota")
+		dailyLimit := store.DailyQuotaLimit{
+			Requests: int64(authCtx.DailyRequestLimit),
+			Tokens:   int64(authCtx.DailyTokenLimit),
+		}
+		// 每日额度（2026-11-17）：请求数与 token 预占都落库，跨重启有效。
+		//
+		// 位置与其它准入判定一致：**必须在打上游之前**。请求数一旦放行就
+		// 记上一次，因为它回答的是「今天调用了几次」，不是「成功几次」。
+		//
+		// token 预占需要 est，所以与配额预占共用同一次估算：
+		//   - 配了 token 上限而没配 TPM 时，needEstimate 由这里补上；
+		//   - 只配了请求数上限时不做估算（那是白算，est 用不上）。
+		if dailyLimit.Tokens > 0 && !needEstimate {
+			needEstimate = true
+		}
 		if needEstimate {
 			outputCeiling = ingress.RequestOutputCeiling(estInput(), outCeilings)
 			est = ingress.EstimateRequestTokens(estInput(), outputCeiling)
 			rate = NewRateCommit(h.limiter, authCtx.KeyID, authCtx.TPMLimit, 0, db, logger)
 			rate.SetRequestID(httpx.RequestIDFromContext(r.Context()))
 		}
-
 		// 终身 token 配额**原子预占**（DESIGN §11.2）。
 		//
 		// 原实现是纯查询（GetKeyQuota）：读 used → 比较 → 放行。并发下多个
@@ -450,7 +469,7 @@ func (h *Handler) Handle(codec ingress.Codec) http.HandlerFunc {
 		// 为常态付一次写事务不划算（与 key 级「quota>0 才预占」同口径）。
 		// 额度判断本身交给 ReserveUserQuota 事务内做，这里只借快照判「是否
 		// 配置了额度」—— 与 key 级用 GetKeyQuota 判 quota>0 完全对称。
-		if u := h.snapshot().UsersByID[authCtx.UserID]; u != nil && u.QuotaTokens > 0 {
+		if u := snap.UsersByID[authCtx.UserID]; u != nil && u.QuotaTokens > 0 {
 			if !needEstimate {
 				outputCeiling = ingress.RequestOutputCeiling(estInput(), outCeilings)
 				est = ingress.EstimateRequestTokens(estInput(), outputCeiling)
@@ -509,13 +528,7 @@ func (h *Handler) Handle(codec ingress.Codec) http.HandlerFunc {
 		//   - `provider/model` 直连形式 → routing.Resolve 会**合成**一条 route，
 		//     其 PublicName 就是请求原文。
 		//
-		// 也就是说这条判定等价于「按客户端实际写的那个标识符查白名单」。
-		// 这正是我们要的：如果只按具名路由判定而放行直连形式，受限用户只要
-		// 改写成 `provider/model` 就能拿到白名单之外的上游模型 —— 白名单形同虚设。
-		// 管理员若确实要放开某个直连标识符，把它本身写进白名单即可
-		// （/v1/models?include=upstream 会列出这些标识符供挑选）。
-		//
-		// 位置排在限速与配额预检之后、触碰上游之前：白名单判定只是内存里的
+		// 位置排在配额与 TPM 之后、触碰上游之前：白名单判定只是内存里的
 		// 线性扫描，比两次数据库预检便宜；放前面会让「超额度的请求」拿到 403
 		// 而不是 429，掩盖更该先解决的配额问题。两者都不打上游，
 		// 顺序只影响错误码优先级。
@@ -527,6 +540,23 @@ func (h *Handler) Handle(codec ingress.Codec) http.HandlerFunc {
 				"request_id", httpx.RequestIDFromContext(r.Context()))
 			codec.WriteError(w, http.StatusForbidden, "model_not_allowed",
 				fmt.Sprintf("model %q is not available for this API key", ing.Model))
+			return
+		}
+
+		var binding continuationBinding
+		var bound bool
+		if ing.PreviousResponseID != "" {
+			binding, bound = h.continuations.get(continuationKey{authCtx.UserID, authCtx.KeyID, route.PublicName, ing.PreviousResponseID})
+		}
+		active := h.selectAttemptCandidates(res, clients, ing, binding, bound, FailoverMaxTargets(snap, h.cfg))
+		if len(active) == 0 {
+			rate.Commit(0)
+			message := "this request requires structured output (json_object), but no candidate upstream can serve it: the anthropic protocol has no equivalent of response_format"
+			if ing.PreviousResponseID != "" {
+				message = "previous_response_id cannot be continued on this model: send the full conversation history"
+			}
+			codec.WriteError(w, http.StatusBadRequest, "invalid_request_error", message)
+			diag.setResult("error", "invalid_request_error", "")
 			return
 		}
 
@@ -555,18 +585,6 @@ func (h *Handler) Handle(codec ingress.Codec) http.HandlerFunc {
 			"model", ing.Model,
 			"request_id", httpx.RequestIDFromContext(r.Context()))
 
-		// 尝试预算：链上按 position 升序最多打 maxTargets 个目标。
-		// 未开启故障转移 → 只打主目标（等价于改造前的单目标行为，零回归）。
-		// 策略值统一来自「设置」页写入的全局默认（快照），config 只作兜底。
-		cands := res.Candidates
-		limit := len(cands)
-		if !route.FailoverEnabled {
-			limit = 1
-		} else if budget := FailoverMaxTargets(snap, h.cfg); budget < limit {
-			limit = budget
-		}
-		preflight := preflightCandidates(route.FailoverEnabled, limit, cands)
-
 		// 余额预检（Lead 与用户确认的口径：预检拒绝，不做预占/退款）。
 		//
 		// 位置：白名单之后、触碰上游之前。理由与上面的白名单同级 —— 白名单
@@ -583,7 +601,7 @@ func (h *Handler) Handle(codec ingress.Codec) http.HandlerFunc {
 		// 必然不等，预占了就得退款（等于把 ReserveQuota/ReleaseQuota 那套再
 		// 实现一遍，而那正是 2026-10-07 的 P0-2 教训）。所以这里是纯查询。
 		balanceStart := diag.begin("balance_precheck")
-		bal := h.precheckBalance(w, r, authCtx, estInput, preflight, codec)
+		bal := h.precheckBalance(w, r, authCtx, estInput, active, codec, snap)
 		diag.end("balance_precheck", balanceStart)
 		if !bal {
 			// 余额预检已写回 402/500。rate.Commit(0) 不能省：走到这里说明
@@ -595,68 +613,50 @@ func (h *Handler) Handle(codec ingress.Codec) http.HandlerFunc {
 			return
 		}
 
-		// The same attempt budget is used by balance preflight and the actual
-		// lane. It is computed above, before any admission query that depends
-		// on which upstream models can actually serve this request.
-
-		// 开故障转移时，跳过正被熔断的目标（若全被熔断则退回整条链，宁可打也不 404）。
+		// 每日额度（2026-11-17）：放在所有**纯本地拒绝**（配额、TPM、模型
+		// 白名单、余额预检、可服务性筛选）之后，真正打上游之前。
 		//
-		// 这一步只做**查询**（TargetAvailable 已是纯函数），不占探测名额：
-		// 紧接着的预算截断会把排到 failover_max_targets 之外的目标丢掉，
-		// 它们永远进不了下面的请求循环，也就没人替它们释放名额。
-		// 名额统一在循环内、真的要发请求前由 ClaimTargetProbe 领取。
-		active := cands
-		if route.FailoverEnabled {
-			var avail []routing.Candidate
-			for _, c := range cands {
-				if h.pool.TargetAvailable(c.TargetID) {
-					avail = append(avail, c)
-				}
-			}
-			if len(avail) > 0 {
-				active = avail
-			}
-		}
-
-		// 硬约束过滤（2026-10-07 P1-8）：请求要求结构化输出（json_object /
-		// json_schema）而候选上游实际使用 anthropic 协议时，跳过该候选。
-		// "auto" 必须先取池中探测后的协议，否则自动识别出的 Anthropic
-		// 会被误当成 Chat 放行，导致约束静默丢失。
+		// 顺序的理由有两条，方向相反但都指向同一个位置：
+		//   - 太早：后面任何一次拒绝都会走 `rate.Commit(0)`，而那时 token
+		//     预占已经记账，等于让「模型不允许」「余额不足」这类请求白白
+		//     吃掉当天的 token 额度；
+		//   - 太晚：进了 failover 循环就可能在第二个目标前才判定，而第一个
+		//     目标已经收到了请求 —— 那种情况不该因为「每日额度已满」而中断，
+		//     也不该在打完之后才发现超限。
 		//
-		// 为什么不能放行：Anthropic 没有 response_format / text.format 的对应物，
-		// inwire 层已无处可翻；照发等于接受「200 但约束静默丢失」——尤其恶劣的
-		// 是它让故障转移改变语义：同一请求打 chat 目标时约束生效，转移
-		// 到 anthropic 目标后仍回 200 但约束消失。取舍：跳过候选比谎报成功更
-		// 安全 —— 客户端拿到明确错误，至少知道该改请求或改路由，而不是拿着
-		// 「看起来成功」的无约束输出去下游消费。
-		//
-		// 探测结果为 chat / response 的候选不受影响：两种协议都能表达这两类
-		// 约束（inwire 层已做等价翻译）。放在熔断筛选之后、预算
-		// 截断之前：先剔除服务不了的目标，让 failover_max_targets 的预算花在
-		// 真正可服务的候选上。
-		if ing.RequiresStructuredOutput {
-			var serviceable []routing.Candidate
-			for _, c := range active {
-				if c.Provider != nil && h.effectiveProviderProtocol(c) != wireproto.Anthropic {
-					serviceable = append(serviceable, c)
-				}
+		// 请求数在这里 +1：它回答的是「今天调用了几次」，被拒的请求不计入
+		// （与 rpm 的「只记放行」同口径）。
+		if !dailyLimit.Unlimited() {
+			requestID := httpx.RequestIDFromContext(r.Context())
+			if requestID == "" {
+				requestID = newID()
+				r = r.WithContext(httpx.WithRequestID(r.Context(), requestID))
 			}
-			if len(serviceable) == 0 {
-				rate.Commit(0)
-				logger.Warn("no upstream can serve structured output request",
-					"model", ing.Model, "key_id", authCtx.KeyID,
-					"candidates", len(active),
+			dres, dok, derr := db.ReserveDailyQuota(r.Context(), requestID, authCtx.KeyID, dailyLimit, est)
+			switch {
+			case derr != nil:
+				// 与配额预检同口径：写库抖动 fail-open，但必须留痕 ——
+				// fail-open 的代价是当天真超发，无声无息就查不到了。
+				logger.Error("daily quota reserve failed (fail-open)",
+					"error", derr, "key_id", authCtx.KeyID)
+			case !dok:
+				logger.Warn("daily quota exceeded", "key_id", authCtx.KeyID,
+					"daily_request_limit", dailyLimit.Requests,
+					"daily_token_limit", dailyLimit.Tokens,
+					"estimated_tokens", est,
 					"request_id", httpx.RequestIDFromContext(r.Context()))
-				codec.WriteError(w, http.StatusBadRequest, "invalid_request_error",
-					"this request requires structured output (json_object/json_schema), "+
-						"but no candidate upstream can serve it: the anthropic protocol has no equivalent of response_format")
-				diag.setResult("error", "invalid_request_error", "")
+				// 退回 TPM 窗口与终身配额预占；每日额度这次没占上，无需退。
+				rate.Commit(0)
+				codec.WriteError(w, http.StatusTooManyRequests, "rate_limit_exceeded",
+					"daily quota exceeded for this API key")
+				diag.setResult("error", "rate_limit_exceeded", "")
 				return
+			default:
+				if rate == nil {
+					rate = NewRateCommit(h.limiter, authCtx.KeyID, authCtx.TPMLimit, 0, db, logger)
+				}
+				rate.SetDailyReservation(dres)
 			}
-			active = serviceable
-		}
-		if len(active) > limit {
-			active = active[:limit]
 		}
 
 		threshold := FailoverFailureThreshold(snap, h.cfg)
@@ -678,7 +678,7 @@ func (h *Handler) Handle(codec ingress.Codec) http.HandlerFunc {
 			isLast := i == len(active)-1
 			lastTarget = cand
 			evaluatedAny = true
-			diag.setSelected(cand, "", h.effectiveProviderProtocol(cand))
+			diag.setSelected(cand, "", effectiveProviderProtocol(clients, cand))
 
 			// 客户端已断开就收手：半路跑掉的人不该消耗整条链的下游配额，
 			// 也不该把一次在途取消误记成目标的失败。此刻尚未写出任何字节，
@@ -688,6 +688,7 @@ func (h *Handler) Handle(codec ingress.Codec) http.HandlerFunc {
 				logger.Info("client disconnected, aborting failover",
 					"model", ing.Model, "attempt", i+1, "error", cerr,
 					"request_id", httpx.RequestIDFromContext(r.Context()))
+				rate.ReleaseDaily()
 				rate.Commit(0)
 				return
 			}
@@ -721,7 +722,7 @@ func (h *Handler) Handle(codec ingress.Codec) http.HandlerFunc {
 						Index: i + 1, TargetID: cand.TargetID,
 						ProviderID: providerID(cand), ProviderName: providerName(cand),
 						ProviderSlug: providerSlug(cand), UpstreamModel: cand.UpstreamModel.ModelID,
-						Protocol: h.effectiveProviderProtocol(cand), EndpointHost: providerEndpointHost(cand),
+						Protocol: effectiveProviderProtocol(clients, cand), EndpointHost: providerEndpointHost(cand),
 						NetworkID: providerNetworkID(cand), ProxyConfigured: providerProxyConfigured(cand),
 						Status: "skipped", ErrorCode: "probe_busy_or_cooling", Eligible: false,
 						FailureStage: "target_circuit_breaker", FailureAttribution: "target_configuration",
@@ -754,7 +755,7 @@ func (h *Handler) Handle(codec ingress.Codec) http.HandlerFunc {
 				credentialAffinity = conversationSessionID(r)
 			}
 			credentialStart := diag.begin("credential_select")
-			client, credID, cerr := h.pool.GetAnyClientByAffinity(cand.Provider.Slug, credentialAffinity)
+			client, credID, credentialVersion, cerr := clients.SelectClient(cand.Provider.Slug, credentialAffinity, binding.credentialID, binding.credentialVersion)
 			diag.end("credential_select", credentialStart)
 			if cerr != nil {
 				// 该目标当前无健康凭据：这是 provider 的凭据状态，不是目标/上游
@@ -774,7 +775,7 @@ func (h *Handler) Handle(codec ingress.Codec) http.HandlerFunc {
 					Index: i + 1, TargetID: cand.TargetID,
 					ProviderID: providerID(cand), ProviderName: providerName(cand),
 					ProviderSlug: providerSlug(cand), UpstreamModel: cand.UpstreamModel.ModelID,
-					Protocol: h.effectiveProviderProtocol(cand), EndpointHost: providerEndpointHost(cand),
+					Protocol: effectiveProviderProtocol(clients, cand), EndpointHost: providerEndpointHost(cand),
 					NetworkID: providerNetworkID(cand), ProxyConfigured: providerProxyConfigured(cand),
 					Status: "failed", ErrorCode: "no_healthy_credential",
 					ErrorMessage: cerr.Error(), CredentialMs: 0, Eligible: true,
@@ -790,12 +791,25 @@ func (h *Handler) Handle(codec ingress.Codec) http.HandlerFunc {
 			}
 			lastUpstreamProtocol = wireproto.FromSDK(client.Protocol())
 			diag.setSelected(cand, credID, lastUpstreamProtocol)
+			if err := rate.StartDaily(r.Context()); err != nil {
+				h.pool.ReleaseTargetProbe(cand.TargetID, probeToken)
+				logger.Error("mark daily quota upstream attempt failed", "key_id", keyID, "error", err)
+				out = Outcome{StatusCode: http.StatusInternalServerError, Code: "internal_error",
+					Message: "daily quota accounting unavailable"}
+				break
+			}
 
 			attemptTrace := upstream.NewAttemptTrace()
 			attemptCtx := upstream.WithAttemptTrace(r.Context(), attemptTrace)
 			attemptReq := r.WithContext(attemptCtx)
 			attemptStart := time.Now()
 			ap := attemptParams{
+				rememberResponse: func(responseID string) {
+					h.continuations.put(continuationKey{authCtx.UserID, authCtx.KeyID, route.PublicName, responseID}, continuationBinding{
+						targetID: cand.TargetID, providerID: cand.Provider.ID, endpoint: cand.Provider.Endpoint,
+						modelID: cand.UpstreamModel.ModelID, credentialID: credID, credentialVersion: credentialVersion,
+					})
+				},
 				w:            w,
 				r:            attemptReq,
 				client:       client,
@@ -902,6 +916,7 @@ func (h *Handler) Handle(codec ingress.Codec) http.HandlerFunc {
 		}
 		diag.setResult(decision.DiagnosticStatus, decision.DiagnosticError, out.Detail)
 		diag.setTerminal(clientGone, gatewayTimeout)
+		rate.ReleaseDaily()
 		rate.Commit(0)
 		provID, providerName, upstreamModel, upstreamProtocol := "", "", "", ""
 		// 归因到最后评估到的目标：即使失败发生在凭据选择阶段，这个目标仍是
@@ -911,7 +926,7 @@ func (h *Handler) Handle(codec ingress.Codec) http.HandlerFunc {
 			provID = lastTarget.Provider.ID
 			providerName = lastTarget.Provider.Name
 			upstreamModel = lastTarget.UpstreamModel.ModelID
-			upstreamProtocol = h.effectiveProviderProtocol(lastTarget)
+			upstreamProtocol = effectiveProviderProtocol(clients, lastTarget)
 			if lastUpstreamProtocol != "" {
 				upstreamProtocol = lastUpstreamProtocol
 			}
@@ -1007,14 +1022,12 @@ func (h *Handler) acquireStreamSlot(ctx context.Context) bool {
 // falling back to the routing snapshot while the pool has no entry yet. The
 // configured value may be "auto"; protocol-specific behavior must never treat
 // that as Chat.
-func (h *Handler) effectiveProviderProtocol(c routing.Candidate) string {
+func effectiveProviderProtocol(clients *upstream.ClientView, c routing.Candidate) string {
 	if c.Provider == nil {
 		return ""
 	}
-	if h.pool != nil {
-		if protocol := h.pool.ResolvedProtocol(c.Provider.Slug); protocol != "" {
-			return protocol
-		}
+	if protocol := clients.ResolvedProtocol(c.Provider.Slug); protocol != "" {
+		return protocol
 	}
 	return wireproto.Normalize(c.Provider.Protocol)
 }
@@ -1301,6 +1314,10 @@ func (h *Handler) attemptStream(p attemptParams) Outcome {
 		case rosetta.EventMessageStart:
 			attempt.StreamEvents++
 			diag.setUpstreamResponse(ev.ID)
+		case rosetta.EventUnknown:
+			if codec.Name() != wireproto.Anthropic || upstreamProtocol != wireproto.Anthropic {
+				return
+			}
 		}
 		sink.Event(ev)
 	}
@@ -1414,25 +1431,13 @@ func (h *Handler) attemptStream(p attemptParams) Outcome {
 				// 成功率虚低，且真故障被 ERROR 噪音淹没。单独一个取值才能把两者分开。
 				status = store.UsageStatusCanceled
 				logger.Info("client disconnected mid-stream", "model", publicModel, "key_id", authCtx.KeyID, "error", err)
-			case errors.Is(err, rosetta.ErrUpstreamMalformed):
-				// 流已提交，但 SDK 在终止事件上判定上游自相矛盾。
-				//
-				// 最典型的现场是 responses 流：同一个 reasoning item 在
-				// output_item.done 与终止事件 response.completed 的 output
-				// 数组里给了两份不同的 encrypted_content，SDK 判
-				// errSealConflict 并包成 ErrUpstreamMalformed（见 SDK
-				// provider_openai_responses.go 的 mapItemErr）。
-				//
-				// 这类错误**不计入目标失败/熔断**（见 committedKindFor 与
-				// OutcomeCommittedMalformed）：它是上游翻译层的元数据缺陷，
-				// 而请求正文其实已经正常生成并交付。按普通失败记账的后果是
-				// 三次请求就把整家上游熔断成 502 —— 2026-11-11 的 tiantoken
-				// 正是这么把「某个模型一直 502」制造出来的。
-				//
-				// 仍要落库 + 报警：客户端确实收到了一条没有正常收尾的流。
+			case errors.Is(err, rosetta.ErrUpstreamMalformed), isResponsesSealConflict(err, upstreamProtocol):
 				status = store.UsageStatusError
 				errorCode = errorCodeStreamMalformed
 				errorDetail = outwire.UpstreamErrorDetail(err)
+				if errorDetail == "" && isResponsesSealConflict(err, upstreamProtocol) {
+					errorDetail = responsesSealConflictReason
+				}
 				logger.Error("stream ended with an inconsistent upstream response",
 					"model", publicModel, "key_id", authCtx.KeyID,
 					"provider", cand.Provider.Slug, "error", err,
@@ -1465,6 +1470,14 @@ func (h *Handler) attemptStream(p attemptParams) Outcome {
 	// message_delta+message_stop），断流按 DESIGN §8.2 不发终止（OpenAI）/
 	// 发 error 事件（Anthropic），canceled 不写任何东西。
 	sink.Finish(status, stopReason, lastUsage, ing.WantsStreamUsage)
+	if codec.Name() == wireproto.Response && upstreamProtocol == wireproto.Response &&
+		(upstreamReq.Store == nil || *upstreamReq.Store) && status == store.UsageStatusOK {
+		if reporter, ok := sink.(outwire.DownstreamResponseIDReporter); ok {
+			if responseID := reporter.DownstreamResponseID(); responseID != "" {
+				p.rememberResponse(responseID)
+			}
+		}
+	}
 
 	latency := time.Since(start).Milliseconds()
 
@@ -1581,6 +1594,7 @@ func (h *Handler) attemptStream(p attemptParams) Outcome {
 		if !lastUsage.IsZero() {
 			rate.Commit(lastUsage.TotalTokens)
 		} else {
+			rate.ReleaseDaily()
 			rate.ReleaseQuota()
 		}
 	})
@@ -1626,21 +1640,22 @@ func (h *Handler) attemptStream(p attemptParams) Outcome {
 // 就要同时改两个签名；打包成结构体后，调用点按名字给值，新增一项也不再
 // 是一次签名手术。
 type attemptParams struct {
-	w            http.ResponseWriter
-	r            *http.Request
-	client       *rosetta.Client
-	ing          *ingress.Request
-	cand         routing.Candidate
-	authCtx      *auth.Context
-	codec        ingress.Codec
-	rate         *RateCommit
-	snap         *snapshot.Snapshot
-	start        time.Time
-	priorTrace   []string
-	diag         *requestDiagnostics
-	attemptTrace *upstream.AttemptTrace
-	index        int
-	attemptStart time.Time
+	rememberResponse func(string)
+	w                http.ResponseWriter
+	r                *http.Request
+	client           *rosetta.Client
+	ing              *ingress.Request
+	cand             routing.Candidate
+	authCtx          *auth.Context
+	codec            ingress.Codec
+	rate             *RateCommit
+	snap             *snapshot.Snapshot
+	start            time.Time
+	priorTrace       []string
+	diag             *requestDiagnostics
+	attemptTrace     *upstream.AttemptTrace
+	index            int
+	attemptStart     time.Time
 }
 
 // startAttempt 做两条路径逐字相同的准备：造一份本次 attempt 专用的请求、
@@ -1705,11 +1720,20 @@ func (h *Handler) attemptNonStream(p attemptParams) Outcome {
 	latency := time.Since(start).Milliseconds()
 	ttfbMs := latency
 
-	writeResult := codec.WriteNonStream(w, resp, publicModel, ing)
+	var writeResult outwire.NonStreamWriteResult
+	if upstreamProtocol == wireproto.Anthropic && codec.Name() == wireproto.Anthropic && len(resp.Unknown) != 0 {
+		writeResult = outwire.WriteSameProtocolAnthropicResponse(w, resp, publicModel)
+	} else {
+		if upstreamProtocol == wireproto.Anthropic && len(resp.Unknown) != 0 {
+			h.logger.Debug("Anthropic server blocks omitted in protocol conversion",
+				"count", len(resp.Unknown), "request_id", httpx.RequestIDFromContext(r.Context()))
+		}
+		writeResult = codec.WriteNonStream(w, resp, publicModel, ing)
+	}
 	if writeResult.Err != nil {
 		if writeResult.EncodeError() {
 			return h.finishNonStreamEncodeFailure(
-				w, r, cand, authCtx, codec, rate, publicModel,
+				w, r, cand, authCtx, codec, rate, resp.Usage, publicModel, upstreamProtocol,
 				start, priorTrace, diag, &attempt, attemptTrace, attemptStart,
 				writeResult,
 			)
@@ -1719,6 +1743,10 @@ func (h *Handler) attemptNonStream(p attemptParams) Outcome {
 			start, priorTrace, diag, &attempt, attemptTrace, attemptStart,
 			latency, ttfbMs, writeResult,
 		)
+	}
+	if codec.Name() == wireproto.Response && upstreamProtocol == wireproto.Response &&
+		(upstreamReq.Store == nil || *upstreamReq.Store) && writeResult.ResponseID != "" {
+		p.rememberResponse(writeResult.ResponseID)
 	}
 
 	h.usage.RecordWithCallback(&store.UsageRecord{
@@ -1754,6 +1782,7 @@ func (h *Handler) attemptNonStream(p attemptParams) Outcome {
 		if !resp.Usage.IsZero() {
 			rate.Commit(resp.Usage.TotalTokens)
 		} else {
+			rate.ReleaseDaily()
 			rate.ReleaseQuota()
 		}
 	})
@@ -1780,7 +1809,8 @@ func (h *Handler) finishNonStreamEncodeFailure(
 	authCtx *auth.Context,
 	codec ingress.Codec,
 	rate *RateCommit,
-	publicModel string,
+	upstreamUsage rosetta.Usage,
+	publicModel, upstreamProtocol string,
 	start time.Time,
 	priorTrace []string,
 	diag *requestDiagnostics,
@@ -1809,7 +1839,7 @@ func (h *Handler) finishNonStreamEncodeFailure(
 		ProviderName:     cand.Provider.Name,
 		UpstreamModel:    cand.UpstreamModel.ModelID,
 		IngressProtocol:  codec.Name(),
-		UpstreamProtocol: h.effectiveProviderProtocol(cand),
+		UpstreamProtocol: upstreamProtocol,
 		Stream:           false,
 		UsageState:       store.UsageStateNone,
 		Status:           store.UsageStatusError,
@@ -1820,6 +1850,11 @@ func (h *Handler) finishNonStreamEncodeFailure(
 		RouteTrace: strings.Join(AppendRouteTrace(
 			priorTrace, len(priorTrace)+1, cand, "fail_terminal", code), "; "),
 	})
+	if !upstreamUsage.IsZero() {
+		rate.settleDaily(upstreamUsage.TotalTokens)
+	} else {
+		rate.ReleaseDaily()
+	}
 	rate.Commit(0)
 
 	out := Outcome{Kind: OutcomeEncodeFailed, Code: code}.normalize()
@@ -1897,6 +1932,7 @@ func (h *Handler) finishNonStreamWriteFailure(
 		if !resp.Usage.IsZero() {
 			rate.Commit(resp.Usage.TotalTokens)
 		} else {
+			rate.ReleaseDaily()
 			rate.ReleaseQuota()
 		}
 	})

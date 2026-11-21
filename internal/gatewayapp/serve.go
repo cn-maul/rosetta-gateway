@@ -305,6 +305,11 @@ func startReconcile(db *store.Store, logger *slog.Logger, shutdown <-chan struct
 		ctx, cancel := maintenanceContext(shutdown)
 		defer cancel()
 		runReconcile := func(reason string) {
+			if count, err := db.SweepExpiredDailyQuota(ctx, time.Now()); err != nil {
+				logger.Warn("expired daily quota sweep failed", "error", err)
+			} else if count > 0 {
+				logger.Warn("recovered expired daily quota reservations", "requests", count)
+			}
 			result, err := db.ReconcileUnchargedUsage(ctx, 500)
 			if err != nil {
 				logger.Error("charge reconciliation scan failed", "error", err, "trigger", reason)

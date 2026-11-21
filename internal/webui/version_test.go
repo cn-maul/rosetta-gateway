@@ -98,6 +98,23 @@ func embeddedBundle(t *testing.T) string {
 	return readEmbedded(t, "dist/assets/"+m[2])
 }
 
+func TestEmbeddedRosettaVersionMatchesGoMod(t *testing.T) {
+	modPath := filepath.Join("..", "..", "go.mod")
+	data, err := os.ReadFile(modPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	version := regexp.MustCompile(`(?m)^\s*(?:require\s+)?github\.com/cn-maul/rosetta\s+(v\d+\.\d+\.\d+\S*)`).FindSubmatch(data)
+	if len(version) != 2 {
+		t.Fatal("go.mod 中没有找到 Rosetta SDK 版本")
+	}
+	want := string(version[1])
+	bundle := embeddedBundle(t)
+	if !strings.Contains(bundle, `"`+want+`"`) && !strings.Contains(bundle, "`"+want+"`") {
+		t.Errorf("内嵌前端缺少 Rosetta SDK 版本 %s，请重新构建并同步前端产物", want)
+	}
+}
+
 // readEmbedded 读 embed 进来的某个文件并转成字符串。
 func readEmbedded(t *testing.T, name string) string {
 	t.Helper()

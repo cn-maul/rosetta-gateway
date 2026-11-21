@@ -19,10 +19,10 @@
 # 「误以为在构建 arm64」留下空间。
 # 基础镜像固定到补丁版本与多架构 manifest digest，避免 tag 漂移导致同一
 # 源码在两次发布中实际使用不同工具链/运行库。升级时两者必须一起评估。
-FROM golang:1.27.3-alpine3.24@sha256:d530cf60723abf1ffae0cd16bb546b379ec0550d2f3815e5b16ed69dbc00fba4 AS build
+FROM golang:1.27.4-alpine3.24@sha256:70bd7ddea8b6cbe5d6943cde279d6b67feb10cc924fb9100d1d8757c1575b280 AS build
 WORKDIR /src
 
-# 禁止 Go 在构建时自动下载/切换工具链。go.mod 的 `go 1.27.3` 是模块
+# 禁止 Go 在构建时自动下载/切换工具链。go.mod 的 `go` 指令是模块
 # 最低版本要求；若基础镜像被误改成更旧的版本，构建应在这里明确失败，
 # 而不是悄悄联网拉一个未固定的补丁版本。
 ENV GOTOOLCHAIN=local
