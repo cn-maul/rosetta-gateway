@@ -108,12 +108,14 @@ export function GroupModelsModal({
   onSaved: () => void | Promise<void>
 }) {
   const [picked, setPicked] = useState<string[]>([])
+  const [modelsValid, setModelsValid] = useState(true)
   const [err, setErr] = useState('')
   const [busy, setBusy] = useState(false)
 
   useEffect(() => {
     if (group) {
       setPicked([...group.models])
+      setModelsValid(true)
       setErr('')
     }
   }, [group])
@@ -122,6 +124,10 @@ export function GroupModelsModal({
     const g = group
     if (!g || busy) return
     setErr('')
+    if (!modelsValid) {
+      setErr('选择「仅所选模型」时至少要勾选一个模型')
+      return
+    }
     setBusy(true)
     try {
       await api.setGroupModels(g.id, [...picked])
@@ -147,7 +153,7 @@ export function GroupModelsModal({
           <Button variant="ghost" onPress={onClose}>
             取消
           </Button>
-          <Button variant="primary" isDisabled={busy} onPress={() => void submit()}>
+          <Button variant="primary" isDisabled={busy || !modelsValid} onPress={() => void submit()}>
             {busy ? '保存中…' : `保存（已选 ${picked.length}）`}
           </Button>
         </div>
@@ -158,7 +164,12 @@ export function GroupModelsModal({
           还没有任何路由（公开模型名）。请先到「上游与模型 / 路由」里建好。
         </div>
       ) : (
-        <ModelPicker value={picked} onChange={setPicked} options={modelOptions} />
+        <ModelPicker
+          value={picked}
+          onChange={setPicked}
+          options={modelOptions}
+          onValidityChange={setModelsValid}
+        />
       )}
       {err ? (
         <div className="text-danger mt-2 text-[12.5px]" role="alert">

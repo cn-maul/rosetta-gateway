@@ -35,6 +35,7 @@ export function Keys() {
   const [cOpen, setCOpen] = useState(false)
   const [editKey, setEditKey] = useState<AccessKey | null>(null)
   const [plainKeyBox, setPlainKeyBox] = useState<PlainKeyBox>({ open: false, key: '', name: '' })
+  const [createdKey, setCreatedKey] = useState<AccessKey | null>(null)
   const [copyingId, setCopyingId] = useState('')
   const [ccPickerKey, setCcPickerKey] = useState<AccessKey | null>(null)
 
@@ -161,8 +162,9 @@ export function Keys() {
   }
 
   /** 创建成功：先展示明文，再刷新列表。 */
-  const onCreated = async (created: { name: string; plaintext_key: string }) => {
+  const onCreated = async (created: { name: string; plaintext_key: string; created?: AccessKey }) => {
     setPlainKeyBox({ open: true, key: created.plaintext_key, name: created.name })
+    setCreatedKey(created.created ?? null)
     await load()
   }
 
@@ -187,7 +189,10 @@ export function Keys() {
 
   /** 关闭明文弹窗，并抹掉明文（前端审计 M5）。明文不应在弹窗关闭后继续驻留：
    * 后端保留了加密副本，用户仍可从列表里再次复制。 */
-  const closePlainKeyBox = () => setPlainKeyBox({ open: false, key: '', name: '' })
+  const closePlainKeyBox = () => {
+    setPlainKeyBox({ open: false, key: '', name: '' })
+    setCreatedKey(null)
+  }
 
   useEffect(() => closePlainKeyBox, [])
 
@@ -313,7 +318,6 @@ export function Keys() {
         importBusy={importBusy}
         onCopy={(k) => void copyExistingKey(k)}
         onCcPicker={(k) => setCcPickerKey(k)}
-        onMagpieImport={(k) => void importKey(k, 'magpie')}
         onEdit={openEdit}
         onDelete={(k) => void removeKey(k)}
         onToggle={(k) => void toggleKey(k)}
@@ -335,13 +339,20 @@ export function Keys() {
         groupOptions={groupOptions}
         onSaved={load}
       />
-      <PlainKeyModal box={plainKeyBox} onClose={closePlainKeyBox} />
+      <PlainKeyModal
+        box={plainKeyBox}
+        onClose={closePlainKeyBox}
+        keyRow={createdKey}
+        onImport={(k, app) => void importKey(k, 'ccswitch', app)}
+        onImportMagpie={(k) => void importKey(k, 'magpie')}
+      />
       <CcPickerModal
         keyRow={ccPickerKey}
         importingAction={importingAction}
         importingApp={ccImportingApp}
         onClose={() => setCcPickerKey(null)}
         onPick={(k, app) => void importKey(k, 'ccswitch', app)}
+        onPickMagpie={(k) => void importKey(k, 'magpie')}
       />
     </div>
   )

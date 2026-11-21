@@ -157,7 +157,6 @@ export function Overview() {
     <>
       <PageHeader
         title="总览"
-        sub={`${rangeLabel(rangeKey)}的调用量与性能，逐日走势见下方图表`}
         actions={
           <>
             <Select

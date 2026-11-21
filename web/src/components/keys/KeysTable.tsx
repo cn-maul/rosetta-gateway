@@ -1,5 +1,5 @@
-import { Copy } from 'lucide-react'
-import { Button, Switch, Table } from '@heroui/react'
+import { Copy, Ellipsis, Pencil, Trash2 } from 'lucide-react'
+import { Button, Dropdown, Label, Switch, Table } from '@heroui/react'
 import { fmtDateTime, fmtTokens } from '../../fmt'
 import { DataTable } from '../../ui/DataTable'
 import { StatusChip } from '../../ui/StatusChip'
@@ -20,7 +20,6 @@ export function KeysTable({
   importBusy,
   onCopy,
   onCcPicker,
-  onMagpieImport,
   onEdit,
   onDelete,
   onToggle,
@@ -38,7 +37,6 @@ export function KeysTable({
   importBusy: (k: AccessKey) => boolean
   onCopy: (k: AccessKey) => void
   onCcPicker: (k: AccessKey) => void
-  onMagpieImport: (k: AccessKey) => void
   onEdit: (k: AccessKey) => void
   onDelete: (k: AccessKey) => void
   onToggle: (k: AccessKey) => void
@@ -153,36 +151,45 @@ export function KeysTable({
                           <Copy size={16} strokeWidth={1.75} aria-hidden />
                         </Button>
                       </span>
-                      <span title={k.can_copy ? '选择要导入 CC Switch 的客户端' : '这把密钥的明文已不可恢复，无法导入；请新建密钥'}>
+                      <span title={k.can_copy ? '导入本机客户端' : '这把密钥的明文已不可恢复，无法导入；请新建密钥'}>
                         <Button
-                          isIconOnly
                           variant="ghost"
                           size="sm"
                           isDisabled={!k.can_copy || importBusy(k)}
-                          aria-label="导入 CC Switch"
+                          aria-label="导入客户端"
                           onPress={() => onCcPicker(k)}
                         >
-                          <img src={ccSwitchIcon} alt="" width={16} height={16} className="object-contain" />
+                          <span className="flex items-center gap-1.5">
+                            <img src={ccSwitchIcon} alt="" width={16} height={16} className="object-contain" aria-hidden />
+                            <img src={magpieIcon} alt="" width={16} height={16} className="icon-invert-dark object-contain" aria-hidden />
+                            <span className="text-xs">导入</span>
+                          </span>
                         </Button>
                       </span>
-                      <span title={k.can_copy ? '把网关地址和这把密钥添加到本机 Magpie' : '这把密钥的明文已不可恢复，无法导入；请新建密钥'}>
-                        <Button
-                          isIconOnly
-                          variant="ghost"
-                          size="sm"
-                          isDisabled={!k.can_copy || importBusy(k)}
-                          aria-label="导入 Magpie"
-                          onPress={() => onMagpieImport(k)}
-                        >
-                          <img src={magpieIcon} alt="" width={17} height={17} className="icon-invert-dark object-contain" />
-                        </Button>
-                      </span>
-                      <Button variant="ghost" size="sm" onPress={() => onEdit(k)}>
-                        编辑
-                      </Button>
-                      <Button variant="danger" size="sm" onPress={() => onDelete(k)}>
-                        删除
-                      </Button>
+                      <Dropdown>
+                        <Dropdown.Trigger>
+                          <Button isIconOnly variant="ghost" size="sm" aria-label={`更多操作 ${k.name || k.key_prefix}`}>
+                            <Ellipsis size={16} aria-hidden />
+                          </Button>
+                        </Dropdown.Trigger>
+                        <Dropdown.Popover>
+                          <Dropdown.Menu
+                            onAction={(key) => {
+                              if (key === 'edit') onEdit(k)
+                              else if (key === 'delete') onDelete(k)
+                            }}
+                          >
+                            <Dropdown.Item id="edit" textValue="编辑">
+                              <Pencil size={14} aria-hidden />
+                              <Label>编辑</Label>
+                            </Dropdown.Item>
+                            <Dropdown.Item id="delete" textValue="删除" className="text-danger">
+                              <Trash2 size={14} aria-hidden />
+                              <Label>删除</Label>
+                            </Dropdown.Item>
+                          </Dropdown.Menu>
+                        </Dropdown.Popover>
+                      </Dropdown>
                       <Switch
                         isSelected={k.enabled}
                         isDisabled={toggling.has(k.id)}

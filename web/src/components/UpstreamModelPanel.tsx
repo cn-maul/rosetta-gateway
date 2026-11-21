@@ -1,4 +1,5 @@
 import { Button, Table } from '@heroui/react'
+import { Waypoints } from 'lucide-react'
 import { DataTable } from '../ui/DataTable'
 import { StatusChip, type StatusTone } from '../ui/StatusChip'
 import { fmtSpeed, fmtSec, fmtPercent, fmtTokens } from '../fmt'
@@ -144,6 +145,7 @@ interface UpstreamModelPanelProps {
   onTest: (m: UpstreamModel) => void
   onEdit: (m: UpstreamModel) => void
   onRemove: (m: UpstreamModel) => void
+  onRoute: (m: UpstreamModel) => void
 }
 
 export function UpstreamModelPanel({
@@ -155,6 +157,7 @@ export function UpstreamModelPanel({
   onTest,
   onEdit,
   onRemove,
+  onRoute,
 }: UpstreamModelPanelProps) {
   return (
     <section className="flex flex-col gap-3">
@@ -240,6 +243,15 @@ export function UpstreamModelPanel({
                         </Button>
                         <Button variant="outline" size="sm" onPress={() => onEdit(m)}>
                           编辑
+                        </Button>
+                        <Button
+                          variant="outline"
+                          size="sm"
+                          aria-label={`用 ${m.model_id} 创建路由`}
+                          onPress={() => onRoute(m)}
+                        >
+                          <Waypoints size={14} aria-hidden />
+                          路由
                         </Button>
                         {/* 链首置灰：后端对链首删除回 409，所以这里提前
                              拦住并把「该去哪儿改」写进 aria-label。置灰而不是

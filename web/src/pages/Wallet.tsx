@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState, useSyncExternalStore } from 'react'
 import { Alert, Button, Spinner, Tabs, toast } from '@heroui/react'
 import { api, ApiFail, isAdmin, session } from '../api'
+import { PageHeader } from '../ui/PageHeader'
 import { ByDayTable, ByUserTable, TopupTable } from '../components/wallet/WalletTables'
 import { TopupModal } from '../components/wallet/TopupModal'
 import { fmtNum, fmtTokens, fmtBalance, fmtRemainder, fmtMoney } from '../fmt'
@@ -191,27 +192,30 @@ export function Wallet() {
 
   return (
     <div>
-      {/* 充值按钮只对管理员出现。真正的拦截在后端，这里只是不给管理员
-          看一个必然失败的入口。 */}
-      <div className="mb-3.5 flex items-center justify-end gap-2">
-        {admin ? (
-          <Button variant="primary" size="sm" onPress={() => setTopupOpen(true)}>
-            充值
-          </Button>
-        ) : null}
-        <Button
-          variant="ghost"
-          size="sm"
-          isDisabled={loading}
-          onPress={() => {
-            void load()
-            // 流水表只在用户已经看过时随刷新一起重拉。
-            if (topupsLoadedRef.current) void loadTopups()
-          }}
-        >
-          刷新
-        </Button>
-      </div>
+      <PageHeader
+        title={admin ? '账户与充值' : '余额与账单'}
+        actions={
+          <>
+            {admin ? (
+              <Button variant="primary" size="sm" onPress={() => setTopupOpen(true)}>
+                充值
+              </Button>
+            ) : null}
+            <Button
+              variant="secondary"
+              size="sm"
+              isDisabled={loading}
+              onPress={() => {
+                void load()
+                // 流水表只在用户已经看过时随刷新一起重拉。
+                if (topupsLoadedRef.current) void loadTopups()
+              }}
+            >
+              刷新
+            </Button>
+          </>
+        }
+      />
 
       {/* 骨架必须先于余额出现，否则点进来的第一眼是「空」，与「没钱」无法区分。 */}
       {loading && !stats ? (
@@ -235,24 +239,19 @@ export function Wallet() {
                 <div className="my-1.5 text-[40px] leading-[1.15] font-semibold tabular-nums">
                   ¥{fmtMoney(totalCost)}
                 </div>
-                <div className="text-muted max-w-[34em] text-[12px] leading-relaxed">
-                  全部历史累计，共 {fmtNum(totalCalls)} 次调用
-                  {totalCalls > 0 ? `，均次 ¥${fmtMoney(avgCost)}` : ''}。
-                </div>
+                <div className="text-muted text-[12px]">累计 · {fmtNum(totalCalls)} 次</div>
               </div>
               <div>
                 <div className="text-muted text-[12.5px]">Token 消耗</div>
                 <div className="my-1.5 text-[22px] leading-tight font-semibold tabular-nums">
                   {fmtTokens(stats?.total_tokens ?? 0)}
                 </div>
-                <div className="text-muted max-w-[34em] text-[12px] leading-relaxed">
-                  与费用同一区间、同一数据源（输入 + 输出 + 缓存命中）。
-                </div>
+                <div className="text-muted text-[12px]">累计 · 输入 + 输出 + 缓存命中</div>
               </div>
               <div>
                 <div className="text-muted text-[12.5px]">调用次数</div>
                 <div className="my-1.5 text-[22px] leading-tight font-semibold tabular-nums">{fmtNum(totalCalls)}</div>
-                <div className="text-muted max-w-[34em] text-[12px] leading-relaxed">与上方金额同源；单看金额无法判断量级。</div>
+                <div className="text-muted text-[12px]">累计</div>
               </div>
             </div>
           ) : (
@@ -266,14 +265,10 @@ export function Wallet() {
                   {unlimited ? '' : '¥'}
                   {fmtBalance(balanceCents, unlimited)}
                 </div>
-                <div className="text-muted max-w-[34em] text-[12px] leading-relaxed">
-                  {unlimited ? '该账户不受余额限制' : '可用余额。耗尽后请求会被拒绝（402），需联系管理员充值。'}
-                </div>
+                <div className="text-muted text-[12px]">{unlimited ? '不限' : '可用余额'}</div>
                 {/* 危险色只给「余额已用尽」：本页唯一对应后端真实 402 的状态。 */}
                 {balanceEmpty ? (
-                  <div className="text-danger mt-1 text-[12px] font-medium">
-                    余额已用尽，现在发起请求会直接失败（HTTP 402），请先联系管理员充值。
-                  </div>
+                  <div className="text-danger mt-1 text-[12px] font-medium">余额已用尽 · 请充值</div>
                 ) : null}
               </div>
               <div>
@@ -281,18 +276,13 @@ export function Wallet() {
                 <div className="my-1.5 text-[22px] leading-tight font-semibold tabular-nums">
                   {remainderText ? '¥' + remainderText : '—'}
                 </div>
-                <div className="text-muted max-w-[34em] text-[12px] leading-relaxed">
-                  {remainderText
-                    ? '已消费但不足一分、尚未从余额扣除的部分，攒够一分后自动扣除。'
-                    : '暂无不足一分的待结算消费。'}
-                </div>
+                <div className="text-muted text-[12px]">{remainderText ? '不足一分，自动累计' : '无'}</div>
               </div>
               <div>
                 <div className="text-muted text-[12.5px]">总消费</div>
                 <div className="my-1.5 text-[22px] leading-tight font-semibold tabular-nums">¥{fmtMoney(totalCost)}</div>
-                <div className="text-muted max-w-[34em] text-[12px] leading-relaxed">
-                  全部历史累计，共 {fmtNum(totalCalls)} 次调用
-                  {totalCalls > 0 ? `，均次 ¥${fmtMoney(avgCost)}` : ''}。
+                <div className="text-muted text-[12px]">
+                  累计 · {fmtNum(totalCalls)} 次{totalCalls > 0 ? ` · 均次 ¥${fmtMoney(avgCost)}` : ''}
                 </div>
               </div>
             </div>

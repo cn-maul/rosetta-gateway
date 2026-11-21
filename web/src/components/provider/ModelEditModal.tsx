@@ -379,11 +379,13 @@ export function ModelDiscoverModal({
   open,
   onClose,
   onSaved,
+  autoDiscover = false,
 }: {
   providerId: string
   open: boolean
   onClose: () => void
   onSaved: () => Promise<void>
+  autoDiscover?: boolean
 }) {
   const [discovering, setDiscovering] = useState(false)
   const [discovered, setDiscovered] = useState<DiscoveredModel[]>([])
@@ -451,6 +453,11 @@ export function ModelDiscoverModal({
       setDiscovering(false)
     }
   }
+
+  useEffect(() => {
+    if (open && autoDiscover) void runDiscover()
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [open, autoDiscover])
 
   const isSelected = (mid: string) => selected.some((s) => s.model_id === mid)
 

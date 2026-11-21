@@ -108,8 +108,11 @@ test('新建上游：协议检测按钮与结论胶囊', async () => {
   assert.ok(page.includes('协议检测'), '缺少「协议检测」按钮文案')
   assert.ok(page.includes('探测中…'), '探测进行中没有反馈文案')
   assert.ok(page.includes('function probeTone'), '缺少探测结论的配色函数')
-  // 结论必须渲染成 StatusChip 胶囊，且区分「可用 / 未发现」。
-  assert.ok(page.includes("r.ok ? ' 可用' : ' 未发现'"), '探测结论没有渲染成可用/未发现胶囊')
+  // 结论必须渲染成 StatusChip 胶囊，且区分「入口可用 / 鉴权失败 / 未发现」。
+  assert.ok(page.includes('probeLabel(r)'), '探测结论没有走统一的 probeLabel')
+  assert.ok(page.includes('入口可用'), '缺少「入口可用」结论')
+  assert.ok(page.includes('鉴权失败'), '缺少「鉴权失败」结论')
+  assert.ok(page.includes('未发现'), '缺少「未发现」结论')
   assert.ok(page.includes("'warn'"), '鉴权未通过（401/403）应有别于「没有这个协议」的颜色')
 })
 

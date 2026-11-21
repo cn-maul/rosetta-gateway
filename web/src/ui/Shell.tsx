@@ -1,7 +1,7 @@
 import { Suspense, useEffect, useRef, useState, useSyncExternalStore } from 'react'
 import { NavLink, Outlet, useLocation, useMatches, useNavigate } from 'react-router-dom'
 import { Avatar, Button, Dropdown, Label, toast } from '@heroui/react'
-import { LogOut, Moon, PanelLeft, Sun, UserRound } from 'lucide-react'
+import { ChevronLeft, LogOut, Menu, Moon, PanelLeft, Sun, UserRound } from 'lucide-react'
 import { ApiFail, isAdmin, logout, session } from '../api'
 import { useTheme } from './theme'
 import { BrandMark } from './BrandMark'
@@ -69,11 +69,12 @@ export function Shell() {
     void loadBranding()
   }, [])
 
-  // ≤900px 视口强制图标栏（224px 会吃掉平板宽度），但用户自己的选择在
-  // 回到宽屏后仍然生效 —— narrow 只影响显示，不写回存储。
+  // ≤900px 视口用抽屉导航：默认收起为图标栏，点顶部菜单键铺开完整导航；
+  // 点任意链接或遮罩即关闭。用户自己的宽屏折叠偏好不写回存储。
   const [collapsed, setCollapsed] = useState(readCollapsed)
+  const [narrowOpen, setNarrowOpen] = useState(false)
   const narrow = useNarrow()
-  const railCollapsed = collapsed || narrow
+  const railCollapsed = narrow ? !narrowOpen : collapsed
   const toggleCollapse = () =>
     setCollapsed((prev) => {
       persistCollapsed(!prev)
@@ -98,6 +99,7 @@ export function Shell() {
   useEffect(() => {
     contentRef.current?.scrollTo({ top: 0 })
     setScrolled(false)
+    setNarrowOpen(false)
   }, [location.pathname])
 
   const doLogout = async () => {
@@ -114,9 +116,21 @@ export function Shell() {
 
   return (
     <div className="flex h-dvh bg-background text-foreground">
+      {narrow && narrowOpen ? (
+        <Button
+          aria-label="关闭导航"
+          className="bg-overlay/30 fixed inset-0 z-30 h-auto w-full rounded-none"
+          onPress={() => setNarrowOpen(false)}
+        />
+      ) : null}
       <aside
         className={
           'flex shrink-0 flex-col border-separator border-r transition-[width] ' +
+          (narrow
+            ? 'fixed inset-y-0 left-0 z-40 bg-background shadow-xl ' +
+              (narrowOpen ? 'w-56' : 'w-14')
+            : '') +
+          ' ' +
           (railCollapsed ? 'w-14' : 'w-56')
         }
       >
@@ -176,22 +190,33 @@ export function Shell() {
               isIconOnly
               size="sm"
               variant="ghost"
-              aria-label={railCollapsed ? '展开侧边栏' : '收起侧边栏'}
-              onPress={toggleCollapse}
+              aria-label={narrow ? '关闭导航' : railCollapsed ? '展开侧边栏' : '收起侧边栏'}
+              onPress={() => (narrow ? setNarrowOpen(false) : toggleCollapse())}
             >
-              <PanelLeft size={16} aria-hidden />
+              {narrow ? <ChevronLeft size={16} aria-hidden /> : <PanelLeft size={16} aria-hidden />}
             </Button>
           </div>
         </div>
       </aside>
 
-      <div className="flex min-w-0 flex-1 flex-col">
+      <div className={'flex min-w-0 flex-1 flex-col' + (narrow ? ' pl-14' : '')}>
         <header
           className={
             'border-separator z-20 flex h-12 shrink-0 items-center gap-3 border-b px-4 ' +
             (scrolled ? 'shadow-sm' : '')
           }
         >
+          {narrow ? (
+            <Button
+              isIconOnly
+              size="sm"
+              variant="ghost"
+              aria-label="打开导航"
+              onPress={() => setNarrowOpen(true)}
+            >
+              <Menu size={18} aria-hidden />
+            </Button>
+          ) : null}
           <span className="text-muted truncate text-[12.5px]">
             {locationLabel(location.pathname, admin, nav)}
           </span>

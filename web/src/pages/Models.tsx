@@ -1,11 +1,14 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { Link } from 'react-router-dom'
-import { Button, Spinner } from '@heroui/react'
+import { Button, Input, Spinner, Table, TextField } from '@heroui/react'
+import { Copy } from 'lucide-react'
 import { api, ApiFail, isAdmin } from '../api'
 import { unitPrice, cacheUnitPrice } from '../modelPrice'
+import { copyText } from '../fmt'
 import type { ModelMeta, ModelPrice } from '../types'
 import { PageHeader } from '../ui/PageHeader'
 import { SectionCard } from '../ui/SectionCard'
+import { StatusChip } from '../ui/StatusChip'
 
 /**
  * 可用模型（全体可见的只读清单）。
@@ -26,6 +29,7 @@ export function Models() {
   const [restricted, setRestricted] = useState(false)
   const [loading, setLoading] = useState(true)
   const [err, setErr] = useState('')
+  const [query, setQuery] = useState('')
 
   // 单价表与映射表都转 Map 而不用下标：models[i] 与 prices[i] 平行数组，
   // 排序后用下标绑定会「A 模型显示 B 模型的价格」—— 错位比空值更难察觉。
@@ -34,9 +38,13 @@ export function Models() {
 
   /** 展示顺序 = 字典序：同一份集合若每次渲染顺序不同，用户的心智模型会漂移。 */
   const sorted = useMemo(() => [...models].filter(Boolean).sort(), [models])
-
   const providerOf = useCallback((name: string) => metaMap.get(name)?.provider_name ?? '', [metaMap])
   const priceOf = useCallback((name: string) => priceMap.get(name), [priceMap])
+  const visible = useMemo(() => {
+    const q = query.trim().toLowerCase()
+    if (!q) return sorted
+    return sorted.filter((m) => m.toLowerCase().includes(q) || providerOf(m).toLowerCase().includes(q))
+  }, [sorted, query, providerOf])
 
   const load = useCallback(async () => {
     const generation = ++pageGenRef.current
@@ -67,13 +75,11 @@ export function Models() {
   }, [])
 
   const priceCell = (v: number | undefined) => unitPrice(v ?? 0)
-  const unsetClass = (unset: boolean) => (unset ? 'font-normal text-muted/70' : 'font-semibold')
 
   return (
     <>
       <PageHeader
         title="可用模型"
-        sub="公开模型清单 · 首选参考价（只读）"
         actions={
           <Button variant="secondary" size="sm" isDisabled={loading} onPress={() => void load()}>
             刷新
@@ -81,17 +87,17 @@ export function Models() {
         }
       />
 
-      <p className="mb-4 text-xs leading-relaxed text-muted">
-        参考价指向首选目标（位置 0）；发生故障转移时，费用以请求日志中的实际目标记录为准。
-        {admin ? (
-          <Link to="/routes" className="text-accent hover:underline">
-            {' '}
-            管理模型与路由 →
-          </Link>
-        ) : null}
-      </p>
-
-      <SectionCard title="模型清单" description={sorted.length ? `共 ${sorted.length} 个` : undefined}>
+      <SectionCard
+        title="模型清单"
+        description={sorted.length ? `${sorted.length} 个` : undefined}
+        actions={
+          admin ? (
+            <Link to="/routes" className="text-link text-xs hover:underline">
+              管理路由
+            </Link>
+          ) : undefined
+        }
+      >
         {loading && sorted.length === 0 ? (
           <div className="flex items-center gap-3 py-8 text-sm text-muted" role="status">
             <Spinner size="sm" /> 加载中…
@@ -112,93 +118,71 @@ export function Models() {
           </p>
         ) : (
           <>
-            {restricted ? (
-              <p
-                className="mb-4 rounded-lg bg-warning-soft px-3.5 py-2 text-xs leading-relaxed text-warning-soft-foreground"
-                role="status"
-              >
-                这份清单已被你的分组收窄过 —— 下面的模型就是你最多能调用的，其余模型即使知道名字也会被拒绝。
-                需要更多模型请联系管理员调整分组白名单。
-              </p>
-            ) : null}
-            <div className="grid grid-cols-[repeat(auto-fill,minmax(min(100%,288px),1fr))] gap-3">
-              {sorted.map((m) => (
-                <article key={m} className="flex flex-col gap-2.5 rounded-2xl border border-separator bg-background-secondary px-4 py-3.5">
-                  <div className="min-w-0">
-                    <div className="break-all font-mono text-[13.5px] leading-snug font-semibold">{m}</div>
-                    <div className="mt-0.5 text-xs text-muted">
-                      {providerOf(m) ? `${providerOf(m)} · ` : ''}
-                      首选参考价（元 / 百万 tokens）
-                    </div>
-                  </div>
-                  <div className="flex flex-col gap-[3px] text-[12.5px]">
-                    <PriceRow label="输入" value={priceCell(priceOf(m)?.price_input)} unset={(priceOf(m)?.price_input ?? 0) <= 0} unsetClass={unsetClass} />
-                    <PriceRow label="输出" value={priceCell(priceOf(m)?.price_output)} unset={(priceOf(m)?.price_output ?? 0) <= 0} unsetClass={unsetClass} />
-                    {/* 「其中:」前缀不能省：缓存命中是**输入的一部分**
-                        （cached ⊆ input），不是额外成本。 */}
-                    <PriceRow
-                      label="其中:缓存命中"
-                      value={cacheUnitPrice(priceOf(m)?.price_input ?? 0, priceOf(m)?.price_cache_hit ?? 0)}
-                      unset={(priceOf(m)?.price_cache_hit ?? 0) <= 0 && (priceOf(m)?.price_input ?? 0) <= 0}
-                      unsetClass={unsetClass}
-                    />
-                  </div>
-                </article>
-              ))}
+            <div className="mb-3 flex flex-wrap items-center gap-2">
+              <TextField aria-label="搜索模型" value={query} onChange={setQuery} className="min-w-[220px] flex-1">
+                <Input type="search" placeholder="搜索模型或供应商" autoComplete="off" />
+              </TextField>
+              <span className="text-muted text-xs">{visible.length} / {sorted.length}</span>
+              {restricted ? <StatusChip tone="info">受分组限制</StatusChip> : null}
             </div>
+            <Table aria-label="可用模型与参考价">
+              <Table.ScrollContainer>
+                <Table.Content className="min-w-[680px]">
+                  <Table.Header>
+                    <Table.Column isRowHeader>模型</Table.Column>
+                    <Table.Column>输入</Table.Column>
+                    <Table.Column>缓存命中</Table.Column>
+                    <Table.Column>输出</Table.Column>
+                    <Table.Column>操作</Table.Column>
+                  </Table.Header>
+                  <Table.Body>
+                    {visible.map((m) => (
+                      <Table.Row key={m}>
+                        <Table.Cell>
+                          <span className="font-mono text-[12.5px] break-all">{m}</span>
+                          {providerOf(m) ? <span className="text-muted block text-[11.5px]">{providerOf(m)}</span> : null}
+                        </Table.Cell>
+                        <Table.Cell>
+                          <PriceCell value={priceCell(priceOf(m)?.price_input)} unset={(priceOf(m)?.price_input ?? 0) <= 0} />
+                        </Table.Cell>
+                        <Table.Cell>
+                          <PriceCell
+                            value={cacheUnitPrice(priceOf(m)?.price_input ?? 0, priceOf(m)?.price_cache_hit ?? 0)}
+                            unset={(priceOf(m)?.price_cache_hit ?? 0) <= 0 && (priceOf(m)?.price_input ?? 0) <= 0}
+                          />
+                        </Table.Cell>
+                        <Table.Cell>
+                          <PriceCell value={priceCell(priceOf(m)?.price_output)} unset={(priceOf(m)?.price_output ?? 0) <= 0} />
+                        </Table.Cell>
+                        <Table.Cell>
+                          <Button isIconOnly variant="ghost" size="sm" aria-label={`复制模型名 ${m}`} onPress={() => void copyText(m)}>
+                            <Copy size={15} aria-hidden />
+                          </Button>
+                        </Table.Cell>
+                      </Table.Row>
+                    ))}
+                  </Table.Body>
+                </Table.Content>
+              </Table.ScrollContainer>
+            </Table>
+            <p className="text-muted mt-2 text-[11.5px]">
+              元 / 百万 tokens · 首选目标参考价 · 未配置不等于免费
+            </p>
           </>
         )}
       </SectionCard>
-
-      <div className="mt-4">
-        <SectionCard title="关于这份清单">
-          <ul className="list-disc space-y-1.5 pl-5 text-[12.5px] leading-relaxed text-muted">
-            <li>
-              清单由网关按你的身份自动算出，<b className="font-semibold text-foreground">本页只读</b>
-              ：能改的地方是「访问密钥」页的模型白名单（只能收紧）和管理员的「分组」页（按组收紧）。
-            </li>
-            {admin ? (
-              <li>你是管理员，看到的是全部已配置的模型名，不受分组白名单约束。</li>
-            ) : restricted ? (
-              <li>你被分在一个收窄过的分组里，清单已被该分组的白名单过滤。</li>
-            ) : (
-              <li>你不在任何受限制的分组里，因此这份清单就是全部已配置的模型名。</li>
-            )}
-            <li>
-              密钥上如果单独设了白名单，最终范围取<b className="font-semibold text-foreground">两者取交集</b>，只会比这里更严。
-            </li>
-            <li>
-              单价单位<b className="font-semibold text-foreground">元 / 百万 tokens</b>
-              ：输入按「未命中缓存」计，缓存命中另有更低的一档（留空则回退到输入价）。
-            </li>
-            <li>
-              标「<b className="font-semibold text-foreground">未配置</b>」表示这一档还没填单价，<b className="font-semibold text-foreground">不等于免费</b>
-              {' '}
-              —— 未配置时该项按 0 元计入，实际花费请以「调用历史」里的记录为准。
-            </li>
-            <li>看不到某个模型不一定是故障：路由被停用、或模型名拼错，都会让它不出现在这份清单里。</li>
-          </ul>
-        </SectionCard>
-      </div>
     </>
   )
 }
 
-function PriceRow({
-  label,
+function PriceCell({
   value,
   unset,
-  unsetClass,
 }: {
-  label: string
   value: string
   unset: boolean
-  unsetClass: (unset: boolean) => string
 }) {
   return (
-    <div className="flex items-baseline justify-between gap-2.5">
-      <span className="whitespace-nowrap text-muted">{label}</span>
-      <span className={`text-right font-mono tabular-nums ${unsetClass(unset)}`}>{value}</span>
-    </div>
+    <span className={`font-mono text-[12.5px] tabular-nums ${unset ? 'text-muted' : 'font-semibold'}`}>{value}</span>
   )
 }

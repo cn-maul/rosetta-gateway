@@ -204,5 +204,13 @@ test('密钥页 Endpoint 显示 base URL，不带具体协议路径', async () =
     !/\/v1\/chat\/completions|\/v1\/messages|\/v1\/responses/.test(code),
     'Endpoint 应显示 <origin>/v1，完整请求路径交给客户端自己拼',
   )
-  assert.match(code, /path: '\/v1'/, '三种协议的 base URL 都是 /v1')
+  assert.match(
+    code,
+    /window\.location\.origin \+ '\/v1'/,
+    '三种协议共用 <origin>/v1，不再按协议拼完整路径',
+  )
+  assert.ok(
+    !/Select|selectedKey|协议类型/.test(code),
+    '协议下拉不改变任何结果，应从 Endpoint 栏移除',
+  )
 })

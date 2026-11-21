@@ -1,5 +1,5 @@
-import { useMemo, useState } from 'react'
-import { Button, Checkbox, SearchField } from '@heroui/react'
+import { useEffect, useMemo, useState } from 'react'
+import { Button, Checkbox, Label, Radio, RadioGroup, SearchField } from '@heroui/react'
 import { unionSelection } from '../modelSelection'
 
 /**
@@ -19,17 +19,24 @@ interface ModelPickerProps {
   /** 清单本身已被上游收窄（如普通用户只拿到本组内的模型）时置 true，
    *  用来提示「你看到的不是全部模型」。 */
   restricted?: boolean
+  /** 由父级决定提交按钮是否禁用；'limited' 且为空时不能静默当成不限。 */
+  onValidityChange?: (valid: boolean) => void
 }
 
 /** 超过这个数量才显示搜索框：几个模型时它是噪音，几十个时才是刚需。 */
 const SEARCH_THRESHOLD = 12
 
-export function ModelPicker({ value, onChange, options, restricted = false }: ModelPickerProps) {
+export function ModelPicker({ value, onChange, options, restricted = false, onValidityChange }: ModelPickerProps) {
   // 选项的确定性顺序。与后端同源（模型名由后端按字典序给出），但这里再排一次
   // 是有意的：组件的语义是「集合」，而界面是「列表」—— 同一份集合每次渲染若
   // 顺序不同，用户勾选一项后整列会跳位，下一次点击就点到了别的模型上。
   const sortedOptions = useMemo(() => [...options].sort(), [options])
   const [query, setQuery] = useState('')
+  const [limited, setLimited] = useState(value.length > 0)
+  const valid = !limited || value.length > 0
+  useEffect(() => {
+    onValidityChange?.(valid)
+  }, [valid, onValidityChange])
   const showSearch = sortedOptions.length > SEARCH_THRESHOLD
   // 过滤后的清单。大小写不敏感：模型名里有大量 gpt-4o / GPT-4O 混写。
   const visible = useMemo(() => {
@@ -62,17 +69,45 @@ export function ModelPicker({ value, onChange, options, restricted = false }: Mo
 
   return (
     <div className="border-separator rounded-lg border p-2">
+      <RadioGroup
+        aria-label="模型范围"
+        value={limited ? 'limited' : 'all'}
+        onChange={(v) => {
+          const next = String(v) === 'limited'
+          setLimited(next)
+          if (!next) onChange([])
+        }}
+        className="mb-2 gap-1.5"
+      >
+        <Radio value="all">
+          <Radio.Content>
+            <Radio.Control>
+              <Radio.Indicator />
+            </Radio.Control>
+            <Label>不额外限制</Label>
+          </Radio.Content>
+        </Radio>
+        <Radio value="limited">
+          <Radio.Content>
+            <Radio.Control>
+              <Radio.Indicator />
+            </Radio.Control>
+            <Label>仅所选模型</Label>
+          </Radio.Content>
+        </Radio>
+      </RadioGroup>
+      {!limited ? (
+        <p className="text-muted px-1 text-xs">
+          {restricted ? '使用分组允许的全部模型。' : '使用当前全部可用模型。'}
+        </p>
+      ) : (
+        <>
       <div className="mb-1.5 flex items-center justify-between gap-2">
         <span className="text-muted text-xs">
-          {value.length === 0 ? '未选 —— 不限制（可见全部模型）' : `已选 ${value.length} / ${options.length}`}
+          {value.length === 0 ? '至少选择一个模型' : `已选 ${value.length} / ${options.length}`}
         </span>
         <span className="flex gap-1.5">
-          <Button
-            variant="ghost"
-            size="sm"
-            isDisabled={options.length === 0 || (query.trim() !== '' && visible.length === 0)}
-            onPress={selectAll}
-          >
+          <Button variant="ghost" size="sm" isDisabled={options.length === 0 || (query.trim() !== '' && visible.length === 0)} onPress={selectAll}>
             {query.trim() ? '全选当前' : '全选'}
           </Button>
           <Button variant="ghost" size="sm" isDisabled={value.length === 0} onPress={clearAll}>
@@ -119,9 +154,10 @@ export function ModelPicker({ value, onChange, options, restricted = false }: Mo
         </>
       )}
 
-      {restricted ? <div className="mt-1.5 text-[11.5px] opacity-70">这份清单已被你的分组收窄过 —— 你最多只能用到这些模型。</div> : null}
-      {/* 关键 tip：弱化色而非危险色 —— 它是一条语义说明，不是警告。 */}
-      <div className="mt-1.5 text-[11.5px] opacity-70">一个都不选 = 不限制；与分组白名单取交集，两者都限制时更严的生效。</div>
+        </>
+      )}
+      {restricted ? <div className="mt-1.5 text-[11.5px] opacity-70">选项已按分组收窄</div> : null}
+      <div className="mt-1.5 text-[11.5px] opacity-70">最终范围与分组限制取交集</div>
     </div>
   )
 }

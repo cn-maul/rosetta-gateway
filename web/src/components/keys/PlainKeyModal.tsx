@@ -1,7 +1,12 @@
 import { Button } from '@heroui/react'
+import { Check, Copy, TerminalSquare } from 'lucide-react'
 import { copyText } from '../../fmt'
 import { toast } from '@heroui/react'
 import { AppModal } from '../../ui/AppModal'
+import { CcPickerModal } from './CcPickerModal'
+import { useState } from 'react'
+import type { AccessKey } from '../../types'
+import type { CcSwitchApp } from '../../importLinks'
 
 export interface PlainKeyBox {
   open: boolean
@@ -16,10 +21,17 @@ export interface PlainKeyBox {
 export function PlainKeyModal({
   box,
   onClose,
+  keyRow,
+  onImport,
+  onImportMagpie,
 }: {
   box: PlainKeyBox
   onClose: () => void
+  keyRow?: AccessKey | null
+  onImport?: (keyRow: AccessKey, app: CcSwitchApp) => void
+  onImportMagpie?: (keyRow: AccessKey) => void
 }) {
+  const [importOpen, setImportOpen] = useState(false)
   const copy = async () => {
     const ok = await copyText(box.key)
     if (ok) toast.success('已复制到剪贴板')
@@ -34,8 +46,18 @@ export function PlainKeyModal({
       dismissable={false}
       footer={
         <div className="flex justify-end gap-2">
-          <Button onPress={() => void copy()}>复制密钥</Button>
+          <Button variant="secondary" onPress={() => void copy()}>
+            <Copy size={15} aria-hidden />
+            复制
+          </Button>
+          {keyRow ? (
+            <Button variant="outline" onPress={() => setImportOpen(true)}>
+              <TerminalSquare size={15} aria-hidden />
+              导入客户端
+            </Button>
+          ) : null}
           <Button variant="primary" onPress={onClose}>
+            <Check size={15} aria-hidden />
             我已保存
           </Button>
         </div>
@@ -48,6 +70,21 @@ export function PlainKeyModal({
         <div className="font-mono text-[13px] break-all">{box.key}</div>
         <div className="text-warning mt-2 text-xs">请立即复制并妥善保管，不要提交到代码仓库。</div>
       </div>
+      <p className="text-muted mt-3 text-xs">Base URL：{window.location.origin}/v1</p>
+      <CcPickerModal
+        keyRow={importOpen && keyRow ? keyRow : null}
+        importingAction=""
+        importingApp={null}
+        onClose={() => setImportOpen(false)}
+        onPick={(k, app) => {
+          setImportOpen(false)
+          onImport?.(k, app)
+        }}
+        onPickMagpie={(k) => {
+          setImportOpen(false)
+          onImportMagpie?.(k)
+        }}
+      />
     </AppModal>
   )
 }

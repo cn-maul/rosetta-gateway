@@ -3,6 +3,7 @@ import { Button, Spinner, toast } from '@heroui/react'
 import { useNavigate, useParams, useSearchParams } from 'react-router-dom'
 import { api } from '../api'
 import { useNetworks } from '../useNetworks'
+import { ChevronLeft } from 'lucide-react'
 import { PageHeader } from '../ui/PageHeader'
 import { SectionCard } from '../ui/SectionCard'
 import { SkeletonBlock } from '../ui/SkeletonBlock'
@@ -269,7 +270,7 @@ export function ProviderDetail() {
     open: false,
     editing: null,
   })
-  const [modelModal, setModelModal] = useState<{ open: boolean; editing: UpstreamModel | null }>({
+  const [modelModal, setModelModal] = useState<{ open: boolean; editing: UpstreamModel | null; discover?: boolean }>({
     open: false,
     editing: null,
   })
@@ -396,13 +397,14 @@ export function ProviderDetail() {
     <div className="flex flex-col gap-5">
       <PageHeader
         title={provider?.name ?? '上游详情'}
+        breadcrumb={
+          <Button variant="outline" size="sm" onPress={() => navigate(backTo)}>
+            <ChevronLeft size={14} aria-hidden />
+            ← 供应商
+          </Button>
+        }
         actions={
           <>
-            {/* 返回用按钮而不是链接：这一页的「返回」是页级动作，与右侧刷新、
-                编辑同级；做成蓝色下划线链接时，它读起来像正文里的跳转词。 */}
-            <Button variant="outline" size="sm" onPress={() => navigate(backTo)}>
-              ← 供应商
-            </Button>
             <Button
               variant="outline"
               isDisabled={loading}
@@ -441,7 +443,16 @@ export function ProviderDetail() {
         </SectionCard>
       ) : provider ? (
         <>
-          {provider.enabled && provider.ready !== true ? (
+          {!credsLoading && !credsErr && creds.length === 0 ? (
+            <Button
+              variant="outline"
+              className="border-warning/30 bg-warning-soft text-warning-foreground h-auto w-full justify-between gap-3 px-3 py-2 text-left text-sm"
+              onPress={() => setCredModal({ open: true, editing: null })}
+            >
+              <span>添加第一把凭据，上游才能开始工作</span>
+              <span className="font-medium">添加凭据 →</span>
+            </Button>
+          ) : provider.enabled && provider.ready !== true ? (
             <div
               role="status"
               className="border-warning/30 bg-warning-soft text-warning-foreground rounded-md border px-3 py-2 text-sm"
@@ -452,6 +463,15 @@ export function ProviderDetail() {
                   ? '未建立可用凭据池，请检查下方凭据配置'
                   : '暂未取得运行时状态')}
             </div>
+          ) : !modelsLoading && !modelsErr && models.length === 0 ? (
+            <Button
+              variant="outline"
+              className="border-separator bg-background-secondary h-auto w-full justify-between gap-3 px-3 py-2 text-left text-sm"
+              onPress={() => setModelModal({ open: true, editing: null, discover: true })}
+            >
+              <span>添加上游模型，之后才能在路由里选择它</span>
+              <span className="font-medium">添加模型 →</span>
+            </Button>
           ) : null}
 
           {/* 三块平铺：概览与凭据并排（各只六行键值 / 三列，天然适合窄栏，
@@ -500,10 +520,11 @@ export function ProviderDetail() {
               testing={testing}
               error={modelsErr}
               onRetry={() => void loadModels(true)}
-              onAdd={() => setModelModal({ open: true, editing: null })}
+              onAdd={() => setModelModal({ open: true, editing: null, discover: true })}
               onTest={(m) => void testModel(m)}
               onEdit={(m) => setModelModal({ open: true, editing: m })}
               onRemove={(m) => void removeModel(m)}
+              onRoute={(m) => navigate(`/routes?model=${encodeURIComponent(m.id)}`)}
             />
           )}
         </>
@@ -538,6 +559,7 @@ export function ProviderDetail() {
         <ModelDiscoverModal
           providerId={provider?.id ?? idRef.current}
           open={modelModal.open && !editingModel}
+          autoDiscover={modelModal.discover}
           onClose={() => setModelModal((f) => ({ ...f, open: false }))}
           onSaved={async () => {
             // 概览的模型数来自列表接口的 model_count，所以必须刷新 provider，

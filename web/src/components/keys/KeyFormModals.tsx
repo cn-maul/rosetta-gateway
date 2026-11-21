@@ -19,6 +19,8 @@ import type { AccessKey, Group } from '../../types'
 interface KeyCreated {
   name: string
   plaintext_key: string
+  /** 服务端返回的完整记录，明文弹窗可直接承接到客户端导入。 */
+  created?: AccessKey
 }
 
 /** 分组覆盖下拉（仅管理员表单里渲染）。空串 = 沿用归属用户所属分组。 */
@@ -95,6 +97,7 @@ export function KeyCreateModal({
     dailyTokens: '',
   })
   const [models, setModels] = useState<string[]>([])
+  const [modelsValid, setModelsValid] = useState(true)
   const [days, setDays] = useState('0')
   const [ips, setIps] = useState('')
   const [groupId, setGroupId] = useState('')
@@ -114,6 +117,7 @@ export function KeyCreateModal({
     setQuota('0')
     setLimit({ mode: 'none', rpm: '', tpm: '', dailyRequests: '', dailyTokens: '' })
     setModels([])
+    setModelsValid(true)
     setDays('0')
     setIps('')
     setGroupId('')
@@ -125,6 +129,10 @@ export function KeyCreateModal({
     if (busy) return
     if (!name.trim()) {
       toast.danger('名称为必填项')
+      return
+    }
+    if (!modelsValid) {
+      toast.danger('「仅所选模型」至少需要选择一个模型')
       return
     }
     const quotaValue = quotaTokens()
@@ -158,7 +166,7 @@ export function KeyCreateModal({
         group_id: isAdmin() ? groupId : undefined,
       })
       onClose()
-      await onCreated(created)
+      await onCreated({ name: created.name, plaintext_key: created.plaintext_key, created })
     } catch (e) {
       if ((e as { status?: number }).status !== 401) toast.danger('创建失败：' + (e as Error).message)
     } finally {
@@ -182,7 +190,7 @@ export function KeyCreateModal({
           <Button variant="ghost" onPress={onClose}>
             取消
           </Button>
-          <Button variant="primary" isDisabled={busy} onPress={() => void submit()}>
+          <Button variant="primary" isDisabled={busy || !modelsValid} onPress={() => void submit()}>
             {busy ? '创建中…' : '创建'}
           </Button>
         </div>
@@ -209,7 +217,13 @@ export function KeyCreateModal({
         </TextField>
         <div>
           <span className="mb-1.5 block text-[13px] font-medium">可用模型</span>
-          <ModelPicker value={models} onChange={setModels} options={modelOptions} restricted={modelsRestricted} />
+          <ModelPicker
+            value={models}
+            onChange={setModels}
+            options={modelOptions}
+            restricted={modelsRestricted}
+            onValidityChange={setModelsValid}
+          />
         </div>
         {/* 宽版双栏：左列是「这把 key 是什么/能用什么」，右列是「限制」。
             之前所有字段单列堆叠，弹窗又窄，滚到底才能看到配额与限速。 */}
@@ -289,6 +303,7 @@ export function KeyEditModal({
     dailyTokens: '',
   })
   const [models, setModels] = useState<string[]>([])
+  const [modelsValid, setModelsValid] = useState(true)
   const [days, setDays] = useState('0')
   // 打开编辑框时的天数快照。保存时只在用户显式改过天数后才发送 expires_at：
   // 总是发送会把「改个名字」变成「把截止时间重锚定到现在」（剩余不足 1 天的 key
@@ -311,6 +326,7 @@ export function KeyEditModal({
     if (!k) return
     setName(k.name)
     setQuota(String(k.quota_tokens ?? 0))
+    setModelsValid(true)
     setLimit({
       mode: detectLimitMode({
         rpm: k.rpm_limit ?? 0,
@@ -335,6 +351,10 @@ export function KeyEditModal({
   const submit = async () => {
     if (!k || !name.trim()) {
       toast.danger('名称为必填项')
+      return
+    }
+    if (!modelsValid) {
+      toast.danger('「仅所选模型」至少需要选择一个模型')
       return
     }
     const quotaValue = quotaTokens()
@@ -388,7 +408,7 @@ export function KeyEditModal({
           <Button variant="ghost" onPress={onClose}>
             取消
           </Button>
-          <Button variant="primary" onPress={() => void submit()}>
+          <Button variant="primary" isDisabled={!modelsValid} onPress={() => void submit()}>
             保存
           </Button>
         </div>
@@ -407,7 +427,13 @@ export function KeyEditModal({
         </TextField>
         <div>
           <span className="mb-1.5 block text-[13px] font-medium">可用模型</span>
-          <ModelPicker value={models} onChange={setModels} options={modelOptions} restricted={modelsRestricted} />
+          <ModelPicker
+            value={models}
+            onChange={setModels}
+            options={modelOptions}
+            restricted={modelsRestricted}
+            onValidityChange={setModelsValid}
+          />
         </div>
         {/* 宽版双栏：左「有效期 / 来源 / 分组」，右「配额 / 限额」。
             编辑弹窗原来 500px 单列，字段一多就要滚很久。

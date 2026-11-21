@@ -20,6 +20,7 @@ import { api } from '../api'
 import { PageHeader } from '../ui/PageHeader'
 import { DataTable } from '../ui/DataTable'
 import { AppModal } from '../ui/AppModal'
+import { StatusChip } from '../ui/StatusChip'
 import { confirmBox } from '../ui/confirm'
 import type { RouteCatalogEntry, RouteCatalogProvider, RouteTargetInput, UpstreamModel } from '../types'
 
@@ -43,8 +44,8 @@ interface TargetRow {
   enabled: boolean
 }
 
-function blankTarget(): TargetRow {
-  return { provider_id: '', upstream_model_id: '', enabled: true }
+function blankTarget(init?: Partial<TargetRow>): TargetRow {
+  return { provider_id: '', upstream_model_id: '', enabled: true, ...init }
 }
 
 export function Routes() {
@@ -58,11 +59,18 @@ export function Routes() {
   // upstream_models.id（短哈希外键）→ 模型对象；Resolve 时拿的是这个外键
   const [mmap, setMmap] = useState<Record<string, UpstreamModel>>({})
   const [pending, setPending] = useState<Set<string>>(new Set())
-  const [editor, setEditor] = useState<{ open: boolean; route?: RouteCatalogEntry }>({ open: false })
+  const [editor, setEditor] = useState<{
+    open: boolean
+    route?: RouteCatalogEntry
+    prefill?: TargetRow
+    defaultName?: string
+  }>({ open: false })
   const loadSeqRef = useRef(0)
+  const handledModelRef = useRef(false)
 
   const q = searchParams.get('q') ?? ''
   const status = searchParams.get('status') ?? ''
+  const modelParam = searchParams.get('model') ?? ''
 
   // 搜索框本地草稿 + 200ms 防抖回写 URL（与 Providers 同口径）。
   const [searchDraft, setSearchDraft] = useState(q)
@@ -83,6 +91,25 @@ export function Routes() {
     }, 200)
     return () => window.clearTimeout(debounceRef.current)
   }, [searchDraft, q, setSearchParams])
+
+  // 从上游模型表点「路由」过来时，直接把该模型填成链首，省掉重新选一遍。
+  // 只消费一次：关掉弹窗后 URL 不再带着 ?model=，刷新不会反复弹。
+  useEffect(() => {
+    if (!modelParam || handledModelRef.current || loading) return
+    const m = mmap[modelParam]
+    if (!m) return
+    handledModelRef.current = true
+    setEditor({
+      open: true,
+      prefill: blankTarget({ provider_id: m.provider_id, upstream_model_id: m.id }),
+      defaultName: m.model_id,
+    })
+    setSearchParams((prev) => {
+      const next = new URLSearchParams(prev)
+      next.delete('model')
+      return next
+    })
+  }, [modelParam, loading, mmap, setSearchParams])
 
   const providerMap = useMemo(() => {
     const m: Record<string, RouteCatalogProvider> = {}
@@ -314,11 +341,11 @@ export function Routes() {
             <Table.Content className="min-w-[880px]">
               <Table.Header>
                 <Table.Column isRowHeader>路由名</Table.Column>
-                <Table.Column>当前服务模型</Table.Column>
+                <Table.Column>首选目标</Table.Column>
                 <Table.Column>上游数</Table.Column>
-                <Table.Column>操作</Table.Column>
                 <Table.Column>故障转移</Table.Column>
                 <Table.Column>启用</Table.Column>
+                <Table.Column>操作</Table.Column>
               </Table.Header>
               <Table.Body>
                 {filtered.map((r) => {
@@ -338,16 +365,6 @@ export function Routes() {
                         ) : null}
                       </Table.Cell>
                       <Table.Cell className="text-right">{r.chain.total} 个</Table.Cell>
-                      <Table.Cell>
-                        <div className="flex items-center gap-1">
-                          <Button variant="tertiary" size="sm" onPress={() => setEditor({ open: true, route: r })}>
-                            编辑
-                          </Button>
-                          <Button variant="ghost" size="sm" isDisabled={pending.has(r.id)} onPress={() => void removeRoute(r)}>
-                            删除
-                          </Button>
-                        </div>
-                      </Table.Cell>
                       <Table.Cell>
                         <Switch
                           isSelected={r.failover_enabled}
@@ -376,6 +393,16 @@ export function Routes() {
                           </Switch.Content>
                         </Switch>
                       </Table.Cell>
+                      <Table.Cell>
+                        <div className="flex items-center gap-1">
+                          <Button variant="tertiary" size="sm" onPress={() => setEditor({ open: true, route: r })}>
+                            编辑
+                          </Button>
+                          <Button variant="ghost" size="sm" isDisabled={pending.has(r.id)} onPress={() => void removeRoute(r)}>
+                            删除
+                          </Button>
+                        </div>
+                      </Table.Cell>
                     </Table.Row>
                   )
                 })}
@@ -386,9 +413,11 @@ export function Routes() {
       </DataTable>
 
       <RouteEditor
-        key={editor.route?.id ?? 'new'}
+        key={editor.route?.id ?? (editor.prefill ? `new-${editor.prefill.upstream_model_id}` : 'new')}
         open={editor.open}
         route={editor.route}
+        prefill={editor.prefill}
+        defaultName={editor.defaultName}
         providers={providers}
         mmap={mmap}
         onClose={() => setEditor({ open: false })}
@@ -441,6 +470,8 @@ function targetIssue(
 function RouteEditor({
   open,
   route,
+  prefill,
+  defaultName,
   providers,
   mmap,
   onClose,
@@ -448,6 +479,8 @@ function RouteEditor({
 }: {
   open: boolean
   route?: RouteCatalogEntry
+  prefill?: TargetRow
+  defaultName?: string
   providers: RouteCatalogProvider[]
   mmap: Record<string, UpstreamModel>
   onClose: () => void
@@ -490,7 +523,7 @@ function RouteEditor({
   useEffect(() => {
     if (!open) return
     const seq = ++chainSeqRef.current
-    setPublicName(route?.public_name ?? '')
+    setPublicName(route?.public_name ?? defaultName ?? '')
     setFailoverEnabled(route?.failover_enabled ?? false)
     setEnabled(route?.enabled ?? true)
     setTargets([])
@@ -534,11 +567,11 @@ function RouteEditor({
       })()
     } else {
       // 新建：链由用户现场填，没有「读回来」这一步，直接算就绪。
-      setTargets([blankTarget()])
+      setTargets([blankTarget(prefill)])
       setChainReady(true)
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [open, route])
+  }, [open, route, prefill, defaultName])
 
   // 链未就绪期间禁止一切改动与保存（覆盖「加载中」与「加载失败」两种情形）
   const chainBlocked = chainLoading || !chainReady || saving
@@ -703,24 +736,16 @@ function RouteEditor({
           void submit()
         }}
       >
-        <div className="mb-4 grid grid-cols-[minmax(0,1fr)_auto] items-end gap-7">
+        <div className="mb-4">
           <TextField aria-label="公开模型名" isRequired value={publicName} onChange={setPublicName}>
             <Label>公开模型名 *</Label>
             <Input placeholder="gpt-4o" className="font-mono" autoComplete="off" disabled={chainBlocked} />
           </TextField>
-          <Switch isSelected={failoverEnabled} isDisabled={chainBlocked} aria-label="自动故障转移" onChange={setFailoverEnabled}>
-            <Switch.Content className="flex items-center gap-2">
-              <Switch.Control>
-                <Switch.Thumb />
-              </Switch.Control>
-              <span className="text-sm">自动故障转移</span>
-            </Switch.Content>
-          </Switch>
         </div>
 
         <div>
           <div className="mb-2.5 flex items-center justify-between">
-            <span className="text-sm font-semibold">上游目标</span>
+            <span className="text-sm font-semibold">目标链</span>
             <Button variant="ghost" size="sm" isDisabled={chainBlocked} onPress={addTarget}>
               + 添加目标
             </Button>
@@ -737,7 +762,7 @@ function RouteEditor({
               <Table.ScrollContainer>
                 <Table.Content className="min-w-[760px]">
                   <Table.Header>
-                    <Table.Column isRowHeader>序号</Table.Column>
+                    <Table.Column isRowHeader>顺序</Table.Column>
                     <Table.Column>上游服务</Table.Column>
                     <Table.Column>上游模型</Table.Column>
                     <Table.Column>启用</Table.Column>
@@ -749,8 +774,16 @@ function RouteEditor({
                       return (
                         <Table.Row key={i} className={i === activeTargetIndex ? 'bg-success-soft' : undefined}>
                           <Table.Cell>
-                            {i + 1}
-                            {i === activeTargetIndex ? <span className="sr-only">（当前服务目标）</span> : null}
+                            <span className="flex items-center gap-1.5">
+                              {i === 0 ? (
+                                <StatusChip tone="ok">首选</StatusChip>
+                              ) : (
+                                <StatusChip tone="dim">备选 {i}</StatusChip>
+                              )}
+                              {i === activeTargetIndex && !failoverEnabled ? (
+                                <span className="text-muted text-[11px]">当前</span>
+                              ) : null}
+                            </span>
                           </Table.Cell>
                           <Table.Cell>
                             <Select
@@ -871,6 +904,21 @@ function RouteEditor({
                 </Table.Content>
               </Table.ScrollContainer>
             </Table>
+          </div>
+          <div className="border-separator mt-3 flex items-start justify-between gap-4 border-t pt-3">
+            <div className="min-w-0">
+              <Label>自动故障转移</Label>
+              <p className="text-muted mt-1 text-xs">
+                {failoverEnabled ? '首选失败后按顺序尝试备选' : '只调用首选目标'}
+              </p>
+            </div>
+            <Switch isSelected={failoverEnabled} isDisabled={chainBlocked} aria-label="自动故障转移" onChange={setFailoverEnabled}>
+              <Switch.Content>
+                <Switch.Control>
+                  <Switch.Thumb />
+                </Switch.Control>
+              </Switch.Content>
+            </Switch>
           </div>
         </div>
 

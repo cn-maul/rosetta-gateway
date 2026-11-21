@@ -32,28 +32,19 @@ export function AccessControl() {
     ? [
         { key: 'users', label: '用户' },
         { key: 'groups', label: '权限分组' },
-        { key: 'keys', label: 'API 密钥' },
       ]
     : [{ key: 'keys', label: 'API 密钥' }]
 
   const heading = tab === 'keys' ? 'API 密钥' : '用户与权限'
-  const sub =
-    tab === 'users'
-      ? '账号、配额、登录状态与模型可见范围'
-      : tab === 'groups'
-        ? '模型白名单按组收窄 —— 空白名单表示不限制'
-        : isAdmin()
-          ? '客户端调用 /v1 时使用的 sk-gw- 密钥'
-          : '客户端调用 /v1 时使用的 sk-gw- 密钥 · 归属恒为你自己'
 
   return (
     <div>
       {/* 页头不放刷新按钮：三个面板进入即拉数，写操作后各自重载自己的数据；
           手动刷新只会让人怀疑「刚才那次保存是不是没生效」。要强制重取就切页签。 */}
-      <PageHeader title={heading} sub={sub} />
-      {isAdmin() ? (
+      <PageHeader title={heading} />
+      {isAdmin() && tab !== 'keys' ? (
         <Tabs
-          aria-label="用户 / 分组 / 访问密钥"
+          aria-label="用户与分组"
           selectedKey={tab}
           onSelectionChange={(key) => {
             if (key !== null) setTab(String(key) as TabKey)
@@ -70,7 +61,7 @@ export function AccessControl() {
             </Tabs.List>
           </Tabs.ListContainer>
           <Tabs.Panel id={tab}>
-            {tab === 'keys' ? <Keys /> : <UsersGroups tab={tab === 'users' ? 'users' : 'groups'} />}
+            <UsersGroups tab={tab === 'users' ? 'users' : 'groups'} />
           </Tabs.Panel>
         </Tabs>
       ) : (

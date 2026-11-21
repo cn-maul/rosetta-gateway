@@ -86,6 +86,23 @@ function traceNodeTone(step: ReturnType<typeof parseRouteTrace>[number]): string
   return 'text-danger'
 }
 
+/** 视口断点。表格列必须按断点**增删列**而不是给单元格加 hidden：
+ *  react-aria 的 Table 用 grid 布局，display:none 的格子会留下空列轨道，
+ *  行与表头之间还会错位。 */
+function useMinWidth(query: string): boolean {
+  const [match, setMatch] = useState(() =>
+    typeof window === 'undefined' ? true : window.matchMedia(query).matches,
+  )
+  useEffect(() => {
+    const mq = window.matchMedia(query)
+    const onChange = (e: MediaQueryListEvent) => setMatch(e.matches)
+    setMatch(mq.matches)
+    mq.addEventListener('change', onChange)
+    return () => mq.removeEventListener('change', onChange)
+  }, [query])
+  return match
+}
+
 function PathFlow({ entry }: { entry: UsageHistoryEntry }) {
   const steps = useMemo(() => parseRouteTrace(entry.route_trace), [entry])
   if (!steps.length) return null
@@ -125,6 +142,11 @@ export function UsageDetail({ days }: { days: number }) {
   const [fModel, setFModel] = useState('')
   const [fKey, setFKey] = useState('')
   const [fUser, setFUser] = useState('')
+  // 窄屏优先保留「哪条请求 / 成没成 / 多久 / 用了多少」，其余列按宽度补回。
+  const showKey = useMinWidth('(min-width: 768px)')
+  const showLg = useMinWidth('(min-width: 1024px)')
+  const showXl = useMinWidth('(min-width: 1280px)')
+  const show2xl = useMinWidth('(min-width: 1536px)')
 
   const queryText = (key: string) => searchParams.get(key) ?? ''
   const request = useMemo(() => {
@@ -363,35 +385,6 @@ export function UsageDetail({ days }: { days: number }) {
             }}
           />
         </TextField>
-        <Select
-          aria-label="调用密钥"
-          className="w-[220px]"
-          isDisabled={!!keyError}
-          selectedKey={fKey}
-          onSelectionChange={(key) => {
-            const v = key === null ? '' : String(key)
-            setFKey(v)
-            applyFilters({ key: v })
-          }}
-        >
-          <SelectTrigger>
-            <SelectValue />
-            <SelectIndicator />
-          </SelectTrigger>
-          <SelectPopover>
-            <ListBox aria-label="调用密钥">
-              <ListBoxItem id="" className="text-muted">全部密钥</ListBoxItem>
-              {keyOptions.map((k) => (
-                <ListBoxItem key={k.id} id={k.id}>
-                  {k.name || k.key_prefix}
-                  {duplicateKeyNames.has(k.name || k.key_prefix)
-                    ? `（${k.username || k.user_id || '无归属'}）`
-                    : ''}
-                </ListBoxItem>
-              ))}
-            </ListBox>
-          </SelectPopover>
-        </Select>
         {admin ? (
           <Select
             aria-label="归属用户"
@@ -424,7 +417,35 @@ export function UsageDetail({ days }: { days: number }) {
             </SelectPopover>
           </Select>
         ) : null}
-        <Button variant="secondary" size="sm" onPress={() => applyFilters()}>应用</Button>
+        <Select
+          aria-label="调用密钥"
+          className="w-[220px]"
+          isDisabled={!!keyError}
+          selectedKey={fKey}
+          onSelectionChange={(key) => {
+            const v = key === null ? '' : String(key)
+            setFKey(v)
+            applyFilters({ key: v })
+          }}
+        >
+          <SelectTrigger>
+            <SelectValue />
+            <SelectIndicator />
+          </SelectTrigger>
+          <SelectPopover>
+            <ListBox aria-label="调用密钥">
+              <ListBoxItem id="" className="text-muted">全部密钥</ListBoxItem>
+              {keyOptions.map((k) => (
+                <ListBoxItem key={k.id} id={k.id}>
+                  {k.name || k.key_prefix}
+                  {duplicateKeyNames.has(k.name || k.key_prefix)
+                    ? `（${k.username || k.user_id || '无归属'}）`
+                    : ''}
+                </ListBoxItem>
+              ))}
+            </ListBox>
+          </SelectPopover>
+        </Select>
         <Button variant="ghost" size="sm" onPress={resetFilters}>重置</Button>
       </div>
       <div className="mb-4 flex flex-wrap items-center justify-between gap-3 text-xs text-muted">
@@ -504,21 +525,21 @@ export function UsageDetail({ days }: { days: number }) {
       >
         <Table aria-label="调用日志">
           <Table.ScrollContainer>
-            <Table.Content className="min-w-[1490px] text-[13px]">
+            <Table.Content className={showLg ? 'min-w-[980px] text-[13px]' : 'min-w-[640px] text-[13px]'}>
               <Table.Header>
-                <Table.Column isRowHeader>时间</Table.Column>
-                <Table.Column>模式</Table.Column>
-                <Table.Column>协议</Table.Column>
-                <Table.Column>请求 IP</Table.Column>
-                {admin ? <Table.Column>上游</Table.Column> : null}
+                <Table.Column isRowHeader>请求时间</Table.Column>
                 <Table.Column>模型</Table.Column>
-                {admin ? <Table.Column>用户</Table.Column> : null}
-                <Table.Column>密钥</Table.Column>
-                <Table.Column>Token 用量</Table.Column>
-                <Table.Column>速度</Table.Column>
-                <Table.Column>时间</Table.Column>
-                <Table.Column>费用</Table.Column>
                 <Table.Column>状态</Table.Column>
+                {admin ? <Table.Column>上游</Table.Column> : null}
+                <Table.Column>耗时</Table.Column>
+                {admin && showLg ? <Table.Column>用户</Table.Column> : null}
+                {showKey ? <Table.Column>密钥</Table.Column> : null}
+                <Table.Column>Token 用量</Table.Column>
+                {showLg ? <Table.Column>费用</Table.Column> : null}
+                {showXl ? <Table.Column>模式</Table.Column> : null}
+                {showLg ? <Table.Column>协议</Table.Column> : null}
+                {show2xl ? <Table.Column>速度</Table.Column> : null}
+                {show2xl ? <Table.Column>请求 IP</Table.Column> : null}
               </Table.Header>
               <Table.Body>
                 {rows.map((h, i) => (
@@ -526,60 +547,6 @@ export function UsageDetail({ days }: { days: number }) {
                     <Table.Cell>
                       <span className="font-mono">{fmtTimeFull(h.ts)}</span>
                     </Table.Cell>
-                    <Table.Cell>
-                      <span className="flex flex-col items-start gap-1">
-                        <StatusChip tone={h.stream ? 'info' : 'dim'}>{h.stream ? '流式' : '非流式'}</StatusChip>
-                        {h.effort ? (
-                          <StatusChip tone={effortTone(h.effort)} title={effortTitle(h.effort)}>
-                            {effortLabel(h.effort)}
-                          </StatusChip>
-                        ) : null}
-                      </span>
-                    </Table.Cell>
-                    {admin ? (
-                      <Table.Cell>
-                        {/* 用户名来自 users 当前值（可改）；用户已删除时回退到 id，
-                            留白会被读成「无归属」，那是另一件事。 */}
-                        <span title={h.user_id || '这条记录没有归属用户'}>
-                          {h.user_name || h.user_id || '无归属'}
-                        </span>
-                      </Table.Cell>
-                    ) : null}
-                    <Table.Cell>
-                      {/* 「上游/下游」两个词占了大半格宽，而这一列真正要看的是两个协议名。
-                          ↑ 上行（网关发给上游）、↓ 下行（客户端进来的），读屏走 sr-only。 */}
-                      <span title={`上行协议：${protocolLabel(h.upstream_protocol, '未记录')}；下行协议：${protocolLabel(h.ingress_protocol, '未记录')}`} className="flex flex-col gap-0.5 text-[11.5px]">
-                        <span className="flex items-center gap-1.5">
-                          <span aria-hidden="true" className="text-muted">↑</span>
-                          <span className="sr-only">上行</span>
-                          <span className="font-mono">{protocolLabel(h.upstream_protocol, '未记录')}</span>
-                        </span>
-                        <span className="flex items-center gap-1.5">
-                          <span aria-hidden="true" className="text-muted">↓</span>
-                          <span className="sr-only">下行</span>
-                          <span className="font-mono">{protocolLabel(h.ingress_protocol, '未记录')}</span>
-                        </span>
-                      </span>
-                    </Table.Cell>
-                    <Table.Cell>
-                      <span className="font-mono" title={h.request_ip || '未记录'}>{h.request_ip || '—'}</span>
-                    </Table.Cell>
-                    {admin ? (
-                      <Table.Cell>
-                        {parseRouteTrace(h.route_trace).length ? (
-                          <PathFlow entry={h} />
-                        ) : (
-                          <span title={upstreamNameTitle(h)} className="flex flex-col">
-                            <span>{upstreamName(h)}</span>
-                            {!h.provider_name && h.provider_id ? (
-                              <span className="text-[11px] text-muted">名称未固化</span>
-                            ) : h.provider_deleted ? (
-                              <span className="text-[11px] text-warning">上游已删除</span>
-                            ) : null}
-                          </span>
-                        )}
-                      </Table.Cell>
-                    ) : null}
                     <Table.Cell>
                       <span className="flex flex-col">
                         <span className="font-mono" title={h.public_model || '—'}>{h.public_model || '—'}</span>
@@ -591,43 +558,6 @@ export function UsageDetail({ days }: { days: number }) {
                       </span>
                     </Table.Cell>
                     <Table.Cell>
-                      {/* 名字是落库时固化的：密钥删掉之后仍显示当时的名字，
-                          加「已删除 · 」前缀；只有升级前的旧记录才回退到 id。 */}
-                      <span title={keyName(h) + (h.user_name || h.user_id ? `（归属 ${h.user_name || h.user_id}）` : '')}>
-                        {keyName(h)}
-                      </span>
-                    </Table.Cell>
-                    <Table.Cell>
-                      {/* 箭头代替「新增输入 / 输出」两个词：这一列是表里最挤的一格，
-                          文字标签会把数字挤到换行。↑ 输入（未命中缓存的新增部分），
-                          ↓ 输出；完整口径在 title 里，读屏走 sr-only 文本。
-                          缓存命中单独一行，它是「输入里有多少是缓存命中」的注脚。 */}
-                      <span title={tokenTitle(h)} className="flex flex-col">
-                        <span className="tabular-nums">
-                          <span aria-hidden="true" className="text-muted">↑</span>
-                          <span className="sr-only">输入</span> {fmtTokens(newInputTokens(h))}{' '}
-                          <span aria-hidden="true" className="text-muted">↓</span>
-                          <span className="sr-only">输出</span> {fmtTokens(h.output_tokens)}
-                        </span>
-                        <span className="text-[11px] text-muted">缓存命中 {fmtTokens(h.cached_tokens)}</span>
-                      </span>
-                    </Table.Cell>
-                    <Table.Cell>{speedText(h)}</Table.Cell>
-                    <Table.Cell>
-                      <span title={timingTitle(h)} className="flex items-center gap-1.5 tabular-nums">
-                        <span className={h.ttfb_ms <= 0 ? 'text-muted' : h.ttfb_ms <= 5000 ? 'text-success' : h.ttfb_ms <= 10000 ? 'text-warning' : 'text-danger'}>
-                          {h.ttfb_ms > 0 ? fmtSec(h.ttfb_ms) : '—'}
-                        </span>
-                        <span className="text-muted">|</span>
-                        <span className={totalTimeTone(h)}>
-                          {h.latency_ms > 0 ? fmtSec(h.latency_ms) : '—'}
-                        </span>
-                      </span>
-                    </Table.Cell>
-                    <Table.Cell>¥{fmtMoney(h.cost)}</Table.Cell>
-                    <Table.Cell>
-                      {/* 抽屉只讲失败原因，成功的行没什么可展开的：给个按钮点开
-                          只会得到一句「这条成功了」。所以只有非 ok 才是按钮。 */}
                       {h.status === 'ok' ? (
                         <span title={statusHint(h)} className="flex items-center gap-2">
                           <StatusChip tone={statusTone(h.status)}>{statusLabel(h.status)}</StatusChip>
@@ -647,6 +577,93 @@ export function UsageDetail({ days }: { days: number }) {
                         </Button>
                       )}
                     </Table.Cell>
+                    {admin ? (
+                      <Table.Cell>
+                        {parseRouteTrace(h.route_trace).length ? (
+                          <PathFlow entry={h} />
+                        ) : (
+                          <span title={upstreamNameTitle(h)} className="flex flex-col">
+                            <span>{upstreamName(h)}</span>
+                            {!h.provider_name && h.provider_id ? (
+                              <span className="text-[11px] text-muted">名称未固化</span>
+                            ) : h.provider_deleted ? (
+                              <span className="text-[11px] text-warning">上游已删除</span>
+                            ) : null}
+                          </span>
+                        )}
+                      </Table.Cell>
+                    ) : null}
+                    <Table.Cell>
+                      <span title={timingTitle(h)} className="flex items-center gap-1.5 tabular-nums">
+                        <span className={h.ttfb_ms <= 0 ? 'text-muted' : h.ttfb_ms <= 5000 ? 'text-success' : h.ttfb_ms <= 10000 ? 'text-warning' : 'text-danger'}>
+                          {h.ttfb_ms > 0 ? fmtSec(h.ttfb_ms) : '—'}
+                        </span>
+                        <span className="text-muted">/</span>
+                        <span className={totalTimeTone(h)}>
+                          {h.latency_ms > 0 ? fmtSec(h.latency_ms) : '—'}
+                        </span>
+                      </span>
+                    </Table.Cell>
+                    {admin && showLg ? (
+                      <Table.Cell>
+                        <span title={h.user_id || '这条记录没有归属用户'}>
+                          {h.user_name || h.user_id || '无归属'}
+                        </span>
+                      </Table.Cell>
+                    ) : null}
+                    {showKey ? (
+                      <Table.Cell>
+                        <span title={keyName(h) + (h.user_name || h.user_id ? `（归属 ${h.user_name || h.user_id}）` : '')}>
+                          {keyName(h)}
+                        </span>
+                      </Table.Cell>
+                    ) : null}
+                    <Table.Cell>
+                      <span title={tokenTitle(h)} className="flex flex-col">
+                        <span className="tabular-nums">
+                          <span aria-hidden="true" className="text-muted">↑</span>
+                          <span className="sr-only">输入</span> {fmtTokens(newInputTokens(h))}{' '}
+                          <span aria-hidden="true" className="text-muted">↓</span>
+                          <span className="sr-only">输出</span> {fmtTokens(h.output_tokens)}
+                        </span>
+                        <span className="text-[11px] text-muted">缓存命中 {fmtTokens(h.cached_tokens)}</span>
+                      </span>
+                    </Table.Cell>
+                    {showLg ? <Table.Cell>¥{fmtMoney(h.cost)}</Table.Cell> : null}
+                    {showXl ? (
+                      <Table.Cell>
+                        <span className="flex flex-col items-start gap-1">
+                          <StatusChip tone={h.stream ? 'info' : 'dim'}>{h.stream ? '流式' : '非流式'}</StatusChip>
+                          {h.effort ? (
+                            <StatusChip tone={effortTone(h.effort)} title={effortTitle(h.effort)}>
+                              {effortLabel(h.effort)}
+                            </StatusChip>
+                          ) : null}
+                        </span>
+                      </Table.Cell>
+                    ) : null}
+                    {showLg ? (
+                      <Table.Cell>
+                        <span title={`上行协议：${protocolLabel(h.upstream_protocol, '未记录')}；下行协议：${protocolLabel(h.ingress_protocol, '未记录')}`} className="flex flex-col gap-0.5 text-[11.5px]">
+                          <span className="flex items-center gap-1.5">
+                            <span aria-hidden="true" className="text-muted">↑</span>
+                            <span className="sr-only">上行</span>
+                            <span className="font-mono">{protocolLabel(h.upstream_protocol, '未记录')}</span>
+                          </span>
+                          <span className="flex items-center gap-1.5">
+                            <span aria-hidden="true" className="text-muted">↓</span>
+                            <span className="sr-only">下行</span>
+                            <span className="font-mono">{protocolLabel(h.ingress_protocol, '未记录')}</span>
+                          </span>
+                        </span>
+                      </Table.Cell>
+                    ) : null}
+                    {show2xl ? <Table.Cell>{speedText(h)}</Table.Cell> : null}
+                    {show2xl ? (
+                      <Table.Cell>
+                        <span className="font-mono" title={h.request_ip || '未记录'}>{h.request_ip || '—'}</span>
+                      </Table.Cell>
+                    ) : null}
                   </Table.Row>
                 ))}
               </Table.Body>

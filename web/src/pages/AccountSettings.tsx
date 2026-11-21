@@ -47,7 +47,7 @@ export function AccountSettings() {
 
   return (
     <div>
-      <PageHeader title="账号设置" sub={`${me.me?.username ?? ''} · 管理自己的登录安全`} />
+      <PageHeader title="账号设置" />
       <SectionCard title="修改密码" description="修改后需要重新登录">
         <form
           className="flex max-w-[480px] flex-col gap-4.5"

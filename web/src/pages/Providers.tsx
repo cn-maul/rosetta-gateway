@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
-import { useNavigate, useSearchParams } from 'react-router-dom'
+import { Link, useNavigate, useSearchParams } from 'react-router-dom'
 import {
   Button,
   Input,
@@ -383,7 +383,9 @@ export function Providers() {
         networks={networks}
         onCreated={async () => {
           setCreateOpen(false)
-          await load()
+        }}
+        onOpenProvider={(p) => {
+          goDetail(p)
         }}
       />
     </>
@@ -400,11 +402,13 @@ function CreateProviderModal({
   onClose,
   networks,
   onCreated,
+  onOpenProvider,
 }: {
   open: boolean
   onClose: () => void
   networks: { id: string; name: string; proxy_url: string }[]
   onCreated: () => Promise<void> | void
+  onOpenProvider: (provider: Provider) => void
 }) {
   const [saving, setSaving] = useState(false)
   const [name, setName] = useState('')
@@ -466,15 +470,16 @@ function CreateProviderModal({
     setSaving(true)
     setFormErr('')
     try {
-      await api.createProvider({
+      const created = await api.createProvider({
         name: name.trim(),
         protocol,
         endpoint: endpoint.trim(),
         api_key: apiKey.trim() || undefined,
         network_id: networkId,
       })
-      toast.success('上游已创建')
-      await onCreated()
+      toast.success('上游已创建，继续添加模型')
+      void onCreated()
+      onOpenProvider(created)
     } catch (e) {
       if (!is401(e)) setFormErr('保存失败：' + (e as Error).message)
     } finally {
@@ -495,7 +500,7 @@ function CreateProviderModal({
             取消
           </Button>
           <Button variant="primary" isDisabled={saving} onPress={() => void submit()}>
-            {saving ? '保存中…' : '创建上游'}
+            {saving ? '保存中…' : '创建并配置'}
           </Button>
         </>
       }
@@ -507,80 +512,14 @@ function CreateProviderModal({
         }}
         className="grid grid-cols-2 gap-4"
       >
-        <TextField aria-label="显示名称" value={name} onChange={setName}>
+        <TextField aria-label="显示名称" value={name} onChange={setName} className="col-span-2">
           <Label>显示名称</Label>
           <Input placeholder="DeepSeek（留空则用 Endpoint）" autoComplete="off" />
         </TextField>
-        {/* Select 自带可见标签：只给 aria-label 时它没有 Label 占位，trigger 会
-            顶到格子顶部，和左边带 Label 的输入框错开一行。 */}
-        <div className="flex flex-col gap-1">
-          <Label>接口方式</Label>
-          <Select aria-label="接口方式" selectedKey={protocol} onSelectionChange={(key) => key !== null && setProtocol(String(key))}>
-            <SelectTrigger>
-              <SelectValue />
-              <SelectIndicator />
-            </SelectTrigger>
-            <SelectPopover>
-              <ListBox aria-label="协议类型">
-                {PROTOCOL_OPTIONS.map((o) => (
-                  <ListBoxItem key={o.value} id={o.value}>
-                    {o.label}
-                  </ListBoxItem>
-                ))}
-              </ListBox>
-            </SelectPopover>
-          </Select>
-        </div>
         <TextField aria-label="Endpoint" isRequired value={endpoint} onChange={setEndpoint} className="col-span-2">
           <Label>Endpoint *</Label>
           <Input placeholder="https://api.deepseek.com" className="font-mono" autoComplete="off" />
         </TextField>
-        <TextField aria-label="API Key" value={apiKey} onChange={setApiKey} className="col-span-2">
-          <Label>API Key</Label>
-          <Input type="password" placeholder="sk-...（可留空，稍后在详情页添加）" className="font-mono" autoComplete="new-password" />
-          <span className="mt-1 block text-[11px] text-muted">
-            添加即启用；slug、超时与重试将自动使用默认值。
-          </span>
-        </TextField>
-        {/* 协议检测：填了 Endpoint（和 Key）之后可以先问一次，避免「建完发现
-            选错协议」再回头删。结论按协议排成三个胶囊，颜色只表示「这台机器上
-            有没有这个协议的入口」——黄/灰不代表这台上游不能用来配这个协议，
-            只代表路径不通。 */}
-        <div className="col-span-2 flex flex-col gap-1.5">
-          <div className="flex flex-wrap items-center gap-2">
-            <Button variant="outline" size="sm" isDisabled={probing || saving} onPress={() => void probeProtocols()}>
-              {probing ? '探测中…' : '协议检测'}
-            </Button>
-            <span className="text-muted text-[11px]">用上面的 Endpoint 与 API Key 试三种协议，不消耗额度</span>
-          </div>
-          {probe ? (
-            <div className="flex flex-wrap items-center gap-1.5" role="status">
-              {probe.map((r) => (
-                <span key={r.protocol} title={`${r.message}（HTTP ${r.status}）`}>
-                  <StatusChip tone={probeTone(r)}>
-                    {protocolLabel(r.protocol, r.protocol)}
-                    {r.ok ? ' 可用' : ' 未发现'}
-                  </StatusChip>
-                </span>
-              ))}
-              {probe.some((r) => r.ok) ? (
-                <Button
-                  variant="ghost"
-                  size="sm"
-                  onPress={() => {
-                    // 选中第一个可用的协议：探测就是为了省掉这一步猜。
-                    const first = probe.find((r) => r.ok)
-                    if (first) setProtocol(first.protocol)
-                  }}
-                >
-                  用第一个可用的
-                </Button>
-              ) : (
-                <span className="text-muted text-[11px]">三种都没找到入口，检查 Endpoint 是否少了 /v1 或多了路径</span>
-              )}
-            </div>
-          ) : null}
-        </div>
         <div className="col-span-2 flex flex-col gap-1">
           <Label>代理</Label>
           <Select
@@ -603,11 +542,79 @@ function CreateProviderModal({
               </ListBox>
             </SelectPopover>
           </Select>
+          <Link to="/networks" className="text-link mt-1 text-[11px]">
+            管理系统代理
+          </Link>
         </div>
-        <p className="col-span-2 text-[11px] leading-relaxed text-muted">
-          默认<b>直连</b>，大多数上游不用改。要走代理就先去 <a className="text-link" href="/networks">代理</a>{' '}
-          建一条（地址填一次到处可用），再回来从下拉里选——不用在这里手填 URL，写错不会报错只是连不上。
-        </p>
+        <TextField aria-label="API Key" value={apiKey} onChange={setApiKey} className="col-span-2">
+          <Label>API Key</Label>
+          <Input type="password" placeholder="sk-...（可留空，稍后在详情页添加）" className="font-mono" autoComplete="new-password" />
+          <span className="mt-1 block text-[11px] text-muted">将作为第一把凭据启用。</span>
+        </TextField>
+        {/* 协议检测：填了 Endpoint（和 Key）之后可以先问一次，避免「建完发现
+            选错协议」再回头删。结论按协议排成三个胶囊，颜色只表示「这台机器上
+            有没有这个协议的入口」——黄/灰不代表这台上游不能用来配这个协议，
+            只代表路径不通。 */}
+        <div className="col-span-2 flex flex-col gap-1.5">
+          <div className="flex flex-wrap items-center gap-2">
+            <Button variant="outline" size="sm" isDisabled={probing || saving} onPress={() => void probeProtocols()}>
+              {probing ? '探测中…' : '协议检测'}
+            </Button>
+            <span className="text-muted text-[11px]">使用上方地址、代理与密钥检测入口</span>
+          </div>
+          {probe ? (
+            <div className="flex flex-wrap items-center gap-1.5" role="status">
+              {probe.map((r) => (
+                <span key={r.protocol} title={`${r.message}（HTTP ${r.status}）`}>
+                  <StatusChip tone={probeTone(r)}>
+                    {protocolLabel(r.protocol, r.protocol)}
+                    {probeLabel(r)}
+                  </StatusChip>
+                </span>
+              ))}
+              {probe.some((r) => r.ok) ? (
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  onPress={() => {
+                    // 选中第一个可用的协议：探测就是为了省掉这一步猜。
+                    const first = probe.find((r) => r.ok)
+                    if (first) setProtocol(first.protocol)
+                  }}
+                >
+                  用第一个可用的
+                </Button>
+              ) : (
+                <span className="text-muted text-[11px]">三种都没找到入口，检查 Endpoint 是否少了 /v1 或多了路径</span>
+              )}
+            </div>
+          ) : null}
+        </div>
+        {/* 协议放在探测之后：先确认真实入口，再决定用哪种接口方式。
+            仍然保留手动选择，检测不可用时用户可以自行指定。 */}
+        <div className="col-span-2 flex flex-col gap-1">
+          <Label>接口方式</Label>
+          <Select
+            aria-label="接口方式"
+            selectedKey={protocol}
+            onSelectionChange={(key) => key !== null && setProtocol(String(key))}
+          >
+            <SelectTrigger>
+              <SelectValue />
+              <SelectIndicator />
+            </SelectTrigger>
+            <SelectPopover>
+              <ListBox aria-label="协议类型">
+                {PROTOCOL_OPTIONS.map((o) => (
+                  <ListBoxItem key={o.value} id={o.value}>
+                    {o.label}
+                  </ListBoxItem>
+                ))}
+              </ListBox>
+            </SelectPopover>
+          </Select>
+          <span className="text-muted text-[11px]">检测后自动选中第一个可用入口，也可手动指定。</span>
+        </div>
         {formErr ? (
           <div className="col-span-2 text-danger text-xs" role="alert">
             {formErr}
@@ -625,4 +632,10 @@ function CreateProviderModal({
 function probeTone(r: ProtocolProbeEntry): 'ok' | 'warn' | 'dim' {
   if (r.ok && (r.status === 401 || r.status === 403)) return 'warn'
   return r.ok ? 'ok' : 'dim'
+}
+
+function probeLabel(r: ProtocolProbeEntry): string {
+  if (!r.ok) return ' 未发现'
+  if (r.status === 401 || r.status === 403) return ' 鉴权失败'
+  return ' 入口可用'
 }

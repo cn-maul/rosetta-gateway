@@ -46,16 +46,16 @@ import type { PruneResult } from '../types'
 
 type TabKey = 'site' | 'model' | 'runtime' | 'price'
 
-const TABS: { key: TabKey; label: string; sub: string }[] = [
-  { key: 'site', label: '站点', sub: '站点名称与 LOGO：显示在登录页与侧栏左上角' },
-  { key: 'model', label: '模型默认', sub: '上游未回报容量时的兜底值' },
-  { key: 'runtime', label: '运行时', sub: '超时、流式看门狗与故障转移' },
+const TABS: { key: TabKey; label: string }[] = [
+  { key: 'site', label: '站点' },
+  { key: 'model', label: '模型默认' },
+  { key: 'runtime', label: '运行时' },
   // 这里曾有一个「安全」页，放的是独立于 users 表的管理密码（另有一份凭据文件兜底）。
   // 统一认证后管理密码就是 users 表里某个用户的密码，已由「我的账号」（自助改）
   // 与「用户管理」（管理员重置）各自承担，所以整块删除 —— 不要在这里加回跳转提示之类的残件。
   // 改价只影响**此后**的用量：历史费用在落库时已按当时的价固化，
   // 所以这里改的是「往后怎么算」，不是「重算历史」。
-  { key: 'price', label: '模型价格', sub: '按供应商 × 模型配置单价；改价只对之后的用量生效，不改写历史费用' },
+  { key: 'price', label: '模型价格' },
 ]
 
 // 运行时推荐默认值由 Go 侧生成（go generate ./internal/config）。
@@ -156,7 +156,6 @@ export function Settings() {
   // 的默认值也都是各自列表的第一项；这里原来写死 'model'，于是点「设置」永远先
   // 看到模型默认值，用户在地址栏里也看不出「站点」这一页存在。
   const tab: TabKey = TABS.some((t) => t.key === rawTab) ? (rawTab as TabKey) : TABS[0].key
-  const tabSub = TABS.find((t) => t.key === tab)?.sub ?? ''
   const setTab = (key: string) => {
     const next = new URLSearchParams(searchParams)
     next.set('tab', key)
@@ -498,7 +497,6 @@ export function Settings() {
     <div>
       <PageHeader
         title="设置"
-        sub={tabSub}
         actions={
           // 站点与价格两个页签各有自己的数据源，外层这个按钮只重取「设置」本体，
           // 所以在那两个页签上不出现 —— 免得点了没反应。
@@ -684,7 +682,7 @@ export function Settings() {
                       用量归档
                     </span>
                   }
-                  description="按时长保留调用明细，更早的记录聚合进「按天累计」后删除；累计永久保留。默认 30 天，由 config.json 的 usage_retention_days 决定（1–3650）。"
+                  description="更早的明细聚合后删除，累计保留"
                   actions={
                     <Button variant="secondary" size="sm" isDisabled={pruning} onPress={() => void runPrune()}>
                       {pruning ? '剪枝中…' : '立即归档剪枝'}

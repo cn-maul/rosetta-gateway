@@ -45,13 +45,7 @@ export function UsageStats() {
     ? daysRaw
     : readPref(daysPrefKey, daysDefault, oneOfInt(DAY_OPTIONS))
 
-  const scope = admin ? '全站' : '仅你自己'
   const title = logs ? '调用日志' : '用量与费用'
-  const subtitle = logs
-    ? `逐条查看调用结果、耗时与记录费用 · ${scope}`
-    : tab === 'users'
-      ? `按用户汇总消费与用量；含已删除用户的历史记录 · ${scope}`
-      : ''
 
   const setTab = (key: string) => {
     const next = new URLSearchParams(searchParams)
@@ -71,7 +65,6 @@ export function UsageStats() {
     <>
       <PageHeader
         title={title}
-        sub={subtitle || undefined}
         actions={
           <ToggleButtonGroup
             aria-label="时间范围"
