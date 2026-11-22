@@ -30,11 +30,11 @@ const deadSettingKey = "model_group_orphan_repair_v1"
 
 func main() {
 	var (
-		src     = flag.String("src", "", "source SQLite file (read-only)")
-		dst     = flag.String("dst", "", "destination SQLite file (created)")
-		force   = flag.Bool("force", false, "overwrite destination if it exists")
-		dryRun  = flag.Bool("dry-run", false, "report what would change, write nothing")
-		noVac   = flag.Bool("no-vacuum", false, "skip the final VACUUM")
+		src      = flag.String("src", "", "source SQLite file (read-only)")
+		dst      = flag.String("dst", "", "destination SQLite file (created)")
+		force    = flag.Bool("force", false, "overwrite destination if it exists")
+		dryRun   = flag.Bool("dry-run", false, "report what would change, write nothing")
+		noVac    = flag.Bool("no-vacuum", false, "skip the final VACUUM")
 		allowWAL = flag.Bool("allow-wal", false, "proceed even if a -wal file exists next to the source")
 	)
 	flag.Parse()
