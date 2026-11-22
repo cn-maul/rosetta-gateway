@@ -65,7 +65,7 @@ export function DataTable({
       )}
 
       {loading && !hasData ? (
-        <div className="divide-y divide-separator rounded-2xl border border-separator bg-background-secondary" role="status" aria-label={label + '加载中'}>
+        <div className="divide-y divide-separator rounded-2xl border border-separator bg-surface-secondary" role="status" aria-label={label + '加载中'}>
           {Array.from({ length: skeletonRows }, (_, r) => (
             <div key={r} className="flex items-center gap-4 px-4 py-3.5">
               {Array.from({ length: skeletonCols }, (_, c) => (

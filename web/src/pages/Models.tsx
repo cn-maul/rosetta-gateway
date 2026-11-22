@@ -9,6 +9,8 @@ import type { ModelMeta, ModelPrice } from '../types'
 import { PageHeader } from '../ui/PageHeader'
 import { SectionCard } from '../ui/SectionCard'
 import { StatusChip } from '../ui/StatusChip'
+import { CHART_COLORS, ChartEmpty, ChartTooltipBox, TooltipRow } from '../ui/chart'
+import { Bar, BarChart, CartesianGrid, ResponsiveContainer, Tooltip, XAxis, YAxis } from 'recharts'
 
 /**
  * 可用模型（全体可见的只读清单）。
@@ -127,7 +129,7 @@ export function Models() {
             </div>
             <Table aria-label="可用模型与参考价">
               <Table.ScrollContainer>
-                <Table.Content className="min-w-[680px]">
+                <Table.Content className="min-w-[760px]">
                   <Table.Header>
                     <Table.Column isRowHeader>模型</Table.Column>
                     <Table.Column>输入</Table.Column>
@@ -171,7 +173,98 @@ export function Models() {
           </>
         )}
       </SectionCard>
+      {sorted.length > 0 ? (
+        <div className="mt-4">
+          <SectionCard
+            title="输入与输出单价对比"
+            description="按输出价排序，横向比较「同样一百万 token 谁更贵」"
+          >
+            <PriceMix models={visible} priceOf={priceOf} />
+          </SectionCard>
+        </div>
+      ) : null}
     </>
+  )
+}
+
+/**
+ * 价格对比图：输入价与输出价并排。
+ *
+ * 这张图只对**同时配置了输入与输出价**的模型出柱：把「未配置」画成 0
+ * 会让免费看起来像最便宜，而真相是没人填过价 —— 两种结论的处置动作
+ * 完全相反（一个放心用，一个要去找管理员补价格）。
+ */
+function PriceMix({
+  models,
+  priceOf,
+}: {
+  models: string[]
+  priceOf: (name: string) => ModelPrice | undefined
+}) {
+  const data = models
+    .map((name) => {
+      const p = priceOf(name)
+      return {
+        label: name,
+        input: p?.price_input ?? 0,
+        output: p?.price_output ?? 0,
+      }
+    })
+    .filter((d) => d.input > 0 && d.output > 0)
+    .sort((a, b) => b.output - a.output)
+    .slice(0, 10)
+  if (data.length === 0) {
+    return <ChartEmpty text="可见模型里还没有同时配置输入与输出价的条目" />
+  }
+  return (
+    <div>
+      <div className="h-[260px]" role="img" aria-label={`输入与输出单价最高的 ${data.length} 个模型`}>
+        <ResponsiveContainer width="100%" height="100%">
+          <BarChart
+            data={data}
+            layout="vertical"
+            margin={{ top: 2, right: 56, bottom: 2, left: 4 }}
+            barCategoryGap="28%"
+          >
+            <CartesianGrid stroke={CHART_COLORS.grid} strokeDasharray="3 5" horizontal={false} />
+            <XAxis
+              type="number"
+              tick={{ fill: CHART_COLORS.muted, fontSize: 10.5 }}
+              axisLine={false}
+              tickLine={false}
+              tickFormatter={(v: number) => `¥${unitPrice(v).replace('¥', '')}`}
+            />
+            <YAxis
+              type="category"
+              dataKey="label"
+              width={150}
+              tick={{ fill: CHART_COLORS.foreground, fontSize: 10.5 }}
+              axisLine={false}
+              tickLine={false}
+              tickFormatter={(value: string) => (value.length > 18 ? value.slice(0, 17) + '…' : value)}
+            />
+            <Tooltip
+              cursor={{ fill: CHART_COLORS.accentSoft }}
+              content={({ active, payload }) => {
+                if (!active || !payload?.length) return null
+                const row = payload[0].payload as (typeof data)[number]
+                return (
+                  <ChartTooltipBox title={row.label}>
+                    <TooltipRow color={CHART_COLORS.accent} label="输入" value={unitPrice(row.input)} />
+                    <TooltipRow color={CHART_COLORS.cost} label="输出" value={unitPrice(row.output)} />
+                  </ChartTooltipBox>
+                )
+              }}
+            />
+            <Bar dataKey="input" fill={CHART_COLORS.accent} radius={[0, 3, 3, 0]} maxBarSize={8} />
+            <Bar dataKey="output" fill={CHART_COLORS.cost} radius={[0, 3, 3, 0]} maxBarSize={8} />
+          </BarChart>
+        </ResponsiveContainer>
+      </div>
+      <p className="text-muted mt-2 text-[11.5px]">
+        元 / 百万 tokens，按输出价降序取前 {data.length} 个；未配置价格的模型不进图，避免把「没填」画成免费。
+      </p>
+    </div>
   )
 }
 

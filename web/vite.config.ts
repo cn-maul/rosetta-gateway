@@ -70,6 +70,12 @@ export default defineConfig({
               name: 'heroui',
               test: /node_modules[\\/](@heroui|@react-aria|@react-stately|@internationalized|react-aria|react-stately|@formatjs|intl-messageformat)[\\/]/,
             },
+            // 图表库只在总览 / 用量类页面用到，单独成块：不与 HeroUI 一起过期，
+            // 也避免把 400KB+ 的图表实现塞进任何一个页面 chunk 里重复下载。
+            {
+              name: 'charts',
+              test: /node_modules[\\/](recharts|d3-|victory-vendor)[\\/]/,
+            },
             // 其余第三方（lucide 图标等）交给默认自动分包，不硬捆成大块
           ],
         },

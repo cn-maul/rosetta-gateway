@@ -1,7 +1,7 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import { readFile } from 'node:fs/promises'
-import { buildUsageSeries, bucketDaysFor, labelStrideFor } from '../src/usageSeries.ts'
+import { buildUsageSeries, bucketDaysFor, bucketForPoint, labelStrideFor } from '../src/usageSeries.ts'
 
 // 2026-11-01 需求：总览页改叫「总览」，用量趋势不再用表格而用图表。
 //
@@ -25,29 +25,35 @@ test('导航与页面标题统一叫「总览」', async () => {
   assert.ok(page.includes('title="总览"'), '页面内 PageHeader 没有改成「总览」')
 })
 
-test('用量趋势用一张图表，不再渲染表格，也不再是七张小图', async () => {
+test('用量趋势用一张可切换图表，不再渲染表格，也不再是七张小图', async () => {
   const page = await read('pages/Overview.tsx')
 
-  assert.ok(page.includes("from '../ui/BarChart'"), '没有引入 BarChart')
-  assert.ok(page.includes('<BarChart'), '趋势区没有渲染柱状图')
+  // 2026-11-22 重塑：从手写柱图换成 Recharts 主趋势图（Token / 请求 / 费用 /
+  // 成功率 / 速度），但「一张图回答走势」的结构不变。
+  assert.ok(page.includes("from 'recharts'"), '没有引入 Recharts')
+  assert.ok(page.includes('<TrendChart'), '趋势区没有渲染趋势图')
   // 表格已经下线：留下 DataTable / Table 只会让两套视图同时存在。
   assert.ok(!page.includes('<DataTable'), '趋势区仍在用 DataTable —— 表格应被图表取代')
   assert.ok(!page.includes('<Table'), '趋势区仍在渲染 Table')
   assert.ok(!page.includes("from '../ui/DataTable'"), 'DataTable 的 import 没有清掉')
-  // 单图：一份柱状图，而不是每个指标一张。
-  assert.equal(page.match(/<BarChart/g).length, 1, '用量趋势应当只有一张柱状图')
+  // 主图一份，其余三个是不同问题（质量 / 性能 / 缓存），不是七个同质趋势。
+  assert.equal(page.match(/<TrendChart/g).length, 1, '用量趋势应当只有一张主趋势图')
+  assert.ok(page.includes('OutcomeChart') && page.includes('PerformanceChart') && page.includes('CacheChart'))
   assert.ok(!page.includes('TrendCard'), '七张小图的 TrendCard 已废弃，应合回一张')
 })
 
-test('柱状图不吃「点」，吃按时间补齐后的桶，且桶里带标签', async () => {
-  const chart = await read('ui/BarChart.tsx')
+test('旧手写柱图已下线，主趋势图点击用桶的真实起止时间', async () => {
+  const page = await read('pages/Overview.tsx')
 
-  assert.ok(chart.includes('buckets: UsageBucket[]'), '柱状图应接收 UsageBucket 序列')
-  // 有值至少 2%：0.5% 在高 DPI 屏上会被舍入成看不见，1 次调用与 0 次就分不清了。
-  assert.ok(chart.includes('Math.max(2, (b.tokens / denom) * 100)'), '柱高计算丢失了最小值保护')
-  assert.ok(chart.includes('b.tokens === 0 ? '), '零值柱没有区分底色')
-  assert.ok(chart.includes('role="img"'), '图表缺少 role="img"，读屏用户拿不到总结')
-  assert.ok(chart.includes('labShort') && chart.includes('labFull'), '横轴没有完整/窄两套标签')
+  // BarChart 没有任何源引用后再留着，就成了第二套图表实现：样式、主题、
+  // 无障碍各自维护，改一处忘一处。
+  await assert.rejects(read('ui/BarChart.tsx'), '旧手写柱图 BarChart.tsx 应已删除')
+
+  // 点击桶跳日志必须传绝对时间窗，不能从标签字符串反解日期 —— 标签里有
+  // `*`、`~` 与中文，一旦格式变化就会静默跳到错误区间。
+  assert.ok(page.includes('bucket.startTs') && page.includes('bucket.endTs'), '点击桶没有使用真实起止时间')
+  assert.ok(!page.includes('parseDayKey'), '仍从标签反解析日期')
+  assert.ok(page.includes('role="img"'), '主趋势图缺少 role="img"')
 })
 
 test('序列按本地日历日补齐，缺的日期补 0 而不是被跳过', () => {
@@ -97,6 +103,21 @@ test('横轴标签抽稀到约 12 个', () => {
   assert.equal(labelStrideFor(365), 31)
 })
 
+test('Recharts 3 的字符串索引也能命中时间桶', () => {
+  const now = new Date(2026, 10, 5, 12, 0, 0).getTime()
+  const series = buildUsageSeries({
+    byDay: [{ key: '2026-11-05', count: 1, tokens: 10 }],
+    days: 3,
+    firstRecordAt: 0,
+    now,
+  })
+
+  assert.equal(bucketForPoint(series, { activeIndex: '2' })?.key, '2026-11-05')
+  assert.equal(bucketForPoint(series, { activeIndex: '2026-11-04' }), undefined)
+  assert.equal(bucketForPoint(series, { activeIndex: null, activeLabel: '2026-11-03' })?.key, '2026-11-03')
+  assert.equal(bucketForPoint(series, { activeIndex: '99', activeLabel: '2026-11-04' })?.key, '2026-11-04')
+})
+
 test('不足一整桶的尾桶打标记，不按整桶高度归一', () => {
   const now = new Date(2026, 10, 5, 12, 0, 0).getTime()
   const firstRecord = new Date(2026, 9, 20, 8, 0, 0).getTime() // 只有 17 天
@@ -106,7 +127,14 @@ test('不足一整桶的尾桶打标记，不按整桶高度归一', () => {
   assert.ok(lastBucket.tip.includes('部分桶'), '尾桶提示要点明只有几天')
 })
 
-test('七张指标卡与趋势区都不带副行小字', async () => {
+test('超长「全部」历史会加宽桶，不画成上百根柱子', () => {
+  const now = new Date(2026, 10, 5, 12, 0, 0).getTime()
+  const firstRecord = new Date(2016, 0, 1, 8, 0, 0).getTime() // 近 11 年
+  const series = buildUsageSeries({ byDay: [], days: 0, firstRecordAt: firstRecord, now })
+  assert.ok(series.length <= 45, `十年历史应合并成有限几根桶，实际 ${series.length}`)
+})
+
+test('指标带不再堆副行小字，也不把页面副标题重复成指标行文', async () => {
   const page = await read('pages/Overview.tsx')
 
   // 需求原话：这些字去掉 ——「293 / 298 有结论的请求」「11.06M 输入 · 219.7K 输出」
@@ -116,9 +144,9 @@ test('七张指标卡与趋势区都不带副行小字', async () => {
   // 不只是「换个说法」：卡片上每多一行小字，「七张卡一眼扫过」就退化成一列行文，
   // 而副行想说明的「样本够不够」在主值为 0 样本时已经显「—」了。所以这里钉住
   // 的是结构 —— Metric 不再有 hint 这个入口，也没有这些文案残留在页面里。
-  for (const frag of ['有结论的请求', '输入 token', '个成功样本', '首字 + 生成', '个样本的输出速度', '每根柱子一个时间桶']) {
+  for (const frag of ['有结论的请求', '个成功样本', '首字 + 生成', '个样本的输出速度', '每根柱子一个时间桶']) {
     assert.ok(!page.includes(frag), `页面里还留着「${frag}」`)
   }
   assert.ok(!page.includes('hint={'), 'Metric 卡仍在传 hint 副行')
-  assert.match(page, /function Metric\(\{ label, value, tone \}/, 'Metric 的 props 应只剩 label/value/tone')
+  assert.ok(!page.includes('input_tokens)} /'), '页面标题/卡片不应重复输入 token 的原始分数')
 })

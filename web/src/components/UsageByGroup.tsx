@@ -5,6 +5,16 @@ import { rangeBounds } from "../range";
 import { RequestGeneration } from "../asyncState";
 import type { UsageGroupEntry, UsageGroupPage } from "../types";
 import { DataTable } from "../ui/DataTable";
+import { StatStrip } from "../ui/StatStrip";
+import { Cell, Pie, PieChart, ResponsiveContainer, Tooltip as ChartTooltip } from "recharts";
+import {
+  CHART_COLORS,
+  ChartEmpty,
+  ChartTooltipBox,
+  TooltipRow,
+  chartShade,
+  shareText,
+} from "../ui/chart";
 
 /**
  * 用量统计的「按维度汇总」面板 —— 上游 / 模型 / 密钥三个页签共用
@@ -33,28 +43,31 @@ export interface UsageByGroupProps {
 }
 
 /**
- * 成功率。分母用 count（全部请求）而不是 ok+err：canceled 既不是成功也不是
- * 失败，但它确实是一次请求 —— 排除它会让「100% 成功」出现在一个发起了 50 次
- * 调用、其中 40 次被客户端掐断的上游上，那是在夸一个不可用的上游。
+ * 成功率。与 Stats 同口径：分母只取「有结论」的请求（ok + err），取消既不算
+ * 成功也不算失败。取消是客户端主动断开，处理方式与上游故障完全不同。
  */
 function successRate(r: UsageGroupEntry): number {
-  return r.count > 0 ? r.ok / r.count : 0;
+  return r.ok + r.err > 0 ? r.ok / (r.ok + r.err) : 0;
 }
 
 function ratePercent(r: UsageGroupEntry): string {
-  return r.count === 0 ? "—" : `${Math.round(successRate(r) * 100)}%`;
+  return r.ok + r.err === 0 ? "—" : `${Math.round(successRate(r) * 100)}%`;
 }
 
 function rateDetail(r: UsageGroupEntry): string {
   return r.count === 0
     ? "暂无请求"
-    : `${fmtNum(r.ok)} 成功 · ${fmtNum(r.err)} 失败`;
+    : `${fmtNum(r.ok)} 成功 · ${fmtNum(r.err)} 失败${
+        r.count - r.ok - r.err > 0 ? ` · ${fmtNum(r.count - r.ok - r.err)} 取消` : ""
+      }`;
 }
 
 /** 成功率配色阈值分两档：999 次里失败 3 次比 1 次里失败 1 次严重得多，但百分比一样。 */
 function rateTone(r: UsageGroupEntry): "" | "bad" | "mid" {
+  // 分母是「有结论」的请求。整行都是取消时没有成功率可言，不能因为
+  // successRate() 回落成 0 就染成红色 —— 取消不是上游故障。
+  if (r.ok + r.err === 0) return "";
   const rate = successRate(r);
-  if (r.count === 0) return "";
   if (rate < 0.5) return "bad";
   if (rate < 0.9) return "mid";
   return "";
@@ -77,8 +90,14 @@ function tpsText(r: UsageGroupEntry): string {
  * 真实库里存在 provider_id 为空串的历史行（无归属的早期记录），name 又带
  * omitempty 会被整个省略 —— 那行既没名字也没键，留白比占位符更像「加载坏了」。
  */
-function firstCell(r: UsageGroupEntry): string {
-  return r.name || r.key || "未归属请求";
+function firstCell(kind: UsageByGroupProps["kind"], r: UsageGroupEntry): string {
+  if (r.name) return r.name;
+  if (!r.key) return "未归属请求";
+  // 上游被删除后 LEFT JOIN 取不到名字，只剩内部 id。直接印一整串 32 位
+  // 十六进制既不可读也无法区分，但完全隐藏又会让「这段历史属于谁」消失。
+  // 保留前 8 位并明确标注「已删除」，比裸 id 或空白都更接近事实。
+  if (kind === "provider") return `已删除 · ${r.key.slice(0, 8)}`;
+  return r.key;
 }
 
 /**
@@ -156,6 +175,9 @@ export function UsageByGroup({
     },
     { requests: 0, tokens: 0, cost: 0 },
   );
+  // 贡献条只负责「谁占大头」，精确值仍由表格给。取全量行的最大值，避免前几名
+  // 之间被重新归一化而看不出相对差距。
+  const maxTokens = rows.reduce((m, row) => Math.max(m, row.tokens), 0);
 
   return (
     <DataTable
@@ -168,54 +190,18 @@ export function UsageByGroup({
       toolbar={
         <div className="flex flex-col gap-2">
           <div className="flex flex-wrap items-center justify-between gap-2">
-            <div
-              aria-label={
-                truncated
-                  ? `前 ${rows.length} 名汇总，共 ${total} ${unit}`
-                  : "当前范围汇总"
-              }
-              className="flex flex-wrap items-center gap-2"
-            >
-              <span className="inline-flex items-center gap-1 rounded-full border border-separator bg-default-soft px-2.5 py-1 text-xs whitespace-nowrap text-muted">
-                {truncated ? (
-                  <>
-                    前{" "}
-                    <b className="text-foreground tabular-nums">
-                      {fmtNum(rows.length)}
-                    </b>{" "}
-                    /
-                    <b className="text-foreground tabular-nums">
-                      {fmtNum(total ?? 0)}
-                    </b>{" "}
-                    {unit}
-                  </>
-                ) : (
-                  <>
-                    <b className="text-foreground tabular-nums">
-                      {fmtNum(rows.length)}
-                    </b>{" "}
-                    {unit}
-                  </>
-                )}
-              </span>
-              <span className="inline-flex items-center gap-1 rounded-full border border-separator bg-default-soft px-2.5 py-1 text-xs whitespace-nowrap text-muted">
-                <b className="text-foreground tabular-nums">
-                  {fmtNum(totals.requests)}
-                </b>{" "}
-                次请求
-              </span>
-              <span className="inline-flex items-center gap-1 rounded-full border border-separator bg-default-soft px-2.5 py-1 text-xs whitespace-nowrap text-muted">
-                <b className="text-foreground tabular-nums">
-                  {fmtTokens(totals.tokens)}
-                </b>{" "}
-                Tokens
-              </span>
-              <span className="inline-flex items-center gap-1 rounded-full border border-separator bg-default-soft px-2.5 py-1 text-xs whitespace-nowrap text-muted">
-                <b className="text-foreground tabular-nums">
-                  ¥{fmtMoney(totals.cost)}
-                </b>{" "}
-                记录费用
-              </span>
+            <div className="text-muted text-xs">
+              {truncated ? (
+                <>
+                  当前展示前{" "}
+                  <b className="text-foreground tabular-nums">{fmtNum(rows.length)}</b> 名，共{" "}
+                  {fmtNum(total ?? 0)} {unit}
+                </>
+              ) : (
+                <>
+                  当前区间共 {fmtNum(rows.length)} {unit}
+                </>
+              )}
             </div>
             <Button
               size="sm"
@@ -226,6 +212,36 @@ export function UsageByGroup({
               {loading ? "加载中…" : "刷新"}
             </Button>
           </div>
+          <StatStrip
+            ariaLabel={truncated ? `前 ${rows.length} 名汇总，共 ${total} ${unit}` : "当前范围汇总"}
+            items={[
+              { label: "请求", value: fmtNum(totals.requests) },
+              { label: "Token", value: fmtTokens(totals.tokens) },
+              { label: "记录费用", value: `¥${fmtMoney(totals.cost)}` },
+              {
+                label: truncated ? "范围" : "分组",
+                value: truncated
+                  ? `${fmtNum(rows.length)} / ${fmtNum(total ?? 0)}`
+                  : fmtNum(rows.length),
+                hint: truncated ? "合计只覆盖当前展示的行" : unit,
+              },
+            ]}
+          />
+          {rows.length > 0 ? (
+          <div className="grid items-stretch gap-3 lg:grid-cols-[minmax(0,1fr)_260px]">
+            <ContributionBar
+              title="Token 构成"
+              rows={rows}
+              max={maxTokens}
+              total={totals.tokens}
+              valueOf={(r) => r.tokens}
+              textOf={(r) => fmtTokens(r.tokens)}
+              labelOf={(r) => firstCell(kind, r)}
+              color={CHART_COLORS.accent}
+            />
+            <SharePie rows={rows} kind={kind} />
+          </div>
+          ) : null}
           {truncated ? (
             <div
               className="text-muted rounded-lg border border-separator bg-default-soft px-2.5 py-1.5 text-xs"
@@ -241,7 +257,7 @@ export function UsageByGroup({
     >
       <Table>
         <Table.ScrollContainer>
-          <Table.Content aria-label={`用量分组统计，可横向滚动`}>
+          <Table.Content aria-label={`用量分组统计，可横向滚动`} className="min-w-[760px]">
             <Table.Header>
               <Table.Column isRowHeader>排名</Table.Column>
               <Table.Column>{firstCol}</Table.Column>
@@ -268,9 +284,9 @@ export function UsageByGroup({
                         {i + 1}
                       </span>
                     </Table.Cell>
-                    <Table.Cell className="max-w-72">
-                      <div className="truncate text-sm font-semibold">
-                        {firstCell(r)}
+                    <Table.Cell className="max-w-60 xl:max-w-72">
+                      <div className="truncate text-sm font-semibold" title={firstCell(kind, r)}>
+                        {firstCell(kind, r)}
                       </div>
                       {sub ? (
                         <div className="text-muted mt-1 truncate font-mono text-xs">
@@ -282,16 +298,10 @@ export function UsageByGroup({
                       <div className="text-sm font-semibold">
                         {fmtNum(r.count)}
                       </div>
-                      <div className="text-muted mt-0.5 text-xs whitespace-nowrap">
-                        {rateDetail(r)}
-                      </div>
                     </Table.Cell>
                     <Table.Cell className="text-right tabular-nums">
                       <div className="text-sm font-semibold">
                         {fmtTokens(r.tokens)}
-                      </div>
-                      <div className="text-muted mt-0.5 text-xs whitespace-nowrap">
-                        总 token
                       </div>
                     </Table.Cell>
                     <Table.Cell className="text-right tabular-nums">
@@ -299,13 +309,10 @@ export function UsageByGroup({
                         <div className="text-sm font-semibold">
                           ¥{fmtMoney(r.cost)}
                         </div>
-                        <div className="text-muted mt-0.5 text-xs whitespace-nowrap">
-                          固化费用
-                        </div>
                       </div>
                     </Table.Cell>
-                    <Table.Cell className="min-w-40">
-                      <div className="flex items-baseline justify-between gap-2.5">
+                    <Table.Cell className="min-w-28 xl:min-w-32">
+                      <div className="flex items-baseline gap-2">
                         <span
                           className={`text-sm font-bold tabular-nums ${
                             tone === "bad"
@@ -317,9 +324,14 @@ export function UsageByGroup({
                         >
                           {ratePercent(r)}
                         </span>
-                        <span className="text-muted text-xs whitespace-nowrap">
-                          {rateDetail(r)}
-                        </span>
+                        {r.ok + r.err > 0 ? (
+                          <span
+                            className="text-muted text-[11px] whitespace-nowrap tabular-nums"
+                            title={rateDetail(r)}
+                          >
+                            {fmtNum(r.ok)}/{fmtNum(r.ok + r.err)}
+                          </span>
+                        ) : null}
                       </div>
                       <div
                         aria-hidden="true"
@@ -340,18 +352,15 @@ export function UsageByGroup({
                       </div>
                     </Table.Cell>
                     <Table.Cell>
-                      <div className="flex flex-wrap items-center gap-1.5">
-                        <span className="inline-flex items-baseline gap-1 rounded-md bg-default-soft px-1.5 py-0.5 text-xs whitespace-nowrap text-muted">
-                          首字{" "}
-                          <b className="text-foreground tabular-nums">
-                            {ttfbText(r)}
-                          </b>
+                      <div
+                        className="text-muted flex flex-col gap-0.5 text-[11.5px] whitespace-nowrap"
+                        title={`平均首字 ${ttfbText(r)} · 输出速度 ${tpsText(r)} t/s`}
+                      >
+                        <span>
+                          首字 <b className="text-foreground tabular-nums">{ttfbText(r)}</b>
                         </span>
-                        <span className="inline-flex items-baseline gap-1 rounded-md bg-default-soft px-1.5 py-0.5 text-xs whitespace-nowrap text-muted">
-                          速度{" "}
-                          <b className="text-foreground tabular-nums">
-                            {tpsText(r)} t/s
-                          </b>
+                        <span>
+                          速度 <b className="text-foreground tabular-nums">{tpsText(r)}</b> t/s
                         </span>
                       </div>
                     </Table.Cell>
@@ -363,5 +372,166 @@ export function UsageByGroup({
         </Table.ScrollContainer>
       </Table>
     </DataTable>
+  );
+}
+
+/**
+ * 前几名的横向贡献条：图表负责「谁占大头」，表格负责精确值。只取前 8 名，
+ * 避免把一张 200 行的表又画成长图；读数与表格同源，不做第二套聚合。
+ */
+function ContributionBar({
+  title,
+  rows,
+  max,
+  total,
+  valueOf,
+  textOf,
+  labelOf,
+  color,
+}: {
+  title: string;
+  rows: UsageGroupEntry[];
+  max: number;
+  total: number;
+  valueOf: (r: UsageGroupEntry) => number;
+  textOf: (r: UsageGroupEntry) => string;
+  labelOf: (r: UsageGroupEntry) => string;
+  color: string;
+}) {
+  const top = [...rows].sort((a, b) => valueOf(b) - valueOf(a)).slice(0, 8);
+  if (max <= 0) {
+    return (
+      <div className="border-separator bg-default-soft rounded-lg border px-3 py-2.5">
+        <div className="text-muted text-[11.5px]">{title}</div>
+        <div className="text-muted mt-2 text-xs">当前区间没有可比较的数据</div>
+      </div>
+    );
+  }
+  const topSum = top.reduce((a, r) => a + valueOf(r), 0);
+  return (
+    <div className="border-separator flex h-full flex-col rounded-lg border px-3 py-2.5">
+      <div className="text-muted mb-2 flex items-center justify-between text-[11.5px]">
+        <span>{title}</span>
+        <span>前 {top.length} 名</span>
+      </div>
+      <div className="flex flex-1 flex-col justify-around gap-2">
+        {top.map((r) => (
+          <div key={r.key} className="grid grid-cols-[minmax(0,1fr)_auto] items-center gap-x-2 gap-y-1">
+            <span className="truncate text-[11.5px]" title={labelOf(r)}>
+              {labelOf(r)}
+            </span>
+            <span className="text-muted text-[11px] tabular-nums">
+              {textOf(r)}
+              <span className="ml-1.5 text-[10px]">
+                {total > 0 ? `${Math.round((valueOf(r) / total) * 100)}%` : "—"}
+              </span>
+            </span>
+            <div className="bg-default-soft col-span-2 h-1 overflow-hidden rounded-full" aria-hidden="true">
+              <div
+                className="h-full rounded-full"
+                style={{ width: `${Math.max(2, (valueOf(r) / max) * 100)}%`, background: color }}
+              />
+            </div>
+          </div>
+        ))}
+      </div>
+      <div className="text-muted border-separator mt-auto flex items-center justify-between gap-2 border-t pt-2 text-[10.5px]">
+        <span>合计 {fmtTokens(total)}</span>
+        <span>
+          前 {top.length} 名占 {total > 0 ? `${Math.round((topSum / total) * 100)}%` : "—"}
+        </span>
+      </div>
+    </div>
+  );
+}
+
+/**
+ * 前 8 名的费用占比环。
+ *
+ * 条形图回答「谁比谁多」，环回答「几家吃掉了整个区间」。两者同源同口径，
+ * 但第 9 名以后归入「其余」：不归并的话，环会变成几十条几乎看不见的细缝，
+ * 占比数字也就失去了意义。若本来就 ≤ 8 名，则不显示「其余」。
+ */
+function SharePie({
+  rows,
+  kind,
+}: {
+  rows: UsageGroupEntry[];
+  kind: UsageByGroupProps["kind"];
+}) {
+  const sorted = [...rows].sort((a, b) => b.cost - a.cost);
+  const top = sorted.slice(0, 8);
+  const rest = sorted.slice(8);
+  const restCost = rest.reduce((a, r) => a + r.cost, 0);
+  const total = sorted.reduce((a, r) => a + r.cost, 0);
+  const data = top
+    .filter((r) => r.cost > 0)
+    .map((r) => ({ key: r.key, name: r.name || r.key || "未归属", value: r.cost }));
+  if (restCost > 0) data.push({ key: "__rest__", name: `其余 ${rest.length} 个`, value: restCost });
+  if (data.length === 0) {
+    return (
+      <div className="border-separator rounded-lg border px-3 py-2.5">
+        <div className="text-muted text-[11.5px]">费用集中度</div>
+        <ChartEmpty text="当前区间没有已计价费用" />
+      </div>
+    );
+  }
+  const unit = kind === "provider" ? "上游" : kind === "model" ? "模型" : "密钥";
+  // 中心读数只算「前 N 名」本身；把「其余」也算进来会让文案声称的
+  // 「前 N 名占比」变成全部已计价费用。分母仍是全部已计价费用。
+  const topEntries = data.filter((d) => d.key !== "__rest__");
+  const topSum = topEntries.reduce((a, d) => a + d.value, 0);
+  // 单一主色的透明度阶梯：费用是同一维度的量，用彩虹色会让读者以为
+  // 颜色本身携带分类信息。降序排列 + 递减透明度，扫一眼就能看出头部。
+  return (
+    <div className="border-separator rounded-lg border px-3 py-2.5">
+      <div className="text-muted mb-1 flex items-center justify-between text-[11.5px]">
+        <span>费用集中度</span>
+        <span>按已计价费用</span>
+      </div>
+      <div className="relative h-[170px]">
+        <ResponsiveContainer width="100%" height="100%">
+          <PieChart>
+            <Pie
+              data={data}
+              dataKey="value"
+              nameKey="name"
+              innerRadius={52}
+              outerRadius={76}
+              paddingAngle={1.5}
+              stroke="none"
+            >
+              {data.map((d, i) => (
+                <Cell
+                  key={d.key}
+                  fill={d.key === "__rest__" ? CHART_COLORS.muted : chartShade(CHART_COLORS.accent, i)}
+                />
+              ))}
+            </Pie>
+            <ChartTooltip
+              content={({ active, payload }) => {
+                if (!active || !payload?.length) return null
+                const row = payload[0].payload as (typeof data)[number]
+                return (
+                  <ChartTooltipBox title={row.name}>
+                    <TooltipRow label="费用" value={`¥${fmtMoney(row.value)}`} />
+                    <TooltipRow label="占已计价" value={shareText(row.value, total)} />
+                  </ChartTooltipBox>
+                )
+              }}
+            />
+          </PieChart>
+        </ResponsiveContainer>
+        <div className="pointer-events-none absolute inset-0 flex flex-col items-center justify-center">
+          <div className="text-[17px] leading-none font-semibold tabular-nums">
+            {shareText(topSum, total)}
+          </div>
+          <div className="text-muted mt-1 text-[10.5px]">前 {topEntries.length} 名占已计价</div>
+        </div>
+      </div>
+      <p className="text-muted mt-1 text-[10.5px]">
+        按记录费用；未计价请求不在环内。前 {topEntries.length} 名按{unit}计。
+      </p>
+    </div>
   );
 }

@@ -24,7 +24,7 @@ main.go[OP5L]: F:离线重建 SQLite 到当前构建的 schema，丢弃已不存
 ===/<repository>/cmd/gateway/===
 bootstrap_admin.go[EI7S]: F:空库时创建待初始化的 admin 账号，并解析 setup_required/ready 状态 | R:code:internal/lifecycle/bootstrap.go,code:internal/store/store.go,code:internal/gatewayapp/run.go | A:PasswordHash 留空建 admin；唯一冲突时重读确认；已有用户则查是否仍有未初始化管理员 | S:password_hash 必须留空，假哈希会让登录无法区分未设密码与密码错误
 generate.go[FV3T]: F:声明 cmd/gateway 的 go:generate 入口，运行 routesgen | R:code:cmd/gateway/routesgen/main.go | A:单条 go:generate go run ./routesgen | S:-
-main.go[EG8T]: F:网关进程入口：读取注入版本，调用 gatewayapp.Run 并注入管理员引导钩子 | R:code:internal/gatewayapp/run.go,code:cmd/gateway/bootstrap_admin.go | A:buildVersion 由 ldflags -X 注入，默认 dev；Run 出错时写日志并以 1 退出；generateID 生成 16 字节随机十六进制 | S:版本只能经 -X main.buildVersion 注入，Dockerfile 与 build.ps1 都以 web/package.json 为唯一来源
+main.go[EG8S]: F:网关进程入口：读取注入版本，调用 gatewayapp.Run 并注入管理员引导钩子 | R:code:internal/gatewayapp/run.go,code:cmd/gateway/bootstrap_admin.go | A:buildVersion 由 ldflags -X 注入，默认 dev；空导入 time/tzdata 把 IANA 时区库编进二进制；Run 出错时写日志并以 1 退出；generateID 生成 16 字节随机十六进制 | S:版本只能经 -X main.buildVersion 注入；tzdata 不能删，Windows 无 zoneinfo，缺了会因 Asia/Shanghai 解析失败而启动即退出
 
 ===/<repository>/cmd/gateway/routesgen/===
 main.go[XV6T]: F:导出网关真实路由契约到 web/src/generated/routes.ts | R:code:cmd/gateway/main.go,code:web/src/generated/routes.ts | A:跑 TestExportRouteContract，解析 ROUTE_CONTRACT: 后的 JSON，按 pattern 排序写出 ApiRouteContract 数组 | S:产物由 go generate 生成，不得手改；CI 以 git diff 校验生成物与源码一致
@@ -36,7 +36,7 @@ docker-entrypoint.sh[OR8T]: F:容器入口：首次启动播种配置，修正 /
 ===/<repository>/docs/===
 AUDIT-2026-11-12-职责划分审计.md[SG6L]: F:2026-11-12 包职责审计：admin 过宽、单价公式归属、配置双路径、维护循环位置等 | R:code:docs/DESIGN.md,code:internal/access/access.go | A:逐条给出 A1-A11 的事实、影响与处理顺序，并列出已确认无问题的分工与验证命令 | S:这是历史快照而非当前缺陷清单；引用前须对照当前代码确认是否已修复
 CONTRIBUTING.md[SG5S]: F:开发环境与协作约定：本机环境、前端约定、代码风格与提交前门禁 | R:code:build.ps1,code:.github/workflows/ci.yml | A:记录 Go/Node 版本、前端反手写门禁、gofmt/vet/测试与 npm typecheck/test/build 命令 | S:门禁以 CI 为准；用 -NoWeb 跳过前端时，embed 产物可能与源码不一致
-DESIGN.md[SG8L]: F:记录网关架构、运行约定、计费模型与协议取舍 | R:code:internal/dataplane/handler.go,code:internal/store/schema.go,code:Dockerfile | A:解释故障转移、日配额恢复、协议互转、管理面及 Go 1.27.4 构建要求 | S:Responses 原始 content_index 在 SDK v1.3.3 未公开；Anthropic 原生工具同协议响应仅保留已识别块，入站原生工具回放仍受限
+DESIGN.md[SG8S]: F:记录网关架构、运行约定、计费模型、协议取舍与前端视觉/图表选型 | R:code:internal/dataplane/handler.go,code:internal/store/schema.go,code:Dockerfile,code:web/src/ui/chart.tsx | A:解释故障转移、日配额恢复、协议互转、管理面，并在 §13.3 固定 HeroUI 组件边界、Recharts 准入、语义色、读数口径与表格列/断点规则；§13.2 记录供应商列表 5 列与上游模型表 6 列 | S:图表统一 Recharts 3.11；成功率分母为成功+失败；费用用 cost、速度用 info；窄表靠 px-2 与固定列宽放下，不堆列；供应商列表不得恢复「类型」独立列
 DIALECTS.md[SN7S]: F:各上游思考/推理方言对照表，列三协议下开启与关闭思考的字段写法 | R:code:internal/dialect/dialect.go,code:internal/dataplane/handler.go | A:汇总各家 reasoning/thinking 字段、三协议与关闭思考矩阵，并规定改表规则 | S:口径取自官方文档；新增上游或协议版本变化必须同步更新，不能凭客户端行为反推
 DOCKER.md[SV5L]: F:Docker 部署手册：快速开始、目录布局、挂载、compose、环境变量、日志、时区、升级与非 root | R:code:Dockerfile,code:docker/docker-entrypoint.sh,code:docker/config.default.json | A:解释端口 8666 由来、/data 状态卷、备份优先级、健康检查与常见问题 | S:状态卷必须持久化 master.key 与 session_secret；丢失 master.key 会让全部上游凭据无法解密
 MULTIUSER.md[SI7L]: F:多用户改造设计：现状、new-api 参考、目标数据模型、改造点、迁移与风险 | R:code:internal/store/schema.go,code:docs/DESIGN.md | A:定义 users/groups/access_keys/usage 关系，给出旧单用户 key 的迁移步骤与待拍板事项 | S:迁移假定存量 key 无归属，升级时会被批量退休；执行前必须备份并逐人重发新 key
@@ -223,36 +223,40 @@ password.go[DI8S]: F:口令策略与 PBKDF2 自描述哈希 | R:code:internal/st
 session.go[DI9M]: F:管理面会话 JWT：HS256 签发、auth_version 栅栏与密钥文件生命周期 | R:code:internal/store/user_dao.go,code:internal/server/user_auth.go | A:密钥取 env→文件→原子生成；Issue 只签 HS256；Verify 校验算法、subject 与数据库 auth_version；Peek 只解析不比对 | S:只接受 HS256；密钥短于 32 字符必须拒绝，不能退化成空密钥签名
 
 ===/<repository>/internal/webui/dist/assets/===
-SectionCard-CRQiqNv2.js[OV3T]: F:通用区块卡片组件的构建 chunk | R:code:internal/webui/embed.go,code:internal/webui/dist/index.html | A:导出 SectionCard，接收 title/description/actions/children 并统一卡片布局 | S:构建产物不手改；改组件须回源并重新 build/sync
-SkeletonBlock-CZWOh0qB.js[OV2T]: F:骨架屏占位组件的构建 chunk | R:code:internal/webui/embed.go,code:internal/webui/dist/index.html | A:导出骨架块，合并 rounded-md 与 bg-default-soft，接受 className | S:构建产物不手改；样式改动须回源
-StatusChip-167M30cR.js[OV2T]: F:状态胶囊组件的构建 chunk | R:code:internal/webui/embed.go,code:internal/webui/dist/index.html | A:导出状态胶囊，把 ok/warn/err/info/dim 映射到 success/warning/danger/accent/default | S:构建产物不手改；色调映射改动须回源
-TokenField-pkeMtCR4.js[OV2T]: F:token 数量输入组件的构建 chunk | R:code:internal/webui/embed.go,code:internal/webui/dist/index.html | A:导出 token 输入，解析 k/m/b 后缀为数值并按 1024 进制换算 | S:构建产物不手改；解析规则改动须回源
 effortTone-P2fVgd9Z.js[OV2T]: F:思考挡位到语义色的映射工具 chunk | R:code:internal/webui/embed.go,code:internal/effort/effort.go | A:把 none/minimal/low/medium/high/xhigh/max 映射为 dim/info/ok/warn/err | S:未知挡位回落 dim；匹配前先 trim 并转小写
 fmt-PMAfO7Ut.js[OV3T]: F:数字与金额格式化工具 chunk | R:code:internal/webui/embed.go,code:internal/webui/dist/index.html | A:提供去尾零、zh-CN 千分位与 1e9/1e6 等单位格式化 | S:金额与数量格式化只此一份；构建产物不手改
-heroui-BvT3H6q9.js[LV4T]: F:HeroUI/React Aria 组件库的第三方打包 chunk | R:code:internal/webui/embed.go,code:internal/webui/dist/index.html | A:打包 HeroUI 与 React Aria 组件实现，供各页面 chunk 共享 | S:第三方依赖包不手改；升级须改 package.json 后重新构建
-index-C3QfeIJy.css[OV5T]: F:Tailwind v4 生成的全站样式表 | R:code:internal/webui/embed.go,code:internal/webui/dist/index.html | A:包含 @layer、主题变量与全部工具类，由抽样的 Tailwind v4.3.5 构建头标识 | S:Tailwind 生成物不手改；主题变量改动须回源并重新构建
 modelPrice--ykvtfZ0.js[OV3T]: F:模型单价格式化工具 chunk | R:code:internal/webui/embed.go,code:internal/store/pricing.go | A:未配置显示「未配置」，继承输入价显示「沿用输入」 | S:未配置与沿用输入价必须是两种文案，不能都显示 0
-priceShared-DlMgL2sw.js[OV3T]: F:计价表单共享逻辑 chunk | R:code:internal/webui/embed.go,code:internal/store/pricing.go | A:四桶价格表单的共享校验/换算：非负、清除与批量提交 | S:构建产物不手改；价格校验与换算须回源
 protocols-DjmrVkrh.js[OV2T]: F:协议枚举与显示名映射 chunk | R:code:internal/webui/embed.go,code:internal/protocol/protocol.go | A:导出 chat/response/anthropic 的 value/label 与 auto 显示名 | S:协议值与显示名映射只此一份；新增协议须同步后端白名单
-react-lukXhb1W.js[LV4T]: F:React 运行时第三方打包 chunk | R:code:internal/webui/embed.go,code:internal/webui/dist/index.html | A:打包 React 与 ReactDOM 运行时，供所有页面 chunk 共享 | S:第三方运行时包不手改；升级须改依赖后重新构建
-rolldown-runtime-WkwZ5CU-.js[LV2T]: F:Rolldown 模块加载运行时 chunk | R:code:internal/webui/embed.go,code:internal/webui/dist/index.html | A:提供模块注册、__commonJS 包装与 require 兼容运行时 | S:构建运行时 chunk 不手改，由打包器生成
-usePersistedState-BhPrFTtd.js[OV3T]: F:本地持久化状态 hook 的构建 chunk | R:code:internal/webui/embed.go,code:internal/webui/dist/theme-init.js | A:提供带递增版本号的持久化状态，避免旧异步写入覆盖新值 | S:构建产物不手改；持久化键与版本须保持兼容
-userDisplay-CkWAyvmr.js[OV3T]: F:用户展示名与异常归属标签工具 chunk | R:code:internal/webui/embed.go,code:internal/store/usage_by_user_dao.go | A:把用户行映射为展示名与角色标签：管理员·历史/已删除/无归属 | S:空用户名有两种含义：用户已删除 vs 无归属，不能混用
-AccessControl-CqCKmz3U.js[OV4T]: F:嵌入式管理面访问控制页面的懒加载产物 | R:code:web/src/pages/AccessControl.tsx,code:web/src/components/Keys.tsx | A:导出访问控制页并在有权限时提供密钥、用户与分组切换 | S:通过前端构建同步更新
-AccountSettings-BDtMDcWH.js[OV3T]: F:嵌入式改密页面的懒加载产物 | R:code:web/src/pages/AccountSettings.tsx | A:渲染三项密码及提交状态，显示失败信息 | S:修改行为需回到 TSX 源码
-Models-Bj19fzk1.js[OV4T]: F:嵌入式公开模型目录的懒加载产物 | R:code:web/src/pages/Models.tsx,code:internal/catalog/models.go | A:导出 Models 并渲染能力和单价条目 | S:构建产物与入口的哈希引用要同步
-Overview-DzWlC5TS.js[OV4T]: F:管理台总览页面构建模块 | R:code:web/src/pages/Overview.tsx,code:internal/webui/dist/index.html | A:导出 Overview 以显示区间指标卡和调用趋势 | S:-
-ProviderDetail-i9LpmSAD.js[OV4T]: F:打包上游详情页及其资源编辑交互 | R:code:web/src/pages/ProviderDetail.tsx,code:web/src/components/provider/ProviderEditModal.tsx | A:导出 ProviderDetail 并在保存后刷新相关数据 | S:-
-Providers-BaMTYUUK.js[OV4T]: F:打包管理台上游列表页 | R:code:web/src/pages/Providers.tsx | A:导出 Providers，呈现管理操作和协议探测状态 | S:-
-Routes-HFbCBeyG.js[OV4T]: F:打包路由及目标链编辑页 | R:code:web/src/pages/Routes.tsx,code:internal/admin/route_target_handler.go | A:导出 Routes 并渲染路由、目标链和提交错误 | S:-
-Settings-DlNF9F0V.js[OV4T]: F:打包系统设置页与维护操作入口 | R:code:web/src/pages/Settings.tsx | A:导出 Settings 并承载定价页签与手动维护按钮 | S:-
-UsageStats-kl_3Yic-.js[OV4T]: F:打包用量统计与日志的页面模块 | R:code:web/src/pages/UsageStats.tsx,code:web/src/components/UsageByGroup.tsx | A:导出 UsageStats 并根据页签和日区间渲染明细或分组统计 | S:-
-Wallet-BUiv9-sr.js[OV4T]: F:打包钱包页面的用量和充值展示 | R:code:web/src/pages/Wallet.tsx,code:web/src/components/wallet/TopupModal.tsx | A:导出 Wallet，支持账务查询与提交充值后的刷新 | S:-
-index-CWQ1tmWX.js[OV6T]: F:嵌入管理后台 SPA 主入口与共享加载代码 | R:code:internal/webui/dist/index.html,code:web/vite.config.ts,code:web/src/main.tsx | A:绑定动态路由模块并内嵌当前应用和 Rosetta SDK 版本 | S:前端源文件或 SDK 版本变化后通过构建与同步生成新入口哈希及引用
-useNetworks-QhSmZCC1.js[OV3T]: F:打包出站网络选项和共享加载逻辑 | R:code:web/src/useNetworks.ts | A:提供网络重载、请求代际守卫和失败时的选项清理 | S:-
+SectionCard-BVPAS8R5.js[OV3T]: F:通用区块卡片组件的构建 chunk | R:code:web/src/ui/SectionCard.tsx | A:导出 SectionCard，统一圆角与无投影卡片壳 | S:构建产物不手改；卡片节奏由源组件与 §13.3 决定
+SkeletonBlock-DRNAb-G5.js[OV2T]: F:骨架屏占位组件的构建 chunk | R:code:web/src/ui/SkeletonBlock.tsx | A:导出骨架块，合并圆角与弱底色 | S:构建产物不手改；只用于首屏占位
+StatusChip-BBUtbbty.js[OV2T]: F:状态胶囊组件的构建 chunk | R:code:web/src/ui/StatusChip.tsx | A:导出状态胶囊，把 ok/warn/err/info/dim 映射为语义色 | S:构建产物不手改；未知状态回落 dim
+TokenField-f8alMy5l.js[OV2T]: F:token 容量输入组件的构建 chunk | R:code:web/src/ui/TokenField.tsx | A:导出 token 输入与 K/M/B 解析 | S:构建产物不手改；空输入表示未配置，不当作 0
+charts-CV47G5oR.js[LV4T]: F:Recharts 图表库的第三方打包 chunk | R:code:internal/webui/dist/index.html,code:web/package.json | A:打包 Recharts 3.11 与其 d3 依赖，供总览与钱包图共享 | S:第三方依赖包不手改；升级须改 package.json 后重新构建
+heroui-BXE9VyKp.js[LV4T]: F:HeroUI/React Aria 组件库的第三方打包 chunk | R:code:internal/webui/dist/index.html,code:web/package.json | A:打包 HeroUI 3.2.7 与 React Aria 实现，供各页面共享 | S:第三方依赖包不手改；升级须改 package.json 后重新构建
+priceShared-iKMlHZ8i.js[OV3T]: F:计价表单共享逻辑的构建 chunk | R:code:web/src/components/price/priceShared.tsx | A:导出四桶价格校验、格式化与批量提交辅助 | S:构建产物不手改；缓存写入价不在界面暴露
+react-C-Ki0UBj.js[LV4T]: F:React 运行时第三方打包 chunk | R:code:internal/webui/dist/index.html,code:web/package.json | A:打包 React 19 与 ReactDOM，供所有页面共享 | S:第三方运行时包不手改；升级须改依赖后重新构建
+rolldown-runtime-XKyaHtl9.js[LV2T]: F:打包器模块加载运行时 chunk | R:code:internal/webui/dist/index.html,code:web/vite.config.ts | A:提供模块注册与 CommonJS 兼容运行时 | S:由构建生成，不手改；更换打包器会整体替换
+StatStrip-CSUVzJs5.js[OV3T]: F:跨页复用的紧凑读数带构建 chunk | R:code:web/src/ui/StatStrip.tsx | A:导出 StatStrip，统一总览与用量页的指标布局、可选提示与等宽数字 | S:构建产物不手改；读数带只放区间合计，不重复页面副标题
+chart-C9yeNuPI.js[OV3T]: F:图表主题、语义色与提示框的共享构建 chunk | R:code:web/src/ui/chart.tsx | A:导出 CHART_COLORS（含 cost/info）、ChartTooltipBox、TooltipRow、chartShade 与占比文案 | S:只引用 CSS 语义变量；金额用 cost、速度/首字用 info，否则暗色下图表与页面脱节
+AccessControl-D0d7aNQQ.js[OV4T]: F:密钥与用户权限管理页的浏览器构建分片 | R:code:web/src/pages/AccessControl.tsx | A:渲染密钥状态、归属与分组覆盖，并装配密钥操作控件 | S:迁移遗留无归属密钥的停用提示对应鉴权拒绝
+AccountSettings-Bkv9h3TM.js[OV4T]: F:账号设置页的浏览器构建分片 | R:code:web/src/pages/AccountSettings.tsx | A:展示当前密码、新密码与确认字段，并校验两次新密码一致 | S:修改成功后要求重新登录
+Models-BMQdfmmB.js[OV4T]: F:可用模型与参考价格图的浏览器构建分片 | R:code:web/src/pages/Models.tsx | A:提供模型或供应商搜索，显示三档单价并绘制输入与输出价对比 | S:未同时配置输入与输出价的模型不入图
+Overview-h9R1LY09.js[OV4T]: F:网关用量总览的浏览器构建分片 | R:code:web/src/pages/Overview.tsx | A:按选定时段呈现可切换主趋势、运行读数与费用去向，分别处理数据加载失败 | S:未计价请求存在时提示已记录费用偏低
+ProviderDetail-pvsNhhbY.js[OV4T]: F:上游详情的浏览器构建分片 | R:code:web/src/pages/ProviderDetail.tsx | A:装配凭据管理、模型与价格面板及上游思考协议配置 | S:无凭据时提示添加，正常使用要求有启用密钥
+Providers-C31t_N4z.js[OV4T]: F:供应商列表及编辑操作的浏览器构建分片 | R:code:web/src/pages/Providers.tsx | A:筛选凭据状态，区分直连和代理，并提供新建、启停与删除 | S:删除确认提示会影响模型和路由可用性
+Routes-BL9efUUz.js[OV4T]: F:公开模型路由管理的浏览器构建分片 | R:code:web/src/pages/Routes.tsx | A:提供搜索、状态筛选、新建、启停、故障转移开关及删除操作 | S:删除后公开名称即不可用，客户端收到 404
+Settings-BCKFWxCa.js[OV4T]: F:系统设置的浏览器构建分片 | R:code:web/src/pages/Settings.tsx | A:装配配置页签与模型批量调价交互，调价前校验已选模型和非负价格 | S:三档价格均为零表示清除价格配置
+UsageStats-lJmoN2aE.js[OV4T]: F:调用日志与用量分析共用的浏览器构建分片 | R:code:web/src/pages/UsageStats.tsx | A:由路由决定日志或分组分析，分析页按上游、模型、用户、密钥切换排行与构成图 | S:日志下钻可读绝对时间；用户维度按角色显示
+Wallet-B9wJq4vv.js[OV4T]: F:余额与账单页的浏览器构建分片 | R:code:web/src/pages/Wallet.tsx | A:管理员查看历史总消费及充值，普通用户查看余额、消耗图与充值记录 | S:管理员按用户拆解通过链接进入用量分析
+check-CTb4Zrhy.js[OV2T]: F:共享勾选图标的构建分片 | R:code:internal/webui/dist/assets/index-CS2SRlbo.js | A:以单个 SVG 路径描述勾选并调用主入口图标工厂 | S:-
+copy-CKEQ_O9c.js[OV2T]: F:共享复制图标的构建分片 | R:code:internal/webui/dist/assets/index-CS2SRlbo.js | A:将重叠方框的 SVG 形状交给主入口图标工厂 | S:-
+index-Bt-vPwVq.css[OV5T]: F:后台主题、组件和布局规则的嵌入样式产物 | R:code:web/src/theme.css,code:internal/webui/dist/index.html | A:合并 Tailwind 工具类、组件样式和亮暗主题色，供 HTML 按内容哈希引用 | S:图表用亮暗主题统一提供的 accent、cost、info 变量
+index-CS2SRlbo.js[OV5T]: F:嵌入式管理后台的应用入口与共享逻辑产物 | R:code:internal/webui/dist/index.html,code:web/src/ui/Shell.tsx | A:挂载 React 根节点与路由，集中装配会话、导航和 API 请求，并维护惰性页面的预加载映射 | S:路由分片及其依赖的哈希引用随构建同步
+usageSeries-B138ru27.js[OV4T]: F:总览与钱包共用的用量时间序列构建分片 | R:code:web/src/usageSeries.ts | A:补齐自然日并聚合到日、周或更宽的历史桶，生成标签和绝对起止时间 | S:识别数字及数字字符串形式的图表桶索引
+useNetworks-BUjaKIHV.js[OV3T]: F:上游配置共用的网络清单加载构建分片 | R:code:internal/webui/dist/assets/index-CS2SRlbo.js | A:请求网络清单，暴露加载状态及直连标识 direct | S:仅当前请求一代可以更新清单和加载状态
 
 ===/<repository>/internal/webui/dist/===
-index.html[OV5T]: F:管理后台嵌入式 SPA 的 HTML 壳与资源入口 | R:code:internal/webui/embed.go,code:internal/webui/dist/theme-init.js,code:web/index.html | A:装配 zh-CN 根节点、入口模块、模块预加载和同步主题脚本 | S:主题脚本必须保持同步外置，适配 CSP 并在首帧前生效；入口哈希由构建生成
+index.html[OV5T]: F:管理后台嵌入式 SPA 的 HTML 壳与资源入口 | R:code:internal/webui/embed.go,code:internal/webui/dist/theme-init.js,code:web/index.html | A:装配中文页面、RG 图标和应用根节点，加载哈希化入口模块、预加载依赖及样式 | S:主题脚本在入口前同步外置执行，满足 CSP 并在首帧前生效；资源名由构建生成
 theme-init.js[EU5T]: F:首帧主题防闪脚本 | R:code:internal/webui/dist/index.html,code:web/src/App.tsx | A:同步读取 rosetta_gw_theme 与 prefers-color-scheme，在首帧前设置 data-theme 和 color-scheme | S:必须在 CSS 应用前同步执行；改成 module 会失去防闪，内联会被 CSP 拦掉
 
 ===/<repository>/internal/webui/===
@@ -274,12 +278,12 @@ README.md[SQ6T]: F:livecheck 的用法与判据说明：用真上游验证思考
 main.go[TQ7L]: F:用真实网关 key 打真上游，验证 thinking/effort/dialect 后缀是否真的生效 | R:code:scripts/livecheck/README.md,code:internal/dialect/dialect.go | A:固定 baseline 与四类后缀用例，按三种协议解析思考痕迹与 reasoning_tokens，流式用例还要求响应体真的是 SSE | S:不能以 HTTP 200 判通过；流式退回整包 JSON 时「没看到思考」只是没走到被测路径
 
 ===/<repository>/web/===
-index.html[EV6T]: F:前端 SPA 的 HTML 壳：语言、favicon、主题防闪脚本与入口模块 | R:code:web/public/theme-init.js,code:web/src/main.tsx | A:声明 zh-CN、color-scheme、内联 SVG 图标，并在 head 里同步加载 theme-init.js | S:主题脚本必须外置且非 module：管理面 CSP 无 unsafe-inline，module 又会延后到首帧之后
-package.json[FV7T]: F:管理前端依赖与脚本清单，同时是发布版本的唯一来源 | R:code:build.ps1,code:.github/workflows/docker.yml | A:固定 React 19、HeroUI 3.2.7、Vite 8、Tailwind 4；提供 dev/build/typecheck/test/sync 五个脚本 | S:version 字段是镜像与二进制版本来源，tag 与它不一致即发布失败
+index.html[EV6T]: F:前端 SPA 的 HTML 壳：语言、favicon、主题防闪脚本与入口模块 | R:code:web/public/theme-init.js,code:web/src/main.tsx | A:声明 zh-CN、color-scheme、内联 SVG 图标，并在 head 里同步加载 theme-init.js；图标用青绿 RG 方块与主题主色一致 | S:主题脚本必须外置且非 module：管理面 CSP 无 unsafe-inline，module 又会延后到首帧之后
+package.json[FV7T]: F:管理前端依赖与脚本清单，同时是发布版本的唯一来源 | R:code:build.ps1,code:.github/workflows/docker.yml,code:web/src/ui/chart.tsx | A:固定 React 19、HeroUI 3.2.7、Vite 8、Tailwind 4 与 Recharts 3.11；提供 dev/build/typecheck/test/sync 五个脚本 | S:version 字段是镜像与二进制版本来源，tag 与它不一致即发布失败；Recharts 升级必须保持 3.x 的 activeIndex 语义
 sync-embed.mjs[XV6T]: F:把 web/dist 同步到 internal/webui/dist（go:embed 的数据源） | R:code:web/package.json,code:internal/webui/embed.go | A:先确认 dist 存在否则报错退出，随后清空目标目录并递归复制 | S:必须先 build 再 sync，dist 缺失时非零退出，避免产出空的 embed 目录
 tsconfig.json[FV6T]: F:前端 TypeScript 编译配置 | R:code:web/tsconfig.node.json,code:web/package.json | A:target ES2022、jsx react-jsx、moduleResolution bundler、strict 开启、noEmit；仅包含 src，并引用 tsconfig.node.json | S:noEmit 是刻意的，构建交给 Vite；开启 emit 会生成与 Vite 冲突的产物
 tsconfig.node.json[FV5T]: F:构建脚本的 TypeScript 配置 | R:code:web/tsconfig.json,code:web/vite.config.ts | A:composite 项目，覆盖 vite.config.ts 与 sync-embed.mjs，启用 node 类型 | S:必须保持 composite，否则 tsconfig.json 的项目引用会失效
-vite.config.ts[FV8T]: F:Vite 构建与开发服务器配置 | R:code:web/package.json,code:web/sync-embed.mjs | A:base 为 ./ 以便 go:embed 在 /admin/ 下服务；版本号单一来源（package.json 与 go.mod 的 rosetta 版本）经 define 注入；dev 把 /admin/api 代理到 bin/config.json 的 listen 端口，读不到回退 8080；Rolldown 按 react 与 heroui 分包 | S:版本必须从 package.json 与 go.mod 读取，手写会与发布版本漂移；base 不能改成绝对路径
+vite.config.ts[FV8T]: F:Vite 构建与开发服务器配置 | R:code:web/package.json,code:web/sync-embed.mjs,code:web/src/ui/chart.tsx | A:base 为 ./ 以便 go:embed 在 /admin/ 下服务；版本号从 package.json 与 go.mod 注入；dev 把 /admin/api 代理到 bin/config.json 的 listen 端口；Rolldown 按 react、heroui、charts 三组分包 | S:版本必须从 package.json 与 go.mod 读取，手写会漂移；charts 组必须匹配 recharts/d3-/victory-vendor，否则图表库会重复进各页面 chunk；base 不能改成绝对路径
 
 ===/<repository>/web/public/===
 theme-init.js[EU6T]: F:首帧之前同步设置 data-theme，消除暗色主题白闪 | R:code:web/index.html,code:web/src/theme.css | A:读 localStorage 的 rosetta_gw_theme 与 prefers-color-scheme，设置 data-theme 与 color-scheme | S:必须与 App 的主题三态判定保持一致；localStorage 不可用时静默降级为浅色
@@ -288,7 +292,7 @@ theme-init.js[EU6T]: F:首帧之前同步设置 data-theme，消除暗色主题�
 legacy-audit.mjs[XQ7M]: F:前端手写存量审计：.vue 数、旧类名引用、裸交互原语与手写 CSS | R:code:web/src/styles.css,code:.github/workflows/ci.yml | A:从样式源反推旧类名集合，只在 class 或 className 属性值里按 token 匹配；--gate 未清零即退出 1 | S:旧类名集合必须从样式源反推，手抄清单会过期；sr-only 必须永久排除，否则这个数字永远归不了零
 
 ===/<repository>/web/src/===
-api.ts[CG9L]: F:管理后台 API 客户端：会话、写操作、下载与全部业务端点封装 | R:code:web/src/types.ts,code:internal/server/autoreload.go | A:PATCH 一律字段级部分更新；401 统一清 token 并置空身份；写操作不额外触发重建；导出读取截断与总数响应头 | S:写成功后不得再调 reload：普通用户必然 403，会把已成功的保存报成失败
+api.ts[CG9L]: F:管理后台 API 客户端：会话、写操作、下载与全部业务端点封装 | R:code:web/src/types.ts,code:internal/server/autoreload.go | A:PATCH 一律字段级部分更新；401 统一清 token 并置空身份；写操作不额外触发重建；调用历史与 CSV 导出可传绝对 from/to 时间窗 | S:写成功后不得再调 reload：普通用户必然 403，会把已成功的保存报成失败；绝对时间窗必须优先于 days，否则图表点击会跳成另一段时间
 asyncState.ts[CG6T]: F:异步视图状态的单调代际判据，防止旧请求结果覆盖新选择 | R:code:web/src/components/UsageByGroup.tsx | A:RequestGeneration 提供 begin、invalidate 与 isCurrent，每次加载递增代际 | S:结果必须同时校验代际与产生它的选择，只比代际会让过期筛选的结果落地
 effortTone.ts[CU6T]: F:思考挡位到语义色的统一映射与展示文案 | R:code:web/src/ui/StatusChip.tsx,code:internal/effort/effort.go | A:none 与 minimal 为 dim，low 为 info，medium 为 ok，high 为 warn，xhigh 与 max 为 err；budget 写法显示为预算 | S:未知挡位回落 dim，不能冒充已知强度；匹配前必须 trim 并转小写
 fmt.ts[CU8M]: F:全站数字、金额、时间与状态文案的展示格式化 | R:code:web/src/components/UsageByGroup.tsx,code:internal/store/pricing.go | A:提供 token 与金额格式化、余额与待结算余数、时间与状态文案，以及剪贴板回退 | S:余额必须按 unlimited 判定，0 分是欠费；小于 1 元要留 4 位小数，否则小额会显示成 0.00
@@ -298,28 +302,28 @@ modelPrice.ts[CU6T]: F:单价展示的两个特例 | R:code:web/src/pages/Models
 modelSelection.ts[CU6T]: F:多选集合的并集工具 | R:code:web/src/pages/Models.tsx | A:unionSelection 返回已选与当前可见项的并集，保留被筛掉的已选项 | S:全选只能并集当前可见项，覆盖整个清单会把筛选外的已选项悄悄删掉
 password.ts[CU7T]: F:密码强度校验，与后端 ValidatePassword 同口径 | R:code:web/src/pages/AccountSettings.tsx,code:web/src/ui/Login.tsx | A:按码点匹配 Ll、Lu、Nd 分类，要求至少 8 字符且至少两类；空串返回空串表示未填 | S:必须按码点而不是字节或 UTF-16 码元分类，否则中文与大小写的判定会和后端不一致
 protocols.ts[CU7T]: F:入站与出站协议选项及展示标签 | R:code:web/src/types.ts,code:web/src/pages/Providers.tsx | A:PROTOCOL_OPTIONS 为 chat、response、anthropic；protocolLabel 额外识别 auto | S:提交值只有三种，auto 仅供展示，不能作为协议写回后端
-range.ts[CU7T]: F:时间区间的本地自然日口径 | R:code:web/src/usageSeries.ts,code:web/src/pages/Overview.tsx | A:提供 localMidnight、rangeStart（0 表示全部）、rangeBounds 与 localDayKey；days=1 从今天 0 点起算 | S:日界必须是本地自然日并与后端 dayExpr localtime 同口径，写成滚动 24 小时会让图与数字对不上
-routeTrace.ts[CU8S]: F:解析失败决策轨迹 N:provider/model -> outcome:reason | R:code:web/src/components/UsageDetailDrawer.tsx,code:internal/dataplane/diagnostics.go | A:按分号分段、支持反斜杠转义，识别 6 类 outcome 与原因表 | S:stream_malformed 明确不计入熔断，不能按普通失败归类
+range.ts[CU7T]: F:时间区间的本地自然日口径 | R:code:web/src/usageSeries.ts,code:web/src/pages/Overview.tsx | A:提供 localMidnight、rangeStart（0 表示全部）、rangeBounds、localDayKey 与 localDayEnd；days=1 从今天 0 点起算 | S:日界必须是本地自然日并与后端 dayExpr localtime 同口径；localDayEnd 必须用日历日 +1 而不是固定加 24 小时，否则跨夏令时会落错边界
+routeTrace.ts[CU8S]: F:解析失败决策轨迹 N:provider/model -> outcome:reason | R:code:web/src/components/UsageDetailDrawer.tsx,code:internal/dataplane/diagnostics.go | A:按分号分段、支持反斜杠转义，识别 6 类 outcome 与原因表；旧记录没有 attempt 时保留原文 | S:stream_malformed 不计入熔断，不能按普通失败归类
 router.tsx[EU8S]: F:前端路由表与会话守卫 | R:code:web/src/ui/AppRoot.tsx,code:web/src/api.ts | A:createHashRouter；ensureSession 进程内只探测一次；authedLoader 把普通用户的 /users 重定向到 /keys，/settings?tab=password 转到 /account，/providers?tab=routes 转到 /routes | S:登录后的 redirect 只接受站内相对路径，放行绝对地址会变成开放重定向
 store.ts[CD7T]: F:极简订阅状态容器 | R:code:web/src/api.ts | A:提供 get、set 与 subscribe，set 做浅合并，不提供选择器 | S:组件必须经 useSyncExternalStore 订阅，直接调 get 不会触发重渲染
-theme.css[CU7T]: F:全站唯一 CSS 入口 | R:code:web/src/main.tsx,code:web/src/ui/theme.ts | A:导入 tailwindcss 与 @heroui/styles；@custom-variant dark 对齐 data-theme=dark；:root 覆写字段背景与边框；定义 icon-invert-dark | S:不要在别处新建样式入口，Tailwind v4 的导入顺序决定主题变量覆盖是否生效
+theme.css[CU7T]: F:全站唯一 CSS 入口与亮暗两套语义令牌 | R:code:web/src/main.tsx,code:web/src/ui/theme.ts,code:web/src/ui/chart.tsx | A:导入 tailwindcss 与 @heroui/styles；@custom-variant dark 对齐 data-theme=dark；定义 accent、surface 三档、separator/muted、成功/警告/危险，以及 cost 金额金色与 info 速度蓝；容器 1360px；细滚动条与选区色 | S:图表与组件只引用语义变量；写十六进制会让暗色主题失去跟随
 thinkingDialect.ts[FU6T]: F:思考方言下拉的九种选项 | R:code:web/src/types.ts | A:空串表示自动，另有 openai、anthropic、deepseek、glm、qwen、minimax、kimi、passthrough；这里只放标签，字段拼写归后端 | S:空串是自动推断而不是不启用，显示成关闭会让用户以为已禁用思考
 tokenCount.ts[CU6T]: F:解析 1024 进制的 token 容量输入 | R:code:web/src/pages/ProviderDetail.tsx | A:支持 K、M、B 后缀、小数以及空格、逗号、下划线分隔 | S:解析失败返回 null 而不是 0，否则非法输入会被静默当成零容量提交
 types.ts[CG9L]: F:后端管理 API 响应契约的 TypeScript 定义 | R:code:web/src/generated/dto-contract.ts,code:web/src/api.ts | A:逐字段对应 internal/admin 响应，覆盖上游、模型、路由、密钥、用户分组、统计与用量；用注释固化缓存 token、成功率分母、费用固化、思考三态等语义 | S:字段语义以注释为准：0 值常表示未配置或无样本，不能按直觉改成可选或当成真实零值
-usageSeries.ts[CU8S]: F:用量趋势的连续日序列构建（总览页专用） | R:code:web/src/range.ts,code:web/src/pages/Overview.tsx | A:稀疏的按日数据先按本地日历补齐为连续日，再按区间合并（不超过 31 天按日、更长按周、全部按月）；尾桶标星并注明实际天数；labelStrideFor 把横轴标签压到约 12 个 | S:日期键必须与后端 dayExpr localtime 逐字一致，对不上会补出一张全零图；柱高不得按桶宽归一，否则部分桶会被放大
+usageSeries.ts[CU8M]: F:用量趋势的连续时间序列构建，供总览与钱包共用 | R:code:web/src/range.ts,code:web/src/pages/Overview.tsx,code:web/src/components/wallet/WalletTables.tsx | A:稀疏日数据按本地日历补齐为连续日，再按区间合并（≤31 天按日、更长按周、全部按月并按历史长度加宽）；桶携带 count/tokens/ok/err/cost/cached/tpsSum 与真实 startTs/endTs；bucketForPoint 接受数字与字符串索引 | S:日期键必须与后端 dayExpr localtime 逐字一致；柱高不得按桶宽归一；点击桶必须用 startTs/endTs，不能从展示标签反解
 useNetworks.ts[CU6T]: F:出站网络下拉的共享数据源 | R:code:web/src/pages/Networks.tsx,code:web/src/pages/Providers.tsx | A:NETWORK_DIRECT_ID 为 direct；load 在进页面与开表单时各查一次；loadSeq 防并发乱序；失败返回错误文案并退化为空列表 | S:刻意不做跨页面永久缓存，缓存首份快照会让下拉停在旧列表；直连不是一条 networks 记录
 userDisplay.ts[CU7T]: F:用户汇总表格的显示名、行标记与头像首字 | R:code:web/src/pages/Wallet.tsx,code:web/src/components/UsageByUser.tsx | A:用户已删除回退 user_id，key 为空显示「无归属」，admin 标「管理员·历史」；首字按码点取，中文与 emoji 不会被劈开 | S:已删除与无归属的数据形状相同但含义不同，不能都留白让读者自己猜
 vite-env.d.ts[FV5T]: F:Vite 环境类型声明 | R:code:web/vite.config.ts,code:web/src/main.tsx | A:引用 vite/client，并声明构建期注入的 __APP_VERSION__ 与 __ROSETTA_VERSION__ | S:两个常量由 vite.config.ts 的 define 注入，删除声明会让使用处类型检查失败
 
 ===/<repository>/web/src/components/===
-CredentialPanel.tsx[AU8S]: F:上游凭据面板：列表展示与启停/换钥/删除回调上抛 | R:code:web/src/components/provider/CredentialFormModal.tsx,code:internal/admin/credential_handler.go | A:用 DataTable 渲染凭据行，启停开关按 toggling 集合防连点；多把凭据时给出互斥提示 | S:「同时只启用一把」的提示必须与表格并存，写成二选一会让凭据数大于 1 时整表消失
+CredentialPanel.tsx[AU8S]: F:上游凭据面板：列表展示与启停/换钥/删除回调上抛 | R:code:web/src/components/provider/CredentialFormModal.tsx,code:internal/admin/credential_handler.go | A:用 DataTable 渲染凭据行，启停开关按 toggling 集合防连点；多把凭据时给出互斥提示；0 条时显示真实空态与「添加凭据」动作而不是空表 | S:「同时只启用一把」的提示必须与表格并存，写成二选一会让凭据数大于 1 时整表消失；空态动作必须走 onAdd，不能只有文案
 Keys.tsx[AU9M]: F:访问密钥页：列表、按用户筛选、建改删启停与导入本机客户端 | R:code:web/src/components/keys/KeysTable.tsx,code:web/src/api.ts | A:管理员按归属筛选并按用量降序；模型与分组选项惰性加载；明文只在局部变量与剪贴板之间流转 | S:明文不得进入组件状态，关闭弹窗必须抹掉，否则会留下第二份可被 devtools 读到的副本
 ModelPicker.tsx[AU7S]: F:模型白名单选择器，承载「一个都不选 = 不限制」的语义 | R:code:web/src/components/UsersGroups.tsx,code:internal/auth/auth.go | A:选项先排序；超过 12 个才显示搜索；全选只并集当前可见项并保留隐藏的已选项 | S:全选不能覆盖整个清单，否则「打搜索词后全选」会把白名单放宽成全部模型
 PriceSettings.tsx[AU8L]: F:模型价格页签：按供应商乘模型列出价格条目，提供增删改与批量入口 | R:code:web/src/components/price/priceShared.tsx,code:internal/store/pricing.go | A:一次拉全部模型本地按供应商分组；筛选变化即回第一页；供应商超 500 家先选供应商再列条目 | S:删除价格必须连界面上不暴露的缓存写入价一起清零，否则留下一个看不见的价继续计费
-UpstreamModelPanel.tsx[AU8M]: F:上游模型面板：价格、容量、思考档位与运行指标分列展示 | R:code:web/src/effortTone.ts,code:internal/effort/effort.go | A:单价三档横排；支持思考三态、已知与未知档位、方言分开显示；链首模型禁止删除 | S:「未配置」不能显示成「不支持」，否则未配置的模型会凭空失去思考能力
-UsageByGroup.tsx[AA7M]: F:按上游、模型、密钥的用量汇总面板，三个页签共用一套列 | R:code:web/src/fmt.ts,code:internal/admin/usage_handler.go | A:每次现算区间边界；成功率分母用全部请求；总数与截断提示都来自后端 total | S:成功率分母不能用成功加失败，否则客户端取消会被算成失败，或把不可用上游夸成 100%
-UsageByUser.tsx[AA7S]: F:按用户汇总消费的面板，含消费占比条与截断说明 | R:code:web/src/userDisplay.ts,code:internal/admin/usage_by_user_handler.go | A:取 200 条上限；合计按当前行求和；显示名与角色标记复用 userDisplay 的同一套规则 | S:截断时合计只是前 N 名的合计，必须当场说明，否则会被读成整个区间的总额
-UsageDetailDrawer.tsx[AA7M]: F:请求详情抽屉：只补表格没有的失败原因、决策轨迹与原始响应 | R:code:web/src/routeTrace.ts,code:internal/dataplane/diagnostics.go | A:展示 HTTP、错误码与停在哪；按 attempt 展开失败决策轨迹；错误说明与 raw body 分段渲染 | S:抽屉不能重复列表已有的列；本地终止的 502 只有轨迹能说明原因，这一段不能省
+UpstreamModelPanel.tsx[AU8L]: F:上游模型面板：价格、容量、思考档位与运行指标分列展示 | R:code:web/src/effortTone.ts,code:internal/effort/effort.go | A:6 列固定为模型/上下文与最大输出/单价/思考/性能/操作；表用 table-fixed 与显式列宽，单价三档竖排；性能合并速度、首字、成功率；支持思考三态、已知与未知档位与方言；链首模型禁止删除 | S:容量表头必须单行「上下文 / 最大输出」，改 table-fixed 后列宽不再随内容漂移；「未配置」不能显示成「不支持」；价格标签预留 w-12
+UsageByGroup.tsx[AA7L]: F:按上游、模型、密钥的用量汇总面板，带 Token 贡献条与费用集中度环 | R:code:web/src/fmt.ts,code:internal/admin/usage_handler.go,code:web/src/ui/chart.tsx | A:每次现算区间边界；顶部统一 StatStrip；贡献条补每行占比与合计并撑满卡片高度；前 8 名费用环的「其余」只进环不进中心；总数与截断提示都来自后端 total | S:成功率分母只能是成功+失败；全取消行不着色；贡献条不得另做一套聚合；表宽 760px、名称列 max-w-60 起步，1105px 下性能列才不被切掉
+UsageByUser.tsx[AA7S]: F:按用户汇总消费的面板，含消费占比条、类目轴柱图与截断说明 | R:code:web/src/userDisplay.ts,code:internal/admin/usage_by_user_handler.go | A:取 200 条上限；合计按当前行求和；显示名与角色标记复用 userDisplay 的同一套规则；柱图补 YAxis 类目轴，两位用户时不再重叠 | S:截断时合计只是前 N 名的合计，必须当场说明，否则会被读成整个区间的总额；柱图不能省略类目轴，否则少量用户会堆成一团
+UsageDetailDrawer.tsx[AA7M]: F:请求详情抽屉：只补表格没有的失败原因、决策轨迹与原始响应 | R:code:web/src/routeTrace.ts,code:internal/dataplane/diagnostics.go | A:展示 HTTP、错误码与停在哪；按 attempt 展开失败决策轨迹，旧记录标出旧格式；错误说明与 raw body 分段渲染；底色统一用 surface-tertiary | S:抽屉不能重复列表已有的列；本地终止的 502 只有轨迹能说明原因，这一段不能省；旧记录没有 attempt 时必须显式标「旧格式」，不能伪装成第一次尝试
 UsersGroups.tsx[AU8M]: F:用户与分组面板：两个页签共用一次取数，编排六个弹窗与删除守卫 | R:code:web/src/components/users/UserTables.tsx,code:internal/admin/user_admin_handler.go | A:并行取用户、分组与可用模型名；行级 pending 防连点；禁用与删除都要二次确认 | S:组内仍有账号或密钥时必须前置拦截，不能等后端 409；防连点必须落在行上，全局 busy 会挡住别的行
 
 ===/<repository>/web/src/components/keys/===
@@ -356,7 +360,7 @@ groupUtils.ts[CU6T]: F:分组名索引与「能否删除」的绑定计数判据
 
 ===/<repository>/web/src/components/wallet/===
 TopupModal.tsx[AB7S]: F:管理员充值或扣减弹窗，按相对金额调整余额 | R:code:web/src/api.ts,code:internal/admin/user_admin_handler.go | A:元转整数分四舍五入；只列普通用户；提示不限额会被切成有限额并预览调整后余额 | S:金额是相对调整不是绝对值；给不限额用户充值会把它切换成有限额
-WalletTables.tsx[AB7M]: F:钱包页三张表：按用户消费汇总、按天消耗与充值流水 | R:code:web/src/userDisplay.ts,code:internal/store/topup_dao.go | A:管理员看全站按用户汇总，普通用户看按天与自己的流水；费用为 0 显示破折号并说明不等于免费 | S:截断时必须说明「仅前 N 名」，否则本表合计会被当成整个区间的总额
+WalletTables.tsx[AB7M]: F:钱包页的按天消耗图、消费去向入口与充值流水表 | R:code:web/src/userDisplay.ts,code:internal/store/topup_dao.go,code:web/src/usageSeries.ts | A:普通用户看补零后的按天/按周消耗柱图与逐日表；管理员看 SpendOverviewCard 并跳 /usage?tab=users；充值流水两种身份共用一张表 | S:钱包不再渲染按用户消费表，避免与用量页出现两张同源汇总；费用为 0 显示破折号，不等于免费；截断时必须说明「仅前 N 条」
 
 ===/<repository>/web/src/generated/===
 defaults.ts[FC6T]: F:go generate 产物：模型容量兜底与运行时默认值 | R:code:web/src/pages/Settings.tsx,code:internal/config/config.go | A:导出 MODEL_DEFAULT_FALLBACKS（上下文 131072、输出 65536）与 RUNTIME_DEFAULTS（上游超时 300000ms、首字 60000、空闲 120000、故障转移最多 3 个目标、阈值 3） | S:标注 DO NOT EDIT，改默认值必须回源 internal/config 并重新生成，手改会在下次生成时丢失
@@ -364,38 +368,39 @@ dto-contract.ts[FN7L]: F:管理 API 的 TypeScript DTO 契约镜像（contractge
 routes.ts[FN7T]: F:管理 API 路由契约清单（routesgen 产物） | R:code:web/src/generated/dto-contract.ts,code:web/src/api.ts | A:导出 ApiRouteContract[]，逐条给出方法、路径与用途说明，供前端与测试核对端点 | S:新增端点要改后端路由表后重新生成，手写补条目会在 CI 的 diff 校验里被冲掉
 
 ===/<repository>/web/src/pages/===
-AccessControl.tsx[AU8T]: F:访问控制页：把密钥、用户、分组三个页签收进一张路由 | R:code:web/src/router.tsx,code:web/src/ui/nav.ts | A:keys 直接渲染密钥页，users 与 groups 跳 /users?tab=；标题按页签而不是角色；普通用户只保留密钥 | S:普通用户只能看到自己的密钥，权限判断不能用页签名代替
-AccountSettings.tsx[AU7T]: F:「我的账号」自助改密页 | R:code:web/src/password.ts,code:web/src/api.ts | A:校验新密码强度与两次输入一致，成功后清 token、置 me 为空并跳 /login?redirect=/account | S:改密后必须清本地会话，留着旧 token 会让下一次请求 401 而不是引导重新登录
-Models.tsx[AU7M]: F:模型清单只读页：按上游分组展示容量、价格与思考配置 | R:code:web/src/modelPrice.ts,code:web/src/types.ts | A:价格与元信息先转 Map 避免平行数组错位；空清单给出明确说明；缓存命中列为输入的子集 | S:空清单不能写成「不限制」，它表示当前用户没有可用模型
+AccessControl.tsx[AU8T]: F:访问控制宿主页：管理员在 /users 看用户与权限分组，密钥独立在 /keys | R:code:web/src/router.tsx,code:web/src/ui/nav.ts | A:keys 直接渲染 Keys；管理员只显示用户与权限分组两个页签；标题按当前页签而不是角色 | S:密钥不再是 /users 下的页签，侧栏、路由与 h1 必须各自与当前地址一致；普通用户只能看到自己的密钥
+AccountSettings.tsx[AU7T]: F:「我的账号」自助改密页 | R:code:web/src/password.ts,code:web/src/api.ts,code:web/src/ui/SectionCard.tsx | A:当前密码 + 新密码 + 确认新密码三段表单；提交前校验强度与一致性，成功后清空本地 token 与会话并跳登录页，留 redirect=/account | S:改密后必须清本地会话；服务端已递增 auth_version，留旧 token 会让下一次请求 401 而不是引导重新登录
+Models.tsx[AU7M]: F:只读展示按身份收窄的可用模型、三档参考单价及输入与输出单价对比 | R:code:web/src/modelPrice.ts,code:web/src/types.ts,code:web/src/ui/chart.tsx | A:价格与元信息按模型名映射；可搜模型或供应商、复制模型名；图只比较搜索结果中输出价最高的十项，输出柱与提示点统一用费用色 | S:空清单表示无可调用模型；缓存命中价为零表示沿用输入价；输入与输出价都已配置才入图，避免把未配置显示成免费
 Networks.tsx[AU7M]: F:出站网络管理页（loader 版本） | R:code:web/src/useNetworks.ts,code:web/src/pages/Providers.tsx | A:loader 失败返回 networks 空数组与 error 而不抛错；直连不是一条记录；删除网络只让引用它的上游回退直连 | S:直连不在 networks 表里，把它当记录渲染会造出一条删不掉的假网络
-Overview.tsx[AU9M]: F:网关总览：七项区间指标加一张按天趋势图 | R:code:web/src/usageSeries.ts,code:web/src/types.ts | A:请求数、Token、成功率、缓存命中率、TPS、首字延迟、生成耗时；区间统一走 range.ts；样本为 0 显示「—」 | S:成功率分母是成功加失败，取消不计；首字与生成耗时必须分开，合成一个数就分不清慢在等字还是慢在吐字
-ProviderDetail.tsx[AU9L]: F:单个上游详情页：承接全部子资源写操作 | R:code:web/src/pages/Providers.tsx,code:web/src/components/UpstreamModelPanel.tsx | A:概览卡、凭据面板与模型面板；换钥、导入删除模型、改设置都在本页，列表页不发子资源请求 | S:404 与 401 必须分开处理：上游已删除应回列表，只有未登录才跳登录
-Providers.tsx[AU9L]: F:上游服务列表页：搜索、状态筛选、新建与行内启停删除 | R:code:web/src/pages/ProviderDetail.tsx,code:web/src/useNetworks.ts | A:列表只取摘要；协议探测结果单独展示；删除走统一确认框；进入详情跳 /providers/:id | S:列表页不得顺手拉凭据或模型，否则十几个上游会放大成几十个请求
-Routes.tsx[AU9L]: F:模型与路由页：公开模型名到有序上游目标链 | R:code:web/src/types.ts,code:web/src/api.ts | A:列表加筛选（全部、启用、停用、故障转移）与行内开关；编辑弹窗整条链替换保存 | S:保存必须整链替换，按目标增量提交会让被删掉的目标继续残留在链上
-Settings.tsx[AU8L]: F:管理员系统设置：站点、模型默认、运行时、模型价格四页签 | R:code:web/src/generated/defaults.ts,code:web/src/api.ts | A:每页签独立取数与保存；运行时按非流式、流式、故障转移分组；改价只影响此后用量 | S:审计日志页签已移除，不要再加读取入口；改价不回溯历史费用，历史金额在落库时已固化
-UsageDetail.tsx[AU8L]: F:调用日志页（/history）：筛选、分页与详情抽屉 | R:code:web/src/routeTrace.ts,code:web/src/components/UsageDetailDrawer.tsx | A:查询状态全部放 URL（status/model/key/user/page/size），输入框只存草稿；导出 CSV 复用已应用条件 | S:请求条件必须以 URL 为准，用草稿发请求会让翻页丢掉尚未提交的筛选
-UsageStats.tsx[AU7S]: F:用量统计页，/history 与 /usage 共用同一组件 | R:code:web/src/pages/UsageDetail.tsx,code:web/src/ui/usePersistedState.ts | A:tab 与 days 存 URL；days 偏好按页面分开（history.days 默认 7、usage.days 默认 1）；切 days 清 page；取数函数保持模块级稳定引用 | S:days 偏好不能共用一份，否则看日志与看统计会互相改掉对方的时间窗
-Wallet.tsx[AU8M]: F:钱包页：管理员看消费汇总加充值记录，普通用户看消耗记录加充值记录 | R:code:web/src/userDisplay.ts,code:web/src/types.ts | A:stats(0, now) 取全部历史；上限 100 用户、90 天用量、50 条充值；余额优先读 stats、me 仅作回退；reqSeq 与 topupSeq 防旧响应覆盖 | S:拿不到 stats 时不得渲染任何金额，用 0 兜底会被读成余额为零
+Overview.tsx[AU9L]: F:网关总览：趋势优先的监控首页，把可切换主曲线、结果环、性能/缓存与费用去向收在一屏 | R:code:web/src/usageSeries.ts,code:web/src/ui/chart.tsx,code:web/src/range.ts | A:一张主图可切 Token/请求/费用/成功率/速度；右侧成功/失败/取消环与趋势图同高；下方首字 vs 生成耗时、缓存命中、费用最高的模型排行；底部统一 StatStrip；费用用 cost 金色、速度用 info 蓝色；点击时间桶带真实 from/to 进 /history | S:成功率分母是成功+失败，取消不计；图表点击必须传桶的 startTs/endTs 而不是从标签反解；cost_pending_count>0 时必须提示区间费用被低估；首字与生成耗时不能合并
+ProviderDetail.tsx[AU9L]: F:单个上游详情页：概览、凭据与模型三块自上而下平铺，并承接全部子资源写操作 | R:code:web/src/components/CredentialPanel.tsx,code:web/src/components/UpstreamModelPanel.tsx,code:web/src/components/provider/ProviderEditModal.tsx | A:概览卡、凭据面板、模型面板各自独立加载与报错；支持换钥、导入/删除模型、测试模型、改设置；?model= 深链打开对应模型弹窗后抹掉参数 | S:404 与 401 必须分开处理：上游已删除应回列表，只有未登录才跳登录；三块不能再并排，520px 凭据表塞进半栏会切掉操作列
+Providers.tsx[AU9L]: F:上游服务列表页：搜索、状态筛选、新建与行内启停删除 | R:code:web/src/pages/ProviderDetail.tsx,code:web/src/useNetworks.ts | A:固定 5 列：上游/Endpoint（下行补协议与模型/凭据数）、网络状态、凭据状态、操作、启用；列表只取摘要；q/status 在 URL，搜索 200ms 防抖回写；删除走统一确认框 | S:列表页不得拉凭据或模型；1100px 下保持 5 列，否则操作与启用被挤出视口
+Routes.tsx[AU9L]: F:路由页：公开模型名到有序上游目标链的列表与编辑 | R:code:web/src/types.ts,code:web/src/api.ts,code:web/src/ui/AppModal.tsx | A:列表筛选（全部/启用/停用/故障转移）与行内开关；编辑弹窗整条链替换保存；支持 ?model= 预填链首；搜索条件存 URL | S:保存必须整链替换，按目标增量提交会让被删掉的目标继续残留在链上；空白目标行不能报「上游不存在」
+Settings.tsx[AU8L]: F:管理员系统设置：站点、模型默认、运行时、模型价格四页签 | R:code:web/src/generated/defaults.ts,code:web/src/api.ts,code:web/src/components/PriceSettings.tsx | A:每页签独立取数与保存；运行时按非流式、流式、故障转移分组并可恢复推荐值；模型价格按供应商乘模型维护；改价只影响此后用量 | S:审计日志与独立管理密码页签已移除，不要再加回；改价不回溯历史费用，历史金额在落库时已固化
+UsageDetail.tsx[AU8L]: F:调用日志页（/history）：筛选、分页、详情抽屉与 CSV 导出 | R:code:web/src/routeTrace.ts,code:web/src/components/UsageDetailDrawer.tsx,code:web/src/range.ts | A:查询状态全部放 URL；输入框只存草稿；支持总览传绝对 from/to 时间窗，导出同窗；时间拆日期/时分两行、状态与 HTTP 码上下排；1105px 下 8 列不溢出 | S:查询条件以 URL 为准；绝对时间窗与 days 不能混用；宽列按 1280/1440/1536 追加，窄表靠 px-2.5 与固定列宽保底
+UsageStats.tsx[AU7S]: F:用量与调用日志的共用壳：按路径决定渲染汇总页签或逐条日志 | R:code:web/src/pages/UsageDetail.tsx,code:web/src/ui/usePersistedState.ts | A:tab 与 days 存 URL；days 偏好按页面分开（history.days 默认 7、usage.days 默认 1）；日志页接受 from/to 绝对时间窗并禁用天数按钮；切 days 清 page 与 span | S:绝对时间窗只能由日志页消费；若汇总页也接受 from/to，会出现页头写某天、表格却按近 N 天统计的静默错位
+Wallet.tsx[AU8M]: F:钱包页：管理员看全站消费概览与充值流水，普通用户看余额、按天消耗与充值 | R:code:web/src/components/wallet/WalletTables.tsx,code:web/src/types.ts,code:web/src/range.ts | A:stats(0, now) 取全部历史；普通用户另取 90 天 by-day；充值流水懒加载、上限 50 条；余额优先读 stats、me 仅作回退；reqSeq 与 topupSeq 防旧响应覆盖 | S:拿不到 stats 时不得渲染任何金额，用 0 兜底会被读成余额为零；管理员不再渲染按用户消费表，拆解统一到 /usage?tab=users
 
 ===/<repository>/web/src/ui/===
 AppDrawer.tsx[CU7T]: F:右侧抽屉容器 | R:code:web/src/ui/AppModal.tsx | A:宽度写在 Drawer.Dialog 的 style 上（width 100%、maxWidth 680） | S:宽度加到 Drawer.Content 会把面板推到左中，而不是限制抽屉宽度
 AppModal.tsx[CU7T]: F:受控弹窗外壳 | R:code:web/src/ui/ConfirmDialog.tsx | A:dismissable 为 false 时 Esc 与遮罩都不关闭；高度用 min(92vh, …) 约束 | S:表单弹窗必须关掉 dismissable，误点遮罩会丢掉未保存内容
 AppRoot.tsx[EU8T]: F:应用根：会话监听、文档标题与登录壳切换 | R:code:web/src/router.tsx,code:web/src/ui/Shell.tsx | A:useDocumentTitle 按 ROLE_TITLES 覆写 /、/history、/wallet；useSessionExpiryWatcher 只在会话由非空变空时跳登录并带 redirect；登录页不套 Shell | S:必须只在会话从有到无时跳转，初次加载就跳会把登录页刷成循环
-BarChart.tsx[CU7T]: F:纯 div 柱状图，不引图表库 | R:code:web/src/usageSeries.ts,code:web/src/pages/Overview.tsx | A:非零柱至少 2% 高，分母最小取 1；标签抽稀但保留 invisible 占位；柱子多于 20 根改用短标签 | S:零值柱不能给最小高度，否则没有调用会被画成有小流量
 BrandMark.tsx[CU6T]: F:站点标识 | R:code:web/src/ui/branding.ts | A:有 LOGO 显示图片，否则显示站名首字方块；图片用 object-contain | S:必须 object-contain，cover 会把横版 LOGO 的两边裁掉
 ConfirmDialog.tsx[CU7T]: F:全局唯一确认对话框 | R:code:web/src/ui/confirm.ts | A:默认焦点落在取消；正文用 whitespace-pre-line 保留换行 | S:默认焦点必须是取消，回车误触不能直接执行删除
-DataTable.tsx[CU7T]: F:表格外壳：工具条、错误提示、加载骨架与空态 | R:code:web/src/ui/SkeletonBlock.tsx | A:已有数据时错误提示与上次结果并存；空态由数据算出 | S:空态必须由数据判断，请求进行中就显示暂无数据会让加载看起来像空结果
+DataTable.tsx[CU7T]: F:表格外壳：工具条、错误提示、加载骨架与空态 | R:code:web/src/ui/SkeletonBlock.tsx | A:已有数据时错误提示与上次结果并存；骨架行用 surface-secondary；空态由数据算出，并支持空态动作 | S:空态必须由数据判断，请求进行中就显示暂无数据会让加载看起来像空结果；刷新已有数据时保留旧表，不退回骨架
 FileImport.tsx[CU7T]: F:文件导入按钮，封装原生文件选择 | R:code:web/src/components/keys/CcPickerModal.tsx | A:选中后回调文件并清空 value；原生 file input 的两个门禁白名单只放行本文件 | S:onChange 后必须清 value，否则连续选择同一个文件不会再触发
 Login.tsx[EU8M]: F:登录页，四种互斥形态 | R:code:web/src/password.ts,code:web/src/ui/branding.ts | A:离线不渲染表单、引导接口失败只给重试、全新部署首次设密码、常规用户名加密码；品牌区先用默认站名再异步替换 | S:离线与降级不能合并成同一屏，前者是网关不可达，后者是引导接口读取失败
 PageFallback.tsx[CU5T]: F:路由懒加载的占位 | R:code:web/src/ui/Shell.tsx | A:居中 Spinner，作为 Suspense 的 fallback | S:只用于 Suspense，页面内加载态应该用 SkeletonBlock 而不是整屏转圈
-PageHeader.tsx[CU6T]: F:页面标题栏 | R:code:web/src/ui/SectionCard.tsx | A:标题、可选描述与右侧操作区共用一套间距 | S:标题只放一处，页面内容里不要再重复渲染同名标题
-SectionCard.tsx[CU6T]: F:内容分区卡片 | R:code:web/src/ui/PageHeader.tsx | A:标题、说明与右侧操作同排，内容区独立 | S:卡片标题层级固定，不要在同一块里再嵌一层同名卡片
-Shell.tsx[EU9M]: F:登录后的应用外壳：侧栏导航、主题切换与用户菜单 | R:code:web/src/ui/nav.ts,code:web/src/ui/AppRoot.tsx | A:按角色取 ADMIN_NAV 或 USER_NAV；折叠状态存 rosetta_gw_sidebar_collapsed；路由切换关闭移动端抽屉；Outlet 外包 Suspense | S:折叠状态的读写都要 try/catch，隐私模式下 localStorage 抛错不能让整个外壳白屏
+PageHeader.tsx[CU6T]: F:页面标题栏 | R:code:web/src/ui/SectionCard.tsx | A:统一 h1 为 text-xl + tracking-tight，标题、可选副标题与右侧操作在同一行并允许换行，底部留 24px 节奏 | S:标题只放一处，页面内容里不要再重复渲染同名标题；操作区可换行，窄屏不能把标题挤成竖排
+SectionCard.tsx[CU6T]: F:内容分区卡片：全站页面级「面」的统一壳 | R:code:web/src/ui/PageHeader.tsx,code:web/src/theme.css | A:卡片固定 rounded-2xl + border-separator + shadow-none；标题、说明与右侧操作同排并允许换行，内容区独立 | S:卡片标题层级固定，不要在同一块里再嵌一层同名卡片；投影只留给浮层与移动端抽屉
+Shell.tsx[EU9M]: F:登录后的应用外壳，提供分角色导航、主题切换和账号菜单 | R:code:web/src/ui/nav.ts,code:web/src/ui/AppRoot.tsx,code:web/src/theme.css | A:按角色选择导航，侧栏折叠状态持久化；广宽页面按路由声明放宽，路径变化时将内容区滚回顶部并收起窄屏抽屉 | S:持久化读写失败不应让外壳白屏；登出请求失败保留本地会话，避免仍有效的服务端令牌被误认为已撤销
 SkeletonBlock.tsx[CU5T]: F:加载骨架块 | R:code:web/src/ui/DataTable.tsx | A:按行数渲染等宽灰条，宽度可配 | S:骨架只用于首屏占位，刷新已有数据时应保留旧表而不是退回骨架
 StatusChip.tsx[CU6T]: F:状态徽章 | R:code:web/src/effortTone.ts | A:按 tone 取色（ok、warn、err、info、dim），文本可截断 | S:未知状态回落 dim，不能借用成功色把未知当成正常
 TokenField.tsx[CU6T]: F:token 容量输入框 | R:code:web/src/tokenCount.ts | A:展示人类可读值，提交前用 tokenCount 解析，非法输入就地报错 | S:空输入表示未配置，不能当成 0 提交
 branding.ts[CG7T]: F:站点品牌（站名与 LOGO）的三态 store | R:code:web/src/ui/BrandMark.tsx,code:web/src/ui/Login.tsx | A:loadBranding 合并并发请求；失败回落 DEFAULT_SITE_NAME 为 Rosetta Gateway 并置 loaded | S:失败后也要置 loaded=true，否则每次订阅都会重新请求，登录页会打爆公开端点
 confirm.ts[CU6T]: F:Promise 式确认框入口 | R:code:web/src/ui/ConfirmDialog.tsx | A:同一时刻只允许一个确认；新请求先把旧的 resolve(false) 再接管 | S:新请求必须先结束旧 Promise，否则旧的调用方会永久挂起
-nav.ts[CU6T]: F:侧栏导航配置 | R:code:web/src/router.tsx,code:web/src/ui/Shell.tsx | A:管理员两组（常用、管理配置），普通用户一组「我的工作台」 | S:导航项必须与路由守卫的权限一致，露出无权访问的入口只会换来 403
+nav.ts[CU6T]: F:侧栏导航配置 | R:code:web/src/router.tsx,code:web/src/ui/Shell.tsx | A:管理员四组（监控、接入、访问与计费、系统），共十一项，接入组含可用模型；普通用户一组「我的工作台」六项，含用量与费用 | S:导航必须与路由守卫权限一致；/keys 与 /users 高亮跟当前地址走
 theme.ts[CU7T]: F:主题三态 store（dark、light、system） | R:code:web/src/theme.css,code:web/src/ui/Shell.tsx | A:THEME_KEY 为 rosetta_gw_theme，与 theme-init.js 同步；用户选择即固化，system 跟随媒体查询 | S:首屏主题必须由内联 theme-init.js 先写 data-theme，等 React 挂载再切会闪白
 usePersistedState.ts[CU7T]: F:URL 优先、localStorage 兜底的偏好状态 | R:code:web/src/pages/UsageStats.tsx | A:键前缀 rosetta.pref.；读取时校验类型，非法值回落默认；URL 参数优先于本地偏好；读写都 try/catch | S:URL 必须优先于本地偏好，否则分享出去的筛选链接会被本机旧偏好覆盖
+chart.tsx[CU7T]: F:Recharts 的全站主题封装：语义色、提示框、空态与占比文案 | R:code:web/src/theme.css,code:web/src/pages/Overview.tsx,code:web/src/components/wallet/WalletTables.tsx | A:CHART_COLORS 全读 CSS 变量，含 accent/success/warning/danger/cost/info/muted/separator；ChartTooltipBox 固定浮层样式；TooltipRow 统一标签与数值；ChartEmpty 统一空态；chartShade 做同一主色的透明度阶梯；shareText 处理 <0.1% 与 0 分母 | S:颜色只用 CSS 语义变量；金额用 cost，速度用 info
+StatStrip.tsx[CU6T]: F:跨页复用的页面级读数带：标签、数值、提示与状态色 | R:code:web/src/pages/Overview.tsx,code:web/src/components/UsageByGroup.tsx,code:web/src/components/UsageByUser.tsx | A:一条带 + 细分隔线，2 列在窄屏、4 列在 md 以上；支持 loading 与 ariaLabel；warning/danger 只染数值 | S:读数带只放区间合计，页面别另写一套胶囊合计

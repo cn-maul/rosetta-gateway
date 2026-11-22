@@ -192,7 +192,7 @@ export function BatchPriceModal({
         <div className="flex flex-col gap-1">
           <span className="text-[13px] font-medium">目标模型（已选 {selectedModels.length} 个）</span>
           <div className="overflow-hidden rounded-lg border border-separator">
-            <div className="bg-background-secondary flex flex-wrap items-center gap-1.5 border-b border-separator p-2">
+            <div className="bg-surface-secondary flex flex-wrap items-center gap-1.5 border-b border-separator p-2">
               <ProviderSelect providers={providers} value={provider} onChange={setProvider} ariaLabel="批量目标供应商" className="w-[150px]" />
               <TextField aria-label="搜索模型" value={search} onChange={setSearch} className="min-w-[140px] flex-1">
                 <Input placeholder="搜索模型…" autoComplete="off" />
@@ -229,7 +229,7 @@ export function BatchPriceModal({
               {targets.length === 0 ? <div className="text-muted px-2.5 py-2 text-xs">没有匹配的模型</div> : null}
             </div>
             {hiddenCount > 0 ? (
-              <div className="bg-background-secondary flex items-center justify-between gap-2 border-t border-separator px-2.5 py-1.5 text-[11px] text-muted">
+              <div className="bg-surface-secondary flex items-center justify-between gap-2 border-t border-separator px-2.5 py-1.5 text-[11px] text-muted">
                 <span>还有 {hiddenCount} 个模型未显示 —— 继续筛选缩小范围，或分批渲染</span>
                 <Button variant="tertiary" size="sm" onPress={() => setRenderCap((c) => c + BATCH_RENDER_CAP_STEP)}>
                   显示更多

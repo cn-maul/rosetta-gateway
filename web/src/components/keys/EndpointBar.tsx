@@ -17,7 +17,7 @@ export function EndpointBar({ action }: { action?: React.ReactNode }) {
   }
 
   return (
-    <div className="border-separator bg-background-secondary mb-3.5 flex flex-wrap items-center gap-2 rounded-xl border px-3 py-2">
+    <div className="border-separator bg-surface-secondary mb-3.5 flex flex-wrap items-center gap-2 rounded-xl border px-3 py-2">
       <span className="text-muted text-xs">Base URL</span>
       <code className="min-w-0 flex-1 truncate font-mono text-[12.5px]" title={endpoint}>
         {endpoint}

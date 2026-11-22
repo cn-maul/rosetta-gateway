@@ -1,13 +1,15 @@
 import { useNavigate } from 'react-router-dom'
 import { Button, Spinner, Table } from '@heroui/react'
+import { Bar, BarChart, CartesianGrid, ResponsiveContainer, Tooltip, XAxis, YAxis } from 'recharts'
 import { DataTable } from '../../ui/DataTable'
 import { StatusChip } from '../../ui/StatusChip'
 import { fmtNum, fmtTokens, fmtMoney, fmtTimeMs } from '../../fmt'
-import type { TopupRecord, UsageByUserEntry, UsageGroupEntry } from '../../types'
-import { userRowName, userRowTag } from '../../userDisplay'
+import type { TopupRecord, UsageGroupEntry } from '../../types'
+import { CHART_COLORS, ChartTooltipBox, TooltipRow } from '../../ui/chart'
+import { buildUsageSeries, type UsageBucket } from '../../usageSeries'
 
 const softError = (text: string) => (
-  <p className="bg-warning-soft text-warning-soft mb-3.5 rounded-md px-2.5 py-2 text-[12.5px]" role="alert">
+  <p className="bg-warning-soft text-warning-soft-foreground mb-3.5 rounded-lg px-3 py-2 text-[12.5px]" role="alert">
     {text}
   </p>
 )
@@ -33,99 +35,115 @@ function GotoHistoryLink() {
   )
 }
 
-/** 管理员的消费汇总（一行一个用户）。这张表失败不替换整块：顶部汇总卡
- * 可能已经渲染出来了，所以错误以提示条出现在表格位置。 */
-export function ByUserTable({
-  byUser,
-  byUserTotal,
-  error,
-  loading,
+/**
+ * 普通用户的消费趋势：钱包页原本只有一张表，看不到「哪段花得多」。
+ * 与总览共用同一套补零与合并规则：90 天窗口按周合并（13 根），缺失的桶
+ * 补 0；逐日精确值仍由下面的表格给。图例标题按实际桶宽写，不能让
+ * 「每日」的标题配一根整周合计的柱子。
+ */
+function DayCostChart({ byDay, days }: { byDay: UsageGroupEntry[]; days: number }) {
+  const rows = buildUsageSeries({ byDay, days, firstRecordAt: 0 })
+  const max = rows.reduce((m, r) => Math.max(m, r.cost), 0)
+  const unit = days > 31 ? '按周' : '每日'
+  if (max <= 0) return null
+  return (
+    <div className="border-separator bg-surface-secondary mb-4 rounded-2xl border p-3.5">
+      <div className="text-muted mb-1 flex items-center justify-between text-[11.5px]">
+        <span>{unit}消耗</span>
+        <span>最高 ¥{fmtMoney(max)}</span>
+      </div>
+      <div className="h-[180px]" role="img" aria-label={`${unit}消耗趋势`}>
+        <ResponsiveContainer width="100%" height="100%">
+          <BarChart data={rows} margin={{ top: 8, right: 4, bottom: 0, left: 2 }}>
+            <CartesianGrid stroke={CHART_COLORS.grid} strokeDasharray="3 5" vertical={false} />
+            <XAxis
+              dataKey="key"
+              tick={{ fill: CHART_COLORS.muted, fontSize: 10 }}
+              axisLine={{ stroke: CHART_COLORS.grid }}
+              tickLine={false}
+              minTickGap={28}
+              tickFormatter={(v: string) => rows.find((r) => r.key === v)?.labFull ?? v.slice(5)}
+            />
+            <YAxis
+              tick={{ fill: CHART_COLORS.muted, fontSize: 10 }}
+              axisLine={false}
+              tickLine={false}
+              width={46}
+              tickFormatter={(v: number) => `¥${fmtMoney(v)}`}
+            />
+            <Tooltip
+              cursor={{ fill: CHART_COLORS.accentSoft }}
+              content={({ active, payload, label }) => {
+                if (!active || !payload?.length) return null
+                const row = payload[0].payload as UsageBucket
+                return (
+                  <ChartTooltipBox title={row.tip}>
+                    <TooltipRow label="费用" value={row.cost > 0 ? `¥${fmtMoney(row.cost)}` : '—'} />
+                    <TooltipRow label="请求" value={fmtNum(row.count)} />
+                    <TooltipRow label="Token" value={fmtTokens(row.tokens)} />
+                  </ChartTooltipBox>
+                )
+              }}
+            />
+            <Bar dataKey="cost" fill={CHART_COLORS.accent} radius={[3, 3, 0, 0]} maxBarSize={10} />
+          </BarChart>
+        </ResponsiveContainer>
+      </div>
+    </div>
+  )
+}
+
+/**
+ * 管理员的「消费去向」入口。
+ *
+ * 这里原本是一张和「用量与费用 → 按用户」完全同源的汇总表：同样的区间、
+ * 同样的字段、同样的用户顺序，只是少了几列筛选。两处并存时，读账的人会
+ * 在两份数字之间来回核对，却无法从钱包页回答「这个月钱花在谁身上」之外的
+ * 任何问题。钱包页保留余额、充值与流水的职责；分析动线交给用量页。
+ */
+export function SpendOverviewCard({
+  totalCost,
   totalCalls,
-  errorCount,
   totalTokens,
 }: {
-  byUser: UsageByUserEntry[]
-  byUserTotal: number
-  error: string
-  loading: boolean
+  totalCost: number
   totalCalls: number
-  errorCount: number
   totalTokens: number
 }) {
-  const truncated = byUserTotal > byUser.length
-  // 未截断时本表合计必须与顶部「用户消费金额」相等（同一区间、同一固化口径）。
-  const sum = byUser.reduce((a, r) => a + r.cost, 0)
+  const navigate = useNavigate()
   return (
-    <div>
-      <div className="text-muted mb-3.5 text-[12.5px]">消费汇总 · 全部历史 · 一行一个用户</div>
-      {loading ? (
-        <Spinner role="status">加载中…</Spinner>
-      ) : error ? (
-        softError(error)
-      ) : byUser.length === 0 ? (
-        emptyBox(
-          '暂无消费记录',
-          '「全部历史」区间内还没有任何用户的用量记录。若总览页显示有流量，说明这里的加载出了问题而不是真的没有数据 —— 请用上方「刷新」重试。',
-        )
-      ) : (
-        <>
-          <DataTable label="账户账单" loading={loading} hasData={true}>
-            <Table>
-              <Table.ScrollContainer>
-                <Table.Content aria-label="账户账单">
-                  <Table.Header>
-                    <Table.Column isRowHeader>用户</Table.Column>
-                    <Table.Column className="text-right">总消费</Table.Column>
-                    <Table.Column className="text-right">调用次数</Table.Column>
-                    <Table.Column className="text-right">Token</Table.Column>
-                  </Table.Header>
-                  <Table.Body>
-                    {byUser.map((r) => {
-                      const tag = userRowTag(r)
-                      return (
-                        <Table.Row key={r.key || '__orphan__'}>
-                          <Table.Cell>
-                            <span className={!r.user_name ? 'font-mono' : ''}>{userRowName(r)}</span>
-                            {tag ? (
-                              <span className="ml-1.5">
-                                <StatusChip tone={tag.tone}>{tag.text}</StatusChip>
-                              </span>
-                            ) : null}
-                          </Table.Cell>
-                          {/* 高精度档：两位小数会把小额整列显示成 0.00。 */}
-                          <Table.Cell className="text-right tabular-nums">
-                            {r.cost > 0 ? '¥' + fmtMoney(r.cost) : '—'}
-                          </Table.Cell>
-                          <Table.Cell className="text-right tabular-nums">{fmtNum(r.count)}</Table.Cell>
-                          <Table.Cell className="text-right tabular-nums">{fmtTokens(r.tokens)}</Table.Cell>
-                        </Table.Row>
-                      )
-                    })}
-                  </Table.Body>
-                </Table.Content>
-              </Table.ScrollContainer>
-            </Table>
-          </DataTable>
-          {truncated ? (
-            <p className="bg-warning-soft text-warning-soft mt-3.5 rounded-md px-2.5 py-2 text-[12.5px]" role="alert">
-              共 {fmtNum(byUserTotal)} 位用户有消费，这里只显示消费最高的 {fmtNum(byUser.length)}{' '}
-              位。要看某位用户的逐条明细，请到「调用历史」页按密钥或模型过滤。
-            </p>
-          ) : null}
-          <div className="text-muted mt-3.5 max-w-[46em] text-[12.5px] leading-relaxed">
-            口径：<strong className="text-foreground">全部历史</strong>
-            的按用户汇总，明细已按天归档合并，30 天明细被清理后这些数字也不会缩水。费用是每条用量
-            <strong className="text-foreground">落库当时</strong>按模型单价算好后固化的，改价不会改写历史。
-            <br />
-            本表合计<strong className="text-foreground">¥{fmtMoney(sum)}</strong>
-            {truncated
-              ? '（仅含上表所示用户，因此小于上方「用户消费金额」）。'
-              : '（与上方「用户消费金额」应当一致；不一致说明有一侧读取失败）。'}
-            全站 {fmtNum(totalCalls)} 次调用、{fmtTokens(totalTokens)} token，失败 {fmtNum(errorCount)} 次。
+    <div className="border-separator bg-surface-secondary rounded-2xl border p-5">
+      <div className="flex flex-wrap items-start justify-between gap-4">
+        <div className="grid min-w-0 gap-4 sm:grid-cols-3">
+          <div>
+            <div className="text-muted text-[12px]">全部历史消费</div>
+            <div className="mt-1 text-[28px] leading-tight font-semibold tabular-nums">¥{fmtMoney(totalCost)}</div>
+            <div className="text-muted mt-1 text-[12px]">按落库金额固化</div>
           </div>
-          <GotoHistoryLink />
-        </>
-      )}
+          <div>
+            <div className="text-muted text-[12px]">Token 消耗</div>
+            <div className="mt-1 text-[20px] leading-tight font-semibold tabular-nums">{fmtTokens(totalTokens)}</div>
+            <div className="text-muted mt-1 text-[12px]">输入 + 输出 + 缓存</div>
+          </div>
+          <div>
+            <div className="text-muted text-[12px]">调用次数</div>
+            <div className="mt-1 text-[20px] leading-tight font-semibold tabular-nums">{fmtNum(totalCalls)}</div>
+            <div className="text-muted mt-1 text-[12px]">全部历史</div>
+          </div>
+        </div>
+        <div className="flex flex-wrap gap-2">
+          <Button variant="primary" size="sm" onPress={() => void navigate('/usage?tab=users')}>
+            按用户查看用量
+          </Button>
+          <Button variant="secondary" size="sm" onPress={() => void navigate('/history')}>
+            逐条调用日志
+          </Button>
+        </div>
+      </div>
+      <p className="text-muted mt-3 max-w-[52em] text-[12px] leading-relaxed">
+        钱包页只负责余额、充值与流水；按用户、按模型、按上游的拆解在「用量与费用」里，
+        那里还能切换近 1 / 7 / 30 天并看到成功率与性能。
+      </p>
     </div>
   )
 }
@@ -163,6 +181,7 @@ export function ByDayTable({
         emptyBox(`近 ${days} 天没有消耗记录`)
       ) : (
         <>
+          <DayCostChart byDay={byDay} days={days} />
           <DataTable label="账户账单" loading={loading} hasData={true}>
             <Table>
               <Table.ScrollContainer>
@@ -224,7 +243,7 @@ export function TopupTable({
   return (
     <div>
       <div className="text-muted mb-3.5 text-[12.5px]">
-        充值记录 · {admin ? `全部用户 · 最近 ${topups.length} 条` : `最近 ${topups.length} 条`}
+        {admin ? `全部用户 · 最近 ${topups.length} 条` : `最近 ${topups.length} 条`}
       </div>
       {loading ? (
         <Spinner role="status">加载中…</Spinner>

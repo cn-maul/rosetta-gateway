@@ -2,18 +2,19 @@ import { useEffect, useRef, useState, useSyncExternalStore } from 'react'
 import { Alert, Button, Spinner, Tabs, toast } from '@heroui/react'
 import { api, ApiFail, isAdmin, session } from '../api'
 import { PageHeader } from '../ui/PageHeader'
-import { ByDayTable, ByUserTable, TopupTable } from '../components/wallet/WalletTables'
+import { SectionCard } from '../ui/SectionCard'
+import { ByDayTable, SpendOverviewCard, TopupTable } from '../components/wallet/WalletTables'
 import { TopupModal } from '../components/wallet/TopupModal'
 import { fmtNum, fmtTokens, fmtBalance, fmtRemainder, fmtMoney } from '../fmt'
 import { rangeStart } from '../range'
-import type { Stats, TopupRecord, UsageByUserEntry, UsageGroupEntry } from '../types'
+import type { Stats, TopupRecord, UsageGroupEntry } from '../types'
 
 /**
  * 钱包与充值：按身份分两种形态的同一页。
  *
  * 管理员账户不再有余额语义 —— 不建 key、不调 API、被禁止给自己充值。
- * 所以管理员进来这一页看的是「别人」的钱：全站消费汇总 + 充值流水 + 充值入口，
- * 刻意没有消耗明细（明细在「调用历史」页，那里才有过滤与 CSV 导出）。
+ * 所以管理员进来这一页看的是「别人」的钱：全站消费概览 + 充值流水 + 充值入口，
+ * 刻意不再重复一张按用户汇总表（拆解在「用量与费用 → 按用户」，明细在「调用日志」）。
  * 普通用户看的是「我的钱」：余额、按天消耗、自己的充值记录。
  */
 export function Wallet() {
@@ -35,14 +36,6 @@ export function Wallet() {
   const [topupLoadErr, setTopupLoadErr] = useState('')
   const [topupsLoading, setTopupsLoading] = useState(true)
   const topupsLoadedRef = useRef(false)
-  // 按用户汇总的消费（仅管理员）。
-  const [byUser, setByUser] = useState<UsageByUserEntry[]>([])
-  const [byUserTotal, setByUserTotal] = useState(0)
-  const [byUserErr, setByUserErr] = useState('')
-
-  // 消费汇总一次拉 100（后端 clampLimit 默认值）：这张表是给人读的，
-  // 超出不静默截断，表尾会显式说明。
-  const BY_USER_LIMIT = 100
   // 按天消耗窗口 90 天：按天一行后 15 天太少，「30 天以前的钱不出现」会让
   // 用户对不上账时以为没扣钱。rangeStart 走本地自然日 0 点，与后端
   // dayExpr（localtime）同口径。
@@ -50,7 +43,8 @@ export function Wallet() {
   // 充值流水取 50（后端 ListTopups 默认值）：低频事件，不做分页控件。
   const TOPUP_LIMIT = 50
 
-  // 页签：普通用户「消耗记录」，管理员「消费汇总」。管理员刻意没有明细格。
+  // 页签只给普通用户（消耗 / 充值）。管理员页不再分页签：概览、消费去向、
+  // 充值流水是一条账务动线，拆成页签反而要多点一次才能核对。
   const [tab, setTab] = useState<'usage' | 'topup'>('usage')
 
   // ---------- 管理员充值弹窗 ----------
@@ -64,14 +58,13 @@ export function Wallet() {
     const seq = ++reqSeq.current
     setLoading(true)
     setErr('')
-    setByUserErr('')
     setByDayErr('')
     try {
-      // now 只取一次：顶部汇总卡（stats）与按用户的表（by-user）是同一区间的
-      // 两种视图，各调一次 Date.now() 会差几毫秒，造成自己造出来的「对不上」。
+      // now 只取一次：顶部汇总卡与按天消耗是同一区间的两种视图，各调一次
+      // Date.now() 会差几毫秒，造成自己造出来的「对不上」。
       const now = Date.now()
       const dayFrom = rangeStart(USAGE_DAYS, now)
-      const [s, d, bu] = await Promise.all([
+      const [s, d] = await Promise.all([
         // stats 传 (0, now) 即「全部历史」：费用是落库当时固化的 cost_total
         // 再求和，改价不改写历史；且后端合并了日归档，明细被剪掉后不缩水。
         api.stats(0, now),
@@ -81,12 +74,6 @@ export function Wallet() {
           : api
               .usageByDay(dayFrom, now)
               .then((r) => ({ ok: true as const, r }), (e: unknown) => ({ ok: false as const, e })),
-        // 仅管理员：普通用户打这个端点必然 403，不能无条件发。
-        admin
-          ? api
-              .usageByUser(0, now, BY_USER_LIMIT)
-              .then((r) => ({ ok: true as const, r }), (e: unknown) => ({ ok: false as const, e }))
-          : Promise.resolve(null),
       ])
       if (seq !== reqSeq.current) return
       setStats(s)
@@ -98,17 +85,6 @@ export function Wallet() {
       } else {
         setByDay([])
         setByDayErr(d.e instanceof Error ? '消耗记录加载失败：' + d.e.message : '消耗记录加载失败')
-      }
-      if (bu === null) {
-        setByUser([])
-        setByUserTotal(0)
-      } else if (bu.ok) {
-        setByUser(bu.r.records)
-        setByUserTotal(bu.r.total)
-      } else {
-        setByUser([])
-        setByUserTotal(0)
-        setByUserErr(bu.e instanceof Error ? '消费汇总加载失败：' + bu.e.message : '消费汇总加载失败')
       }
     } catch (e) {
       if (seq !== reqSeq.current) return
@@ -152,9 +128,10 @@ export function Wallet() {
 
   // 充值页签懒加载：第一次进入才拉流水。
   useEffect(() => {
-    if (tab === 'topup' && !topupsLoadedRef.current) void loadTopups()
+    // 管理员没有页签，流水就在页面上，必须挂载即拉；普通用户仍按页签懒加载。
+    if ((admin || tab === 'topup') && !topupsLoadedRef.current) void loadTopups()
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [tab])
+  }, [admin, tab])
 
   // 充值成功：余额与汇总立刻重算；流水表只有用户已经看过才刷（没进过
   // 页签就保持「进入时再拉」，反正拉回来必然是最新数据）。
@@ -180,15 +157,10 @@ export function Wallet() {
   // 0 次调用时不能算均次 —— 会得到除零。
   const avgCost = totalCalls > 0 ? totalCost / totalCalls : 0
 
-  const tabs = admin
-    ? [
-        { key: 'usage', label: '消费汇总' },
-        { key: 'topup', label: '充值记录' },
-      ]
-    : [
-        { key: 'usage', label: '消耗记录' },
-        { key: 'topup', label: '充值记录' },
-      ]
+  const tabs = [
+    { key: 'usage', label: '消耗记录' },
+    { key: 'topup', label: '充值记录' },
+  ]
 
   return (
     <div>
@@ -231,31 +203,10 @@ export function Wallet() {
         </Alert>
       ) : (
         <>
-          {/* ---------- 顶部汇总卡：按身份两套，整块换掉而不是条件显示列 ---------- */}
-          {admin ? (
-            <div className="bg-default-soft mb-3.5 grid grid-cols-1 gap-5 rounded-xl p-6 md:grid-cols-[3fr_1fr_1fr]">
-              <div>
-                <div className="text-muted text-[12.5px]">用户消费金额</div>
-                <div className="my-1.5 text-[40px] leading-[1.15] font-semibold tabular-nums">
-                  ¥{fmtMoney(totalCost)}
-                </div>
-                <div className="text-muted text-[12px]">累计 · {fmtNum(totalCalls)} 次</div>
-              </div>
-              <div>
-                <div className="text-muted text-[12.5px]">Token 消耗</div>
-                <div className="my-1.5 text-[22px] leading-tight font-semibold tabular-nums">
-                  {fmtTokens(stats?.total_tokens ?? 0)}
-                </div>
-                <div className="text-muted text-[12px]">累计 · 输入 + 输出 + 缓存命中</div>
-              </div>
-              <div>
-                <div className="text-muted text-[12.5px]">调用次数</div>
-                <div className="my-1.5 text-[22px] leading-tight font-semibold tabular-nums">{fmtNum(totalCalls)}</div>
-                <div className="text-muted text-[12px]">累计</div>
-              </div>
-            </div>
-          ) : (
-            <div className="bg-default-soft mb-3.5 grid grid-cols-1 gap-5 rounded-xl p-6 md:grid-cols-[2fr_1fr_1fr]">
+          {/* ---------- 顶部汇总卡：普通用户看到的是自己的余额，
+              管理员直接进入「消费去向」卡（不再额外渲染一张同数汇总卡）。 ---------- */}
+          {admin ? null : (
+            <div className="mb-3.5 grid grid-cols-1 gap-5 rounded-2xl border border-separator bg-surface p-6 shadow-none md:grid-cols-[2fr_1fr_1fr]">
               <div>
                 <div className="text-muted text-[12.5px]">当前余额</div>
                 {/* 显示口径必须走 fmtBalance：unlimited 时它返回「不限」。
@@ -288,36 +239,43 @@ export function Wallet() {
             </div>
           )}
 
-          <Tabs
-            aria-label="钱包分区"
-            selectedKey={tab}
-            onSelectionChange={(key) => {
-              if (key !== null) setTab(String(key) as 'usage' | 'topup')
-            }}
-          >
-            <Tabs.ListContainer>
-              <Tabs.List>
-                {tabs.map((t) => (
-                  <Tabs.Tab key={t.key} id={t.key}>
-                    <Tabs.Indicator />
-                    {t.label}
-                  </Tabs.Tab>
-                ))}
-              </Tabs.List>
-            </Tabs.ListContainer>
-            <Tabs.Panel id={tab}>
-              {tab === 'usage' ? (
-                admin ? (
-                  <ByUserTable
-                    byUser={byUser}
-                    byUserTotal={byUserTotal}
-                    error={byUserErr}
-                    loading={loading}
-                    totalCalls={totalCalls}
-                    errorCount={stats?.error_count ?? 0}
-                    totalTokens={stats?.total_tokens ?? 0}
-                  />
-                ) : (
+          {admin ? (
+            <div className="flex flex-col gap-4">
+              <SpendOverviewCard
+                totalCost={totalCost}
+                totalCalls={totalCalls}
+                totalTokens={stats?.total_tokens ?? 0}
+              />
+              <SectionCard title="充值记录">
+                <TopupTable
+                  topups={topups}
+                  total={topupTotal}
+                  error={topupLoadErr}
+                  loading={topupsLoading}
+                  admin
+                />
+              </SectionCard>
+            </div>
+          ) : (
+            <Tabs
+              aria-label="钱包分区"
+              selectedKey={tab}
+              onSelectionChange={(key) => {
+                if (key !== null) setTab(String(key) as 'usage' | 'topup')
+              }}
+            >
+              <Tabs.ListContainer className="w-fit max-w-full">
+                <Tabs.List>
+                  {tabs.map((t) => (
+                    <Tabs.Tab key={t.key} id={t.key}>
+                      <Tabs.Indicator />
+                      {t.label}
+                    </Tabs.Tab>
+                  ))}
+                </Tabs.List>
+              </Tabs.ListContainer>
+              <Tabs.Panel id={tab}>
+                {tab === 'usage' ? (
                   <ByDayTable
                     byDay={byDay}
                     error={byDayErr}
@@ -327,18 +285,18 @@ export function Wallet() {
                     usedTokens={usedTokens}
                     quotaTokens={quotaTokens}
                   />
-                )
-              ) : (
-                <TopupTable
-                  topups={topups}
-                  total={topupTotal}
-                  error={topupLoadErr}
-                  loading={topupsLoading}
-                  admin={admin}
-                />
-              )}
-            </Tabs.Panel>
-          </Tabs>
+                ) : (
+                  <TopupTable
+                    topups={topups}
+                    total={topupTotal}
+                    error={topupLoadErr}
+                    loading={topupsLoading}
+                    admin={false}
+                  />
+                )}
+              </Tabs.Panel>
+            </Tabs>
+          )}
         </>
       )}
 

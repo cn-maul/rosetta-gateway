@@ -13,10 +13,10 @@ export function PageHeader({
   actions?: ReactNode
 }) {
   return (
-    <header className="mb-3.5 flex items-start justify-between gap-3.5">
+    <header className="mb-6 flex flex-wrap items-center justify-between gap-3.5">
       <div>
         {breadcrumb ? <div className="mb-1">{breadcrumb}</div> : null}
-        <h1 className="text-2xl font-semibold">{title}</h1>
+        <h1 className="text-xl font-semibold tracking-tight">{title}</h1>
         {sub ? <div className="text-muted mt-1 text-[12.5px]">{sub}</div> : null}
       </div>
       {actions ? <div className="flex flex-wrap items-center gap-2">{actions}</div> : null}

@@ -41,6 +41,7 @@ export const ADMIN_NAV: NavGroup[] = [
     items: [
       { to: '/providers', label: '供应商', icon: Server },
       { to: '/routes', label: '路由', icon: Route },
+      { to: '/models', label: '可用模型', icon: Box },
       { to: '/networks', label: '代理', icon: Globe },
     ],
   },

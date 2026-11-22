@@ -1,0 +1,1 @@
+import{d as e}from"./heroui-BXE9VyKp.js";import{t}from"./react-C-Ki0UBj.js";var n=t();function r({className:t=``}){return(0,n.jsx)(e,{className:`rounded-md bg-default-soft ${t}`,"aria-hidden":`true`})}export{r as t};

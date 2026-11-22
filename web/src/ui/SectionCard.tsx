@@ -12,10 +12,10 @@ interface SectionCardProps {
 export function SectionCard({ title, description, actions, children }: SectionCardProps) {
   const hasHead = title !== undefined || actions !== undefined
   return (
-    <Card>
+    <Card className="rounded-2xl border border-separator shadow-none">
       {hasHead ? (
         <Card.Header>
-          <div className="flex w-full items-start justify-between gap-3">
+          <div className="flex w-full flex-wrap items-center justify-between gap-3">
             <div>
               {title ? <Card.Title>{title}</Card.Title> : null}
               {description ? <Card.Description>{description}</Card.Description> : null}

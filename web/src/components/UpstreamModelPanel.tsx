@@ -1,6 +1,8 @@
 import { Button, Table } from '@heroui/react'
 import { Waypoints } from 'lucide-react'
+import { Bar, BarChart, CartesianGrid, Cell, ResponsiveContainer, Tooltip, XAxis, YAxis } from 'recharts'
 import { DataTable } from '../ui/DataTable'
+import { CHART_COLORS, ChartEmpty, ChartTooltipBox, TooltipRow } from '../ui/chart'
 import { StatusChip, type StatusTone } from '../ui/StatusChip'
 import { fmtSpeed, fmtSec, fmtPercent, fmtTokens } from '../fmt'
 import { unitPrice } from '../modelPrice'
@@ -20,11 +22,12 @@ import type { UpstreamModel } from '../types'
  */
 
 /**
- * 一格里三个单价横排成「输入 | 输出 | 缓存命中」——
- * 顺序与编辑弹窗的字段顺序一致（输入、缓存命中、输出；缓存写入价 2026-10-31
- * 起不再暴露，未配置时按输入价计费）。
- * 未配置用「—」而不是「未配置」：一格里挤三个词会撑爆列宽，
- * 完整口径在 title 与编辑弹窗里。
+ * 单价按「输入 / 输出 / 缓存」三行竖排。
+ *
+ * 横排成一行会把价格列撑到 220px 以上，加上操作列的四个按钮后整表必然
+ * 横向溢出——最右侧的「成功率 / 操作」被挤出视口，既看不到也点不到。
+ * 竖排后每行仍能对齐比较，但列宽不再随单价位数增长。
+ * 未配置用「—」而不是「未配置」：完整口径在 title 与编辑弹窗里。
  */
 function priceCell(m: UpstreamModel) {
   const parts: { key: string; label: string; value: number }[] = [
@@ -33,19 +36,19 @@ function priceCell(m: UpstreamModel) {
     { key: 'hit', label: '缓存命中', value: m.price_cache_hit },
   ]
   return (
-    <span
-      className="flex items-center gap-1.5 text-xs whitespace-nowrap tabular-nums"
+    <div
+      className="flex flex-col gap-0.5 text-[11.5px] whitespace-nowrap tabular-nums"
       title={parts.map((p) => `${p.label} ${unitPrice(p.value)}`).join(' · ')}
     >
-      {parts.map((p, i) => (
+      {parts.map((p) => (
         <span key={p.key} className="flex items-center gap-1.5">
-          {i > 0 ? <span className="text-muted/60">|</span> : null}
-          <span className={p.value > 0 ? undefined : 'text-muted'}>
+          <span className="text-muted w-12 shrink-0 whitespace-nowrap">{p.label}</span>
+          <span className={p.value > 0 ? 'font-medium' : 'text-muted'}>
             {p.value > 0 ? unitPrice(p.value) : '—'}
           </span>
         </span>
       ))}
-    </span>
+    </div>
   )
 }
 
@@ -177,18 +180,16 @@ export function UpstreamModelPanel({
       >
         <Table aria-label="上游模型">
           <Table.ScrollContainer>
-            <Table.Content className="min-w-[1120px]">
+            <Table.Content className="min-w-[800px] text-xs [&_td]:px-2 [&_th]:px-2 [&_th]:whitespace-nowrap [&_table]:table-fixed">
               {/* 整表左对齐（用户要求）：数字列也左对齐，与其余运维表一致。
                   表头里把价位顺序写进列名，省得每次都要对着数字猜哪格是哪个。 */}
               <Table.Header>
-                <Table.Column isRowHeader>模型</Table.Column>
-                <Table.Column>上下文 / 最大输出</Table.Column>
-                <Table.Column>价格（元/1M） 输入 | 输出 | 缓存命中</Table.Column>
-                <Table.Column>思考（是否支持 / 挡位）</Table.Column>
-                <Table.Column>速度(tok/s)</Table.Column>
-                <Table.Column>首字(s)</Table.Column>
-                <Table.Column>成功率</Table.Column>
-                <Table.Column>操作</Table.Column>
+              <Table.Column isRowHeader className="w-[172px] min-w-[172px] whitespace-nowrap">模型</Table.Column>
+              <Table.Column>上下文 / 最大输出</Table.Column>
+              <Table.Column className="w-[124px] whitespace-nowrap">单价（元/1M）</Table.Column>
+              <Table.Column className="w-[112px] whitespace-nowrap">思考</Table.Column>
+              <Table.Column className="w-[76px] whitespace-nowrap">性能</Table.Column>
+              <Table.Column className="w-[172px] whitespace-nowrap">操作</Table.Column>
               </Table.Header>
               <Table.Body>
                 {models.map((m) => (
@@ -208,24 +209,24 @@ export function UpstreamModelPanel({
                     <Table.Cell>{capacityCell(m)}</Table.Cell>
                     <Table.Cell>{priceCell(m)}</Table.Cell>
                     <Table.Cell>{thinkingCell(m)}</Table.Cell>
-                    <Table.Cell className="text-xs tabular-nums">
-                      {m.tokens_per_sec ? (
-                        fmtSpeed(m.tokens_per_sec)
-                      ) : (
-                        <span className="text-muted">—</span>
-                      )}
-                    </Table.Cell>
-                    <Table.Cell className="text-xs tabular-nums">
-                      {m.ttfb_ms ? fmtSec(m.ttfb_ms) : <span className="text-muted">—</span>}
-                    </Table.Cell>
-                    <Table.Cell className="text-xs tabular-nums">
-                      {m.call_count ? (
-                        <span className={(m.success_rate ?? 1) < 1 ? 'text-warning' : undefined}>
-                          {fmtPercent(m.success_rate ?? 1)}%
+                    <Table.Cell>
+                      <div
+                        className="text-muted flex flex-col gap-0.5 text-[11px] whitespace-nowrap tabular-nums"
+                        title={`输出速度 ${m.tokens_per_sec ? `${fmtSpeed(m.tokens_per_sec)} t/s` : '无样本'} · 首字 ${m.ttfb_ms ? `${fmtSec(m.ttfb_ms)}s` : '无样本'} · 成功率 ${m.call_count ? `${fmtPercent(m.success_rate ?? 1)}%` : '无样本'}`}
+                      >
+                        <span title="输出速度">
+                          <b className="text-foreground">{m.tokens_per_sec ? fmtSpeed(m.tokens_per_sec) : '—'}</b> t/s
                         </span>
-                      ) : (
-                        <span className="text-muted">—</span>
-                      )}
+                        <span title="平均首字">
+                          首字 <b className="text-foreground">{m.ttfb_ms ? fmtSec(m.ttfb_ms) : '—'}</b>s
+                        </span>
+                        <span>
+                          成功{' '}
+                          <b className={(m.success_rate ?? 1) < 1 ? 'text-warning' : 'text-foreground'}>
+                            {m.call_count ? `${fmtPercent(m.success_rate ?? 1)}%` : '—'}
+                          </b>
+                        </span>
+                      </div>
                     </Table.Cell>
                     <Table.Cell>
                       <div className="flex items-center gap-1">
@@ -279,6 +280,96 @@ export function UpstreamModelPanel({
           </Table.ScrollContainer>
         </Table>
       </DataTable>
+
+      <ModelSpeedChart models={models} />
     </section>
+  )
+}
+
+/**
+ * 同一上游下各模型的速度对比。
+ *
+ * 表格已经逐行给了速度、首字与成功率，但「哪个模型明显更快」在一列数字里
+ * 读不出来，而这正是换模型/调路由时最直接的依据。只画**有速度样本**的
+ * 模型：没调用过的模型没有速度可言，补 0 会把它们画成最慢。
+ *
+ * 颜色按成功率分档：速度再快、成功率 60% 也不该被当成好选择。
+ */
+function ModelSpeedChart({ models }: { models: UpstreamModel[] }) {
+  const data = models
+    .filter((m) => (m.tokens_per_sec ?? 0) > 0)
+    .map((m) => ({
+      label: m.model_id,
+      tps: m.tokens_per_sec ?? 0,
+      rate: m.success_rate ?? 1,
+      calls: m.call_count ?? 0,
+      ttfb: m.ttfb_ms ?? 0,
+    }))
+    .sort((a, b) => b.tps - a.tps)
+    .slice(0, 12)
+  if (data.length === 0) {
+    return null
+  }
+  const max = data[0].tps
+  return (
+    <div className="rounded-2xl border border-separator bg-surface p-4">
+      <div className="mb-2 flex flex-wrap items-baseline justify-between gap-2">
+        <h3 className="text-sm font-semibold">模型速度</h3>
+        <span className="text-muted text-[11.5px]">
+          近 5 次成功调用的平均输出速度；颜色表示近 100 次成功率
+        </span>
+      </div>
+      <div className="h-[220px]" role="img" aria-label={`${data.length} 个模型的速度对比`}>
+        <ResponsiveContainer width="100%" height="100%">
+          <BarChart data={data} layout="vertical" margin={{ top: 2, right: 40, bottom: 2, left: 4 }}>
+            <CartesianGrid stroke={CHART_COLORS.grid} strokeDasharray="3 5" horizontal={false} />
+            <XAxis
+              type="number"
+              domain={[0, max * 1.1]}
+              tick={{ fill: CHART_COLORS.muted, fontSize: 10.5 }}
+              axisLine={false}
+              tickLine={false}
+              tickFormatter={(v: number) => `${fmtSpeed(v)}`}
+            />
+            <YAxis
+              type="category"
+              dataKey="label"
+              width={150}
+              tick={{ fill: CHART_COLORS.foreground, fontSize: 10.5 }}
+              axisLine={false}
+              tickLine={false}
+              tickFormatter={(value: string) => (value.length > 20 ? value.slice(0, 19) + '…' : value)}
+            />
+            <Tooltip
+              cursor={{ fill: CHART_COLORS.accentSoft }}
+              content={({ active, payload }) => {
+                if (!active || !payload?.length) return null
+                const row = payload[0].payload as (typeof data)[number]
+                return (
+                  <ChartTooltipBox title={row.label}>
+                    <TooltipRow label="速度" value={`${fmtSpeed(row.tps)} t/s`} />
+                    <TooltipRow label="首字" value={row.ttfb > 0 ? `${fmtSec(row.ttfb)}s` : '—'} />
+                    <TooltipRow label="成功率" value={row.calls > 0 ? `${fmtPercent(row.rate)}%` : '—'} />
+                    <TooltipRow label="样本" value={fmtTokens(row.calls)} />
+                  </ChartTooltipBox>
+                )
+              }}
+            />
+            <Bar dataKey="tps" radius={[0, 4, 4, 0]} maxBarSize={16}>
+              {data.map((row) => (
+                <Cell
+                  key={row.label}
+                  fill={
+                    row.calls > 0 && row.rate < 0.9
+                      ? CHART_COLORS.danger
+                      : CHART_COLORS.info
+                  }
+                />
+              ))}
+            </Bar>
+          </BarChart>
+        </ResponsiveContainer>
+      </div>
+    </div>
   )
 }

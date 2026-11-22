@@ -14,12 +14,45 @@
   --font-mono: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
 
   /* 全站常量做成令牌，避免各页写 max-w-[1180px] 之类魔法值 */
-  --container-app: 1180px;
-  --spacing-gutter: 1.375rem;
+  --container-app: 1360px;
+  --spacing-gutter: clamp(1rem, 2.2vw, 2rem);
+
+  /* 滚动条改成细轨：宽表的横向滚动条原来是一整条灰带，压在最后一行下面，
+     比表格本身更显眼。这里统一 WebKit 与 Firefox 两条路径。 */
+  --sb-size: 8px;
+  --sb-thumb: color-mix(in oklab, var(--muted) 34%, transparent);
+  --sb-thumb-hover: color-mix(in oklab, var(--muted) 55%, transparent);
 }
 
 body {
   font-family: var(--font-sans);
+}
+
+* {
+  scrollbar-width: thin;
+  scrollbar-color: var(--sb-thumb) transparent;
+}
+
+::-webkit-scrollbar {
+  width: var(--sb-size);
+  height: var(--sb-size);
+}
+
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+::-webkit-scrollbar-thumb {
+  border-radius: 999px;
+  background: var(--sb-thumb);
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: var(--sb-thumb-hover);
+}
+
+::selection {
+  background: color-mix(in oklab, var(--accent) 24%, transparent);
 }
 
 /* 输入类控件（Input / Textarea / Select.Trigger / 各种 *-group）的可辨识度。
@@ -33,11 +66,51 @@ body {
    --field-border-hover / --field-border-focus 由 HeroUI 从 --field-border 派生
    （color-mix 88% / 74%），跟着一处改动即可生效。 */
 :root {
+  --accent: oklch(0.55 0.14 188);
+  --accent-soft: color-mix(in oklab, var(--accent) 12%, transparent);
+  --accent-soft-foreground: color-mix(in oklab, var(--accent) 82%, var(--foreground) 18%);
+  --background: oklch(0.975 0.006 240);
+  --foreground: oklch(0.27 0.025 250);
+  --surface: oklch(0.995 0.002 240);
+  --surface-secondary: oklch(0.955 0.008 240);
+  --surface-tertiary: oklch(0.935 0.01 240);
+  --border: oklch(0.89 0.012 240);
+  --separator: oklch(0.915 0.01 240);
+  --muted: oklch(0.51 0.025 245);
+  --success: oklch(0.58 0.12 166);
+  --warning: oklch(0.68 0.13 70);
+  --danger: oklch(0.58 0.18 24);
+  /* 图表语义色：费用与提示/警告分开，速度与主用量分开。
+     否则同一张图里「钱」和「慢」都会变成橙色，读者无法从颜色判断维度。 */
+  --cost: oklch(0.64 0.13 70);
+  --info: oklch(0.57 0.11 250);
+  --default: oklch(0.94 0.008 240);
+  --radius: 0.5rem;
+  --surface-shadow: none;
+  --field-shadow: none;
   --field-background: var(--surface-secondary);
   --field-border: var(--border);
   --field-border-width: 1px;
 }
 [data-theme="dark"] {
+  --accent: oklch(0.76 0.13 182);
+  --accent-soft: color-mix(in oklab, var(--accent) 14%, transparent);
+  --accent-soft-foreground: color-mix(in oklab, var(--accent) 82%, var(--foreground) 18%);
+  --background: oklch(0.17 0.014 250);
+  --foreground: oklch(0.94 0.008 240);
+  --surface: oklch(0.215 0.017 250);
+  --overlay: var(--surface);
+  --surface-secondary: oklch(0.25 0.018 250);
+  --surface-tertiary: oklch(0.285 0.018 250);
+  --border: oklch(0.34 0.018 250);
+  --separator: oklch(0.3 0.018 250);
+  --muted: oklch(0.7 0.018 245);
+  --success: oklch(0.76 0.11 166);
+  --warning: oklch(0.79 0.12 72);
+  --danger: oklch(0.7 0.16 24);
+  --cost: oklch(0.79 0.12 72);
+  --info: oklch(0.75 0.1 250);
+  --default: oklch(0.27 0.016 250);
   --field-background: var(--surface-secondary);
   --field-border: var(--border);
   --field-border-width: 1px;

@@ -85,20 +85,9 @@ export function Shell() {
   const nav = admin ? ADMIN_NAV : USER_NAV
   const activeTo = activeNavTo(location.pathname, location.search)
 
-  // 内容区在容器里滚（不是 window）：顶栏的发丝线在滚过 4px 后出现；
-  // 路由切换把内容区滚回顶部。
   const contentRef = useRef<HTMLElement | null>(null)
-  const [scrolled, setScrolled] = useState(false)
-  useEffect(() => {
-    const el = contentRef.current
-    if (!el) return
-    const onScroll = () => setScrolled(el.scrollTop > 4)
-    el.addEventListener('scroll', onScroll, { passive: true })
-    return () => el.removeEventListener('scroll', onScroll)
-  }, [])
   useEffect(() => {
     contentRef.current?.scrollTo({ top: 0 })
-    setScrolled(false)
     setNarrowOpen(false)
   }, [location.pathname])
 
@@ -125,7 +114,7 @@ export function Shell() {
       ) : null}
       <aside
         className={
-          'flex shrink-0 flex-col border-separator border-r transition-[width] ' +
+          'flex shrink-0 flex-col border-separator border-r bg-surface transition-[width] ' +
           (narrow
             ? 'fixed inset-y-0 left-0 z-40 bg-background shadow-xl ' +
               (narrowOpen ? 'w-56' : 'w-14')
@@ -139,9 +128,6 @@ export function Shell() {
           {!railCollapsed && (
             <div className="min-w-0">
               <div className="truncate text-sm font-semibold">{branding.name}</div>
-              <div className="text-muted truncate text-xs">
-                {admin ? '管理控制台' : '个人工作台'}
-              </div>
             </div>
           )}
         </div>
@@ -168,7 +154,7 @@ export function Shell() {
                       'mb-0.5 flex items-center gap-2.5 rounded-lg px-2.5 py-2 text-sm ' +
                       (railCollapsed ? 'justify-center' : '') +
                       (active
-                        ? ' bg-surface-secondary text-foreground font-medium'
+                        ? ' bg-accent-soft text-accent-soft-foreground font-semibold'
                         : ' text-muted hover:bg-surface-secondary/60 hover:text-foreground')
                     }
                   >
@@ -201,10 +187,7 @@ export function Shell() {
 
       <div className={'flex min-w-0 flex-1 flex-col' + (narrow ? ' pl-14' : '')}>
         <header
-          className={
-            'border-separator z-20 flex h-12 shrink-0 items-center gap-3 border-b px-4 ' +
-            (scrolled ? 'shadow-sm' : '')
-          }
+          className="border-separator z-20 flex h-12 shrink-0 items-center gap-3 border-b px-4"
         >
           {narrow ? (
             <Button

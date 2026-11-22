@@ -466,7 +466,7 @@ export function ProviderDetail() {
           ) : !modelsLoading && !modelsErr && models.length === 0 ? (
             <Button
               variant="outline"
-              className="border-separator bg-background-secondary h-auto w-full justify-between gap-3 px-3 py-2 text-left text-sm"
+              className="border-separator bg-surface-secondary h-auto w-full justify-between gap-3 px-3 py-2 text-left text-sm"
               onPress={() => setModelModal({ open: true, editing: null, discover: true })}
             >
               <span>添加上游模型，之后才能在路由里选择它</span>
@@ -478,7 +478,7 @@ export function ProviderDetail() {
                并排后首屏能同时看到「这个上游是谁」和「它现在用哪把 key」），
                模型表独占下一行（五列、可能几十行，占满才不用横向滚动）。
                */}
-          <div className="grid items-start gap-5 lg:grid-cols-2">
+          <div className="grid items-start gap-5">
             <ProviderOverviewCard
               provider={provider}
               networks={networks}

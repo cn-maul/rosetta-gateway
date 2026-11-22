@@ -317,7 +317,7 @@ export function PriceSettings({ refreshSignal }: { refreshSignal: number }) {
               <Button
                 key={p.id}
                 variant="secondary"
-                className="flex h-auto flex-col items-start gap-1 rounded-xl border border-separator bg-background-secondary p-3.5 text-left font-normal hover:border-accent/45"
+                className="flex h-auto flex-col items-start gap-1 rounded-xl border border-separator bg-surface-secondary p-3.5 text-left font-normal hover:border-accent/45"
                 onPress={() => setPriceProvider(p.id)}
               >
                 <span className="truncate text-sm font-medium">{p.name || p.slug}</span>

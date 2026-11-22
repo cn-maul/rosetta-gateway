@@ -51,7 +51,7 @@ test('普通用户视图：藏上游列、模型只显示路由名', async () =>
   const page = await read('pages/UsageDetail.tsx')
   assert.ok(page.includes('const admin = isAdmin()'), '调用日志没用 isAdmin 区分视图')
   assert.ok(
-    page.includes('{admin ? <Table.Column>上游</Table.Column> : null}'),
+    /\{admin \? <Table\.Column[^>]*>上游<\/Table\.Column> : null\}/.test(page),
     '上游列表头没有按身份隐藏',
   )
   // 实际模型（上游模型名）只在管理员视角出现：表体里那一行必须被 admin 守卫包住。

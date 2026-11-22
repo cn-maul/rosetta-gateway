@@ -43,8 +43,47 @@ function unparsed(raw: string): TraceStep {
   return { raw, attempt: null, provider: '', model: '', outcome: '', outcomeLabel: '原始记录', explanation: '', reason: '', reasonLabel: '', parsed: false }
 }
 
+/**
+ * v1.6.7 之前的轨迹写法：`provider=X/model=Y > outcome:Z`。
+ *
+ * 这段格式只存在于历史行（当时还没有 `N:x/y -> outcome` 这套编号格式），
+ * 但它们仍然在调用历史里，且含义完全可读 —— 排障时显示「记录异常」会把
+ * 一条正常的旧记录说成损坏数据。这里只做**结构还原**，映射到与当前格式
+ * 相同的 TraceStep；无法完整匹配的仍走 unparsed，绝不猜。
+ */
+const LEGACY_TRACE = /^provider=(.+?)\/model=(.+?)\s*>\s*outcome:([A-Za-z_]+)(?::(.*))?$/s
+
+function parseLegacy(value: string): TraceStep | null {
+  const m = LEGACY_TRACE.exec(value)
+  if (!m) return null
+  const [, provider, model, outcome, reason = ''] = m
+  if (!provider || !model) return null
+  // 旧格式把错误码直接放在 outcome 位（例如 upstream_error:rate_limit），
+  // 与当前的 ok / fail_switch / fail_terminal 词表不是一套。认识的照旧解释；
+  // 不认识的仍然显式说明「旧记录只存了结果码」，而不是把它吞成损坏数据。
+  const known = Object.hasOwn(outcomes, outcome) ? outcomes[outcome] : undefined
+  const reasonLabel = [outcome, reason].filter(Boolean).join(' · ')
+  return {
+    raw: value,
+    // 旧格式没有尝试序号：留空而不是编一个 1，避免在界面上声称「这是第一次」。
+    attempt: null,
+    provider,
+    model,
+    outcome,
+    outcomeLabel: known?.label ?? '旧格式结果',
+    explanation:
+      known?.explanation ??
+      `旧记录只保存了结果码「${reasonLabel}」，没有区分是否允许故障转移。`,
+    reason,
+    reasonLabel: known ? (Object.hasOwn(reasons, reason) ? reasons[reason] : reason) : '',
+    parsed: true,
+  }
+}
+
 export function parseTraceStep(raw: string): TraceStep {
   const value = raw.trim()
+  const legacy = parseLegacy(value)
+  if (legacy) return legacy
   // 转义的 "/"、";"、"\"" 不能参与分隔；用 unescape 后的逻辑读取字段。
   const arrow = findUnescapedLast(value, ' -> ')
   const colon = findUnescaped(value, ':', 0)

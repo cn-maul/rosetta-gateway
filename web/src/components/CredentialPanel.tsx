@@ -71,16 +71,22 @@ export function CredentialPanel({
         label="上游凭据"
         error={error}
         hasData={creds.length > 0}
+        empty={creds.length === 0}
+        emptyText="还没有凭据。上游必须有一把启用的密钥才能工作。"
         onRetry={onRetry}
-        emptyText="无凭据 —— 上游鉴权必需"
+        emptyAction={
+          <Button variant="outline" size="sm" onPress={onAdd}>
+            添加凭据
+          </Button>
+        }
       >
         <Table aria-label="上游凭据">
           <Table.ScrollContainer>
-            <Table.Content className="min-w-[560px]">
+            <Table.Content className="min-w-[520px]">
               <Table.Header>
-                <Table.Column isRowHeader>凭据</Table.Column>
-                <Table.Column>状态</Table.Column>
-                <Table.Column>操作</Table.Column>
+                <Table.Column isRowHeader className="whitespace-nowrap">凭据</Table.Column>
+                <Table.Column className="w-[96px] whitespace-nowrap">状态</Table.Column>
+                <Table.Column className="w-[230px] whitespace-nowrap">操作</Table.Column>
               </Table.Header>
               <Table.Body>
                 {creds.map((c) => {

@@ -1,6 +1,7 @@
 import { useLocation, useSearchParams } from 'react-router-dom'
-import { Tabs, ToggleButton, ToggleButtonGroup } from '@heroui/react'
+import { Button, Tabs, ToggleButton, ToggleButtonGroup } from '@heroui/react'
 import { api, isAdmin } from '../api'
+import { fmtTimeFull } from '../fmt'
 import { PageHeader } from '../ui/PageHeader'
 import { UsageByGroup } from '../components/UsageByGroup'
 import { UsageByUser } from '../components/UsageByUser'
@@ -44,6 +45,15 @@ export function UsageStats() {
   const days = DAY_OPTIONS.includes(daysRaw)
     ? daysRaw
     : readPref(daysPrefKey, daysDefault, oneOfInt(DAY_OPTIONS))
+  // 总览图点进来时会带绝对时间窗（from/to）。只有调用日志页消费它：日志是
+  // 逐条记录，能按任意区间查；用量页的四个汇总端点仍以 days 为参数，若也接
+  // 受 from/to，就会出现「页头写着某天、表格却按近 N 天统计」的静默错位。
+  const fromRaw = Number(searchParams.get('from'))
+  const toRaw = Number(searchParams.get('to'))
+  const span =
+    logs && Number.isFinite(fromRaw) && toRaw > fromRaw && fromRaw >= 0
+      ? { from: fromRaw, to: toRaw }
+      : undefined
 
   const title = logs ? '调用日志' : '用量与费用'
 
@@ -58,6 +68,20 @@ export function UsageStats() {
     const next = new URLSearchParams(searchParams)
     next.set('days', String(value))
     next.delete('page')
+    next.delete('from')
+    next.delete('to')
+    setSearchParams(next)
+  }
+  const pushRange = (value: { from: number; to: number } | undefined) => {
+    const next = new URLSearchParams(searchParams)
+    if (value) {
+      next.set('from', String(value.from))
+      next.set('to', String(value.to))
+    } else {
+      next.delete('from')
+      next.delete('to')
+    }
+    next.delete('page')
     setSearchParams(next)
   }
 
@@ -65,35 +89,47 @@ export function UsageStats() {
     <>
       <PageHeader
         title={title}
+        sub={span ? `${fmtTimeFull(span.from)} 至 ${fmtTimeFull(span.to)}` : undefined}
         actions={
-          <ToggleButtonGroup
-            aria-label="时间范围"
-            selectionMode="single"
-            disallowEmptySelection
-            selectedKeys={[String(days)]}
-            onSelectionChange={(keys) => {
-              const value = [...keys][0]
-              if (value !== undefined) setDays(Number(value))
-            }}
-          >
-            {DAY_OPTIONS.map((d) => (
-              <ToggleButton key={d} id={String(d)} size="sm">
-                {DAY_LABELS[d]}
-              </ToggleButton>
-            ))}
-          </ToggleButtonGroup>
+          <div className="flex items-center gap-2">
+            {span ? (
+              <Button
+                size="sm"
+                variant="tertiary"
+                onPress={() => pushRange(undefined)}
+              >
+                清除时间点
+              </Button>
+            ) : null}
+            <ToggleButtonGroup
+              aria-label="时间范围"
+              selectionMode="single"
+              disallowEmptySelection
+              selectedKeys={[String(days)]}
+              onSelectionChange={(keys) => {
+                const value = [...keys][0]
+                if (value !== undefined) setDays(Number(value))
+              }}
+            >
+              {DAY_OPTIONS.map((d) => (
+                <ToggleButton key={d} id={String(d)} size="sm" isDisabled={Boolean(span)}>
+                  {DAY_LABELS[d]}
+                </ToggleButton>
+              ))}
+            </ToggleButtonGroup>
+          </div>
         }
       />
 
       {logs ? (
-        <UsageDetail days={days} key={days} />
+        <UsageDetail days={days} span={span} />
       ) : (
         <Tabs
           aria-label="用量分析维度"
           selectedKey={tab}
           onSelectionChange={(key) => setTab(String(key))}
         >
-          <Tabs.ListContainer>
+          <Tabs.ListContainer className="w-fit max-w-full">
             <Tabs.List>
               {tabs.map((t) => (
                 <Tabs.Tab key={t.key} id={t.key}>

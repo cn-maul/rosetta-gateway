@@ -5,6 +5,10 @@ import (
 	"encoding/hex"
 	"log/slog"
 	"os"
+	// 把 IANA 时区库编进二进制。Windows 没有 /usr/share/zoneinfo，
+	// 而真实部署的 config.json 常写 timezone: "Asia/Shanghai" —— 不内嵌时
+	// time.LoadLocation 会直接失败，网关在配置校验阶段就退出。
+	_ "time/tzdata"
 
 	"github.com/cn-maul/rosetta-gateway/internal/gatewayapp"
 )

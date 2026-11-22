@@ -96,11 +96,18 @@ function RouteTrace({ steps }: { steps: TraceStep[] }) {
           // 不要空着 —— 空行会被读成「这里本来就没东西」。
           const reason = s.parsed ? s.reasonLabel : ''
           return (
-            <li key={i} className="flex items-start gap-2.5 rounded-lg bg-background-tertiary px-3 py-2">
+            <li key={i} className="flex items-start gap-2.5 rounded-lg bg-surface-tertiary px-3 py-2">
               <span className="mt-px shrink-0 font-mono text-[11px] text-muted">{s.attempt ?? i + 1}</span>
               <div className="min-w-0 flex-1">
                 <div className="flex flex-wrap items-center gap-x-2 gap-y-1">
-                  <strong className="text-xs break-all">{s.parsed ? s.provider : '记录异常'}</strong>
+                  <strong className="text-xs break-all">{s.parsed ? s.provider : '旧格式记录'}</strong>
+                  {s.attempt !== null ? (
+                    <span className="font-mono text-[10.5px] text-muted">#{s.attempt}</span>
+                  ) : s.parsed ? (
+                    <span className="text-muted text-[10.5px]" title="旧记录没有尝试序号">
+                      旧格式
+                    </span>
+                  ) : null}
                   {s.model ? <span className="font-mono text-[11px] break-all text-muted">/ {s.model}</span> : null}
                   <StatusChip tone={tone}>{s.outcomeLabel}</StatusChip>
                 </div>
@@ -162,7 +169,7 @@ function errorView(detail: string | undefined) {
 
 function Scale({ label, children, tone }: { label: string; children: React.ReactNode; tone?: string }) {
   return (
-    <div className="min-w-0 rounded-lg bg-background-tertiary px-3 py-2.5">
+    <div className="min-w-0 rounded-lg bg-surface-tertiary px-3 py-2.5">
       <span className="mb-1 block text-[10.5px] text-muted">{label}</span>
       <strong className={'block break-all ' + (tone ?? '')}>{children}</strong>
     </div>
@@ -226,13 +233,13 @@ function DetailContent({ entry }: { entry: UsageHistoryEntry }) {
       {ev.rawPretty ? (
         <div className="mt-3.5">
           <h3 className="mb-2 text-xs font-semibold text-muted">完整原始响应</h3>
-          <pre className="max-h-[52vh] overflow-auto rounded-xl bg-background-tertiary px-3.5 py-3.5 font-mono text-xs leading-relaxed whitespace-pre-wrap break-words">
+          <pre className="max-h-[52vh] overflow-auto rounded-xl bg-surface-tertiary px-3.5 py-3.5 font-mono text-xs leading-relaxed whitespace-pre-wrap break-words">
             {ev.rawPretty}
           </pre>
         </div>
       ) : null}
       {!ev.message && !ev.rawPretty ? (
-        <p className="mt-3 rounded-lg bg-background-tertiary px-3.5 py-2 text-xs leading-relaxed text-muted">
+        <p className="mt-3 rounded-lg bg-surface-tertiary px-3.5 py-2 text-xs leading-relaxed text-muted">
           {entry.status === 'ok'
             ? '这条请求成功了，没有错误详情。耗时、Token 与费用都印在列表那一行里。'
             : entry.status === 'canceled'

@@ -77,18 +77,18 @@ test('每个 <DataTable 的 empty 实参都由数据算，不是字面量 true',
   )
 })
 
-test('用户表与钱包三张表的 empty 跟着行数走', () => {
+test('用户表与钱包两张表的 empty 跟着行数走', () => {
   const users = readFileSync(join(SRC, 'components/users/UserTables.tsx'), 'utf8')
   assert.match(users, /empty=\{users\.length === 0\}/, '用户表的 empty 必须看 users.length')
   assert.match(users, /empty=\{groups\.length === 0\}/, '分组表的 empty 必须看 groups.length')
 
   const wallet = readFileSync(join(SRC, 'components/wallet/WalletTables.tsx'), 'utf8')
-  // 三张表各自的空态在外层用 byUser/byDay/topups 判过了，所以 DataTable 层
+  // 两张表各自的空态在外层用 byDay/topups 判过了，所以 DataTable 层
   // 不给 empty（默认 false）即可 —— 关键是不能再传字面量 true。
-  assert.doesNotMatch(wallet, /empty=\{true\}/, '钱包三张表不应再传字面量 empty')
+  assert.doesNotMatch(wallet, /empty=\{true\}/, '钱包表格不应再传字面量 empty')
   assert.equal(
     (wallet.match(/<DataTable label="账户账单"/g) ?? []).length,
-    3,
-    '钱包三张表的 DataTable 数量应为 3',
+    2,
+    '钱包只剩按天消耗与充值流水两张表（按用户汇总已移到用量页）',
   )
 })

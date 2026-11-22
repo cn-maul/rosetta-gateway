@@ -77,3 +77,14 @@ export function localDayKey(ms: number): string {
   const p = (x: number) => String(x).padStart(2, '0')
   return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}`
 }
+
+/**
+ * 某个自然日的最后一毫秒（本地时区，含当天全部记录）。
+ *
+ * 用 `new Date(y, m, d + 1)` 而不是 `+ DAY_MS`：跨夏令时的自然日不是 24 小时，
+ * 固定加一天会落进次日或前一天的边界。
+ */
+export function localDayEnd(ms: number): number {
+  const d = new Date(ms)
+  return new Date(d.getFullYear(), d.getMonth(), d.getDate() + 1).getTime() - 1
+}

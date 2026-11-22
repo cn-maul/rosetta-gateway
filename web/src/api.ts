@@ -471,8 +471,8 @@ import type {
  * 时间范围走 range.ts 的区间口径（近 1 天 = 今天 0 点起，而非滚动 24 小时），
  * 所以 History 页与总览页的「近 N 天」说的是同一段时间。
  */
-function usageHistoryQuery(days: number, filters?: HistoryFilters): string {
-  const { from, to } = rangeBounds(days)
+function usageHistoryQuery(days: number, filters?: HistoryFilters, span?: { from: number; to: number }): string {
+  const { from, to } = span ?? rangeBounds(days)
   const q = new URLSearchParams({ from: String(from), to: String(to) })
   if (filters?.status) q.set('status', filters.status)
   if (filters?.model) q.set('model', filters.model)
@@ -825,14 +825,25 @@ export const api = {
 
   // 调用历史：分页查询（limit = 每页条数，offset = 偏移）。
   // 返回 { records, total }，total 是**过滤后的总条数**（不受分页影响）。
-  usageHistory: (days = 7, limit = 20, offset = 0, filters?: HistoryFilters) =>
+  usageHistory: (
+    days = 7,
+    limit = 20,
+    offset = 0,
+    filters?: HistoryFilters,
+    span?: { from: number; to: number },
+  ) =>
     get<UsageHistoryPage>(
-      `/usage/history?${usageHistoryQuery(days, filters)}&limit=${limit}&offset=${offset}`,
+      `/usage/history?${usageHistoryQuery(days, filters, span)}&limit=${limit}&offset=${offset}`,
     ),
   // 调用历史 CSV 导出：与列表同参数。响应是文件，走 download() 而非 request()；
   // 行数上限由后端钳制（maxUsageLimit），这里不重复传 limit。
   // 返回值里的 truncated/total 让调用方能明确提示「导出被截断」，
   // 而不是让人对着一个缺行的 CSV 得出「上游只失败过 N 次」的错误结论。
-  exportUsageCSV: (days = 7, filters?: HistoryFilters) =>
-    download('GET', `/usage/history.csv?${usageHistoryQuery(days, filters)}`, undefined, 'usage-history.csv'),
+  exportUsageCSV: (days = 7, filters?: HistoryFilters, span?: { from: number; to: number }) =>
+    download(
+      'GET',
+      `/usage/history.csv?${usageHistoryQuery(days, filters, span)}`,
+      undefined,
+      'usage-history.csv',
+    ),
 }

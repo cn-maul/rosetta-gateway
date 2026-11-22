@@ -56,6 +56,17 @@ function upstreamNameTitle(h: UsageHistoryEntry): string {
   return '这条记录没有归因到具体上游'
 }
 
+/** 日期与时分秒分两行：整串横排要占 180px，1280 宽的笔记本屏放不下右侧列。 */
+function TimeCell({ text }: { text: string }) {
+  const [date, clock] = text.split(' ')
+  return (
+    <span className="flex flex-col font-mono leading-tight">
+      <span>{date}</span>
+      <span className="text-muted tabular-nums">{clock}</span>
+    </span>
+  )
+}
+
 /** 速度格：tps = 0 表示没有可计算样本（上游未报 usage / 错误请求），
  * 不是「速度为零」。所以显示 —，不能把 0 直接印出来。 */
 function speedText(h: UsageHistoryEntry): string {
@@ -81,6 +92,7 @@ function tokenTitle(h: UsageHistoryEntry): string {
 }
 
 function traceNodeTone(step: ReturnType<typeof parseRouteTrace>[number]): string {
+  if (!step.parsed) return 'text-muted'
   if (step.outcome === 'ok') return 'text-success'
   if (step.outcome === 'skip') return 'text-muted'
   return 'text-danger'
@@ -111,14 +123,22 @@ function PathFlow({ entry }: { entry: UsageHistoryEntry }) {
       {steps.map((step, i) => (
         <span key={i} className="flex items-center gap-1.5">
           {i > 0 ? <span aria-hidden="true" className="text-muted">→</span> : null}
-          <span className={traceNodeTone(step)}>{step.parsed ? step.provider : '记录异常'}</span>
+          <span className={traceNodeTone(step)} title={step.parsed ? undefined : step.raw}>
+            {step.parsed ? step.provider : '旧记录'}
+          </span>
         </span>
       ))}
     </span>
   )
 }
 
-export function UsageDetail({ days }: { days: number }) {
+export function UsageDetail({
+  days,
+  span,
+}: {
+  days: number
+  span?: { from: number; to: number }
+}) {
   // 普通用户看的是「我自己调了哪些路由」，后台怎么转发跟他的排障无关：
   // 上游那一列整列不渲染，模型只显示路由名（public_model），不露背后实际模型。
   const admin = isAdmin()
@@ -138,14 +158,17 @@ export function UsageDetail({ days }: { days: number }) {
   const [exportNotice, setExportNotice] = useState('')
   const [loadedPage, setLoadedPage] = useState(1)
   const [loadedDays, setLoadedDays] = useState(days)
+  const [loadedSpan, setLoadedSpan] = useState(span)
   const [fStatus, setFStatus] = useState('')
   const [fModel, setFModel] = useState('')
   const [fKey, setFKey] = useState('')
   const [fUser, setFUser] = useState('')
   // 窄屏优先保留「哪条请求 / 成没成 / 多久 / 用了多少」，其余列按宽度补回。
   const showKey = useMinWidth('(min-width: 768px)')
-  const showLg = useMinWidth('(min-width: 1024px)')
-  const showXl = useMinWidth('(min-width: 1280px)')
+  // 11 列在 1024px 就全开时，长模型名（DeepSeek-V4.1-Flash 这类）会被压成
+  // 一字一行，连「上游」表头都竖排。宽列必须等到真正放得下再出现。
+  const showLg = useMinWidth('(min-width: 1280px)')
+  const showXl = useMinWidth('(min-width: 1440px)')
   const show2xl = useMinWidth('(min-width: 1536px)')
 
   const queryText = (key: string) => searchParams.get(key) ?? ''
@@ -205,6 +228,7 @@ export function UsageDetail({ days }: { days: number }) {
         r.size,
         (r.page - 1) * r.size,
         filters(r.status, r.model, r.keyId, r.userId),
+        span,
       )
       if (seq !== reqSeq.current) return
       const last = Math.max(1, Math.ceil(result.total / r.size))
@@ -216,6 +240,7 @@ export function UsageDetail({ days }: { days: number }) {
       setTotal(result.total)
       setLoadedPage(r.page)
       setLoadedDays(days)
+      setLoadedSpan(span)
     } catch (e) {
       if (seq === reqSeq.current && (e as { status?: number }).status !== 401) {
         setErr('调用日志加载失败：' + (e as Error).message)
@@ -223,7 +248,7 @@ export function UsageDetail({ days }: { days: number }) {
     } finally {
       if (seq === reqSeq.current) setLoading(false)
     }
-  }, [days, request, pushQuery])
+  }, [days, request, pushQuery, span])
 
   useEffect(() => {
     void load()
@@ -307,7 +332,7 @@ export function UsageDetail({ days }: { days: number }) {
     try {
       // 草稿还没应用时先写回 URL（分页会随之清掉），CSV 始终按草稿条件导。
       applyFilters()
-      const result = await api.exportUsageCSV(days, filters(fStatus, fModel.trim(), fKey, fUser))
+      const result = await api.exportUsageCSV(days, filters(fStatus, fModel.trim(), fKey, fUser), span)
       if (result.truncated) {
         setExportNotice(
           (result.total === undefined ? '' : '共 ' + fmtNum(result.total) + ' 条，') +
@@ -324,7 +349,10 @@ export function UsageDetail({ days }: { days: number }) {
     }
   }
 
-  const errText = err + (rows.length ? '（近 ' + loadedDays + ' 天，第 ' + loadedPage + ' 页）' : '')
+  const windowText = loadedSpan
+    ? `${fmtTimeFull(loadedSpan.from)} 至 ${fmtTimeFull(loadedSpan.to)}`
+    : `近 ${loadedDays} 天`
+  const errText = err + (rows.length ? `（${windowText}，第 ${loadedPage} 页）` : '')
 
   /** 密钥下拉的展示名。密钥名没有唯一约束，两个用户都建一把「主力」时
    *  只写名字会得到两个完全相同的选项 —— 选中哪一个都是猜。归属用户是
@@ -353,7 +381,7 @@ export function UsageDetail({ days }: { days: number }) {
       <div className="mb-4 flex flex-wrap items-center gap-2.5">
         <Select
           aria-label="请求状态"
-          className="w-[130px]"
+          className="w-[120px] min-w-[104px] flex-1 basis-[104px]"
           selectedKey={fStatus}
           onSelectionChange={(key) => {
             const v = key === null ? '' : String(key)
@@ -374,7 +402,12 @@ export function UsageDetail({ days }: { days: number }) {
             </ListBox>
           </SelectPopover>
         </Select>
-        <TextField aria-label="公开模型名" value={fModel} onChange={setFModel} className="w-[230px]">
+        <TextField
+          aria-label="公开模型名"
+          value={fModel}
+          onChange={setFModel}
+          className="min-w-[176px] flex-[1.6] basis-[200px]"
+        >
           <Input
             placeholder="公开模型名（精确匹配）"
             className="font-mono"
@@ -388,7 +421,7 @@ export function UsageDetail({ days }: { days: number }) {
         {admin ? (
           <Select
             aria-label="归属用户"
-            className="w-[170px]"
+            className="w-[150px] min-w-[128px] flex-1 basis-[128px]"
             isDisabled={!!userError}
             selectedKey={fUser}
             onSelectionChange={(key) => {
@@ -419,7 +452,7 @@ export function UsageDetail({ days }: { days: number }) {
         ) : null}
         <Select
           aria-label="调用密钥"
-          className="w-[220px]"
+          className="w-[190px] min-w-[150px] flex-1 basis-[160px]"
           isDisabled={!!keyError}
           selectedKey={fKey}
           onSelectionChange={(key) => {
@@ -525,33 +558,39 @@ export function UsageDetail({ days }: { days: number }) {
       >
         <Table aria-label="调用日志">
           <Table.ScrollContainer>
-            <Table.Content className={showLg ? 'min-w-[980px] text-[13px]' : 'min-w-[640px] text-[13px]'}>
+            <Table.Content
+              className={
+                showLg
+                  ? 'min-w-[1130px] text-[13px]'
+                  : 'min-w-[760px] text-[13px] [&_td]:px-2.5 [&_th]:px-2.5'
+              }
+            >
               <Table.Header>
-                <Table.Column isRowHeader>请求时间</Table.Column>
-                <Table.Column>模型</Table.Column>
-                <Table.Column>状态</Table.Column>
-                {admin ? <Table.Column>上游</Table.Column> : null}
-                <Table.Column>耗时</Table.Column>
-                {admin && showLg ? <Table.Column>用户</Table.Column> : null}
-                {showKey ? <Table.Column>密钥</Table.Column> : null}
-                <Table.Column>Token 用量</Table.Column>
-                {showLg ? <Table.Column>费用</Table.Column> : null}
-                {showXl ? <Table.Column>模式</Table.Column> : null}
-                {showLg ? <Table.Column>协议</Table.Column> : null}
-                {show2xl ? <Table.Column>速度</Table.Column> : null}
-                {show2xl ? <Table.Column>请求 IP</Table.Column> : null}
+                <Table.Column isRowHeader className="min-w-[104px] whitespace-nowrap">请求时间</Table.Column>
+                <Table.Column className="min-w-[150px]">模型</Table.Column>
+                <Table.Column className="whitespace-nowrap">状态</Table.Column>
+                {admin ? <Table.Column className="min-w-[96px] whitespace-nowrap">上游</Table.Column> : null}
+                <Table.Column className="whitespace-nowrap">耗时</Table.Column>
+                {admin ? <Table.Column className="whitespace-nowrap">用户</Table.Column> : null}
+                {showKey ? <Table.Column className="whitespace-nowrap">密钥</Table.Column> : null}
+                <Table.Column className="min-w-[112px] whitespace-nowrap">Token 用量</Table.Column>
+                {showLg ? <Table.Column className="whitespace-nowrap">费用</Table.Column> : null}
+                {showXl ? <Table.Column className="whitespace-nowrap">模式</Table.Column> : null}
+                {showLg ? <Table.Column className="whitespace-nowrap">协议</Table.Column> : null}
+                {show2xl ? <Table.Column className="whitespace-nowrap">速度</Table.Column> : null}
+                {show2xl ? <Table.Column className="whitespace-nowrap">请求 IP</Table.Column> : null}
               </Table.Header>
               <Table.Body>
                 {rows.map((h, i) => (
                   <Table.Row key={h.ts + ':' + i}>
-                    <Table.Cell>
-                      <span className="font-mono">{fmtTimeFull(h.ts)}</span>
+                    <Table.Cell className="whitespace-nowrap">
+                      <TimeCell text={fmtTimeFull(h.ts)} />
                     </Table.Cell>
-                    <Table.Cell>
-                      <span className="flex flex-col">
-                        <span className="font-mono" title={h.public_model || '—'}>{h.public_model || '—'}</span>
+                    <Table.Cell className="min-w-0">
+                      <span className="flex min-w-0 flex-col">
+                        <span className="truncate font-mono" title={h.public_model || '—'}>{h.public_model || '—'}</span>
                         {admin ? (
-                          <span className="font-mono text-[11.5px] text-muted" title={h.upstream_model || '实际模型未记录'}>
+                          <span className="truncate font-mono text-[11.5px] text-muted" title={h.upstream_model || '实际模型未记录'}>
                             {h.upstream_model || '实际模型未记录'}
                           </span>
                         ) : null}
@@ -559,7 +598,7 @@ export function UsageDetail({ days }: { days: number }) {
                     </Table.Cell>
                     <Table.Cell>
                       {h.status === 'ok' ? (
-                        <span title={statusHint(h)} className="flex items-center gap-2">
+                        <span title={statusHint(h)} className="flex flex-col items-start gap-1 whitespace-nowrap">
                           <StatusChip tone={statusTone(h.status)}>{statusLabel(h.status)}</StatusChip>
                           {h.http_status > 0 ? <span className="text-[11px] text-muted">HTTP {h.http_status}</span> : null}
                         </span>
@@ -570,7 +609,7 @@ export function UsageDetail({ days }: { days: number }) {
                           aria-label={'查看' + statusLabel(h.status) + '错误详情'}
                           onPress={() => setSelected(h)}
                         >
-                          <span title={statusHint(h) + ' · 点击查看错误详情'} className="flex items-center gap-2">
+                          <span title={statusHint(h) + ' · 点击查看错误详情'} className="flex flex-col items-start gap-1 whitespace-nowrap">
                             <StatusChip tone={statusTone(h.status)}>{statusLabel(h.status)}</StatusChip>
                             {h.http_status > 0 ? <span className="text-[11px] text-muted">HTTP {h.http_status}</span> : null}
                           </span>
@@ -578,7 +617,7 @@ export function UsageDetail({ days }: { days: number }) {
                       )}
                     </Table.Cell>
                     {admin ? (
-                      <Table.Cell>
+                      <Table.Cell className="whitespace-nowrap">
                         {parseRouteTrace(h.route_trace).length ? (
                           <PathFlow entry={h} />
                         ) : (
@@ -604,7 +643,7 @@ export function UsageDetail({ days }: { days: number }) {
                         </span>
                       </span>
                     </Table.Cell>
-                    {admin && showLg ? (
+                    {admin ? (
                       <Table.Cell>
                         <span title={h.user_id || '这条记录没有归属用户'}>
                           {h.user_name || h.user_id || '无归属'}

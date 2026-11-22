@@ -22,8 +22,13 @@ import { PROTOCOL_OPTIONS, protocolLabel } from '../protocols'
 import { PageHeader } from '../ui/PageHeader'
 import { DataTable } from '../ui/DataTable'
 import { AppModal } from '../ui/AppModal'
+import { SectionCard } from '../ui/SectionCard'
 import { StatusChip } from '../ui/StatusChip'
-import type { ProtocolProbeEntry } from '../types'
+import { CHART_COLORS, ChartEmpty, ChartTooltipBox, TooltipRow, shareText } from '../ui/chart'
+import { rangeBounds } from '../range'
+import { fmtNum, fmtTokens, fmtPercent } from '../fmt'
+import { Bar, BarChart, CartesianGrid, ResponsiveContainer, Tooltip, XAxis, YAxis } from 'recharts'
+import type { ProtocolProbeEntry, UsageGroupEntry } from '../types'
 import { confirmBox } from '../ui/confirm'
 import type { Provider } from '../types'
 
@@ -70,6 +75,10 @@ export function Providers() {
   const [providers, setProviders] = useState<Provider[]>([])
   const [pending, setPending] = useState<Set<string>>(new Set())
   const [createOpen, setCreateOpen] = useState(false)
+  // 近 7 天各上游的 Token 占比：列表只回答「配了什么」，
+  // 这张图回答「流量实际压在谁身上」。单独请求且失败静默降级 ——
+  // 它是辅助判断，不该让整张上游表变成错误态。
+  const [mix, setMix] = useState<UsageGroupEntry[] | null>(null)
   const loadSeqRef = useRef(0)
 
   // 网络清单不参与 load() 的成败判定：它只是展示辅助（行内的网络名与
@@ -146,6 +155,11 @@ export function Providers() {
   useEffect(() => {
     void load()
     void loadNetworks()
+    const { from, to } = rangeBounds(7)
+    api
+      .usageByProvider(from, to, 50)
+      .then((page) => setMix(page.records))
+      .catch(() => setMix(null))
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
 
@@ -291,15 +305,13 @@ export function Providers() {
       >
         <Table aria-label="上游列表">
           <Table.ScrollContainer>
-            <Table.Content className="min-w-[920px]">
+            <Table.Content className="min-w-[760px]">
               <Table.Header>
-                <Table.Column isRowHeader>上游 / Endpoint</Table.Column>
-                <Table.Column>类型</Table.Column>
-                <Table.Column>网络状态</Table.Column>
-                <Table.Column>凭据状态</Table.Column>
-                <Table.Column>模型 / 凭据</Table.Column>
-                <Table.Column>操作</Table.Column>
-                <Table.Column>启用</Table.Column>
+                <Table.Column isRowHeader className="whitespace-nowrap">上游 / Endpoint</Table.Column>
+                <Table.Column className="w-[96px] whitespace-nowrap">网络状态</Table.Column>
+                <Table.Column className="min-w-[210px] whitespace-nowrap">凭据状态</Table.Column>
+                <Table.Column className="w-[128px] whitespace-nowrap">操作</Table.Column>
+                <Table.Column className="w-[64px] whitespace-nowrap">启用</Table.Column>
               </Table.Header>
               <Table.Body>
                 {filtered.map((p) => (
@@ -309,13 +321,15 @@ export function Providers() {
                         variant="ghost"
                         aria-label={`查看 ${p.name} 详情`}
                         onPress={() => goDetail(p)}
-                        className="block h-auto w-full px-2 py-1 text-left"
+                        className="block h-auto w-full min-w-0 px-2 py-1 text-left"
                       >
-                        <span className="block font-medium">{p.name}</span>
-                        <span className="text-muted block font-mono text-xs">{p.endpoint}</span>
+                        <span className="block truncate font-medium">{p.name}</span>
+                        <span className="text-muted block truncate font-mono text-xs">{p.endpoint}</span>
+                        <span className="text-muted mt-0.5 block truncate text-xs">
+                          {protocolLabel(p.protocol)} · {p.model_count ?? '—'} 模型 / {p.cred_count ?? '—'} 凭据
+                        </span>
                       </Button>
                     </Table.Cell>
-                    <Table.Cell>{protocolLabel(p.protocol)}</Table.Cell>
                     <Table.Cell>
                       {isDirectProvider(p) ? (
                         <StatusChip tone="dim" title="直接连接，不经过代理">
@@ -330,15 +344,10 @@ export function Providers() {
                     <Table.Cell>
                       <StatusChip tone={readyTone(p)}>{readyLabel(p)}</StatusChip>
                       {p.ready === false ? (
-                        <span className="text-muted mt-0.5 block max-w-[220px] truncate text-xs">
+                        <span className="text-muted mt-0.5 block max-w-[260px] text-xs leading-snug">
                           {p.ready_reason || '未建立可用凭据池，请检查凭据'}
                         </span>
                       ) : null}
-                    </Table.Cell>
-                    <Table.Cell className="text-right">
-                      <span className="font-mono text-xs">
-                        {p.model_count ?? '—'} / {p.cred_count ?? '—'}
-                      </span>
                     </Table.Cell>
                     <Table.Cell>
                       <div className="flex items-center gap-1">
@@ -377,6 +386,12 @@ export function Providers() {
         </Table>
       </DataTable>
 
+      <div className="mt-4">
+        <SectionCard title="上游负载（近 7 天）" description="Token 占比与成功率，回答「流量实际压在谁身上」">
+          <ProviderMix rows={mix} />
+        </SectionCard>
+      </div>
+
       <CreateProviderModal
         open={createOpen}
         onClose={() => setCreateOpen(false)}
@@ -389,6 +404,76 @@ export function Providers() {
         }}
       />
     </>
+  )
+}
+
+/**
+ * 上游负载：横向条形图只画 Token 占比，成功率放进提示框。
+ *
+ * 不把「请求数」和「Token」画成两组柱：两者常常同向，同向的两组柱只会
+ * 让图变宽而不会多回答一个问题。这里要回答的是「谁占大头」，
+ * 一个维度 + 提示框里的成功率足够了。
+ */
+function ProviderMix({ rows }: { rows: UsageGroupEntry[] | null }) {
+  if (rows === null) return <ChartEmpty text="负载数据暂时不可用（不影响上面的配置列表）" />
+  const top = [...rows]
+    .filter((r) => r.tokens > 0)
+    .sort((a, b) => b.tokens - a.tokens)
+    .slice(0, 8)
+  if (top.length === 0) return <ChartEmpty text="近 7 天还没有调用记录" />
+  const total = rows.reduce((a, r) => a + r.tokens, 0)
+  const share = top.reduce((a, r) => a + r.tokens, 0)
+  const data = top.map((r) => ({ ...r, label: r.name || r.key || '未归属上游' }))
+  const max = Math.max(...data.map((d) => d.tokens))
+  return (
+    <div>
+      <div className="h-[220px]" role="img" aria-label={`近 7 天 Token 占比最高的 ${data.length} 个上游`}>
+        <ResponsiveContainer width="100%" height="100%">
+          <BarChart data={data} layout="vertical" margin={{ top: 2, right: 48, bottom: 2, left: 4 }}>
+            <CartesianGrid stroke={CHART_COLORS.grid} strokeDasharray="3 5" horizontal={false} />
+            <XAxis
+              type="number"
+              domain={[0, max * 1.1]}
+              tick={{ fill: CHART_COLORS.muted, fontSize: 10.5 }}
+              axisLine={false}
+              tickLine={false}
+              tickFormatter={(v: number) => fmtTokens(v)}
+            />
+            <YAxis
+              type="category"
+              dataKey="label"
+              width={128}
+              tick={{ fill: CHART_COLORS.foreground, fontSize: 11 }}
+              axisLine={false}
+              tickLine={false}
+              tickFormatter={(value: string) => (value.length > 14 ? value.slice(0, 13) + '…' : value)}
+            />
+            <Tooltip
+              cursor={{ fill: CHART_COLORS.accentSoft }}
+              content={({ active, payload }) => {
+                if (!active || !payload?.length) return null
+                const row = payload[0].payload as (typeof data)[number]
+                return (
+                  <ChartTooltipBox title={row.label}>
+                    <TooltipRow label="Token" value={fmtTokens(row.tokens)} />
+                    <TooltipRow label="占比" value={shareText(row.tokens, total)} />
+                    <TooltipRow label="请求" value={fmtNum(row.count)} />
+                    <TooltipRow
+                      label="成功率"
+                      value={row.ok + row.err > 0 ? `${fmtPercent(row.ok / (row.ok + row.err))}%` : '—'}
+                    />
+                  </ChartTooltipBox>
+                )
+              }}
+            />
+            <Bar dataKey="tokens" fill={CHART_COLORS.accent} radius={[0, 4, 4, 0]} maxBarSize={18} />
+          </BarChart>
+        </ResponsiveContainer>
+      </div>
+      <p className="text-muted mt-2 text-[11.5px]">
+        前 {data.length} 个上游占近 7 天 Token 的 {shareText(share, total)}；没有流量的上游不占位。
+      </p>
+    </div>
   )
 }
 
