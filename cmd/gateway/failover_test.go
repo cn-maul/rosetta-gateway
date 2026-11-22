@@ -202,8 +202,15 @@ func buildHarnessChain(t *testing.T, chain []harnessChain, failover bool, codec 
 	// Cleanup runs LIFO. Stop the usage worker before the store cleanup above
 	// closes SQLite; otherwise the worker can still be writing when TempDir
 	// removes the directory, which fails on Linux with "directory not empty".
+	//
+	// 预算取 90s 而不是生产关停的 5s：这里的语义是「测试不许在收尾时丢记录」，
+	// 不是复刻关停时限。压测用例（perf_test.go 的并发扩展、perf_split_test.go
+	// 的三条手臂）会留下数千条异步用量，CI 的 2 核 runner 上单 worker 排空
+	// 需要十几秒 —— 原来卡 5s 时，这些用例失败在清理阶段，而不是被测行为上，
+	// 红色日志只说「没排空」，把真正的性能数字淹没掉了。
+	// 生产侧的 5s 预算在 lifecycle.DefaultShutdownBudget 里单独定义，与此无关。
 	t.Cleanup(func() {
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
 		defer cancel()
 		if !usageRec.Wait(ctx) {
 			t.Errorf("usage recorder did not drain before test cleanup")

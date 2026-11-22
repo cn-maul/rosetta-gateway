@@ -1481,12 +1481,16 @@ func (h *Handler) attemptStream(p attemptParams) Outcome {
 	}
 	if codec.Name() == wireproto.Response && upstreamProtocol == wireproto.Response &&
 		(upstreamReq.Store == nil || *upstreamReq.Store) && status == store.UsageStatusOK {
+		// 只有「上游给出的 id」才能登记为续接键。网关生成的 id 对客户端有效、
+		// 但对上游不存在，登记它会让下一轮的 previous_response_id 打到上游
+		// 并换回一个 404 —— 那正是 2026-11-22 全量测试暴露的缺陷。
+		//
+		// 这里**不再**回退到无条件 DownstreamResponseID()：分支写错时
+		// （sink 忘了实现窄接口）应当「不登记」，而不是「登记一个可疑的值」。
+		// 不登记是安全失败：客户端的续接请求会被 400 挡下并要求发全量历史，
+		// 而不是被悄悄转发。
 		if reporter, ok := sink.(outwire.UpstreamResponseIDReporter); ok {
 			if responseID := reporter.DownstreamResponseIDFromUpstream(); responseID != "" {
-				p.rememberResponse(responseID)
-			}
-		} else if reporter, ok := sink.(outwire.DownstreamResponseIDReporter); ok {
-			if responseID := reporter.DownstreamResponseID(); responseID != "" {
 				p.rememberResponse(responseID)
 			}
 		}

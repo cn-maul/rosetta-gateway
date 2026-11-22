@@ -57,10 +57,16 @@ type splitArm struct {
 }
 
 // runSplitArm 跑一个手臂并打印（复用既有 runNonStreamWorkload，不另造脚手架）。
+//
+// 行数必须在**排空之后**统计。原来这里在压测返回的瞬间就读 usage 行数，
+// 而落库是异步的（单 worker，批 50），3000 条里有 2990 条还在队列里 ——
+// CI 上量到的是「新增 2 行」，拆分结论直接失真（末端数字被当成了整条手臂的成本）。
 func runSplitArm(t *testing.T, env *perfEnv, db *store.Store, body string, conc, total int, label string) splitArm {
 	t.Helper()
 	base := usageRowCount(t, db)
 	r := runNonStreamWorkload(env.client, env.gw.URL, body, conc, total)
+	// 只有成功请求会产生 usage 记录；404 手臂不写行，want==base 立即返回。
+	drainUsage(t, db, base+r.ok)
 	rows := usageRowCount(t, db) - base
 	t.Logf("split %-16s 吞吐=%8.1f req/s  P50=%-12v P99=%-14v ok=%-6d failed=%-4d 新增 usage 行=%d",
 		label, r.qps, r.p50.Round(time.Microsecond), r.p99.Round(time.Microsecond), r.ok, r.failed, rows)
@@ -146,7 +152,6 @@ func TestSplitInsertVsCharge(t *testing.T) {
 			t.Fatalf("预热(404)意外状态: %d", code)
 		}
 	}
-	drainUsage(t, db, usageRowCount(t, db))
 	settle()
 
 	// —— 手臂 N：两件事都不做（基准天花板）——
@@ -156,8 +161,6 @@ func TestSplitInsertVsCharge(t *testing.T) {
 
 	// —— 手臂 I：只 INSERT（无价格 → 扣费 no-op）——
 	armI := runSplitArm(t, env, db, nonStreamBody, conc, total, "I 只INSERT")
-	totalI := usageRowCount(t, db)
-	drainUsage(t, db, totalI)
 	settle()
 
 	// —— 手臂 F：INSERT + 扣费 ——
@@ -177,7 +180,6 @@ func TestSplitInsertVsCharge(t *testing.T) {
 			t.Fatalf("改价后预热失败: code=%d err=%v", code, err)
 		}
 	}
-	drainUsage(t, db, usageRowCount(t, db))
 	settle()
 
 	armF := runSplitArm(t, env, db, nonStreamBody, conc, total, "F INSERT+扣费")
