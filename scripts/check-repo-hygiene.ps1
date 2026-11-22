@@ -74,10 +74,9 @@ $patterns = @(
     @{
         Id       = 'local-config'
         Label    = '本地配置'
-        # `.aoci/config.json` 是 AOCI 的受管配置，不含网关 admin_token /
-        # providers api_key / routes；它由 `.aoci/.gitignore` 显式放行。
-        # 这里只拦网关根目录及普通子目录里的运行时配置。
-        Regex    = '^(?!\.aoci/)(.*/)?(admin_auth|config)\.json$'
+        # 这里拦网关根目录及普通子目录里的运行时配置。入库的那份是
+        # config.example.json。
+        Regex    = '^(.*/)?(admin_auth|config)\.json$'
         Why      = '含 admin_token / providers api_key / routes。入库的那份是 config.example.json。'
         CaseIns  = $false
     }
