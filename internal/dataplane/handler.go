@@ -1470,9 +1470,22 @@ func (h *Handler) attemptStream(p attemptParams) Outcome {
 	// message_delta+message_stop），断流按 DESIGN §8.2 不发终止（OpenAI）/
 	// 发 error 事件（Anthropic），canceled 不写任何东西。
 	sink.Finish(status, stopReason, lastUsage, ing.WantsStreamUsage)
+	terminalWriteFailed := outwire.FirstWriteError(sink) != nil
+	if terminalWriteFailed {
+		// 终止事件同样可能写失败（例如客户端在 response.completed 之前断开）。
+		// 此处不改用量状态——上方首轮收尾已按「已提交」记账——但必须阻止
+		// 把这次未完整送达的响应登记成可续接绑定。
+		status = store.UsageStatusCanceled
+		errorCode = "downstream_write_failed"
+		errorDetail = outwire.SafeErrorDetail(outwire.FirstWriteError(sink))
+	}
 	if codec.Name() == wireproto.Response && upstreamProtocol == wireproto.Response &&
 		(upstreamReq.Store == nil || *upstreamReq.Store) && status == store.UsageStatusOK {
-		if reporter, ok := sink.(outwire.DownstreamResponseIDReporter); ok {
+		if reporter, ok := sink.(outwire.UpstreamResponseIDReporter); ok {
+			if responseID := reporter.DownstreamResponseIDFromUpstream(); responseID != "" {
+				p.rememberResponse(responseID)
+			}
+		} else if reporter, ok := sink.(outwire.DownstreamResponseIDReporter); ok {
 			if responseID := reporter.DownstreamResponseID(); responseID != "" {
 				p.rememberResponse(responseID)
 			}
@@ -1745,8 +1758,8 @@ func (h *Handler) attemptNonStream(p attemptParams) Outcome {
 		)
 	}
 	if codec.Name() == wireproto.Response && upstreamProtocol == wireproto.Response &&
-		(upstreamReq.Store == nil || *upstreamReq.Store) && writeResult.ResponseID != "" {
-		p.rememberResponse(writeResult.ResponseID)
+		(upstreamReq.Store == nil || *upstreamReq.Store) && writeResult.UpstreamResponseID != "" {
+		p.rememberResponse(writeResult.UpstreamResponseID)
 	}
 
 	h.usage.RecordWithCallback(&store.UsageRecord{

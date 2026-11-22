@@ -2,11 +2,11 @@
 
 镜像：`ghcr.io/cn-maul/rosetta-gateway`
 
-**镜像版本号 = 软件版本号**，两者都取自 `web/package.json` 的 `version`（当前 **2.3.0**）。
-发布 `v2.3.0` tag 会得到 `:2.3.0` 与 `:latest` 两个标签；CI 会校验 tag 与
+**镜像版本号 = 软件版本号**，两者都取自 `web/package.json` 的 `version`（当前 **2.3.1**）。
+发布 `v2.3.1` tag 会得到 `:2.3.1` 与 `:latest` 两个标签；CI 会校验 tag 与
 `package.json` 一致，不一致直接构建失败（防止打出名不副实的镜像）。
 
-> 下文示例中的 `:2.3.0` 是**编写时的当前版本**。实际部署请先 `docker pull ghcr.io/cn-maul/rosetta-gateway:2.3.0`
+> 下文示例中的 `:2.3.1` 是**编写时的当前版本**。实际部署请先 `docker pull ghcr.io/cn-maul/rosetta-gateway:2.3.1`
 > 确认该 tag 存在，或直接用 `:latest`。
 
 架构：`linux/amd64`（`docker.yml` 的 buildx 只构建这一种；需要 arm64 再说）。
@@ -22,7 +22,7 @@ docker run -d \
   -p 127.0.0.1:8666:8666 \
   -v rosetta-gateway-data:/data \
   --restart unless-stopped \
-  ghcr.io/cn-maul/rosetta-gateway:2.3.0
+  ghcr.io/cn-maul/rosetta-gateway:2.3.1
 ```
 
 然后打开 `http://127.0.0.1:8666/admin/` —— 首次进入会显示「首次设置密码」表单，
@@ -174,7 +174,7 @@ Chrome / Edge / Brave / Opera 一律硬拦；Firefox 也拦，只是报错文案
 ```yaml
 services:
   rosetta-gateway:
-    image: ghcr.io/cn-maul/rosetta-gateway:2.3.0
+    image: ghcr.io/cn-maul/rosetta-gateway:2.3.1
     container_name: rosetta-gateway
     restart: unless-stopped
     # 正常关停的名义预算是 24s（剪枝 5s + 费用重算 2s + 对账 2s +
@@ -364,6 +364,11 @@ docker run --rm -v rosetta-gateway-data:/data -v "$PWD:/backup" alpine sh -c '
 ```bash
 docker compose pull && docker compose up -d
 ```
+
+**v2.3.0 → v2.3.1 可以直接原地升级，无数据库结构变化。** 这一版修正
+Responses 续接状态：只有当上游真的返回 response id 时才登记绑定，
+网关自己生成的 id、续接被拒以及终止事件写失败都不会再留下可续接状态；
+客户端拿生成 id 回传时会直接得到 400，而不会再打到上游。
 
 **v2.2.0 → v2.3.0 可以直接原地升级。** 启动时会幂等补齐
 `access_key_daily_usage` 表、`access_keys.daily_request_limit` /

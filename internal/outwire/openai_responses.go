@@ -126,6 +126,10 @@ type ResponsesSSE struct {
 	writeErr error
 	// output 累积已收尾的 output item（response.completed 内嵌完整对象）。
 	output []responsesOutputItem
+	// upstreamID 记录上游给出的 response id，用来区分「网关生成的 id」与
+	// 「上游认得、可以续接的 id」。客户端只能用前者回传，后者才是能发回
+	// 上游的续接键；两者混用会让一次被拒的续接悄悄打到上游。
+	upstreamID string
 	// pendingIndex 是「下一个 item 应当占的 output_index」。
 	//
 	// # 为什么需要它（2026-10-21 修 A3-P1-4 / 汇总 O4）
@@ -203,6 +207,18 @@ func (s *ResponsesSSE) DownstreamResponseID() string {
 	return s.id
 }
 
+// DownstreamResponseIDFromUpstream reports the client-visible id only when it
+// came from the upstream. A gateway-generated id is not a continuation key for
+// the upstream, so callers must not record it as a binding.
+func (s *ResponsesSSE) DownstreamResponseIDFromUpstream() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.upstreamID == "" || s.id != s.upstreamID {
+		return ""
+	}
+	return s.id
+}
+
 func (s *ResponsesSSE) responseSkeleton(status string) map[string]any {
 	return map[string]any{
 		"id":                  s.id,
@@ -225,6 +241,7 @@ func (s *ResponsesSSE) ensureStarted(id string) {
 	s.started = true
 	if id != "" {
 		s.id = id
+		s.upstreamID = id
 	}
 	s.writeEvent("response.created", map[string]any{"response": s.responseSkeleton("in_progress")})
 }
@@ -901,6 +918,9 @@ func WriteResponsesResponseWithTools(w http.ResponseWriter, resp *rosetta.ChatRe
 	})
 	if result.Err == nil {
 		result.ResponseID = id
+		if resp.ID != "" {
+			result.UpstreamResponseID = resp.ID
+		}
 	}
 	return result
 }

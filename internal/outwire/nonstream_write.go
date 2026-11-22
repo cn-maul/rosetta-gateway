@@ -17,6 +17,10 @@ type NonStreamWriteResult struct {
 	// the generated value so continuation state keys on what the caller saw,
 	// not on the empty upstream value.
 	ResponseID string
+	// UpstreamResponseID is non-empty only when ResponseID came from the
+	// upstream. A generated downstream id is not a valid upstream continuation
+	// key, so the caller must not bind it.
+	UpstreamResponseID string
 }
 
 // EncodeError reports a failure that happened before any downstream bytes
